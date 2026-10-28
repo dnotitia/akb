@@ -28,7 +28,7 @@ VAULT = "catalog-bench-knowledge"
 COLLECTION = "notes"
 TITLE = "quick-update"
 CONTENT = "A short note for the team."
-URI = f"akb://{VAULT}/coll/{COLLECTION}/doc/quick-update"
+URI = f"akb://{VAULT}/coll/{COLLECTION}/doc/quick-update.md"
 
 
 class _ListedToolset:
@@ -89,6 +89,11 @@ def test_captured_catalog_schema_is_the_scorer_authority() -> None:
         tool_count=1,
         catalog_hash=hash_json(tools),
         catalog_token_estimate=token_estimate(tools),
+        server_discover={
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {},
+            "instructions": "Synthetic server instructions.",
+        },
         tools=tools,
     )
 
@@ -104,6 +109,7 @@ def _call(
     *,
     result_fields: dict[str, str] | None = None,
     succeeded: bool = True,
+    stage_id: str | None = None,
 ) -> ToolCallRecord:
     return ToolCallRecord(
         order=order,
@@ -120,13 +126,15 @@ def _call(
         server_status_code=None if succeeded else 500,
         server_error_code=None if succeeded else "internal_error",
         result_fields=result_fields or {},
+        operation_kind="material",
+        stage_id=stage_id,
     )
 
 
 def _exact_calls() -> list[ToolCallRecord]:
     return [
-        _call(1, "akb_create_vault", "create", "vault", {"name": VAULT}),
-        _call(2, "akb_create_collection", "create", "collection", {"vault": VAULT, "path": COLLECTION}),
+        _call(1, "akb_create_vault", "create", "vault", {"name": VAULT}, stage_id="create_vault_1"),
+        _call(2, "akb_create_collection", "create", "collection", {"vault": VAULT, "path": COLLECTION}, stage_id="create_collection_1"),
         _call(
             3,
             "akb_put",
@@ -134,13 +142,19 @@ def _exact_calls() -> list[ToolCallRecord]:
             "document",
             {"vault": VAULT, "collection": COLLECTION, "title": TITLE, "content": CONTENT},
             result_fields={"uri": URI},
+            stage_id="create_document_1",
         ),
-        _call(4, "akb_get", "read", "document", {"uri": URI}),
-        _call(5, "akb_provenance", "read", "document", {"uri": URI}),
+        _call(4, "akb_get", "read", "document", {"uri": URI}, stage_id="read_document_1"),
+        _call(5, "akb_provenance", "read", "document", {"uri": URI}, stage_id="read_document_2"),
     ]
 
 
-def _score(task, calls: list[ToolCallRecord]) -> TrialOutcome:
+def _score(
+    task,
+    calls: list[ToolCallRecord],
+    *,
+    before: StateObservation | None = None,
+) -> TrialOutcome:
     outcome = TrialOutcome(
         task_id=task.id,
         category=task.category,
@@ -153,8 +167,25 @@ def _score(task, calls: list[ToolCallRecord]) -> TrialOutcome:
         first_logical_operation=calls[0].logical_operation if calls else "none",
         tool_calls=calls,
     )
-    before = StateObservation(True, 200, {"items": []})
-    after = StateObservation(True, 200, {"items": [{"name": "quick-update.md"}]})
+    before = before or StateObservation(
+        True,
+        task.expected_final_state.resolved_before_expected_status,
+        {"code": "not_found", "detail": f"Vault not found: {VAULT}"},
+    )
+    after = StateObservation(
+        True,
+        200,
+        {
+            "items": [
+                {
+                    "name": TITLE,
+                    "path": f"{COLLECTION}/quick-update.md",
+                    "type": "document",
+                    "uri": URI,
+                }
+            ]
+        },
+    )
     outcome.finalize(task, before, after)
     return outcome
 
@@ -165,8 +196,8 @@ def test_multistep_pair_declares_semantic_sequence_without_legacy_tool_lock_in()
 
     assert len(tasks) == 2
     assert {task.locale for task in tasks} == {"ko-KR", "en-US"}
-    assert len(all_tasks) == 26
-    assert len(manifest.pair_categories) == 13
+    assert len(all_tasks) == 40
+    assert len(manifest.pair_categories) == 20
     assert source_blind_violations_for(tasks, manifest.operation_map) == []
     for task in tasks:
         assert [attempt.logical_operation for attempt in task.expected_material_attempts] == [
@@ -198,9 +229,20 @@ def test_exact_outcome_and_cross_call_dataflow_complete_the_multistep_task() -> 
     assert outcome.success is True
 
 
+def test_wrong_before_status_prevents_multistep_task_success() -> None:
+    _manifest, tasks = _multistep_tasks()
+    task = tasks[0]
+    outcome = _score(task, _exact_calls(), before=StateObservation(True, 200, {"items": []}))
+
+    assert task.expected_final_state.resolved_before_expected_status == 404
+    assert outcome.state_contract_passed is False
+    assert outcome.user_outcome_completed is False
+    assert outcome.success is False
+
+
 @pytest.mark.parametrize(
     "mutation",
-    ("missing_step", "wrong_order", "wrong_target", "wrong_resource", "missing_binding", "failed_step", "extra_step"),
+    ("missing_step", "wrong_order", "wrong_target", "wrong_resource", "missing_binding", "failed_step"),
 )
 def test_incomplete_or_semantically_wrong_multistep_trace_fails(mutation: str) -> None:
     _manifest, tasks = _multistep_tasks()
@@ -218,16 +260,26 @@ def test_incomplete_or_semantically_wrong_multistep_trace_fails(mutation: str) -
         calls[1] = calls[1].model_copy(update={"resource_type": "document"})
     elif mutation == "missing_binding":
         calls[2] = calls[2].model_copy(update={"result_fields": {}})
-    elif mutation == "failed_step":
+    else:
         calls[1] = calls[1].model_copy(update={"server_succeeded": False, "server_error_code": "internal_error"})
-    elif mutation == "extra_step":
-        calls.append(_call(6, "akb_get", "read", "document", {"uri": URI}))
 
     calls = [call.model_copy(update={"order": order}) for order, call in enumerate(calls, 1)]
     outcome = _score(tasks[0], calls)
 
     assert outcome.user_outcome_completed is False
     assert outcome.success is False
+
+
+def test_registered_read_after_multistep_completion_is_reported_without_failing_task() -> None:
+    _manifest, tasks = _multistep_tasks()
+    calls = [*_exact_calls(), _call(6, "akb_get", "read", "document", {"uri": URI})]
+
+    outcome = _score(tasks[0], calls)
+
+    assert outcome.user_outcome_completed is True
+    assert outcome.success is True
+    assert outcome.stopping_accuracy is True
+    assert outcome.post_completion_overshoot == 1
 
 
 def test_equivalent_read_tools_are_accepted_when_semantics_and_binding_match() -> None:

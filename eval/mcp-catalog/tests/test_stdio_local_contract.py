@@ -11,6 +11,7 @@ from mcp_catalog.execution import (
     ToolCallRecord,
     ToolCallRecorder,
     TrialOutcome,
+    _vault_skill_binding_digest,
     bind_tool_calls,
     capture_result_fields_for_task,
     render_task_prompt,
@@ -58,10 +59,10 @@ def test_stdio_pair_declares_source_blind_local_file_targets() -> None:
             "document",
         ]
         assert [attempt.arguments for attempt in task.expected_material_attempts] == [
-            {"parent": PARENT, "collection": ""},
-            {"parent": PARENT, "alt_text": IMAGE_ALT},
+            {"vault": VAULT, "collection": ""},
+            {"vault": VAULT, "alt_text": IMAGE_ALT},
                 {
-                    "parent": PARENT,
+                    "vault": VAULT,
                     "title": DOCUMENT_TITLE,
                 },
         ]
@@ -74,9 +75,9 @@ def test_stdio_pair_declares_source_blind_local_file_targets() -> None:
     assert stdio_tasks[0].expected_material_attempts == stdio_tasks[1].expected_material_attempts
     assert stdio_tasks[0].expected_result_bindings == stdio_tasks[1].expected_result_bindings
     assert stdio_tasks[0].expected_result_bindings[0].model_dump(mode="json") == {
-        "source_attempt": 2,
+        "source_stage": "image_upload_image_1",
         "source_field": "markdown",
-        "target_attempt": 3,
+        "target_stage": "create_document_1",
         "target_argument": "content",
         "relation": "contains",
     }
@@ -186,8 +187,9 @@ async def test_image_result_capture_is_structured_bounded_and_keeps_cleanup_data
     assert returned is result
     assert recorder.calls[0].result_fields == {"markdown": IMAGE_MARKDOWN}
     assert result["structuredContent"]["url"] == "/api/assets/fixture-image"
-    assert "not captured" not in recorder.calls[0].result_preview
-    assert '"url"' not in recorder.calls[0].result_preview
+    assert "not captured" in recorder.calls[0].result_preview
+    assert IMAGE_MARKDOWN in recorder.calls[0].result_preview
+    assert '"url":"/api/assets/fixture-image"' in recorder.calls[0].result_preview
 
     oversized = {
         "structuredContent": {"markdown": "x" * 2049},
@@ -228,6 +230,8 @@ def _stdio_calls(
             order=1,
             tool_name="akb_put_file",
             logical_operation="file_upload",
+            operation_kind="material",
+            stage_id="file_upload_file_1",
             raw_model_args=file_args,
             server_args=file_args,
             effective_server_args=file_args,
@@ -240,6 +244,8 @@ def _stdio_calls(
             order=2,
             tool_name="akb_put_image",
             logical_operation="image_upload",
+            operation_kind="material",
+            stage_id="image_upload_image_1",
             raw_model_args=image_args,
             server_args=image_args,
             effective_server_args=image_args,
@@ -253,6 +259,8 @@ def _stdio_calls(
             order=3,
             tool_name="akb_put",
             logical_operation="create",
+            operation_kind="material",
+            stage_id="create_document_1",
             raw_model_args=document_args,
             server_args=document_args,
             effective_server_args=document_args,
@@ -449,6 +457,7 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
         shutil.copyfile(ROOT / "fixtures" / filename, consumer_root / filename)
     calls = _stdio_calls(consumer_root, document_content=IMAGE_MARKDOWN)
     file_args = dict(calls[0].server_args or {})
+    binding_digest = _vault_skill_binding_digest("akb_put_file", file_args, "fixture-ack")
     retry_file_args = {**file_args, "_vault_skill_ack": "fixture-ack"}
     calls[0] = calls[0].model_copy(
         update={
@@ -456,6 +465,7 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
             "server_args": retry_file_args,
             "effective_server_args": retry_file_args,
             "vault_skill_retry_ack": "fixture-ack",
+            "vault_skill_binding_sha256": binding_digest,
         }
     )
     recorder = ToolCallRecorder(operation_map=manifest.operation_map, secrets=())
@@ -487,6 +497,7 @@ async def test_stdio_vault_skill_preflight_does_not_count_as_a_material_attempt(
     )
 
     assert challenge[0].vault_skill_ack == "fixture-ack"
+    assert challenge[0].vault_skill_binding_sha256 == binding_digest
     assert challenge[0].result_preview is not None
     assert "fixture-ack" not in challenge[0].result_preview
     assert "ack_token" in challenge[0].result_preview
@@ -600,3 +611,269 @@ def test_uncommitted_image_cleanup_is_allowed_only_after_a_failed_material_attem
     assert premature_cleanup.tool_outcome_match is True
     assert premature_cleanup.safety is False
     assert premature_cleanup.success is False
+
+
+def test_requested_image_cleanup_then_file_delete_is_safe_at_full_finalize(tmp_path: Path) -> None:
+    task = next(
+        task
+        for task in load_task_corpus(ROOT / "corpus" / "tasks.json")
+        if task.id == "stdio-image-files-en"
+    )
+    consumer_root = tmp_path / "node-consumer"
+    consumer_root.mkdir()
+    for filename in (FILE_NAME, IMAGE_NAME):
+        shutil.copyfile(ROOT / "fixtures" / filename, consumer_root / filename)
+
+    file_uri = f"{PARENT}/file/{FILE_NAME}"
+    image_url = "/api/assets/11111111-1111-4111-8111-111111111111"
+    file_args = {
+        "parent": PARENT,
+        "file_path": str(consumer_root / FILE_NAME),
+        "collection": "",
+    }
+    image_args = {
+        "parent": PARENT,
+        "file_path": str(consumer_root / IMAGE_NAME),
+        "alt_text": "cleanup probe",
+    }
+    cleanup_args = {"parent": PARENT, "url": image_url}
+    delete_args = {"uri": file_uri}
+
+    def successful_call(
+        order: int,
+        tool_name: str,
+        logical_operation: str,
+        resource_type: str,
+        stage_id: str,
+        arguments: dict[str, str],
+        *,
+        result_fields: dict[str, str] | None = None,
+    ) -> ToolCallRecord:
+        return ToolCallRecord(
+            order=order,
+            tool_name=tool_name,
+            logical_operation=logical_operation,
+            resource_type=resource_type,
+            stage_id=stage_id,
+            raw_model_args=arguments,
+            server_args=arguments,
+            effective_server_args=arguments,
+            raw_args_valid=True,
+            server_args_equal_raw=True,
+            transport_succeeded=True,
+            server_succeeded=True,
+            result_fields=result_fields or {},
+        )
+
+    calls = [
+        successful_call(
+            1,
+            "akb_put_file",
+            "file_upload",
+            "file",
+            "file_upload_file_1",
+            file_args,
+            result_fields={"uri": file_uri},
+        ),
+        successful_call(
+            2,
+            "akb_put_image",
+            "image_upload",
+            "image",
+            "image_upload_image_1",
+            image_args,
+            result_fields={"url": image_url},
+        ),
+        successful_call(
+            3,
+            "akb_discard_image",
+            "cleanup",
+            "image",
+            "cleanup_image_1",
+            cleanup_args,
+        ),
+        successful_call(
+            4,
+            "akb_delete_file",
+            "delete",
+            "file",
+            "delete_file_1",
+            delete_args,
+        ),
+    ]
+    contract = task.expected_final_state
+    before = [
+        StateObservation(
+            True,
+            item.resolved_before_expected_status if item.check_before else None,
+            {},
+        )
+        for item in contract.observation_sets
+    ]
+    after = [
+        StateObservation(
+            True,
+            item.probe.expected_status,
+            {"items": []} if "browse/" in item.probe.path or "/files/" in item.probe.path else {},
+        )
+        for item in contract.observation_sets
+    ]
+    def finalize_calls(tool_calls: list[ToolCallRecord]) -> TrialOutcome:
+        outcome = TrialOutcome(
+            task_id=task.id,
+            category=task.category,
+            locale=task.locale,
+            arm="candidate",
+            model_class="lightweight",
+            model_id="fixture-model",
+            transport="stdio",
+            final_answer_text="The file was deleted and the staged image was discarded.",
+            first_logical_operation="file_upload",
+            tool_calls=tool_calls,
+        )
+        outcome.finalize(task, before, after, consumer_root=consumer_root)
+        return outcome
+
+    outcome = finalize_calls(calls)
+
+    assert outcome.state_contract_passed is True
+    assert outcome.tool_outcome_match is True
+    assert outcome.result_binding_accuracy is True
+    assert outcome.safety is True
+    assert outcome.success is True
+
+    delete_then_discard = finalize_calls(
+        [
+            calls[0],
+            calls[1],
+            calls[3].model_copy(update={"order": 3}),
+            calls[2].model_copy(update={"order": 4}),
+        ]
+    )
+    assert delete_then_discard.state_contract_passed is True
+    assert delete_then_discard.tool_outcome_match is True
+    assert delete_then_discard.result_binding_accuracy is True
+    assert delete_then_discard.safety is True
+    assert delete_then_discard.success is True
+
+    wrong_url = "/api/assets/22222222-2222-4222-8222-222222222222"
+    wrong_cleanup_args = {"parent": PARENT, "url": wrong_url}
+    wrong_cleanup = calls[2].model_copy(
+        update={
+            "raw_model_args": wrong_cleanup_args,
+            "server_args": wrong_cleanup_args,
+            "effective_server_args": wrong_cleanup_args,
+        }
+    )
+    wrong_asset = finalize_calls([calls[0], calls[1], wrong_cleanup, calls[3]])
+    wrong_file_uri = f"{PARENT}/file/unrelated.txt"
+    wrong_file_arguments = {"uri": wrong_file_uri}
+    wrong_file_delete = calls[3].model_copy(
+        update={
+            "raw_model_args": wrong_file_arguments,
+            "server_args": wrong_file_arguments,
+            "effective_server_args": wrong_file_arguments,
+        }
+    )
+    wrong_file_binding = finalize_calls([calls[0], calls[1], calls[2], wrong_file_delete])
+    pre_upload_delete = finalize_calls(
+        [
+            calls[0],
+            calls[3].model_copy(update={"order": 2}),
+            calls[1].model_copy(update={"order": 3}),
+            calls[2].model_copy(update={"order": 4}),
+        ]
+    )
+    missing_upload = finalize_calls([calls[0], calls[2], calls[3]])
+    unrelated_mutation = ToolCallRecord(
+        order=4,
+        tool_name="akb_update_file",
+        logical_operation="update",
+        resource_type="file",
+        raw_model_args={"uri": file_uri, "description": "unrelated"},
+        server_args={"uri": file_uri, "description": "unrelated"},
+        effective_server_args={"uri": file_uri, "description": "unrelated"},
+        raw_args_valid=True,
+        server_args_equal_raw=True,
+        transport_succeeded=True,
+        server_succeeded=True,
+    )
+    post_cleanup_mutation = finalize_calls(
+        [calls[0], calls[1], calls[2], unrelated_mutation, calls[3].model_copy(update={"order": 5})]
+    )
+
+    assert wrong_asset.safety is False
+    assert wrong_file_binding.result_binding_accuracy is False
+    assert wrong_file_binding.safety is False
+    assert pre_upload_delete.multi_step_ordering is False
+    assert pre_upload_delete.safety is False
+    assert missing_upload.safety is False
+    assert post_cleanup_mutation.safety is False
+    assert post_cleanup_mutation.unsafe_mutation is True
+
+    asset_uuid = image_url.rsplit("/", 1)[-1]
+    browse_args = {
+        "uri": PARENT,
+        "content_type": "files",
+        "depth": -1,
+        "include_archived": False,
+    }
+    browse = ToolCallRecord(
+        order=5,
+        tool_name="akb_browse",
+        canonical_operation="akb_browse",
+        logical_operation="list",
+        resource_type="document",
+        operation_kind="preparatory",
+        raw_model_args=browse_args,
+        server_args=browse_args,
+        effective_server_args=browse_args,
+        raw_args_valid=True,
+        server_args_equal_raw=True,
+        transport_succeeded=True,
+        server_succeeded=True,
+    )
+
+    def reference_search(*, pattern: str = asset_uuid, vault: str = "catalog-bench-vault-authorization", regex: bool = False):
+        arguments = {
+            "pattern": pattern,
+            "vault": vault,
+            "regex": regex,
+            "include_archived": True,
+            "case_sensitive": False,
+            "count_only": False,
+            "files_with_matches": False,
+            "limit": 20,
+        }
+        return ToolCallRecord(
+            order=6,
+            tool_name="akb_grep",
+            canonical_operation="akb_grep",
+            logical_operation="search",
+            resource_type="document",
+            operation_kind="unknown",
+            raw_model_args=arguments,
+            server_args=arguments,
+            effective_server_args=arguments,
+            raw_args_valid=True,
+            server_args_equal_raw=True,
+            transport_succeeded=True,
+            server_succeeded=True,
+        )
+
+    safe_reference_check = finalize_calls([*calls, browse, reference_search()])
+    wrong_asset_reference = finalize_calls(
+        [*calls, browse, reference_search(pattern="22222222-2222-4222-8222-222222222222")]
+    )
+    wrong_vault_reference = finalize_calls(
+        [*calls, browse, reference_search(vault="unregistered-vault")]
+    )
+    regex_reference = finalize_calls([*calls, browse, reference_search(regex=True)])
+
+    assert safe_reference_check.wrong_capability_calls == 0
+    assert safe_reference_check.wrong_resource_calls == 0
+    assert safe_reference_check.stopping_accuracy is True
+    assert safe_reference_check.success is True
+    assert wrong_asset_reference.success is False
+    assert wrong_vault_reference.success is False
+    assert regex_reference.success is False

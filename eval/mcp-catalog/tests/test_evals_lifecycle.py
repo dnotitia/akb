@@ -9,6 +9,7 @@ from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.evidence import serialize_report
 from mcp_catalog.execution import CURRENT_TRIAL, TrialOutcome, evaluate_dataset
 from mcp_catalog.runtime import RuntimeContractError, RuntimeFixture, StateObservation
+from paired_artifact_factory import provider_name_for_model
 from test_runtime_contract import _TimedResetClient, descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -75,6 +76,7 @@ class _ReadinessGuardExecutor:
         return TrialOutcome(
             task_id=task.id,
             category=task.category,
+            locale=task.locale,
             arm=self.arm,
             model_class=self.model_spec.class_name,
             model_id=self.model_spec.model_id,
@@ -107,6 +109,7 @@ class _TokenRecordingExecutor:
         return TrialOutcome(
             task_id=task.id,
             category=task.category,
+            locale=task.locale,
             arm=self.arm,
             model_class=self.model_spec.class_name,
             model_id=self.model_spec.model_id,
@@ -155,6 +158,7 @@ class FakeExecutor:
         return TrialOutcome(
             task_id=task.id,
             category=task.category,
+            locale=task.locale,
             arm=self.arm,
             model_class=self.model_spec.class_name,
             model_id=self.model_spec.model_id,
@@ -228,13 +232,15 @@ async def test_measured_behavioral_failure_is_checkpointed_as_completed_but_unsu
             return TrialOutcome(
                 task_id=task.id,
                 category=task.category,
+                locale=task.locale,
                 arm=self.arm,
                 model_class=self.model_spec.class_name,
                 model_id=model_id,
                 transport=self.transport,
-                error="Model token limit (8192) exceeded",
-                failure_kind="output_limit",
-                input_tokens=10,
+                    error="Model token limit (8192) exceeded",
+                    failure_kind="output_limit",
+                    tool_calls=[],
+                    input_tokens=10,
                 output_tokens=2,
                 total_tokens=12,
                 model_requests=1,
@@ -242,15 +248,44 @@ async def test_measured_behavioral_failure_is_checkpointed_as_completed_but_unsu
                 provider_evidence=[
                     {
                         "model": model_id,
-                        "routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}},
+                        "routing": {
+                            "endpoints": {
+                                "available": [{
+                                    "provider": provider_name_for_model(self.model_spec),
+                                    "selected": True,
+                                }]
+                            }
+                        },
                         "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
                     }
                 ],
                 provider_cost_usd=0.00001,
                 cost_source="provider_response",
-                routing_observed=True,
-                routing_valid=True,
-            )
+                    routing_observed=True,
+                    routing_valid=True,
+                    state_available_before=True,
+                    state_available_after=True,
+                    state_before={},
+                    state_after={},
+                    state_observations_before=[
+                        {
+                            "available": True,
+                            "status_code": item.resolved_before_expected_status,
+                            "payload": {},
+                            "error": None,
+                        }
+                        for item in task.expected_final_state.observation_sets
+                    ],
+                    state_observations_after=[
+                        {
+                            "available": True,
+                            "status_code": item.probe.expected_status,
+                            "payload": {},
+                            "error": None,
+                        }
+                        for item in task.expected_final_state.observation_sets
+                    ],
+                )
 
     async def checkpoint_sink(_outcome: TrialOutcome, status: str) -> None:
         events.append(status)

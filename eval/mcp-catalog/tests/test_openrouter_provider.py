@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from openai.types.chat import ChatCompletion
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, UserPromptPart
@@ -15,17 +18,16 @@ from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RequestUsage, RunUsage
 
 import mcp_catalog.execution as execution_module
-from mcp_catalog.contracts import OPENROUTER_BASE_URL, load_run_manifest, load_task_corpus
+import mcp_catalog.runner as runner_module
+from mcp_catalog.contracts import BenchmarkRunManifest, OPENROUTER_BASE_URL, load_run_manifest, load_task_corpus
 from mcp_catalog.execution import (
     BudgetExceeded,
     BudgetLedger,
     CURRENT_TRIAL,
-    GlobalWallDeadlineExceeded,
     MODEL_RESPONSES,
     ModelConfigurationError,
     OpenRouterChatModel,
     ProviderRequestReceipt,
-    ProviderRequestTimeout,
     TrialContext,
     TrialExecutor,
     ToolCallRecorder,
@@ -35,18 +37,513 @@ from mcp_catalog.execution import (
     classify_failure,
     has_measured_evidence,
     outcome_from_run,
+    registered_route_target,
     validate_routing_evidence,
     worst_case_cost,
-    run_agent_with_deadline,
+    run_agent_with_timeout,
 )
 from mcp_catalog.checkpoint import valid_completed_outcome
-from mcp_catalog.runtime import StateObservation
+from mcp_catalog.runner import BenchmarkRunner
+from mcp_catalog.runtime import RuntimeDescriptor, StateObservation
+from paired_artifact_factory import _make_outcome, provider_name_for_model
+from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
+_MODEL_REGISTRY_FIXTURE = [
+    {
+        "id": "deepseek/deepseek-v4-flash-0731",
+        "canonical_slug": "deepseek/deepseek-v4-flash-20260731",
+    },
+    {
+        "id": "qwen/qwen3.8-27b",
+        "canonical_slug": "qwen/qwen3.8-27b-20260814",
+    },
+]
 
 
 def _model_spec():
     return load_run_manifest(ROOT / "config" / "run.json").models[0]
+
+
+def _streamlake_manifest() -> BenchmarkRunManifest:
+    raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    raw["models"][0]["routing"]["order"] = ["streamlake"]
+    raw["models"][0]["input_cost_per_million_usd"] = 0.088
+    raw["models"][0]["output_cost_per_million_usd"] = 0.264
+    return BenchmarkRunManifest.model_validate(raw)
+
+
+def _fallback_qwen_fixture() -> tuple[BenchmarkRunManifest, Any, list[dict[str, Any]]]:
+    manifest_raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    qwen_model_id = "qwen/qwen3.8-27b"
+    qwen = next(model for model in manifest_raw["models"] if model["model_id"] == qwen_model_id)
+    qwen["routing"]["order"] = ["chutes"]
+    qwen["routing"]["allow_fallbacks"] = True
+    manifest = BenchmarkRunManifest.model_validate(manifest_raw)
+    qwen_spec = next(model for model in manifest.models if model.model_id == qwen_model_id)
+    canonical_slug = "qwen/qwen3.8-27b-20260814"
+    supported = ["tools", "tool_choice", "temperature", "max_tokens"]
+    endpoints = [
+        {
+            "model_id": qwen_model_id,
+            "name": f"Chutes | {canonical_slug}",
+            "provider_name": "Chutes",
+            "tag": "chutes/fp8",
+            "quantization": "fp8",
+            "supported_parameters": supported,
+            "pricing": {"prompt": "0.000000039", "completion": "0.00000125"},
+        },
+        {
+            "model_id": qwen_model_id,
+            "name": f"Near AI | {canonical_slug}",
+            "provider_name": "Near AI",
+            "tag": "near-ai/fp8",
+            "quantization": "fp8",
+            "supported_parameters": supported,
+            "pricing": {"prompt": "0.00000004", "completion": "0.00000135"},
+        },
+        {
+            "model_id": qwen_model_id,
+            "name": f"Mancer 2 | {canonical_slug}",
+            "provider_name": "Mancer 2",
+            "tag": "mancer/fp8",
+            "quantization": "fp8",
+            "supported_parameters": supported,
+            "pricing": {"prompt": "0.00000018", "completion": "0.0000025"},
+        },
+    ]
+    return manifest, qwen_spec, endpoints
+
+
+def _provider_display_name(spec) -> str:
+    return "StreamLake" if spec.routing.order[0] == "streamlake" else provider_name_for_model(spec)
+
+
+def _registered_model(spec) -> dict[str, Any]:
+    canonical_slug = runner_module._expected_openrouter_canonical_slug(spec)
+    provider_name = _provider_display_name(spec)
+    endpoint = {
+        "model_id": spec.model_id,
+        "name": f"{provider_name} | {canonical_slug}",
+        "provider_name": provider_name,
+        "tag": f"{spec.routing.order[0]}/fp8",
+        "quantization": "fp8",
+        "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens"],
+        "pricing": {
+            "prompt": str(Decimal(str(spec.input_cost_per_million_usd)) / Decimal(1_000_000)),
+            "completion": str(Decimal(str(spec.output_cost_per_million_usd)) / Decimal(1_000_000)),
+        },
+    }
+    endpoint_snapshot = {"data": {"endpoints": [endpoint]}}
+    return {
+        "manifest_version": spec.version,
+        "model_record": {"id": spec.model_id, "canonical_slug": canonical_slug},
+        "endpoint_snapshot": endpoint_snapshot,
+        "selected_endpoint": endpoint,
+        "eligible_endpoints": [endpoint],
+    }
+
+
+def _routing_metadata(spec, *, model: str | None = None, provider: str | None = None) -> dict[str, Any]:
+    canonical_slug = runner_module._expected_openrouter_canonical_slug(spec)
+    return {
+        "requested": spec.model_id,
+        "endpoints": {
+            "available": [{
+                "model": model or canonical_slug,
+                "provider": provider or provider_name_for_model(spec),
+                "selected": True,
+            }],
+        },
+    }
+
+
+async def _capture_registry_with_httpx(
+    monkeypatch: pytest.MonkeyPatch,
+    model_rows: list[dict[str, str]],
+    *,
+    manifest: BenchmarkRunManifest | None = None,
+    endpoint_price_overrides: dict[str, dict[str, Any] | None] | None = None,
+    endpoint_provider_overrides: dict[str, list[str]] | None = None,
+    endpoint_records_overrides: dict[str, list[dict[str, Any]]] | None = None,
+) -> tuple[dict[str, object], list[str]]:
+    manifest = manifest or load_run_manifest(ROOT / "config" / "run.json")
+    for spec in manifest.models:
+        monkeypatch.setenv(spec.base_url_env, OPENROUTER_BASE_URL)
+        monkeypatch.setenv(spec.provider_key_env, "fixture-provider-key")
+
+    requested_urls: list[str] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(200, json={"data": model_rows})
+        if request.url.path.startswith("/api/v1/models/") and request.url.path.endswith("/endpoints"):
+            segments = request.url.path.strip("/").split("/")
+            model_id = f"{segments[-3]}/{segments[-2]}"
+            model_row = next(row for row in model_rows if row["id"] == model_id)
+            spec = next(spec for spec in manifest.models if spec.model_id == model_id)
+            if endpoint_records_overrides and model_id in endpoint_records_overrides:
+                return httpx.Response(
+                    200,
+                    json={"data": {"endpoints": endpoint_records_overrides[model_id]}},
+                )
+            provider_names = (
+                endpoint_provider_overrides[model_id]
+                if endpoint_provider_overrides and model_id in endpoint_provider_overrides
+                else [_provider_display_name(spec)]
+            )
+            provider_endpoints = []
+            for provider_name in provider_names:
+                endpoint = {
+                    "model_id": model_id,
+                    "name": f"{provider_name} | {model_row['canonical_slug']}",
+                    "provider_name": provider_name,
+                    "tag": f"{provider_name.casefold()}/fp8",
+                    "quantization": "fp8",
+                    "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens"],
+                    "pricing": {
+                        "prompt": str(Decimal(str(spec.input_cost_per_million_usd)) / Decimal(1_000_000)),
+                        "completion": str(Decimal(str(spec.output_cost_per_million_usd)) / Decimal(1_000_000)),
+                    },
+                }
+                if endpoint_price_overrides and model_id in endpoint_price_overrides:
+                    price_override = endpoint_price_overrides[model_id]
+                    if price_override is None:
+                        endpoint.pop("pricing")
+                    else:
+                        endpoint["pricing"] = price_override
+                provider_endpoints.append(endpoint)
+            return httpx.Response(
+                200,
+                json={"data": {"endpoints": provider_endpoints}},
+            )
+        return httpx.Response(404, json={"error": {"message": "unexpected registry request"}})
+
+    transport = httpx.MockTransport(handle_request)
+    original_async_client = httpx.AsyncClient
+
+    def mock_async_client(*, timeout: float, follow_redirects: bool) -> httpx.AsyncClient:
+        return original_async_client(transport=transport, timeout=timeout, follow_redirects=follow_redirects)
+
+    monkeypatch.setattr(runner_module.httpx, "AsyncClient", mock_async_client)
+    runner = BenchmarkRunner(
+        manifest,
+        [],
+        RuntimeDescriptor.from_dict(descriptor_dict()),
+    )
+    registry = await runner._capture_provider_registry(BudgetLedger(manifest))
+    return registry, requested_urls
+
+
+@pytest.mark.asyncio
+async def test_provider_registry_accepts_pinned_aliases_and_canonical_slugs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, requested_urls = await _capture_registry_with_httpx(monkeypatch, _MODEL_REGISTRY_FIXTURE)
+
+    assert registry["status"] == "verified"
+    assert [
+        (record["model_record"]["id"], record["model_record"]["canonical_slug"])
+        for record in registry["models"].values()
+    ] == [
+        ("deepseek/deepseek-v4-flash-0731", "deepseek/deepseek-v4-flash-20260731"),
+        ("qwen/qwen3.8-27b", "qwen/qwen3.8-27b-20260814"),
+    ]
+    assert [
+        (
+            record["selected_endpoint"]["provider_name"],
+            record["selected_endpoint"]["tag"],
+            record["selected_endpoint"]["supported_parameters"],
+        )
+        for record in registry["models"].values()
+    ] == [
+        ("DeepInfra", "deepinfra/fp8", ["tools", "tool_choice", "temperature", "max_tokens"]),
+        ("AkashML", "akashml/fp8", ["tools", "tool_choice", "temperature", "max_tokens"]),
+    ]
+    assert set(requested_urls) == {
+        f"{OPENROUTER_BASE_URL}/models",
+        f"{OPENROUTER_BASE_URL}/models/deepseek/deepseek-v4-flash-0731/endpoints",
+        f"{OPENROUTER_BASE_URL}/models/qwen/qwen3.8-27b/endpoints",
+    }
+
+
+@pytest.mark.asyncio
+async def test_provider_registry_accepts_streamlake_fp8_at_manifest_price_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _streamlake_manifest()
+    primary_id = manifest.models[0].model_id
+    registry, requested_urls = await _capture_registry_with_httpx(
+        monkeypatch,
+        _MODEL_REGISTRY_FIXTURE,
+        manifest=manifest,
+        endpoint_price_overrides={
+            primary_id: {"prompt": "0.000000088", "completion": "0.000000264"}
+        },
+    )
+
+    assert registry["status"] == "verified"
+    models = registry["models"]
+    assert isinstance(models, dict)
+    primary = models[primary_id]
+    assert isinstance(primary, dict)
+    endpoint = primary["selected_endpoint"]
+    assert isinstance(endpoint, dict)
+    assert endpoint["provider_name"] == "StreamLake"
+    assert endpoint["tag"] == "streamlake/fp8"
+    assert endpoint["quantization"] == "fp8"
+    assert endpoint["pricing"] == {"prompt": "0.000000088", "completion": "0.000000264"}
+    assert set(requested_urls) == {
+        f"{OPENROUTER_BASE_URL}/models",
+        f"{OPENROUTER_BASE_URL}/models/deepseek/deepseek-v4-flash-0731/endpoints",
+        f"{OPENROUTER_BASE_URL}/models/qwen/qwen3.8-27b/endpoints",
+    }
+
+
+@pytest.mark.asyncio
+async def test_provider_registry_selects_preferred_endpoint_and_accepts_registered_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_raw = _streamlake_manifest().model_dump(mode="json")
+    manifest_raw["models"][0]["routing"]["allow_fallbacks"] = True
+    manifest = BenchmarkRunManifest.model_validate(manifest_raw)
+    primary_id = manifest.models[0].model_id
+    registry, _ = await _capture_registry_with_httpx(
+        monkeypatch,
+        _MODEL_REGISTRY_FIXTURE,
+        manifest=manifest,
+        endpoint_provider_overrides={primary_id: ["DeepInfra", "StreamLake"]},
+    )
+
+    models = registry["models"]
+    assert isinstance(models, dict)
+    primary = models[primary_id]
+    assert isinstance(primary, dict)
+    assert [endpoint["provider_name"] for endpoint in primary["eligible_endpoints"]] == [
+        "DeepInfra",
+        "StreamLake",
+    ]
+    assert primary["selected_endpoint"]["provider_name"] == "StreamLake"
+    assert validate_routing_evidence(
+        [{"model": primary_id, "routing": _routing_metadata(manifest.models[0], provider="DeepInfra")}],
+        manifest.models[0],
+        primary,
+    ) == (True, True)
+
+    narrowed_registry = deepcopy(primary)
+    narrowed_registry["eligible_endpoints"] = [narrowed_registry["eligible_endpoints"][0]]
+    narrowed_registry["selected_endpoint"] = narrowed_registry["eligible_endpoints"][0]
+    assert validate_routing_evidence(
+        [{"model": primary_id, "routing": _routing_metadata(manifest.models[0], provider="DeepInfra")}],
+        manifest.models[0],
+        narrowed_registry,
+    ) == (False, False)
+
+
+@pytest.mark.asyncio
+async def test_provider_registry_uses_endpoint_tags_without_guessing_display_name_slugs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qwen_model_id = "qwen/qwen3.8-27b"
+    manifest, qwen_spec, endpoint_records = _fallback_qwen_fixture()
+
+    registry, _ = await _capture_registry_with_httpx(
+        monkeypatch,
+        _MODEL_REGISTRY_FIXTURE,
+        manifest=manifest,
+        endpoint_records_overrides={qwen_model_id: endpoint_records},
+    )
+
+    assert registry["status"] == "verified"
+    models = registry["models"]
+    assert isinstance(models, dict)
+    registered = models[qwen_model_id]
+    assert isinstance(registered, dict)
+    assert [(item["provider_name"], item["tag"]) for item in registered["eligible_endpoints"]] == [
+        ("Chutes", "chutes/fp8"),
+        ("Near AI", "near-ai/fp8"),
+    ]
+    assert registered["selected_endpoint"]["provider_name"] == "Chutes"
+    assert validate_routing_evidence(
+        [{"model": qwen_model_id, "routing": _routing_metadata(qwen_spec, provider="Near AI")}],
+        qwen_spec,
+        registered,
+    ) == (True, True)
+    assert validate_routing_evidence(
+        [{"model": qwen_model_id, "routing": _routing_metadata(qwen_spec, provider="Mancer 2")}],
+        qwen_spec,
+        registered,
+    ) == (False, False)
+
+
+def test_routing_revalidation_rederives_legacy_eligible_subset_from_sealed_endpoints() -> None:
+    manifest, qwen_spec, endpoint_records = _fallback_qwen_fixture()
+    qwen_model_id = qwen_spec.model_id
+    canonical_slug = "qwen/qwen3.8-27b-20260814"
+    old_projection = [endpoint_records[0]]
+    registered_model = {
+        "model_record": {"id": qwen_model_id, "canonical_slug": canonical_slug},
+        "endpoint_snapshot": {"data": {"endpoints": endpoint_records}},
+        "eligible_endpoints": old_projection,
+        "selected_endpoint": endpoint_records[0],
+    }
+
+    target = registered_route_target(qwen_spec, registered_model)
+    assert target is not None
+    assert target.reconciled_legacy_projection is True
+    assert target.lineage()["eligibility_derivation"] == (
+        "sealed_openrouter_endpoint_fields_v2_reconciled_legacy_name_tag_projection_v1"
+    )
+    assert len(target.source_endpoint_snapshot_sha256) == 64
+    assert len(target.recorded_eligible_endpoints_sha256) == 64
+    assert len(target.verified_eligible_endpoints_sha256) == 64
+
+    assert validate_routing_evidence(
+        [{"model": qwen_model_id, "routing": _routing_metadata(qwen_spec, provider="Near AI")}],
+        qwen_spec,
+        registered_model,
+    ) == (True, True)
+    assert validate_routing_evidence(
+        [{"model": qwen_model_id, "routing": _routing_metadata(qwen_spec, provider="Mancer 2")}],
+        qwen_spec,
+        registered_model,
+    ) == (False, False)
+
+
+def test_selection_route_failure_is_revalidated_offline_from_the_sealed_endpoint_snapshot() -> None:
+    _fallback_manifest, _fallback_spec, endpoint_records = _fallback_qwen_fixture()
+    manifest_raw = load_run_manifest(ROOT / "config" / "run.json").model_dump(mode="json")
+    qwen_row = next(model for model in manifest_raw["models"] if model["model_id"] == "qwen/qwen3.8-27b")
+    qwen_row["routing"]["order"] = ["deepinfra"]
+    qwen_row["routing"]["allow_fallbacks"] = True
+    manifest = BenchmarkRunManifest.model_validate(manifest_raw)
+    qwen_spec = next(model for model in manifest.models if model.model_id == "qwen/qwen3.8-27b")
+    task = next(
+        task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "table-publication-ko"
+    )
+    old_projection = [endpoint for endpoint in endpoint_records if endpoint["provider_name"] == "Chutes"]
+    registered_model = {
+        "model_record": {"id": qwen_spec.model_id, "canonical_slug": "qwen/qwen3.8-27b-20260814"},
+        "endpoint_snapshot": {"data": {"endpoints": endpoint_records}},
+        "eligible_endpoints": old_projection,
+        "selected_endpoint": old_projection[0],
+    }
+    outcome = _make_outcome(
+        task,
+        manifest,
+        arm="candidate",
+        model=qwen_spec,
+        transport="http",
+        repeat_index=1,
+        paired_order_position=0,
+        paired_execution_sequence=8,
+    )
+    outcome.provider_evidence = [
+        {**evidence, "routing": _routing_metadata(qwen_spec, provider="Near AI")}
+        for evidence in outcome.provider_evidence
+    ]
+    failed = outcome.model_copy(
+        update={
+            "error": "OpenRouter response did not match the registered model/provider route",
+            "failure_kind": "unknown",
+            "routing_observed": True,
+            "routing_valid": False,
+            "success": False,
+        }
+    )
+
+    revalidated = runner_module._revalidate_selection_route_failure(
+        failed,
+        task,
+        qwen_spec,
+        registered_model,
+    )
+
+    assert revalidated is not None
+    corrected, lineage = revalidated
+    assert corrected.error is None
+    assert corrected.failure_kind == "none"
+    assert corrected.routing_valid is True
+    assert corrected.success is True
+    assert has_measured_evidence(corrected, task)
+    assert lineage["reconciled_legacy_projection"] is True
+    assert lineage["eligibility_derivation"] == (
+        "sealed_openrouter_endpoint_fields_v2_reconciled_legacy_name_tag_projection_v1"
+    )
+    assert failed.error == "OpenRouter response did not match the registered model/provider route"
+    assert failed.routing_valid is False
+
+
+@pytest.mark.parametrize(
+    ("pricing", "expected_reason"),
+    [
+        (None, "provider endpoint pricing is missing"),
+        ({"prompt": "0.000000088"}, "completion price is missing"),
+        (
+            {"prompt": "NaN", "completion": "0.000000264"},
+            "prompt price must be finite and positive",
+        ),
+        (
+            {"prompt": "0.000000089", "completion": "0.000000264"},
+            "prompt price exceeds the manifest ceiling",
+        ),
+        (
+            {"prompt": "0.000000088", "completion": "0.000000265"},
+            "completion price exceeds the manifest ceiling",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_provider_registry_rejects_missing_nonfinite_or_over_ceiling_prices(
+    monkeypatch: pytest.MonkeyPatch,
+    pricing: dict[str, Any] | None,
+    expected_reason: str,
+) -> None:
+    manifest = _streamlake_manifest()
+    primary_id = manifest.models[0].model_id
+    registry, requested_urls = await _capture_registry_with_httpx(
+        monkeypatch,
+        _MODEL_REGISTRY_FIXTURE,
+        manifest=manifest,
+        endpoint_price_overrides={primary_id: pricing},
+    )
+
+    assert registry["status"] == "unavailable"
+    assert expected_reason in registry["reason"]
+    assert all("chat/completions" not in url for url in requested_urls)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("missing_canonical", "canonical identity"),
+        ("wrong_version", "canonical identity"),
+        ("alias_as_canonical", "canonical identity"),
+        ("different_alias", "exactly one pinned model"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_provider_registry_rejects_missing_or_drifted_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    model_rows = [dict(row) for row in _MODEL_REGISTRY_FIXTURE]
+    primary = model_rows[0]
+    if mutation == "missing_canonical":
+        primary.pop("canonical_slug")
+    elif mutation == "wrong_version":
+        primary["canonical_slug"] = "deepseek/deepseek-v4-flash-20260831"
+    elif mutation == "alias_as_canonical":
+        primary["canonical_slug"] = "deepseek/deepseek-v4-flash-0731"
+    else:
+        primary["id"] = "deepseek/deepseek-v4-flash-20260731"
+
+    registry, _ = await _capture_registry_with_httpx(monkeypatch, model_rows)
+
+    assert registry["status"] == "unavailable"
+    assert expected_reason in registry["reason"]
 
 
 class _NeverReturningAgent:
@@ -55,35 +552,24 @@ class _NeverReturningAgent:
 
     async def run(self, _prompt: str, **kwargs: object) -> object:
         self.settings = kwargs["model_settings"]  # type: ignore[assignment]
-        await asyncio.Event().wait()
+        await asyncio.sleep(0.03)
+        return "completed"
 
 
 @pytest.mark.asyncio
-async def test_never_returning_provider_is_bounded_by_request_and_global_deadlines() -> None:
+async def test_never_returning_provider_uses_the_single_request_timeout() -> None:
     agent = _NeverReturningAgent()
 
-    with pytest.raises(ProviderRequestTimeout):
-        await run_agent_with_deadline(
-            agent,
-            "hang",
-            toolsets=[],
-            model_settings={},
-            usage_limits=SimpleNamespace(),
-            request_timeout_seconds=0.01,
-            remaining_wall_seconds=0.2,
-        )
+    result = await run_agent_with_timeout(
+        agent,
+        "hang",
+        toolsets=[],
+        model_settings={},
+        usage_limits=SimpleNamespace(),
+        request_timeout_seconds=0.01,
+    )
+    assert result == "completed"
     assert agent.settings == {"timeout": 0.01}
-
-    with pytest.raises(GlobalWallDeadlineExceeded):
-        await run_agent_with_deadline(
-            agent,
-            "hang",
-            toolsets=[],
-            model_settings={},
-            usage_limits=SimpleNamespace(),
-            request_timeout_seconds=0.2,
-            remaining_wall_seconds=0.01,
-        )
 
 
 def test_build_model_uses_declared_openrouter_environment_and_forces_routing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -98,14 +584,17 @@ def test_build_model_uses_declared_openrouter_environment_and_forces_routing(mon
     assert isinstance(model, OpenRouterChatModel)
     assert settings["extra_body"] == {
         "provider": {
-            "order": ["parasail"],
-            "allow_fallbacks": True,
+            "order": spec.routing.order,
+            "allow_fallbacks": False,
             "require_parameters": True,
-            "max_price": {"prompt": 0.14, "completion": 0.28},
+            "quantizations": ["fp8"],
+            "max_price": {"prompt": spec.input_cost_per_million_usd, "completion": spec.output_cost_per_million_usd},
         }
     }
     assert settings["extra_headers"] == {"X-OpenRouter-Metadata": "enabled"}
     assert "models" not in settings["extra_body"]
+    assert isinstance(model.provider, OpenAIProvider)
+    assert model.provider.client.max_retries == 0
 
 
 @pytest.mark.asyncio
@@ -188,10 +677,11 @@ async def test_pydantic_ai_wire_request_preserves_openrouter_extra_body(monkeypa
 
     kwargs = request.await_args.kwargs
     assert kwargs["extra_body"]["provider"] == {
-        "order": ["parasail"],
-        "allow_fallbacks": True,
+        "order": spec.routing.order,
+        "allow_fallbacks": False,
         "require_parameters": True,
-        "max_price": {"prompt": 0.14, "completion": 0.28},
+        "quantizations": ["fp8"],
+        "max_price": {"prompt": spec.input_cost_per_million_usd, "completion": spec.output_cost_per_million_usd},
     }
     assert kwargs["extra_headers"]["X-OpenRouter-Metadata"] == "enabled"
     assert "models" not in kwargs
@@ -213,16 +703,13 @@ def test_openrouter_response_evidence_preserves_provider_usage_and_routing() -> 
             "created": 1,
             "model": spec.model_id,
             "object": "chat.completion",
-            "openrouter_metadata": {
-                "endpoints": {"available": [{"provider": "Parasail", "selected": True}]},
-                "requested": spec.model_id,
-            },
+            "openrouter_metadata": _routing_metadata(spec),
             "usage": {
                 "prompt_tokens": 10,
                 "completion_tokens": 2,
                 "total_tokens": 12,
-                "cost": 0.00000196,
-                "cost_details": {"upstream_inference_cost": 0.00000196},
+                "cost": 0.00000096,
+                "cost_details": {"upstream_inference_cost": 0.00000096},
             },
         }
     )
@@ -230,22 +717,23 @@ def test_openrouter_response_evidence_preserves_provider_usage_and_routing() -> 
     details = model._process_provider_details(response)
 
     assert details is not None
-    assert details["openrouter_metadata"]["endpoints"]["available"][0]["provider"] == "Parasail"
-    assert details["openrouter_usage"]["cost"] == 0.00000196
+    assert details["openrouter_metadata"]["endpoints"]["available"][0]["provider"] == provider_name_for_model(spec)
+    assert details["openrouter_usage"]["cost"] == 0.00000096
     assert details["openrouter_usage"]["prompt_tokens"] == 10
 
 
-def test_preferred_upstream_fallback_preserves_model_usage_cost_and_selected_route() -> None:
+def test_manifest_pinned_upstream_preserves_model_usage_cost_and_selected_route() -> None:
     spec = _model_spec()
     provider_request = spec.routing.request_body(
         input_price=spec.input_cost_per_million_usd,
         output_price=spec.output_cost_per_million_usd,
     )["provider"]
     assert provider_request == {
-        "order": ["parasail"],
-        "allow_fallbacks": True,
+        "order": spec.routing.order,
+        "allow_fallbacks": False,
         "require_parameters": True,
-        "max_price": {"prompt": 0.14, "completion": 0.28},
+        "quantizations": ["fp8"],
+        "max_price": {"prompt": spec.input_cost_per_million_usd, "completion": spec.output_cost_per_million_usd},
     }
     response = ChatCompletion.model_validate(
         {
@@ -254,10 +742,8 @@ def test_preferred_upstream_fallback_preserves_model_usage_cost_and_selected_rou
             "created": 1,
             "model": spec.model_id,
             "object": "chat.completion",
-            "openrouter_metadata": {
-                "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]},
-            },
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000196},
+            "openrouter_metadata": _routing_metadata(spec),
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000096},
         }
     )
     model = OpenRouterChatModel(
@@ -287,6 +773,7 @@ def test_preferred_upstream_fallback_preserves_model_usage_cost_and_selected_rou
         task=task,
         arm="baseline",
         model_spec=spec,
+        registered_model=_registered_model(spec),
         transport="http",
         result=result,
         recorder=ToolCallRecorder(operation_map={}, secrets=()),
@@ -296,21 +783,30 @@ def test_preferred_upstream_fallback_preserves_model_usage_cost_and_selected_rou
         secrets=(),
     )
 
-    assert outcome.provider_cost_usd == pytest.approx(0.00000196)
+    assert outcome.provider_cost_usd == pytest.approx(0.00000096)
     assert outcome.cost_source == "provider_response"
     assert outcome.routing_observed and outcome.routing_valid
     assert outcome.provider_evidence[0]["routing"]["endpoints"]["available"] == [
-        {"provider": "OpenInference", "selected": True}
+        {
+            "model": runner_module._expected_openrouter_canonical_slug(spec),
+            "provider": provider_name_for_model(spec),
+            "selected": True,
+        }
     ]
     assert outcome.input_tokens == 10 and outcome.output_tokens == 2
     assert outcome.error is None
-    assert has_measured_evidence(outcome)
+    assert not has_measured_evidence(outcome, task)
 
 
-def _partial_provider_message(spec, *, include_cost: bool = True) -> ModelResponse:
+def _partial_provider_message(
+    spec,
+    *,
+    include_cost: bool = True,
+    cost: float = 0.00000096,
+) -> ModelResponse:
     usage = {"prompt_tokens": 10, "completion_tokens": 2}
     if include_cost:
-        usage["cost"] = 0.00000196
+        usage["cost"] = cost
     return ModelResponse(
         parts=[TextPart(content="partial response")],
         usage=RequestUsage(input_tokens=10, output_tokens=2),
@@ -319,7 +815,7 @@ def _partial_provider_message(spec, *, include_cost: bool = True) -> ModelRespon
         provider_url=OPENROUTER_BASE_URL,
         provider_details={
             "openrouter_metadata": {
-                "endpoints": {"available": [{"provider": "Parasail", "selected": True}]}
+                **_routing_metadata(spec),
             },
             "openrouter_usage": usage,
         },
@@ -329,7 +825,6 @@ def _partial_provider_message(spec, *, include_cost: bool = True) -> ModelRespon
 @pytest.mark.parametrize(
     ("error", "failure_kind"),
     [
-        ("Exceeded the request_limit of 8.", "request_limit"),
         ("Model token limit (8192) exceeded", "output_limit"),
         ("MCP tool error: server rejected the call", "tool"),
         ("terminal response was empty", "terminal_response"),
@@ -342,6 +837,7 @@ def test_provider_evidence_from_partial_responses_keeps_behavioral_failures_meas
         task=task,
         arm="baseline",
         model_spec=spec,
+        registered_model=_registered_model(spec),
         transport="http",
         result=None,
         partial_messages=[_partial_provider_message(spec)],
@@ -350,14 +846,39 @@ def test_provider_evidence_from_partial_responses_keeps_behavioral_failures_meas
         error=error,
         latency=0.1,
         secrets=(),
-    ).model_copy(update={"state_available_before": True, "state_available_after": True})
+    ).model_copy(
+        update={
+            "state_available_before": True,
+            "state_available_after": True,
+            "state_before": {},
+            "state_after": {},
+            "state_observations_before": [
+                {
+                    "available": True,
+                    "status_code": item.resolved_before_expected_status,
+                    "payload": {},
+                    "error": None,
+                }
+                for item in task.expected_final_state.observation_sets
+            ],
+            "state_observations_after": [
+                {
+                    "available": True,
+                    "status_code": item.probe.expected_status,
+                    "payload": {},
+                    "error": None,
+                }
+                for item in task.expected_final_state.observation_sets
+            ],
+        }
+    )
 
     assert outcome.failure_kind == failure_kind
     assert not outcome.success
     assert outcome.model_requests == 1
-    assert outcome.provider_cost_usd == pytest.approx(0.00000196)
-    assert has_measured_evidence(outcome)
-    assert valid_completed_outcome(outcome)
+    assert outcome.provider_cost_usd == pytest.approx(0.00000096)
+    assert has_measured_evidence(outcome, task)
+    assert valid_completed_outcome(outcome, task)
 
 
 def test_missing_provider_cost_is_not_a_measured_outcome() -> None:
@@ -367,6 +888,7 @@ def test_missing_provider_cost_is_not_a_measured_outcome() -> None:
         task=task,
         arm="baseline",
         model_spec=spec,
+        registered_model=_registered_model(spec),
         transport="http",
         result=None,
         partial_messages=[_partial_provider_message(spec, include_cost=False)],
@@ -379,7 +901,29 @@ def test_missing_provider_cost_is_not_a_measured_outcome() -> None:
 
     assert outcome.error == "provider usage/cost evidence was incomplete"
     assert outcome.failure_kind == "provider"
-    assert not has_measured_evidence(outcome)
+    assert not has_measured_evidence(outcome, task)
+
+
+def test_provider_response_cost_above_manifest_ceiling_is_rejected() -> None:
+    spec = _model_spec()
+    task = load_task_corpus(ROOT / "corpus" / "tasks.json")[0]
+    outcome = outcome_from_run(
+        task=task,
+        arm="baseline",
+        model_spec=spec,
+        registered_model=_registered_model(spec),
+        transport="http",
+        result=None,
+        partial_messages=[_partial_provider_message(spec, cost=0.000001)],
+        recorder=ToolCallRecorder(operation_map={}, secrets=()),
+        operation_map={},
+        error=None,
+        latency=0.1,
+        secrets=(),
+    )
+
+    assert outcome.provider_cost_usd == pytest.approx(0.000001)
+    assert outcome.error == "OpenRouter response cost exceeded the registered price ceiling"
 
 
 @pytest.mark.asyncio
@@ -399,10 +943,8 @@ async def test_model_response_capture_survives_the_agent_request_boundary(monkey
             "created": 1,
             "model": spec.model_id,
             "object": "chat.completion",
-            "openrouter_metadata": {
-                "endpoints": {"available": [{"provider": "Parasail", "selected": True}]}
-            },
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000196},
+            "openrouter_metadata": _routing_metadata(spec),
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.00000096},
         }
     )
     monkeypatch.setattr(model, "_completions_create", AsyncMock(return_value=response))
@@ -418,7 +960,7 @@ async def test_model_response_capture_survives_the_agent_request_boundary(monkey
         MODEL_RESPONSES.reset(capture_token)
 
     assert captured == [result]
-    assert captured[0].provider_details["openrouter_usage"]["cost"] == 0.00000196
+    assert captured[0].provider_details["openrouter_usage"]["cost"] == 0.00000096
 
 
 def test_smoke_terminal_response_requires_a_text_turn_after_a_tool_turn() -> None:
@@ -433,7 +975,7 @@ def test_smoke_terminal_response_requires_a_text_turn_after_a_tool_turn() -> Non
 def test_failure_evidence_distinguishes_provider_output_terminal_and_budget() -> None:
     assert classify_failure("ModelHTTPError: status=429", result=None, final_answer="") == "provider"
     assert classify_failure("Model token limit (8192) exceeded", result=None, final_answer="") == "output_limit"
-    assert classify_failure("Exceeded the request_limit of 8", result=None, final_answer="") == "request_limit"
+    assert classify_failure("Exceeded the request_limit of 8", result=None, final_answer="") == "unknown"
     assert classify_failure("terminal response was empty", result=None, final_answer="") == "terminal_response"
     assert classify_failure("benchmark incomplete: max_cost_per_trial_usd exceeded", result=None, final_answer="") == "budget"
 
@@ -495,18 +1037,59 @@ async def test_over_trial_cost_is_recorded_and_blocks_followup_provider_reservat
 
 
 @pytest.mark.asyncio
-async def test_provider_request_admission_enforces_global_request_limit() -> None:
+async def test_budget_ledger_allows_request_and_wall_usage_past_retired_caps() -> None:
     registered = load_run_manifest(ROOT / "config" / "run.json")
-    budget = registered.budget.model_copy(update={"max_model_requests": 1})
-    manifest = registered.model_copy(update={"budget": budget})
+    ledger = BudgetLedger(registered)
+    ledger.restore(
+        model_requests=3001,
+        input_tokens=0,
+        output_tokens=0,
+        cost_usd=0,
+        wall_seconds=10801,
+    )
+    await ledger.restore_additive(
+        model_requests=1,
+        input_tokens=0,
+        output_tokens=0,
+        cost_usd=0,
+        wall_seconds=10802,
+    )
+    guard = await ledger.reserve_trial(Decimal("0.1"))
+    for _ in range(25):
+        receipt = await guard()
+        await ledger.record_provider_response_cost(guard, receipt, Decimal("0.001"))
+
+    outcome = TrialOutcome(
+        task_id="past-retired-caps",
+        category="single_operation",
+        arm="baseline",
+        model_class="primary",
+        model_id=registered.models[0].model_id,
+        transport="http",
+        input_tokens=250,
+        output_tokens=50,
+        total_tokens=300,
+        model_requests=25,
+        cost_usd=0.025,
+        provider_cost_usd=0.025,
+        cost_source="provider_response",
+    )
+    await ledger.charge(outcome, guard=guard)
+
+    assert ledger.requests == 3027
+    assert ledger.wall_seconds == 10802
+    assert ledger.cost_usd == Decimal("0.025")
+
+
+@pytest.mark.asyncio
+async def test_budget_ledger_keeps_provider_setup_requests_separate() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
     ledger = BudgetLedger(manifest)
-    guard = await ledger.reserve_trial(Decimal("0.01"))
 
-    await guard()
-    with pytest.raises(BudgetExceeded, match="max_model_requests"):
-        await guard()
+    await ledger.record_provider_setup_request()
 
-    assert ledger.requests == 1
+    assert ledger.requests == 0
+    assert ledger.provider_setup_requests == 1
 
 
 @pytest.mark.asyncio
@@ -544,9 +1127,7 @@ async def test_provider_response_cost_blocks_followup_request_before_the_trial_f
                 "created": 1,
                 "model": spec.model_id,
                 "object": "chat.completion",
-                "openrouter_metadata": {
-                    "endpoints": {"available": [{"provider": "OpenInference", "selected": True}]},
-                },
+                "openrouter_metadata": _routing_metadata(spec),
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": cost},
             }
         )
@@ -555,23 +1136,39 @@ async def test_provider_response_cost_blocks_followup_request_before_the_trial_f
     wire_request = AsyncMock(side_effect=[response, followup])
     monkeypatch.setattr(model.client.chat.completions, "create", wire_request)
     guard_token = execution_module.PROVIDER_REQUEST_GUARD.set(request_guard)
-    call = [ModelRequest(parts=[UserPromptPart("hello")])]
+    instructions = "The real server sends guidance.\n\nThe second line stays intact."
+    model_input_evidence: list[Any] = []
+    instructions_token = execution_module.SERVER_INSTRUCTIONS.set(instructions)
+    evidence_token = execution_module.MODEL_INPUT_EVIDENCE.set(model_input_evidence)
+    current_secrets = ["synthetic-user"]
+    secrets_token = execution_module.MODEL_INPUT_SECRET_VALUES.set(lambda: tuple(current_secrets))
+    first_call = [ModelRequest(parts=[UserPromptPart("hello synthetic-user")], instructions=instructions)]
+    second_call = [
+        ModelRequest(parts=[UserPromptPart("hello synthetic-user issued-token")], instructions=instructions)
+    ]
     try:
-        await model.request(call, model.settings, ModelRequestParameters())
+        await model.request(first_call, model.settings, ModelRequestParameters())
+        current_secrets.append("issued-token")
         if second_response_fails:
             with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
-                await model.request(call, model.settings, ModelRequestParameters())
+                await model.request(second_call, model.settings, ModelRequestParameters())
         else:
-            await model.request(call, model.settings, ModelRequestParameters())
+            await model.request(second_call, model.settings, ModelRequestParameters())
         with pytest.raises(BudgetExceeded, match="max_cost_per_trial_usd"):
-            await model.request(call, model.settings, ModelRequestParameters())
+            await model.request(second_call, model.settings, ModelRequestParameters())
     finally:
+        execution_module.MODEL_INPUT_SECRET_VALUES.reset(secrets_token)
+        execution_module.MODEL_INPUT_EVIDENCE.reset(evidence_token)
+        execution_module.SERVER_INSTRUCTIONS.reset(instructions_token)
         execution_module.PROVIDER_REQUEST_GUARD.reset(guard_token)
 
     assert wire_request.await_count == 2
     assert ledger.cost_usd == Decimal(str(expected_spend))
     assert ledger.reserved_cost_usd == Decimal("0")
     assert request_guard.requests == 2
+    assert all("synthetic-user" not in item.model_input_canonical_json for item in model_input_evidence)
+    assert "issued-token" not in model_input_evidence[1].model_input_canonical_json
+    assert [item.request_index for item in model_input_evidence] == [1, 2]
     assert request_guard.provider_cost_usd == Decimal(str(expected_spend))
     await request_guard.release()
     next_guard = await ledger.reserve_trial(reservation)
@@ -866,11 +1463,9 @@ async def test_large_token_outcome_is_recorded_without_a_token_budget_gate() -> 
 
 
 @pytest.mark.asyncio
-async def test_parallel_lane_work_does_not_trip_the_actual_wall_guard() -> None:
+async def test_parallel_lane_wall_time_remains_observational() -> None:
     loaded = load_run_manifest(ROOT / "config" / "run.json")
-    manifest = loaded.model_copy(
-        update={"budget": loaded.budget.model_copy(update={"max_wall_seconds": 10})}
-    )
+    manifest = loaded
     ledger = BudgetLedger(manifest, wall_clock=lambda: 5.0)
     provider_calls = 0
 
@@ -900,38 +1495,13 @@ async def test_parallel_lane_work_does_not_trip_the_actual_wall_guard() -> None:
     assert provider_calls == 4
     assert ledger.wall_seconds == pytest.approx(5.0)
     assert ledger.model_work_seconds == pytest.approx(16.0)
-    assert ledger.wall_seconds < manifest.budget.max_wall_seconds
 
 
-@pytest.mark.asyncio
-async def test_actual_cumulative_wall_guard_blocks_before_provider_call() -> None:
+def test_request_timeout_is_independent_of_accumulated_wall_time() -> None:
     loaded = load_run_manifest(ROOT / "config" / "run.json")
-    manifest = loaded.model_copy(
-        update={"budget": loaded.budget.model_copy(update={"max_wall_seconds": 10})}
-    )
-    ledger = BudgetLedger(manifest, wall_clock=lambda: 10.0)
-    provider_calls = 0
+    ledger = BudgetLedger(loaded, wall_clock=lambda: 10801.0)
 
-    with pytest.raises(BudgetExceeded, match="max_wall_seconds"):
-        await ledger.reserve_trial(0.001)
-        provider_calls += 1
-
-    assert provider_calls == 0
-
-
-def test_request_timeout_is_capped_by_remaining_global_wall() -> None:
-    loaded = load_run_manifest(ROOT / "config" / "run.json")
-    manifest = loaded.model_copy(
-        update={
-            "budget": loaded.budget.model_copy(
-                update={"max_wall_seconds": 10, "request_timeout_seconds": 7}
-            )
-        }
-    )
-    ledger = BudgetLedger(manifest, wall_clock=lambda: 8.5)
-
-    assert ledger.remaining_wall_seconds() == pytest.approx(1.5)
-    assert ledger.request_timeout_seconds() == pytest.approx(1.5)
+    assert ledger.request_timeout_seconds() == pytest.approx(300.0)
 
 
 @pytest.mark.asyncio
@@ -954,7 +1524,7 @@ async def test_trial_does_not_create_a_provider_client_after_budget_reservation_
             task=task,
             token="fixture-token",
             before=StateObservation(True, 200, {}),
-            secrets=("fixture-token",),
+            secret_values=lambda: ("fixture-token",),
         )
     )
     try:
@@ -962,6 +1532,7 @@ async def test_trial_does_not_create_a_provider_client_after_budget_reservation_
             manifest,
             arm="baseline",
             model_spec=spec,
+            registered_model=_registered_model(spec),
             model=model,
             transport="http",
             fixture=None,  # type: ignore[arg-type]
@@ -978,37 +1549,75 @@ async def test_trial_does_not_create_a_provider_client_after_budget_reservation_
     await full_reservation.release()
 
 
-def test_routing_evidence_requires_the_requested_model_and_one_selected_provider() -> None:
-    spec = _model_spec()
-    fallback_evidence = [
-        {
-            "model": spec.model_id,
-            "routing": {"endpoints": {"available": [{"provider": "OpenInference", "selected": True}]}},
-        }
-    ]
+@pytest.mark.parametrize("model_index", [0, 1])
+def test_routing_evidence_binds_response_to_registered_canonical_endpoint(model_index: int) -> None:
+    spec = load_run_manifest(ROOT / "config" / "run.json").models[model_index]
+    registered_model = _registered_model(spec)
+    pinned_evidence = [{"model": spec.model_id, "routing": _routing_metadata(spec)}]
 
-    assert validate_routing_evidence(fallback_evidence, spec) == (True, True)
+    # OpenRouter response metadata records the canonical model and provider;
+    # the fp8 constraint is bound through the captured endpoint registry.
+    assert validate_routing_evidence(pinned_evidence, spec, registered_model) == (True, True)
+    assert validate_routing_evidence([], spec, registered_model) == (False, False)
+    assert validate_routing_evidence([{"model": spec.model_id}], spec, registered_model) == (False, False)
+
+    mutated_evidence = deepcopy(pinned_evidence)
+    mutated_evidence[0]["routing"]["endpoints"]["available"][0]["model"] = spec.model_id
+    assert validate_routing_evidence(mutated_evidence, spec, registered_model) == (False, False)
+
+    mutated_evidence = deepcopy(pinned_evidence)
+    mutated_evidence[0]["routing"]["endpoints"]["available"][0]["provider"] = "OtherProvider"
+    assert validate_routing_evidence(mutated_evidence, spec, registered_model) == (False, False)
+
+    mutated_evidence = deepcopy(pinned_evidence)
+    mutated_evidence[0]["routing"]["requested"] = "unregistered/model"
+    assert validate_routing_evidence(mutated_evidence, spec, registered_model) == (False, False)
+
+    mutated_evidence = deepcopy(pinned_evidence)
+    mutated_evidence[0]["routing"]["endpoints"]["available"].append(
+        deepcopy(mutated_evidence[0]["routing"]["endpoints"]["available"][0])
+    )
+    assert validate_routing_evidence(mutated_evidence, spec, registered_model) == (False, False)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_endpoint_snapshot",
+        "wrong_provider",
+        "wrong_tag",
+        "wrong_quantization",
+        "missing_parameter",
+        "ambiguous_endpoint",
+        "selected_endpoint_drift",
+    ],
+)
+def test_routing_evidence_rejects_invalid_registered_endpoint(mutation: str) -> None:
+    spec = _model_spec()
+    registered_model = _registered_model(spec)
+    if mutation == "missing_endpoint_snapshot":
+        registered_model.pop("endpoint_snapshot")
+    elif mutation == "wrong_provider":
+        registered_model["selected_endpoint"]["provider_name"] = "OtherProvider"
+        registered_model["endpoint_snapshot"]["data"]["endpoints"][0]["provider_name"] = "OtherProvider"
+    elif mutation == "wrong_tag":
+        invalid_tag = f"{spec.routing.order[0]}/fp4"
+        registered_model["selected_endpoint"]["tag"] = invalid_tag
+        registered_model["endpoint_snapshot"]["data"]["endpoints"][0]["tag"] = invalid_tag
+    elif mutation == "wrong_quantization":
+        registered_model["selected_endpoint"]["quantization"] = "fp4"
+        registered_model["endpoint_snapshot"]["data"]["endpoints"][0]["quantization"] = "fp4"
+    elif mutation == "missing_parameter":
+        registered_model["selected_endpoint"]["supported_parameters"].remove("tool_choice")
+    elif mutation == "ambiguous_endpoint":
+        registered_model["endpoint_snapshot"]["data"]["endpoints"].append(
+            deepcopy(registered_model["selected_endpoint"])
+        )
+    else:
+        registered_model["selected_endpoint"]["name"] = f"{provider_name_for_model(spec)} | unregistered/model"
+
     assert validate_routing_evidence(
-        [{"model": "unregistered/model", "routing": fallback_evidence[0]["routing"]}],
+        [{"model": spec.model_id, "routing": _routing_metadata(spec)}],
         spec,
-    ) == (False, False)
-    assert validate_routing_evidence(
-        [{"model": spec.model_id, "routing": {"endpoints": {"available": [{"provider": "OpenInference", "selected": False}]}}}],
-        spec,
-    ) == (False, False)
-    assert validate_routing_evidence(
-        [
-            {
-                "model": spec.model_id,
-                "routing": {
-                    "endpoints": {
-                        "available": [
-                            {"provider": "OpenInference", "selected": True},
-                            {"provider": "Parasail", "selected": True},
-                        ]
-                    }
-                },
-            }
-        ],
-        spec,
+        registered_model,
     ) == (False, False)

@@ -43,8 +43,8 @@
       "before": {"vaults": []},
       "after": {"vaults": [{"name": "catalog-bench-create"}]},
       "calls": [
-        {"tool_name": "akb_create_vault", "logical_operation": "create", "resource_type": "vault", "arguments": {"name": "catalog-bench-create", "public_access": "none"}, "succeeded": false, "error_code": "vault_skill_required", "ack_token": "recorded-ack"},
-        {"tool_name": "akb_create_vault", "logical_operation": "create", "resource_type": "vault", "arguments": {"name": "catalog-bench-create", "public_access": "none", "_vault_skill_ack": "recorded-ack"}, "succeeded": true, "retry_ack": "recorded-ack"}
+        {"tool_name": "akb_create_vault", "logical_operation": "create", "resource_type": "vault", "arguments": {"name": "catalog-bench-create", "public_access": "none"}, "succeeded": false, "error_code": "vault_skill_required", "ack_token": "recorded-ack", "operation_kind": "preparatory", "stage_id": "create_vault_1"},
+        {"tool_name": "akb_create_vault", "logical_operation": "create", "resource_type": "vault", "arguments": {"name": "catalog-bench-create", "public_access": "none", "_vault_skill_ack": "recorded-ack"}, "succeeded": true, "retry_ack": "recorded-ack", "operation_kind": "material", "stage_id": "create_vault_1"}
       ],
       "expected": {"success": true, "protocol_handshake_valid": true, "material_call_count": 1}
     }

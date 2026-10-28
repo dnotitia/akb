@@ -2484,6 +2484,68 @@ def _fixture_hash_spy(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_control_plane_seeds_login_capable_non_admin_fixture_owner(tmp_path, monkeypatch):
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), scenario="app-control-plane"))
+    owner_id = uuid.uuid4()
+    runtime._fixture_catalog = {
+        "status": "ready",
+        "scenario": "app-control-plane",
+        "namespace": "fixture-control",
+        "actors": {"target_owner": {"id": str(owner_id), "role": "owner"}},
+        "apps": {"target": {"id": str(uuid.uuid4())}},
+    }
+    inserts = []
+    user_ids = {}
+
+    class Connection:
+        async def fetchval(self, query, *args):
+            inserts.append((" ".join(query.split()), args))
+            return user_ids.setdefault(args[1], args[0])
+
+    async def insert_vault(_connection, *, namespace, label, **_kwargs):
+        return uuid.uuid4(), f"{namespace}-vault-{label}"
+
+    async def insert_release(_connection, *, app_id, version):
+        return uuid.uuid4()
+
+    async def insert_installation(_connection, **_kwargs):
+        return uuid.uuid4()
+
+    monkeypatch.setattr(runtime, "_insert_fixture_vault", insert_vault)
+    monkeypatch.setattr(runtime, "_insert_fixture_release", insert_release)
+    monkeypatch.setattr(runtime, "_insert_fixture_installation", insert_installation)
+    monkeypatch.setattr(runtime, "_publish_installation_lifecycle_commands", lambda **_kwargs: None)
+
+    connection = Connection()
+    await runtime._seed_control_plane_installation_lifecycle(
+        connection,
+        password_hash="fixture-password-hash",  # pragma: allowlist secret
+        system_admin_id=uuid.uuid4(),
+    )
+
+    owner_insert = next(item for item in inserts if item[1][1] == "fixture-owner")
+    assert "is_admin" in owner_insert[0]
+    assert "FALSE" in owner_insert[0]
+    assert "ON CONFLICT (username) DO UPDATE" in owner_insert[0]
+    assert "RETURNING id" in owner_insert[0]
+    assert owner_insert[1][3] == "fixture-password-hash"
+    assert runtime._fixture_catalog["actors"]["fixture_owner"] == {
+        "id": str(owner_insert[1][0]),
+        "username": "fixture-owner",
+        "role": "fixture_owner",
+        "is_admin": False,
+    }
+    first_owner_id = runtime._fixture_catalog["actors"]["fixture_owner"]["id"]
+    await runtime._seed_control_plane_installation_lifecycle(
+        connection,
+        password_hash="fixture-password-hash",  # pragma: allowlist secret
+        system_admin_id=uuid.uuid4(),
+    )
+    assert runtime._fixture_catalog["actors"]["fixture_owner"]["id"] == first_owner_id
+    assert len([item for item in inserts if item[1][1] == "fixture-owner"]) == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("scenario,expected_helpers", [
     ("empty", []),
     ("app-installation-lifecycle", ["_seed_app_installation_lifecycle"]),

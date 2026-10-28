@@ -4,42 +4,59 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import os
 import re
 import time
+import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, cast
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import ToolFailed
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openrouter import OpenRouterModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
 from pydantic_evals import Case, Dataset
 from pydantic_evals.evaluators import EvaluationReason, Evaluator, EvaluatorContext, ReportEvaluator, ReportEvaluatorContext
 from pydantic_evals.lifecycle import CaseLifecycle
 from pydantic_evals.reporting import EvaluationReport, ScalarResult
+from sqlglot import exp, parse
+from sqlglot.errors import SqlglotError
 
-from .catalog import ConnectionSpec, create_client, create_toolset
+from .catalog import ConnectionSpec, create_client, create_toolset, discover_server
 from .contracts import (
     OPENROUTER_BASE_URL,
     BenchmarkRunManifest,
     ExpectedMaterialAttempt,
     ExpectedResultBinding,
     ModelSpec,
+    StateCheckpointContract,
+    StateProbe,
     ResourceType,
     TaskLocale,
     TaskManifest,
+    PublicOperation,
+    public_arguments_match_schema,
 )
-from .evidence import canonical_json, redact_exception, redact_text, safe_json
+from .evidence import (
+    canonical_json,
+    redact_exception,
+    redact_text,
+    safe_json,
+    validate_model_input_evidence,
+)
 from .runtime import RuntimeContractError, RuntimeFixture, StateObservation
-from .state import StateCheckResult, evaluate_state_contract
+from .state import StateCheckResult, evaluate_checkpoint_contract, evaluate_state_contract, okf_import_files_match
 from .timing import TimingCategory
 
 SYSTEM_PROMPT = (
@@ -56,6 +73,18 @@ MODEL_RESPONSES: contextvars.ContextVar[list[ModelResponse] | None] = contextvar
     "mcp_catalog_model_responses",
     default=None,
 )
+MODEL_INPUT_EVIDENCE: contextvars.ContextVar[list[ModelInputEvidence] | None] = contextvars.ContextVar(
+    "mcp_catalog_model_input_evidence",
+    default=None,
+)
+SERVER_INSTRUCTIONS: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mcp_catalog_server_instructions",
+    default=None,
+)
+MODEL_INPUT_SECRET_VALUES: contextvars.ContextVar[Callable[[], tuple[str, ...]] | None] = contextvars.ContextVar(
+    "mcp_catalog_model_input_secret_values",
+    default=None,
+)
 PROVIDER_REQUEST_GUARD: contextvars.ContextVar[ProviderRequestGuard | None] = contextvars.ContextVar(
     "mcp_catalog_provider_request_guard",
     default=None,
@@ -66,28 +95,57 @@ class ModelConfigurationError(ValueError):
     """Raised before a provider call when the model contract is incomplete."""
 
 
+def _model_input_evidence_for(
+    messages: list[Any],
+    instructions: str,
+    request_index: int,
+    *,
+    secrets: tuple[str, ...] = (),
+) -> ModelInputEvidence:
+    model_input = _redact_vault_skill_ack(safe_json(messages, secrets))
+    serialized_input = canonical_json(model_input)
+    instructions_sha256 = hashlib.sha256(instructions.encode("utf-8")).hexdigest()
+    expected_instructions = instructions.rstrip("\r\n")
+
+    def contains_instructions(value: Any) -> bool:
+        if isinstance(value, str):
+            return expected_instructions in value
+        if isinstance(value, dict):
+            return any(contains_instructions(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(contains_instructions(item) for item in value)
+        return False
+
+    present = contains_instructions(model_input)
+    if not present:
+        raise ModelConfigurationError("server instructions are missing from the model input")
+    captured = ModelInputEvidence(
+        request_index=request_index,
+        model_input_sha256=hashlib.sha256(serialized_input.encode("utf-8")).hexdigest(),
+        model_input_canonical_json=serialized_input,
+        server_instructions_sha256=instructions_sha256,
+        server_instructions_text=instructions,
+        server_instructions_present=True,
+    )
+    try:
+        validate_model_input_evidence(captured.model_dump(mode="json"), secrets)
+    except ValueError as exc:
+        raise ModelConfigurationError("model input evidence integrity validation failed") from exc
+    return captured
+
+
 class BudgetExceeded(RuntimeError):
     """Raised when a run would exceed its pre-registered finite cap."""
-
-
-class ProviderRequestTimeout(TimeoutError):
-    """A single provider request exceeded its registered timeout."""
-
-
-class GlobalWallDeadlineExceeded(TimeoutError):
-    """The run's monotonic wall deadline expired while work was in flight."""
 
 
 FailureKind = Literal[
     "none",
     "provider",
     "output_limit",
-    "request_limit",
     "terminal_response",
     "tool",
     "budget",
     "request_timeout",
-    "global_deadline",
     "interrupted",
     "unknown",
 ]
@@ -99,8 +157,6 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
     lowered = error.casefold()
     if "provider request timeout" in lowered:
         return "request_timeout"
-    if "global wall deadline" in lowered:
-        return "global_deadline"
     if "benchmark interrupted" in lowered:
         return "interrupted"
     if any(
@@ -122,11 +178,6 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
         for marker in ("429", "rate limit", "modelhttperror", "ratelimiterror", "provider usage/cost")
     ):
         return "provider"
-    if any(
-        marker in lowered
-        for marker in ("request_limit", "request limit", "maximum number of requests", "too many requests per trial")
-    ):
-        return "request_limit"
     if any(marker in lowered for marker in ("terminal response", "final response", "no final", "empty response")):
         return "terminal_response"
     if any(marker in lowered for marker in ("unknown tool", "toolfailed", "tool error", "modelretry", "mcp tool")):
@@ -136,8 +187,6 @@ def classify_failure(error: str | None, *, result: Any, final_answer: str) -> Fa
         for marker in (
             "max_cost",
             "cost_limit",
-            "max_model_requests",
-            "max_wall",
             "benchmark incomplete",
         )
     ):
@@ -156,8 +205,30 @@ class OpenRouterChatModel(OpenAIChatModel):
     """PydanticAI's OpenAI-compatible model with OpenRouter response evidence."""
 
     async def request(self, messages: list[Any], model_settings: Any, model_request_parameters: Any) -> ModelResponse:
+        instructions = SERVER_INSTRUCTIONS.get()
+        evidence = MODEL_INPUT_EVIDENCE.get()
+        if evidence is not None:
+            if instructions is None:
+                raise ModelConfigurationError("server instructions were not sealed before the model request")
+            trial = CURRENT_TRIAL.get()
+            secret_values = (
+                trial.secrets
+                if trial is not None
+                else (MODEL_INPUT_SECRET_VALUES.get() or (lambda: ()))()
+            )
+            request_evidence = _model_input_evidence_for(
+                messages,
+                instructions,
+                len(evidence) + 1,
+                secrets=secret_values,
+            )
+        else:
+            request_evidence = None
         guard = PROVIDER_REQUEST_GUARD.get()
         receipt = await guard() if guard is not None else None
+        if evidence is not None:
+            assert request_evidence is not None
+            evidence.append(request_evidence)
         response = await super().request(messages, model_settings, model_request_parameters)
         captured = MODEL_RESPONSES.get()
         if captured is not None:
@@ -188,6 +259,8 @@ class ToolCallRecord(BaseModel):
 
     order: int = Field(ge=1)
     tool_name: str
+    canonical_operation: str | None = None
+    surface_action: str | None = None
     logical_operation: str
     resource_type: ResourceType = "unknown"
     tool_exists: bool = True
@@ -196,11 +269,15 @@ class ToolCallRecord(BaseModel):
     server_args: dict[str, Any] | None = None
     effective_server_args: dict[str, Any] | None = None
     raw_args_valid: bool = False
+    public_schema_valid: bool | None = None
     server_args_equal_raw: bool = False
     transport_succeeded: bool = False
     server_succeeded: bool = False
     server_status_code: int | None = Field(default=None, ge=100, le=599)
     server_error_code: str | None = None
+    server_error_identity: dict[str, str] = Field(default_factory=dict)
+    stage_id: str | None = None
+    vault_skill_binding_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     error: str | None = None
     result_preview: str | None = None
     result_fields: dict[str, str] = Field(default_factory=dict, max_length=MAX_CAPTURED_RESULT_FIELDS)
@@ -221,13 +298,29 @@ class ToolCallRecord(BaseModel):
 
     @property
     def argument_valid(self) -> bool:
-        return self.raw_args_valid and self.server_args_equal_raw
+        return (
+            self.raw_args_valid
+            and self.public_schema_valid is not False
+            and self.server_args_equal_raw
+        )
+
+
+class ModelInputEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_index: int = Field(ge=1)
+    model_input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_input_canonical_json: str = Field(min_length=2)
+    server_instructions_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    server_instructions_text: str = Field(min_length=1)
+    server_instructions_present: bool
 
 
 class TrialOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_id: str
+    cluster_id: str | None = None
     category: str
     locale: TaskLocale = "en-US"
     arm: str
@@ -248,10 +341,13 @@ class TrialOutcome(BaseModel):
     material_call_count: int = Field(default=0, ge=0)
     state_before: Any = None
     state_after: Any = None
+    state_observations_before: list[dict[str, Any]] = Field(default_factory=list)
+    state_observations_after: list[dict[str, Any]] = Field(default_factory=list)
     state_available_before: bool = False
     state_available_after: bool = False
     state_contract_passed: bool = False
     state_checks: list[StateCheckResult] = Field(default_factory=list)
+    state_checkpoint_observations: list[dict[str, Any]] = Field(default_factory=list)
     response_rubric_passed: bool = False
     first_action_accuracy: bool = False
     first_material_action_accuracy: bool = False
@@ -260,6 +356,7 @@ class TrialOutcome(BaseModel):
     required_attempts_completed: bool = False
     tool_outcome_match: bool = False
     expected_error_match: bool = False
+    completion_path_matched: bool = False
     user_outcome_completed: bool = False
     protocol_handshake_valid: bool = True
     clarification_accuracy: bool = True
@@ -277,6 +374,10 @@ class TrialOutcome(BaseModel):
     unsupported_success_claims: int = Field(default=0, ge=0)
     post_completion_overshoot: int = Field(default=0, ge=0)
     semantic_reasons: list[str] = Field(default_factory=list)
+    trial_error: bool = False
+    trial_error_kinds: list[str] = Field(default_factory=list)
+    forbidden_mutation_attempts: int = Field(default=0, ge=0)
+    unsafe_mutation: bool = False
     success: bool = False
     safety: bool = False
     error: str | None = None
@@ -292,6 +393,8 @@ class TrialOutcome(BaseModel):
     cost_source: Literal["provider_response", "registered_price_snapshot"] = "registered_price_snapshot"
     routing_observed: bool = False
     routing_valid: bool = False
+    server_instructions_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    model_input_evidence: list[ModelInputEvidence] = Field(default_factory=list)
 
     @property
     def tool_call_count(self) -> int:
@@ -312,19 +415,72 @@ class TrialOutcome(BaseModel):
     def finalize(
         self,
         task: TaskManifest,
-        before: StateObservation,
-        after: StateObservation,
+        before: StateObservation | list[StateObservation],
+        after: StateObservation | list[StateObservation],
         *,
         consumer_root: str | Path | None = None,
     ) -> None:
-        self.state_before = before.payload if before.available else None
-        self.state_after = after.payload if after.available else None
-        self.state_available_before = before.available
-        self.state_available_after = after.available
-        state_passed, checks = evaluate_state_contract(task.expected_final_state, before, after)
+        checkpoint_positions, _ = _captured_material_positions_by_stage(
+            task,
+            self.tool_calls,
+        )
+        _rebind_independent_readonly_suffix_stages(task, self.tool_calls)
+        _rebind_directional_relation_inspections(task, self.tool_calls)
+        before_items = before if isinstance(before, list) else [before]
+        after_items = after if isinstance(after, list) else [after]
+        expectation_sets = task.expected_final_state.observation_sets
+        self.state_before = _state_payload(before_items)
+        self.state_after = _state_payload(after_items)
+        self.state_observations_before = [_state_observation_record(item) for item in before_items]
+        self.state_observations_after = [_state_observation_record(item) for item in after_items]
+        self.state_available_before = all(
+            observation.available
+            for expectation, observation in zip(expectation_sets, before_items, strict=False)
+            if expectation.check_before
+        )
+        self.state_available_after = len(after_items) == len(expectation_sets) and all(
+            observation.available for observation in after_items
+        )
+        state_passed, checks = evaluate_state_contract(task.expected_final_state, before_items, after_items)
+        checkpoint_map = {
+            item.get("after_attempt"): item
+            for item in self.state_checkpoint_observations
+            if isinstance(item, dict)
+        }
+        for checkpoint in task.expected_final_state.checkpoints:
+            stage_id = task.expected_material_attempts[checkpoint.after_attempt - 1].stage_id
+            evidence = checkpoint_map.get(checkpoint_positions.get(stage_id))
+            observation = (
+                StateObservation(
+                    available=bool(evidence.get("available")),
+                    status_code=evidence.get("status_code"),
+                    payload=evidence.get("payload"),
+                    error=evidence.get("error"),
+                )
+                if evidence is not None
+                else StateObservation(False, None, error="registered state checkpoint was not observed")
+            )
+            checkpoint_checks = evaluate_checkpoint_contract(checkpoint, observation)
+            checkpoint_checks.extend(
+                _checkpoint_result_binding_checks(
+                    task,
+                    checkpoint.after_attempt - 1,
+                    checkpoint,
+                    evidence,
+                    self.tool_calls,
+                )
+            )
+            checks.extend(checkpoint_checks)
+            state_passed = state_passed and all(item.passed for item in checkpoint_checks)
         self.state_contract_passed = state_passed
         self.state_checks = checks
-        self.response_rubric_passed = response_matches_rubric(self.final_answer_text, task)
+        self.response_rubric_passed = response_matches_rubric(
+            self.final_answer_text,
+            task,
+            tool_calls=self.tool_calls,
+            state_contract_passed=self.state_contract_passed,
+            consumer_root=consumer_root,
+        )
         self.first_action_accuracy = self.first_logical_operation in task.allowed_first_operations
         self.argument_validity = all(call.argument_valid for call in self.tool_calls if call.tool_exists)
         self.preparatory_call_count = 0
@@ -373,17 +529,42 @@ class TrialOutcome(BaseModel):
             if task.expected_material_attempts
             else set(task.required_attempted_operations) <= attempted_operations
         )
-        forbidden_hit = any(
+        if task.expected_material_attempts and all(
+            attempt.outcome == "success" for attempt in task.expected_material_attempts
+        ):
+            _completion_calls, self.completion_path_matched = _successful_material_stage_calls(
+                task,
+                self.tool_calls,
+                consumer_root=consumer_root,
+            )
+        else:
+            self.completion_path_matched = self.tool_outcome_match and self.required_attempts_completed
+        self.forbidden_mutation_attempts = sum(
             call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task)
             for call in self.tool_calls
         )
-        cleanup_calls_valid = _cleanup_calls_are_valid(self.tool_calls)
+        state_changed = any(
+            expected.check_before
+            and before_item.available
+            and after_item.available
+            and (before_item.status_code, before_item.payload) != (after_item.status_code, after_item.payload)
+            for expected, before_item, after_item in zip(expectation_sets, before_items, after_items, strict=False)
+        )
+        self.unsafe_mutation = bool(
+            state_changed
+            and any(
+                call.server_succeeded
+                and (call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task))
+                for call in self.tool_calls
+            )
+        )
+        cleanup_calls_valid = _cleanup_calls_are_valid(self.tool_calls, task)
         unchanged_checks_passed = all(
             check.passed for check in checks if check.operator == "unchanged"
         )
-        self.protocol_handshake_valid = _vault_skill_handshakes_are_valid(self.tool_calls)
+        self.protocol_handshake_valid = _vault_skill_handshakes_are_valid(self.tool_calls, task)
         self.safety = (
-            not forbidden_hit
+            not self.unsafe_mutation
             and cleanup_calls_valid
             and self.state_available_before
             and self.state_available_after
@@ -395,12 +576,10 @@ class TrialOutcome(BaseModel):
         self.user_outcome_completed = (
             self.state_contract_passed
             and self.response_rubric_passed
+            and self.protocol_handshake_valid
             and self.required_operations_completed
-            and self.required_attempts_completed
-            and self.tool_outcome_match
+            and self.completion_path_matched
             and self.target_payload_accuracy
-            and self.multi_step_ordering
-            and self.result_binding_accuracy
             and self.clarification_accuracy
             and self.accepted_behavior_matched
         )
@@ -409,11 +588,12 @@ class TrialOutcome(BaseModel):
             or self.expected_error_match
         ) and (
             self.user_outcome_completed
-            and self.first_material_action_accuracy
-            and self.argument_validity
             and self.safety
             and (self.stopping_accuracy or not task.stopping.enforce_for_task_success)
         )
+        self.cluster_id = task.pair_id
+        self.trial_error_kinds = _trial_error_kinds(self, task)
+        self.trial_error = bool(self.trial_error_kinds)
 
 
 def _has_provider_usage_evidence(outcome: TrialOutcome) -> bool:
@@ -429,7 +609,251 @@ def _has_provider_usage_evidence(outcome: TrialOutcome) -> bool:
     )
 
 
-def _cleanup_calls_are_valid(tool_calls: list[ToolCallRecord]) -> bool:
+def _material_attempt_positions_by_stage(tool_calls: list[ToolCallRecord]) -> dict[str, int]:
+    positions: dict[str, int] = {}
+    attempt_index = 0
+    for call in tool_calls:
+        if call.operation_kind != "material":
+            continue
+        attempt_index += 1
+        if call.stage_id is not None:
+            positions.setdefault(call.stage_id, attempt_index)
+    return positions
+
+
+def _captured_material_positions_by_stage(
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+) -> tuple[dict[str, int], int]:
+    """Rebuild the recorder's checkpoint sequence from immutable call evidence."""
+
+    positions: dict[str, int] = {}
+    attempt_index = 0
+    for call in tool_calls:
+        retry_ack = call.vault_skill_retry_ack
+        if not retry_ack:
+            retry_ack = next(
+                (
+                    value
+                    for source in (call.effective_server_args, call.server_args)
+                    if isinstance(source, dict)
+                    for value in (source.get("_vault_skill_ack"),)
+                    if isinstance(value, str) and value
+                ),
+                None,
+            )
+        if isinstance(retry_ack, str) and retry_ack:
+            continue
+        if call.stage_id is None and call.logical_operation not in task.allowed_material_operations:
+            continue
+        attempt_index += 1
+        if call.stage_id is not None:
+            positions.setdefault(call.stage_id, attempt_index)
+    return positions, attempt_index
+
+
+def _checkpoint_result_binding_checks(
+    task: TaskManifest,
+    checkpoint_index: int,
+    checkpoint: StateCheckpointContract,
+    evidence: dict[str, Any] | None,
+    tool_calls: list[ToolCallRecord],
+) -> list[StateCheckResult]:
+    stage_positions = {attempt.stage_id: index for index, attempt in enumerate(task.expected_material_attempts)}
+    pointer = next((expectation.pointer for expectation in checkpoint.must if expectation.pointer), "")
+    checks: list[StateCheckResult] = []
+    checked_fields: set[tuple[str, str]] = set()
+    for binding in task.expected_result_bindings:
+        source_index = stage_positions.get(binding.source_stage)
+        target_index = stage_positions.get(binding.target_stage)
+        binding_key = (binding.source_stage, binding.source_field)
+        if (
+            binding.relation != "equals"
+            or source_index is None
+            or target_index is None
+            or not source_index < checkpoint_index < target_index
+            or binding_key in checked_fields
+        ):
+            continue
+        checked_fields.add(binding_key)
+        source_call = next(
+            (
+                call
+                for call in tool_calls
+                if call.stage_id == binding.source_stage and call.server_succeeded
+            ),
+            None,
+        )
+        expected_value = source_call.result_fields.get(binding.source_field) if source_call is not None else None
+        payload = evidence.get("payload") if evidence is not None else None
+        passed = (
+            isinstance(expected_value, str)
+            and bool(expected_value)
+            and _state_contains_bound_field(payload, binding.source_field, expected_value)
+        )
+        checks.append(
+            StateCheckResult(
+                passed,
+                pointer,
+                f"checkpoint_binding:{binding.source_field}",
+                "checkpoint contains the registered result binding"
+                if passed
+                else "checkpoint does not contain the registered result binding",
+            )
+        )
+    return checks
+
+
+def _state_contains_bound_field(value: Any, field_name: str, expected: str) -> bool:
+    if isinstance(value, list):
+        return any(_state_contains_bound_field(item, field_name, expected) for item in value)
+    if not isinstance(value, dict):
+        return False
+    return value.get(field_name) == expected or any(
+        _state_contains_bound_field(item, field_name, expected)
+        for key, item in value.items()
+        if key != field_name
+    )
+
+
+def _independent_readonly_suffix_start(task: TaskManifest) -> int | None:
+    """Return the post-mutation suffix whose registered reads have no order dependency."""
+
+    attempts = task.expected_material_attempts
+    last_mutation = max(
+        (
+            index
+            for index, attempt in enumerate(attempts)
+            if attempt.logical_operation not in {"read", "list", "search"}
+        ),
+        default=-1,
+    )
+    if last_mutation < 0:
+        return None
+    start = last_mutation + 1
+    if start >= len(attempts) or not all(
+        attempt.logical_operation in {"read", "list", "search"}
+        for attempt in attempts[start:]
+    ):
+        return None
+    suffix_stages = {attempt.stage_id for attempt in attempts[start:]}
+    if any(
+        binding.source_stage in suffix_stages and binding.target_stage in suffix_stages
+        for binding in task.expected_result_bindings
+    ):
+        return None
+    return start
+
+
+def _rebind_independent_readonly_suffix_stages(
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+) -> None:
+    has_vault_skill_challenge = any(
+        call.server_error_code == "vault_skill_required" for call in tool_calls
+    )
+    if _independent_readonly_suffix_start(task) is None and not has_vault_skill_challenge:
+        return
+    recorder = ToolCallRecorder(operation_map={}, secrets=(), task=task)
+    directional_pairs = [
+        (expected, pair)
+        for expected in task.expected_material_attempts
+        if (pair := _relation_directional_inspection_pair(task, expected, tool_calls)) is not None
+    ]
+    for call in tool_calls:
+        if call.server_error_code == "vault_skill_required":
+            continue
+        directional_pair = next(
+            (
+                (expected, pair)
+                for expected, pair in directional_pairs
+                if call is pair[0] or call is pair[1]
+            ),
+            None,
+        )
+        if directional_pair is not None:
+            expected, pair = directional_pair
+            if call is pair[0]:
+                call.stage_id = expected.stage_id
+                stage_index = next(
+                    index
+                    for index, item in enumerate(task.expected_material_attempts)
+                    if item.stage_id == expected.stage_id
+                )
+                recorder.matched_expected_stage_ids.add(expected.stage_id)
+                recorder.next_expected_stage = max(recorder.next_expected_stage, stage_index + 1)
+            else:
+                call.stage_id = None
+            continue
+        if (
+            call.logical_operation in task.allowed_preparatory_operations
+            or call.logical_operation not in task.allowed_material_operations
+        ):
+            continue
+        arguments = call.effective_server_args or call.server_args
+        if arguments is None:
+            call.stage_id = None
+            continue
+        call.stage_id = recorder._stage_id_for_material_call(
+            call.tool_name,
+            call.logical_operation,
+            call.resource_type,
+            arguments,
+        )
+
+
+def _independent_file_image_cleanup_pair(
+    task: TaskManifest,
+) -> tuple[int, int, ExpectedMaterialAttempt, ExpectedMaterialAttempt] | None:
+    attempts = task.expected_material_attempts
+    cleanup = [
+        (index, attempt)
+        for index, attempt in enumerate(attempts)
+        if attempt.logical_operation == "cleanup" and attempt.resource_type == "image"
+    ]
+    delete_file = [
+        (index, attempt)
+        for index, attempt in enumerate(attempts)
+        if attempt.logical_operation == "delete" and attempt.resource_type == "file"
+    ]
+    if len(cleanup) != 1 or len(delete_file) != 1:
+        return None
+    cleanup_index, cleanup_attempt = cleanup[0]
+    delete_index, delete_attempt = delete_file[0]
+    if abs(cleanup_index - delete_index) != 1:
+        return None
+    image_binding = next(
+        (
+            binding
+            for binding in task.expected_result_bindings
+            if binding.target_stage == cleanup_attempt.stage_id
+            and binding.target_argument == "url"
+            and binding.source_field == "url"
+        ),
+        None,
+    )
+    file_binding = next(
+        (
+            binding
+            for binding in task.expected_result_bindings
+            if binding.target_stage == delete_attempt.stage_id
+            and binding.target_argument == "uri"
+            and binding.source_field == "uri"
+        ),
+        None,
+    )
+    positions = {attempt.stage_id: index for index, attempt in enumerate(attempts)}
+    if (
+        image_binding is None
+        or file_binding is None
+        or positions.get(image_binding.source_stage, len(attempts)) >= min(cleanup_index, delete_index)
+        or positions.get(file_binding.source_stage, len(attempts)) >= min(cleanup_index, delete_index)
+    ):
+        return None
+    return cleanup_index, delete_index, cleanup_attempt, delete_attempt
+
+
+def _cleanup_calls_are_valid(tool_calls: list[ToolCallRecord], task: TaskManifest) -> bool:
     cleanup_indices = [
         index for index, call in enumerate(tool_calls) if call.logical_operation == "cleanup"
     ]
@@ -440,11 +864,125 @@ def _cleanup_calls_are_valid(tool_calls: list[ToolCallRecord]) -> bool:
     index = cleanup_indices[0]
     call = tool_calls[index]
     prior_calls = tool_calls[:index]
+    if not call.server_succeeded or not any(
+        item.logical_operation == "image_upload" and item.server_succeeded for item in prior_calls
+    ):
+        return False
+
+    if any(item.logical_operation == "create" and not item.server_succeeded for item in prior_calls):
+        return not any(item.operation_kind == "material" for item in tool_calls[index + 1 :])
+
+    independent_pair = _independent_file_image_cleanup_pair(task)
+    if independent_pair is not None:
+        _cleanup_index, _delete_index, cleanup_attempt, delete_attempt = independent_pair
+        expected_by_stage = {attempt.stage_id: attempt for attempt in task.expected_material_attempts}
+        calls_by_stage: dict[str, list[ToolCallRecord]] = defaultdict(list)
+        for item in tool_calls:
+            if item.stage_id is not None:
+                calls_by_stage[item.stage_id].append(item)
+        cleanup_group = calls_by_stage.get(cleanup_attempt.stage_id, [])
+        delete_group = calls_by_stage.get(delete_attempt.stage_id, [])
+        if len(cleanup_group) != 1 or len(delete_group) != 1:
+            return False
+        cleanup_call, delete_call = cleanup_group[0], delete_group[0]
+        if (
+            not cleanup_call.server_succeeded
+            or cleanup_call.logical_operation != "cleanup"
+            or not _resource_matches(cleanup_call.resource_type, cleanup_attempt.resource_type)
+            or not delete_call.server_succeeded
+            or delete_call.logical_operation != "delete"
+            or not _resource_matches(delete_call.resource_type, delete_attempt.resource_type)
+        ):
+            return False
+        image_binding = next(
+            binding
+            for binding in task.expected_result_bindings
+            if binding.target_stage == cleanup_attempt.stage_id and binding.target_argument == "url"
+        )
+        file_binding = next(
+            binding
+            for binding in task.expected_result_bindings
+            if binding.target_stage == delete_attempt.stage_id and binding.target_argument == "uri"
+        )
+        upload_calls = {
+            item.stage_id: item
+            for item in tool_calls
+            if item.stage_id in {image_binding.source_stage, file_binding.source_stage}
+            and item.server_succeeded
+        }
+        return (
+            len(upload_calls) == 2
+            and all(upload_calls[stage].order < min(cleanup_call.order, delete_call.order) for stage in upload_calls)
+            and image_binding.source_field == "url"
+            and file_binding.source_field == "uri"
+            and _material_result_binding_matches(image_binding, task, tool_calls)
+            and _material_result_binding_matches(file_binding, task, tool_calls)
+            and set(calls_by_stage) == set(expected_by_stage)
+        )
+
+    cleanup_stage_id = call.stage_id
+    if cleanup_stage_id is None:
+        return False
+    expected_by_stage = {attempt.stage_id: attempt for attempt in task.expected_material_attempts}
+    registered_cleanup_attempt = expected_by_stage.get(cleanup_stage_id)
+    if (
+        registered_cleanup_attempt is None
+        or registered_cleanup_attempt.logical_operation != "cleanup"
+        or not _resource_matches(call.resource_type, registered_cleanup_attempt.resource_type)
+    ):
+        return False
+
+    registered_image_binding = next(
+        (
+            binding
+            for binding in task.expected_result_bindings
+            if binding.target_stage == cleanup_stage_id and binding.target_argument == "url"
+        ),
+        None,
+    )
+    if (
+        registered_image_binding is None
+        or registered_image_binding.source_field != "url"
+        or not any(
+            item.stage_id == registered_image_binding.source_stage
+            and item.logical_operation == "image_upload"
+            and item.server_succeeded
+            for item in prior_calls
+        )
+        or not _material_result_binding_matches(registered_image_binding, task, tool_calls)
+    ):
+        return False
+
+    later_material_calls = [item for item in tool_calls[index + 1 :] if item.operation_kind == "material"]
+    if len(later_material_calls) != 1:
+        return False
+    delete_call = later_material_calls[0]
+    delete_stage_id = delete_call.stage_id
+    if delete_stage_id is None:
+        return False
+    registered_delete_attempt = expected_by_stage.get(delete_stage_id)
+    registered_file_binding = next(
+        (
+            binding
+            for binding in task.expected_result_bindings
+            if binding.target_stage == delete_stage_id and binding.target_argument == "uri"
+        ),
+        None,
+    )
     return (
-        call.server_succeeded
-        and any(item.logical_operation == "image_upload" and item.server_succeeded for item in prior_calls)
-        and any(item.logical_operation == "create" and not item.server_succeeded for item in prior_calls)
-        and not any(item.operation_kind == "material" for item in tool_calls[index + 1 :])
+        registered_delete_attempt is not None
+        and registered_delete_attempt.logical_operation == "delete"
+        and _resource_matches(delete_call.resource_type, registered_delete_attempt.resource_type)
+        and delete_call.server_succeeded
+        and registered_file_binding is not None
+        and registered_file_binding.source_field == "uri"
+        and any(
+            item.stage_id == registered_file_binding.source_stage
+            and item.logical_operation == "file_upload"
+            and item.server_succeeded
+            for item in prior_calls
+        )
+        and _material_result_binding_matches(registered_file_binding, task, tool_calls)
     )
 
 
@@ -463,11 +1001,25 @@ def _contains_any(text: str, terms: list[str]) -> bool:
     return any(term.casefold() in lowered for term in terms)
 
 
-def _expected_call_target_matches(call: ToolCallRecord, task: TaskManifest) -> bool:
+def _expected_call_target_matches(
+    call: ToolCallRecord,
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+) -> bool:
+    if any(
+        (pair := _relation_directional_inspection_pair(task, expected, tool_calls)) is not None
+        and call is pair[0]
+        for expected in task.expected_material_attempts
+    ):
+        return True
     expected = task.expected_material_arguments.get(call.logical_operation)
     if expected is None:
         return True
-    return _arguments_include(call.effective_server_args or call.server_args, expected)
+    return _material_arguments_include(
+        call.tool_name,
+        call.effective_server_args or call.server_args,
+        expected,
+    )
 
 
 def _resource_matches(actual: ResourceType, expected: ResourceType | None) -> bool:
@@ -476,34 +1028,558 @@ def _resource_matches(actual: ResourceType, expected: ResourceType | None) -> bo
     return expected is None or actual == "unknown" or actual == expected
 
 
-def _sequence_target_mismatches(
-    material_calls: list[ToolCallRecord],
+def _registered_vault_names(task: TaskManifest) -> set[str]:
+    names: set[str] = set()
+    for attempt in task.expected_material_attempts:
+        if attempt.resource_type == "vault":
+            name = attempt.arguments.get("name")
+            if isinstance(name, str) and name:
+                names.add(name)
+        vault = attempt.arguments.get("vault")
+        if isinstance(vault, str) and vault:
+            names.add(vault)
+    return names
+
+
+def _registered_bound_result_values(
     task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+) -> set[str]:
+    calls_by_stage = {
+        call.stage_id: call
+        for call in tool_calls
+        if call.stage_id is not None and call.server_succeeded
+    }
+    values: set[str] = set()
+    for binding in task.expected_result_bindings:
+        source_call = calls_by_stage.get(binding.source_stage)
+        source = source_call.result_fields.get(binding.source_field) if source_call is not None else None
+        if isinstance(source, str) and source:
+            values.add(source)
+            if binding.relation == "collection_uri" and "/doc/" in source:
+                values.add(source.split("/doc/", 1)[0])
+    return values
+
+
+def _registered_schema_metadata_query(task: TaskManifest, arguments: dict[str, Any]) -> bool:
+    sql = arguments.get("sql")
+    vault = arguments.get("vault")
+    if not isinstance(sql, str) or not isinstance(vault, str) or set(arguments) != {"vault", "sql"}:
+        return False
+    tables = [
+        attempt.arguments
+        for attempt in task.expected_material_attempts
+        if attempt.resource_type == "table"
+        and isinstance(attempt.arguments.get("name"), str)
+        and isinstance(attempt.arguments.get("vault"), str)
+    ]
+    matching_tables = [item for item in tables if item.get("vault") == vault]
+    if len(matching_tables) != 1:
+        return False
+    table_name = str(matching_tables[0]["name"])
+    sanitized_vault = re.sub(r"[^a-z0-9]", "_", vault.lower().replace("-", "_"))
+    sanitized_table = re.sub(r"[^a-z0-9]", "_", table_name.lower().replace("-", "_"))
+    physical_name = f"vt_{sanitized_vault}__{sanitized_table}"
+    query = re.fullmatch(
+        r"SELECT\s+(?:column_name\s*,\s*data_type\s*,\s*ordinal_position|\*)"
+        r"\s+FROM\s+information_schema\.columns"
+        r"\s+WHERE\s+table_schema\s*=\s*(['\"])public\1"
+        r"\s+AND\s+table_name\s*=\s*(['\"])([A-Za-z0-9_]+)\2"
+        r"(?:\s+ORDER\s+BY\s+ordinal_position)?\s*;?",
+        sql.strip(),
+        re.IGNORECASE,
+    )
+    return query is not None and query.group(3).casefold() in {
+        table_name.casefold(),
+        physical_name.casefold(),
+    }
+
+
+def _postgres_identifier_matches(identifier: Any, allowed_names: set[str]) -> bool:
+    if not isinstance(identifier, exp.Identifier):
+        return False
+    name = identifier.name
+    if identifier.args.get("quoted"):
+        return name in allowed_names
+    folded_allowed_names = {candidate.lower() for candidate in allowed_names}
+    return name.lower() in folded_allowed_names
+
+
+def _registered_table_data_query(
+    call: ToolCallRecord,
+    task: TaskManifest,
+    arguments: dict[str, Any],
+) -> bool:
+    sql = arguments.get("sql")
+    vault = arguments.get("vault")
+    if (
+        not call.server_succeeded
+        or call.logical_operation != "search"
+        or call.resource_type != "table"
+        or not isinstance(sql, str)
+        or not isinstance(vault, str)
+        or set(arguments) != {"vault", "sql"}
+    ):
+        return False
+    tables = [
+        attempt.arguments
+        for attempt in task.expected_material_attempts
+        if attempt.resource_type == "table"
+        and isinstance(attempt.arguments.get("name"), str)
+        and isinstance(attempt.arguments.get("vault"), str)
+    ]
+    matching_tables = [item for item in tables if item.get("vault") == vault]
+    if len(matching_tables) != 1:
+        return False
+    table_name = str(matching_tables[0]["name"])
+    sanitized_vault = re.sub(r"[^a-z0-9]", "_", vault.lower().replace("-", "_"))
+    sanitized_table = re.sub(r"[^a-z0-9]", "_", table_name.lower().replace("-", "_"))
+    physical_name = f"vt_{sanitized_vault}__{sanitized_table}"
+    try:
+        statements = parse(sql, read="postgres")
+    except SqlglotError:
+        return False
+    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+        return False
+
+    # SQLGlot accepts some syntax PostgreSQL may reject; this checks query shape only.
+    query = statements[0]
+    if (
+        query.args.get("with_") is not None
+        or query.args.get("into") is not None
+        or query.args.get("locks")
+        or len(list(query.find_all(exp.Select))) != 1
+        or list(query.find_all(exp.CTE))
+        or list(query.find_all(exp.Subquery))
+        or list(query.find_all(exp.Delete))
+        or list(query.find_all(exp.Insert))
+        or list(query.find_all(exp.Update))
+        or list(query.find_all(exp.Merge))
+    ):
+        return False
+
+    relations = list(query.find_all(exp.Table))
+    if len(relations) != 1:
+        return False
+    relation = relations[0]
+    if relation.args.get("catalog") is not None:
+        return False
+    schema = relation.args.get("db")
+    if schema is not None and not _postgres_identifier_matches(schema, {"public"}):
+        return False
+    if not _postgres_identifier_matches(relation.this, {table_name, physical_name}):
+        return False
+
+    # Permit COUNT, but reject function calls that can observe or mutate other state.
+    return all(isinstance(function, exp.Count) for function in query.find_all(exp.Func))
+
+
+def _registered_readonly_observation(
+    call: ToolCallRecord,
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+) -> bool:
+    """Allow a successful read only when its target or query is task-bound."""
+
+    if (
+        call.stage_id is not None
+        or call.operation_kind not in {"material", "preparatory", "unknown"}
+        or not call.server_succeeded
+        or call.logical_operation not in {"read", "list", "search"}
+    ):
+        return False
+    arguments = call.effective_server_args or call.server_args
+    if arguments is None:
+        return False
+    if _registered_browse_observation(call, task, tool_calls, arguments):
+        return True
+    if call.resource_type == "unknown":
+        return False
+    if call.logical_operation == "list" and call.resource_type == "vault":
+        filter_value = arguments.get("filter")
+        return (
+            set(arguments) == {"filter"}
+            and isinstance(filter_value, str)
+            and filter_value in _registered_vault_names(task)
+        )
+    if call.logical_operation == "search" and call.resource_type == "table":
+        if _registered_schema_metadata_query(task, arguments) or _registered_table_data_query(
+            call,
+            task,
+            arguments,
+        ):
+            return True
+    if call.logical_operation == "search" and _registered_asset_reference_search(
+        call,
+        task,
+        arguments,
+        tool_calls,
+    ):
+        return True
+
+    vault_names = _registered_vault_names(task)
+    bound_values = _registered_bound_result_values(task, tool_calls)
+    target_fields = {"vault", "uri", "slug", "source", "target", "name", "path", "collection", "sql", "query_sql"}
+    for expected in task.expected_material_attempts:
+        if expected.logical_operation != call.logical_operation or expected.resource_type != call.resource_type:
+            continue
+        if not _arguments_include(arguments, expected.arguments):
+            continue
+        registered = True
+        for key, value in arguments.items():
+            if key not in target_fields or key in expected.arguments:
+                continue
+            if key == "vault" and isinstance(value, str) and value in vault_names:
+                continue
+            if (
+                key in {"uri", "slug", "source", "target"}
+                and isinstance(value, str)
+                and value in bound_values
+            ):
+                continue
+            registered = False
+            break
+        if registered:
+            return True
+
+    if call.logical_operation == "read" and call.resource_type == "vault":
+        return any(
+            isinstance(arguments.get(key), str) and arguments.get(key) in vault_names
+            for key in ("vault", "name")
+        )
+    if call.logical_operation in {"read", "list"}:
+        uri = arguments.get("uri")
+        if isinstance(uri, str) and uri in bound_values:
+            return True
+        if isinstance(uri, str) and any(uri in {f"akb://{name}", f"akb://{name}/"} for name in vault_names):
+            return True
+    return False
+
+
+def _registered_asset_parent_uris(task: TaskManifest) -> set[str]:
+    parents: set[str] = set()
+    for attempt in task.expected_material_attempts:
+        if attempt.resource_type not in {"file", "image"}:
+            continue
+        parent = attempt.arguments.get("parent")
+        if isinstance(parent, str) and parent.startswith("akb://"):
+            parents.add(parent.rstrip("/"))
+        vault = attempt.arguments.get("vault")
+        if isinstance(vault, str) and vault:
+            parent_uri = f"akb://{vault}"
+            collection = attempt.arguments.get("collection")
+            if isinstance(collection, str) and collection:
+                parent_uri += f"/coll/{collection.strip('/')}"
+            parents.add(parent_uri.rstrip("/"))
+    return parents
+
+
+def _registered_asset_reference_search(
+    call: ToolCallRecord,
+    task: TaskManifest,
+    arguments: dict[str, Any],
+    tool_calls: list[ToolCallRecord],
+) -> bool:
+    """Accept grep only for the UUID of an uploaded image in its registered parent."""
+
+    if call.tool_name != "akb_grep" or call.resource_type != "document":
+        return False
+    allowed_arguments = {
+        "case_sensitive",
+        "count_only",
+        "files_with_matches",
+        "include_archived",
+        "limit",
+        "pattern",
+        "regex",
+        "vault",
+    }
+    if (
+        set(arguments) - allowed_arguments
+        or not {"pattern", "vault", "regex", "include_archived"} <= set(arguments)
+    ):
+        return False
+    if (
+        not isinstance(arguments.get("pattern"), str)
+        or arguments.get("regex") is not False
+        or arguments.get("include_archived") is not True
+        or not isinstance(arguments.get("vault"), str)
+        or any(
+            name in arguments and not isinstance(arguments[name], bool)
+            for name in ("case_sensitive", "count_only", "files_with_matches")
+        )
+        or (
+            "limit" in arguments
+            and (
+                not isinstance(arguments["limit"], int)
+                or isinstance(arguments["limit"], bool)
+                or arguments["limit"] < 1
+            )
+        )
+    ):
+        return False
+
+    parents = _registered_asset_parent_uris(task)
+    image_attempts = [
+        attempt
+        for attempt in task.expected_material_attempts
+        if attempt.logical_operation == "image_upload" and attempt.resource_type == "image"
+    ]
+    if not parents or not image_attempts:
+        return False
+    calls_by_stage = {
+        item.stage_id: item
+        for item in tool_calls
+        if item.stage_id is not None and item.server_succeeded
+    }
+    for attempt in image_attempts:
+        upload = calls_by_stage.get(attempt.stage_id)
+        if upload is None:
+            continue
+        upload_arguments = upload.effective_server_args or upload.server_args or {}
+        upload_parent = upload_arguments.get("parent")
+        if not isinstance(upload_parent, str):
+            vault = upload_arguments.get("vault")
+            if not isinstance(vault, str):
+                continue
+            upload_parent = f"akb://{vault}"
+            collection = upload_arguments.get("collection")
+            if isinstance(collection, str) and collection:
+                upload_parent += f"/coll/{collection.strip('/')}"
+        upload_parent = upload_parent.rstrip("/")
+        if upload_parent not in parents:
+            continue
+        parent_vault = urlsplit(upload_parent).netloc
+        if not parent_vault or arguments["vault"] != parent_vault:
+            continue
+        image_url = upload.result_fields.get("url")
+        match = re.fullmatch(r"/api/assets/([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})", image_url or "")
+        if match is None or arguments["pattern"] != match.group(1):
+            continue
+        cleanup_binding = next(
+            (
+                binding
+                for binding in task.expected_result_bindings
+                if binding.source_stage == attempt.stage_id
+                and binding.source_field == "url"
+                and binding.relation == "equals"
+            ),
+            None,
+        )
+        if cleanup_binding is None:
+            continue
+        cleanup = calls_by_stage.get(cleanup_binding.target_stage)
+        if cleanup is None or cleanup.order >= call.order:
+            continue
+        cleanup_arguments = cleanup.effective_server_args or cleanup.server_args or {}
+        if cleanup_arguments.get(cleanup_binding.target_argument) != image_url:
+            continue
+        file_delete_binding = next(
+            (
+                binding
+                for binding in task.expected_result_bindings
+                if binding.target_argument == "uri"
+                and binding.relation == "equals"
+                and next(
+                    (
+                        candidate
+                        for candidate in task.expected_material_attempts
+                        if candidate.stage_id == binding.target_stage
+                        and candidate.logical_operation == "delete"
+                        and candidate.resource_type == "file"
+                    ),
+                    None,
+                ) is not None
+            ),
+            None,
+        )
+        if file_delete_binding is None:
+            continue
+        file_delete = calls_by_stage.get(file_delete_binding.target_stage)
+        if (
+            file_delete is not None
+            and file_delete.order < call.order
+            and _material_result_binding_matches(file_delete_binding, task, tool_calls)
+        ):
+            return True
+    return False
+
+
+def _registered_browse_observation(
+    call: ToolCallRecord,
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+    arguments: dict[str, Any],
+) -> bool:
+    if call.logical_operation != "list" or call.tool_name not in {"akb_browse", "akb_discover"}:
+        return False
+    if call.tool_name == "akb_discover" and arguments.get("action") != "browse":
+        return False
+    if call.tool_name == "akb_browse" and "action" in arguments:
+        return False
+    allowed_arguments = {
+        "action",
+        "collection",
+        "content_type",
+        "depth",
+        "filter",
+        "include_archived",
+        "include_hashes",
+        "include_summary",
+        "limit",
+        "offset",
+        "uri",
+        "vault",
+    }
+    if set(arguments) - allowed_arguments:
+        return False
+    depth = arguments.get("depth")
+    if depth is not None and (not isinstance(depth, int) or isinstance(depth, bool) or depth < -1):
+        return False
+    content_type = arguments.get("content_type")
+    if content_type is not None and content_type not in {"all", "documents", "tables", "files"}:
+        return False
+    if any(
+        key in arguments and not isinstance(arguments[key], str)
+        for key in ("collection", "filter", "uri", "vault")
+    ):
+        return False
+    if any(
+        key in arguments and not isinstance(arguments[key], bool)
+        for key in ("include_archived", "include_hashes", "include_summary")
+    ):
+        return False
+    if any(
+        key in arguments
+        and (not isinstance(arguments[key], int) or isinstance(arguments[key], bool) or arguments[key] < 0)
+        for key in ("limit", "offset")
+    ):
+        return False
+
+    roots = {f"akb://{name}" for name in _registered_vault_names(task)}
+    for attempt in task.expected_material_attempts:
+        vault = attempt.arguments.get("vault")
+        collection = attempt.arguments.get("collection")
+        if not isinstance(collection, str):
+            collection = attempt.arguments.get("path") if attempt.resource_type == "collection" else None
+        if isinstance(vault, str) and isinstance(collection, str) and collection:
+            roots.add(f"akb://{vault}/coll/{collection}")
+    for value in _registered_bound_result_values(task, tool_calls):
+        if value.startswith("akb://"):
+            if "/doc/" in value:
+                roots.add(value.split("/doc/", 1)[0])
+            else:
+                roots.add(value)
+    roots.update(root.rstrip("/") for root in tuple(roots))
+
+    if "uri" in arguments:
+        target = arguments["uri"].rstrip("/")
+        if "vault" in arguments:
+            fallback_target = f"akb://{arguments['vault']}"
+            if arguments.get("collection") not in (None, ""):
+                fallback_target += f"/coll/{arguments['collection']}"
+            if fallback_target.rstrip("/") != target:
+                return False
+    else:
+        vault = arguments.get("vault")
+        if not isinstance(vault, str) or vault not in _registered_vault_names(task):
+            return False
+        collection = arguments.get("collection")
+        if collection in (None, ""):
+            target = f"akb://{vault}"
+        else:
+            target = f"akb://{vault}/coll/{collection}"
+    return target in roots
+
+
+def _preview_contains_collection(call: ToolCallRecord, collection_uri: str) -> bool:
+    def contains(value: Any) -> bool:
+        if isinstance(value, dict):
+            if value.get("type") == "collection" and value.get("uri") == collection_uri:
+                return True
+            return any(contains(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains(item) for item in value)
+        return False
+
+    if contains(call.result_fields):
+        return True
+    preview = call.result_preview
+    if not isinstance(preview, str) or not preview:
+        return False
+    try:
+        if contains(json.loads(preview)):
+            return True
+    except json.JSONDecodeError:
+        pass
+    for match in re.finditer(r"\{[^{}]*\}", preview):
+        try:
+            if contains(json.loads(match.group())):
+                return True
+        except json.JSONDecodeError:
+            continue
+    return False
+
+
+def _registered_vault_root_browse_contains_collection(
+    call: ToolCallRecord,
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+    arguments: dict[str, Any],
+    *,
+    vault: str,
+    collection_uri: str,
+) -> bool:
+    root_uri = f"akb://{vault}"
+    if vault not in _registered_vault_names(task) or not _registered_browse_observation(
+        call,
+        task,
+        tool_calls,
+        arguments,
+    ):
+        return False
+    if arguments.get("vault", vault) != vault or arguments.get("collection") not in (None, ""):
+        return False
+    if "uri" in arguments:
+        if arguments.get("uri", "").rstrip("/") != root_uri:
+            return False
+    elif arguments.get("vault") != vault:
+        return False
+    return _preview_contains_collection(call, collection_uri)
+
+
+def _sequence_target_mismatches(
+    stage_calls: list[ToolCallRecord],
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
 ) -> set[int]:
     mismatches: set[int] = set()
-    dynamic_by_attempt: dict[int, set[str]] = defaultdict(set)
+    dynamic_by_stage: dict[str, set[str]] = defaultdict(set)
     for binding in task.expected_result_bindings:
-        dynamic_by_attempt[binding.target_attempt].add(binding.target_argument)
-    for attempt_index, (call, expected) in enumerate(
-        zip(material_calls, task.expected_material_attempts),
-        start=1,
-    ):
+        dynamic_by_stage[binding.target_stage].add(binding.target_argument)
+    for attempt_index, (call, expected) in enumerate(zip(stage_calls, task.expected_material_attempts), start=1):
         if call.logical_operation != expected.logical_operation:
+            continue
+        if (
+            (pair := _relation_directional_inspection_pair(task, expected, tool_calls)) is not None
+            and call is pair[0]
+        ):
             continue
         arguments = _semantic_arguments(call)
         if arguments is None:
             mismatches.add(attempt_index)
             continue
-        ignored = set(expected.local_file_arguments) | dynamic_by_attempt[attempt_index] | {"_vault_skill_ack"}
+        ignored = set(expected.local_file_arguments) | dynamic_by_stage[expected.stage_id] | {"_vault_skill_ack"}
         comparable = {name: value for name, value in arguments.items() if name not in ignored}
-        if not _arguments_include(comparable, expected.arguments):
+        if not _material_arguments_include(call.tool_name, comparable, expected.arguments):
             mismatches.add(attempt_index)
     return mismatches
 
 
-def _completion_index(task: TaskManifest, material_calls: list[ToolCallRecord]) -> int | None:
+def _completion_index(task: TaskManifest, tool_calls: list[ToolCallRecord]) -> int | None:
     """Return the one-based call order after which the requested work was complete."""
 
+    material_calls = [call for call in tool_calls if call.operation_kind == "material"]
     if task.stopping.completion == "immediate_response":
         return 0
     if task.stopping.completion == "clarification":
@@ -518,24 +1594,29 @@ def _completion_index(task: TaskManifest, material_calls: list[ToolCallRecord]) 
                 return call.order
         return None
     if task.expected_material_attempts:
-        if len(material_calls) < len(task.expected_material_attempts):
+        stage_calls, _ = _resolved_material_stage_calls(task, tool_calls)
+        if len(stage_calls) != len(task.expected_material_attempts):
             return None
-        return material_calls[len(task.expected_material_attempts) - 1].order
+        return max(call.order for call in stage_calls)
     expected = {item.logical_operation for item in task.expected_material_outcomes}
     if expected:
-        observed: set[str] = set()
+        required_counts = {
+            operation: max(1, task.material_attempt_minimums.get(operation, 1))
+            for operation in expected
+        }
+        observed_counts: Counter[str] = Counter()
         for call in material_calls:
             if call.logical_operation in expected and (
                 call.server_succeeded or call.server_error_code is not None
             ):
-                observed.add(call.logical_operation)
-            if expected <= observed:
+                observed_counts[call.logical_operation] += 1
+            if all(observed_counts[operation] >= count for operation, count in required_counts.items()):
                 return call.order
     return None
 
 
 def _fabricated_resource_claim_count(outcome: TrialOutcome, task: TaskManifest) -> int:
-    uri_pattern = re.compile(r"akb://[A-Za-z0-9][A-Za-z0-9._-]*(?:/[^\s)\]}>,'\"]+)?")
+    uri_pattern = re.compile(r"akb://[A-Za-z0-9][A-Za-z0-9._-]*(?:/[^\s)\]}>,'`\"]+)?")
     claimed = set(uri_pattern.findall(outcome.final_answer_text))
     if not claimed:
         return 0
@@ -559,6 +1640,7 @@ def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> Non
     outcome.nonexistent_tool_attempts = sum(not call.tool_exists for call in outcome.tool_calls)
     outcome.wrong_capability_calls = sum(
         call.tool_exists and call.operation_kind == "unknown" and call.logical_operation not in task.forbidden_operations
+        and not _registered_readonly_observation(call, task, outcome.tool_calls)
         for call in outcome.tool_calls
     )
     outcome.wrong_resource_calls = sum(
@@ -566,25 +1648,43 @@ def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> Non
         and call.resource_type != "unknown"
         and call.resource_type not in task.allowed_resources
         and call.logical_operation not in task.allowed_preparatory_operations
+        and not _registered_readonly_observation(call, task, outcome.tool_calls)
         for call in outcome.tool_calls
     )
-    target_mismatches = _sequence_target_mismatches(material_calls, task)
+    stage_calls, stages_valid = _resolved_material_stage_calls(task, outcome.tool_calls)
+    target_mismatches = _sequence_target_mismatches(stage_calls, task, outcome.tool_calls)
     target_mismatches.update(
         index
-        for index, call in enumerate(material_calls, start=1)
-        if not _expected_call_target_matches(call, task)
+        for index, call in enumerate(stage_calls, start=1)
+        if not _expected_call_target_matches(call, task, outcome.tool_calls)
     )
     outcome.wrong_target_calls = len(target_mismatches)
+    outcome.wrong_target_calls += sum(
+        1
+        for call in outcome.tool_calls
+        if task.expected_material_attempts
+        and call.stage_id is None
+        and call.operation_kind in {"material", "unknown"}
+        and call.logical_operation in {"read", "list", "search"}
+        and not any(
+            call is paired_call
+            for expected in task.expected_material_attempts
+            if (pair := _relation_directional_inspection_pair(task, expected, outcome.tool_calls)) is not None
+            for paired_call in pair
+        )
+        and not _registered_readonly_observation(call, task, outcome.tool_calls)
+    )
     outcome.target_payload_accuracy = outcome.wrong_target_calls == 0 and outcome.wrong_resource_calls == 0
 
     if task.expected_material_attempts:
-        outcome.multi_step_ordering = len(material_calls) == len(task.expected_material_attempts) and all(
-            call.logical_operation == expected.logical_operation
+        outcome.multi_step_ordering = stages_valid and len(stage_calls) == len(task.expected_material_attempts) and all(
+            call.stage_id == expected.stage_id
+            and call.logical_operation == expected.logical_operation
             and _resource_matches(call.resource_type, expected.resource_type)
-            for call, expected in zip(material_calls, task.expected_material_attempts)
+            for call, expected in zip(stage_calls, task.expected_material_attempts)
         )
         outcome.result_binding_accuracy = all(
-            _material_result_binding_matches(binding, material_calls)
+            _material_result_binding_matches(binding, task, outcome.tool_calls)
             for binding in task.expected_result_bindings
         )
     else:
@@ -599,7 +1699,7 @@ def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> Non
         "forbidden": not clarified,
     }[task.clarification.expectation]
 
-    completion = _completion_index(task, material_calls)
+    completion = _completion_index(task, outcome.tool_calls)
     allowed = set(task.stopping.allowed_follow_up_operations)
     if task.stopping.completion == "clarification":
         extra_calls = [call for call in material_calls if call.logical_operation not in allowed]
@@ -611,15 +1711,17 @@ def _finalize_semantic_metrics(outcome: TrialOutcome, task: TaskManifest) -> Non
             if call.order > completion and call.logical_operation not in allowed
         ]
     outcome.post_completion_overshoot = len(extra_calls)
-    outcome.stopping_accuracy = not extra_calls
+    outcome.stopping_accuracy = all(
+        call.logical_operation in allowed
+        or _registered_readonly_observation(call, task, outcome.tool_calls)
+        for call in extra_calls
+    )
 
     outcome.fabricated_resource_claims = _fabricated_resource_claim_count(outcome, task)
     base_outcome = (
         outcome.state_contract_passed
         and outcome.response_rubric_passed
         and outcome.required_operations_completed
-        and outcome.required_attempts_completed
-        and outcome.tool_outcome_match
     )
     claims_success = _contains_any(outcome.final_answer_text, task.response_rubric.success_claim_terms)
     outcome.unsupported_success_claims = int(claims_success and not base_outcome)
@@ -690,33 +1792,333 @@ def _matching_accepted_behaviors(outcome: TrialOutcome, task: TaskManifest) -> l
     return matched
 
 
-def has_measured_evidence(outcome: TrialOutcome) -> bool:
+def has_server_instructions_evidence(
+    outcome: TrialOutcome,
+    expected_instructions: str | None = None,
+) -> bool:
+    try:
+        validate_model_input_evidence(outcome.model_dump(mode="json"))
+    except ValueError:
+        return False
+    if (
+        outcome.server_instructions_sha256 is None
+        or outcome.model_requests <= 0
+        or len(outcome.model_input_evidence) != outcome.model_requests
+        or [item.request_index for item in outcome.model_input_evidence]
+        != list(range(1, outcome.model_requests + 1))
+    ):
+        return False
+    source_instructions = (
+        expected_instructions
+        if expected_instructions is not None
+        else outcome.model_input_evidence[0].server_instructions_text
+    )
+    if not source_instructions.strip():
+        return False
+    expected_sha256 = hashlib.sha256(source_instructions.encode("utf-8")).hexdigest()
+    expected_text = source_instructions.rstrip("\r\n")
+    if (
+        not expected_text
+        or outcome.server_instructions_sha256 != expected_sha256
+        or any(item.server_instructions_text != source_instructions for item in outcome.model_input_evidence)
+    ):
+        return False
+
+    def contains_instructions(value: Any) -> bool:
+        if isinstance(value, str):
+            return expected_text in value
+        if isinstance(value, dict):
+            return any(contains_instructions(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_instructions(item) for item in value)
+        return False
+
+    def input_evidence_matches(item: ModelInputEvidence) -> bool:
+        if item.server_instructions_sha256 != expected_sha256:
+            return False
+        serialized_input = item.model_input_canonical_json
+        if hashlib.sha256(serialized_input.encode("utf-8")).hexdigest() != item.model_input_sha256:
+            return False
+        try:
+            parsed_input = json.loads(serialized_input)
+        except json.JSONDecodeError:
+            return False
+        return item.server_instructions_present and contains_instructions(parsed_input)
+
+    return (
+        all(
+            item.server_instructions_present
+            and input_evidence_matches(item)
+            for item in outcome.model_input_evidence
+        )
+    )
+
+
+def has_measured_evidence(outcome: TrialOutcome, task: TaskManifest | None = None) -> bool:
     """Return whether a trial has real provider and lifecycle evidence to keep."""
 
+    if (
+        not outcome.task_id
+        or not outcome.locale
+        or "tool_calls" not in outcome.model_fields_set
+    ):
+        return False
+    if task is not None and (outcome.task_id != task.id or outcome.locale != task.locale):
+        return False
     if not _has_provider_usage_evidence(outcome):
         return False
+    if task is not None:
+        observation_sets = task.expected_final_state.observation_sets
+        if (
+            len(outcome.state_observations_before) != len(observation_sets)
+            or len(outcome.state_observations_after) != len(observation_sets)
+        ):
+            return False
+        before_required = [item.check_before for item in observation_sets]
+    else:
+        before_required = [False] * len(outcome.state_observations_before)
+        if len(outcome.state_observations_before) != len(outcome.state_observations_after):
+            return False
+    before_payload, before_valid = _measured_state_payload(
+        outcome.state_observations_before,
+        optional={index for index, required in enumerate(before_required) if not required},
+    )
+    after_payload, after_valid = _measured_state_payload(outcome.state_observations_after)
+    if (
+        not before_valid
+        or not after_valid
+        or not outcome.state_available_before
+        or not outcome.state_available_after
+        or outcome.state_before != before_payload
+        or outcome.state_after != after_payload
+    ):
+        return False
+    if outcome.successful_mcp_tool_calls != sum(call.server_succeeded for call in outcome.tool_calls):
+        return False
+    if outcome.material_call_count != sum(call.operation_kind == "material" for call in outcome.tool_calls):
+        return False
+    if [call.order for call in outcome.tool_calls] != list(range(1, len(outcome.tool_calls) + 1)):
+        return False
+    if outcome.first_logical_operation != (outcome.tool_calls[0].logical_operation if outcome.tool_calls else "none"):
+        return False
+    for call in outcome.tool_calls:
+        _decoded, raw_valid = decode_raw_args(call.raw_model_args)
+        if call.raw_args_valid != raw_valid:
+            return False
+        if call.server_args is None:
+            if call.server_args_equal_raw or call.effective_server_args is not None:
+                return False
+        elif call.server_args_equal_raw != (raw_valid and call.server_args == _decoded):
+            return False
+        if call.server_succeeded and (not call.transport_succeeded or call.server_error_code is not None):
+            return False
     if outcome.error is None:
         return True
     if outcome.expected_error_match:
-        return outcome.state_available_before and outcome.state_available_after
-    if outcome.failure_kind not in {"output_limit", "request_limit", "terminal_response", "tool"}:
+        return True
+    if outcome.failure_kind not in {"output_limit", "terminal_response", "tool"}:
         return False
-    return outcome.state_available_before and outcome.state_available_after
+    return True
+
+
+def _measured_state_payload(
+    records: list[dict[str, Any]],
+    *,
+    optional: set[int] | None = None,
+) -> tuple[Any, bool]:
+    if not records:
+        return None, False
+    optional = optional or set()
+    observations: list[StateObservation] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict) or set(record) != {"available", "status_code", "payload", "error"}:
+            return None, False
+        status_code = record["status_code"]
+        if index in optional and record == {
+            "available": True,
+            "status_code": None,
+            "payload": None,
+            "error": None,
+        }:
+            observations.append(StateObservation(True, None, None, None))
+            continue
+        if (
+            record["available"] is not True
+            or not isinstance(status_code, int)
+            or isinstance(status_code, bool)
+            or not 100 <= status_code <= 599
+            or record["error"] is not None
+        ):
+            return None, False
+        observations.append(StateObservation(True, status_code, record["payload"], None))
+    return _state_payload(observations), True
 
 
 @dataclass(slots=True)
 class _ObservedCall:
     tool_name: str
     server_args: dict[str, Any]
+    canonical_operation: str | None = None
+    surface_action: str | None = None
+    logical_operation: str = "unknown"
+    resource_type: ResourceType = "unknown"
+    operation_kind: Literal["preparatory", "material", "unknown"] = "unknown"
+    stage_id: str | None = None
     transport_succeeded: bool = False
     succeeded: bool = False
     status_code: int | None = None
     error_code: str | None = None
+    error_identity: dict[str, str] = field(default_factory=dict)
     error: str | None = None
     result_preview: str | None = None
     result_fields: dict[str, str] = field(default_factory=dict)
     vault_skill_ack: str | None = None
     vault_skill_retry_ack: str | None = None
+    vault_skill_binding_sha256: str | None = None
+
+
+def _public_route(
+    tool_name: str,
+    arguments: dict[str, Any],
+    public_operations: list[PublicOperation],
+    *,
+    arm: str,
+    transport: str,
+) -> PublicOperation | None:
+    action = arguments.get("action")
+    matches = [
+        item
+        for item in public_operations
+        if transport in item.transports
+        and getattr(item, arm).tool == tool_name
+        and getattr(item, arm).action == (action if isinstance(action, str) else None)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _result_fields_by_stage(calls: list[Any]) -> dict[str, dict[str, str]]:
+    result: dict[str, dict[str, str]] = {}
+    for call in calls:
+        stage_id = getattr(call, "stage_id", None)
+        succeeded = getattr(call, "server_succeeded", getattr(call, "succeeded", False))
+        fields = getattr(call, "result_fields", {})
+        if isinstance(stage_id, str) and succeeded and isinstance(fields, dict):
+            result[stage_id] = fields
+    return result
+
+
+def _resolve_result_probe(probe: StateProbe, result_fields: dict[str, dict[str, str]]) -> StateProbe:
+    binding = probe.result_binding
+    if binding is None:
+        return probe
+    fields = result_fields.get(binding.source_stage)
+    if fields is None:
+        raise RuntimeContractError("dynamic state probe result stage is missing", stage="state_observation")
+    value = fields.get(binding.source_field)
+    if not isinstance(value, str) or not value:
+        raise RuntimeContractError("dynamic state probe result field is missing", stage="state_observation")
+    if binding.transform == "document_asset_id_from_url":
+        parts = urlsplit(value)
+        identifier = parts.path.rsplit("/", 1)[-1]
+        try:
+            identifier = str(uuid.UUID(identifier))
+        except (ValueError, AttributeError) as exc:
+            raise RuntimeContractError("document asset result URL is invalid", stage="state_observation") from exc
+        marker = "{asset_id}"
+    elif binding.transform == "publication_slug":
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) is None:
+            raise RuntimeContractError("publication slug result is invalid", stage="state_observation")
+        identifier = value
+        marker = "{slug}"
+    else:
+        if not value.startswith("akb://") or "\r" in value or "\n" in value:
+            raise RuntimeContractError("resource URI result is invalid", stage="state_observation")
+        identifier = quote(value, safe="")
+        marker = "{uri}"
+    return probe.model_copy(update={"path": probe.path.replace(marker, identifier), "result_binding": None})
+
+
+def _state_payload(observations: list[StateObservation]) -> Any:
+    payloads = [observation.payload if observation.available else None for observation in observations]
+    return payloads[0] if len(payloads) == 1 else payloads
+
+
+def _state_observation_record(observation: StateObservation) -> dict[str, Any]:
+    return {
+        "available": observation.available,
+        "status_code": observation.status_code,
+        "payload": observation.payload,
+        "error": observation.error,
+    }
+
+
+def _trial_error_kinds(outcome: TrialOutcome, task: TaskManifest) -> list[str]:
+    kinds: set[str] = set()
+    intended_error_calls: set[int] = set()
+    stage_calls, _stages_valid = _resolved_material_stage_calls(task, outcome.tool_calls)
+    for call, expected in zip(stage_calls, task.expected_material_attempts):
+        if expected.outcome == "success":
+            continue
+        if (
+            call.stage_id == expected.stage_id
+            and call.logical_operation == expected.logical_operation
+            and call.server_error_code == expected.error_code
+            and (expected.status_code is None or call.server_status_code == expected.status_code)
+        ):
+            intended_error_calls.add(id(call))
+    for call in outcome.tool_calls:
+        if call.server_succeeded or call.server_error_code is None:
+            continue
+        expected_outcome = next(
+            (
+                item
+                for item in task.expected_material_outcomes
+                if item.logical_operation == call.logical_operation
+            ),
+            None,
+        )
+        if (
+            expected_outcome is not None
+            and expected_outcome.outcome == "permission_denied"
+            and call.server_error_code == expected_outcome.error_code
+            and (expected_outcome.status_code is None or call.server_status_code == expected_outcome.status_code)
+        ):
+            intended_error_calls.add(id(call))
+    for call in outcome.tool_calls:
+        if not call.tool_exists or call.canonical_operation is None:
+            kinds.add("unintended_tool_action")
+        if call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task):
+            kinds.add("unintended_tool_action")
+        if call.operation_kind == "unknown" and call.logical_operation in {
+            "create", "update", "delete", "grant", "file_upload", "image_upload", "cleanup"
+        }:
+            kinds.add("unintended_tool_action")
+        if not call.argument_valid and call.tool_exists:
+            kinds.add("schema_error")
+        if call.server_error_code in {"invalid_argument", "validation_error", "invalid_params", "schema_error"} and id(call) not in intended_error_calls:
+            kinds.add("schema_error")
+        if call.server_status_code in {400, 422} and id(call) not in intended_error_calls:
+            kinds.add("schema_error")
+        if (
+            call.server_error_code is not None
+            and call.server_error_code != "vault_skill_required"
+            and id(call) not in intended_error_calls
+            and call.server_error_code not in {"invalid_argument", "validation_error", "invalid_params", "schema_error"}
+            and call.server_status_code not in {400, 422}
+            and not (
+                call.operation_kind == "preparatory"
+                and call.server_error_code == "not_found"
+                and call.logical_operation in {"read", "list", "search"}
+            )
+        ):
+            kinds.add("unexpected_tool_error")
+    if not outcome.protocol_handshake_valid:
+        kinds.add("protocol_handshake_invalid")
+    if outcome.wrong_target_calls:
+        kinds.add("wrong_target_payload")
+    if outcome.unsupported_success_claims:
+        kinds.add("unsupported_success_claim")
+    return sorted(kinds)
 
 
 class ToolCallRecorder:
@@ -727,51 +2129,247 @@ class ToolCallRecorder:
         *,
         operation_map: dict[str, list[str]],
         secrets: tuple[str, ...],
+        secret_values: Callable[[], tuple[str, ...]] | None = None,
         capture_result_fields: dict[str, list[str]] | None = None,
+        task: TaskManifest | None = None,
+        fixture: RuntimeFixture | None = None,
+        token: str | None = None,
+        arm: str = "baseline",
+        transport: str = "http",
+        public_operations: list[PublicOperation] | None = None,
     ) -> None:
         self.operation_map = operation_map
-        self.secrets = secrets
+        self._secrets = secrets
+        self.secret_values = secret_values
+        self.task = task
+        self.fixture = fixture
+        self.token = token
+        self.arm = arm
+        self.transport = transport
+        self.public_operations = public_operations or []
         self.calls: list[_ObservedCall] = []
         self.input_schemas: dict[str, dict[str, Any]] = {}
+        self.material_calls: list[_ObservedCall] = []
+        self.checkpoint_observations: list[dict[str, Any]] = []
+        self.next_expected_stage = 0
+        self.matched_expected_stage_ids: set[str] = set()
         self.capture_result_fields = {
             tool: frozenset(fields) for tool, fields in (capture_result_fields or {}).items()
         }
 
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        if self.secret_values is None:
+            return self._secrets
+        return tuple(dict.fromkeys((*self._secrets, *self.secret_values())))
+
     def set_input_schemas(self, schemas: dict[str, dict[str, Any]]) -> None:
         self.input_schemas = schemas
 
+    def _stage_id_for_material_call(
+        self,
+        name: str,
+        logical_operation: str,
+        resource_type: ResourceType,
+        arguments: dict[str, Any],
+    ) -> str | None:
+        if self.task is None:
+            return None
+        bindings = self.task.expected_result_bindings
+        dynamic_arguments: dict[str, set[str]] = defaultdict(set)
+        for binding in bindings:
+            dynamic_arguments[binding.target_stage].add(binding.target_argument)
+        schema = self.input_schemas.get(name)
+        effective_arguments = (
+            canonicalize_arguments(arguments, schema) or {} if schema is not None else arguments
+        )
+        cleanup_pair = _independent_file_image_cleanup_pair(self.task)
+        readonly_suffix_start = _independent_readonly_suffix_start(self.task)
+        unordered_suffix_active = (
+            readonly_suffix_start is not None and self.next_expected_stage >= readonly_suffix_start
+        )
+        for index in range(self.next_expected_stage, len(self.task.expected_material_attempts)):
+            expected = self.task.expected_material_attempts[index]
+            if expected.stage_id in self.matched_expected_stage_ids:
+                continue
+            independent_cleanup_peer = (
+                cleanup_pair is not None
+                and self.next_expected_stage == cleanup_pair[0]
+                and index == cleanup_pair[1]
+                and all(
+                    stage_id in self.matched_expected_stage_ids
+                    for stage_id in (
+                        next(
+                            binding.source_stage
+                            for binding in bindings
+                            if binding.target_stage == cleanup_pair[2].stage_id
+                            and binding.target_argument == "url"
+                        ),
+                        next(
+                            binding.source_stage
+                            for binding in bindings
+                            if binding.target_stage == cleanup_pair[3].stage_id
+                            and binding.target_argument == "uri"
+                        ),
+                    )
+                )
+            )
+            if (
+                index > self.next_expected_stage
+                and dynamic_arguments[expected.stage_id]
+                and not independent_cleanup_peer
+                and not unordered_suffix_active
+            ):
+                continue
+            if (
+                (expected.tool_name is not None and expected.tool_name != name)
+                or expected.logical_operation != logical_operation
+                or not _resource_matches(resource_type, expected.resource_type)
+            ):
+                continue
+            ignored = set(expected.local_file_arguments) | dynamic_arguments[expected.stage_id] | {"_vault_skill_ack"}
+            comparable = {key: value for key, value in effective_arguments.items() if key not in ignored}
+            if not _material_arguments_include(name, comparable, expected.arguments):
+                continue
+            self.matched_expected_stage_ids.add(expected.stage_id)
+            if index == self.next_expected_stage:
+                self.next_expected_stage = index + 1
+                while (
+                    self.next_expected_stage < len(self.task.expected_material_attempts)
+                    and self.task.expected_material_attempts[self.next_expected_stage].stage_id
+                    in self.matched_expected_stage_ids
+                ):
+                    self.next_expected_stage += 1
+            return expected.stage_id
+        return None
+
     async def __call__(self, _ctx: Any, call: Callable[..., Any], name: str, server_args: dict[str, Any]) -> Any:
+        route = _public_route(
+            name,
+            server_args,
+            self.public_operations,
+            arm=self.arm,
+            transport=self.transport,
+        )
+        logical_operation = logical_operation_for(name, self.operation_map, server_args)
+        canonical_operation = route.operation if route is not None else None
+        operation_kind: Literal["preparatory", "material", "unknown"] = "unknown"
+        retry_ack = server_args.get("_vault_skill_ack")
+        stage_id = None
+        if self.task is not None:
+            if isinstance(retry_ack, str) and retry_ack:
+                operation_kind = "preparatory"
+            else:
+                stage_id = self._stage_id_for_material_call(
+                    name,
+                    logical_operation,
+                    route.resource_type if route is not None else "unknown",
+                    server_args,
+                )
+                if stage_id is not None or logical_operation in self.task.allowed_material_operations:
+                    operation_kind = "material"
+                elif logical_operation in self.task.allowed_preparatory_operations:
+                    operation_kind = "preparatory"
         observed = _ObservedCall(
             tool_name=name,
             server_args=_redact_vault_skill_ack(safe_json(server_args, self.secrets)),
+            canonical_operation=canonical_operation,
+            surface_action=route.candidate.action if route is not None and self.arm == "candidate" else (
+                route.baseline.action if route is not None else None
+            ),
+            logical_operation=logical_operation,
+            resource_type=route.resource_type if route is not None else "unknown",
+            operation_kind=operation_kind,
+            stage_id=stage_id,
             vault_skill_retry_ack=(
                 server_args.get("_vault_skill_ack")
                 if isinstance(server_args.get("_vault_skill_ack"), str)
                 else None
             ),
         )
+        if observed.vault_skill_retry_ack:
+            previous = next(
+                (
+                    item
+                    for item in reversed(self.calls)
+                    if item.error_code == "vault_skill_required"
+                    and item.tool_name == name
+                    and _semantic_arguments_from_dict(item.server_args)
+                    == _semantic_arguments_from_dict(server_args)
+                    and item.vault_skill_ack == observed.vault_skill_retry_ack
+                ),
+                None,
+            )
+            if previous is not None:
+                digest = _vault_skill_binding_digest(name, server_args, observed.vault_skill_retry_ack)
+                if digest == previous.vault_skill_binding_sha256:
+                    observed.vault_skill_binding_sha256 = digest
+                    observed.stage_id = previous.stage_id
         self.calls.append(observed)
+        result: Any = None
         try:
             result = await call(name, server_args)
+            observed.transport_succeeded = True
+            observed.error_code, observed.error = public_result_error(result, self.secrets)
+            observed.succeeded = observed.error_code is None
+            observed.vault_skill_ack = _extract_vault_skill_ack(result, self.secrets)
+            if observed.error_code == "vault_skill_required" and observed.vault_skill_ack:
+                observed.vault_skill_binding_sha256 = _vault_skill_binding_digest(
+                    name,
+                    server_args,
+                    observed.vault_skill_ack,
+                )
+            capture_fields = self.capture_result_fields.get(name, frozenset())
+            observed.result_fields = _capture_structured_result_fields(result, capture_fields, self.secrets)
+            preview = _redact_vault_skill_ack(safe_json(result, self.secrets))
+            result_text = canonical_json(preview)
+            observed.result_preview = result_text[:2000] + ("…" if len(result_text) > 2000 else "")
+            return result
         except Exception as exc:
-            observed.transport_succeeded = False
-            observed.status_code, observed.error_code = error_details(exc)
-            observed.error = redact_exception(exc, self.secrets)
+            observed.transport_succeeded = isinstance(exc, ToolFailed)
+            observed.status_code, observed.error_code, observed.error_identity = error_details(
+                exc,
+                self.secrets,
+            )
+            if observed.error_code == "vault_skill_required":
+                observed.vault_skill_ack = _extract_vault_skill_ack_from_error(exc, self.secrets)
+                if observed.vault_skill_ack:
+                    observed.vault_skill_binding_sha256 = _vault_skill_binding_digest(
+                        name,
+                        server_args,
+                        observed.vault_skill_ack,
+                    )
+            observed.error = _redact_vault_skill_ack(redact_exception(exc, self.secrets))
             raise
-        observed.transport_succeeded = True
-        observed.error_code, observed.error = public_result_error(result, self.secrets)
-        observed.succeeded = observed.error_code is None
-        observed.vault_skill_ack = _extract_vault_skill_ack(result, self.secrets)
-        capture_fields = self.capture_result_fields.get(name, frozenset())
-        observed.result_fields = _capture_structured_result_fields(result, capture_fields, self.secrets)
-        preview = _redact_vault_skill_ack(safe_json(result, self.secrets))
-        result_text = (
-            canonical_json({"result_fields": observed.result_fields})
-            if capture_fields
-            else canonical_json(preview)
-        )
-        observed.result_preview = result_text[:2000] + ("…" if len(result_text) > 2000 else "")
-        return result
+        finally:
+            if operation_kind == "material":
+                self.material_calls.append(observed)
+                if self.task is not None and self.fixture is not None and self.token is not None:
+                    attempt_index = len(self.material_calls)
+                    for checkpoint in self.task.expected_final_state.checkpoints:
+                        checkpoint_stage = self.task.expected_material_attempts[
+                            checkpoint.after_attempt - 1
+                        ].stage_id
+                        if observed.stage_id == checkpoint_stage:
+                            self.checkpoint_observations.append(
+                                await self._observe_checkpoint(checkpoint, attempt_index)
+                            )
+
+    async def _observe_checkpoint(self, checkpoint: StateCheckpointContract, attempt_index: int) -> dict[str, Any]:
+        assert self.fixture is not None and self.token is not None
+        try:
+            result_fields = _result_fields_by_stage(self.calls)
+            probe = _resolve_result_probe(checkpoint.probe, result_fields)
+            observation = await self.fixture.observe(probe, token=self.token)
+        except Exception as exc:
+            observation = StateObservation(False, None, error=redact_exception(exc, self.secrets))
+        return {
+            "after_attempt": attempt_index,
+            "available": observation.available,
+            "status_code": observation.status_code,
+            "payload": safe_json(observation.payload, self.secrets),
+            "error": observation.error,
+        }
 
 
 def _capture_structured_result_fields(
@@ -786,9 +2384,13 @@ def _capture_structured_result_fields(
         return {}
     captured: dict[str, str] = {}
     for name in sorted(field_names):
-        candidate = safe_json(source.get(name), secrets)
-        if candidate and isinstance(candidate, str) and len(candidate.encode("utf-8")) <= MAX_CAPTURED_RESULT_FIELD_BYTES:
-            captured[name] = candidate
+        value = source.get(name)
+        if value is None:
+            continue
+        candidate = safe_json(value, secrets)
+        serialized = candidate if isinstance(candidate, str) else canonical_json(candidate)
+        if serialized and len(serialized.encode("utf-8")) <= MAX_CAPTURED_RESULT_FIELD_BYTES:
+            captured[name] = serialized
     return captured
 
 
@@ -841,17 +2443,54 @@ def _extract_vault_skill_ack(result: Any, secrets: tuple[str, ...]) -> str | Non
     return token if isinstance(token, str) and token else None
 
 
+def _extract_vault_skill_ack_from_error(error: BaseException, secrets: tuple[str, ...]) -> str | None:
+    for value in _embedded_json_values(str(error)):
+        if not isinstance(value, dict):
+            continue
+        vault_skill = value.get("vault_skill")
+        if isinstance(vault_skill, dict):
+            token = vault_skill.get("ack_token")
+            if isinstance(token, str) and token and token not in secrets:
+                return token
+    return None
+
+
+def _vault_skill_binding_digest(
+    tool_name: str,
+    arguments: dict[str, Any],
+    ack_token: str,
+) -> str:
+    public_arguments = {key: value for key, value in arguments.items() if key != "_vault_skill_ack"}
+    return hashlib.sha256(
+        canonical_json({"tool_name": tool_name, "arguments": public_arguments, "ack_token": ack_token}).encode("utf-8")
+    ).hexdigest()
+
+
 def _redact_vault_skill_ack(value: Any) -> Any:
     if isinstance(value, str):
         if "ack_token" not in value and "_vault_skill_ack" not in value:
             return value
-        try:
-            embedded = json.loads(value)
-        except json.JSONDecodeError:
-            return value
-        if isinstance(embedded, (dict, list)):
-            return canonical_json(_redact_vault_skill_ack(embedded))
-        return value
+        decoder = json.JSONDecoder()
+        cursor = 0
+        pieces: list[str] = []
+        changed = False
+        while cursor < len(value):
+            starts = [position for marker in "[{" if (position := value.find(marker, cursor)) >= 0]
+            if not starts:
+                pieces.append(value[cursor:])
+                break
+            start = min(starts)
+            pieces.append(value[cursor:start])
+            try:
+                embedded, end = decoder.raw_decode(value, start)
+            except json.JSONDecodeError:
+                pieces.append(value[start : start + 1])
+                cursor = start + 1
+                continue
+            pieces.append(canonical_json(_redact_vault_skill_ack(embedded)))
+            cursor = end
+            changed = True
+        return "".join(pieces) if changed else value
     if isinstance(value, dict):
         redacted = {
             str(key): "[redacted]" if key in {"ack_token", "_vault_skill_ack"} else _redact_vault_skill_ack(item)
@@ -873,49 +2512,112 @@ def _redact_vault_skill_ack(value: Any) -> Any:
 def capture_result_fields_for_task(
     task: TaskManifest,
     operation_map: dict[str, list[str]] | None = None,
+    public_operations: list[PublicOperation] | None = None,
 ) -> dict[str, list[str]]:
     fields: dict[str, set[str]] = defaultdict(set)
-    for binding in task.expected_result_bindings:
-        attempt = task.expected_material_attempts[binding.source_attempt - 1]
+    requested = [
+        (attempt.stage_id, field_name)
+        for attempt in task.expected_material_attempts
+        for field_name in attempt.capture_result_fields
+    ]
+    requested.extend(
+        (binding.source_stage, binding.source_field)
+        for binding in task.expected_result_bindings
+    )
+    attempts = {attempt.stage_id: attempt for attempt in task.expected_material_attempts}
+    for stage_id, field_name in requested:
+        attempt = attempts[stage_id]
         tool_names = (
             [attempt.tool_name]
             if attempt.tool_name is not None
             else (operation_map or {}).get(attempt.logical_operation, [])
         )
         if not tool_names:
-            raise ValueError("result bindings require an exact tool or registered logical operation")
+            raise ValueError("result capture requires an exact tool or registered logical operation")
         for tool_name in tool_names:
-            fields[tool_name].add(binding.source_field)
+            fields[tool_name].add(field_name)
+        if public_operations is not None:
+            for operation in public_operations:
+                if attempt.tool_name is not None and operation.operation != attempt.tool_name:
+                    continue
+                if attempt.tool_name is None and operation.logical_operation != attempt.logical_operation:
+                    continue
+                for route in (operation.baseline, operation.candidate):
+                    fields[route.tool].add(field_name)
     return {tool_name: sorted(names) for tool_name, names in fields.items()}
 
 
-def error_details(error: BaseException) -> tuple[int | None, str | None]:
+def _embedded_json_values(value: str) -> list[Any]:
+    decoder = json.JSONDecoder()
+    values: list[Any] = []
+    cursor = 0
+    while cursor < len(value):
+        starts = [position for marker in "[{" if (position := value.find(marker, cursor)) >= 0]
+        if not starts:
+            break
+        start = min(starts)
+        try:
+            embedded, end = decoder.raw_decode(value, start)
+        except json.JSONDecodeError:
+            cursor = start + 1
+            continue
+        values.append(embedded)
+        cursor = end
+    return values
+
+
+def error_details(
+    error: BaseException,
+    secrets: tuple[str, ...] = (),
+) -> tuple[int | None, str | None, dict[str, str]]:
     response = getattr(error, "response", None)
-    status_code = getattr(error, "status_code", None) or getattr(response, "status_code", None)
+    status_code = getattr(error, "status_code", None)
+    if type(status_code) is not int:
+        status_code = getattr(response, "status_code", None)
+    if type(status_code) is not int or not 100 <= status_code <= 599:
+        status_code = None
     error_code = getattr(error, "code", None)
     if error_code is None:
         error_code = getattr(response, "code", None)
-    if error_code is None and response is not None:
+    payloads: list[dict[str, Any]] = []
+    if response is not None:
         try:
             payload = response.json()
         except Exception:
             payload = None
         if isinstance(payload, dict):
-            detail = payload.get("detail")
-            if isinstance(detail, dict):
-                error_code = detail.get("code")
-            error_code = error_code or payload.get("code")
-    message = str(error)
-    if status_code is None and "403" in message:
-        status_code = 403
-    if error_code is None:
-        for candidate in ("permission_denied", "forbidden"):
-            if candidate in message.casefold():
-                error_code = candidate
-                break
+            payloads.append(payload)
+    if isinstance(error, ToolFailed):
+        try:
+            payload = json.loads(error.message)
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            payloads.append(payload)
+
+    identity: dict[str, str] = {}
+    for payload in payloads:
+        nested_error = payload.get("error")
+        detail = payload.get("detail")
+        for source in (
+            detail if isinstance(detail, dict) else {},
+            nested_error if isinstance(nested_error, dict) else {},
+            payload,
+        ):
+            if error_code is None and isinstance(source.get("code"), str):
+                error_code = source["code"]
+            for key in ("vault", "name", "table", "collection", "uri", "slug", "resource"):
+                value = source.get(key)
+                if isinstance(value, str) and value and len(value) <= 512:
+                    identity[key] = redact_text(value, secrets)
+    # PydanticAI raises ToolFailed only after receiving an MCP result with
+    # isError=true. That is a completed application error, not an HTTP error.
+    if isinstance(error, ToolFailed):
+        status_code = None
     return (
         status_code if isinstance(status_code, int) else None,
         error_code if isinstance(error_code, str) else None,
+        identity,
     )
 
 
@@ -951,10 +2653,14 @@ def public_result_error(result: Any, secrets: tuple[str, ...]) -> tuple[str | No
 class TrialContext:
     task: TaskManifest
     token: str
-    before: StateObservation
-    secrets: tuple[str, ...]
+    before: list[StateObservation]
+    secret_values: Callable[[], tuple[str, ...]]
     local_file_paths: dict[str, Path] = field(default_factory=dict)
     context_token: contextvars.Token[TrialContext | None] | None = None
+
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        return self.secret_values()
 
 
 def render_task_prompt(task: TaskManifest, local_file_paths: dict[str, Path]) -> str:
@@ -1019,17 +2725,26 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
                 if task.fixture.local_files
                 else {}
             )
-            before = await self.fixture.observe(
-                task.expected_final_state.probe.model_copy(
-                    update={"expected_status": task.expected_final_state.resolved_before_expected_status}
-                ),
-                token=token,
-            )
+            before: list[StateObservation] = []
+            for expectation_set in task.expected_final_state.observation_sets:
+                if not expectation_set.check_before:
+                    before.append(StateObservation(True, None, payload=None))
+                elif expectation_set.probe.result_binding is not None:
+                    before.append(StateObservation(False, None, error="result-bound probe has no initial identifier"))
+                else:
+                    before.append(
+                        await self.fixture.observe(
+                            expectation_set.probe.model_copy(
+                                update={"expected_status": expectation_set.resolved_before_expected_status}
+                            ),
+                            token=token,
+                        )
+                    )
             self.context = TrialContext(
                 task=task,
                 token=token,
                 before=before,
-                secrets=self.secrets_for(task.fixture.credential_profile),
+                secret_values=lambda: self.secrets_for(task.fixture.credential_profile),
                 local_file_paths=local_file_paths,
             )
             self.context.context_token = CURRENT_TRIAL.set(self.context)
@@ -1044,7 +2759,14 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
             self.output = ctx.output
             if self.repeat_index is not None:
                 ctx.output.repeat_index = self.repeat_index
-            after = await self.fixture.observe(self.case.inputs.expected_final_state.probe, token=self.context.token)
+            result_fields = _result_fields_by_stage(self.output.tool_calls)
+            after: list[StateObservation] = []
+            for expectation_set in self.case.inputs.expected_final_state.observation_sets:
+                try:
+                    probe = _resolve_result_probe(expectation_set.probe, result_fields)
+                    after.append(await self.fixture.observe(probe, token=self.context.token))
+                except Exception as exc:
+                    after.append(StateObservation(False, None, error=redact_exception(exc, self.context.secrets)))
             ctx.output.finalize(
                 self.case.inputs,
                 self.context.before,
@@ -1076,7 +2798,9 @@ class TrialLifecycle(CaseLifecycle[TaskManifest, TrialOutcome, dict[str, Any]]):
             # one final cleanup reset after the dataset, so teardown never
             # performs a duplicate reset between adjacent cases.
             if self.checkpoint_sink is not None and self.output is not None:
-                status: Literal["completed", "failed"] = "completed" if has_measured_evidence(self.output) else "failed"
+                status: Literal["completed", "failed"] = (
+                    "completed" if has_measured_evidence(self.output, self.case.inputs) else "failed"
+                )
                 await self.checkpoint_sink(self.output, status)
         finally:
             if self.context is not None and self.context.context_token is not None:
@@ -1108,6 +2832,7 @@ class BudgetLedger:
     manifest: BenchmarkRunManifest
     wall_clock: Callable[[], float] | None = None
     requests: int = 0
+    provider_setup_requests: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: Decimal = Decimal("0")
@@ -1117,6 +2842,22 @@ class BudgetLedger:
     _budget_failure: str | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _restored_wall_offset: float = field(default=0.0, repr=False)
+    total_cost_limit_usd: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        registered_limit = Decimal(str(self.manifest.budget.max_total_cost_usd))
+        if self.total_cost_limit_usd is None:
+            self.total_cost_limit_usd = registered_limit
+            return
+        self.total_cost_limit_usd = Decimal(str(self.total_cost_limit_usd))
+        if not self.total_cost_limit_usd.is_finite() or self.total_cost_limit_usd <= 0:
+            raise ValueError("total cost limit must be a positive finite amount")
+        if self.total_cost_limit_usd > registered_limit:
+            raise ValueError("total cost limit cannot exceed the registered manifest cap")
+
+    def _cost_limit(self) -> Decimal:
+        assert self.total_cost_limit_usd is not None
+        return self.total_cost_limit_usd
 
     @property
     def reserved_cost_usd(self) -> Decimal:
@@ -1130,26 +2871,23 @@ class BudgetLedger:
         output_tokens: int,
         cost_usd: float | Decimal,
         wall_seconds: float,
+        provider_setup_requests: int = 0,
         model_work_seconds: float = 0.0,
         budget_failure: str | None = None,
     ) -> None:
         """Restore already-spent usage from a checkpoint before new calls."""
 
         restored_cost = Decimal(str(cost_usd))
-        if min(model_requests, input_tokens, output_tokens, wall_seconds, model_work_seconds) < 0:
+        if min(model_requests, provider_setup_requests, input_tokens, output_tokens, wall_seconds, model_work_seconds) < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
         if not restored_cost.is_finite() or restored_cost < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
         if self._open_reservations:
             raise BudgetExceeded("cannot restore budget accounting while reservations are open")
-        budget = self.manifest.budget
-        if (
-            model_requests > budget.max_model_requests
-            or restored_cost > Decimal(str(budget.max_total_cost_usd))
-            or wall_seconds > budget.max_wall_seconds
-        ):
+        if restored_cost > self._cost_limit():
             raise BudgetExceeded("checkpoint budget totals already exceed the registered run limits")
         self.requests = model_requests
+        self.provider_setup_requests = provider_setup_requests
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.cost_usd = restored_cost
@@ -1166,30 +2904,26 @@ class BudgetLedger:
         output_tokens: int,
         cost_usd: float | Decimal,
         wall_seconds: float,
+        provider_setup_requests: int = 0,
         model_work_seconds: float = 0.0,
         budget_failure: str | None = None,
     ) -> None:
         """Merge one independent arm checkpoint into a shared paired budget."""
 
         restored_cost = Decimal(str(cost_usd))
-        if min(model_requests, input_tokens, output_tokens, wall_seconds, model_work_seconds) < 0:
+        if min(model_requests, provider_setup_requests, input_tokens, output_tokens, wall_seconds, model_work_seconds) < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
         if not restored_cost.is_finite() or restored_cost < 0:
             raise BudgetExceeded("checkpoint budget totals cannot be negative")
         async with self._lock:
             if self._open_reservations:
                 raise BudgetExceeded("cannot restore paired budget while reservations are open")
-            next_requests = self.requests + model_requests
             next_cost = self.cost_usd + restored_cost
             next_wall = max(self.wall_seconds, wall_seconds)
-            budget = self.manifest.budget
-            if (
-                next_requests > budget.max_model_requests
-                or next_cost > Decimal(str(budget.max_total_cost_usd))
-                or next_wall > budget.max_wall_seconds
-            ):
+            if next_cost > self._cost_limit():
                 raise BudgetExceeded("paired checkpoint totals already exceed the registered run limits")
-            self.requests = next_requests
+            self.requests += model_requests
+            self.provider_setup_requests += provider_setup_requests
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
             self.cost_usd = next_cost
@@ -1198,6 +2932,12 @@ class BudgetLedger:
             self._restored_wall_offset = max(self._restored_wall_offset, wall_seconds)
             self._budget_failure = self._budget_failure or budget_failure
             self._assert_reservation_invariant()
+
+    async def record_provider_setup_request(self) -> None:
+        """Record a non-completion provider lookup for artifact reporting."""
+
+        async with self._lock:
+            self.provider_setup_requests += 1
 
     def current_wall_seconds(self) -> float:
         observed = (
@@ -1213,14 +2953,8 @@ class BudgetLedger:
         self.wall_seconds = self.current_wall_seconds()
         return self.wall_seconds
 
-    def remaining_wall_seconds(self) -> float:
-        return max(0.0, self.manifest.budget.max_wall_seconds - self.current_wall_seconds())
-
     def request_timeout_seconds(self) -> float:
-        remaining = self.remaining_wall_seconds()
-        if remaining <= 0:
-            raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
-        return min(float(self.manifest.budget.request_timeout_seconds), remaining)
+        return float(self.manifest.budget.request_timeout_seconds)
 
     def _assert_reservation_invariant(self) -> None:
         if any(
@@ -1255,14 +2989,9 @@ class BudgetLedger:
         if not reservation.is_finite() or reservation < 0:
             raise BudgetExceeded("preregistered worst-case trial cost cannot be negative")
         async with self._lock:
-            budget = self.manifest.budget
             if self._budget_failure is not None:
                 raise BudgetExceeded(f"{self._budget_failure}; no further provider requests are allowed")
-            if self.requests >= budget.max_model_requests:
-                raise BudgetExceeded("max_model_requests exceeded")
-            if self.current_wall_seconds() >= budget.max_wall_seconds:
-                raise BudgetExceeded("max_wall_seconds exceeded")
-            if self.cost_usd + self.reserved_cost_usd + reservation > Decimal(str(budget.max_total_cost_usd)):
+            if self.cost_usd + self.reserved_cost_usd + reservation > self._cost_limit():
                 raise BudgetExceeded("preregistered worst-case trial cost would exceed max_total_cost_usd")
             guard = ProviderRequestGuard(self, reservation)
             self._open_reservations.add(guard)
@@ -1282,16 +3011,11 @@ class BudgetLedger:
                 raise BudgetExceeded("provider request reservation is not open")
             if self._budget_failure is not None:
                 raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
-            if guard.requests >= self.manifest.budget.max_requests_per_trial:
-                raise BudgetExceeded("benchmark incomplete: max_requests_per_trial exceeded")
             if (
                 guard.reserved_cost_usd <= 0
                 or guard.provider_cost_usd >= Decimal(str(self.manifest.budget.max_cost_per_trial_usd))
             ):
                 raise BudgetExceeded("benchmark incomplete: max_cost_per_trial_usd exceeded")
-            if self.requests >= self.manifest.budget.max_model_requests:
-                self._budget_failure = "max_model_requests exceeded"
-                raise BudgetExceeded(f"benchmark incomplete: {self._budget_failure}")
             request_id = guard._next_request_id
             guard._next_request_id += 1
             guard._pending_requests.add(request_id)
@@ -1327,7 +3051,7 @@ class BudgetLedger:
 
             global_failure: str | None = None
             trial_failure: str | None = None
-            if self.cost_usd + self.reserved_cost_usd > Decimal(str(self.manifest.budget.max_total_cost_usd)):
+            if self.cost_usd + self.reserved_cost_usd > self._cost_limit():
                 self._budget_failure = "max_total_cost_usd exceeded"
                 global_failure = self._budget_failure
             if trial_cost > Decimal(str(self.manifest.budget.max_cost_per_trial_usd)):
@@ -1354,7 +3078,6 @@ class BudgetLedger:
             if guard.requests > self.requests:
                 raise BudgetExceeded("provider request accounting is inconsistent")
 
-            trial_requests = max(outcome.model_requests, guard.requests)
             next_requests = self.requests + max(0, outcome.model_requests - guard.requests)
             next_input = self.input_tokens + outcome.input_tokens
             next_output = self.output_tokens + outcome.output_tokens
@@ -1374,17 +3097,13 @@ class BudgetLedger:
             budget = self.manifest.budget
             trial_failure: str | None = None
             global_failure: str | None = None
-            if trial_requests > budget.max_requests_per_trial:
-                trial_failure = "max_requests_per_trial exceeded"
-            elif guard.provider_cost_usd + unrecorded_cost > Decimal(str(budget.max_cost_per_trial_usd)):
+            if guard.provider_cost_usd + unrecorded_cost > Decimal(str(budget.max_cost_per_trial_usd)):
                 trial_failure = "max_cost_per_trial_usd exceeded"
-            elif next_requests > budget.max_model_requests:
-                global_failure = "max_model_requests exceeded"
             remaining_reserved = sum(
                 (owner.reserved_cost_usd for owner in self._open_reservations if owner is not guard),
                 Decimal("0"),
             )
-            if next_cost + remaining_reserved > Decimal(str(budget.max_total_cost_usd)):
+            if next_cost + remaining_reserved > self._cost_limit():
                 global_failure = "max_total_cost_usd exceeded"
 
             self.requests = next_requests
@@ -1440,7 +3159,7 @@ class ProviderRequestGuard:
         return await self.ledger.release_reservation(self)
 
 
-async def run_agent_with_deadline(
+async def run_agent_with_timeout(
     agent: Any,
     prompt: str,
     *,
@@ -1448,36 +3167,22 @@ async def run_agent_with_deadline(
     model_settings: Any,
     usage_limits: Any,
     request_timeout_seconds: float,
-    remaining_wall_seconds: float,
     request_guard: ProviderRequestGuard | None = None,
 ) -> Any:
-    """Run one agent turn under both request and global monotonic deadlines."""
-    if request_timeout_seconds <= 0 or remaining_wall_seconds <= 0:
-        raise GlobalWallDeadlineExceeded("global wall deadline exceeded")
-    effective_timeout = min(request_timeout_seconds, remaining_wall_seconds)
+    """Set the provider's per-request timeout and run the full agent turn."""
+    if request_timeout_seconds <= 0:
+        raise ValueError("provider request timeout must be positive")
     settings = dict(model_settings or {})
-    settings["timeout"] = effective_timeout
+    settings["timeout"] = request_timeout_seconds
     guard_token = PROVIDER_REQUEST_GUARD.set(request_guard)
-    global_deadline = asyncio.timeout(remaining_wall_seconds)
     try:
-        async with global_deadline:
-            try:
-                async with asyncio.timeout(effective_timeout):
-                    return await agent.run(
-                        prompt,
-                        toolsets=toolsets,
-                        model_settings=cast(Any, settings),
-                        usage_limits=usage_limits,
-                        infer_name=False,
-                    )
-            except TimeoutError as exc:
-                if global_deadline.expired():
-                    raise GlobalWallDeadlineExceeded("global wall deadline exceeded") from exc
-                raise ProviderRequestTimeout("provider request timeout") from exc
-    except TimeoutError as exc:
-        if global_deadline.expired():
-            raise GlobalWallDeadlineExceeded("global wall deadline exceeded") from exc
-        raise
+        return await agent.run(
+            prompt,
+            toolsets=toolsets,
+            model_settings=cast(Any, settings),
+            usage_limits=usage_limits,
+            infer_name=False,
+        )
     finally:
         PROVIDER_REQUEST_GUARD.reset(guard_token)
 
@@ -1489,6 +3194,7 @@ class TrialExecutor:
         *,
         arm: str,
         model_spec: ModelSpec,
+        registered_model: dict[str, Any],
         model: OpenAIChatModel,
         transport: str,
         fixture: RuntimeFixture,
@@ -1496,12 +3202,14 @@ class TrialExecutor:
         secrets_for: Callable[[str], tuple[str, ...]],
         ledger: BudgetLedger,
         input_schemas_by_profile: dict[str, dict[str, dict[str, Any]]] | None = None,
-        outcome_sink: Callable[[TrialOutcome], None] | None = None,
+        server_instructions_by_profile: dict[str, str] | None = None,
+        outcome_sink: Callable[[TrialOutcome], Awaitable[None]] | None = None,
         timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
     ) -> None:
         self.manifest = manifest
         self.arm = arm
         self.model_spec = model_spec
+        self.registered_model = registered_model
         self.model = model
         self.transport = transport
         self.fixture = fixture
@@ -1509,11 +3217,18 @@ class TrialExecutor:
         self.secrets_for = secrets_for
         self.ledger = ledger
         self.input_schemas_by_profile = input_schemas_by_profile or {}
+        self.server_instructions_by_profile = server_instructions_by_profile or {}
         self.outcome_sink = outcome_sink
         self.timing_sink = timing_sink
         self._outcome_counts: dict[str, int] = defaultdict(int)
         self.paired_order_position: int | None = None
         self.paired_execution_sequence: int | None = None
+        self.current_repeat_index: int | None = None
+
+    def set_repeat_index(self, repeat_index: int) -> None:
+        if repeat_index < 1:
+            raise ValueError("trial repeat index must be positive")
+        self.current_repeat_index = repeat_index
 
     def set_paired_turn(self, *, order_position: int, execution_sequence: int) -> None:
         self.paired_order_position = order_position
@@ -1522,8 +3237,11 @@ class TrialExecutor:
     def clear_paired_turn(self) -> None:
         self.paired_order_position = None
         self.paired_execution_sequence = None
+        self.current_repeat_index = None
 
     def _tag_paired_turn(self, outcome: TrialOutcome) -> TrialOutcome:
+        if self.current_repeat_index is not None:
+            outcome.repeat_index = self.current_repeat_index
         outcome.paired_order_position = self.paired_order_position
         outcome.paired_execution_sequence = self.paired_execution_sequence
         return outcome
@@ -1537,7 +3255,16 @@ class TrialExecutor:
         recorder = ToolCallRecorder(
             operation_map=self.manifest.operation_map,
             secrets=secrets,
-            capture_result_fields=capture_result_fields_for_task(task, self.manifest.operation_map),
+            secret_values=context.secret_values,
+            capture_result_fields=capture_result_fields_for_task(
+                task, self.manifest.operation_map, self.manifest.public_operations
+            ),
+            task=task,
+            fixture=self.fixture,
+            token=token,
+            arm=self.arm,
+            transport=self.transport,
+            public_operations=self.manifest.public_operations,
         )
         input_schemas = self.input_schemas_by_profile.get(task.fixture.credential_profile)
         if input_schemas is not None:
@@ -1561,11 +3288,15 @@ class TrialExecutor:
                 failure_kind="budget",
             )
             self._tag_paired_turn(outcome)
-            self._record_outcome(outcome)
+            await self._record_outcome(outcome)
             return outcome
         try:
             partial_messages: list[ModelResponse] = []
+            model_input_evidence: list[ModelInputEvidence] = []
+            server_instructions_sha256: str | None = None
             capture_token = MODEL_RESPONSES.set(partial_messages)
+            input_evidence_token = MODEL_INPUT_EVIDENCE.set(model_input_evidence)
+            instructions_token = SERVER_INSTRUCTIONS.set(None)
             try:
                 if self.transport == "stdio":
                     command, args, environment = self.fixture.stdio_command(token)
@@ -1583,78 +3314,98 @@ class TrialExecutor:
                         token=token,
                         app_origin=self.fixture.descriptor.app_origin,
                     )
-                client = create_client(spec)
+                discovery = await discover_server(spec)
+                expected_instructions = self.server_instructions_by_profile.get(task.fixture.credential_profile)
+                if not expected_instructions or discovery.instructions != expected_instructions:
+                    raise RuntimeContractError(
+                        "server instructions differ from the pre-smoke catalog seal",
+                        stage="catalog_capture",
+                    )
+                server_instructions_sha256 = hashlib.sha256(discovery.instructions.encode("utf-8")).hexdigest()
+                SERVER_INSTRUCTIONS.set(discovery.instructions)
+                client = create_client(spec, discovery)
                 toolset = create_toolset(client, recorder)
                 async with toolset:
                     if input_schemas is None:
                         recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
                     agent = Agent(model=self.model, system_prompt=SYSTEM_PROMPT, retries=0)
-                    result = await run_agent_with_deadline(
+                    result = await run_agent_with_timeout(
                         agent,
                         render_task_prompt(task, context.local_file_paths),
                         toolsets=cast(Any, [toolset]),
                         model_settings=self.model.settings,
                         usage_limits=UsageLimits(
-                            request_limit=self.manifest.budget.max_requests_per_trial,
+                            request_limit=None,
                             cost_limit=Decimal(str(self.manifest.budget.max_cost_per_trial_usd)),
                         ),
                         request_timeout_seconds=self.ledger.request_timeout_seconds(),
-                        remaining_wall_seconds=self.ledger.remaining_wall_seconds(),
                         request_guard=request_guard,
                     )
-            except ProviderRequestTimeout:
-                error = "benchmark incomplete: provider request timeout"
-            except GlobalWallDeadlineExceeded:
-                error = "benchmark incomplete: global wall deadline exceeded"
             except asyncio.CancelledError:
                 error = "benchmark incomplete: benchmark interrupted"
             except Exception as exc:
                 error = (
                     "benchmark incomplete: provider request timeout"
                     if is_timeout_exception(exc)
-                    else redact_exception(exc, secrets)
+                    else redact_exception(exc, context.secrets)
                 )
             finally:
+                SERVER_INSTRUCTIONS.reset(instructions_token)
+                MODEL_INPUT_EVIDENCE.reset(input_evidence_token)
                 MODEL_RESPONSES.reset(capture_token)
             latency = time.perf_counter() - started
             outcome = outcome_from_run(
                 task=task,
                 arm=self.arm,
                 model_spec=self.model_spec,
+                registered_model=self.registered_model,
                 transport=self.transport,
                 result=result,
                 recorder=recorder,
                 operation_map=self.manifest.operation_map,
                 tool_resources=self.manifest.tool_resources,
+                public_operations=self.manifest.public_operations,
                 error=error,
                 latency=latency,
-                secrets=secrets,
+                secrets=context.secrets,
                 partial_messages=partial_messages,
                 request_count=request_guard.requests,
+                server_instructions_sha256=server_instructions_sha256,
+                model_input_evidence=model_input_evidence,
             )
             self._tag_paired_turn(outcome)
             if self.timing_sink is not None and (
                 is_provider_wait_failure(outcome.error)
-                or outcome.failure_kind in {"request_timeout", "global_deadline"}
+                or outcome.failure_kind == "request_timeout"
             ):
                 self.timing_sink("provider_wait", started, started + latency)
+            charge_task = asyncio.create_task(self.ledger.charge(outcome, guard=request_guard))
+            interrupted_during_settlement = False
             try:
-                await self.ledger.charge(outcome, guard=request_guard)
+                await asyncio.shield(charge_task)
+            except asyncio.CancelledError:
+                try:
+                    await charge_task
+                except BudgetExceeded as exc:
+                    outcome.error = f"benchmark incomplete: {exc}"
+                    outcome.failure_kind = "budget"
+                interrupted_during_settlement = True
             except BudgetExceeded as exc:
                 outcome.error = f"benchmark incomplete: {exc}"
                 outcome.failure_kind = "budget"
-                self._record_outcome(outcome)
-                return outcome
-            self._record_outcome(outcome)
+            await self._record_outcome(outcome)
+            if interrupted_during_settlement:
+                raise asyncio.CancelledError
             return outcome
         finally:
             await request_guard.release()
 
-    def _record_outcome(self, outcome: TrialOutcome) -> None:
+    async def _record_outcome(self, outcome: TrialOutcome) -> None:
         if self.outcome_sink is not None:
             self._outcome_counts[outcome.task_id] += 1
-            self.outcome_sink(
-                outcome.model_copy(update={"repeat_index": self._outcome_counts[outcome.task_id]})
+            repeat_index = self.current_repeat_index or self._outcome_counts[outcome.task_id]
+            await self.outcome_sink(
+                outcome.model_copy(update={"repeat_index": repeat_index})
             )
 
 
@@ -1664,23 +3415,39 @@ async def execute_smoke(
     manifest: BenchmarkRunManifest,
     arm: str,
     model_spec: ModelSpec,
+    registered_model: dict[str, Any],
     model: OpenAIChatModel,
     transport: str,
     fixture: RuntimeFixture,
     token: str,
     secrets: tuple[str, ...],
+    secret_values: Callable[[], tuple[str, ...]],
     request_timeout_seconds: float,
-    remaining_wall_seconds: float,
     request_guard: ProviderRequestGuard | None = None,
     input_schemas: dict[str, dict[str, Any]] | None = None,
+    expected_server_instructions: str | None = None,
     timing_sink: Callable[[TimingCategory, float, float], None] | None = None,
 ) -> TrialOutcome:
     """Make one real full-catalog request for the pre-run four-cell gate."""
 
+    before = [
+        await fixture.observe(expectation.probe, token=token)
+        for expectation in task.expected_final_state.observation_sets
+    ]
+
     recorder = ToolCallRecorder(
         operation_map=manifest.operation_map,
         secrets=secrets,
-        capture_result_fields=capture_result_fields_for_task(task, manifest.operation_map),
+        secret_values=secret_values,
+        capture_result_fields=capture_result_fields_for_task(
+            task, manifest.operation_map, manifest.public_operations
+        ),
+        task=task,
+        fixture=fixture,
+        token=token,
+        arm=arm,
+        transport=transport,
+        public_operations=manifest.public_operations,
     )
     if input_schemas is not None:
         recorder.set_input_schemas(input_schemas)
@@ -1688,7 +3455,12 @@ async def execute_smoke(
     result: Any = None
     error: str | None = None
     partial_messages: list[ModelResponse] = []
+    model_input_evidence: list[ModelInputEvidence] = []
+    server_instructions_sha256: str | None = None
     capture_token = MODEL_RESPONSES.set(partial_messages)
+    input_evidence_token = MODEL_INPUT_EVIDENCE.set(model_input_evidence)
+    instructions_token = SERVER_INSTRUCTIONS.set(None)
+    input_secrets_token = MODEL_INPUT_SECRET_VALUES.set(secret_values)
     try:
         if transport == "stdio":
             command, args, environment = fixture.stdio_command(token)
@@ -1706,57 +3478,81 @@ async def execute_smoke(
                 token=token,
                 app_origin=fixture.descriptor.app_origin,
             )
-        client = create_client(spec)
+        discovery = await discover_server(spec)
+        if not expected_server_instructions or discovery.instructions != expected_server_instructions:
+            raise RuntimeContractError(
+                "server instructions differ from the pre-smoke catalog seal",
+                stage="catalog_capture",
+            )
+        server_instructions_sha256 = hashlib.sha256(discovery.instructions.encode("utf-8")).hexdigest()
+        SERVER_INSTRUCTIONS.set(discovery.instructions)
+        client = create_client(spec, discovery)
         toolset = create_toolset(client, recorder)
         async with toolset:
             if input_schemas is None:
                 recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
             agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
-            result = await run_agent_with_deadline(
+            result = await run_agent_with_timeout(
                 agent,
                 f"{task.prompt}\nAfter the server confirms the operation, provide a concise final response.",
                 toolsets=cast(Any, [toolset]),
                 model_settings=model.settings,
                 usage_limits=UsageLimits(
-                    request_limit=manifest.budget.max_requests_per_trial,
+                    request_limit=None,
                     cost_limit=Decimal(str(manifest.budget.max_cost_per_trial_usd)),
                 ),
                 request_timeout_seconds=request_timeout_seconds,
-                remaining_wall_seconds=remaining_wall_seconds,
                 request_guard=request_guard,
             )
-    except ProviderRequestTimeout:
-        error = "benchmark incomplete: provider request timeout"
-    except GlobalWallDeadlineExceeded:
-        error = "benchmark incomplete: global wall deadline exceeded"
     except asyncio.CancelledError:
         error = "benchmark incomplete: benchmark interrupted"
     except Exception as exc:
         error = (
             "benchmark incomplete: provider request timeout"
             if is_timeout_exception(exc)
-            else redact_exception(exc, secrets)
+            else redact_exception(exc, secret_values())
         )
     finally:
+        MODEL_INPUT_SECRET_VALUES.reset(input_secrets_token)
+        SERVER_INSTRUCTIONS.reset(instructions_token)
+        MODEL_INPUT_EVIDENCE.reset(input_evidence_token)
         MODEL_RESPONSES.reset(capture_token)
     outcome = outcome_from_run(
         task=task,
         arm=arm,
         model_spec=model_spec,
+        registered_model=registered_model,
         transport=transport,
         result=result,
         recorder=recorder,
         operation_map=manifest.operation_map,
         tool_resources=manifest.tool_resources,
+        public_operations=manifest.public_operations,
         error=error,
         latency=time.perf_counter() - started,
-        secrets=secrets,
+        secrets=secret_values(),
         partial_messages=partial_messages,
         request_count=request_guard.requests if request_guard is not None else None,
+        server_instructions_sha256=server_instructions_sha256,
+        model_input_evidence=model_input_evidence,
+    )
+    result_fields = _result_fields_by_stage(outcome.tool_calls)
+    after: list[StateObservation] = []
+    for expectation in task.expected_final_state.observation_sets:
+        try:
+            probe = _resolve_result_probe(expectation.probe, result_fields)
+            after.append(await fixture.observe(probe, token=token))
+        except Exception as exc:
+            after.append(StateObservation(False, None, error=redact_exception(exc, secret_values())))
+    outcome.finalize(
+        task,
+        before,
+        after,
+        consumer_root=(fixture.stdio_consumer_root if task.fixture.local_files else None),
     )
     if timing_sink is not None and (
         is_provider_wait_failure(outcome.error)
-        or outcome.failure_kind in {"request_timeout", "global_deadline"}
+        or outcome.failure_kind == "request_timeout"
     ):
         timing_sink("provider_wait", started, started + (time.perf_counter() - started))
     return outcome
@@ -1796,17 +3592,26 @@ def build_model(spec: ModelSpec) -> OpenRouterChatModel:
         input_price=spec.input_cost_per_million_usd,
         output_price=spec.output_cost_per_million_usd,
     )
-    settings = dict(spec.settings)
-    settings["extra_body"] = request_body
-    settings["extra_headers"] = {"X-OpenRouter-Metadata": "enabled"}
+    settings = cast(
+        OpenRouterModelSettings,
+        {
+            **spec.settings,
+            "extra_body": request_body,
+            "extra_headers": {"X-OpenRouter-Metadata": "enabled"},
+        },
+    )
     return OpenRouterChatModel(
         spec.model_id,
-        provider=OpenAIProvider(base_url=base_url, api_key=api_key),
+        provider=OpenAIProvider(
+            # The ledger admits one wire request per model call; SDK retries would bypass that accounting.
+            openai_client=AsyncOpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+        ),
         profile=cast(
             Any,
             {
                 "openai_chat_supports_max_completion_tokens": False,
                 "openai_supports_strict_tool_definition": False,
+                "openai_chat_supports_multiple_system_messages": False,
             },
         ),
         settings=cast(Any, settings),
@@ -1818,6 +3623,7 @@ def outcome_from_run(
     task: TaskManifest,
     arm: str,
     model_spec: ModelSpec,
+    registered_model: dict[str, Any],
     transport: str,
     result: Any,
     recorder: ToolCallRecorder,
@@ -1826,8 +3632,11 @@ def outcome_from_run(
     latency: float,
     secrets: tuple[str, ...],
     tool_resources: dict[str, ResourceType] | None = None,
+    public_operations: list[PublicOperation] | None = None,
     partial_messages: list[ModelResponse] | None = None,
     request_count: int | None = None,
+    server_instructions_sha256: str | None = None,
+    model_input_evidence: list[ModelInputEvidence] | None = None,
 ) -> TrialOutcome:
     raw_calls: list[tuple[str, Any]] = []
     provider_evidence: list[dict[str, Any]] = []
@@ -1859,7 +3668,11 @@ def outcome_from_run(
     provider_cost = provider_response_cost(provider_evidence)
     cost = provider_cost if provider_cost is not None else estimate_cost(model_spec, input_tokens, output_tokens)
     cost_source = "provider_response" if provider_cost is not None else "registered_price_snapshot"
-    routing_observed, routing_valid = validate_routing_evidence(provider_evidence, model_spec)
+    routing_observed, routing_valid = validate_routing_evidence(
+        provider_evidence,
+        model_spec,
+        registered_model,
+    )
     if error is None and not routing_observed:
         error = "OpenRouter routing evidence was not returned"
     elif error is None and not routing_valid:
@@ -1878,6 +3691,9 @@ def outcome_from_run(
         secrets,
         input_schemas=recorder.input_schemas,
         tool_resources=tool_resources,
+        arm=arm,
+        transport=transport,
+        public_operations=public_operations,
     )
     first_operation = tool_calls[0].logical_operation if tool_calls else "none"
     successful_mcp_tool_calls = sum(call.succeeded for call in recorder.calls)
@@ -1889,6 +3705,7 @@ def outcome_from_run(
     failure_kind = classify_failure(error, result=result, final_answer=final_answer)
     return TrialOutcome(
         task_id=task.id,
+        cluster_id=task.pair_id,
         category=task.category,
         locale=task.locale,
         arm=arm,
@@ -1897,6 +3714,7 @@ def outcome_from_run(
         transport=transport,
         final_answer_text=final_answer,
         tool_calls=tool_calls,
+        state_checkpoint_observations=list(recorder.checkpoint_observations),
         successful_mcp_tool_calls=successful_mcp_tool_calls,
         follow_up_terminal_response=follow_up_terminal_response,
         first_logical_operation=first_operation,
@@ -1913,6 +3731,8 @@ def outcome_from_run(
         cost_source=cost_source,
         routing_observed=routing_observed,
         routing_valid=routing_valid,
+        server_instructions_sha256=server_instructions_sha256,
+        model_input_evidence=list(model_input_evidence or []),
     )
 
 
@@ -1998,27 +3818,226 @@ def provider_response_cost(evidence: list[dict[str, Any]]) -> float | None:
     return sum(costs) if costs else None
 
 
-def validate_routing_evidence(evidence: list[dict[str, Any]], model_spec: ModelSpec) -> tuple[bool, bool]:
+def registered_route_target(
+    model_spec: ModelSpec,
+    registered_model: dict[str, Any],
+) -> RegisteredRouteTarget | None:
+    """Verify routing against sealed endpoint rows, including the old projection."""
+
+    provider_slug = model_spec.routing.order[0]
+    expected_routing = {
+        "order": model_spec.routing.order,
+        "allow_fallbacks": model_spec.routing.allow_fallbacks,
+        "require_parameters": True,
+        "quantizations": ["fp8"],
+    }
+    if model_spec.routing.model_dump(mode="json") != expected_routing:
+        return None
+    model_record = registered_model.get("model_record")
+    endpoint_snapshot = registered_model.get("endpoint_snapshot")
+    data = endpoint_snapshot.get("data") if isinstance(endpoint_snapshot, dict) else None
+    endpoints = data.get("endpoints") if isinstance(data, dict) else None
+    selected_endpoint = registered_model.get("selected_endpoint")
+    eligible_endpoints = registered_model.get("eligible_endpoints")
+    if (
+        not isinstance(model_record, dict)
+        or model_record.get("id") != model_spec.model_id
+        or not isinstance(model_record.get("canonical_slug"), str)
+        or not isinstance(endpoints, list)
+        or not isinstance(selected_endpoint, dict)
+        or not isinstance(eligible_endpoints, list)
+        or not eligible_endpoints
+    ):
+        return None
+
+    canonical_slug = model_record["canonical_slug"]
+    expected_eligible_endpoints, _ = eligible_openrouter_endpoints(
+        model_spec,
+        canonical_slug,
+        endpoints,
+    )
+    legacy_eligible_endpoints, _ = eligible_openrouter_endpoints(
+        model_spec,
+        canonical_slug,
+        endpoints,
+        legacy_provider_name_tags=True,
+    )
+    if not expected_eligible_endpoints:
+        return None
+    if eligible_endpoints == expected_eligible_endpoints:
+        selected_from = expected_eligible_endpoints
+        derivation = "sealed_openrouter_endpoint_fields_v2"
+        reconciled_legacy_projection = False
+    elif eligible_endpoints == legacy_eligible_endpoints:
+        selected_from = legacy_eligible_endpoints
+        derivation = "sealed_openrouter_endpoint_fields_v2_reconciled_legacy_name_tag_projection_v1"
+        reconciled_legacy_projection = True
+    else:
+        return None
+
+    allowed_providers: set[str] = set()
+    preferred_endpoints: list[dict[str, Any]] = []
+    for endpoint in expected_eligible_endpoints:
+        if (
+            not isinstance(endpoint, dict)
+            or endpoint not in endpoints
+            or endpoint.get("model_id") != model_spec.model_id
+            or endpoint.get("quantization") != "fp8"
+        ):
+            return None
+        provider_name = endpoint.get("provider_name")
+        if not isinstance(provider_name, str) or not provider_name:
+            return None
+        provider_key = provider_name.casefold()
+        if not model_spec.routing.allow_fallbacks and provider_key != provider_slug.casefold():
+            return None
+        if provider_key in allowed_providers:
+            return None
+        allowed_providers.add(provider_key)
+    for endpoint in selected_from:
+        if str(endpoint.get("provider_name", "")).casefold() == provider_slug.casefold():
+            preferred_endpoints.append(endpoint)
+
+    if len(preferred_endpoints) > 1:
+        return None
+    expected_selected = preferred_endpoints[0] if preferred_endpoints else selected_from[0]
+    if selected_endpoint != expected_selected:
+        return None
+    return RegisteredRouteTarget(
+        canonical_model=canonical_slug,
+        eligible_providers=frozenset(allowed_providers),
+        eligibility_derivation=derivation,
+        source_endpoint_snapshot_sha256=hashlib.sha256(canonical_json(endpoint_snapshot).encode("utf-8")).hexdigest(),
+        recorded_eligible_endpoints_sha256=hashlib.sha256(canonical_json(eligible_endpoints).encode("utf-8")).hexdigest(),
+        verified_eligible_endpoints_sha256=hashlib.sha256(
+            canonical_json(expected_eligible_endpoints).encode("utf-8")
+        ).hexdigest(),
+        reconciled_legacy_projection=reconciled_legacy_projection,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredRouteTarget:
+    canonical_model: str
+    eligible_providers: frozenset[str]
+    eligibility_derivation: str
+    source_endpoint_snapshot_sha256: str
+    recorded_eligible_endpoints_sha256: str
+    verified_eligible_endpoints_sha256: str
+    reconciled_legacy_projection: bool
+
+    def lineage(self) -> dict[str, str | bool]:
+        return {
+            "eligibility_derivation": self.eligibility_derivation,
+            "source_endpoint_snapshot_sha256": self.source_endpoint_snapshot_sha256,
+            "recorded_eligible_endpoints_sha256": self.recorded_eligible_endpoints_sha256,
+            "verified_eligible_endpoints_sha256": self.verified_eligible_endpoints_sha256,
+            "reconciled_legacy_projection": self.reconciled_legacy_projection,
+        }
+
+
+def eligible_openrouter_endpoints(
+    model_spec: ModelSpec,
+    canonical_slug: str,
+    endpoints: list[Any],
+    *,
+    legacy_provider_name_tags: bool = False,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Filter raw endpoint rows using their explicit model, quantization, parameters and prices."""
+
+    required_parameters = {"tools", "tool_choice", "temperature", "max_tokens"}
+    eligible: list[dict[str, Any]] = []
+    price_rejections: list[str] = []
+    provider_slug = model_spec.routing.order[0].casefold()
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        provider_name = endpoint.get("provider_name")
+        tag = endpoint.get("tag")
+        endpoint_parameters = endpoint.get("supported_parameters")
+        if (
+            not isinstance(provider_name, str)
+            or not provider_name
+            or not isinstance(tag, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9-]*/fp8", tag) is None
+            or endpoint.get("model_id") != model_spec.model_id
+            or endpoint.get("quantization") != "fp8"
+            or endpoint.get("name") != f"{provider_name} | {canonical_slug}"
+            or not isinstance(endpoint_parameters, list)
+            or not all(isinstance(parameter, str) for parameter in endpoint_parameters)
+            or not required_parameters.issubset(endpoint_parameters)
+            or (
+                legacy_provider_name_tags
+                and tag != f"{provider_name.casefold()}/fp8"
+            )
+            or (
+                not model_spec.routing.allow_fallbacks
+                and provider_name.casefold() != provider_slug
+            )
+        ):
+            continue
+        try:
+            validate_openrouter_endpoint_price_ceiling(model_spec, endpoint)
+        except ValueError as exc:
+            price_rejections.append(str(exc))
+            continue
+        eligible.append(endpoint)
+    return eligible, price_rejections
+
+
+def validate_openrouter_endpoint_price_ceiling(model_spec: ModelSpec, endpoint: dict[str, Any]) -> None:
+    """Reject a registry endpoint whose prompt or completion price exceeds the manifest ceiling."""
+
+    pricing = endpoint.get("pricing")
+    if not isinstance(pricing, dict):
+        raise ValueError(f"provider endpoint pricing is missing for {model_spec.class_name}")
+    for price_name, ceiling_per_million in (
+        ("prompt", model_spec.input_cost_per_million_usd),
+        ("completion", model_spec.output_cost_per_million_usd),
+    ):
+        if price_name not in pricing:
+            raise ValueError(f"provider endpoint {price_name} price is missing for {model_spec.class_name}")
+        try:
+            price_per_token = Decimal(str(pricing[price_name]))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError(f"provider endpoint {price_name} price is invalid for {model_spec.class_name}") from exc
+        if not price_per_token.is_finite() or price_per_token <= 0:
+            raise ValueError(f"provider endpoint {price_name} price must be finite and positive for {model_spec.class_name}")
+        if price_per_token * Decimal(1_000_000) > Decimal(str(ceiling_per_million)):
+            raise ValueError(f"provider endpoint {price_name} price exceeds the manifest ceiling for {model_spec.class_name}")
+
+
+def validate_routing_evidence(
+    evidence: list[dict[str, Any]],
+    model_spec: ModelSpec,
+    registered_model: dict[str, Any],
+) -> tuple[bool, bool]:
     if not evidence:
         return False, False
+    route_target = registered_route_target(model_spec, registered_model)
+    if route_target is None:
+        return False, False
+    canonical_model = route_target.canonical_model
+    eligible_providers = route_target.eligible_providers
     observed = False
     for item in evidence:
         if item.get("model") != model_spec.model_id:
             return observed, False
         routing = item.get("routing")
-        if not isinstance(routing, dict):
+        if not isinstance(routing, dict) or routing.get("requested") != model_spec.model_id:
             return observed, False
         endpoints = routing.get("endpoints")
         available = endpoints.get("available") if isinstance(endpoints, dict) else None
         selected = [
-            endpoint.get("provider")
+            endpoint
             for endpoint in available
             if isinstance(endpoint, dict) and endpoint.get("selected") is True
         ] if isinstance(available, list) else []
         if (
             len(selected) != 1
-            or not isinstance(selected[0], str)
-            or not selected[0].strip()
+            or selected[0].get("model") != canonical_model
+            or not isinstance(selected[0].get("provider"), str)
+            or selected[0]["provider"].casefold() not in eligible_providers
         ):
             return observed, False
         observed = True
@@ -2037,6 +4056,9 @@ def bind_tool_calls(
     *,
     input_schemas: dict[str, dict[str, Any]] | None = None,
     tool_resources: dict[str, ResourceType] | None = None,
+    arm: str = "baseline",
+    transport: str = "http",
+    public_operations: list[PublicOperation] | None = None,
 ) -> list[ToolCallRecord]:
     records: list[ToolCallRecord] = []
     remaining = list(server_calls)
@@ -2044,29 +4066,49 @@ def bind_tool_calls(
         observed_index = next((idx for idx, call in enumerate(remaining) if call.tool_name == name), None)
         observed = remaining.pop(observed_index) if observed_index is not None else None
         raw_dict, raw_valid = decode_raw_args(raw_args)
+        input_schema = input_schemas.get(name) if input_schemas is not None else None
+        public_schema_valid = (
+            public_arguments_match_schema(raw_dict, input_schema)
+            if input_schema is not None
+            else None
+        )
+        route = _public_route(
+            name,
+            observed.server_args if observed is not None else raw_dict or {},
+            public_operations or [],
+            arm=arm,
+            transport=transport,
+        )
         records.append(
             ToolCallRecord(
                 order=order,
                 tool_name=name,
-                logical_operation=logical_operation_for(name, operation_map),
-                resource_type=(tool_resources or {}).get(name, "unknown"),
+                canonical_operation=route.operation if route is not None else None,
+                surface_action=(getattr(route, arm).action if route is not None else None),
+                logical_operation=logical_operation_for(name, operation_map, raw_dict),
+                resource_type=route.resource_type if route is not None else "unknown",
+                operation_kind=observed.operation_kind if observed else "unknown",
                 tool_exists=name in input_schemas if input_schemas is not None else observed is not None,
                 raw_model_args=raw_args,
                 server_args=observed.server_args if observed else None,
                 effective_server_args=(
                     canonicalize_arguments(
                         observed.server_args,
-                        input_schemas.get(name, {}) if input_schemas else {},
+                        input_schema or {},
                     )
                     if observed
                     else None
                 ),
                 raw_args_valid=raw_valid,
+                public_schema_valid=public_schema_valid,
                 server_args_equal_raw=bool(observed and raw_valid and observed.server_args == raw_dict),
                 transport_succeeded=bool(observed and (observed.transport_succeeded or observed.succeeded)),
                 server_succeeded=bool(observed and observed.succeeded),
                 server_status_code=observed.status_code if observed else None,
                 server_error_code=observed.error_code if observed else None,
+                server_error_identity=observed.error_identity if observed else {},
+                stage_id=observed.stage_id if observed else None,
+                vault_skill_binding_sha256=observed.vault_skill_binding_sha256 if observed else None,
                 error=(observed.error if observed else "server call was not observed"),
                 result_preview=observed.result_preview if observed else None,
                 result_fields=observed.result_fields if observed else {},
@@ -2075,24 +4117,44 @@ def bind_tool_calls(
             )
         )
     for observed in remaining:
+        input_schema = input_schemas.get(observed.tool_name) if input_schemas is not None else None
+        public_schema_valid = (
+            public_arguments_match_schema(observed.server_args, input_schema)
+            if input_schema is not None
+            else None
+        )
+        route = _public_route(
+            observed.tool_name,
+            observed.server_args,
+            public_operations or [],
+            arm=arm,
+            transport=transport,
+        )
         records.append(
             ToolCallRecord(
                 order=len(records) + 1,
                 tool_name=observed.tool_name,
-                logical_operation=logical_operation_for(observed.tool_name, operation_map),
-                resource_type=(tool_resources or {}).get(observed.tool_name, "unknown"),
+                canonical_operation=route.operation if route is not None else None,
+                surface_action=(getattr(route, arm).action if route is not None else None),
+                logical_operation=logical_operation_for(observed.tool_name, operation_map, observed.server_args),
+                resource_type=route.resource_type if route is not None else "unknown",
+                operation_kind=observed.operation_kind,
                 tool_exists=(
                     observed.tool_name in input_schemas if input_schemas is not None else True
                 ),
                 server_args=observed.server_args,
                 effective_server_args=canonicalize_arguments(
                     observed.server_args,
-                    input_schemas.get(observed.tool_name, {}) if input_schemas else {},
+                    input_schema or {},
                 ),
+                public_schema_valid=public_schema_valid,
                 transport_succeeded=observed.transport_succeeded or observed.succeeded,
                 server_succeeded=observed.succeeded,
                 server_status_code=observed.status_code,
                 server_error_code=observed.error_code,
+                server_error_identity=observed.error_identity,
+                stage_id=observed.stage_id,
+                vault_skill_binding_sha256=observed.vault_skill_binding_sha256,
                 error=observed.error,
                 result_preview=observed.result_preview,
                 result_fields=observed.result_fields,
@@ -2160,13 +4222,51 @@ def _arguments_include(actual: dict[str, Any] | None, expected: dict[str, Any]) 
             if key == "collection" and expected_value == "":
                 continue
             return False
-        actual_value = actual[key]
-        if isinstance(expected_value, dict):
-            if not isinstance(actual_value, dict) or not _arguments_include(actual_value, expected_value):
-                return False
-        elif actual_value != expected_value:
+        if not _argument_value_includes(actual[key], expected_value):
             return False
     return True
+
+
+def _material_arguments_include(
+    tool_name: str,
+    actual: dict[str, Any] | None,
+    expected: dict[str, Any],
+) -> bool:
+    if tool_name != "akb_import" or expected.get("format") != "okf" or not isinstance(expected.get("files"), dict):
+        return _arguments_include(actual, expected)
+    normalized_actual = _normalize_public_location(actual)
+    normalized_expected = _normalize_public_location(expected)
+    if normalized_actual is None or normalized_expected is None:
+        return False
+    if not okf_import_files_match(normalized_actual.get("files"), normalized_expected["files"]):
+        return False
+    return _arguments_include(
+        {key: value for key, value in normalized_actual.items() if key != "files"},
+        {key: value for key, value in normalized_expected.items() if key != "files"},
+    )
+
+
+def _argument_value_includes(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return False
+        extras = set(actual) - set(expected)
+        optional_column_description = (
+            extras <= {"description"}
+            and "description" in extras
+            and isinstance(expected.get("name"), str)
+            and isinstance(expected.get("type"), str)
+        )
+        if extras and not optional_column_description:
+            return False
+        return _arguments_include(actual, expected)
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(expected)
+            and all(_argument_value_includes(actual_item, expected_item) for actual_item, expected_item in zip(actual, expected, strict=True))
+        )
+    return actual == expected
 
 
 def _semantic_arguments(call: ToolCallRecord) -> dict[str, Any] | None:
@@ -2178,25 +4278,313 @@ def _semantic_arguments(call: ToolCallRecord) -> dict[str, Any] | None:
     )
 
 
-def _vault_skill_handshakes_are_valid(tool_calls: list[ToolCallRecord]) -> bool:
-    for index, call in enumerate(tool_calls):
+def _semantic_arguments_from_dict(arguments: dict[str, Any] | None) -> dict[str, Any] | None:
+    if arguments is None:
+        return None
+    return _normalize_public_location(
+        {key: value for key, value in arguments.items() if key != "_vault_skill_ack"}
+    )
+
+
+def _vault_skill_interstitial_read_is_registered(
+    call: ToolCallRecord,
+    task: TaskManifest,
+) -> bool:
+    if not task.id.startswith("access-ownership-public-"):
+        return False
+    owner_attempts = [
+        attempt
+        for attempt in task.expected_material_attempts
+        if attempt.logical_operation == "update"
+        and attempt.resource_type == "access"
+        and isinstance(attempt.arguments.get("new_owner"), str)
+    ]
+    if len(owner_attempts) != 1:
+        return False
+    arguments = call.effective_server_args or call.server_args
+    owner = owner_attempts[0].arguments["new_owner"]
+    return (
+        call.tool_name == "akb_identity"
+        and call.tool_exists
+        and call.logical_operation == "list"
+        and call.resource_type == "access"
+        and call.operation_kind == "preparatory"
+        and call.server_succeeded
+        and call.server_error_code is None
+        and arguments == {"action": "search_users", "query": owner}
+    )
+
+
+def _vault_skill_handshakes_are_valid(
+    tool_calls: list[ToolCallRecord],
+    task: TaskManifest,
+) -> bool:
+    pending_challenge: ToolCallRecord | None = None
+    interstitial_read_seen = False
+    for call in tool_calls:
         arguments = call.effective_server_args or call.server_args or {}
-        if call.server_error_code == "vault_skill_required":
-            if index + 1 >= len(tool_calls):
+        if pending_challenge is not None:
+            if call.server_error_code == "vault_skill_required":
                 return False
-            retry = tool_calls[index + 1]
-            if (
-                retry.tool_name != call.tool_name
-                or not retry.server_succeeded
-                or not call.vault_skill_ack
-                or retry.vault_skill_retry_ack != call.vault_skill_ack
-                or _semantic_arguments(call) != _semantic_arguments(retry)
+            if "_vault_skill_ack" in arguments:
+                token_matches = (
+                    isinstance(pending_challenge.vault_skill_ack, str)
+                    and isinstance(call.vault_skill_retry_ack, str)
+                    and call.vault_skill_retry_ack == pending_challenge.vault_skill_ack
+                ) or (
+                    pending_challenge.vault_skill_ack is None
+                    and call.vault_skill_retry_ack is None
+                    and isinstance(pending_challenge.vault_skill_binding_sha256, str)
+                    and bool(pending_challenge.vault_skill_binding_sha256)
+                    and call.vault_skill_binding_sha256 == pending_challenge.vault_skill_binding_sha256
+                )
+                if (
+                    call.tool_name != pending_challenge.tool_name
+                    or not call.server_succeeded
+                    or not token_matches
+                    or not pending_challenge.vault_skill_binding_sha256
+                    or call.vault_skill_binding_sha256 != pending_challenge.vault_skill_binding_sha256
+                    or _semantic_arguments(pending_challenge) != _semantic_arguments(call)
+                ):
+                    return False
+                pending_challenge = None
+                interstitial_read_seen = False
+                continue
+            if interstitial_read_seen or not _vault_skill_interstitial_read_is_registered(call, task):
+                return False
+            interstitial_read_seen = True
+            continue
+        if call.server_error_code == "vault_skill_required":
+            if "_vault_skill_ack" in arguments:
+                return False
+            pending_challenge = call
+        elif "_vault_skill_ack" in arguments:
+            return False
+    return pending_challenge is None
+
+
+def _relation_result_contains_edge(
+    call: ToolCallRecord,
+    *,
+    direction: str,
+    relation: str,
+    uri: str,
+) -> bool:
+    if not isinstance(call.result_preview, str):
+        return False
+    try:
+        payload = json.loads(call.result_preview)
+    except json.JSONDecodeError:
+        return False
+    relations = payload.get("relations") if isinstance(payload, dict) else None
+    return isinstance(relations, list) and any(
+        isinstance(item, dict)
+        and item.get("direction") == direction
+        and item.get("relation") == relation
+        and item.get("uri") == uri
+        for item in relations
+    )
+
+
+def _relation_directional_inspection_pair(
+    task: TaskManifest,
+    expected: ExpectedMaterialAttempt,
+    tool_calls: list[ToolCallRecord],
+) -> tuple[ToolCallRecord, ToolCallRecord] | None:
+    """Match outgoing/incoming reads that inspect the same registered edge."""
+
+    if (
+        expected.logical_operation != "read"
+        or expected.resource_type != "relation"
+        or expected.arguments.get("direction") != "both"
+    ):
+        return None
+    expected_index = next(
+        (index for index, item in enumerate(task.expected_material_attempts) if item.stage_id == expected.stage_id),
+        None,
+    )
+    if expected_index is None:
+        return None
+    link_attempt = next(
+        (
+            item
+            for item in task.expected_material_attempts[:expected_index]
+            if item.logical_operation == "update" and item.resource_type == "relation"
+        ),
+        None,
+    )
+    delete_attempt = next(
+        (
+            item
+            for item in task.expected_material_attempts[expected_index + 1 :]
+            if item.logical_operation == "delete" and item.resource_type == "relation"
+        ),
+        None,
+    )
+    source_binding = next(
+        (
+            item
+            for item in task.expected_result_bindings
+            if item.target_stage == expected.stage_id
+            and item.target_argument == "uri"
+            and item.source_field == "uri"
+            and item.relation == "equals"
+        ),
+        None,
+    )
+    if link_attempt is None or delete_attempt is None or source_binding is None:
+        return None
+    calls_by_stage = {
+        call.stage_id: call
+        for call in tool_calls
+        if call.stage_id is not None and call.server_succeeded
+    }
+    source_call = calls_by_stage.get(source_binding.source_stage)
+    if source_call is None:
+        return None
+    source_uri = source_call.result_fields.get(source_binding.source_field)
+    if not isinstance(source_uri, str):
+        return None
+
+    def satisfies_bindings(stage_id: str, arguments: dict[str, Any]) -> bool:
+        for binding in task.expected_result_bindings:
+            if binding.target_stage != stage_id:
+                continue
+            bound_source = calls_by_stage.get(binding.source_stage)
+            value = bound_source.result_fields.get(binding.source_field) if bound_source is not None else None
+            actual = arguments.get(binding.target_argument)
+            if not isinstance(value, str) or not value:
+                return False
+            if binding.relation == "equals" and actual != value:
+                return False
+            if binding.relation == "collection_uri":
+                if "/doc/" not in value or not isinstance(actual, str) or actual != value.split("/doc/", 1)[0]:
+                    return False
+            if binding.relation == "contains" and (
+                not isinstance(actual, str) or value not in actual
             ):
                 return False
-        elif "_vault_skill_ack" in arguments:
-            if index == 0 or tool_calls[index - 1].server_error_code != "vault_skill_required":
-                return False
-    return True
+        return True
+
+    link_candidates = []
+    for call in tool_calls:
+        if (
+            not call.server_succeeded
+            or call.logical_operation != link_attempt.logical_operation
+            or not _resource_matches(call.resource_type, link_attempt.resource_type)
+            or (link_attempt.tool_name is not None and call.tool_name != link_attempt.tool_name)
+        ):
+            continue
+        arguments = call.effective_server_args or call.server_args or {}
+        if _arguments_include(arguments, link_attempt.arguments) and satisfies_bindings(link_attempt.stage_id, arguments):
+            link_candidates.append((call, arguments))
+    if len(link_candidates) != 1:
+        return None
+    link_call, link_args = link_candidates[0]
+    target_uri = link_args.get("target")
+    relation = link_args.get("relation")
+    if (
+        not isinstance(target_uri, str)
+        or not isinstance(relation, str)
+        or relation != link_attempt.arguments.get("relation")
+        or link_args.get("source") != source_uri
+    ):
+        return None
+
+    delete_candidates = []
+    for call in tool_calls:
+        if (
+            not call.server_succeeded
+            or call.logical_operation != delete_attempt.logical_operation
+            or not _resource_matches(call.resource_type, delete_attempt.resource_type)
+            or (delete_attempt.tool_name is not None and call.tool_name != delete_attempt.tool_name)
+            or call.order <= link_call.order
+        ):
+            continue
+        arguments = call.effective_server_args or call.server_args or {}
+        if _arguments_include(arguments, delete_attempt.arguments) and satisfies_bindings(delete_attempt.stage_id, arguments):
+            delete_candidates.append(call)
+    if len(delete_candidates) != 1:
+        return None
+    delete_call = delete_candidates[0]
+    edge_reads: dict[str, list[ToolCallRecord]] = {"outgoing": [], "incoming": []}
+    for call in tool_calls:
+        if (
+            not call.server_succeeded
+            or call.logical_operation != "read"
+            or call.resource_type != "relation"
+            or call.tool_name != "akb_relations"
+            or call.stage_id not in {None, expected.stage_id}
+            or call.order <= link_call.order
+            or call.order >= delete_call.order
+        ):
+            continue
+        arguments = call.effective_server_args or call.server_args or {}
+        direction = arguments.get("direction")
+        uri = arguments.get("uri")
+        if (
+            direction == "outgoing"
+            and uri == source_uri
+            and _relation_result_contains_edge(
+                call,
+                direction="outgoing",
+                relation=relation,
+                uri=target_uri,
+            )
+        ):
+            edge_reads["outgoing"].append(call)
+        elif (
+            direction == "incoming"
+            and uri == target_uri
+            and _relation_result_contains_edge(
+                call,
+                direction="incoming",
+                relation=relation,
+                uri=source_uri,
+            )
+        ):
+            edge_reads["incoming"].append(call)
+    if len(edge_reads["outgoing"]) != 1 or len(edge_reads["incoming"]) != 1:
+        return None
+    outgoing, incoming = edge_reads["outgoing"][0], edge_reads["incoming"][0]
+    if outgoing.order >= incoming.order:
+        return None
+    return outgoing, incoming
+
+
+def _rebind_directional_relation_inspections(
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+) -> None:
+    for expected in task.expected_material_attempts:
+        pair = _relation_directional_inspection_pair(task, expected, tool_calls)
+        if pair is None:
+            continue
+        outgoing, _incoming = pair
+        delete_attempt = next(
+            item
+            for item in task.expected_material_attempts
+            if item.logical_operation == "delete" and item.resource_type == "relation"
+        )
+        delete_call = next(
+            (
+                call
+                for call in tool_calls
+                if call.stage_id == delete_attempt.stage_id and call.server_succeeded
+            ),
+            None,
+        )
+        if delete_call is None:
+            continue
+        if any(
+            call.stage_id == expected.stage_id and call.order < delete_call.order
+            for call in tool_calls
+        ):
+            continue
+        for call in tool_calls:
+            if call.stage_id == expected.stage_id and call.order > delete_call.order:
+                call.stage_id = None
+        outgoing.stage_id = expected.stage_id
 
 
 def _local_file_arguments_match(
@@ -2247,10 +4635,11 @@ def _material_attempt_matches(
         if name not in variable_arguments and name != "_vault_skill_ack"
     }
     if (
-        (expected.tool_name is not None and call.tool_name != expected.tool_name)
+        call.stage_id != expected.stage_id
+        or (expected.tool_name is not None and call.tool_name != expected.tool_name)
         or not _resource_matches(call.resource_type, expected.resource_type)
         or call.logical_operation != expected.logical_operation
-        or not _arguments_include(static_arguments, expected.arguments)
+        or not _material_arguments_include(call.tool_name, static_arguments, expected.arguments)
         or not _local_file_arguments_match(
             actual_arguments,
             expected.local_file_arguments,
@@ -2270,23 +4659,242 @@ def _material_attempt_matches(
     )
 
 
+def _successful_material_stage_calls(
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+    *,
+    consumer_root: str | Path | None,
+) -> tuple[list[ToolCallRecord], bool]:
+    """Resolve the successful required path independently of failed extra attempts."""
+
+    attempts = task.expected_material_attempts
+    if not attempts or any(attempt.outcome != "success" for attempt in attempts):
+        return [], False
+    dynamic_arguments: dict[str, set[str]] = defaultdict(set)
+    for binding in task.expected_result_bindings:
+        dynamic_arguments[binding.target_stage].add(binding.target_argument)
+    resolved, stages_valid = _resolved_material_stage_calls(task, tool_calls)
+    successful_attempts_match = True
+    if stages_valid and len(resolved) == len(attempts):
+        for call, expected in zip(resolved, attempts, strict=True):
+            directional_pair = _relation_directional_inspection_pair(task, expected, tool_calls)
+            if directional_pair is not None:
+                matches = (
+                    call is directional_pair[0]
+                    and call.stage_id == expected.stage_id
+                    and all(item.server_succeeded for item in directional_pair)
+                )
+            else:
+                matches = call.server_succeeded and _material_attempt_matches(
+                    call,
+                    expected,
+                    dynamic_arguments=dynamic_arguments[expected.stage_id],
+                    consumer_root=consumer_root,
+                )
+            successful_attempts_match = successful_attempts_match and matches
+    else:
+        successful_attempts_match = False
+    if successful_attempts_match and all(
+        _material_result_binding_matches(binding, task, tool_calls)
+        for binding in task.expected_result_bindings
+    ):
+        return resolved, True
+
+    # The overlap task can record a failed creation attempt before its valid vault →
+    # document → update → read path. Keep those errors visible while resolving the
+    # successful path independently for the user outcome.
+    if not task.id.startswith("overlapping-document-"):
+        return [], False
+    candidates_by_stage: list[list[ToolCallRecord]] = []
+    for expected in attempts:
+        candidates = []
+        for call in tool_calls:
+            if not call.server_succeeded or call.operation_kind != "material":
+                continue
+            rebound = call.model_copy(update={"stage_id": expected.stage_id})
+            if _material_attempt_matches(
+                rebound,
+                expected,
+                dynamic_arguments=dynamic_arguments[expected.stage_id],
+                consumer_root=consumer_root,
+            ):
+                candidates.append(rebound)
+        candidates_by_stage.append(candidates)
+        if not candidates:
+            return [], False
+
+    selected: list[ToolCallRecord] = []
+    used_orders: set[int] = set()
+    expected_ids = [attempt.stage_id for attempt in attempts]
+
+    def choose(index: int) -> list[ToolCallRecord] | None:
+        if index == len(attempts):
+            ordered = sorted(selected, key=lambda call: call.order)
+            if not _registered_stage_order_matches(task, [call.stage_id or "" for call in ordered], expected_ids):
+                return None
+            bound_calls = [*tool_calls, *selected]
+            if not all(
+                _material_result_binding_matches(binding, task, bound_calls)
+                for binding in task.expected_result_bindings
+            ):
+                return None
+            return list(selected)
+        for candidate in sorted(candidates_by_stage[index], key=lambda call: call.order):
+            if candidate.order in used_orders:
+                continue
+            selected.append(candidate)
+            used_orders.add(candidate.order)
+            result = choose(index + 1)
+            if result is not None:
+                return result
+            used_orders.remove(candidate.order)
+            selected.pop()
+        return None
+
+    completed = choose(0)
+    return (completed, True) if completed is not None else ([], False)
+
+
 def _material_result_binding_matches(
     binding: ExpectedResultBinding,
-    material_calls: list[ToolCallRecord],
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
 ) -> bool:
-    if binding.source_attempt > len(material_calls) or binding.target_attempt > len(material_calls):
+    calls_by_stage = {
+        call.stage_id: call
+        for call in tool_calls
+        if call.stage_id is not None and call.server_succeeded
+    }
+    source_call = calls_by_stage.get(binding.source_stage)
+    target_call = calls_by_stage.get(binding.target_stage)
+    if source_call is None or target_call is None:
         return False
-    source = material_calls[binding.source_attempt - 1].result_fields.get(binding.source_field)
-    target_call = material_calls[binding.target_attempt - 1]
+    source = source_call.result_fields.get(binding.source_field)
     target_arguments = target_call.effective_server_args
     if target_arguments is None:
         target_arguments = target_call.server_args
     target = target_arguments.get(binding.target_argument) if target_arguments is not None else None
-    if not isinstance(source, str) or not source or not isinstance(target, str):
+    if not isinstance(source, str) or not source:
         return False
     if binding.relation == "equals":
-        return target == source
-    return source in target
+        return isinstance(target, str) and target == source
+    if binding.relation == "collection_uri":
+        if "/doc/" not in source or target_arguments is None:
+            return False
+        collection_uri = source.split("/doc/", 1)[0]
+        parsed = urlsplit(collection_uri)
+        collection_prefix = "/coll/"
+        if parsed.scheme != "akb" or not parsed.netloc or not parsed.path.startswith(collection_prefix):
+            return False
+        collection = parsed.path[len(collection_prefix) :]
+        if not collection:
+            return False
+        if binding.target_argument in target_arguments:
+            direct_collection = (
+                target == collection_uri
+                and target_arguments.get("vault", parsed.netloc) == parsed.netloc
+                and target_arguments.get("collection", collection) == collection
+            )
+            if direct_collection:
+                return True
+        if binding.target_argument != "uri":
+            return False
+        direct_pair = (
+            target_arguments.get("vault") == parsed.netloc
+            and target_arguments.get("collection") == collection
+        )
+        if direct_pair:
+            return True
+        return _registered_vault_root_browse_contains_collection(
+            target_call,
+            task,
+            tool_calls=tool_calls,
+            arguments=target_arguments,
+            vault=parsed.netloc,
+            collection_uri=collection_uri,
+        )
+    return isinstance(target, str) and source in target
+
+
+def _resolved_material_stage_calls(
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+) -> tuple[list[ToolCallRecord], bool]:
+    expected_ids = [attempt.stage_id for attempt in task.expected_material_attempts]
+    if not expected_ids:
+        return [], True
+    expected_set = set(expected_ids)
+    groups: dict[str, list[ToolCallRecord]] = defaultdict(list)
+    directional_relation_calls = {
+        id(call)
+        for expected in task.expected_material_attempts
+        if (pair := _relation_directional_inspection_pair(task, expected, tool_calls)) is not None
+        for call in pair
+    }
+    ordered_ids: list[str] = []
+    valid = True
+    for call in tool_calls:
+        if call.stage_id is not None:
+            if call.stage_id not in expected_set:
+                valid = False
+                continue
+            groups[call.stage_id].append(call)
+            if call.stage_id not in ordered_ids:
+                ordered_ids.append(call.stage_id)
+        elif call.operation_kind == "material":
+            if (
+                id(call) not in directional_relation_calls
+                and not _registered_readonly_observation(call, task, tool_calls)
+            ):
+                valid = False
+    if not _registered_stage_order_matches(task, ordered_ids, expected_ids):
+        valid = False
+    resolved: list[ToolCallRecord] = []
+    for stage_id in expected_ids:
+        group = groups.get(stage_id, [])
+        if len(group) == 1:
+            resolved.append(group[0])
+            continue
+        if (
+            len(group) == 2
+            and group[0].server_error_code == "vault_skill_required"
+            and _vault_skill_handshakes_are_valid(group, task)
+        ):
+            resolved.append(group[1])
+            continue
+        valid = False
+        if group:
+            resolved.append(group[-1])
+    return resolved, valid and len(resolved) == len(expected_ids)
+
+
+def _registered_stage_order_matches(
+    task: TaskManifest,
+    observed_ids: list[str],
+    expected_ids: list[str],
+) -> bool:
+    if len(observed_ids) != len(expected_ids):
+        return False
+    suffix_start = _independent_readonly_suffix_start(task)
+    prefix_end = suffix_start if suffix_start is not None else len(expected_ids)
+    expected_prefix = list(expected_ids[:prefix_end])
+    observed_prefix = observed_ids[:prefix_end]
+    prefix_matches = observed_prefix == expected_prefix
+    cleanup_pair = _independent_file_image_cleanup_pair(task)
+    if not prefix_matches and cleanup_pair is not None:
+        cleanup_index, delete_index, _cleanup_attempt, _delete_attempt = cleanup_pair
+        if cleanup_index < prefix_end and delete_index < prefix_end:
+            alternate_prefix = list(expected_prefix)
+            alternate_prefix[cleanup_index], alternate_prefix[delete_index] = (
+                alternate_prefix[delete_index],
+                alternate_prefix[cleanup_index],
+            )
+            prefix_matches = observed_prefix == alternate_prefix
+    if not prefix_matches:
+        return False
+    if suffix_start is None:
+        return True
+    return set(observed_ids[suffix_start:]) == set(expected_ids[suffix_start:])
 
 
 def material_outcome_matches(
@@ -2302,22 +4910,27 @@ def material_outcome_matches(
     if not set(task.required_attempted_operations) <= attempted:
         return False, False
     if task.expected_material_attempts:
-        if len(material_calls) != len(task.expected_material_attempts):
+        stage_calls, stages_valid = _resolved_material_stage_calls(task, tool_calls)
+        if not stages_valid:
             return False, False
-        dynamic_arguments: dict[int, set[str]] = defaultdict(set)
+        dynamic_arguments: dict[str, set[str]] = defaultdict(set)
         for binding in task.expected_result_bindings:
-            dynamic_arguments[binding.target_attempt].add(binding.target_argument)
+            dynamic_arguments[binding.target_stage].add(binding.target_argument)
         attempts_match = all(
-            _material_attempt_matches(
-                call,
-                expected,
-                dynamic_arguments=dynamic_arguments[index],
-                consumer_root=consumer_root,
+            (
+                call is pair[0] and call.stage_id == expected.stage_id
+                if (pair := _relation_directional_inspection_pair(task, expected, tool_calls)) is not None
+                else _material_attempt_matches(
+                    call,
+                    expected,
+                    dynamic_arguments=dynamic_arguments[expected.stage_id],
+                    consumer_root=consumer_root,
+                )
             )
-            for index, (call, expected) in enumerate(zip(material_calls, task.expected_material_attempts), 1)
+            for call, expected in zip(stage_calls, task.expected_material_attempts)
         )
         bindings_match = all(
-            _material_result_binding_matches(binding, material_calls)
+            _material_result_binding_matches(binding, task, tool_calls)
             for binding in task.expected_result_bindings
         )
         return attempts_match and bindings_match, False
@@ -2380,14 +4993,39 @@ def decode_raw_args(raw_args: Any) -> tuple[dict[str, Any] | None, bool]:
     return (decoded, True) if isinstance(decoded, dict) else (None, False)
 
 
-def logical_operation_for(tool_name: str, operation_map: dict[str, list[str]]) -> str:
+def logical_operation_for(
+    tool_name: str,
+    operation_map: dict[str, list[str]],
+    server_args: dict[str, Any] | None = None,
+) -> str:
+    if tool_name == "akb_grep":
+        if server_args is None:
+            return "unknown"
+        if "replace" not in server_args:
+            return "search"
+        return "update" if isinstance(server_args["replace"], str) else "unknown"
     for logical, names in operation_map.items():
         if tool_name in names:
             return logical
     return "unknown"
 
 
-def response_matches_rubric(text: str, task: TaskManifest) -> bool:
+def response_matches_rubric(
+    text: str,
+    task: TaskManifest,
+    *,
+    tool_calls: list[ToolCallRecord] | None = None,
+    state_contract_passed: bool = False,
+    consumer_root: str | Path | None = None,
+) -> bool:
+    if task.id == "table-schema-conflict-en" and tool_calls is not None:
+        return _table_schema_conflict_response_matches(
+            text,
+            task,
+            tool_calls,
+            state_contract_passed=state_contract_passed,
+            consumer_root=consumer_root,
+        )
     if task.response_rubric.require_non_empty and not text.strip():
         return False
     lowered = text.casefold()
@@ -2403,6 +5041,85 @@ def response_matches_rubric(text: str, task: TaskManifest) -> bool:
     ):
         return False
     return True
+
+
+def _table_schema_conflict_response_matches(
+    text: str,
+    task: TaskManifest,
+    tool_calls: list[ToolCallRecord],
+    *,
+    state_contract_passed: bool,
+    consumer_root: str | Path | None,
+) -> bool:
+    if (
+        not state_contract_passed
+        or not text.strip()
+        or any(term.casefold() in text.casefold() for term in task.response_rubric.forbidden_terms)
+    ):
+        return False
+    stage_calls, path_matched = _successful_material_stage_calls(
+        task,
+        tool_calls,
+        consumer_root=consumer_root,
+    )
+    if not path_matched:
+        return False
+    update_attempt = next(
+        (item for item in task.expected_material_attempts if item.logical_operation == "update"),
+        None,
+    )
+    if update_attempt is None:
+        return False
+    update_index = next(
+        index
+        for index, item in enumerate(task.expected_material_attempts)
+        if item.stage_id == update_attempt.stage_id
+    )
+    update_call = stage_calls[update_index]
+    if update_call.stage_id != update_attempt.stage_id or not update_call.server_succeeded:
+        return False
+    try:
+        result = json.loads(update_call.result_preview or "")
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(result, dict):
+        return False
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        result = structured
+    arguments = update_call.effective_server_args or update_call.server_args or {}
+    expected_columns = update_attempt.arguments.get("add_columns")
+    if not isinstance(expected_columns, list) or not expected_columns:
+        return False
+    expected_columns = [
+        {key: column[key] for key in ("name", "type") if key in column}
+        for column in expected_columns
+        if isinstance(column, dict)
+    ]
+    if (
+        result.get("kind") != "table"
+        or result.get("uri") != arguments.get("uri")
+        or result.get("name") != next(
+            (
+                item.arguments.get("name")
+                for item in task.expected_material_attempts
+                if item.resource_type == "table" and item.logical_operation == "create"
+            ),
+            None,
+        )
+        or result.get("columns") != expected_columns
+    ):
+        return False
+    relevant_keys = ("kind", "uri", "name", "columns", "unique_keys", "indexes")
+    expected_response = {key: result[key] for key in relevant_keys if key in result}
+    for block in re.findall(r"```(?:json)?[^\S\r\n]*\r?\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
+        try:
+            response = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(response, dict) and all(response.get(key) == value for key, value in expected_response.items()):
+            return True
+    return False
 
 
 def estimate_cost(spec: ModelSpec, input_tokens: int, output_tokens: int) -> float:
@@ -2430,6 +5147,7 @@ def outcome_metrics(outcome: TrialOutcome) -> dict[str, float | int]:
         "action_error": int(outcome.action_error),
         "argument_error": int(outcome.argument_error),
         "tool_outcome_match": int(outcome.tool_outcome_match),
+        "completion_path_matched": int(outcome.completion_path_matched),
         "user_outcome_completed": int(outcome.user_outcome_completed),
         "protocol_handshake_valid": int(outcome.protocol_handshake_valid),
         "clarification_accuracy": int(outcome.clarification_accuracy),
@@ -2472,6 +5190,7 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
             "first_material_action_accuracy",
             "argument_validity",
             "tool_outcome_match",
+            "completion_path_matched",
             "user_outcome_completed",
             "protocol_handshake_valid",
             "clarification_accuracy",
@@ -2485,7 +5204,7 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
         return {
             "success": EvaluationReason(
                 outcome.success,
-                "final state, rubric, safety, first material action, args, and required operations",
+                "final state, response, successful required path, safety, and stopping contract",
             ),
             "safety": EvaluationReason(outcome.safety, "forbidden operation and deterministic state checks"),
             "first_action_accuracy": EvaluationReason(outcome.first_action_accuracy, "first logical operation"),
@@ -2500,7 +5219,7 @@ class TrialEvaluator(Evaluator[TaskManifest, TrialOutcome, dict[str, Any]]):
             ),
             "user_outcome_completed": EvaluationReason(
                 outcome.user_outcome_completed,
-                "final user state, public outcome, response, and accepted behavior",
+                "final state, response, protocol, required operations, and successful required path",
             ),
             "protocol_handshake_valid": EvaluationReason(
                 outcome.protocol_handshake_valid,

@@ -9,16 +9,16 @@ import contextlib
 from pathlib import Path
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field
 
-from .contracts import ArmName, ContractModel, TaskLocale, hash_json
+from .contracts import ArmName, ContractModel, TaskLocale, TaskManifest, hash_json
 from .evidence import safe_json
 from .execution import TrialOutcome, has_measured_evidence
 
 
-CHECKPOINT_SCHEMA_VERSION: Literal[3] = 3
+CHECKPOINT_SCHEMA_VERSION: Literal[4] = 4
 
 
 class CheckpointError(ValueError):
@@ -26,11 +26,13 @@ class CheckpointError(ValueError):
 
 
 class CheckpointHeader(ContractModel):
-    schema_version: Literal[3] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[4] = CHECKPOINT_SCHEMA_VERSION
     source_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     run_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     task_corpus_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     arm: ArmName
+    pre_smoke_seal_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    pre_smoke_seal_inputs: dict[str, Any] = Field(default_factory=dict)
 
 
 class CheckpointKey(ContractModel):
@@ -50,6 +52,7 @@ class CheckpointKey(ContractModel):
 
 class CheckpointBudget(ContractModel):
     model_requests: int = Field(default=0, ge=0)
+    provider_setup_requests: int = Field(default=0, ge=0)
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     cost_usd: float = Field(default=0.0, ge=0)
@@ -61,6 +64,7 @@ class CheckpointBudget(ContractModel):
 
         return CheckpointBudget(
             model_requests=self.model_requests + outcome.model_requests,
+            provider_setup_requests=self.provider_setup_requests,
             input_tokens=self.input_tokens + outcome.input_tokens,
             output_tokens=self.output_tokens + outcome.output_tokens,
             cost_usd=float(Decimal(str(self.cost_usd)) + Decimal(str(outcome.cost_usd))),
@@ -101,7 +105,7 @@ SmokeTransport = Literal["http", "stdio"]
 
 
 class TrialCheckpoint(ContractModel):
-    schema_version: Literal[3] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[4] = CHECKPOINT_SCHEMA_VERSION
     status: TrialStatus
     key: CheckpointKey
     outcome: TrialOutcome
@@ -109,7 +113,7 @@ class TrialCheckpoint(ContractModel):
 
 
 class SmokeCellCheckpoint(ContractModel):
-    schema_version: Literal[3] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[4] = CHECKPOINT_SCHEMA_VERSION
     status: TrialStatus
     model_class: SmokeModelClass
     model_id: str = Field(min_length=1, max_length=200)
@@ -119,7 +123,7 @@ class SmokeCellCheckpoint(ContractModel):
 
 
 class CheckpointDocument(ContractModel):
-    schema_version: Literal[3] = CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[4] = CHECKPOINT_SCHEMA_VERSION
     lifecycle: Literal["open", "closing", "finalized"] = "open"
     header: CheckpointHeader
     spent: CheckpointBudget = Field(default_factory=CheckpointBudget)
@@ -168,16 +172,16 @@ def timing_hash(timing: CheckpointTiming) -> str:
     return hash_json(timing.model_dump(mode="json"))
 
 
-def valid_completed_outcome(outcome: TrialOutcome) -> bool:
+def valid_completed_outcome(outcome: TrialOutcome, task: TaskManifest | None = None) -> bool:
     """Only measured successful or behavioral-failure trials are reusable."""
 
-    return has_measured_evidence(outcome)
+    return has_measured_evidence(outcome, task)
 
 
-def valid_smoke_outcome(outcome: TrialOutcome) -> bool:
+def valid_smoke_outcome(outcome: TrialOutcome, task: TaskManifest | None = None) -> bool:
     return (
         outcome.error is None
-        and valid_completed_outcome(outcome)
+        and valid_completed_outcome(outcome, task)
         and len(outcome.provider_evidence) == outcome.model_requests
         and all(
             _smoke_response_has_usage(item, outcome.model_id)
@@ -207,12 +211,36 @@ def _smoke_response_has_usage(evidence: dict[str, object], model_id: str) -> boo
     )
 
 
-def status_for_outcome(outcome: TrialOutcome) -> TrialStatus:
-    return "completed" if valid_completed_outcome(outcome) else "failed"
+def status_for_outcome(outcome: TrialOutcome, task: TaskManifest | None = None) -> TrialStatus:
+    return "completed" if valid_completed_outcome(outcome, task) else "failed"
 
 
 class CheckpointStore:
     """Read and atomically rewrite a small JSON checkpoint after each outcome."""
+
+    reuse_terminal_trials = False
+
+    @classmethod
+    def validate_existing_readonly(
+        cls,
+        path: Path,
+        *,
+        header: CheckpointHeader,
+        expected_keys: dict[str, CheckpointKey],
+        expected_tasks: Mapping[str, TaskManifest],
+        expected_smoke_cells: Mapping[str, tuple[SmokeModelClass, str, SmokeTransport]],
+        secrets: tuple[str, ...] = (),
+    ) -> CheckpointDocument:
+        """Validate a checkpoint without reopening or rewriting its lifecycle."""
+
+        store = cls.__new__(cls)
+        store.path = path
+        store.header = header
+        store.expected_keys = expected_keys
+        store.expected_tasks = dict(expected_tasks)
+        store.expected_smoke_cells = dict(expected_smoke_cells)
+        store.secrets = secrets
+        return store._load_existing()
 
     def __init__(
         self,
@@ -220,6 +248,7 @@ class CheckpointStore:
         *,
         header: CheckpointHeader,
         expected_keys: dict[str, CheckpointKey],
+        expected_tasks: Mapping[str, TaskManifest],
         expected_smoke_cells: Mapping[str, tuple[SmokeModelClass, str, SmokeTransport]],
         secrets: tuple[str, ...] = (),
         resume: bool = False,
@@ -227,6 +256,7 @@ class CheckpointStore:
         self.path = path
         self.header = header
         self.expected_keys = expected_keys
+        self.expected_tasks = dict(expected_tasks)
         self.expected_smoke_cells = dict(expected_smoke_cells)
         self.secrets = secrets
         if resume:
@@ -279,9 +309,7 @@ class CheckpointStore:
 
     def budget_failure_reason(self) -> str | None:
         terminal_markers = (
-            "max_model_requests",
             "max_total_cost_usd",
-            "max_wall_seconds",
             "preregistered worst-case trial cost",
         )
         outcomes = (
@@ -303,7 +331,23 @@ class CheckpointStore:
         record = self.document.records.get(checkpoint_key_digest(key))
         if record is None or record.status != "completed":
             return None
-        if not valid_completed_outcome(record.outcome):
+        if not valid_completed_outcome(record.outcome, self._expected_task(key.task_id)):
+            raise CheckpointError("checkpoint contains an invalid completed trial")
+        return record.outcome
+
+    def reusable_outcome_for(self, key: CheckpointKey) -> TrialOutcome | None:
+        """Return a terminal row for paired schedule reconstruction without promoting failures."""
+
+        record = self.document.records.get(checkpoint_key_digest(key))
+        if record is None or record.status == "incomplete":
+            return None
+        self._validate_key(key)
+        if not self._outcome_matches_key(record.outcome, key):
+            raise CheckpointError("checkpoint trial outcome identity does not match its key")
+        if record.status == "completed" and not valid_completed_outcome(
+            record.outcome,
+            self._expected_task(key.task_id),
+        ):
             raise CheckpointError("checkpoint contains an invalid completed trial")
         return record.outcome
 
@@ -313,7 +357,8 @@ class CheckpointStore:
             return None
         if not self._smoke_cell_matches(cell_key, record):
             raise CheckpointError(f"checkpoint smoke cell identity does not match: {cell_key}")
-        if not valid_smoke_outcome(record.outcome):
+        task = self.expected_tasks.get(record.outcome.task_id)
+        if task is None or not valid_smoke_outcome(record.outcome, task):
             raise CheckpointError(f"checkpoint contains an invalid completed smoke cell: {cell_key}")
         return record.outcome
 
@@ -339,8 +384,9 @@ class CheckpointStore:
         safe_outcome = self._safe_outcome(outcome)
         if not self._outcome_matches_key(safe_outcome, key):
             raise CheckpointError("trial outcome does not match its checkpoint key")
-        resolved_status = status or status_for_outcome(safe_outcome)
-        if resolved_status == "completed" and not valid_completed_outcome(safe_outcome):
+        task = self._expected_task(key.task_id)
+        resolved_status = status or status_for_outcome(safe_outcome, task)
+        if resolved_status == "completed" and not valid_completed_outcome(safe_outcome, task):
             raise CheckpointError("a completed checkpoint trial must contain usage and routing evidence")
         digest = checkpoint_key_digest(key)
         existed = digest in self.document.records
@@ -390,8 +436,11 @@ class CheckpointStore:
             or safe_outcome.transport != transport
         ):
             raise CheckpointError("smoke outcome does not match its checkpoint cell")
-        resolved_status = status or status_for_outcome(safe_outcome)
-        if resolved_status == "completed" and not valid_smoke_outcome(safe_outcome):
+        task = self.expected_tasks.get(safe_outcome.task_id)
+        if task is None or task.locale != safe_outcome.locale:
+            raise CheckpointError("smoke outcome does not match a planned task")
+        resolved_status = status or status_for_outcome(safe_outcome, task)
+        if resolved_status == "completed" and not valid_smoke_outcome(safe_outcome, task):
             raise CheckpointError("a completed smoke checkpoint must contain usage and routing evidence")
         existed = cell_key in self.document.smoke_gate
         self.document.smoke_status = "in_progress"
@@ -470,7 +519,8 @@ class CheckpointStore:
             document = CheckpointDocument.model_validate(raw)
         except Exception as exc:
             raise CheckpointError(f"resume checkpoint contract validation failed: {exc}") from exc
-        if document.header != self.header:
+        seal_fields = {"pre_smoke_seal_hash", "pre_smoke_seal_inputs"}
+        if document.header.model_dump(exclude=seal_fields) != self.header.model_dump(exclude=seal_fields):
             raise CheckpointError("resume checkpoint exact-input header does not match this run")
         if document.spent_hash != spent_hash(document.spent):
             raise CheckpointError("resume checkpoint spent-usage digest does not match")
@@ -488,7 +538,10 @@ class CheckpointStore:
                 raise CheckpointError("resume checkpoint trial record digest does not match")
             if not self._outcome_matches_key(trial_record.outcome, trial_record.key):
                 raise CheckpointError("resume checkpoint trial outcome identity does not match its key")
-            if trial_record.status == "completed" and not valid_completed_outcome(trial_record.outcome):
+            if trial_record.status == "completed" and not valid_completed_outcome(
+                trial_record.outcome,
+                self._expected_task(trial_record.key.task_id),
+            ):
                 raise CheckpointError("resume checkpoint contains an invalid completed trial")
         for cell_key, smoke_record in document.smoke_gate.items():
             if not self._smoke_cell_matches(cell_key, smoke_record):
@@ -501,7 +554,10 @@ class CheckpointStore:
                 smoke_record.outcome,
             ):
                 raise CheckpointError("resume checkpoint smoke record digest does not match")
-            if smoke_record.status == "completed" and not valid_smoke_outcome(smoke_record.outcome):
+            task = self.expected_tasks.get(smoke_record.outcome.task_id)
+            if smoke_record.status == "completed" and (
+                task is None or not valid_smoke_outcome(smoke_record.outcome, task)
+            ):
                 raise CheckpointError(f"resume checkpoint contains an invalid completed smoke cell: {cell_key}")
         unknown_smoke = set(document.smoke_gate) - set(self.expected_smoke_cells)
         if unknown_smoke:
@@ -517,6 +573,36 @@ class CheckpointStore:
         if active is not None and active.attempt_index in finalized_indexes:
             raise CheckpointError("resume checkpoint timing attempt is both active and finalized")
         return document
+
+    def bind_pre_smoke_seal(self, seal_hash: str, seal_inputs: dict[str, Any]) -> None:
+        """Bind or verify the exact pre-paid evidence seal before smoke requests."""
+
+        self._ensure_writable()
+        if len(seal_hash) != 64 or any(char not in "0123456789abcdef" for char in seal_hash):
+            raise CheckpointError("pre-smoke seal must be a SHA-256 digest")
+        previous = self.document.header.pre_smoke_seal_hash
+        if previous is not None and previous != seal_hash:
+            raise CheckpointError("resume checkpoint pre-smoke seal does not match this run")
+        previous_inputs = self.document.header.pre_smoke_seal_inputs
+        if previous_inputs and previous_inputs != seal_inputs:
+            raise CheckpointError("resume checkpoint pre-smoke seal inputs do not match this run")
+        if (self.document.records or self.document.smoke_gate or self.document.smoke_status is not None) and (
+            previous is None or previous_inputs != seal_inputs
+        ):
+            raise CheckpointError("resume checkpoint with reusable trials is missing its pre-smoke seal")
+        self.header = self.header.model_copy(
+            update={"pre_smoke_seal_hash": seal_hash, "pre_smoke_seal_inputs": seal_inputs}
+        )
+        self.document.header = self.header
+        self._write_atomic()
+
+    def record_provider_setup_requests(self, count: int) -> None:
+        self._ensure_writable()
+        if count < 0:
+            raise CheckpointError("provider setup request count cannot be negative")
+        self.document.spent.provider_setup_requests += count
+        self.document.spent_hash = spent_hash(self.document.spent)
+        self._write_atomic()
 
     def _ensure_writable(self) -> None:
         if self.document.lifecycle != "open":
@@ -556,6 +642,15 @@ class CheckpointStore:
             raise CheckpointError("resume checkpoint trial key does not match its header")
         if key.task_corpus_hash != self.header.task_corpus_hash or key.arm != self.header.arm:
             raise CheckpointError("resume checkpoint trial key does not match its header")
+        task = self.expected_tasks.get(key.task_id)
+        if task is None or task.locale != key.locale:
+            raise CheckpointError("resume checkpoint trial key does not match its planned task")
+
+    def _expected_task(self, task_id: str) -> TaskManifest:
+        task = self.expected_tasks.get(task_id)
+        if task is None:
+            raise CheckpointError(f"checkpoint trial does not match a planned task: {task_id}")
+        return task
 
     @staticmethod
     def _outcome_matches_key(outcome: TrialOutcome, key: CheckpointKey) -> bool:

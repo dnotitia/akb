@@ -83,13 +83,13 @@ def test_run_stdin_reaches_auth_preflight_without_catalog_or_model_calls(tmp_pat
     assert not output.exists()
 
 
-def test_run_stdin_stops_before_live_calls_when_provider_key_is_missing(tmp_path: Path) -> None:
+def test_standalone_run_requires_isolated_cells_before_live_calls(tmp_path: Path) -> None:
     environment = os.environ.copy()
     provider_key_env = "MCP_BENCH_OPENROUTER_" + "API_KEY"
     environment["MCP_BENCH_OPENROUTER_BASE_URL"] = "https://openrouter.ai/api/v1"
     environment.pop(provider_key_env, None)
     environment["AKB_E2E_PAT"] = "fixture-pat"
-    environment.pop("MCP_BENCH_READ_ONLY_PAT", None)
+    environment["MCP_BENCH_AUTHORIZATION_PAT"] = "fixture-authorization-pat"
     output = tmp_path / "run.json"
 
     completed = subprocess.run(
@@ -114,8 +114,8 @@ def test_run_stdin_stops_before_live_calls_when_provider_key_is_missing(tmp_path
     )
 
     assert completed.returncode == 2
-    assert "needs_user_input" in completed.stderr
-    assert provider_key_env in completed.stderr
+    assert "configuration_error" in completed.stderr
+    assert "isolated benchmark_cells" in completed.stderr
     assert "No such file" not in completed.stderr
     assert not output.exists()
 

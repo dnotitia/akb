@@ -2721,17 +2721,26 @@ class E2ERuntime:
         password_hash: str,
         label: str,
     ) -> uuid.UUID:
-        user_id = uuid.uuid4()
-        await connection.execute(
+        user_id = await connection.fetchval(
             """
-            INSERT INTO users (id, username, email, password_hash)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO users (id, username, email, password_hash, is_admin)
+            VALUES ($1, $2, $3, $4, FALSE)
+            ON CONFLICT (username) DO UPDATE SET
+                password_hash = EXCLUDED.password_hash,
+                is_admin = FALSE,
+                account_status = 'active',
+                credential_change_required = FALSE,
+                updated_at = NOW()
+            WHERE users.email = EXCLUDED.email AND users.is_admin = FALSE
+            RETURNING id
             """,
-            user_id,
+            uuid.uuid4(),
             username,
             f"{label}@invalid.akb",
             password_hash,
         )
+        if not isinstance(user_id, uuid.UUID):
+            raise ProvisioningFailure("fixture user could not be created or safely reused")
         return user_id
 
     async def _insert_fixture_vault(
@@ -3447,6 +3456,19 @@ class E2ERuntime:
             "role": "reader",
             "vault_role": "reader",
             "vault_scope": "target",
+        }
+        fixture_owner_username = "fixture-owner"
+        fixture_owner_id = await self._insert_fixture_user(
+            connection,
+            username=fixture_owner_username,
+            password_hash=password_hash,
+            label=fixture_owner_username,
+        )
+        actors["fixture_owner"] = {
+            "id": str(fixture_owner_id),
+            "username": fixture_owner_username,
+            "role": "fixture_owner",
+            "is_admin": False,
         }
         authorization_vault_id, authorization_vault_name = await self._insert_fixture_vault(
             connection,

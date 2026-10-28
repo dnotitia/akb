@@ -9,6 +9,7 @@ from typing import Any, cast
 from fastmcp import Client
 from fastmcp.client.transports.http import StreamableHttpTransport
 from fastmcp.client.transports.stdio import StdioTransport
+from mcp.types import DiscoverResult
 from pydantic import BaseModel
 from pydantic_ai.mcp import MCPToolset
 
@@ -26,23 +27,53 @@ class ConnectionSpec:
     environment: dict[str, str] | None = None
 
 
-def create_client(spec: ConnectionSpec) -> Client[Any]:
-    """Create one fresh official FastMCP client for a trial."""
-
+def _create_transport(spec: ConnectionSpec) -> Any:
     if spec.transport == "http":
-        transport: Any = StreamableHttpTransport(
+        return StreamableHttpTransport(
             f"{spec.app_origin.rstrip('/')}/mcp/",
             headers={"Authorization": f"Bearer {spec.token}"},
         )
-    elif spec.transport == "stdio":
+    if spec.transport == "stdio":
         if spec.command is None or spec.environment is None:
             raise RuntimeContractError("stdio connection is missing process coordinates")
-        transport = StdioTransport(spec.command, list(spec.args), env=spec.environment)
-    else:
-        raise RuntimeContractError(f"unsupported benchmark transport: {spec.transport}")
+        return StdioTransport(spec.command, list(spec.args), env=spec.environment)
+    raise RuntimeContractError(f"unsupported benchmark transport: {spec.transport}")
+
+
+async def discover_server(spec: ConnectionSpec) -> DiscoverResult:
+    """Read real modern server metadata through the official FastMCP session."""
+
+    probe = Client(
+        cast(Any, _create_transport(spec)),
+        mode=PROTOCOL_REVISION,
+        auto_initialize=False,
+        cache=False,
+    )
+    async with probe:
+        raw_result = await probe.session.send_discover(PROTOCOL_REVISION)
+    try:
+        discovery = DiscoverResult.model_validate(raw_result)
+    except ValueError as exc:
+        raise RuntimeContractError(f"server/discover returned invalid metadata: {exc}") from exc
+    if PROTOCOL_REVISION not in discovery.supported_versions:
+        raise RuntimeContractError("server/discover did not confirm the pinned protocol revision")
+    if discovery.result_type != "complete" or not isinstance(discovery.instructions, str) or not discovery.instructions.strip():
+        raise RuntimeContractError("server/discover did not provide complete metadata and instructions")
+    return discovery
+
+
+def create_client(spec: ConnectionSpec, prior_discover: DiscoverResult) -> Client[Any]:
+    """Create a modern FastMCP client pinned to the server's real discover result."""
+
     # Explicitly pin the modern MCP mode.  `auto` would make a protocol
-    # negotiation choice that is not part of the benchmark comparison.
-    return Client(cast(Any, transport), mode=PROTOCOL_REVISION, cache=False)
+    # negotiation choice that is not part of the benchmark comparison. The
+    # discover result came from the server and is adopted by this client.
+    return Client(
+        cast(Any, _create_transport(spec)),
+        mode=PROTOCOL_REVISION,
+        prior_discover=prior_discover,
+        cache=False,
+    )
 
 
 def create_toolset(client: Client[Any], recorder: Any = None) -> MCPToolset:
@@ -57,7 +88,7 @@ def create_toolset(client: Client[Any], recorder: Any = None) -> MCPToolset:
         cache_tools=False,
         cache_resources=False,
         cache_prompts=False,
-        include_instructions=False,
+        include_instructions=True,
     )
 
 
@@ -84,7 +115,8 @@ async def capture_catalog(
         )
     else:
         spec = ConnectionSpec(transport=transport, token=token, app_origin=fixture.descriptor.app_origin)
-    client = create_client(spec)
+    discovery = await discover_server(spec)
+    client = create_client(spec, discovery)
     toolset = create_toolset(client)
     async with toolset:
         tools = await toolset.list_tools()
@@ -100,6 +132,7 @@ async def capture_catalog(
         tool_count=len(tool_dicts),
         catalog_hash=hash_json(tool_dicts),
         catalog_token_estimate=token_estimate(tool_dicts),
+        server_discover=discovery.model_dump(mode="json", by_alias=True, exclude_none=False),
         tools=tool_dicts,
     )
 

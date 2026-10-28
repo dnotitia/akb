@@ -10,6 +10,10 @@ dependencies = [
     "mcp==2.2.0",
     "mcp-types==2.2.0",
     "httpx==0.28.1",
+    "jsonschema==4.26.0",
+    "pyyaml==6.0.3",
+    "scipy==1.18.1",
+    "sqlglot==30.22.0",
 ]
 
 [project.optional-dependencies]

@@ -194,13 +194,13 @@ def test_descriptor_rejects_cross_origin_reset() -> None:
 
 
 @pytest.mark.asyncio
-async def test_state_probe_can_treat_expected_absence_as_available_evidence() -> None:
+async def test_state_probe_records_json_responses_even_when_status_differs_from_final_expectation() -> None:
     descriptor = RuntimeDescriptor.from_dict(descriptor_dict())
     fixture = RuntimeFixture(descriptor)
     fixture.client = _ObserveClient()  # type: ignore[assignment]
 
     observation = await fixture.observe(
-        StateProbe(service="app", path="/api/v1/browse/not-created", expected_status=404),
+        StateProbe(service="app", path="/api/v1/browse/not-created", expected_status=200),
         token="fixture-token",
     )
 
