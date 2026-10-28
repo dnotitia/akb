@@ -2569,7 +2569,7 @@ class SearchService:
         """Return the document's distinct section paths, without their bodies,
         in first-occurrence order.
 
-        Used by `akb_drill_down`'s empty-match fallback to surface the
+        Used by `akb_get`'s empty-match fallback to surface the
         available headings cheaply — pulling full content for a 1000-
         section doc just to extract heading strings is wasteful.
 

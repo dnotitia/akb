@@ -282,7 +282,7 @@ def split_browse_uri(uri: str) -> tuple[str, str | None]:
     - ``akb://V/coll/X/Y``              → ``("V", "X/Y")`` — nested
 
     Raises ``ValueError`` for typed URIs (those are leaf resources —
-    drill into them with ``akb_get`` / ``akb_drill_down`` / ``akb_sql``
+    drill into them with ``akb_get`` / ``akb_sql``
     / ``akb_get_file`` instead) and for malformed input.
     """
     parsed = parse_uri(uri)

@@ -249,7 +249,7 @@ def drill_down_handler(monkeypatch):
         monkeypatch.setattr(
             mcp_server.search_service, "list_section_headings", fake_headings
         )
-        return mcp_server._handle_drill_down
+        return mcp_server._handle_get
 
     return configure
 
@@ -277,7 +277,7 @@ async def test_sections_envelope_keeps_its_baseline_keys(drill_down_handler):
         headings=["# A"],
     )
 
-    response = await handler({"uri": URI}, "user-1", None)
+    response = await handler({"uri": URI, "mode": "sections"}, "user-1", None)
 
     assert BASELINE_SECTIONS_RESPONSE <= set(response)
     assert BASELINE_DRILL_DOWN_SECTION <= set(response["sections"][0])
@@ -286,7 +286,7 @@ async def test_sections_envelope_keeps_its_baseline_keys(drill_down_handler):
 async def test_empty_match_envelope_keeps_its_baseline_keys(drill_down_handler):
     handler = drill_down_handler(sections=[], headings=["# A", "# B"])
 
-    response = await handler({"uri": URI, "section": "Nope"}, "user-1", None)
+    response = await handler({"uri": URI, "mode": "sections", "section": "Nope"}, "user-1", None)
 
     assert BASELINE_EMPTY_SECTIONS_RESPONSE <= set(response)
     assert response["sections"] == []

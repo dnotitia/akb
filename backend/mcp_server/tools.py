@@ -199,7 +199,7 @@ TOOLS = [
     Tool(
         name="akb_get",
         description=(
-            "Retrieve a document by its URI. Returns full content with metadata. "
+            "Read a document by URI: full content and metadata by default, sections, or outline. Sections may be filtered by heading or body pattern; only full supports version. "
             "Use akb_browse or akb_search first to obtain the URI. "
             "Optionally pass a commit hash (from akb_history) to read a previous version."
         ),
@@ -207,9 +207,22 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI — akb://{vault}[/coll/{coll_path}]/doc/{filename}"},
-                "version": {"type": "string", "description": "Git commit hash for a specific version (from akb_history)"},
+                "version": {"type": "string", "description": "Commit hash for full mode only"},
+                "mode": {"type": "string", "enum": ["full", "sections", "outline"], "default": "full"},
+                "section": {"type": "string", "description": "Heading substring; sections mode only"},
+                "pattern": {"type": "string", "description": "Body substring; sections mode only"},
             },
             "required": ["uri"],
+            "allOf": [
+                {
+                    "if": {"properties": {"mode": {"const": "sections"}}, "required": ["mode"]},
+                    "else": {"not": {"anyOf": [{"required": ["section"]}, {"required": ["pattern"]}]}},
+                },
+                {
+                    "if": {"properties": {"mode": {"enum": ["sections", "outline"]}}, "required": ["mode"]},
+                    "then": {"not": {"required": ["version"]}},
+                },
+            ],
         },
     ),
     Tool(
@@ -421,7 +434,7 @@ TOOLS = [
             "(code, URLs, version numbers) prefer akb_grep. Returns each hit's `uri`; "
             "`collection_summary` and `vault_description` describe the hit's parent "
             "context but do not affect matching or ranking. "
-            "Use akb_drill_down or akb_get with that URI for full content. "
+            "Use akb_get with that URI for full content or sections. "
             "Response reports `returned` (in `results`) and `total_matches` (size of the "
             "deduped prefetch pool — NOT a corpus-wide hit count; vector ANN is top-K only). "
             "When `truncated=true` the prefetch pool was capped, meaning the corpus may hold "
@@ -562,37 +575,6 @@ TOOLS = [
                 },
             },
             "required": ["pattern"],
-        },
-    ),
-    Tool(
-        name="akb_drill_down",
-        description=(
-            "Read section-level (L3) content of a document, or list its "
-            "section headings.\n"
-            "Two modes:\n"
-            "- `mode='sections'` (default): return body content of matched "
-            "sections. Filter with `section` (heading substring) and/or "
-            "`pattern` (substring grep on body). On empty match the response "
-            "carries an `outline` so you can retry.\n"
-            "- `mode='outline'`: return heading paths only (no bodies). "
-            "Use this to discover the document's structure cheaply before "
-            "deciding which section to read.\n"
-            "Returns {uri, sections|outline, returned, total?, truncated?, hint?}."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "uri": {"type": "string", "description": "Document URI"},
-                "mode": {
-                    "type": "string",
-                    "enum": ["sections", "outline"],
-                    "default": "sections",
-                    "description": "'sections' for body content, 'outline' for heading paths only.",
-                },
-                "section": {"type": "string", "description": "Section heading filter (partial match). Used in `sections` mode."},
-                "pattern": {"type": "string", "description": "Substring grep inside matched section bodies (case-insensitive). Used in `sections` mode."},
-            },
-            "required": ["uri"],
         },
     ),
     Tool(

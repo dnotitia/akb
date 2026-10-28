@@ -102,3 +102,39 @@ def test_relation_tool_descriptions_match_the_vault_boundary():
     assert "explicit" in relations and "implicit" in relations
     unlink = tools["akb_unlink"].description.lower()
     assert "explicit" in unlink and "implicit" in unlink
+
+
+def test_document_reads_share_one_public_tool():
+    tools = {tool.name: tool for tool in TOOLS}
+    assert "akb_drill_down" not in tools
+    assert len(tools) == 43
+    schema = tools["akb_get"].input_schema["properties"]
+    assert schema["mode"]["enum"] == ["full", "sections", "outline"]
+    assert schema["mode"]["default"] == "full"
+    assert {"section", "pattern", "version"} <= schema.keys()
+
+
+async def test_document_read_modes_and_invalid_arguments(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
+    from mcp_server import server
+
+    monkeypatch.setattr(server, "check_vault_access", AsyncMock())
+    monkeypatch.setattr(server.doc_service, "get", AsyncMock(return_value=SimpleNamespace(model_dump=lambda: {"content": "whole", "current_commit": "abc"})))
+    monkeypatch.setattr(server.search_service, "drill_down", AsyncMock(return_value=[{"section_path": "# 한글", "content": "selected"}]))
+    monkeypatch.setattr(server.search_service, "list_section_headings", AsyncMock(return_value=["# 한글"]))
+    user = server._MCPUser(user_id="u")
+    uri = "akb://v/doc/a.md"
+    full = await server._dispatch("akb_get", {"uri": uri}, user)
+    assert full["content"] == "whole"
+    sections = await server._dispatch("akb_get", {"uri": uri, "mode": "sections", "section": "한글"}, user)
+    assert sections["sections"][0]["content"] == "selected"
+    outline = await server._dispatch("akb_get", {"uri": uri, "mode": "outline"}, user)
+    assert outline["outline"] == ["# 한글"]
+    for bad in ({"mode": None}, {"mode": "unknown"}, {"section": "한글"}, {"mode": "outline", "pattern": "x"}, {"mode": "sections", "version": "abcdef0"}, {"mode": "sections", "section": None}, {"version": 4}, {"version": ""}):
+        result = await server._dispatch("akb_get", {"uri": uri, **bad}, user)
+        assert "error" in result, bad

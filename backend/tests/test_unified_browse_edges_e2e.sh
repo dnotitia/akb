@@ -688,7 +688,7 @@ print(int(d.get('path')=='specs'))
 # Passing a doc/table/file URI to browse is an error (those are leaves).
 R=$(mcp_call akb_browse "{\"uri\":\"akb://$VAULT/doc/root-uri-doc.md\"}" | mcp_result)
 DRILL_REJECT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('error' in d)" 2>/dev/null)
-[ "$DRILL_REJECT" = "True" ] && pass "browse(uri=doc/...) rejected — use akb_get/akb_drill_down for leaves" || fail "Leaf URI rejection" "should have errored"
+[ "$DRILL_REJECT" = "True" ] && pass "browse(uri=doc/...) rejected — use akb_get for leaves" || fail "Leaf URI rejection" "should have errored"
 
 # ── 23. akb_graph: depth → hops rename (0.3.0) ─────────────────
 echo ""
@@ -749,9 +749,9 @@ case "$COLL_FIELD" in
   *)   fail "Search collection field" "got '$COLL_FIELD'" ;;
 esac
 
-# ── 25. akb_drill_down sub_sections hint (0.3.0) ───────────────
+# ── 25. akb_get sub_sections hint (0.3.0) ───────────────
 echo ""
-echo "▸ 25. akb_drill_down sub_sections hint"
+echo "▸ 25. akb_get sub_sections hint"
 
 # Create a doc with nested headings so drill_down has children to surface.
 R=$(mcp_call akb_put "{\"vault\":\"$VAULT\",\"collection\":\"docs\",\"title\":\"hierarchy\",\"content\":\"# Setup\\n\\nintro\\n\\n## Setup/Install\\n\\ninstall steps\\n\\n## Setup/Configure\\n\\nconfig steps\",\"type\":\"reference\"}" | mcp_result)
@@ -761,7 +761,7 @@ HIER_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['
 sleep 2
 
 # Drill into the parent section — response should suggest sub-sections.
-R=$(mcp_call akb_drill_down "{\"uri\":\"$HIER_URI\",\"section\":\"Setup\"}" | mcp_result)
+R=$(mcp_call akb_get "{\"uri\":\"$HIER_URI\",\"mode\":\"sections\",\"section\":\"Setup\"}" | mcp_result)
 HINT_OK=$(echo "$R" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -774,7 +774,7 @@ ok = (
 )
 print(int(ok))
 " 2>/dev/null)
-[ "$HINT_OK" = "1" ] && pass "akb_drill_down: hint or sub_sections surfaced on match" || fail "Drill-down hint" "shape=$R"
+[ "$HINT_OK" = "1" ] && pass "akb_get: hint or sub_sections surfaced on match" || fail "Drill-down hint" "shape=$R"
 
 # Cleanup the sentinel resources we created in 21/25 — keeps the
 # response in §18's depth assertions stable for any future reruns.

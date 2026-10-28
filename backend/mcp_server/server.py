@@ -315,7 +315,6 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_get": _READ_SCOPE,
     "akb_search": _READ_SCOPE,
     "akb_grep": _READ_SCOPE,
-    "akb_drill_down": _READ_SCOPE,
     "akb_activity": _READ_SCOPE,
     "akb_diff": _READ_SCOPE,
     "akb_history": _READ_SCOPE,
@@ -646,11 +645,23 @@ def _resolve_parent(args: dict, *, kind_name: str) -> tuple[str, str]:
 
 @_h("akb_get")
 async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
+    mode = args.get("mode", "full")
+    if not isinstance(mode, str) or mode not in ("full", "sections", "outline"):
+        return err("mode must be full, sections, or outline", code=INVALID_ARGUMENT)
+    for key in ("uri", "version", "section", "pattern"):
+        if key in args and not isinstance(args[key], str):
+            return err(f"{key} must be a string", code=INVALID_ARGUMENT)
+    if mode != "sections" and any(key in args for key in ("section", "pattern")):
+        return err("section and pattern require sections mode", code=INVALID_ARGUMENT)
+    if mode != "full" and "version" in args:
+        return err("version requires full mode", code=INVALID_ARGUMENT)
+    if mode != "full":
+        return await _read_sections(args, uid, mode)
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="reader")
-    version = args.get("version")
-    if version:
+    if "version" in args:
+        version: str = args["version"]
         if not HEX_COMMIT_RE.fullmatch(version):
             return err(
                 "version must be a 7-64 char lowercase hex commit hash; "
@@ -921,10 +932,9 @@ async def _handle_grep(args: dict, uid: str, user: _MCPUser) -> dict:
     return result
 
 
-@_h("akb_drill_down")
-async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
+async def _read_sections(args: dict, uid: str, mode: str) -> dict:
     # Two modes:
-    #   - "sections" (default): return body content for matched sections,
+    #   - "sections": return body content for matched sections,
     #     optionally narrowed by `pattern` (substring grep on body).
     #   - "outline":            return heading paths only (no bodies).
     #     Use this to discover what sections exist in a long document
@@ -933,8 +943,8 @@ async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
     # `outline` so the agent has something to retry against.
     OUTLINE_CAP = 50
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
+    doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="reader")
-    mode = args.get("mode") or "sections"
 
     if mode == "outline":
         # Fetch one more than the cap so we can tell whether the
@@ -956,7 +966,7 @@ async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
             response["truncated"] = True
             response["hint"] = (
                 f"More than {OUTLINE_CAP} headings exist — outline is capped. "
-                f"Call again with `section` set to a known prefix to narrow."
+                f"Call again in sections mode with `section` set to a known prefix to narrow."
             )
         else:
             response["total"] = len(headings)

@@ -75,7 +75,7 @@ async def drill_down(
     if parsed is None or parsed.kind != "doc" or parsed.identifier is None:
         raise HTTPException(status_code=400, detail=f"Expected a doc URI, got {uri!r}")
     vault, doc_path = parsed.vault, parsed.identifier
-    # MCP `akb_drill_down` enforces vault ACL via check_vault_access; the
+    # MCP `akb_get` enforces vault ACL via check_vault_access; the
     # REST entry-point used to skip it, letting any authenticated user
     # read chunk content from any vault they don't belong to.
     await check_vault_access(user.user_id, vault, required_role="reader")

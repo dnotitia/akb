@@ -1,4 +1,4 @@
-"""`akb_drill_down(mode='outline')` lists headings, not chunks.
+"""`akb_get(mode='outline')` lists headings, not chunks.
 
 A section longer than `MAX_CHUNK_SIZE` is stored as several chunks that
 all carry the same `section_path`. The outline used to emit one row per

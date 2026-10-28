@@ -2,7 +2,7 @@
 name: akb-query
 description: Answer a question from the AKB vault — decompose, search (hybrid / graph), ground in compiled-truth-over-timeline precedence, and synthesize a cited answer with gap/conflict/stale flags. Read-only.
 argument-hint: '{question} --vault {name}'
-allowed-tools: Read, mcp__akb__akb_search, mcp__akb__akb_relations, mcp__akb__akb_graph, mcp__akb__akb_provenance, mcp__akb__akb_get, mcp__akb__akb_drill_down, mcp__akb__akb_browse, mcp__akb__akb_activity
+allowed-tools: Read, mcp__akb__akb_search, mcp__akb__akb_relations, mcp__akb__akb_graph, mcp__akb__akb_provenance, mcp__akb__akb_get, mcp__akb__akb_browse, mcp__akb__akb_activity
 ---
 
 # AKB Query
@@ -65,8 +65,8 @@ Dedup the combined hits by document URI before Phase 3.
 
 For the top 3–5 deduped hits, read enough to answer — cheapest read first:
 
-1. `akb_drill_down(uri="{uri}", mode="outline")` to see the document's structure.
-2. Read the **compiled-truth (top) sections first** via `akb_drill_down(uri, section="…")` — that is the document's current best understanding. Treat the **timeline (bottom) section** as supporting evidence, not the headline.
+1. `akb_get(uri="{uri}", mode="outline")` to see the document's structure.
+2. Read the **compiled-truth (top) sections first** via `akb_get(uri, mode="sections", section="…")` — that is the document's current best understanding. Treat the **timeline (bottom) section** as supporting evidence, not the headline.
 3. `akb_get(uri)` only when you need the full document.
 4. `akb_provenance(uri)` when the question is about authorship or recency ("who decided…", "when was…") — document-level who/when.
 

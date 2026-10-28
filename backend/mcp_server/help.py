@@ -29,8 +29,8 @@ All connected via a unified knowledge graph with AKB URI scheme.
 | Topic | Tools | What it does |
 |-------|-------|--------------|
 | `quickstart` | — | Step-by-step first session guide |
-| `documents` | put, get, update, delete, browse, drill_down | Create and manage documents |
-| `search` | search, browse, drill_down | Find and read documents |
+| `documents` | put, get, update, delete, browse | Create and manage documents |
+| `search` | search, browse, get | Find and read documents |
 | `tables` | create_table, sql, alter_table, drop_table | Structured data (real PG tables + SQL) |
 | `files` | put_file, get_file, delete_file | Binary files (S3-backed) |
 | `images` | put_image, discard_image | Inline images for Markdown documents |
@@ -85,7 +85,7 @@ akb_browse(vault="engineering", collection="decisions")
 akb_get(uri="akb://engineering/doc/decisions/use-grpc.md")
 → full document with metadata
 
-akb_drill_down(uri="akb://engineering/doc/decisions/use-grpc.md", section="Background")
+akb_get(mode="sections", uri="akb://engineering/doc/decisions/use-grpc.md", section="Background")
 → just the Background section
 ```
 The `uri` is an AKB URI of the form `akb://{vault}/{type}/{identifier}`.
@@ -127,7 +127,7 @@ Each document has: vault, collection (directory), title, content, type, tags, st
 | `akb_edit` | Applying a partial edit via exact string replacement (saves tokens) |
 | `akb_delete` | Removing a document |
 | `akb_browse` | Exploring what exists (tree view) |
-| `akb_drill_down` | Reading specific sections of a long document |
+| `akb_get(mode="sections")` | Reading specific sections of a long document |
 | `akb_put_image` | Uploading a local image to embed in Markdown |
 | `akb_create_collection` | Creating an empty collection (folder) in a vault |
 | `akb_delete_collection` | Deleting a collection (with optional `recursive=true` cascade) |
@@ -156,7 +156,7 @@ akb_put(..., related_to=["akb://v/doc/path/to/related.md"], depends_on=["akb://v
 akb_browse(vault="v")            # default depth=1 — root + first level of collection contents
 akb_browse(vault="v", depth=0)   # narrowest — root contents only, no descent
 akb_browse(vault="v", depth=-1)  # heaviest — entire subtree of the vault
-akb_drill_down(uri="akb://v/doc/path/to/file.md", section="API")  # one section
+akb_get(mode="sections", uri="akb://v/doc/path/to/file.md", section="API")  # one section
 ```
 
 **Update only what changed:**
@@ -205,7 +205,7 @@ akb_search(query="auth flow", source_uris=[
 - `title`, `summary`: overview
 - `matched_section`: the most relevant chunk
 - `source_type`: `"document"`, `"table"`, or `"file"` — **dispatch follow-up tool accordingly**
-- `uri`: pass to `akb_get` / `akb_drill_down` for documents,
+- `uri`: pass to `akb_get` for documents,
         `akb_sql` for tables, `akb_get_file` for files
 - `vault`, `path`, `tags`, `doc_type`: metadata
 
@@ -221,12 +221,12 @@ akb_browse(vault="v", collection="specs")    # Drill into specs/, direct childre
 akb_browse(vault="v", depth=-1)              # Entire vault subtree in one call
 ```
 
-## akb_drill_down — Section Reader
+## akb_get — Section Reader
 When a document is long and you only need one part:
 
 ```
-akb_drill_down(uri="akb://v/doc/path/to/file.md")                    # All sections
-akb_drill_down(uri="akb://v/doc/path/to/file.md", section="Setup")   # Just "Setup"
+akb_get(mode="sections", uri="akb://v/doc/path/to/file.md")  # All sections
+akb_get(mode="sections", uri="akb://v/doc/path/to/file.md", section="Setup")   # Just "Setup"
 ```
 
 ## Search → Read Pattern
@@ -238,7 +238,7 @@ r = results[0]
 # surface but need different read tools.
 if r.source_type == "document":
     doc = akb_get(uri=r.uri)
-    section = akb_drill_down(uri=r.uri, section="Steps")
+    section = akb_get(mode="sections", uri=r.uri, section="Steps")
 elif r.source_type == "table":
     rows = akb_sql(vault=r.vault, sql=f"SELECT * FROM {r.title}")
 elif r.source_type == "file":
@@ -570,7 +570,7 @@ results = akb_search(query="authentication")
 ### Step 2: Read the top results
 ```
 akb_get(uri="akb://eng/doc/specs/top1.md")
-akb_drill_down(uri="akb://eng/doc/specs/top2.md", section="Implementation")
+akb_get(mode="sections", uri="akb://eng/doc/specs/top2.md", section="Implementation")
 ```
 
 ### Step 3: Check related documents
@@ -715,6 +715,10 @@ akb_put(vault="eng", collection="decisions", title="Adopt gRPC",
 | Param | Required | Description |
 |-------|----------|-------------|
 | uri | ✓ | Document AKB URI — `akb://{vault}[/coll/{coll_path}]/doc/{filename}` |
+| mode | | `full` (default), `sections`, or `outline` |
+| section | | Heading substring; sections mode only |
+| pattern | | Body substring; sections mode only |
+| version | | Commit hash; full mode only |
 
 ## Returns
 Full document: title, content, metadata (type, tags, status, created_by, dates), relations.
@@ -722,9 +726,11 @@ Full document: title, content, metadata (type, tags, status, created_by, dates),
 ## Examples
 ```
 akb_get(uri="akb://eng/doc/decisions/adopt-grpc.md")
+akb_get(uri="akb://eng/doc/decisions/adopt-grpc.md", mode="sections", section="Background")
+akb_get(uri="akb://eng/doc/decisions/adopt-grpc.md", mode="outline")
 ```
 
-💡 For large documents, use `akb_drill_down` to read specific sections.""",
+Sections are partial indexed content, not the complete document body. Read full content before replacing a document. Empty section results include an outline for retrying.""",
 
     "akb_update": """# akb_update — Update a Document
 
@@ -885,7 +891,7 @@ akb_search(query="budget", tags=["finance"], limit=5)
 ```
 
 ## Result Fields
-- `uri`: AKB URI — pass to akb_get / akb_drill_down (docs), akb_get_file (files), akb_sql (tables)
+- `uri`: AKB URI — pass to akb_get (docs), akb_get_file (files), akb_sql (tables)
 - `title`, `summary`: overview
 - `score`: relevance (0.0-1.0)
 - `matched_section`: the most relevant chunk
@@ -965,26 +971,6 @@ read from; it names a storage strategy, never an address. If snippets hit
 response safety bounds,
 `truncated` is true and `truncation` reports the applied match/byte limits.
 When replace is used, response also includes `replaced_docs` count and `replacements` list.""",
-
-    "akb_drill_down": """# akb_drill_down — Section-Level Reader
-
-Read specific sections of a document without loading everything.
-
-## Parameters
-| Param | Required | Description |
-|-------|----------|-------------|
-| uri | ✓ | Document AKB URI |
-| section | | Section name filter (partial match) |
-
-## Examples
-```
-akb_drill_down(uri="akb://eng/doc/specs/api.md")                    # All section headings
-akb_drill_down(uri="akb://eng/doc/specs/api.md", section="Setup")   # Just "Setup" section
-akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API")     # Sections containing "API"
-```
-
-💡 Token-efficient: read summaries via browse, then drill into the section you need.""",
-
 
     "akb_create_table": """# akb_create_table — Create a Table
 

@@ -304,7 +304,7 @@ echo "▸ 14. Drill-down alignment"
 R=$(mcp akb_search "{\"query\":\"Rhinoceros\",\"vault\":\"$VAULT\",\"limit\":1}" | mcp_text)
 HIT_DOC_URI=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); rs=d.get('results',[]); print(rs[0]['uri'] if rs else '')" 2>/dev/null)
 if [ -n "$HIT_DOC_URI" ]; then
-  R=$(mcp akb_drill_down "{\"uri\":\"$HIT_DOC_URI\"}" | mcp_text)
+  R=$(mcp akb_get "{\"uri\":\"$HIT_DOC_URI\",\"mode\":\"sections\"}" | mcp_text)
   N_SEC=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('sections',[])))" 2>/dev/null)
   [ "$N_SEC" -ge 1 ] 2>/dev/null && pass "drill-down on search hit: $N_SEC sections" || fail "drill-down" "no sections for $HIT_DOC_URI"
 else

@@ -78,7 +78,7 @@ _GENESIS = "0" * 64
 # `_required_scope` that gates the call, so an argument-driven write is
 # recorded even though the tool name sits in this set.
 _READ_ONLY_TOOLS = frozenset({
-    "akb_get", "akb_search", "akb_browse", "akb_drill_down", "akb_grep",
+    "akb_get", "akb_search", "akb_browse", "akb_grep",
     "akb_graph", "akb_relations", "akb_history", "akb_diff", "akb_activity",
     "akb_provenance", "akb_list_vaults", "akb_vault_info", "akb_vault_members",
     "akb_whoami", "akb_help", "akb_search_users", "akb_publications",

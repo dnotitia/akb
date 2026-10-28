@@ -2102,7 +2102,7 @@ class DocumentService:
     @staticmethod
     def _browse_hint(vault: str, collection: str | None, items: list[BrowseItem]) -> str:
         if collection:
-            return 'Use akb_drill_down(uri=...) to read sections, or akb_get(uri=...) for full content. Pass the canonical `uri` from any item above.'
+            return 'Use akb_get(mode="sections", uri=...) to read sections, or akb_get(uri=...) for full content. Pass the canonical `uri` from any item above.'
         if items:
             type_counts: dict[str, int] = {}
             for i in items:

@@ -153,7 +153,7 @@ async def test_documents_browse_search_and_versioned_reads(
     assert type(search.get("total")) is int
     assert search["total"] >= 0
 
-    drilled = await _call_json(mcp_client, runtime_session, "akb_drill_down", {"uri": doc_uri})
+    drilled = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": doc_uri, "mode": "sections"})
     sections = drilled.get("sections")
     assert isinstance(sections, list) and sections
     assert not any(

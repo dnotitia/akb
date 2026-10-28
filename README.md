@@ -177,7 +177,7 @@ letting the indexing worker re-populate.
 | `akb_create_table` / `akb_alter_table` / `akb_drop_table` / `akb_sql` | Tabular content — per-doc tables + SQL |
 | `akb_browse` | Tree traversal (collection → docs) |
 | `akb_search` / `akb_grep` | Hybrid search (dense + BM25) / literal grep |
-| `akb_drill_down` | Section-level retrieval |
+| `akb_get` | Full document, section, and outline retrieval |
 | `akb_relations` / `akb_link` / `akb_unlink` / `akb_graph` | Knowledge graph |
 | `akb_edit` / `akb_diff` / `akb_history` | In-place edit, diff, revision history |
 | `akb_grant` / `akb_revoke` / `akb_set_public` | Permission boundaries — per-user, per-org, public |
