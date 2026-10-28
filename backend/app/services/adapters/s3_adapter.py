@@ -395,6 +395,20 @@ def delete(key: str) -> None:
         raise wrap_error(e, f"delete {key}") from e
 
 
+def list_objects_page(
+    prefix: str, *, continuation_token: str | None = None, limit: int = 100,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Bound one inventory request; callers own traversal and retention policy."""
+    kwargs: dict[str, Any] = {"Bucket": settings.s3_bucket, "Prefix": prefix, "MaxKeys": limit}
+    if continuation_token is not None:
+        kwargs["ContinuationToken"] = continuation_token
+    try:
+        page = client().list_objects_v2(**kwargs)
+    except ClientError as e:
+        raise wrap_error(e, "list temporary file objects") from e
+    return page.get("Contents", []), page.get("NextContinuationToken")
+
+
 # ── Presign ──────────────────────────────────────────────────────
 
 

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -38,6 +39,9 @@ def upload(monkeypatch):
         async def fetchrow(self, *_args):
             return {"name": "team"}
 
+        async def fetchval(self, *_args):
+            return "team"
+
     class Pool:
         @asynccontextmanager
         async def acquire(self):
@@ -49,9 +53,10 @@ def upload(monkeypatch):
 
     async def confirm(conn, fid, vid, **values):
         current = await find(conn, vid, fid)
-        if not current or current["upload_state"] != "pending":
+        inspected_key = values.pop("expected_s3_key")
+        if not current or current["upload_state"] != "pending" or current["s3_key"] != inspected_key:
             return False
-        state["row"].update(values, upload_state="confirmed")
+        state["row"].update(values, upload_state="confirmed", hash_verified_at=datetime.now(timezone.utc))
         return True
 
     async def cancel(conn, vid, fid):
@@ -65,6 +70,7 @@ def upload(monkeypatch):
     monkeypatch.setattr(fs, "get_pool", AsyncMock(return_value=Pool()))
     monkeypatch.setattr(fs.vault_files_repo, "lease_file_upload_confirmation", find)
     monkeypatch.setattr(fs.vault_files_repo, "find_by_id", find)
+    monkeypatch.setattr(fs.vault_files_repo, "find_by_id_for_update", find)
     monkeypatch.setattr(fs.vault_files_repo, "confirm_file_upload_metadata", confirm)
     monkeypatch.setattr(fs.vault_files_repo, "delete_pending_file", cancel)
     head = Mock(return_value={"ContentLength": len(data), "ETag": '"etag"', "VersionId": "v1"})
@@ -101,6 +107,8 @@ async def test_duplicate_inflight_confirmations_publish_once(upload, monkeypatch
 
     async def hash_in_parallel(function, *args):
         nonlocal callers
+        if function is not fs.compute_stream_content_hash:
+            return function(*args)
         callers += 1
         if callers == 2:
             both_hashing.set()

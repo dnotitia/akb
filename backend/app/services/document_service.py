@@ -114,6 +114,7 @@ def _safe_remote_host(url: str) -> str:
 import frontmatter
 
 from app.db.postgres import get_pool
+from app.models.document_preconditions import validate_token, validate_update_preconditions
 from app.exceptions import (
     AKBError,
     ConflictError,
@@ -1032,6 +1033,10 @@ class DocumentService:
         self, vault: str, doc_ref: str, req: DocumentUpdateRequest,
         agent_id: str | None = None, *, skill_internal: bool = False,
     ) -> DocumentPutResponse:
+        validate_update_preconditions(
+            content=req.content, expected_commit=req.expected_commit,
+            expected_content_hash=req.expected_content_hash,
+        )
         if req.status is not None and req.status not in DOC_STATUSES:
             raise ValidationError(
                 f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}"
@@ -1062,7 +1067,7 @@ class DocumentService:
             # Optimistic concurrency: if caller pinned expected_commit, refuse
             # the write when the row has moved on. Caller should re-read and
             # retry against the new HEAD.
-            if req.expected_commit and row["current_commit"] != req.expected_commit:
+            if req.expected_commit is not None and row["current_commit"] != req.expected_commit:
                 raise ConflictError(
                     f"current_commit moved: expected {req.expected_commit}, "
                     f"actual {row['current_commit']}"
@@ -1116,7 +1121,7 @@ class DocumentService:
             fallback_metadata=_document_row_frontmatter(row),
         )
         current_hash, _ = await self._ensure_document_hash(doc_repo, row, current_body, conn=conn)
-        if req.expected_content_hash and req.expected_content_hash != current_hash:
+        if req.expected_content_hash is not None and req.expected_content_hash != current_hash:
             raise ConflictError(
                 f"content_hash moved: expected {req.expected_content_hash}, "
                 f"actual {current_hash}"
@@ -1542,6 +1547,7 @@ class DocumentService:
         Raises:
             EditError: If old_string is empty, not found, or not unique (and replace_all=False).
         """
+        validate_token(base_commit, name="base_commit")
         vault_repo, doc_repo, _ = await self._repos()
 
         vault_id = await vault_repo.get_id_by_name(vault)
@@ -1560,7 +1566,7 @@ class DocumentService:
             )
             if not row:
                 raise NotFoundError("Document", doc_ref)
-            if base_commit and row["current_commit"] != base_commit:
+            if base_commit is not None and row["current_commit"] != base_commit:
                 raise ConflictError(
                     f"current_commit moved: expected {base_commit}, "
                     f"actual {row['current_commit']}"

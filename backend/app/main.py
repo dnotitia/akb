@@ -225,8 +225,9 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
             "code": "token_issuance_validation", "message": "Token issuance validation failed",
             "details": {"fields": fields},
         }))
-    if request.url.path == "/api/v1/my/account/deletion":
-        # Validation must never echo the password (including malformed request bodies).
+    if request.url.path == "/api/v1/my/account/deletion" or request.url.path.startswith("/api/v1/documents/"):
+        # Never echo passwords or a whole rejected document body in an input
+        # error (a document model-level predicate error carries its raw body).
         details = [{k: e[k] for k in ("loc", "msg", "type") if k in e} for e in details]
     return JSONResponse(
         status_code=422,

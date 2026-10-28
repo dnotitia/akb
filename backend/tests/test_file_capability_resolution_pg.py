@@ -34,6 +34,7 @@ _MIGRATIONS = (
     "019_s3_delete_outbox.py",
     "055_native_revision_m1_file_storage.py",
     "067_vault_file_upload_state.py",
+    "079_worker_claim_lifecycle.py",
     "104_file_write_capability_key.py",
 )
 
@@ -50,7 +51,9 @@ async def _can_connect(dsn: str) -> bool:
 @pytest_asyncio.fixture
 async def pool():
     if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
+        if os.getenv("REQUIRE_REAL_PG") == "1":
+            pytest.fail("Real PostgreSQL is required for File lifecycle tests")
+        pytest.skip("Postgres not reachable; set AKB_TEST_DSN for File lifecycle tests")
     pool = await asyncpg.create_pool(dsn=_DSN, min_size=1, max_size=4)
     backend_dir = Path(__file__).resolve().parents[1]
     async with pool.acquire() as conn:
@@ -92,7 +95,8 @@ async def service(pool, monkeypatch):
 
 async def _grant(
     pool, vault_id, *, file_id=None, object_key=_KEY, method="PUT",
-    ttl=3600, with_file_row=True, upload_state="pending",
+    ttl=3600, with_file_row=True, upload_state="pending", file_key=None,
+    intent_id=None,
 ) -> str:
     fid = file_id or uuid.uuid4()
     token = fs._new_capability_token()
@@ -106,7 +110,7 @@ async def _grant(
                 VALUES ($1, $2, 'file', $3, 'report.bin', $4,
                         'application/pdf', 0, 'tester')
                 """,
-                fid, vault_id, upload_state, object_key or _KEY,
+                fid, vault_id, upload_state, file_key or object_key or _KEY,
             )
         # The table's own CHECK splits the two lanes: a GET intent carries no
         # filename and a PUT intent must carry filename, mime_type and actor.
@@ -118,7 +122,7 @@ async def _grant(
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
                       NOW() + ($10 * INTERVAL '1 second'))
             """,
-            uuid.uuid4(), fid, vault_id, method,
+            intent_id or uuid.uuid4(), fid, vault_id, method,
             None if method == "GET" else "report.bin",
             None if method == "GET" else "application/pdf",
             None if method == "GET" else "tester",
@@ -132,6 +136,55 @@ async def test_a_live_grant_resolves_to_its_key(service, pool, vault_id):
     resolved = await service.resolve_write_capability(token)
     assert resolved["object_key"] == _KEY
     assert resolved["mime_type"] == "application/pdf"
+
+
+async def test_confirmed_original_upload_is_protected(service, pool, vault_id):
+    token = await _grant(pool, vault_id, upload_state="confirmed")
+    assert (await service.resolve_write_capability(token))["already_confirmed"] is True
+
+
+async def test_replacement_upload_is_not_the_confirmed_live_object(service, pool, vault_id):
+    fid, rid = uuid.uuid4(), uuid.uuid4()
+    async with pool.acquire() as conn:
+        name = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+    staging_key = fs._replacement_staging_key(name, fid, rid)
+    token = await _grant(
+        pool, vault_id, file_id=fid, intent_id=rid,
+        object_key=staging_key, file_key=_KEY, upload_state="confirmed",
+    )
+
+    resolved = await service.resolve_write_capability(token)
+
+    assert resolved["object_key"] == staging_key
+    assert resolved["already_confirmed"] is False
+
+
+async def test_original_grant_does_not_follow_a_replaced_file(service, pool, vault_id):
+    fid = uuid.uuid4()
+    token = await _grant(pool, vault_id, file_id=fid, upload_state="confirmed")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE vault_files SET s3_key = $2 WHERE id = $1", fid, "team/new-object.bin",
+        )
+
+    # The old key may now belong to another file. The old grant must not
+    # become writable just because its logical file moved to a different key.
+    with pytest.raises(NotFoundError):
+        await service.resolve_write_capability(token)
+
+
+async def test_replacement_key_must_match_its_own_intent(service, pool, vault_id):
+    fid, other_rid = uuid.uuid4(), uuid.uuid4()
+    async with pool.acquire() as conn:
+        name = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+    token = await _grant(
+        pool, vault_id, file_id=fid, intent_id=uuid.uuid4(),
+        object_key=fs._replacement_staging_key(name, fid, other_rid),
+        file_key=_KEY, upload_state="confirmed",
+    )
+
+    with pytest.raises(NotFoundError):
+        await service.resolve_write_capability(token)
 
 
 async def test_a_grant_whose_file_was_deleted_stops_working(service, pool, vault_id):

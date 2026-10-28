@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from app.db.postgres import get_pool
@@ -39,6 +40,16 @@ PENDING_UPLOAD_DELETE_RECHECK_SECONDS = 24 * 60 * 60
 SWEEP_GRACE_INTERVAL = "1 day"
 SWEEP_INTERVAL_SECONDS = 3600.0
 _last_sweep_at: float = 0.0
+
+# This namespace is never published directly: confirmation copies to a fresh
+# key outside it. Inventory, unlike a one-shot delete, also finds an accepted
+# PUT that completes after the issuance-time cleanup has already run.
+REPLACEMENT_STAGING_PREFIX = "__akb_file_replacements__/"
+REPLACEMENT_STAGING_RETENTION_SECONDS = 3600 + 300
+STAGING_SCAN_INTERVAL_SECONDS = 60
+STAGING_SCAN_PAGE_SIZE = 100
+_last_staging_scan_at: float = 0.0
+_staging_scan_cursor: str | None = None
 
 
 # ── Outbox helpers (called by services in their TX) ──────────────
@@ -292,10 +303,83 @@ async def _sweep_outbox_once() -> int:
     return n
 
 
+def _is_replacement_staging_key(key: str) -> bool:
+    if not key.startswith(REPLACEMENT_STAGING_PREFIX):
+        return False
+    parts = key[len(REPLACEMENT_STAGING_PREFIX):].split("/")
+    if len(parts) != 3 or not parts[0]:
+        return False
+    try:
+        return all(str(uuid.UUID(part)) == part for part in parts[1:])
+    except ValueError:
+        return False
+
+
+async def _reconcile_staging_once() -> int:
+    """Rediscover expired temporary bytes, including writes after cleanup.
+
+    A page is advanced only after its DB work commits. Every full traversal
+    wraps to the beginning, so recreated keys behind the cursor are not lost.
+    Object age is a retention input, NOT proof that all writers have stopped.
+    No database connection is held while listing the object store.
+    """
+    global _last_staging_scan_at, _staging_scan_cursor
+    now = time.monotonic()
+    if now - _last_staging_scan_at < STAGING_SCAN_INTERVAL_SECONDS:
+        return 0
+    _last_staging_scan_at = now
+    objects, next_cursor = await asyncio.to_thread(
+        s3_adapter.list_objects_page, REPLACEMENT_STAGING_PREFIX,
+        continuation_token=_staging_scan_cursor, limit=STAGING_SCAN_PAGE_SIZE,
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=REPLACEMENT_STAGING_RETENTION_SECONDS)
+    keys = [obj["Key"] for obj in objects
+            if _is_replacement_staging_key(obj["Key"])
+            and isinstance(obj.get("LastModified"), datetime)
+            and obj["LastModified"] < cutoff]
+    queued = 0
+    if keys:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                for key in keys:
+                    if not await vault_files_repo.try_lock_s3_key_for_mutation(conn, key):
+                        continue
+                    # Missing intents can be legitimate: expiry reaping and
+                    # Vault deletion remove them. DB errors must propagate,
+                    # never be interpreted as proof of expiry.
+                    outbox_id = await conn.fetchval(
+                        """
+                        INSERT INTO s3_delete_outbox (s3_key, next_attempt_at)
+                        SELECT $1::text, NOW()
+                         WHERE NOT EXISTS (SELECT 1 FROM vault_files WHERE s3_key = $1)
+                           AND NOT EXISTS (
+                               SELECT 1 FROM m1_file_transfer_intents
+                                WHERE id = $2 AND object_key = $1
+                                  AND method = 'PUT' AND expires_at > NOW()
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM s3_delete_outbox
+                                WHERE s3_key = $1 AND processed_at IS NULL
+                           )
+                        RETURNING id
+                        """,
+                        key, uuid.UUID(key.rsplit("/", 1)[1]),
+                    )
+                    queued += outbox_id is not None
+    _staging_scan_cursor = next_cursor
+    return queued
+
+
 # ── Loop ─────────────────────────────────────────────────────────
 
 
 async def _process_once() -> int:
+    try:
+        queued = await _reconcile_staging_once()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("s3_delete_worker staging inventory failed: %s", e)
+        queued = 0
     try:
         d = await _process_deletes_once()
     except Exception as e:  # noqa: BLE001
@@ -305,7 +389,7 @@ async def _process_once() -> int:
         await _sweep_outbox_once()
     except Exception as e:  # noqa: BLE001
         logger.exception("s3_delete_worker outbox sweep failed: %s", e)
-    return d
+    return d + queued
 
 
 _runner = BackfillRunner("s3_delete_worker", _process_once)

@@ -54,6 +54,23 @@ specifically; the proxy has its own log in
 
 ### Fixed
 
+- File replacement upload capabilities now write to their own staging object
+  instead of being mistaken for a confirmed-file replay. Obsolete original
+  upload capabilities are rejected after a replacement, and every confirmation
+  uses a fresh candidate so retries cannot overwrite or delete published bytes.
+- Ordinary upload confirmation now transitions only the inspected pending
+  reservation. Replays of confirmed Files return current metadata or a
+  non-destructive hash conflict, and browser upload failures no longer issue a
+  general File DELETE. Collection cascades lock current File rows before
+  enqueueing object cleanup, preventing a concurrent replacement from leaking
+  its newly published object.
+- The S3 delete worker periodically inventories the private replacement-staging
+  prefix, so an accepted upload completing after its original cleanup is
+  rediscovered. The existing outbox still performs deletion; no timeout or
+  upload-grant lifetime is increased. See
+  [file-storage cleanup](../docs/operations/file-storage-cleanup.md) for the
+  prefix-list permission and retention boundaries.
+
 - Password-protected publications now share their attempt budget across API
   replicas and process restarts. PostgreSQL atomically reserves each attempt
   before verification; per-IP and publication-wide backoff retain their
@@ -91,6 +108,16 @@ specifically; the proxy has its own log in
   unconstrained columns instead of returning `null`, matching the published
   OpenAPI response contract. Declared enum values, table data, constraints,
   and drift reporting are unchanged.
+
+### Documents
+
+- **Breaking:** whole-body document updates, including empty bodies and proxy
+  `file` input, now require `expected_commit` or `expected_content_hash` from
+  the original read. Both supplied conditions must match. Metadata-only
+  patches and exact-text edits retain their separate contracts. Empty,
+  malformed and normalized-away version tokens are rejected. REST, MCP,
+  help and SDK types describe the same rules; MCP rejects invalid input
+  without echoing the rejected body. See `docs/operations/document-write-preconditions.md`.
 
 ## 0.17.0 — 2026-10-19
 

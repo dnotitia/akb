@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from hashlib import sha256
 from types import SimpleNamespace
 
 import pytest
@@ -53,6 +54,10 @@ class _Pool:
         return _Acquire(self.connection)
 
 
+def _parent_token(path: str) -> str:
+    return sha256(path.encode()).hexdigest()[:40]
+
+
 class _Documents:
     def __init__(self, rows: list[dict], *, fail_path: str | None = None):
         self.contents = {row["path"]: row["content"] for row in rows}
@@ -64,7 +69,7 @@ class _Documents:
         self.get_calls.append(path)
         return SimpleNamespace(
             content=self.contents[path],
-            current_commit=f"parent-{path}",
+            current_commit=_parent_token(path),
         )
 
     async def update(self, _vault: str, path: str, request, *, agent_id=None):
@@ -73,8 +78,8 @@ class _Documents:
             raise WriteBusyError("test-vault", 1.0)
         self.contents[path] = request.content
         return SimpleNamespace(
-            commit_hash=f"commit-{path}",
-            previous_commit=f"parent-{path}",
+            commit_hash=_parent_token(f"updated:{path}"),
+            previous_commit=_parent_token(path),
         )
 
 
@@ -123,7 +128,7 @@ async def test_replace_applies_to_full_scope_while_limit_only_bounds_preview(leg
     assert len(result["replacements"]) == 51
     assert all(row["previous_commit"] for row in result["replacements"])
     assert all(content.startswith("TODO(owner)") for content in documents.contents.values())
-    assert all(request.expected_commit == f"parent-{path}" for path, request in documents.update_calls)
+    assert all(request.expected_commit == _parent_token(path) for path, request in documents.update_calls)
 
 
 @pytest.mark.asyncio
@@ -205,7 +210,7 @@ async def test_replace_failure_returns_committed_receipts_and_stops(legacy_grep)
     assert result["code"] == "write_busy"
     assert result["replacement_complete"] is False
     assert result["replaced_docs"] == 1
-    assert result["replacements"][0]["previous_commit"] == f"parent-{rows[0]['path']}"
+    assert result["replacements"][0]["previous_commit"] == _parent_token(rows[0]["path"])
     assert result["details"]["failed_uri"].endswith("/doc/001.md")
     assert result["details"]["committed_replacements"] == 1
     assert [path for path, _request in documents.update_calls] == [

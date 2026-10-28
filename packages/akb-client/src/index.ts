@@ -379,8 +379,7 @@ export interface AkbDocumentPutInput extends AkbDocumentVaultOptions {
   slug?: string | null;
 }
 
-export interface AkbDocumentUpdateInput {
-  content?: string | null;
+interface AkbDocumentUpdateFields {
   title?: string | null;
   type?: string | null;
   status?: AkbDocumentStatus | null;
@@ -393,6 +392,18 @@ export interface AkbDocumentUpdateInput {
   expectedCommit?: string | null;
   expectedContentHash?: string | null;
 }
+
+/** Whole-body replacements require a condition from the original read.
+ * A hash protects body equality only; use a revision for metadata context.
+ * Never fetch a newer token just to submit a body derived from an older read.
+ */
+export type AkbDocumentUpdateInput = AkbDocumentUpdateFields & (
+  | { content?: null }
+  | ({ content: string } & (
+      | { expectedCommit: string }
+      | { expectedContentHash: string }
+    ))
+);
 
 export interface AkbStorageVaultOptions {
   vault?: string | null;

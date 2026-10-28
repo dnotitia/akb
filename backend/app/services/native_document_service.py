@@ -22,6 +22,7 @@ from app.services.search_filters import ArchiveScope
 import asyncpg
 
 from app.db.postgres import get_pool
+from app.models.document_preconditions import validate_token, validate_update_preconditions
 from app.exceptions import (
     AKBError,
     ConflictError,
@@ -854,6 +855,10 @@ class NativeDocumentService(DocumentService):
         *,
         skill_internal: bool = False,
     ) -> DocumentPutResponse:
+        validate_update_preconditions(
+            content=req.content, expected_commit=req.expected_commit,
+            expected_content_hash=req.expected_content_hash,
+        )
         if req.status is not None and req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
         vault_id, current = await self._current(vault, doc_ref)
@@ -895,7 +900,7 @@ class NativeDocumentService(DocumentService):
         native = await self._native()
         race_count = 0
         while True:
-            if req.expected_commit and not await self._expected_commit_matches_current(
+            if req.expected_commit is not None and not await self._expected_commit_matches_current(
                 namespace_id=vault_id,
                 resource_id=resource_id,
                 expected_commit=req.expected_commit,
@@ -907,7 +912,7 @@ class NativeDocumentService(DocumentService):
             frontmatter, current_body = await self._document_frontmatter(vault_id, current)
             previous_status = frontmatter.get("status") or "draft"
             previous_hash = _body_content_hash(current_body)
-            if req.expected_content_hash and req.expected_content_hash != previous_hash:
+            if req.expected_content_hash is not None and req.expected_content_hash != previous_hash:
                 raise ConflictError(f"content_hash moved: expected {req.expected_content_hash}, actual {previous_hash}")
             if req.depends_on is not None:
                 validate_new_structured_relation_refs(
@@ -1127,6 +1132,7 @@ class NativeDocumentService(DocumentService):
         *,
         skill_internal: bool = False,
     ) -> DocumentPutResponse:
+        validate_token(base_commit, name="base_commit")
         if not old_string:
             raise EditError("old_string cannot be empty")
         vault_id, current = await self._current(vault, doc_ref)
@@ -1135,7 +1141,7 @@ class NativeDocumentService(DocumentService):
         native = await self._native()
         race_count = 0
         while True:
-            if base_commit and not await self._expected_commit_matches_current(
+            if base_commit is not None and not await self._expected_commit_matches_current(
                 namespace_id=vault_id,
                 resource_id=resource_id,
                 expected_commit=base_commit,
