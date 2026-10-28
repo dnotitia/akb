@@ -841,6 +841,9 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
         vault = vault_arg
         collection = args.get("collection")
     await check_vault_access(uid, vault, required_role="reader")
+    paged = args.get("page_size") is not None or args.get("cursor") is not None or args.get("content_type") == "collections"
+    if paged and ("limit" in args or "offset" in args):
+        return err("Use page_size/cursor or legacy limit/offset, not both.", code=INVALID_ARGUMENT)
     result = await doc_service.browse(
         vault,
         collection=collection,
@@ -848,6 +851,7 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
         content_type=args.get("content_type", "all"),
         include_hashes=args.get("include_hashes", False),
         include_archived=args.get("include_archived", False),
+        **({"page_size": args.get("page_size", 100), "cursor": args.get("cursor")} if paged else {}),
     )
     include_summary = args.get("include_summary")
     payload = browse_payload(result, include_summary=bool(include_summary))
@@ -859,6 +863,9 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
             if needle in (it.get("name") or "").lower()
             or needle in (it.get("path") or "").lower()
         ]
+    if paged:
+        payload["returned"] = len(payload.get("items") or [])
+        return payload
     return _paginate(payload, args, items_key="items")
 
 
@@ -1181,11 +1188,8 @@ async def _handle_unlink(args: dict, uid: str, user: _MCPUser) -> dict:
 @_h("akb_provenance")
 async def _handle_provenance(args: dict, uid: str, user: _MCPUser) -> dict:
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
-    await check_vault_access(uid, vault, required_role="reader")
-    doc = await _find_doc(vault, doc_path)
-    if not doc:
-        return err("Document not found", code=NOT_FOUND)
-    return await get_provenance(str(doc["id"]), vault_id=doc["vault_id"])
+    access = await check_vault_access(uid, vault, required_role="reader")
+    return await get_provenance(doc_path, vault_id=access["vault_id"])
 
 
 @_h("akb_create_table")

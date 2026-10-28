@@ -185,7 +185,7 @@ async def test_cloud_hybrid_search_filter_uses_vault_col_override():
     assert s._client.calls[-1]["json"]["filter"] == f"{COL_VAULT_ID} IN ('{_UUID}')"
 
 
-# ── workbench #1069: source_types ANDs onto the Coral WHERE clause ──
+# ── source_types ANDs onto the Coral WHERE clause ──
 
 def test_vault_filter_sql_source_types_ands_onto_either_branch():
     assert vault_filter_sql([_UUID], None, source_types=["native_document"]) == (
@@ -210,7 +210,7 @@ def test_vault_filter_sql_rejects_unknown_source_type():
 @pytest.mark.asyncio
 async def test_db_hybrid_search_source_types_reach_filter(monkeypatch):
     """source_types must reach the Coral request `filter` ANDed with the ACL
-    branch — otherwise stale legacy points consume the top-K (workbench #1069)."""
+    branch — otherwise stale legacy points consume the top-K."""
     from unittest.mock import AsyncMock
     monkeypatch.setattr("app.services.sparse_encoder.load_stats", AsyncMock(return_value={}))
 

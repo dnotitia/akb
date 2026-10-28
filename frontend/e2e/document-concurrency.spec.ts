@@ -317,6 +317,128 @@ test.describe("document concurrency against the real API", () => {
     expect(saved.content).toContain("My addition after reload");
   });
 
+  test("preserves a composed result when access verification cancels a comparison reload", async ({ page, request }) => {
+    const fixture = await setup(page, request);
+    await fixture.source.fill("Base line\nMy addition\n");
+    const changed = await request.patch(fixture.path, { headers: fixture.headers, data: {
+      content: "Base line\nRemote addition\n", expected_commit: fixture.document.current_commit,
+    } });
+    expect(changed.ok()).toBeTruthy();
+    const remote = await changed.json();
+    await page.getByRole("button", { name: "Check for changes" }).click();
+    await page.getByRole("button", { name: "Compare changes" }).click();
+    const composed = "Base line\nRemote addition\nReviewed local addition\n";
+    await page.getByRole("textbox", { name: "Combined document body" }).fill(composed);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let started!: () => void;
+    const pending = new Promise<void>(resolve => { started = resolve; });
+    let delayNextRead = true;
+    await page.route("**/api/v1/documents/**", async route => {
+      if (route.request().method() === "GET" && delayNextRead) {
+        delayNextRead = false;
+        started();
+        await gate;
+      }
+      await route.continue();
+    });
+    try {
+      await page.getByRole("button", { name: "Reload comparison", exact: true }).click();
+      await page.getByRole("dialog", { name: "Reload this comparison?" }).getByRole("button", { name: "Reload comparison", exact: true }).click();
+      await pending;
+      await expect(page.getByRole("textbox", { name: "Combined document body" })).toBeDisabled();
+      await reverifyAccess(page, fixture.name);
+      const combined = page.getByRole("textbox", { name: "Combined document body" });
+      await expect(combined).toBeEnabled();
+      await expect(combined).toHaveValue(composed);
+      await expect(page.getByRole("button", { name: "Reload comparison", exact: true })).toBeEnabled();
+      await expect(page.getByRole("button", { name: "Apply combined changes" })).toBeEnabled();
+    } finally {
+      release();
+    }
+    await expect(page.getByRole("textbox", { name: "Combined document body" })).toHaveValue(composed);
+    await page.getByRole("button", { name: "Apply combined changes" }).click();
+    const receipt = page.waitForResponse(response => response.request().method() === "PATCH" && response.url().includes("/api/v1/documents/"));
+    await page.getByRole("button", { name: "Save changes" }).click();
+    expect((await receipt).request().postDataJSON().expected_commit).toBe(remote.current_commit);
+    await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
+    expect((await (await request.get(fixture.path, { headers: fixture.headers })).json()).content).toContain("Reviewed local addition");
+  });
+
+  for (const keepLocalImage of [true, false]) {
+    test(`preserves current and historical images while ${keepLocalImage ? "keeping" : "excluding"} a real pending upload`, async ({ page, request }) => {
+      const fixture = await setup(page, request);
+      const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+      await page.getByRole("button", { name: /^Editor mode:/ }).click();
+      await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
+      const upload = page.waitForResponse(response => response.request().method() === "POST" && response.url().includes("/api/v1/assets/"));
+      await page.getByTestId("markdown-editor").locator('input[type="file"]').setInputFiles({ name: "local-image.png", mimeType: "image/png", buffer: png });
+      const uploaded = await upload;
+      expect(uploaded.status()).toBe(201);
+      const local = await uploaded.json();
+      await expect(page.getByTestId("markdown-editor").locator('img[alt="local-image"]')).toBeVisible();
+      await page.getByRole("button", { name: /^Editor mode:/ }).click();
+      await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
+      await expect(fixture.source).toHaveValue(new RegExp(local.id));
+      async function image(filename: string) {
+        const response = await request.post("/api/v1/assets/" + fixture.name + "?filename=" + filename, {
+          headers: { ...fixture.headers, "Content-Type": "image/png" }, data: png,
+        });
+        expect(response.status()).toBe(201);
+        return response.json();
+      }
+      const historical = await image("historical.png");
+      const remote = await image("remote.png");
+      const oldRevision = await request.patch(fixture.path, { headers: fixture.headers, data: {
+        content: `Historical image\n![history](${historical.target})\n![remote](${remote.target})\n`,
+        expected_commit: fixture.document.current_commit,
+      } });
+      expect(oldRevision.ok()).toBeTruthy();
+      const historicalCommit = (await oldRevision.json()).current_commit;
+      const remoteBody = `Remote addition\n![remote](${remote.target})\n`;
+      const change = await request.patch(fixture.path, { headers: fixture.headers, data: { content: remoteBody, expected_commit: historicalCommit } });
+      expect(change.ok()).toBeTruthy();
+      const reviewedCommit = (await change.json()).current_commit;
+      await page.getByRole("button", { name: "Check for changes" }).click();
+      await page.getByRole("button", { name: "Compare changes" }).click();
+      await page.getByRole("button", { name: "Keep editing" }).click();
+      await expect(fixture.source).toHaveValue(new RegExp(local.id));
+      const metadata = "/api/v1/assets/" + fixture.name + "/" + local.id + "/metadata";
+      expect((await (await request.get(metadata, { headers: fixture.headers })).json()).status).toBe("unclaimed");
+      await page.getByRole("button", { name: "Compare changes" }).click();
+      const combinedBody = remoteBody + (keepLocalImage ? `![local](${local.target})\n` : "Reviewed without local image\n");
+      await page.getByRole("textbox", { name: "Combined document body" }).fill(combinedBody);
+      await page.getByRole("button", { name: "Apply combined changes" }).click();
+      await page.getByRole("button", { name: /^Editor mode:/ }).click();
+      await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
+      await expect(fixture.source).toHaveValue(new RegExp(remote.id));
+      if (keepLocalImage) await expect(fixture.source).toHaveValue(new RegExp(local.id));
+      const receipt = page.waitForResponse(response => response.request().method() === "PATCH" && response.url().includes("/api/v1/documents/"));
+      await page.getByRole("button", { name: "Save changes" }).click();
+      expect((await receipt).request().postDataJSON().expected_commit).toBe(reviewedCommit);
+      await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
+      const saved = await (await request.get(fixture.path, { headers: fixture.headers })).json();
+      expect(saved.content).toContain(remote.id);
+      expect(saved.content.includes(local.id)).toBe(keepLocalImage);
+      if (keepLocalImage) {
+        expect((await (await request.get(metadata, { headers: fixture.headers })).json()).status).toBe("claimed");
+      } else {
+        await expect.poll(async () => (await request.get(metadata, { headers: fixture.headers })).status()).toBe(404);
+      }
+      async function readableImage(id: string, commit?: string) {
+        const query = new URLSearchParams({ vault: fixture.name, document: fixture.document.path });
+        if (commit) query.set("commit", commit);
+        const response = await request.get("/api/assets/" + id + "?" + query, { headers: fixture.headers });
+        expect(response.status()).toBe(200);
+        expect(response.headers()["content-type"]).toContain("image/png");
+        expect((await response.body()).byteLength).toBeGreaterThan(0);
+      }
+      await readableImage(remote.id);
+      await readableImage(historical.id, historicalCommit);
+      if (keepLocalImage) await readableImage(local.id);
+    });
+  }
+
   test("cancels comparison without replacing the draft and detects a second change before saving", async ({ page, request }) => {
     const fixture = await setup(page, request);
     await fixture.source.fill("Base line\nMy addition\n");

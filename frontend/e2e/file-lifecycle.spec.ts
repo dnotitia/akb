@@ -76,7 +76,11 @@ test("large JSON is download-only and smaller JSON expands by one page", async (
   await expect(page.getByText('"entry-199"', { exact: true })).toBeVisible();
   await expect(page.getByText('"entry-200"', { exact: true })).toHaveCount(0);
   await page.route("**/file-preview-fixture/**", route => route.fulfill({ contentType: "application/json", body: JSON.stringify({ huge: "한".repeat(200_000) }) }));
+  await page.route("**/api/v1/files/fixture/f-reading/download", route => route.fulfill({ json: { download_url: "/file-preview-fixture/renewed-source", expires_in: 60 } }));
   await page.getByRole("button", { name: "Refresh link", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Refresh link", exact: true })).toBeEnabled();
+  await expect(page.getByText('"entry-199"', { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Reload preview", exact: true }).click();
   await expect(page.getByText(/too large for an inline preview/)).toBeVisible();
   await expect(page.getByRole("link", { name: "Download file" })).toBeVisible();
   await expect(page.getByRole("region", { name: "JSON file content" })).toHaveCount(0);
@@ -110,7 +114,8 @@ async function uploadFixture(page: Page) {
 test("native-picker foreground proof preserves the chosen File and upload fields", async ({ page }) => {
   const proof = await uploadFixture(page);
   await page.goto("/vault/fixture");
-  await page.getByRole("button", { name: "Upload file", exact: true }).click();
+  await page.getByRole("button", { name: "Add content", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Upload file", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Upload a file" });
   const picker = page.getByLabel(/^File/);
   const pickerId = await picker.getAttribute("id");
@@ -151,7 +156,8 @@ for (const outcome of ["pending", "uncertain"] as const) {
     await page.route("**/api/v1/files/fixture/saved-upload", route => route.fulfill(uncertain ? { status: 404 } : { json: saved }));
     await page.route("**/api/v1/files/fixture/saved-upload/download", route => route.fulfill({ json: { download_url: "/file-preview-fixture/source", expires_in: 60 } }));
     await page.goto("/vault/fixture");
-    await page.getByRole("button", { name: "Upload file", exact: true }).click();
+    await page.getByRole("button", { name: "Add content", exact: true }).click();
+    await page.getByRole("menuitem", { name: "Upload file", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "Upload a file" });
     await page.getByLabel(/^File/).setInputFiles({ name: "report.txt", mimeType: "text/plain", buffer: Buffer.from("saved") });
     await dialog.getByRole("button", { name: "Upload file", exact: true }).click();

@@ -36,12 +36,13 @@ AKB keeps one tool and authorization core behind two protocol adapters:
 
 | Surface | Modern | Legacy |
 |---|---|---|
-| Direct HTTP `/mcp/` | `2026-07-28` stateless `server/discover` and per-request `_meta` with `Mcp-Protocol-Version` / `Mcp-Method` (and `Mcp-Name` for named calls) | `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25` initialize + `Mcp-Session-Id` lifecycle |
+| Direct HTTP `/mcp/` | `2026-07-28` stateless `server/discover` and per-request `_meta` with `Mcp-Protocol-Version` / `Mcp-Method` (and `Mcp-Name` for named calls) | `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25` initialize, stateless requests (no `Mcp-Session-Id` lifecycle) |
 | `akb-mcp` stdio proxy | `2026-07-28` discovery and per-request metadata | `2025-06-18` initialize |
 
 The proxy answers either handshake locally and normalizes backend calls to the
-modern stateless contract when available. Legacy backend sessions are used
-only during a rolling upgrade when modern discovery is unavailable. A process
+modern stateless contract when available. For older backends without modern discovery, the proxy can fall back to
+legacy initialization and retain a session ID if that older server returns one.
+The current backend runs both adapters statelessly. A process
 cannot mix generations, and unsupported revisions or conflicting protocol
 evidence fail closed before a tool or local-file operation runs.
 
@@ -240,6 +241,11 @@ root. Walking up a URI to its parent collection is a pure string
 operation — paste the parent into `akb_browse(uri=...)` to list
 siblings without an extra lookup.
 
+For large Vaults, start with `akb_browse(uri=..., depth=0, page_size=100)`
+and follow `next_cursor` until `complete=true`, or drill into a Collection.
+See [bounded navigation and literal-search scope limits](docs/operations/large-vault-navigation.md)
+for paging, partial results and protective grep errors.
+
 ```yaml
 ---
 title: "Payment API v2 migration plan"
@@ -263,14 +269,20 @@ With the explicit Bare Git backend, a vault is stored as a git tree of
 identity is the path — the same model as Google Cloud's
 [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog)
 (OKF v0.1), which AKB independently arrived at before the spec existed.
-AKB-authored bundles satisfy all three OKF MUST rules. The Git-tree exporter
-below exports Bare Git vaults as a conformant OKF bundle (documents, plus tables/files as concept docs)
-and validates bundles. It is not a Native vault exporter:
+AKB-authored bundles satisfy all three OKF MUST rules. Server-side
+`akb_export({"vault": "<vault>", "format": "okf"})` and authenticated
+`GET /api/v1/vaults/{vault}/export?format=okf` support both PostgreSQL Native
+and Bare Git through the document service. Bundles contain documents plus
+tables/files represented as concept documents.
+
+The offline CLI below reads an existing Bare Git worktree; it does not read
+Native storage. Run it from `backend/`:
 
 ```bash
-python -m app.cli okf-export --from-git /data/vaults/_worktrees/<vault> \
+cd backend
+uv run python -m app.cli okf-export --from-git /data/vaults/_worktrees/<vault> \
     --vault <vault> --out ./okf-out/
-python -m app.cli okf-validate ./okf-out/
+uv run python -m app.cli okf-validate ./okf-out/
 ```
 
 OKF and AKB are complementary — OKF standardizes *how knowledge is written
@@ -464,6 +476,8 @@ and every refresh. Production HTTPS cookies use the browser-enforced `__Host-` p
 names. Generate the key as 32 random bytes encoded with unpadded base64url and
 keep it stable across restarts. See the [Keycloak boundary](./docs/designs/keycloak-oidc/00-overview.md)
 for refresh, logout, and back-channel revocation details.
+
+### Local JWT migration and rotation
 
 Local login issues only the versioned `local-session-rs256-v2` profile:
 RS256 with an installation-owned RSA-3072 key, an RFC 7638 `kid`, exact

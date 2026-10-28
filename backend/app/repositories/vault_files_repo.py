@@ -50,6 +50,14 @@ async def lock_s3_key_for_mutation(conn, s3_key: str) -> None:
     )
 
 
+async def try_lock_s3_key_for_mutation(conn, s3_key: str) -> bool:
+    """Reserve a short metadata decision without waiting for remote cleanup."""
+    return bool(await conn.fetchval(
+        "SELECT pg_try_advisory_xact_lock($1::int, hashtext($2))",
+        _S3_KEY_LOCK_NAMESPACE, s3_key,
+    ))
+
+
 async def try_lock_s3_key_for_cleanup(conn, s3_key: str) -> bool:
     """Hold one session lock across a cleanup probe and remote delete.
 
@@ -85,11 +93,7 @@ async def s3_key_available_for_registration(
     the caller selects a fresh random key. A same-vault row remains adoptable;
     cleanup will observe that live reference and retire its stale intent.
     """
-    locked = await conn.fetchval(
-        "SELECT pg_try_advisory_xact_lock($1::int, hashtext($2))",
-        _S3_KEY_LOCK_NAMESPACE,
-        s3_key,
-    )
+    locked = await try_lock_s3_key_for_mutation(conn, s3_key)
     if not locked:
         return False
 
@@ -388,6 +392,7 @@ async def lease_file_upload_confirmation(
              WHERE id = $1
                AND vault_id = $2
                AND kind = 'file'
+               AND upload_state = 'pending'
             RETURNING *
         )
         SELECT leased.id, leased.vault_id, leased.collection_id, leased.kind,
@@ -413,7 +418,7 @@ async def find_by_id_for_update(
     """Return and row-lock one standalone File for an atomic mutation."""
     row = await conn.fetchrow(
         """
-        SELECT vf.id, vf.vault_id, vf.collection_id, c.path AS collection,
+        SELECT vf.id, vf.vault_id, vf.collection_id, vf.kind, vf.upload_state, c.path AS collection,
                vf.name, vf.s3_key, vf.mime_type, vf.size_bytes,
                vf.description, vf.created_by, vf.created_at, vf.updated_at,
                vf.content_hash, vf.hash_algorithm, vf.etag,
@@ -859,6 +864,7 @@ async def confirm_file_upload_metadata(
     file_id: uuid.UUID,
     vault_id: uuid.UUID,
     *,
+    expected_s3_key: str,
     size_bytes: int,
     content_hash: str,
     hash_algorithm: str,
@@ -880,10 +886,27 @@ async def confirm_file_upload_metadata(
           AND vault_id = $7
           AND kind = 'file'
           AND upload_state = 'pending'
+          AND s3_key = $8
         RETURNING id
         """,
         size_bytes, content_hash, hash_algorithm, etag, storage_version, file_id,
-        vault_id,
+        vault_id, expected_s3_key,
+    )
+    return row is not None
+
+
+async def delete_failed_pending_file(
+    conn, *, vault_id: uuid.UUID, file_id: uuid.UUID, expected_s3_key: str,
+) -> bool:
+    """Remove only the unconfirmed reservation whose bytes were inspected."""
+    row = await conn.fetchrow(
+        """
+        DELETE FROM vault_files
+         WHERE id = $1 AND vault_id = $2 AND kind = 'file'
+           AND upload_state = 'pending' AND s3_key = $3
+        RETURNING id
+        """,
+        file_id, vault_id, expected_s3_key,
     )
     return row is not None
 

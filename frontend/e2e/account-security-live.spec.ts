@@ -40,7 +40,7 @@ test("Security: revoke two local sessions, retain PAT, reauthenticate and delete
     expect((await request.get(`${endpoint}/auth/me`, { headers: bearer(first) })).status()).toBe(401);
     expect((await request.get(`${endpoint}/auth/me`, { headers: bearer(second) })).status()).toBe(401);
     expect((await request.get(`${endpoint}/auth/me`, { headers: bearer(pat) })).status()).toBe(200);
-    await page.getByLabel("Username", { exact: true }).fill(username);
+    await page.getByLabel("Username or email", { exact: true }).fill(username);
     await page.getByLabel("Password", { exact: true }).fill(password);
     await page.getByRole("button", { name: "Sign in", exact: true }).click();
     await expect(page).not.toHaveURL(/\/auth/);

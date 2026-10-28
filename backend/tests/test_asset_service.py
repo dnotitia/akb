@@ -1305,6 +1305,7 @@ async def test_regular_file_confirm_rejects_attachment_before_storage_access(
         "lease_file_upload_confirmation",
         fake_lease,
     )
+    monkeypatch.setattr(file_service.vault_files_repo, "find_by_id_for_update", fake_lease)
     monkeypatch.setattr(file_service.s3_adapter, "head", unexpected_head)
 
     with pytest.raises(NotFoundError):

@@ -46,7 +46,7 @@ MATRIX_ENV = "AKB_NATIVE_REVISION_CAPACITY_MATRICES_JSON"
 MATRIX_HASH_ENV = "AKB_NATIVE_REVISION_CAPACITY_MATRIX_SET_SHA256"
 POOL_MAX_SIZE_ENV = "AKB_NATIVE_REVISION_CAPACITY_POOL_MAX_SIZE"
 MEASUREMENT_TABLE = "m1_capacity_derived_projection"
-# Exact frozen workbench comparison set.  The concurrency manifest contains two
+# Exact frozen M0 comparison set.  The concurrency manifest contains two
 # planned C=128 repeats that were not run after the first safety-censored cell;
 # the fresh overload manifest replaced them.  Excluding those exact two IDs and
 # including the localized matrix reproduces the 70 cells actually published by

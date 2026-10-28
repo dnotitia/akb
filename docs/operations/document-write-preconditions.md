@@ -88,10 +88,18 @@ original editor draft.
 
 Draft ownership and read verification have different lifetimes. A foreground
 access check cancels outdated reads, but does not discard the same user's
-reviewed comparison. The Vault Guide comparison is hidden while ownership is
+reviewed comparison. Canceling a comparison read also ends that request's busy
+state, so restored access permits editing and retrying without closing the
+comparison or losing a composed result. The Vault Guide comparison is hidden while ownership is
 being verified and restored, unchanged, when the same owner is authorized.
 Changing the account or Vault does not carry that comparison into the new
 workspace.
+
+Pending-upload ownership survives editor remounts during comparison and is
+kept separate from the images referenced by the composed body. On a successful
+save, accepted uploads are claimed and excluded pending uploads are discarded
+through the existing lifecycle. Current and historical document images retain
+their server-side reference protection.
 
 A successful write is acknowledged against its document, account and auth
 session, not an access-check counter. An intervening same-session access check
@@ -116,6 +124,8 @@ Metadata-only reservation backfills remain unchanged. The proxy forwards
 conditions unchanged when reading a local file and never fetches one itself.
 
 No database migration, new configuration or proxy-runtime upgrade is required.
+Deploy the backend with the document-head endpoint before the new frontend;
+an older backend's missing route cannot verify an editor's current access.
 Existing clients can send the new required condition through their existing
 transport. See the [SDK README](../../packages/akb-client/README.md#recovering-a-conflict)
 for the typed update and reviewed recovery pattern.

@@ -2,7 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Uses isolated HTTP fixtures, never a user's data.");
 
-async function fixture(page: Page, dark: boolean) {
+async function fixture(page: Page, dark: boolean, role: "owner" | "reader" = "owner") {
   await page.addInitScript((dark) => {
     localStorage.setItem("akb_token", "composer-settings-fixture");
     localStorage.setItem("akb_theme", dark ? "dark" : "light");
@@ -12,10 +12,10 @@ async function fixture(page: Page, dark: boolean) {
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
     if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "writing-fixture", username: "reviewer", display_name: "Workspace reviewer", email: "reviewer@example.invalid", auth_method: "local", is_admin: false } });
-    if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ id: "writing-vault", name: "fixture", role: "owner" }] } });
+    if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ id: "writing-vault", name: "fixture", role }] } });
     if (path.endsWith("/info")) return route.fulfill({ json: {
       name: "fixture", description: "A shared space for decisions, product notes, and operating guides.",
-      role: "owner", public_access: "none", owner_display_name: "Workspace reviewer",
+      role, public_access: "none", owner_display_name: "Workspace reviewer",
       created_at: "2026-09-01T09:00:00Z", last_activity: "2026-09-24T08:30:00Z",
       is_archived: false, is_external_git: false, member_count: 4,
       collection_count: 2, document_count: 12, table_count: 1, file_count: 3,
@@ -29,6 +29,7 @@ async function fixture(page: Page, dark: boolean) {
       path: "overview/vault-skill.md", title: "Workspace guide", content: "# Working together\n\nKeep decisions with their context.",
       current_commit: "fixture-guide-commit", status: "active",
     } });
+    if (path.includes("/help/vault-skill-preview/")) return route.fulfill({ contentType: "text/plain", body: "# Agent context\n\nUse this vault for team decisions." });
     return route.fulfill({ json: { items: [], history: [], relations: [], vaults: [], subscribed: false, unread_count: 0 } });
   });
 }
@@ -46,6 +47,10 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
     await expect(details).toBeVisible();
     const collection = composer.getByLabel(/^Collection/);
     await expect(collection).toHaveValue("notes");
+    // The lazy editor replaces a taller fallback. Measure after it mounts so
+    // the two rectangles cannot straddle that layout change on a cold runner.
+    const body = composer.locator('[contenteditable="true"]').first();
+    await expect(body).toBeVisible();
     const writingBox = (await writing.boundingBox())!;
     const detailsBox = (await details.boundingBox())!;
     if (width >= 1440) {
@@ -59,7 +64,6 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
       await expect(composer.getByRole("button", { name: "Edit collection: notes", exact: true })).toBeInViewport({ ratio: 1 });
     }
     await composer.getByLabel(/^Title/).fill("Working together: product decisions");
-    const body = composer.locator('[contenteditable="true"]').first();
     await expect(body).toBeVisible();
     await body.fill("Write decisions with their context so the next person can pick up where you left off.");
     await expect(composer.getByRole("button", { name: "Create document" })).toBeEnabled();
@@ -96,8 +100,8 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
     await page.setViewportSize({ width, height: 1000 });
     await fixture(page, dark);
     await page.goto("/vault/fixture/settings");
-    const general = page.getByRole("region", { name: "General", exact: true });
-    const access = page.getByRole("region", { name: "Access", exact: true });
+    const general = page.getByRole("region", { name: "Vault details", exact: true });
+    const access = page.getByRole("region", { name: "Access permissions", exact: true });
     const guide = page.getByRole("region", { name: "Vault guide", exact: true });
     const danger = page.getByRole("region", { name: "Danger zone", exact: true });
     for (const [region, id] of [[general, "general"], [access, "access"], [guide, "skill"], [danger, "danger"]] as const) {
@@ -105,12 +109,23 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
       await expect(region).toHaveAttribute("id", id);
       const group = region.locator('[data-slot="settings-group"]');
       await expect(group).toHaveCount(1);
-      await expect(group).toHaveCSS("border-top-width", "1px");
-      const firstRow = group.locator('[data-slot="settings-row"]').first();
-      const labelSurface = firstRow.locator('[data-slot="settings-label"]');
-      const valueSurface = firstRow.locator('[data-slot="settings-value"]');
-      expect(await labelSurface.evaluate(node => getComputedStyle(node).backgroundColor)).not.toBe(await valueSurface.evaluate(node => getComputedStyle(node).backgroundColor));
+      await expect(group).toHaveCSS("border-top-width", "0px");
       expect(await region.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+    }
+    const sections = [general, access, guide, danger];
+    for (let index = 1; index < sections.length; index++) {
+      const previousBorder = await sections[index - 1].evaluate(node => parseFloat(getComputedStyle(node).borderBottomWidth));
+      const currentBorder = await sections[index].evaluate(node => parseFloat(getComputedStyle(node).borderTopWidth));
+      expect(previousBorder + currentBorder).toBeGreaterThanOrEqual(1);
+    }
+    const wideForm = await page.getByTestId("settings-workspace-frame").evaluate(node =>
+      node.clientWidth >= 64 * parseFloat(getComputedStyle(document.documentElement).fontSize));
+    for (const region of [general, access]) {
+      const headingBox = (await region.getByRole("heading").boundingBox())!;
+      const groupBox = (await region.locator('[data-slot="settings-group"]').boundingBox())!;
+      if (wideForm) expect(groupBox.x).toBeGreaterThan(headingBox.x + headingBox.width);
+      else expect(groupBox.y).toBeGreaterThanOrEqual(headingBox.y + headingBox.height);
+      await expect(region.locator('[data-slot="settings-row"]')).toHaveCount(0);
     }
     await expect(page.getByRole("tablist")).toHaveCount(0);
     await expect(page.getByRole("tabpanel")).toHaveCount(0);
@@ -119,7 +134,17 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
     await expect(details).toHaveCount(0);
     await expect(general.getByRole("button", { name: "Copy vault address", exact: true })).toBeVisible();
     await expect(page.getByLabel("Vault ownership and dates", { exact: true })).toHaveCount(0);
-    await expect(page.locator('[data-slot="vault-collections-sidebar"]')).toHaveCount(0);
+    const explorer = page.getByRole("navigation", { name: "fixture explorer", exact: true });
+    if (width >= 1024) {
+      await expect(explorer).toBeVisible();
+      await expect(page.getByRole("button", { name: "Switch vault: fixture", exact: true })).toBeVisible();
+    } else {
+      await expect(page.locator("#vault-workspace-navigation")).toBeHidden();
+      await page.getByRole("button", { name: "Open vault navigation", exact: true }).click();
+      await expect(explorer).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("button", { name: "Open vault navigation", exact: true })).toBeFocused();
+    }
     await expect(page.getByRole("navigation", { name: "Vault sections" })).toHaveCount(0);
     await page.screenshot({ path: testInfo.outputPath("settings-general.png"), animations: "disabled" });
     const description = page.getByLabel("Description", { exact: true });
@@ -130,28 +155,63 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
     const firstChoice = policy.getByRole("radio", { name: "Invited members only", exact: true });
     const lastChoice = policy.getByRole("radio", { name: "Everyone can edit", exact: true });
     await expect(firstChoice).toBeChecked();
-    await expect(firstChoice.locator("..")).toHaveCSS("border-top-width", "1px");
-    await expect(lastChoice.locator("..")).toHaveCSS("border-top-width", "1px");
-    await expect(policy).toHaveAccessibleDescription("Only people you add as members can open this vault.");
+    await expect(policy).toHaveCSS("border-top-width", "1px");
+    const choices = await policy.locator("label").all();
+    for (let index = 1; index < choices.length; index++) {
+      const previous = choices[index - 1];
+      const current = choices[index];
+      const horizontal = (await current.boundingBox())!.x > (await previous.boundingBox())!.x;
+      const previousBorder = await previous.evaluate((node, horizontal) => parseFloat(getComputedStyle(node)[horizontal ? "borderRightWidth" : "borderBottomWidth"]), horizontal);
+      const currentBorder = await current.evaluate((node, horizontal) => parseFloat(getComputedStyle(node)[horizontal ? "borderLeftWidth" : "borderTopWidth"]), horizontal);
+      expect(previousBorder + currentBorder).toBeGreaterThanOrEqual(1);
+    }
+    await expect(policy).toHaveAccessibleDescription("Only people invited to this vault.");
     await expect(lastChoice).toBeVisible();
     await firstChoice.focus();
     await page.keyboard.press("ArrowDown");
     const readingChoice = policy.getByRole("radio", { name: "Everyone can view", exact: true });
     await expect(readingChoice).toBeFocused();
     await expect(readingChoice).toBeChecked();
-    await expect(policy).toHaveAccessibleDescription("Anyone signed in to this AKB can view content without an invitation. Editing still requires permission.");
+    await expect(policy).toHaveAccessibleDescription("Signed-in AKB users can read without an invitation.");
     await expect(general.getByRole("button", { name: "Save changes", exact: true })).toBeEnabled();
     await expect(access.getByRole("button", { name: "Save changes", exact: true })).toBeEnabled();
-    await expect(access.getByRole("link", { name: "Manage members", exact: true })).toHaveAttribute("href", "/vault/fixture/members");
-    await expect(access.getByRole("link", { name: "Public links", exact: true })).toHaveAttribute("href", "/vault/fixture/publications");
     await page.screenshot({ path: testInfo.outputPath("settings-access.png"), animations: "disabled" });
+    await expect(guide.getByRole("region", { name: "Vault guide preview", exact: true })).toContainText("Keep decisions with their context.");
+    await expect(guide.getByRole("textbox", { name: "Vault guide body", exact: true })).toHaveCount(0);
+    await expect(guide.getByRole("link", { name: "Open guide", exact: true })).toHaveAttribute("href", "/vault/fixture/doc/overview%2Fvault-skill.md");
     await guide.getByRole("button", { name: "Edit guide", exact: true }).click();
     const guideBody = guide.getByRole("textbox", { name: "Vault guide body", exact: true });
     await guideBody.fill("# Draft guide\n\nKeep this draft while viewing a preview.");
-    await guide.getByRole("button", { name: "Preview guide", exact: true }).click();
+    await guide.getByRole("button", { name: "Guide options", exact: true }).click();
+    const options = page.getByRole("menu", { name: "Guide options", exact: true });
+    await expect(options.getByRole("menuitem", { name: "History", exact: true })).toHaveAttribute("href", "/vault/fixture/doc/overview%2Fvault-skill.md?commit=fixture-guide-commit");
+    await expect(options.getByRole("menuitem", { name: "Reset to template", exact: true })).toBeVisible();
+    await options.getByRole("menuitem", { name: "Agent view", exact: true }).click();
+    await expect(guide.getByRole("region", { name: "Agent view", exact: true })).toContainText("Use this vault for team decisions.");
+    await guide.getByRole("button", { name: "Close agent view", exact: true }).click();
+    await expect(guide.getByRole("region", { name: "Vault guide preview", exact: true })).toContainText("Keep decisions with their context.");
     await guide.getByRole("button", { name: "Edit guide", exact: true }).click();
     await expect(guideBody).toHaveValue("# Draft guide\n\nKeep this draft while viewing a preview.");
+    await guide.getByRole("link", { name: "Open guide", exact: true }).click();
+    const reader = page.getByRole("dialog", { name: "Document preview", exact: true });
+    await expect(reader).toBeVisible();
+    await expect(page).toHaveURL(/\/vault\/fixture\/doc\/overview%2Fvault-skill\.md$/);
+    await expect(reader.getByRole("heading", { name: "Working together", exact: true })).toBeVisible();
+    await reader.getByRole("button", { name: "Close dialog", exact: true }).click();
+    await expect(page).toHaveURL(/\/vault\/fixture\/settings$/);
+    await expect(guideBody).toHaveValue("# Draft guide\n\nKeep this draft while viewing a preview.");
+    await guide.getByRole("button", { name: "Cancel", exact: true }).click();
+    const discardGuide = page.getByRole("dialog", { name: "Discard unsaved guide changes?", exact: true });
+    await discardGuide.getByRole("button", { name: "Keep editing", exact: true }).click();
+    await expect(guideBody).toHaveValue("# Draft guide\n\nKeep this draft while viewing a preview.");
+    await page.getByRole("navigation", { name: "Current page", exact: true }).getByRole("link", { name: "Back to fixture", exact: true }).click();
+    const discardSettings = page.getByRole("dialog", { name: "Discard unsaved settings changes?", exact: true });
+    await expect(page.getByRole("dialog")).toHaveCount(1);
+    await discardSettings.getByRole("button", { name: "Keep editing", exact: true }).click();
+    await expect(page).toHaveURL(/\/vault\/fixture\/settings$/);
+    await expect(guideBody).toHaveValue("# Draft guide\n\nKeep this draft while viewing a preview.");
     await expect(description).toHaveValue("A draft description that must survive working across the settings sheet.");
+    await expect(readingChoice).toBeChecked();
     await page.screenshot({ path: testInfo.outputPath("settings-guide.png"), animations: "disabled" });
     await expect(danger.getByRole("button", { name: "Archive", exact: true })).toBeVisible();
     await expect(danger.getByRole("button", { name: "Delete vault", exact: true })).toBeVisible();
@@ -164,22 +224,54 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
   });
 }
 
+for (const width of [375, 1920]) test(`readers can read the Guide without settings mutation controls at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 1000 });
+  await fixture(page, false, "reader");
+  await page.goto("/vault/fixture/settings");
+  await expect(page.getByText("Read only — only the vault owner can change settings.", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Description", { exact: true })).toHaveJSProperty("readOnly", true);
+  const policy = page.getByRole("radiogroup", { name: "Who can access", exact: true });
+  await expect(policy.getByRole("radio")).toHaveCount(3);
+  for (const choice of await policy.getByRole("radio").all()) await expect(choice).toBeDisabled();
+  const guide = page.getByRole("region", { name: "Vault guide", exact: true });
+  await expect(guide.getByRole("region", { name: "Vault guide preview", exact: true })).toContainText("Keep decisions with their context.");
+  await expect(guide.getByRole("link", { name: "Open guide", exact: true })).toHaveAttribute("href", "/vault/fixture/doc/overview%2Fvault-skill.md");
+  await expect(guide.getByRole("button", { name: "Edit guide", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Save changes", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Danger zone", exact: true })).toHaveCount(0);
+  await guide.getByRole("button", { name: "Guide options", exact: true }).click();
+  const options = page.getByRole("menu", { name: "Guide options", exact: true });
+  await expect(options.getByRole("menuitem", { name: "Agent view", exact: true })).toBeVisible();
+  await expect(options.getByRole("menuitem", { name: "History", exact: true })).toBeVisible();
+  await expect(options.getByRole("menuitem", { name: "Reset to template", exact: true })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(guide.getByRole("button", { name: "Guide options", exact: true })).toBeFocused();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
 test("wide Settings keeps one scroll surface and a readable expanded Guide on short screens", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 600 });
   await fixture(page, false);
-  const content = "# Working together\n\n" + Array.from({ length: 60 }, (_, index) => `## Decision ${index + 1}\n\nKeep decisions with their context. `.repeat(3)).join("\n\n");
+  const content = "# Working together\n\n" + Array.from({ length: 60 }, (_, index) => `## Decision ${index + 1}\n\n${"Keep decisions with their context. ".repeat(3)}`).join("\n\n");
   await page.route("**/api/v1/documents/fixture/**", route => route.fulfill({ json: {
     path: "overview/vault-skill.md", title: "Workspace guide", content,
     current_commit: "fixture-guide-commit", status: "active",
   } }));
   await page.goto("/vault/fixture/settings#skill");
-  const frame = page.getByTestId("settings-workspace-frame");
+  const frame = page.locator('[data-slot="vault-route-viewport"]');
+  const sheet = page.getByTestId("settings-workspace-frame");
   const guide = page.getByRole("region", { name: "Vault guide", exact: true });
-  await guide.getByRole("button", { name: "Preview guide", exact: true }).click();
   const previewHeading = guide.getByRole("heading", { name: "Working together", exact: true });
   await expect(previewHeading).toBeVisible();
-  const preview = guide.getByRole("region", { name: "Guide preview", exact: true });
+  const preview = guide.getByRole("region", { name: "Vault guide preview", exact: true });
   expect((await preview.boundingBox())!.width).toBeLessThanOrEqual(1024);
+  await expect(guide.getByRole("heading", { name: "Decision 60", exact: true })).toBeHidden();
+  const showMore = guide.getByRole("button", { name: "Show more", exact: true });
+  await expect(showMore).toHaveAttribute("aria-expanded", "false");
+  await showMore.click();
+  await expect(guide.getByRole("button", { name: "Show less", exact: true })).toHaveAttribute("aria-expanded", "true");
+  await expect(guide.getByRole("heading", { name: "Decision 60", exact: true })).toBeVisible();
+  expect(await sheet.evaluate(node => node.scrollHeight <= node.clientHeight)).toBe(true);
   await expect.poll(() => frame.evaluate(node => node.scrollHeight > node.clientHeight)).toBe(true);
   await frame.evaluate(node => { node.scrollTop = node.scrollHeight; });
   expect(await page.evaluate(() => window.scrollY)).toBe(0);

@@ -38,9 +38,9 @@ For each (arm, query) pair the runner:
 The judge is a separate step — a Claude sub-agent reasons over the
 ground-truth `must_mention` / `forbidden` / `faithfulness` rules
 without using substring matchers (those under-credit paraphrase).
-No external commercial LLM API; the harness assumes Claude
-subscription via sub-agent and OpenRouter-backed cheap models for
-the agent itself.
+The agent calls an OpenAI-compatible model endpoint (OpenRouter by default);
+provider usage may incur charges. The judge workflow is a separate manual or
+agent-assisted step and requires access to the source corpus.
 
 ## Layout
 
@@ -56,9 +56,8 @@ src/
   paths.py             EVALSET_DIR / RUNS_DIR — one resolution for all stages
 scripts/
   run_v4_multiproc.sh  Multi-process driver — N processes × M queries each
-evalset-project-akb/   Tracked seed questions over the `project-akb` vault —
-                       the only worked examples of the schema in this repo
-                       (`evalset/` itself stays private, see below)
+evalset-synthetic/    Three questions over the public fictional Orchard corpus
+corpus-synthetic/     Source documents for those questions (no private vault needed)
 tests/                 Unit tests for the gate/tradeoff arithmetic and the
                        seed evalset schema
 ```
@@ -69,30 +68,57 @@ The runner reads everything from environment variables so the same
 script targets dev, staging, and prod. The harness is corpus-
 agnostic — point it at any AKB instance and supply your own evalset.
 
+Start a disposable AKB instance using the [Native quickstart](../../README.md#quick-start),
+create a user and PAT, then import the public fixture documents through your MCP
+client. The following are tool calls (the `content` value means the complete text
+of the named local file, not its path):
+
+1. `akb_create_vault(name="bench-synthetic", description="Fictional Orchard benchmark fixtures", public_access="none")`.
+2. For each Markdown file in [`corpus-synthetic/`](corpus-synthetic/), call
+   `akb_put(parent="akb://bench-synthetic/coll/fixtures", slug="<filename without .md>", title="<document heading>", content="<full file text>")`.
+3. Confirm the returned URIs match `ground_truth.source_docs` in
+   [`evalset-synthetic/`](evalset-synthetic/). Follow any vault-skill acknowledgement
+   returned by the server, then retry the same write. Wait for indexing to finish
+   before comparing search arms.
+
+Use a fresh instance if that vault name already belongs to another experiment.
+These fictional contracts are test data, not descriptions of AKB behavior.
+
+From `eval/agentic-bench/`, with Python dependencies from the backend development
+setup installed and its virtual environment activated:
+
 ```bash
-# 1) Author an evalset/q*.yaml per question. Schema:
-#    id, category, query, ground_truth: {must_mention, forbidden, source_docs}
-# 2) Smoke-test a single (arm, query) pair to confirm the agent is
-#    actually using the tools you expect:
-RUNS_DIR=runs_smoke \
-AKB_MCP_URL=https://... AKB_PAT=... \
-LLM_API_KEY=... LLM_MODEL=qwen/qwen3.6-plus \
+export EVALSET_DIR="$PWD/evalset-synthetic"
+export RUNS_DIR="$PWD/runs_v4_smoke"
+export AKB_MCP_URL=http://localhost:8000/mcp/
+# Set AKB_PAT and LLM_API_KEY privately; never commit them.
+export LLM_MODEL=qwen/qwen3.6-plus
 python -m src.runner --arm A3_tree --query q001
-# 3) Full run — one process per (arm, chunk):
-bash scripts/run_v4_multiproc.sh
-# 4) Hand off to a Claude sub-agent for verdicts:
+# All four arms over the three public questions:
+python -m src.runner --arm all --query all --parallel 1
+# Separate judge workflow; the judge must inspect these synthetic sources:
 python -m src.prep_judge_v3 prep
-# (sub-agent writes runs_*/verdicts/verdicts_batch_*.json)
+# Review batches/*.json against source text; write verdicts as described below.
 python -m src.prep_judge_v3 finalize
-RUNS_DIR=runs_v1 python -m src.judge --aggregate
+python -m src.judge --aggregate
 ```
 
-`RUNS_DIR` is required for any version other than the default
-`runs/`. `EVALSET_DIR` selects the question set (default `evalset/`; the
-tracked seed set is `evalset-project-akb/`) and is read by the runner, the
-judge prep and the aggregator through one helper (`src/paths.py`), so a
-run cannot be produced against one question set and scored against
-another. The aggregator emits `metrics.json` next to the raw runs.
+For each batch, write a JSON array to
+`$RUNS_DIR/verdicts/verdicts_batch_00.json` (increment the suffix per batch).
+Each entry needs `qid`, `arm`, `matched` (list of supported required facts),
+`missing` (list of missing required facts), `forbidden_found` (list),
+`faithfulness` (`high`, `medium`, or `low`), `verdict` (`PASS` or `FAIL`), and
+`reason`. Judge each answer against both the question and source document;
+`PASS` requires all required facts, no forbidden claims, and faithful support.
+
+Keep `EVALSET_DIR` and `RUNS_DIR` exported for every stage. The `v4` in the
+run directory name selects the four-arm layout in the historical judge prep;
+use that prefix with this workflow. All stages use
+`src/paths.py`; omitting `EVALSET_DIR` selects the untracked `evalset/` directory.
+The aggregator emits `metrics.json` next to the raw runs. The historical
+`scripts/run_v4_multiproc.sh` assumes 100 questions (`q001`–`q100`); it is not
+the driver for this three-question fixture. These fixtures test harness setup
+and schema compatibility, not statistical retrieval quality.
 
 ## The accuracy gate and the cost tradeoff
 
@@ -199,31 +225,18 @@ Other observations the runs surface:
 The Korean-law evalset and per-run summaries that produced these
 numbers live in the private sister repo.
 
-## What we keep private
+## Public fixtures and historical experiments
 
-The Korean-law evalset, the per-run summaries, the per-query judge
-verdicts, the v1–v8 result narratives, and the vault snapshots all
-live in a sister repo. They aren't checked in here because:
+The original domain-specific experiments used a separate corpus that is not
+included here. Their aggregate observations above are historical context, not
+results reproduced by the three-question public example.
 
-- the ground-truth answers are domain-specific and were hand-
-  authored — they aren't a public dataset;
-- the raw model outputs include Korean text that's load-bearing for
-  the analysis but not useful as an OSS artefact;
-- the harness is the part that's reusable across corpora.
-
-If you fork this for your own domain, you'll write your own
-`evalset/`. The schema is intentionally tiny.
-
-`evalset-project-akb/` is the exception that is checked in: three seed
-questions over the `project-akb` vault (the AKB family's own
-design/decision record), written so this repository carries at least one
-worked example of the schema. Point the harness at them with
-`EVALSET_DIR=evalset-project-akb`. They cover a cross-repository seam
-(the Product-API contract in `product/pipeline/modules/collector.md`), a
-single decision with a client-visible consequence (`ADR-016`, write-lane
-admission), and a two-sided module contract (`product/akb-oss/modules/backend.md`).
-Each answer lives in one section of one document, so an arm that retrieves
-the right document and stops has not answered the question.
+The checked-in `corpus-synthetic/` and `evalset-synthetic/` provide all source
+text and ground truth needed for a small independent run. No internal document
+or private vault is required. To evaluate another domain, supply your own
+`EVALSET_DIR` with `id`, `category`, `query`, and `ground_truth` containing
+`must_mention`, `forbidden`, and canonical `source_docs` URIs. Import the matching
+corpus into your own instance and record its revision alongside the results.
 
 ## License
 

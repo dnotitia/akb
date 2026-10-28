@@ -161,7 +161,7 @@ def test_vault_path_eligible(monkeypatch):
 
 
 def test_native_document_search_uses_vault_path_with_source_type_predicate(monkeypatch):
-    """With the driver-side source_type predicate (workbench #1069), the native
+    """With the driver-side source_type predicate, the native
     arm takes the vault path too: stale legacy points are excluded driver-side
     before the top-K cut, so they can no longer suppress valid native hits.
     `source_types` is what carries the active-arm constraint (asserted in
@@ -326,7 +326,7 @@ async def test_search_requires_vault_or_user_id():
 
 @pytest.mark.asyncio
 async def test_run_vector_search_forwards_source_types_to_driver(monkeypatch):
-    """`source_types` (workbench #1069) threads into the driver's hybrid_search
+    """`source_types` threads into the driver's hybrid_search
     so stale points from the non-active Document arm are excluded driver-side
     before the top-K cut. None (legacy callers) stays None = no constraint."""
     import app.services.search_service as ss

@@ -10,9 +10,18 @@ import pytest
 
 from mcp_catalog.checkpoint import CheckpointError, CheckpointHeader, CheckpointKey, CheckpointStore
 from mcp_catalog.contracts import hash_json, load_run_manifest, load_task_corpus
-from mcp_catalog.execution import ToolCallRecord, ToolCallRecorder, TrialOutcome, bind_tool_calls, response_matches_rubric
-from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts, planned_arm_order
+from mcp_catalog.execution import (
+    ToolCallRecord,
+    ToolCallRecorder,
+    TrialOutcome,
+    bind_tool_calls as _bind_tool_calls,
+    canonicalize_arguments,
+    response_matches_rubric,
+)
+from mcp_catalog.runner import _build_artifact_hash_input, compare_artifacts
 from mcp_catalog.runtime import StateObservation
+from paired_artifact_factory import provider_name_for_model
+from paired_artifact_factory import complete_paired_artifacts
 
 
 ROOT = Path(__file__).parents[1]
@@ -35,6 +44,25 @@ def _loaded() -> tuple[object, list[object]]:
     )
 
 
+def bind_tool_calls(*args, **kwargs):
+    manifest, _tasks = _loaded()
+    kwargs.setdefault("tool_resources", manifest.tool_resources)
+    kwargs.setdefault("public_operations", manifest.public_operations)
+    kwargs.setdefault("arm", "baseline")
+    raw_calls = args[0] if args else kwargs.get("raw_calls", [])
+    names = {name for name, _arguments in raw_calls}
+    stdio_only = {
+        operation.operation
+        for operation in manifest.public_operations
+        if operation.transports == ["stdio"]
+    }
+    if names and names <= stdio_only:
+        kwargs.setdefault("transport", "stdio")
+    else:
+        kwargs.setdefault("transport", "http")
+    return _bind_tool_calls(*args, **kwargs)
+
+
 def _seal_comparison_artifact(artifact: dict[str, object]) -> None:
     current = artifact.get("artifact_hash_input")
     trial_order = current.get("trial_order", []) if isinstance(current, dict) else []
@@ -42,7 +70,7 @@ def _seal_comparison_artifact(artifact: dict[str, object]) -> None:
     artifact["artifact_hash"] = hash_json(artifact["artifact_hash_input"])
 
 
-def test_corpus_has_thirteen_tasks_per_locale_and_one_pair_per_locale() -> None:
+def test_corpus_has_twenty_tasks_per_locale_and_twenty_semantic_pairs() -> None:
     manifest, tasks = _loaded()
 
     manifest.validate_tasks(tasks)
@@ -51,20 +79,20 @@ def test_corpus_has_thirteen_tasks_per_locale_and_one_pair_per_locale() -> None:
     for task in tasks:
         pairs[task.pair_id].append(task)
 
-    assert len(tasks) == 26
-    assert locales == {"ko-KR": 13, "en-US": 13}
-    assert sum(len(task.fixture.transports) for task in tasks) * len(manifest.models) * manifest.repeats == 200
+    assert len(tasks) == 40
+    assert locales == {"ko-KR": 20, "en-US": 20}
+    assert sum(len(task.fixture.transports) for task in tasks) * len(manifest.models) * manifest.repeats * len(manifest.arms) == 608
     assert set(pairs) == set(manifest.pair_categories)
     assert all({task.locale for task in members} == {"ko-KR", "en-US"} for members in pairs.values())
     assert all(len(members) == 2 for members in pairs.values())
     assert Counter(task.category for task in tasks) == {
         "single_operation": 6,
         "ambiguous_action": 4,
-        "multi_step": 8,
+        "multi_step": 20,
         "destructive_confirmation": 2,
         "authorization": 2,
         "invalid_input_recovery": 2,
-        "stdio_local": 2,
+        "stdio_local": 4,
     }
 
 
@@ -94,7 +122,7 @@ def test_stdio_pair_requires_both_file_and_image_operations_in_both_locales() ->
     _manifest, tasks = _loaded()
     stdio_tasks = [task for task in tasks if task.category == "stdio_local"]
 
-    assert len(stdio_tasks) == 2
+    assert len(stdio_tasks) == 4
     assert {task.locale for task in stdio_tasks} == {"ko-KR", "en-US"}
     for task in stdio_tasks:
         assert set(task.fixture.transports) == {"stdio"}
@@ -115,6 +143,49 @@ def test_authorization_rubric_is_locale_specific_without_cross_language_terms() 
     assert not response_matches_rubric("Access is denied; I cannot change it.", korean)
     assert response_matches_rubric("Access is denied; I cannot change it.", english)
     assert not response_matches_rubric("권한이 없어 변경할 수 없습니다.", english)
+
+
+@pytest.mark.asyncio
+async def test_raw_arguments_must_match_the_captured_public_schema_without_coercion() -> None:
+    schema = {
+        "akb_identity": {
+            "type": "object",
+            "properties": {
+                "action": {"const": "search_users"},
+                "include_archived": {"type": "boolean"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["action", "include_archived", "limit"],
+            "additionalProperties": False,
+        }
+    }
+
+    async def succeed(_name: str, _arguments: dict[str, object]) -> dict[str, bool]:
+        return {"ok": True}
+
+    async def bind(arguments: dict[str, object]) -> ToolCallRecord:
+        recorder = ToolCallRecorder(operation_map={"search": ["akb_identity"]}, secrets=())
+        recorder.set_input_schemas(schema)
+        await recorder(None, succeed, "akb_identity", arguments)
+        raw = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        return bind_tool_calls(
+            [("akb_identity", raw)],
+            recorder.calls,
+            recorder.operation_map,
+            (),
+            input_schemas=recorder.input_schemas,
+        )[0]
+
+    valid = await bind({"action": "search_users", "include_archived": True, "limit": 50})
+    stringified = await bind({"action": "search_users", "include_archived": "True", "limit": "50"})
+
+    assert valid.raw_args_valid is True
+    assert valid.public_schema_valid is True
+    assert valid.argument_valid is True
+    assert stringified.raw_args_valid is True
+    assert stringified.server_args_equal_raw is True
+    assert stringified.public_schema_valid is False
+    assert stringified.argument_valid is False
 
 
 @pytest.mark.asyncio
@@ -298,7 +369,11 @@ async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_b
     _manifest, tasks = _loaded()
     recovery_task = next(task for task in tasks if task.id == "invalid-recovery-en")
     auth_task = next(task for task in tasks if task.id == "authorization-readonly-en")
-    recovery_recorder = ToolCallRecorder(operation_map={"create": ["akb_create_vault"]}, secrets=())
+    recovery_recorder = ToolCallRecorder(
+        operation_map={"create": ["akb_create_vault"]},
+        secrets=(),
+        task=recovery_task,
+    )
     recovery_recorder.set_input_schemas(
         {"akb_create_vault": {"properties": {"public_access": {"default": "none"}}}}
     )
@@ -461,11 +536,20 @@ def test_invalid_recovery_requires_the_rejected_attempt_before_success() -> None
     before = StateObservation(True, 200, {"vaults": []})
     after = StateObservation(True, 200, {"vaults": [{"name": "catalog-bench-recovery"}]})
 
-    def call(order: int, name: str, *, succeeded: bool, status_code: int | None = None, error_code: str | None = None) -> ToolCallRecord:
+    def call(
+        order: int,
+        name: str,
+        *,
+        stage_id: str,
+        succeeded: bool,
+        status_code: int | None = None,
+        error_code: str | None = None,
+    ) -> ToolCallRecord:
         return ToolCallRecord(
             order=order,
             tool_name="akb_create_vault",
             logical_operation="create",
+            operation_kind="material",
             raw_model_args={"name": name},
             server_args={"name": name},
             effective_server_args={"name": name, "public_access": "none"},
@@ -474,6 +558,7 @@ def test_invalid_recovery_requires_the_rejected_attempt_before_success() -> None
             server_succeeded=succeeded,
             server_status_code=status_code,
             server_error_code=error_code,
+            stage_id=stage_id,
         )
 
     skipped = TrialOutcome(
@@ -486,7 +571,7 @@ def test_invalid_recovery_requires_the_rejected_attempt_before_success() -> None
         transport="http",
         final_answer_text="Created the recovery vault.",
         first_logical_operation="create",
-        tool_calls=[call(1, "catalog-bench-recovery", succeeded=True)],
+        tool_calls=[call(1, "catalog-bench-recovery", stage_id="create_vault_2", succeeded=True)],
     )
     skipped.finalize(task, before, after)
     assert skipped.tool_outcome_match is False
@@ -494,8 +579,8 @@ def test_invalid_recovery_requires_the_rejected_attempt_before_success() -> None
 
     recovered = skipped.model_copy(deep=True)
     recovered.tool_calls = [
-        call(1, "bad/name", succeeded=False, status_code=400, error_code="invalid_argument"),
-        call(2, "catalog-bench-recovery", succeeded=True),
+        call(1, "bad/name", stage_id="create_vault_1", succeeded=False, status_code=400, error_code="invalid_argument"),
+        call(2, "catalog-bench-recovery", stage_id="create_vault_2", succeeded=True),
     ]
     recovered.final_answer_text = "The invalid name was rejected, then the recovery vault was created."
     recovered.finalize(task, before, after)
@@ -574,7 +659,9 @@ def test_missing_wrong_target_and_bypass_material_attempts_fail() -> None:
         ],
     )
     bypass.finalize(task, state, state)
-    assert bypass.safety is False
+    assert bypass.forbidden_mutation_attempts == 1
+    assert bypass.unsafe_mutation is False
+    assert bypass.safety is True
     assert bypass.success is False
 
 
@@ -694,21 +781,21 @@ def test_stdio_pair_requires_the_ordered_file_image_document_trace(tmp_path: Pat
     for filename in ("sample-note.txt", "sample-image.png"):
         shutil.copyfile(ROOT / "fixtures" / filename, consumer_root / filename)
     markdown = "![benchmark sample image](/api/assets/fixture-image)"
-    file_args = {"parent": "akb://catalog-bench-vault-authorization", "file_path": str(consumer_root / "sample-note.txt"), "collection": ""}
-    image_args = {"parent": "akb://catalog-bench-vault-authorization", "file_path": str(consumer_root / "sample-image.png"), "alt_text": "benchmark sample image"}
-    document_args = {"parent": "akb://catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document", "content": markdown, "type": "note", "status": "draft"}
+    file_args = {"vault": "catalog-bench-vault-authorization", "file_path": str(consumer_root / "sample-note.txt"), "collection": ""}
+    image_args = {"vault": "catalog-bench-vault-authorization", "file_path": str(consumer_root / "sample-image.png"), "alt_text": "benchmark sample image"}
+    document_args = {"vault": "catalog-bench-vault-authorization", "title": "catalog-bench-stdio-document", "content": markdown, "type": "note", "status": "draft"}
     outcome = TrialOutcome(
         task_id=task.id, category=task.category, locale=task.locale, arm="baseline",
         model_class="primary", model_id="model", transport="stdio",
         final_answer_text="Uploaded the file, attached the image, and created the document.",
         first_logical_operation="identity",
         tool_calls=[
-            {"order": 1, "tool_name": "akb_whoami", "logical_operation": "identity", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
-            {"order": 2, "tool_name": "akb_list_vaults", "logical_operation": "list", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
-            {"order": 3, "tool_name": "akb_get", "logical_operation": "read", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
-            {"order": 4, "tool_name": "akb_put_file", "logical_operation": "file_upload", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": file_args},
-            {"order": 5, "tool_name": "akb_put_image", "logical_operation": "image_upload", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": image_args, "result_fields": {"markdown": markdown}},
-            {"order": 6, "tool_name": "akb_put", "logical_operation": "create", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": document_args},
+            {"order": 1, "tool_name": "akb_whoami", "logical_operation": "identity", "operation_kind": "preparatory", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
+            {"order": 2, "tool_name": "akb_list_vaults", "logical_operation": "list", "operation_kind": "preparatory", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
+            {"order": 3, "tool_name": "akb_get", "logical_operation": "read", "operation_kind": "preparatory", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True},
+            {"order": 4, "tool_name": "akb_put_file", "logical_operation": "file_upload", "operation_kind": "material", "stage_id": "file_upload_file_1", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": file_args},
+            {"order": 5, "tool_name": "akb_put_image", "logical_operation": "image_upload", "operation_kind": "material", "stage_id": "image_upload_image_1", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": image_args, "result_fields": {"markdown": markdown}},
+            {"order": 6, "tool_name": "akb_put", "logical_operation": "create", "operation_kind": "material", "stage_id": "create_document_1", "raw_args_valid": True, "server_args_equal_raw": True, "server_succeeded": True, "server_args": document_args},
         ],
     )
     state_before = StateObservation(True, 200, {"items": []})
@@ -761,159 +848,97 @@ def test_keyword_match_cannot_override_a_failed_deterministic_state_contract() -
     assert outcome.success is False
 
 
-def _comparison_artifact(manifest: dict, *, candidate: bool) -> dict:
-    arm = "candidate" if candidate else "baseline"
-    events: list[dict] = []
-    sequence = 0
-    for repeat_index in range(1, 4):
-        for task_id in ("read-vaults-ko", "read-vaults-en"):
-            for order_position, planned_arm in enumerate(
-                planned_arm_order(task_id, repeat_index, manifest["paired_order_seed"])
-            ):
-                sequence += 1
-                events.append(
-                    {
-                        "sequence": sequence,
-                        "cell": "primary:http",
-                        "task_id": task_id,
-                        "repeat_index": repeat_index,
-                        "arm": planned_arm,
-                        "order_position": order_position,
-                    }
-                )
-    trials: list[dict] = []
-    for task_id, locale in (("read-vaults-ko", "ko-KR"), ("read-vaults-en", "en-US")):
-        for repeat_index in range(1, 4):
-            trials.append(
-                TrialOutcome(
-                    task_id=task_id,
-                    category="single_operation",
-                    locale=locale,
-                    arm=arm,
-                    model_class="primary",
-                    model_id="model",
-                    transport="http",
-                    repeat_index=repeat_index,
-                    paired_order_position=planned_arm_order(
-                        task_id,
-                        repeat_index,
-                        manifest["paired_order_seed"],
-                    ).index(arm),
-                    paired_execution_sequence=next(
-                        item["sequence"]
-                        for item in events
-                        if item["task_id"] == task_id
-                        and item["repeat_index"] == repeat_index
-                        and item["arm"] == arm
-                    ),
-                    first_logical_operation="list",
-                    first_material_operation="list",
-                    first_action_accuracy=True,
-                    first_material_action_accuracy=True,
-                    argument_validity=True,
-                    required_operations_completed=True,
-                    success=True,
-                    safety=True,
-                    total_tokens=90 if candidate else 100,
-                    latency_seconds=0.9 if candidate else 1.0,
-                ).model_dump(mode="json")
-            )
-    artifact = {
-        "schema_version": 1,
-        "status": "complete",
-        "arm": arm,
-        "run_manifest_hash": hash_json(manifest),
-        "task_corpus_hash": "corpus-hash",
-        "task_ids": ["read-vaults-ko", "read-vaults-en"],
-        "task_locales": [
-            {"id": "read-vaults-ko", "locale": "ko-KR", "pair_id": "read-vaults"},
-            {"id": "read-vaults-en", "locale": "en-US", "pair_id": "read-vaults"},
-        ],
-        "category_counts": {"single_operation": 2},
-        "locale_counts": {"ko-KR": 1, "en-US": 1},
-        "source_revision": "b" * 40 if candidate else "a" * 40,
-        "protocol_revision": "2026-07-28",
-        "request_timeout_seconds": manifest["budget"]["request_timeout_seconds"],
-        "artifact_versions": {},
-        "fixture": {"scenario": "app-control-plane", "reset": {"method": "POST", "body": {"scenario": "app-control-plane"}}},
-        "manifest": manifest,
-        "smoke_gate": {"status": "passed", "required_cells": [], "cells": []},
-        "overall_metrics": {},
-        "locale_metrics": {},
-        "catalogs": {"http:default": {"catalog_token_estimate": 100 if not candidate else 50}},
-        "runs": {"primary:http": {"trials": trials}},
-        "paired_execution": {
-            "mode": "counterbalanced_task_repeat",
-            "seed": manifest["paired_order_seed"],
-            "complete": True,
-            "events": events,
-            "reused": [],
-        },
-        "paired_budget_used": {
-            "model_requests": 12,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.01,
-            "wall_seconds": 1.0,
-            "model_work_seconds": 1.0,
-            "max_total_cost_usd": 50.0,
-        },
-    }
-    _seal_comparison_artifact(artifact)
-    return artifact
+def test_comparison_aggregates_locales_into_registered_semantic_clusters() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    result = compare_artifacts(baseline, candidate)
 
-
-def test_locale_metrics_are_reported_and_paired_without_mixing_locales() -> None:
-    manifest, _tasks = _loaded()
-    result = compare_artifacts(
-        _comparison_artifact(manifest.model_dump(mode="json"), candidate=False),
-        _comparison_artifact(manifest.model_dump(mode="json"), candidate=True),
-    )
-
-    assert set(result["locale"]) == {"ko-KR", "en-US"}
-    assert result["locale"]["ko-KR"]["metrics"]["success"]["independent_tasks"] == 1
-    assert result["locale"]["en-US"]["metrics"]["success"]["independent_tasks"] == 1
-    assert result["overall"]["metrics"]["success"]["independent_tasks"] == 2
+    assert result["verdict"] == "adopt"
+    assert result["independent_cluster_count"] == 20
+    assert result["overall"]["success"]["independent_clusters"] == 20
+    assert result["cells"]["primary:http"]["independent_clusters"] == 18
+    assert result["cells"]["primary:stdio"]["independent_clusters"] == 20
 
 
 def test_literal_first_tool_diagnostic_is_separate_from_material_action_gate() -> None:
-    manifest, _tasks = _loaded()
-    baseline = _comparison_artifact(manifest.model_dump(mode="json"), candidate=False)
-    candidate = _comparison_artifact(manifest.model_dump(mode="json"), candidate=True)
+    baseline, candidate = complete_paired_artifacts()
+    manifest, tasks = _loaded()
+    task = next(item for item in tasks if item.id == "read-vaults-ko")
+    route = next(item for item in manifest.public_operations if item.logical_operation == "identity")
     for artifact in (baseline, candidate):
+        arm = artifact["arm"]
+        route_spec = getattr(route, arm)
+        schema = next(
+            tool["inputSchema"]
+            for tool in artifact["catalogs"]["http:default"]["tools"]
+            if tool["name"] == route_spec.tool
+        )
+        arguments = {"action": route_spec.action} if route_spec.action is not None else {}
+        effective_arguments = canonicalize_arguments(arguments, schema)
         for trial in artifact["runs"]["primary:http"]["trials"]:
-            trial["first_action_accuracy"] = False
+            if trial["task_id"] != task.id:
+                continue
+            outcome = TrialOutcome.model_validate(trial)
+            outcome.tool_calls = [
+                ToolCallRecord(
+                    order=1,
+                    tool_name=route_spec.tool,
+                    canonical_operation=route.operation,
+                    surface_action=route_spec.action,
+                    logical_operation=route.logical_operation,
+                    resource_type=route.resource_type,
+                    tool_exists=True,
+                    operation_kind="preparatory",
+                    raw_model_args=arguments,
+                    server_args=arguments,
+                    effective_server_args=effective_arguments,
+                    raw_args_valid=True,
+                        public_schema_valid=True,
+                    server_args_equal_raw=True,
+                    transport_succeeded=True,
+                    server_succeeded=True,
+                    server_status_code=200,
+                ),
+                *[
+                    call.model_copy(update={"order": call.order + 1})
+                    for call in outcome.tool_calls
+                ],
+            ]
+            outcome.successful_mcp_tool_calls += 1
+            outcome.first_logical_operation = "identity"
+            before = [StateObservation(**item) for item in outcome.state_observations_before]
+            after = [StateObservation(**item) for item in outcome.state_observations_after]
+            outcome.finalize(task, before, after)
+            trial.clear()
+            trial.update(outcome.model_dump(mode="json"))
         _seal_comparison_artifact(artifact)
 
     result = compare_artifacts(baseline, candidate)
-    metrics = result["paired"]["primary:http"]["metrics"]
 
-    assert metrics["first_action_accuracy"]["candidate_mean"] == 0
-    assert metrics["first_material_action_accuracy"]["candidate_mean"] == 1
-    assert result["paired"]["primary:http"]["gate"]["first_material_action_not_worse"] is True
+    assert result["verdict"] == "adopt"
+    assert result["gate"]["checks"]["success_noninferiority_overall_and_each_cell"] is True
 
 
 def test_comparison_rejects_a_trial_with_the_wrong_declared_locale() -> None:
-    manifest, _tasks = _loaded()
-    baseline = _comparison_artifact(manifest.model_dump(mode="json"), candidate=False)
-    candidate = _comparison_artifact(manifest.model_dump(mode="json"), candidate=True)
-    candidate["runs"]["primary:http"]["trials"][0]["locale"] = "en-US"
+    baseline, candidate = complete_paired_artifacts()
+    first = candidate["runs"]["primary:http"]["trials"][0]
+    first["locale"] = "en-US" if first["locale"] == "ko-KR" else "ko-KR"
     _seal_comparison_artifact(candidate)
 
-    with pytest.raises(ValueError, match="trial locale"):
-        compare_artifacts(baseline, candidate)
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "trial locale" in result["gate"]["reasons"][0]
 
 
 def test_comparison_rejects_a_trial_with_the_wrong_repeat_index() -> None:
-    manifest, _tasks = _loaded()
-    baseline = _comparison_artifact(manifest.model_dump(mode="json"), candidate=False)
-    candidate = _comparison_artifact(manifest.model_dump(mode="json"), candidate=True)
+    baseline, candidate = complete_paired_artifacts()
     candidate["runs"]["primary:http"]["trials"][0]["repeat_index"] = 4
     _seal_comparison_artifact(candidate)
 
-    with pytest.raises(ValueError, match="repeat indices"):
-        compare_artifacts(baseline, candidate)
+    result = compare_artifacts(baseline, candidate)
+
+    assert result["verdict"] == "inconclusive"
+    assert "repeat indices" in result["gate"]["reasons"][0]
 
 
 def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> None:
@@ -948,23 +973,58 @@ def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> Non
         model_id=manifest.models[0].model_id,
         transport="http",
         repeat_index=1,
+        tool_calls=[],
         input_tokens=10,
         output_tokens=2,
         total_tokens=12,
         model_requests=1,
         cost_usd=0.00001,
-        provider_evidence=[{"routing": {"endpoints": {"available": [{"provider": "parasail", "selected": True}]}}, "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001}}],
+        provider_evidence=[{
+            "routing": {
+                "endpoints": {
+                    "available": [{
+                        "provider": provider_name_for_model(manifest.models[0]),
+                        "selected": True,
+                    }]
+                }
+            },
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.00001},
+        }],
         provider_cost_usd=0.00001,
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        state_available_before=True,
+        state_available_after=True,
+        state_before={},
+        state_after={},
+        state_observations_before=[
+            {
+                "available": True,
+                "status_code": item.resolved_before_expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
+        state_observations_after=[
+            {
+                "available": True,
+                "status_code": item.probe.expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
     )
     store = CheckpointStore(
         tmp_path / "checkpoint.json",
         header=header,
         expected_keys={hash_json(key.model_dump(mode="json")): key},
+        expected_tasks={task.id: task for task in tasks},
         expected_smoke_cells={},
     )
+    store.bind_pre_smoke_seal("e" * 64, {"status": "unavailable", "reason": "test fixture"})
     store.record_trial(key, outcome, status="completed")
     raw = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
     raw["records"][next(iter(raw["records"]))]["key"]["locale"] = "en-US"
@@ -975,6 +1035,7 @@ def test_locale_is_part_of_checkpoint_key_and_hash_inputs(tmp_path: Path) -> Non
             tmp_path / "checkpoint.json",
             header=header,
             expected_keys={hash_json(key.model_dump(mode="json")): key},
+            expected_tasks={task.id: task for task in tasks},
             expected_smoke_cells={},
             resume=True,
         )

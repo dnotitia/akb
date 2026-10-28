@@ -8,37 +8,74 @@ const path = "guides/team/operations/reading.md";
 const lastEdited = "2026-09-14T09:42:30Z";
 const createdAt = "2026-08-25T01:05:00Z";
 
+for (const width of [1024, 1280, 1600]) for (const dark of [false, true]) {
+  test(`Document byline insets and sidebar hairlines align at ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 1000 });
+    await fixture(page, dark, false, body, undefined, { created_by_name: "김민정" });
+    await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
+    const tools = page.locator(".reading-studio-header");
+    await expect(page.locator("#document-reading-canvas").getByRole("group", { name: "Document metadata", exact: true })).toContainText("김민정");
+    const opener = page.getByRole("button", { name: "Open vault navigation", exact: true });
+    if (await opener.isVisible()) await opener.click();
+    const sidebar = page.locator("#vault-workspace-navigation");
+    const management = sidebar.locator('[data-slot="collection-management-row"]');
+    await expect(management).toBeVisible();
+    const row = (await tools.boundingBox())!;
+    const rail = (await management.boundingBox())!;
+    expect(Math.abs(row.y - rail.y)).toBeLessThanOrEqual(1);
+    expect(Math.abs(row.y + row.height - rail.y - rail.height)).toBeLessThanOrEqual(1);
+    expect(row.height).toBe(48);
+    const metadata = (await page.locator("#document-reading-canvas").getByRole("group", { name: "Document metadata", exact: true }).boundingBox())!;
+    const heading = (await page.locator("#document-reading-canvas").getByRole("heading", { name: "Authored heading", exact: true }).boundingBox())!;
+    expect(Math.abs(metadata.x - heading.x)).toBeLessThanOrEqual(1);
+    expect(metadata.y).toBeGreaterThanOrEqual(heading.y + heading.height);
+    const identity = (await sidebar.locator('[data-slot="vault-identity-header"]').boundingBox())!;
+    const header = (await page.locator(".app-header").boundingBox())!;
+    expect(Math.abs(identity.y + identity.height - header.y - header.height)).toBeLessThanOrEqual(1);
+    await page.screenshot({ path: testInfo.outputPath("document-sidebar-alignment.png") });
+  });
+}
+
+test.describe("Document command alignment on touch", () => {
+  test.use({ hasTouch: true });
+  test("keeps touch targets and adjacent sidebar hairlines aligned", async ({ page }) => {
+    await page.setViewportSize({ width: 1600, height: 1000 });
+    await fixture(page, false, false, body, undefined, { created_by_name: "김민정" });
+    await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
+    const tools = page.locator(".reading-studio-header");
+    await expect(page.locator("#document-reading-canvas").getByRole("group", { name: "Document metadata", exact: true })).toContainText("김민정");
+    const row = (await tools.boundingBox())!;
+    const management = (await page.locator('[data-slot="collection-management-row"]').boundingBox())!;
+    expect(row.height).toBe(64);
+    expect(Math.abs(row.y + row.height - management.y - management.height)).toBeLessThanOrEqual(1);
+    const targets = await tools.locator("[data-reader-control]:visible").evaluateAll(nodes => nodes.map(node => node.getBoundingClientRect().height));
+    expect(targets.every(height => height >= 44)).toBe(true);
+  });
+});
+
 for (const scenario of [
   { width: 375, height: 812, dark: false, preview: false },
   { width: 1440, height: 900, dark: false, preview: false },
   { width: 2560, height: 1440, dark: true, preview: false },
   { width: 1280, height: 800, dark: false, preview: true },
-]) test(`document publishing belongs to ${scenario.preview ? "the preview header" : "reading tools"} at ${scenario.width}px`, async ({ page }, testInfo) => {
+]) test(`document publishing opens from overflow at ${scenario.width}px ${scenario.preview ? "preview" : "full page"}`, async ({ page }, testInfo) => {
   await page.setViewportSize(scenario);
   await fixture(page, scenario.dark, false, body, "reading-public");
   if (scenario.preview) {
     await page.goto("/search?q=reading&source=document");
     await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
   } else await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const publishing = page.getByRole("group", { name: "Document publishing", exact: true });
-  const trigger = publishing.getByRole("button", { name: "Public link", exact: true });
+  const trigger = documentActions(page);
   await expect(trigger).toBeInViewport({ ratio: 1 });
   const tools = page.getByRole("group", { name: "Document reading tools", exact: true });
+  await expect(tools.getByRole("button", { name: /^(Publish|Public link)$/ })).toHaveCount(0);
   const triggerBox = (await trigger.boundingBox())!;
   const toolsBox = (await tools.boundingBox())!;
-  if (scenario.preview) {
-    await expect(tools.getByRole("button", { name: /Publish|Public link/ })).toHaveCount(0);
-    expect(triggerBox.y + triggerBox.height).toBeLessThanOrEqual(toolsBox.y + 1);
-    await expect(page.getByTestId("document-preview-dialog").getByRole("button", { name: "Navigate in fixture", exact: true })).toHaveCount(0);
-  } else {
-    await expect(page.getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
-    await expect(tools.getByRole("button", { name: "Public link", exact: true })).toHaveCount(1);
-    expect(triggerBox.y).toBeGreaterThanOrEqual(toolsBox.y);
-    expect(triggerBox.y + triggerBox.height).toBeLessThanOrEqual(toolsBox.y + toolsBox.height);
-  }
+  expect(triggerBox.y).toBeGreaterThanOrEqual(toolsBox.y);
+  expect(triggerBox.y + triggerBox.height).toBeLessThanOrEqual(toolsBox.y + toolsBox.height);
   const canvas = page.locator("#document-reading-canvas");
   const before = await canvas.boundingBox();
-  await trigger.click();
+  await openPublication(page);
   const panel = page.getByRole("dialog", { name: "Public link", exact: true });
   await expect(panel).toBeVisible();
   const panelBox = (await panel.boundingBox())!;
@@ -47,16 +84,14 @@ for (const scenario of [
   await page.keyboard.press("Escape");
   await expect(panel).toHaveCount(0);
   await expect(trigger).toBeFocused();
-  await trigger.click();
-  // On mobile the anchored panel overlays the authored heading; the resource
-  // breadcrumb stays outside it and must dismiss without changing the article.
+  await openPublication(page);
   await page.getByRole("navigation", { name: "Resource location", exact: true }).locator('[aria-current="page"]').click();
   await expect(panel).toHaveCount(0);
   expect(await canvas.boundingBox()).toEqual(before);
   await page.screenshot({ path: testInfo.outputPath("publication-placement.png") });
   if (!scenario.preview) {
     await openVaultDestination(page, "Overview");
-    await expect(publishing).toHaveCount(0);
+    await expect(documentActions(page)).toHaveCount(0);
   }
 });
 
@@ -69,13 +104,12 @@ const body = [
   "![Small diagram](/reading-fixture.svg)",
 ].join("\n\n");
 
-async function fixture(page: Page, dark = false, folded = false, content = body, publicSlug?: string, metadata: { summary?: string; status?: string; title?: string } = {}) {
+async function fixture(page: Page, dark = false, folded = false, content = body, publicSlug?: string, metadata: { summary?: string; status?: string; title?: string; created_by_name?: string | null; created_by?: string | null } = {}) {
   await page.addInitScript(({ dark, folded }) => {
     localStorage.setItem("akb_token", "resource-reading-browser-fixture");
     localStorage.setItem("akb_theme", dark ? "dark" : "light");
     if (folded) {
       localStorage.setItem("akb.treeVisible", "0");
-      localStorage.setItem("akb.vaultRailCollapsed", "1");
     }
   }, { dark, folded });
   await page.route("**/reading-fixture.svg", route => route.fulfill({ contentType: "image/svg+xml", body: '<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><rect width="80" height="40" fill="teal"/></svg>' }));
@@ -127,29 +161,32 @@ async function expectQuietResourceTrail(trail: Locator, kind: "document" | "file
 
 async function revealVaultNavigation(page: Page) {
   const trigger = page.getByRole("button", { name: "Open vault navigation", exact: true });
-  const drawer = await trigger.isVisible();
-  if (drawer) await trigger.click();
-  return drawer;
+  if (await trigger.isVisible()) await trigger.click();
+  await expect(page.locator("#vault-workspace-navigation")).toBeVisible();
+  return page.locator('[data-navigation-mode="overlay"]').isVisible();
 }
 
 async function expectQuietVaultTrail(page: Page, label: string) {
+  const isRoot = label === "Overview";
+  const isFocusedPage = ["Graph", "Public links", "Members", "Settings"].includes(label);
   const trail = page.getByRole("navigation", { name: "Current page", exact: true });
-  await expect(trail.locator('[aria-current="page"]')).toHaveText(label);
-  const vault = trail.getByRole("link", { name: "fixture", exact: true });
+  await expect(trail.locator('[aria-current="page"]')).toHaveText(isRoot ? "fixture" : label);
+  const vault = trail.getByRole("link", { name: isFocusedPage ? "Back to fixture" : "fixture", exact: true });
   await expect(vault).toHaveAttribute("href", "/vault/fixture");
   await expect(vault.locator(".lucide-box")).toBeVisible();
+  if (isFocusedPage) await expect(page.getByRole("link", { name: "Back to vault fixture", exact: true })).toHaveAttribute("href", "/vault/fixture");
   await expect(trail.getByRole("button")).toHaveCount(0);
-  const switcher = page.getByRole("button", { name: "Navigate in fixture", exact: true });
-  await expect(switcher).toHaveText("Navigate");
-  await expect(switcher).toBeInViewport({ ratio: 1 });
-  const switcherBounds = (await switcher.boundingBox())!;
-  const trailBounds = (await trail.boundingBox())!;
-  expect(switcherBounds.x + switcherBounds.width).toBeLessThanOrEqual(trailBounds.x);
+  await expect(page.getByRole("button", { name: "Navigate in fixture", exact: true })).toHaveCount(0);
   await expect(trail.locator("svg")).toHaveCount(1);
   const current = trail.locator('[aria-current="page"]');
   await expect(current).toBeInViewport({ ratio: 1 });
   const textBounds = (await current.boundingBox())!;
   const vaultBounds = (await vault.boundingBox())!;
+  if (isRoot) {
+    await expect(vault).toHaveAttribute("aria-current", "page");
+    await expect(trail.getByText("/", { exact: true })).toHaveCount(0);
+    return;
+  }
   const gap = textBounds.x - vaultBounds.x - vaultBounds.width;
   expect(gap).toBeGreaterThan(8);
   expect(gap).toBeLessThan(24);
@@ -173,7 +210,7 @@ for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
     await expect(trigger).toBeInViewport({ ratio: 1 });
     await expect(navigation).toHaveCount(0);
     await expect(page.getByRole("banner").getByRole("button", { name: "Search knowledge", exact: true })).toHaveCount(1);
-    await expect(page.getByRole("button", { name: "Navigate in fixture", exact: true })).toBeInViewport();
+    await expect(vaultBreadcrumb(page)).toBeInViewport({ ratio: 1 });
     const searchBox = (await trigger.boundingBox())!;
     expect(searchBox.x + searchBox.width).toBeLessThanOrEqual(width);
     await expect(trigger).toHaveCSS("border-top-width", "1px");
@@ -313,7 +350,16 @@ for (const scenario of [
     url.searchParams.get("q") === "reading" && url.searchParams.get("source") === "document" &&
     url.searchParams.get("v") === (selectedVaults.length === 2 ? "fixture,팀-beta" : null),
   );
-  await expect(page.getByRole("button", { name: `Search scope: ${selectedVaults.join(", ")}`, exact: true })).toBeVisible();
+  const scopeSummary = selectedVaults.length > 1 ? `${selectedVaults.length} vaults` : selectedVaults[0];
+  const pageScope = page.getByTestId("search-query-entry").getByRole("button", { name: `Search scope: ${scopeSummary}`, exact: true });
+  await expect(pageScope).toBeVisible();
+  await pageScope.click();
+  await expect(page.getByRole("menuitemcheckbox", { checked: true })).toHaveCount(selectedVaults.length);
+  for (const vault of selectedVaults) {
+    await expect(page.getByRole("menuitemcheckbox", { name: new RegExp(`^${vault}(?:\\s*Current vault)?$`) })).toHaveAttribute("aria-checked", "true");
+  }
+  await page.keyboard.press("Escape");
+  await expect(pageScope).toBeFocused();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
@@ -464,26 +510,62 @@ for (const scope of ["vault", "all"] as const) for (const destination of ["resul
   }
 });
 
+function vaultBreadcrumb(page: Page) {
+  return page.getByRole("navigation", { name: /^(Current page|Resource location)$/ })
+    .getByRole("link", { name: /^(Back to )?fixture$/ });
+}
+
 async function openVaultDestination(page: Page, name: string) {
-  await page.getByRole("button", { name: "Navigate in fixture", exact: true }).click();
-  await page.getByRole("menu", { name: "Vault pages", exact: true }).getByRole("menuitem", { name, exact: true }).click();
+  if (new URL(page.url()).pathname.replace(/\/$/, "") !== "/vault/fixture") {
+    await vaultBreadcrumb(page).click();
+    await expect(page).toHaveURL(url => url.pathname === "/vault/fixture");
+  }
+  if (name !== "Overview") await page.getByRole("navigation", { name: "Vault pages", exact: true }).getByRole("link", { name, exact: true }).click();
 }
 
 async function expectVaultDestinationsReachable(page: Page, current?: string) {
-  const headerMenu = page.getByRole("button", { name: "Navigate in fixture", exact: true });
-  await expect(headerMenu).toHaveCount(1);
-  await expect(headerMenu).toHaveText("Navigate");
-  await expect(headerMenu).toBeInViewport({ ratio: 1 });
+  await expect(vaultBreadcrumb(page)).toHaveAttribute("href", "/vault/fixture");
+  await expect(vaultBreadcrumb(page)).toBeInViewport({ ratio: 1 });
+  await expect(page.getByRole("button", { name: "Navigate in fixture", exact: true })).toHaveCount(0);
   await expect(page.getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
-  await headerMenu.click();
-  const menu = page.getByRole("menu", { name: "Vault pages", exact: true });
-  await expect(menu.getByRole("menuitem")).toHaveCount(5);
-  for (const [name, href] of vaultDestinations) await expect(menu.getByRole("menuitem", { name, exact: true })).toHaveAttribute("href", href);
-  await expect(menu.locator('[aria-current="page"]')).toHaveCount(current ? 1 : 0);
-  if (current) await expect(menu.getByRole("menuitem", { name: current, exact: true })).toHaveAttribute("aria-current", "page");
-  expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
-  await page.keyboard.press("Escape");
-  await expect(headerMenu).toBeFocused();
+  const navigation = page.getByRole("navigation", { name: "Vault pages", exact: true });
+  if (current === "Overview") {
+    await expect(navigation.getByRole("link")).toHaveCount(4);
+    for (const [name, href] of vaultDestinations.filter(([name]) => name !== "Overview")) {
+      await expect(navigation.getByRole("link", { name, exact: true })).toHaveAttribute("href", href);
+    }
+  } else await expect(navigation).toHaveCount(0);
+}
+
+function documentActions(page: Page) {
+  return page.getByRole("group", { name: "Document reading tools", exact: true })
+    .getByRole("button", { name: `Actions for ${title}`, exact: true });
+}
+
+async function openPublication(page: Page, name: "Publish" | "Public link" = "Public link") {
+  await documentActions(page).click();
+  await page.getByRole("menuitem", { name, exact: true }).click();
+  await expect(page.getByRole("dialog", { name: name === "Publish" ? "Publish document" : "Public link", exact: true })).toBeVisible();
+}
+
+async function openDocumentDetails(page: Page, section?: "Properties" | "Version history" | "Related documents") {
+  const panel = page.locator('[data-slot="document-context-panel"]');
+  if (!await panel.count()) {
+    await expect(page.getByRole("group", { name: "Document reading tools", exact: true })).toBeVisible();
+    const direct = page.getByRole("button", { name: "Document details", exact: true });
+    if (await direct.count()) await direct.click();
+    else {
+      await documentActions(page).click();
+      await page.getByRole("menuitem", { name: "Document details", exact: true }).click();
+    }
+  }
+  await expect(panel).toBeVisible();
+  if (section) {
+    const disclosure = panel.locator(`[data-context-section="${({ Properties: "info", "Version history": "history", "Related documents": "relations" })[section]}"]`);
+    if (await disclosure.getAttribute("open") === null) await disclosure.locator("summary").click();
+    await expect(disclosure).toHaveAttribute("open", "");
+  }
+  return panel;
 }
 
 for (const width of [375, 1440, 2560]) for (const dark of [false, true]) {
@@ -544,38 +626,40 @@ test("a short resource title keeps its kind marker attached on a wide header", a
   await page.screenshot({ path: testInfo.outputPath("breadcrumb-short-title.png") });
 });
 
-test("document Vault destinations share one header menu without selecting Overview", async ({ page }) => {
+test("document returns to the Overview before exposing Vault destinations", async ({ page }) => {
   await page.setViewportSize({ width: 2560, height: 1000 });
   await fixture(page);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const navigation = page.getByRole("navigation", { name: "Vault sections", exact: true });
-  await expect(navigation).toHaveCount(0);
-  await page.getByRole("button", { name: "Navigate in fixture", exact: true }).click();
-  const menu = page.getByRole("menu", { name: "Vault pages", exact: true });
-  await expect(menu.getByRole("menuitem")).toHaveCount(5);
-  await expect(menu.locator('[aria-current="page"]')).toHaveCount(0);
-  for (const [name, href] of vaultDestinations) await expect(menu.getByRole("menuitem", { name, exact: true })).toHaveAttribute("href", href);
-  await page.keyboard.press("Escape");
+  await expectVaultDestinationsReachable(page);
+  await vaultBreadcrumb(page).click();
+  await expectQuietVaultTrail(page, "Overview");
+  await expectVaultDestinationsReachable(page, "Overview");
+  await page.goBack();
+  await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeVisible();
+  await expectVaultDestinationsReachable(page);
 });
 
-for (const width of [320, 1440]) test(`long summaries preserve draft state and publishing controls at ${width}px`, async ({ page }, testInfo) => {
+for (const width of [320, 1440]) test(`long summaries preserve draft state and overflow publishing at ${width}px`, async ({ page }, testInfo) => {
   await page.setViewportSize({ width, height: 900 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
   const summary = "An extended description of this document. ".repeat(40);
   await fixture(page, false, false, "test", "existing-link", { summary, status: "draft" });
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const context = page.locator('[data-slot="resource-command-row"]');
+  const context = page.locator("#document-reading-canvas");
   await expect(context.getByText("Draft", { exact: true })).toBeVisible();
-  await expect(page.getByRole("group", { name: "Document publishing", exact: true }).getByRole("button", { name: "Public link", exact: true })).toBeInViewport({ ratio: 1 });
-  await expect(context.getByRole("button", { name: `Actions for ${title}`, exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(documentActions(page)).toBeInViewport({ ratio: 1 });
+  const summaryRegion = page.getByRole("region", { name: "Document summary", exact: true });
+  await expect(summaryRegion).toHaveText(summary.trim());
+  await expect(summaryRegion).toBeVisible();
+  await expect(page.getByRole("button", { name: "Read document summary" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /summary scrolling/ })).toBeHidden();
   const time = context.locator("time");
   await expect(time).toBeVisible();
-  if (width === 1440) {
-    expect(await time.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
-    await page.getByRole("button", { name: "Read document summary" }).click();
-    const dialog = page.getByRole("dialog", { name: "Document summary", exact: true });
-    await expect(dialog).toContainText(summary.trim());
-    await page.keyboard.press("Escape");
-  } else await expect(page.getByRole("button", { name: "Read document summary" })).toBeHidden();
+  if (width === 1440) expect(await time.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+  await openPublication(page);
+  await expect(page.getByRole("dialog", { name: "Public link", exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(documentActions(page)).toBeFocused();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("short-draft.png") });
 });
@@ -622,7 +706,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     await expect(page.locator("h1#doc-title")).toHaveCount(1);
     await expect(page.locator('[data-slot="resource-command-row"]')).toHaveCount(1);
     const readingTools = page.getByRole("group", { name: "Document reading tools", exact: true });
-    await expect(readingTools.getByRole("tab", { name: "Preview", exact: true })).toBeVisible();
+    await expect(readingTools.getByRole("radio", { name: "Preview", exact: true })).toBeVisible();
     await expect(readingTools.getByRole("button", { name: "Copy markdown", exact: true })).toBeVisible();
     const contextBounds = (await page.locator('[data-slot="resource-command-row"]').boundingBox())!;
     const toolBounds = (await readingTools.boundingBox())!;
@@ -636,34 +720,28 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     const surface = await page.locator("#document-reading-canvas").evaluate(el => getComputedStyle(el).backgroundColor);
     await expect(page.locator(".app-header")).toHaveCSS("background-color", surface);
     await expect(readingTools).toHaveCSS("background-color", surface);
-    await expect(page.getByRole("group", { name: "Document publishing", exact: true }).getByRole("button", { name: "Publish", exact: true })).toBeInViewport({ ratio: 1 });
-    if (toolBounds.width >= 768) {
+    await expect(readingTools.getByRole("button", { name: "Publish", exact: true })).toHaveCount(0);
+    if (toolBounds.width >= 656) {
       expect(toolBounds.height).toBeLessThanOrEqual(49);
-      const timeBounds = (await readingTools.locator("time").boundingBox())!;
-      const tabBounds = (await readingTools.getByRole("tablist").boundingBox())!;
-      expect(Math.abs(timeBounds.y + timeBounds.height / 2 - tabBounds.y - tabBounds.height / 2)).toBeLessThanOrEqual(1);
     }
-    const modeBounds = (await readingTools.getByRole("tablist").boundingBox())!;
-    const actionBounds = (await readingTools.getByRole("group", { name: "Document actions", exact: true }).boundingBox())!;
+    const modeBounds = (await readingTools.getByRole("radiogroup", { name: "Document view mode", exact: true }).boundingBox())!;
+    const actionBounds = (await readingTools.getByRole("button", { name: "Copy markdown", exact: true }).boundingBox())!;
     expect(modeBounds.x + modeBounds.width).toBeLessThan(actionBounds.x);
     const commandMetrics = await page.locator('[data-slot="resource-command-row"] [data-reader-control]').evaluateAll(elements => elements.map(element => ({
       height: element.getBoundingClientRect().height,
       font: getComputedStyle(element).fontSize,
     })));
-    expect(new Set(commandMetrics.map(item => item.height)).size).toBe(1);
-    expect(commandMetrics.every(item => item.font === "14px")).toBe(true);
-    const commandWidth = (await page.locator('[data-slot="resource-command-row"]').boundingBox())!.width;
-    expect(commandMetrics.every(item => item.height === (commandWidth >= 768 ? 32 : 44))).toBe(true);
-    const editTime = page.locator('[data-slot="resource-command-row"] time');
+    expect(commandMetrics.every(item => item.height >= 28 && item.height <= 44)).toBe(true);
+    const editTime = page.locator('#document-reading-canvas [data-slot="document-byline"] time');
     await expect(editTime).toHaveAttribute("datetime", new Date(lastEdited).toISOString());
     const exactEditTime = await page.evaluate(value => new Date(value).toLocaleString(undefined, {
       year: "numeric", month: "short", day: "numeric", hour: "numeric",
       minute: "2-digit", second: "2-digit", timeZoneName: "short",
     }), lastEdited);
     await expect(editTime.locator(".sr-only")).toHaveText(`Last edited: ${exactEditTime}`);
-    if (commandWidth >= 512) await expect(editTime).toBeVisible();
-    await expect(page.getByRole("group", { name: "Document actions", exact: true })).toBeVisible();
-    await expect(page.getByRole("group", { name: "More document options", exact: true })).toBeVisible();
+    await expect(editTime).toBeVisible();
+    await expect(readingTools.getByRole("button", { name: "Document details", exact: true })).toHaveCount(0);
+    await expect(documentActions(page)).toBeVisible();
     await expect(page.getByRole("button", { name: "Open document info", exact: true })).toHaveCount(0);
     const collections = page.locator('[data-slot="vault-collections-sidebar"]');
     await expect(page.getByRole("button", { name: /^Explore vault:/ })).toHaveCount(0);
@@ -671,7 +749,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     const navigation = page.getByRole("navigation", { name: "Vault sections", exact: true });
     await expectVaultDestinationsReachable(page);
     await expect(navigation).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Navigate in fixture", exact: true })).toBeInViewport();
+    await expect(vaultBreadcrumb(page)).toBeInViewport({ ratio: 1 });
     await expect(page.getByRole("navigation", { name: "Vault management", exact: true })).toHaveCount(0);
     await expect(page.getByText("In this vault", { exact: true })).toHaveCount(0);
     await expect(page.locator('[data-slot="resource-command-row"]').getByRole("navigation", { name: "Resource location", exact: true })).toHaveCount(0);
@@ -686,20 +764,33 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       expect(searchBox.width).toBe(256);
     }
     const drawer = await revealVaultNavigation(page);
-    if (width === 2560) await page.getByRole("button", { name: "Expand collections", exact: true }).click();
-    await expect(collections.getByRole("tree", { name: "fixture explorer", exact: true })).toBeVisible();
-    await expect(collections.getByRole("button", { name: "Collapse collections", exact: true })).toBeInViewport();
+    const contextPanel = page.locator("#vault-workspace-navigation");
+    await expect(contextPanel).toHaveCount(1);
+    await expect(collections.getByRole("navigation", { name: "fixture explorer", exact: true })).toBeVisible();
+    await expect(collections.getByRole("treeitem")).toHaveCount(0);
+    await expect(contextPanel.locator('[data-slot="vault-identity-header"]').getByRole("button", { name: "Switch vault: fixture", exact: true })).toBeVisible();
+    await expect(contextPanel.getByRole("button", { name: "Add content", exact: true })).toHaveCount(1);
+    await expect(page.getByRole("button", { name: "Close vault navigation", exact: true })).toBeInViewport();
+    if (width >= 1024) {
+      const resize = page.getByRole("separator", { name: "Resize vault navigation", exact: true });
+      await expect(resize).toHaveAttribute("aria-valuenow", "256");
+      await expect(resize).toHaveAttribute("aria-valuemin", "224");
+      await expect(resize).toHaveAttribute("aria-valuemax", "360");
+    }
     await expect(collections.getByRole("link", { name: /^(Search|Graph|Public links|Members|Settings)$/ })).toHaveCount(0);
     if (drawer) {
+      // Leave the identity tooltip before testing the outer disclosure's
+      // Escape behavior; nested layers consume Escape independently.
+      await collections.getByRole("navigation", { name: "fixture explorer", exact: true }).getByRole("button").first().focus();
       await page.keyboard.press("Escape");
       await expect(page.getByRole("button", { name: "Open vault navigation", exact: true })).toBeFocused();
     }
-    if (width === 2560) await page.getByRole("button", { name: "Collapse collections", exact: true }).click();
+    if (width === 2560) await page.getByRole("button", { name: "Close vault navigation", exact: true }).click();
     for (const name of ["Edit", "Copy markdown", `Actions for ${title}`]) {
-      await expect(page.getByRole("region", { name: "Document workspace" }).getByRole("button", { name, exact: true })).toBeInViewport();
+      await expect(readingTools.getByRole("button", { name, exact: true })).toBeInViewport();
     }
-    await expect(readingTools.getByRole("button", { name: "Publish", exact: true })).toBeInViewport();
-    await expect(page.getByRole("tab", { name: "Raw", exact: true })).toBeInViewport();
+    await expect(readingTools.getByRole("button", { name: "Publish", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("radio", { name: "Raw markdown", exact: true })).toBeInViewport();
     const flow = page.locator(".document-reading-flow .ProseMirror");
     const measures = await flow.evaluate(root => {
       const box = (selector: string) => {
@@ -714,7 +805,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       expect(box.width).toBeCloseTo(measures.heading.width, 0);
     }
     expect(measures.heading.margin).toBe("0px");
-    expect(measures.paragraph.width).toBeLessThanOrEqual(1025);
+    expect(measures.paragraph.width).toBeLessThanOrEqual(832);
     const innerTable = await flow.locator("table").boundingBox();
     // The wrapper owns a 1px border on either side.
     expect(Math.abs(innerTable!.x - measures.table.x)).toBeLessThanOrEqual(1);
@@ -727,8 +818,9 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     if (width === 375) {
       const commands = await page.locator('[data-slot="resource-command-row"]').boundingBox();
       // Metadata now belongs to this same toolbar; allow its compact first
-      // line above the 44px touch controls, but no redundant command band.
-      expect(commands!.height).toBeLessThanOrEqual(86);
+      // line above the 44px touch controls and the 1px bottom divider,
+      // but no redundant command band.
+      expect(commands!.height).toBeLessThanOrEqual(91);
     }
     if (width >= 1440) expect(measures.heading.top).toBeLessThanOrEqual(220);
     await expect(page.getByRole("region", { name: "Scrollable table" })).toHaveAttribute("tabindex", "0");
@@ -749,179 +841,162 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     await expect(page.getByRole("menuitem", { name: "Team practices" })).toHaveAttribute("href", /collection=guides%2Fteam/);
     await expect(page.getByRole("menuitem", { name: "Operations" })).toHaveAttribute("href", /collection=guides%2Fteam%2Foperations/);
     await page.keyboard.press("Escape");
-    if (width === 2560) {
-      await page.getByRole("region", { name: "Document workspace" }).getByRole("button", { name: `Actions for ${title}` }).click();
-      await page.getByRole("menuitemradio", { name: "Wide", exact: true }).click();
-      await expect(page.locator(".document-reading-wide")).toBeVisible();
-      const wide = await flow.locator("p").first().boundingBox();
-      expect(wide!.width).toBeGreaterThan(measures.paragraph.width);
-    }
-    const actions = page.getByRole("region", { name: "Document workspace" }).getByRole("button", { name: `Actions for ${title}` });
+    const actions = documentActions(page);
     await actions.click();
-    for (const name of ["Document info", "Table of contents", "Relations", "History", "Version history"]) {
-      await expect(page.getByRole("menuitem", { name, exact: true })).toHaveCount(0);
+    for (const name of ["Copy document link", "Copy markdown", "Publish", "Version history"]) {
+      await expect(page.getByRole("menuitem", { name, exact: true })).toBeVisible();
     }
+    await expect(page.getByRole("menuitemradio", { name: /^(Standard|Wide)$/ })).toHaveCount(0);
     await page.keyboard.press("Escape");
     await expect(actions).toBeFocused();
-    const rail = page.locator('[data-slot="document-context-rail"]');
-    for (const [name, icon] of [["Document info", "info"], ["Table of contents", "list-tree"], ["Relations", "link-2"], ["Version history", "history"]]) {
-      const trigger = rail.getByRole("button", { name, exact: true });
-      await expect(trigger).toBeInViewport();
-      await expect(trigger.locator("svg")).toHaveAttribute("aria-hidden", "true");
-      await expect(trigger.locator("svg")).toHaveClass(new RegExp(`lucide-${icon}(?: |$)`));
-      await expect(trigger).toHaveAttribute("aria-expanded", "false");
-    }
+    await expect(page.locator('[data-slot="document-context-rail"]')).toHaveCount(0);
+    const detailsTrigger = actions;
+    await expect(page.locator('[data-slot="document-context-panel"]')).toHaveCount(0);
+    await expect(detailsTrigger.locator("svg")).toHaveAttribute("aria-hidden", "true");
     const canvas = page.locator("#document-reading-canvas");
-    const beforeInfo = (await canvas.boundingBox())!;
-    const floating = await rail.evaluate(element => {
-      const bounds = element.parentElement!.getBoundingClientRect();
+    const beforeDetails = (await canvas.boundingBox())!;
+    const docked = await page.locator(".reading-studio").evaluate(element => {
       const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
-      return bounds.width >= 48 * rem && bounds.height >= 20 * rem;
+      return element.getBoundingClientRect().width >= 50 * rem;
     });
-    if (width === 375) expect(floating).toBe(false);
-    if (width === 2560) expect(floating).toBe(true);
-    const info = rail.getByRole("button", { name: "Document info", exact: true });
-    await info.click();
-    const panel = page.getByRole(floating ? "complementary" : "dialog", { name: "Document info", exact: true });
-    await expect(panel).toHaveAttribute("data-mode", floating ? "floating" : "overlay");
-    await expect(panel.getByRole("heading", { name: "Document info", exact: true })).toBeVisible();
-    await expect(panel.getByText(title, { exact: true })).toBeVisible();
-    await expect(panel.locator(`time[datetime="${new Date(lastEdited).toISOString()}"]`)).toBeVisible();
-    await expect(panel.locator(`time[datetime="${new Date(createdAt).toISOString()}"]`)).toBeVisible();
-    const close = panel.getByRole("button", { name: "Close document panel", exact: true });
+    if (width === 375) expect(docked).toBe(false);
+    if (width === 2560) expect(docked).toBe(true);
+    const panel = await openDocumentDetails(page);
+    await expect(panel).toHaveAttribute("data-mode", docked ? "docked" : "overlay");
+    await expect(page.getByRole(docked ? "complementary" : "dialog", { name: "Document details", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Document details", exact: true })).toBeVisible();
+    const close = page.getByRole("button", { name: "Close document panel", exact: true });
     await expect(close).toBeFocused();
-    await expect(page.getByRole("group", { name: "Document context", exact: true })).toHaveCount(1);
-    const afterInfo = (await canvas.boundingBox())!;
-    expect(afterInfo).toEqual(beforeInfo);
-    if (floating) {
+    await expect(panel.getByRole("navigation", { name: "Document outline", exact: true })).toBeVisible();
+    const afterDetails = (await canvas.boundingBox())!;
+    if (docked) {
       const panelBox = (await panel.boundingBox())!;
-      expect(panelBox.x).toBeGreaterThan(afterInfo.x);
-      expect(panelBox.width).toBeGreaterThanOrEqual(360);
-      expect(panelBox.width).toBeLessThanOrEqual(400);
-      expect(panelBox.x + panelBox.width).toBeLessThanOrEqual((await rail.boundingBox())!.x);
-      expect(panelBox.y + panelBox.height).toBeLessThanOrEqual(beforeInfo.y + beforeInfo.height);
+      const contextBox = (await page.locator(".reading-details-host").boundingBox())!;
+      expect(contextBox.width).toBe(288);
+      expect(panelBox.width).toBe(contextBox.width - 1);
+      expect(contextBox.x).toBeCloseTo(afterDetails.x + afterDetails.width, 0);
+      expect(afterDetails.width + contextBox.width).toBeCloseTo(beforeDetails.width, 0);
+      expect(afterDetails.x).toBe(beforeDetails.x);
+      expect(afterDetails.height).toBe(beforeDetails.height);
     } else {
+      expect(afterDetails).toEqual(beforeDetails);
       await expect(panel).toHaveAttribute("aria-modal", "true");
       await page.keyboard.press("Shift+Tab");
       expect(await panel.evaluate(element => element.contains(document.activeElement))).toBe(true);
     }
+    const headingLink = panel.getByRole("link", { name: "Authored heading", exact: true });
+    const readingUrl = page.url();
+    await headingLink.click();
+    await expect(panel).toBeVisible();
+    await expect(headingLink).toBeFocused();
+    await headingLink.press("Enter");
+    await expect(headingLink).toBeFocused();
+    await expect(page).toHaveURL(readingUrl);
+    await openDocumentDetails(page, "Properties");
+    await expect(panel.getByText(title, { exact: true })).toBeVisible();
+    await expect(panel.locator(`time[datetime="${new Date(lastEdited).toISOString()}"]`)).toBeVisible();
+    await expect(panel.locator(`time[datetime="${new Date(createdAt).toISOString()}"]`)).toBeVisible();
+    await openDocumentDetails(page, "Related documents");
+    await expect(panel.getByText("No relations yet.", { exact: true })).toBeVisible();
+    await expect(panel.locator('[data-context-section="info"]')).not.toHaveAttribute("open");
+    await openDocumentDetails(page, "Version history");
+    await expect(panel.locator('[data-context-section="history"]')).toHaveAttribute("open", "");
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-    await page.screenshot({ path: testInfo.outputPath("document-context-info.png") });
-    const controls = floating ? rail : panel;
-    await controls.getByRole("button", { name: "Table of contents", exact: true }).click();
-    const outline = page.getByRole(floating ? "complementary" : "dialog", { name: "On this page", exact: true });
-    await expect(outline.getByRole("navigation", { name: "Document outline", exact: true })).toBeVisible();
-    await expect(outline.getByRole("link", { name: "Authored heading", exact: true })).toBeVisible();
-    const outlineControls = floating ? rail : outline;
-    await outlineControls.getByRole("button", { name: "Relations", exact: true }).click();
-    const relations = page.getByRole(floating ? "complementary" : "dialog", { name: "Relations", exact: true });
-    await expect(relations.getByText("No relations yet.", { exact: true })).toBeVisible();
-    await (floating ? rail : relations).getByRole("button", { name: "Version history", exact: true }).click();
-    await expect(page.getByRole(floating ? "complementary" : "dialog", { name: "Version history", exact: true })).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath("document-details.png") });
     await page.keyboard.press("Escape");
-    await expect(rail.getByRole("button", { name: "Version history", exact: true })).toBeFocused();
-    await expect(page.locator('[data-slot="document-context-panel"]')).toHaveCount(0);
-    expect((await canvas.boundingBox())!.width).toBe(beforeInfo.width);
-    await info.click();
-    await page.getByRole("button", { name: "Close document panel", exact: true }).click();
-    await expect(info).toBeFocused();
-    if (floating) {
-      await info.click();
-      await info.click();
-      await expect(page.locator('[data-slot="document-context-panel"]')).toHaveCount(0);
-      await expect(info).toBeFocused();
-    } else {
-      const outlineTrigger = rail.getByRole("button", { name: "Table of contents", exact: true });
-      await outlineTrigger.click();
-      const outlinePanel = page.getByRole("dialog", { name: "On this page", exact: true });
-      const headingLink = outlinePanel.getByRole("link", { name: "Authored heading", exact: true });
-      await headingLink.click();
-      await expect(outlinePanel).toBeVisible();
-      await expect(headingLink).toBeFocused();
-      // Repeated navigation must preserve the outline, including its focus scope.
-      await headingLink.press("Enter");
-      await expect(outlinePanel).toBeVisible();
-      await expect(headingLink).toBeFocused();
-      await page.keyboard.press("Escape");
-      await expect(outlinePanel).toHaveCount(0);
-      await expect(outlineTrigger).toBeFocused();
-      await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeInViewport();
-    }
+    await expect(panel).toHaveCount(0);
+    await expect(detailsTrigger).toBeFocused();
+    expect(await canvas.boundingBox()).toEqual(beforeDetails);
+    await openDocumentDetails(page);
+    await close.click();
+    await expect(detailsTrigger).toBeFocused();
+    // Overflow history enters the same pane and focuses its native disclosure.
+    await actions.click();
+    await page.getByRole("menuitem", { name: "Version history", exact: true }).click();
+    await expect(panel.locator('[data-context-section="history"] > summary')).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(detailsTrigger).toBeFocused();
   });
 }
 
-test("context tools remain reachable in a short landscape reader", async ({ page }) => {
+test("document details remain reachable in a short landscape reader", async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 280 });
   await fixture(page);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const rail = page.locator('[data-slot="document-context-rail"]');
-  const history = rail.getByRole("button", { name: "Version history", exact: true });
-  await expect(history).toBeVisible();
-  expect(await rail.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true);
+  const trigger = documentActions(page);
+  await expect(trigger).toBeInViewport();
+  await trigger.focus();
+  await trigger.press("Enter");
+  await page.getByRole("menuitem", { name: "Document details", exact: true }).click();
+  const panel = page.getByRole("dialog", { name: "Document details", exact: true });
+  await expect(page.getByRole("button", { name: "Close document panel" })).toBeInViewport();
+  const history = panel.locator('[data-context-section="history"] > summary');
   await history.focus();
   await expect(history).toBeInViewport();
-  await page.keyboard.press("Enter");
-  const panel = page.getByRole("dialog", { name: "Version history", exact: true });
-  await expect(panel.getByRole("button", { name: "Close document panel" })).toBeInViewport();
+  await history.press("Enter");
+  await expect(panel.locator('[data-context-section="history"]')).toHaveAttribute("open", "");
   await page.keyboard.press("Escape");
-  await expect(history).toBeFocused();
+  await expect(trigger).toBeFocused();
 });
 
-test("a deep document reader opens every Vault page directly and browser Back restores its context", async ({ page }, testInfo) => {
+test("a deep document reader reaches every Vault page through Overview and Back restores its context", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 2560, height: 1000 });
   await fixture(page);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
   await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeVisible();
-  const navigation = page.getByRole("navigation", { name: "Vault sections", exact: true });
-  const switcher = page.getByRole("button", { name: "Navigate in fixture", exact: true });
-  await expect(navigation).toHaveCount(0);
-  await expect(switcher).toBeVisible();
   for (const [name, href] of vaultDestinations) {
     await openVaultDestination(page, name);
-    await expect(page).toHaveURL(new RegExp(`${href}$`));
-    await expect(navigation).toHaveCount(0);
+    await expect(page).toHaveURL(url => url.pathname === href);
     await expectQuietVaultTrail(page, name);
     await expectVaultDestinationsReachable(page, name);
     await page.goBack();
+    if (name !== "Overview") await page.goBack();
     await expect(page).toHaveURL(new RegExp(`/doc/${encodeURIComponent(path)}$`));
     await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeVisible();
-    await expect(navigation).toHaveCount(0);
-    await expect(switcher).toBeVisible();
+    await expectVaultDestinationsReachable(page);
     await expect(page.locator(".app-header").getByRole("navigation", { name: "Resource location", exact: true })).toContainText(title);
   }
-  await switcher.focus();
+  await vaultBreadcrumb(page).focus();
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("menuitem", { name: "Overview", exact: true })).toBeFocused();
-  await page.keyboard.press("End");
-  await expect(page.getByRole("menuitem", { name: "Settings", exact: true })).toBeFocused();
+  const settings = page.getByRole("navigation", { name: "Vault pages", exact: true }).getByRole("link", { name: "Settings", exact: true });
+  await settings.focus();
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/\/vault\/fixture\/settings$/);
+  await expect(page.locator("#main")).toBeFocused();
   await expectQuietVaultTrail(page, "Settings");
   await page.screenshot({ path: testInfo.outputPath("vault-settings-navigation.png") });
   await page.goBack();
+  await page.goBack();
   await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeVisible();
-  await expect(navigation).toHaveCount(0);
-  await expect(switcher).toBeVisible();
-  await expect(page.locator(".app-header").getByRole("navigation", { name: "Resource location", exact: true })).toBeVisible();
   await expect(page.locator('[data-slot="resource-command-row"]').getByRole("navigation", { name: "Resource location", exact: true })).toHaveCount(0);
-  // Clicking the already selected Vault must navigate, not be swallowed as a
-  // no-op merely because the document belongs to the same Vault.
-  await page.getByRole("navigation", { name: "Vaults", exact: true }).getByRole("link", { name: "fixture, writer", exact: true }).click();
+  // Selecting the current Vault still leaves a resource for its Overview.
+  const pickerTrigger = page.getByRole("button", { name: "Switch vault: fixture", exact: true });
+  await pickerTrigger.click();
+  const picker = page.getByRole("dialog", { name: "Vaults", exact: true });
+  const vaultSearch = picker.getByRole("searchbox", { name: "Find a vault", exact: true });
+  await expect(vaultSearch).toBeFocused();
+  await vaultSearch.fill("missing");
+  await expect(picker.getByText("No vaults match this name.", { exact: true })).toBeVisible();
+  // Filtering the anchored chooser keeps the surrounding identity visible.
+  await expect(pickerTrigger).toBeVisible();
+  await expect(pickerTrigger).toHaveText("fixture");
+  await vaultSearch.fill("fixture");
+  const selectedVault = picker.getByRole("link", { name: "fixture, current vault", exact: true });
+  await expect(selectedVault).toHaveAttribute("aria-current", "location");
+  await selectedVault.click();
   await expect(page).toHaveURL(/\/vault\/fixture$/);
-  await expect(navigation).toHaveCount(0);
+  await expect(picker).toHaveCount(0);
   await expectQuietVaultTrail(page, "Overview");
   await page.goBack();
-  await page.getByRole("navigation", { name: "Resource location", exact: true }).getByRole("link", { name: "fixture", exact: true }).click();
+  await vaultBreadcrumb(page).click();
   await expect(page).toHaveURL(/\/vault\/fixture$/);
 });
 
-test("maximum saved rail widths use a temporary drawer without changing preferences", async ({ page }, testInfo) => {
+test("maximum saved navigation width uses a temporary disclosure without changing preferences", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1024, height: 1000 });
   await fixture(page);
   await page.addInitScript(() => {
-    localStorage.setItem("akb.vaultRailWidth.v2", "320");
-    localStorage.setItem("akb.treeWidth.v2", "480");
-    localStorage.setItem("akb.vaultRailCollapsed", "0");
+    localStorage.setItem("akb.focusedNavigationWidth.v1", "360");
     localStorage.setItem("akb.treeVisible", "1");
   });
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
@@ -935,14 +1010,20 @@ test("maximum saved rail widths use a temporary drawer without changing preferen
   await open.click();
   await expect(page.locator("#vault-workspace-navigation")).toBeInViewport();
   const collections = page.locator('[data-slot="vault-collections-sidebar"]');
-  await expect(collections.getByRole("tree", { name: "fixture explorer", exact: true })).toBeVisible();
+  await expect(collections.getByRole("navigation", { name: "fixture explorer", exact: true })).toBeVisible();
+  const resize = page.getByRole("separator", { name: "Resize vault navigation", exact: true });
+  await expect(resize).toHaveCount(1);
+  await expect(resize).toHaveAttribute("aria-valuenow", "360");
+  await expect(resize).toHaveAttribute("aria-valuemin", "224");
+  await expect(resize).toHaveAttribute("aria-valuemax", "360");
   await expect(collections.getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
+  await collections.getByRole("navigation", { name: "fixture explorer", exact: true }).getByRole("button").first().focus();
   await page.keyboard.press("Escape");
   await expect(open).toBeFocused();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("maximum-rails-compact.png") });
   // A Collection breadcrumb must reveal its destination even when the saved
-  // desktop rails currently require the temporary drawer.
+  // context panel currently requires the temporary disclosure.
   const parentCollection = location.getByRole("link", { name: "Operations", exact: true });
   if (await parentCollection.isVisible()) await parentCollection.click();
   else {
@@ -951,74 +1032,64 @@ test("maximum saved rail widths use a temporary drawer without changing preferen
   }
   await expect(page).toHaveURL(/\/vault\/fixture\?collection=guides%2Fteam%2Foperations$/);
   await expect(page.locator("#vault-workspace-navigation")).toBeInViewport();
+  await collections.getByRole("navigation", { name: "fixture explorer", exact: true }).getByRole("button").first().focus();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("button", { name: "Open vault navigation", exact: true })).toBeFocused();
   await page.setViewportSize({ width: 1920, height: 1000 });
   await expect(page.locator('[data-navigation-mode="inline"]')).toBeVisible();
-  await expect(page.getByRole("button", { name: "Open vault navigation", exact: true })).toBeHidden();
-  expect(await page.evaluate(() => ["akb.vaultRailWidth.v2", "akb.treeWidth.v2", "akb.vaultRailCollapsed", "akb.treeVisible"].map(key => localStorage.getItem(key)))).toEqual(["320", "480", "0", "1"]);
+  await expect(page.getByRole("button", { name: "Close vault navigation", exact: true })).toBeInViewport();
+  await expect(resize).toHaveAttribute("aria-valuenow", "360");
+  expect(await page.evaluate(() => ["akb.focusedNavigationWidth.v1", "akb.treeVisible"].map(key => localStorage.getItem(key)))).toEqual(["360", "1"]);
 });
 
-for (const dark of [false, true]) test(`Vault menu stays outside content scrolling and independent from collection collapse in ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
+for (const dark of [false, true]) test(`Vault destinations preserve one context panel and its visibility in ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1920, height: 1000 });
   await fixture(page, dark);
   await page.goto("/vault/fixture");
   const initialTreePreference = await page.evaluate(() => localStorage.getItem("akb.treeVisible"));
   const collections = page.locator('[data-slot="vault-collections-sidebar"]');
-  const tree = collections.getByRole("tree", { name: "fixture explorer", exact: true });
+  const tree = collections.getByRole("navigation", { name: "fixture explorer", exact: true });
   await expect(tree).toBeVisible();
-  const navigation = page.getByRole("navigation", { name: "Vault sections", exact: true });
-  const trigger = page.getByRole("button", { name: "Navigate in fixture", exact: true });
-  await expect(navigation).toHaveCount(0);
-  const position = (await trigger.boundingBox())!;
-  expect(position.height).toBe(36);
+  const breadcrumb = vaultBreadcrumb(page);
+  const position = (await breadcrumb.boundingBox())!;
   const header = (await page.locator(".app-header").boundingBox())!;
   expect(header.height).toBe(56);
   const initialViewport = (await page.locator('[data-slot="vault-route-viewport"]').boundingBox())!;
   expect(initialViewport.y).toBe(header.y + header.height);
   for (const [name, href] of vaultDestinations) {
     await openVaultDestination(page, name);
-    await expect(page).toHaveURL(new RegExp(`${href}$`));
+    await expect(page).toHaveURL(url => url.pathname === href);
     await expectQuietVaultTrail(page, name);
     await expectVaultDestinationsReachable(page, name);
-    if (name === "Overview") {
-      await expect(tree).toBeVisible();
-      expect(await trigger.boundingBox()).toEqual(position);
-    } else {
-      await expect(navigation).toHaveCount(0);
-      await expect(collections).toHaveCount(0);
-      expect(await page.evaluate(() => localStorage.getItem("akb.treeVisible"))).toBe(initialTreePreference);
-    }
-    await expect(page.locator(".app-header").getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
-    await expect(collections.getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
-    await expect(page.locator('[data-slot="vault-route-viewport"]').getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
     if (name !== "Overview") {
+      await expect(tree).toBeVisible();
+      await expect(page.locator("#vault-workspace-navigation")).toHaveCount(1);
+      expect(await page.evaluate(() => localStorage.getItem("akb.treeVisible"))).toBe(initialTreePreference);
       await page.goBack();
       await expect(tree).toBeVisible();
-      expect(await trigger.boundingBox()).toEqual(position);
     }
+    await expect(page.locator(".app-header").getByRole("navigation", { name: "Vault pages", exact: true })).toHaveCount(0);
+    await expect(collections.getByRole("navigation", { name: "Vault pages", exact: true })).toHaveCount(0);
+    expect(await breadcrumb.boundingBox()).toEqual(position);
   }
   const viewport = page.locator('[data-slot="vault-route-viewport"]');
   await viewport.evaluate(element => { element.scrollTop = element.scrollHeight; });
-  expect(await trigger.boundingBox()).toEqual(position);
+  expect(await breadcrumb.boundingBox()).toEqual(position);
   await page.screenshot({ path: testInfo.outputPath("working-page-navigation.png") });
-  await page.getByRole("button", { name: "Collapse collections", exact: true }).click();
-  const expand = page.getByRole("button", { name: "Expand collections", exact: true });
+  await page.getByRole("button", { name: "Close vault navigation", exact: true }).click();
+  const expand = page.getByRole("button", { name: "Open vault navigation", exact: true });
   await expect(expand).toBeInViewport();
   await expect(collections).toBeHidden();
-  await expect(navigation).toHaveCount(0);
   await expectVaultDestinationsReachable(page, "Overview");
   expect(await page.evaluate(() => localStorage.getItem("akb.treeVisible"))).toBe("0");
   await openVaultDestination(page, "Members");
-  await expect(collections).toHaveCount(0);
+  await expect(collections).toBeHidden();
   expect(await page.evaluate(() => localStorage.getItem("akb.treeVisible"))).toBe("0");
   await page.goBack();
   await expect(expand).toBeInViewport();
   await expect(collections).toBeHidden();
-  await expectQuietVaultTrail(page, "Overview");
   await expand.click();
   await expect(tree).toBeVisible();
-  expect(await trigger.boundingBox()).toEqual(position);
   expect(await page.evaluate(() => localStorage.getItem("akb.treeVisible"))).toBe("1");
   await page.goto("/vault/fixture/activity");
   await expectQuietVaultTrail(page, "Activity");
@@ -1026,11 +1097,11 @@ for (const dark of [false, true]) test(`Vault menu stays outside content scrolli
   await expect(tree).toBeVisible();
 });
 
-test("Vault menu remains stable when only working content width changes", async ({ page }, testInfo) => {
+test("Vault breadcrumb remains stable when only working content width changes", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1920, height: 1000 });
   await fixture(page);
   await page.goto("/vault/fixture");
-  const trigger = page.getByRole("button", { name: "Navigate in fixture", exact: true });
+  const trigger = vaultBreadcrumb(page);
   const content = page.locator('[data-slot="vault-route-viewport"]');
   await expect(page.locator('[data-navigation-mode="inline"]')).toBeVisible();
   const original = (await trigger.boundingBox())!;
@@ -1053,7 +1124,7 @@ test("Vault menu remains stable when only working content width changes", async 
 });
 
 for (const width of [1440, 768]) {
-  test(`short-height collection sidebar remains reachable without an empty outer gutter at ${width}px`, async ({ page }, testInfo) => {
+  test(`short-height context navigation remains reachable without an empty outer gutter at ${width}px`, async ({ page }, testInfo) => {
     await page.setViewportSize({ width, height: 1000 });
     await page.emulateMedia({ reducedMotion: "reduce" });
     await fixture(page);
@@ -1061,8 +1132,8 @@ for (const width of [1440, 768]) {
     await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeVisible();
     await revealVaultNavigation(page);
     const collections = page.locator('[data-slot="vault-collections-sidebar"]');
-    const collapse = collections.getByRole("button", { name: "Collapse collections", exact: true });
-    const tree = collections.getByRole("tree", { name: "fixture explorer", exact: true });
+    const collapse = page.getByRole("button", { name: "Close vault navigation", exact: true });
+    const tree = collections.getByRole("navigation", { name: "fixture explorer", exact: true });
     await expect(collapse).toBeInViewport();
     await expect(collections.getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
     const emptyGutter = () => collections.evaluate(element => ({
@@ -1073,17 +1144,19 @@ for (const width of [1440, 768]) {
     await expect.poll(emptyGutter).toEqual({ style: "auto", overflow: false, reservedWidth: 0 });
 
     await collapse.focus();
-    const shortHeight = width >= 1024 ? 240 : 360;
+    // The compact identity and icon controls leave more reading room; use
+    // a shorter viewport so this fixture still exercises actual overflow.
+    const shortHeight = width >= 1024 ? 180 : 280;
     await page.setViewportSize({ width, height: shortHeight });
     await expect.poll(async () => {
       const box = (await collections.boundingBox())!;
       return box.y + box.height;
     }).toBe(shortHeight);
-    // The restored sidebar has no footer destinations. Its header remains
-    // reachable while focus reveals a document inside the independent tree.
-    const document = tree.getByRole("treeitem", { name: `Document: ${title}`, exact: true });
-    await document.focus();
-    await expect(document).toBeInViewport();
+    // The stable header toggle remains reachable while native link focus
+    // reveals a document inside the independently scrolling explorer.
+    const treeDocument = tree.getByRole("link", { name: `Document: ${title}`, exact: true });
+    await treeDocument.focus();
+    await expect(treeDocument).toBeInViewport();
     await expect.poll(() => tree.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
     await collapse.focus();
     await expect(collapse).toBeInViewport();
@@ -1096,77 +1169,71 @@ for (const width of [1440, 768]) {
   });
 }
 
-test("Vault menu preserves keyboard selection while its mobile header resizes", async ({ page }) => {
+test("Overview page links preserve keyboard focus while the mobile workspace resizes", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 900 });
   await page.emulateMedia({ reducedMotion: "reduce" });
   await fixture(page);
   await page.goto("/vault/fixture");
-  const trigger = page.getByRole("button", { name: "Navigate in fixture", exact: true });
-  const menu = page.getByRole("menu", { name: "Vault pages", exact: true });
-  await trigger.focus();
+  const navigation = page.getByRole("navigation", { name: "Vault pages", exact: true });
+  const settings = navigation.getByRole("link", { name: "Settings", exact: true });
+  await settings.focus();
+  for (const width of [768, 375]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect(settings).toBeFocused();
+    await expect(settings).toBeInViewport({ ratio: 1 });
+    await expectVaultDestinationsReachable(page, "Overview");
+  }
   await page.keyboard.press("Enter");
-  await page.keyboard.press("End");
-  await expect(page.getByRole("menuitem", { name: "Settings", exact: true })).toBeFocused();
-  await page.setViewportSize({ width: 768, height: 900 });
-  await expect(menu).toBeInViewport();
-  await expect(menu.getByRole("menuitem", { name: "Settings", exact: true })).toBeFocused();
-  await page.setViewportSize({ width: 375, height: 900 });
-  await expect(menu).toBeInViewport();
-  await expect(menu.getByRole("menuitem", { name: "Settings", exact: true })).toBeFocused();
-  await page.keyboard.press("Escape");
-  await expect(trigger).toHaveAttribute("aria-expanded", "false");
-  await expect(trigger).toBeFocused();
-  await expect(menu).toHaveCount(0);
-  await page.keyboard.press("Enter");
-  await expect(menu).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(trigger).toBeFocused();
+  await expect(page).toHaveURL(/\/vault\/fixture\/settings$/);
+  await expect(page.locator("#main")).toBeFocused();
 });
 
-test("Vault navigation adapts to enlarged text and a short landscape viewport", async ({ page }) => {
+test("Vault discovery adapts to enlarged text and a short landscape viewport", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 900 });
   await page.emulateMedia({ reducedMotion: "reduce" });
   await fixture(page);
   await page.goto("/vault/fixture");
-  const trigger = page.getByRole("button", { name: "Navigate in fixture", exact: true });
   await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
   await expectVaultDestinationsReachable(page, "Overview");
-  await expect(trigger).toBeInViewport({ ratio: 1 });
-  expect(await trigger.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  const links = page.getByRole("navigation", { name: "Vault pages", exact: true }).getByRole("link");
+  for (const link of await links.all()) {
+    await link.focus();
+    await expect(link).toBeInViewport({ ratio: 1 });
+    expect(await link.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  }
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.evaluate(() => { document.documentElement.style.fontSize = ""; });
   await page.setViewportSize({ width: 844, height: 390 });
   await expectVaultDestinationsReachable(page, "Overview");
-  await expect(trigger).toBeInViewport({ ratio: 1 });
+  for (const link of await links.all()) {
+    await link.focus();
+    await expect(link).toBeInViewport({ ratio: 1 });
+  }
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
 for (const width of [375, 768]) {
-  test(`Vault menu stays separate from the breadcrumb and tracks its current page at ${width}px`, async ({ page }, testInfo) => {
+  test(`Overview links stay separate from the breadcrumb at ${width}px`, async ({ page }, testInfo) => {
     await page.setViewportSize({ width, height: 900 });
     await page.emulateMedia({ reducedMotion: "reduce" });
     await fixture(page);
     await page.goto("/vault/fixture");
-    const navigation = page.getByRole("navigation", { name: "Vault sections", exact: true });
-    const trigger = page.getByRole("button", { name: "Navigate in fixture", exact: true });
+    const navigation = page.getByRole("navigation", { name: "Vault pages", exact: true });
     await expectVaultDestinationsReachable(page, "Overview");
     await expectQuietVaultTrail(page, "Overview");
-    const triggerBox = (await trigger.boundingBox())!;
-    expect(triggerBox.height).toBe(44);
-    expect(triggerBox.x).toBeGreaterThanOrEqual(0);
-    expect(triggerBox.x + triggerBox.width).toBeLessThanOrEqual(width);
-    expect(await trigger.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
-    await trigger.focus();
-    await page.keyboard.press("Enter");
-    const menu = page.getByRole("menu", { name: "Vault pages", exact: true });
-    await expect(menu.getByRole("menuitem").first()).toBeFocused();
-    await page.screenshot({ path: testInfo.outputPath("vault-menu-mobile.png") });
-    await page.keyboard.press("End");
-    await expect(menu.getByRole("menuitem", { name: "Settings", exact: true })).toBeFocused();
-    await page.keyboard.press("Enter");
+    await expect(page.locator(".app-header").getByRole("navigation", { name: "Vault pages", exact: true })).toHaveCount(0);
+    for (const link of await navigation.getByRole("link").all()) {
+      const box = (await link.boundingBox())!;
+      expect(box.height).toBeGreaterThanOrEqual(44);
+      expect(box.x).toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width).toBeLessThanOrEqual(width);
+    }
+    await page.screenshot({ path: testInfo.outputPath("vault-pages-mobile.png") });
+    const settings = navigation.getByRole("link", { name: "Settings", exact: true });
+    await settings.focus();
+    await settings.press("Enter");
     await expect(page).toHaveURL(/\/vault\/fixture\/settings$/);
-    await expect(menu).toHaveCount(0);
-    await expect(trigger).toBeFocused();
+    await expect(page.locator("#main")).toBeFocused();
     await expectQuietVaultTrail(page, "Settings");
     await expectVaultDestinationsReachable(page, "Settings");
     await page.goBack();
@@ -1174,8 +1241,7 @@ for (const width of [375, 768]) {
     await expectVaultDestinationsReachable(page, "Overview");
     await openVaultDestination(page, "Members");
     await expect(page).toHaveURL(/\/vault\/fixture\/members$/);
-    await expect(navigation).toHaveCount(0);
-    await expect(trigger).toBeInViewport();
+    await expect(vaultBreadcrumb(page)).toBeInViewport();
     await expect(page.getByTestId("members-workspace-frame")).toBeVisible();
     await expectQuietVaultTrail(page, "Members");
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -1245,15 +1311,15 @@ test("preview owns local location, restores Search, and promotes Raw to the Vaul
   await expect(page.getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
   await expect(reader.locator('[data-slot="resource-command-row"]').getByRole("navigation", { name: "Resource location", exact: true })).toHaveCount(0);
   await expect(page.locator('.app-header [aria-label="Current page"]')).toHaveText("Search");
-  await reader.getByRole("tab", { name: "Raw", exact: true }).click();
+  await reader.getByRole("radio", { name: "Raw markdown", exact: true }).click();
   await expect(reader.getByTestId("doc-raw")).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(reader).toHaveCount(0);
   await expect(page).toHaveURL(/\/search\?q=reading&source=document/);
   await expect(result).toBeFocused();
   await result.click();
-  await reader.getByRole("tab", { name: "Raw", exact: true }).click();
-  await expect(reader.getByRole("tab", { name: "Raw", exact: true })).toHaveAttribute("aria-selected", "true");
+  await reader.getByRole("radio", { name: "Raw markdown", exact: true }).click();
+  await expect(reader.getByRole("radio", { name: "Raw markdown", exact: true })).toHaveAttribute("aria-checked", "true");
   await expect(reader.getByTestId("doc-raw")).toBeVisible();
   await reader.getByRole("button", { name: "Open document in vault" }).click();
   await expect(reader).toHaveCount(0);
@@ -1264,22 +1330,20 @@ test("preview owns local location, restores Search, and promotes Raw to the Vaul
   await expect(page.getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
 });
 
-test("Vault Search preview suspends its Vault menu and restores it on close", async ({ page }) => {
+test("Vault Search preview keeps local location and restores its background breadcrumb", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await fixture(page);
   await page.goto("/vault/fixture/search?q=reading&source=document");
-  const navigation = page.getByRole("button", { name: "Navigate in fixture", exact: true });
+  const navigation = page.getByRole("navigation", { name: "Current page", exact: true });
   await expectVaultDestinationsReachable(page);
-  await expect(page.getByRole("button", { name: "Search knowledge", exact: true })).toBeVisible();
   const initialPosition = await navigation.boundingBox();
   const result = page.getByRole("link", { name: /문서 읽기 작업공간/ }).first();
   await result.click();
   const preview = page.getByTestId("document-preview-dialog");
   await expect(preview).toBeVisible();
-  await expect(preview.getByRole("button", { name: "Navigate in fixture", exact: true })).toHaveCount(0);
-  await expect(navigation).toHaveCount(0);
-  await preview.getByRole("tab", { name: "Raw", exact: true }).click();
-  await expect(navigation).toHaveCount(0);
+  await expect(preview.getByRole("navigation", { name: "Vault pages", exact: true })).toHaveCount(0);
+  await expect(preview.getByRole("navigation", { name: "Resource location", exact: true })).toContainText(title);
+  await preview.getByRole("radio", { name: "Raw markdown", exact: true }).click();
   await page.keyboard.press("Escape");
   await expect(preview).toHaveCount(0);
   await expect(page).toHaveURL(/\/vault\/fixture\/search\?q=reading&source=document$/);
@@ -1289,35 +1353,38 @@ test("Vault Search preview suspends its Vault menu and restores it on close", as
   expect(await navigation.boundingBox()).toEqual(initialPosition);
 });
 
-for (const width of [375, 1440]) test(`read-mode segments retain manual keyboard activation at ${width}px`, async ({ page }) => {
+for (const width of [375, 1440]) test(`read-mode radios select immediately with keyboard navigation at ${width}px`, async ({ page }) => {
   await page.setViewportSize({ width, height: 1000 });
   await fixture(page);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const rendered = page.getByRole("tab", { name: "Preview", exact: true });
-  const raw = page.getByRole("tab", { name: "Raw", exact: true });
-  await expect(rendered).toHaveAttribute("aria-selected", "true");
+  const rendered = page.getByRole("radio", { name: "Preview", exact: true });
+  const raw = page.getByRole("radio", { name: "Raw markdown", exact: true });
+  await expect(rendered).toHaveAttribute("aria-checked", "true");
   await rendered.focus();
   await page.keyboard.press("ArrowRight");
   await expect(raw).toBeFocused();
-  await expect(rendered).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByTestId("doc-raw")).toHaveCount(0);
+  await expect(raw).toHaveAttribute("aria-checked", "true");
+  await expect(page.getByTestId("doc-raw")).toBeVisible();
+  await expect(page.getByRole("tooltip")).toHaveCount(0);
   await page.keyboard.press("Enter");
-  await expect(raw).toHaveAttribute("aria-selected", "true");
+  await expect(raw).toHaveAttribute("aria-checked", "true");
   await expect(page.getByTestId("doc-raw")).toBeVisible();
   await page.keyboard.press("Home");
   await expect(rendered).toBeFocused();
-  await expect(raw).toHaveAttribute("aria-selected", "true");
+  await expect(rendered).toHaveAttribute("aria-checked", "true");
   await page.keyboard.press("Space");
-  await expect(rendered).toHaveAttribute("aria-selected", "true");
+  await expect(rendered).toHaveAttribute("aria-checked", "true");
   await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeVisible();
   for (const tab of [rendered, raw]) {
     expect(await tab.evaluate(element => getComputedStyle(element, "::after").content)).toBe("none");
     expect(await tab.evaluate(element => parseFloat(getComputedStyle(element).borderRadius))).toBeGreaterThan(0);
   }
-  expect(await rendered.evaluate(element => getComputedStyle(element).backgroundColor)).not.toBe(await raw.evaluate(element => getComputedStyle(element).backgroundColor));
+  await expect(rendered).toHaveAttribute("tabindex", "0");
+  await expect(raw).toHaveAttribute("tabindex", "-1");
+  expect(await rendered.evaluate(element => getComputedStyle(element).color)).not.toBe(await raw.evaluate(element => getComputedStyle(element).color));
 });
 
-for (const width of [375, 1440]) test(`modified keyboard Vault links keep a dirty editor in its original tab at ${width}px`, async ({ page, context }) => {
+for (const width of [375, 1440]) test(`modified keyboard Vault chooser links keep a dirty editor in its original tab at ${width}px`, async ({ page, context }) => {
   // Popups must also remain isolated from the real local backend. Page-owned
   // fixtures take precedence in the original tab; the new tab only tests linking.
   await context.route("**/api/v1/**", route => route.fulfill({ json: {} }));
@@ -1327,21 +1394,27 @@ for (const width of [375, 1440]) test(`modified keyboard Vault links keep a dirt
   const editor = page.getByRole("textbox", { name: "Document body (markdown)" });
   await editor.fill("Keep editing here while checking Vault settings in another tab.");
   await expect(page.getByText("Draft saved locally", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Navigate in fixture", exact: true }).click();
-  const destination = page.getByRole("menuitem", { name: "Settings", exact: true });
+  if (width < 1024) await page.getByRole("button", { name: "Open vault navigation", exact: true }).click();
+  const switcher = page.locator("#vault-workspace-navigation").getByRole("button", { name: "Switch vault: fixture", exact: true });
+  await switcher.click();
+  const picker = page.getByRole("dialog", { name: "Vaults", exact: true });
+  const destination = picker.getByRole("link", { name: "fixture, current vault", exact: true });
   await destination.focus();
   // Browser-native new-tab gestures do not necessarily retain a JS opener.
   const popupPromise = context.waitForEvent("page");
   await page.keyboard.press("ControlOrMeta+Enter");
   const popup = await popupPromise;
-  await expect(popup).toHaveURL(/\/vault\/fixture\/settings$/);
+  await expect(popup).toHaveURL(/\/vault\/fixture$/);
   await popup.close();
   await expect(page).toHaveURL(/\?view=edit$/);
   await expect(page.getByRole("dialog", { name: "Leave this document?", exact: true })).toHaveCount(0);
+  await expect(picker).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(switcher).toBeFocused();
   await expect(editor).toContainText("Keep editing here");
 });
 
-for (const width of [375, 1440]) test(`Vault navigation protects an unsaved editor draft at ${width}px`, async ({ page }) => {
+for (const width of [375, 1440]) test(`Header Vault chooser protects an unsaved editor draft at ${width}px`, async ({ page }) => {
   await page.setViewportSize({ width, height: 1000 });
   await fixture(page);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}?view=edit`);
@@ -1349,18 +1422,60 @@ for (const width of [375, 1440]) test(`Vault navigation protects an unsaved edit
   const draft = "An unsaved draft kept while reviewing another Vault page.";
   await editor.fill(draft);
   await expect(page.getByText("Draft saved locally", { exact: true })).toBeVisible();
-  await openVaultDestination(page, "Settings");
+  if (width < 1024) await page.getByRole("button", { name: "Open vault navigation", exact: true }).click();
+  const switcher = page.locator("#vault-workspace-navigation").getByRole("button", { name: "Switch vault: fixture", exact: true });
+  const switchVault = async () => {
+    const picker = page.getByRole("dialog", { name: "Vaults", exact: true });
+    if (!await picker.isVisible()) {
+      if (!await switcher.isVisible()) await page.getByRole("button", { name: "Open vault navigation", exact: true }).click();
+      await switcher.click();
+      const search = picker.getByRole("searchbox", { name: "Find a vault", exact: true });
+      await expect(search).toBeFocused();
+      await search.fill("fixture");
+      await picker.getByRole("button", { name: /^Filter by role(?:, 1 active)?$/ }).click();
+      await picker.getByRole("button", { name: "Can edit", exact: true }).click();
+    }
+    await picker.getByRole("link", { name: "fixture, current vault", exact: true }).click();
+  };
+  await switchVault();
   const confirmation = page.getByRole("dialog", { name: "Leave this document?", exact: true });
   await expect(confirmation).toBeVisible();
+  await expect(page.locator("#vault-switcher-panel")).toHaveAttribute("inert", "");
+  await expect(page.locator("#vault-switcher-panel")).toHaveAttribute("aria-hidden", "true");
   await expect(page).toHaveURL(/\?view=edit$/);
   await expect(page.getByRole("menu")).toHaveCount(0);
   await confirmation.getByRole("button", { name: "Keep editing", exact: true }).click();
   await expect(confirmation).toHaveCount(0);
+  const remainingPicker = page.getByRole("dialog", { name: "Vaults", exact: true });
+  await expect(remainingPicker).toBeVisible();
+  await expect(remainingPicker).not.toHaveAttribute("inert", "");
+  await expect(remainingPicker.getByRole("searchbox", { name: "Find a vault", exact: true })).toHaveValue("fixture");
+  await expect(remainingPicker.getByRole("button", { name: "Can edit", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(remainingPicker.getByRole("searchbox", { name: "Find a vault", exact: true })).toBeFocused();
+  await expect(page.locator("#vault-workspace-navigation")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(switcher).toBeFocused();
   await expect(editor).toContainText(draft);
-  await openVaultDestination(page, "Settings");
+  // Global Vaults remains a native directory link and consults the same guard.
+  const globalVaults = width < 1024
+    ? page.getByRole("navigation", { name: "Primary mobile navigation", exact: true }).getByRole("link", { name: "Vaults", exact: true })
+    : page.getByTestId("app-sidebar").getByRole("link", { name: "Vaults", exact: true });
+  await expect(globalVaults).toHaveAttribute("href", "/vault");
+  await globalVaults.click();
+  await expect(confirmation).toBeVisible();
+  await expect(page).toHaveURL(/\?view=edit$/);
+  await confirmation.getByRole("button", { name: "Keep editing", exact: true }).click();
+  await expect(confirmation).toHaveCount(0);
+  await expect(editor).toContainText(draft);
+  // A global departure returns focus to the editor and closes the mobile
+  // disclosure. Wait for that state before opening it again.
+  await expect(page.getByRole("textbox", { name: "Document title", exact: true })).toBeFocused();
+  if (width < 1024) await expect(page.locator("#vault-workspace-navigation")).toBeHidden();
+  await switchVault();
   await confirmation.getByRole("button", { name: "Leave document", exact: true }).click();
-  await expect(page).toHaveURL(/\/vault\/fixture\/settings$/);
-  await expectQuietVaultTrail(page, "Settings");
+  await expect(page).toHaveURL(/\/vault\/fixture$/);
+  await expectQuietVaultTrail(page, "Overview");
+  await expectVaultDestinationsReachable(page, "Overview");
 });
 
 test("toolbar publishing opens a review, never publishes on disclosure, and restores focus", async ({ page }, testInfo) => {
@@ -1371,9 +1486,10 @@ test("toolbar publishing opens a review, never publishes on disclosure, and rest
     if (new URL(request.url()).pathname.includes("/publications") && request.method() !== "GET") mutations += 1;
   });
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const publish = page.getByRole("group", { name: "Document publishing", exact: true }).getByRole("button", { name: "Publish", exact: true });
-  await expect(publish).not.toHaveAttribute("aria-disabled", "true");
+  const publish = documentActions(page);
   await publish.click();
+  await expect(page.getByRole("menuitem", { name: "Publish", exact: true })).not.toHaveAttribute("aria-disabled", "true");
+  await page.getByRole("menuitem", { name: "Publish", exact: true }).click();
   const review = page.getByRole("dialog", { name: "Publish document" });
   await expect(review).toHaveAttribute("data-side", "bottom");
   await expect(page.locator('[data-slot="dialog-overlay"]')).toHaveCount(0);
@@ -1414,12 +1530,12 @@ for (const scenario of [
     await page.goto("/search?q=reading&source=document");
     await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
   } else await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const trigger = page.getByRole("button", { name: "Publish", exact: true });
+  const trigger = documentActions(page);
   await expect(trigger).toBeVisible();
   const canvas = page.locator("#document-reading-canvas");
   const before = await canvas.boundingBox();
   const overlayCount = await page.locator('[data-slot="dialog-overlay"]').count();
-  await trigger.click();
+  await openPublication(page, "Publish");
   const panel = page.getByRole("dialog", { name: "Publish document", exact: true });
   await expect(panel).toBeVisible();
   await expect(page.locator('[data-slot="dialog-overlay"]')).toHaveCount(overlayCount);
@@ -1461,7 +1577,7 @@ for (const scenario of [
   expect(await canvas.boundingBox()).toEqual(before);
   await page.keyboard.press("Escape");
   await expect(ready).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Public link", exact: true })).toBeFocused();
+  await expect(trigger).toBeFocused();
   if (scenario.preview) await expect(page.getByTestId("document-preview-dialog")).toBeVisible();
 });
 
@@ -1496,12 +1612,12 @@ for (const dark of [false, true]) test(`public-link popover anchors to its butto
   await page.setViewportSize({ width: 1440, height: 1000 });
   await fixture(page, dark, false, body, "guide-public");
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const trigger = page.getByRole("button", { name: "Public link", exact: true });
+  const trigger = documentActions(page);
   await expect(trigger).toBeVisible();
   const canvas = page.locator("#document-reading-canvas");
   const before = await canvas.boundingBox();
   const scrollBefore = await canvas.evaluate(element => element.scrollTop);
-  await trigger.click();
+  await openPublication(page);
   const panel = page.getByRole("dialog", { name: "Public link", exact: true });
   await expect(panel).toBeVisible();
   await expect(panel).toHaveAttribute("data-side", "bottom");
@@ -1516,23 +1632,25 @@ for (const dark of [false, true]) test(`public-link popover anchors to its butto
   expect(await page.locator("body").evaluate(element => getComputedStyle(element).pointerEvents)).not.toBe("none");
   await page.screenshot({ path: testInfo.outputPath("public-link-popover.png") });
 
-  // An uncovered reader action works on the first outside click.
-  const summary = page.getByRole("button", { name: "Read document summary", exact: true });
-  await summary.click();
+  // A reader action dismisses the popover on its first click.
+  const details = documentActions(page);
+  await openDocumentDetails(page);
   await expect(panel).toHaveCount(0);
-  const summaryPanel = page.getByRole("dialog", { name: "Document summary", exact: true });
-  await expect(summaryPanel).toBeVisible();
+  const detailsPanel = page.locator('[data-slot="document-context-panel"]');
+  await expect(detailsPanel).toBeVisible();
   await page.keyboard.press("Escape");
-  await expect(summaryPanel).toHaveCount(0);
-  await expect(summary).toBeFocused();
-  await trigger.click();
+  await expect(detailsPanel).toHaveCount(0);
+  await expect(details).toBeFocused();
+  await openPublication(page);
   await trigger.click();
   await expect(panel).toHaveCount(0);
-  await trigger.click();
+  await expect(page.getByRole("menu")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await openPublication(page);
   await page.keyboard.press("Escape");
   await expect(panel).toHaveCount(0);
   await expect(trigger).toBeFocused();
-  await trigger.click();
+  await openPublication(page);
   await panel.getByRole("button", { name: "Close public link" }).click();
   await expect(trigger).toBeFocused();
 });
@@ -1541,11 +1659,11 @@ for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }
   await page.setViewportSize(viewport);
   await fixture(page, false, true, body, "guide-public");
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const trigger = page.getByRole("button", { name: "Public link", exact: true });
+  const trigger = documentActions(page);
   await expect(trigger).toBeVisible();
   const canvas = page.locator("#document-reading-canvas");
   const before = await canvas.boundingBox();
-  await trigger.click();
+  await openPublication(page);
   const panel = page.getByRole("dialog", { name: "Public link", exact: true });
   await expect(panel).toBeVisible();
   const box = (await panel.boundingBox())!;
@@ -1573,10 +1691,10 @@ for (const previewMode of [false, true]) test(`public-link popover preserves con
     await page.goto("/search?q=reading&source=document");
     await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
   } else await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const trigger = page.getByRole("button", { name: "Public link", exact: true });
+  const trigger = documentActions(page);
   await expect(trigger).toBeVisible();
   const readingUrl = page.url();
-  await trigger.click();
+  await openPublication(page);
   const panel = page.getByRole("dialog", { name: "Public link", exact: true });
   await panel.getByRole("button", { name: "Copy link", exact: true }).click();
   await expect(panel.getByRole("status")).toHaveText("Link copied.");
@@ -1598,7 +1716,7 @@ for (const previewMode of [false, true]) test(`public-link popover preserves con
   if (previewMode) {
     const preview = page.getByTestId("document-preview-dialog");
     await expect(preview).toBeVisible();
-    await trigger.click();
+    await openPublication(page);
     await preview.locator("#document-reading-canvas").click({ position: { x: 40, y: 80 } });
     await expect(panel).toHaveCount(0);
     await expect(preview).toBeVisible();
@@ -1606,62 +1724,51 @@ for (const previewMode of [false, true]) test(`public-link popover preserves con
   }
 });
 
-test("outside action closes floating context without swallowing the click", async ({ page }) => {
+test("docked details remain open while overflow actions are usable", async ({ page }) => {
   await page.setViewportSize({ width: 2560, height: 1000 });
   await fixture(page);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const actions = page.getByRole("region", { name: "Document workspace" }).getByRole("button", { name: `Actions for ${title}` });
-  const context = page.getByRole("group", { name: "Document context", exact: true });
-  await context.getByRole("button", { name: "Document info", exact: true }).click();
-  const close = page.getByRole("button", { name: "Close document panel" });
-  await expect(close).toBeFocused();
-  await context.getByRole("button", { name: "Table of contents", exact: true }).click();
-  await expect(page.getByRole("complementary", { name: "On this page", exact: true })).toBeVisible();
-  await expect(context.getByRole("button", { name: "Table of contents", exact: true })).toHaveAttribute("aria-expanded", "true");
-  await actions.click();
-  await expect(page.locator('[data-slot="document-context-panel"]')).toHaveCount(0);
+  const panel = await openDocumentDetails(page);
+  await expect(panel).toHaveAttribute("data-mode", "docked");
+  await documentActions(page).click();
   await expect(page.getByRole("menu")).toBeVisible();
-  await page.getByRole("menuitemradio", { name: "Wide", exact: true }).click();
-  await expect(actions).toBeFocused();
-  await actions.click();
+  await expect(panel).toBeVisible();
   await page.keyboard.press("Escape");
-  await expect(actions).toBeFocused();
-  await context.getByRole("button", { name: "Table of contents", exact: true }).click();
-  await page.keyboard.press("Escape");
-  await expect(context.getByRole("button", { name: "Table of contents", exact: true })).toBeFocused();
+  await expect(documentActions(page)).toBeFocused();
+  await expect(panel).toBeVisible();
+  await page.getByRole("button", { name: "Close document panel", exact: true }).click();
+  await expect(documentActions(page)).toBeFocused();
 });
 
-test("floating context preserves article geometry, scroll and selection while open", async ({ page }) => {
+test("docked details preserve article scroll and remain open during reading", async ({ page }) => {
   await page.setViewportSize({ width: 2560, height: 1000 });
   await fixture(page, false, false, body + "\n\n" + "A long article paragraph. ".repeat(2000));
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
   const canvas = page.locator("#document-reading-canvas");
   await expect(page.getByRole("heading", { name: "Authored heading", exact: true })).toBeVisible();
   await canvas.evaluate(element => { element.scrollTop = 240; });
-  const before = await canvas.boundingBox();
-  const paragraph = page.locator(".document-reading-flow .ProseMirror > p").first();
-  const beforeParagraph = await paragraph.boundingBox();
-  await page.getByRole("button", { name: "Document info", exact: true }).click();
-  expect(await canvas.boundingBox()).toEqual(before);
-  expect(await paragraph.boundingBox()).toEqual(beforeParagraph);
+  const before = (await canvas.boundingBox())!;
+  const panel = await openDocumentDetails(page, "Properties");
+  await expect(panel).toHaveAttribute("data-mode", "docked");
   expect(await canvas.evaluate(element => element.scrollTop)).toBe(240);
-  const panel = page.getByRole("complementary", { name: "Document info", exact: true });
+  const after = (await canvas.boundingBox())!;
+  expect(after.width + (await page.locator(".reading-details-host").boundingBox())!.width).toBeCloseTo(before.width, 0);
   await panel.getByText(title, { exact: true }).click({ clickCount: 3 });
   await expect(panel).toBeVisible();
   await canvas.hover({ position: { x: 40, y: 80 } });
   await page.mouse.wheel(0, 200);
   await expect.poll(() => canvas.evaluate(element => element.scrollTop)).toBeGreaterThan(240);
-  await expect(panel).toBeVisible();
   await canvas.click({ position: { x: 40, y: 80 } });
-  await expect(panel).toHaveCount(0);
+  await expect(panel).toBeVisible();
+  await page.getByRole("button", { name: "Close document panel", exact: true }).click();
+  expect(await canvas.boundingBox()).toEqual(before);
 });
 
 test("properties enter unified authoring while relation dialogs retain their inspector", async ({ page }) => {
   await page.setViewportSize({ width: 2560, height: 1000 });
   await fixture(page);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  const rail = page.locator('[data-slot="document-context-rail"]');
-  await rail.getByRole("button", { name: "Document info", exact: true }).click();
+  await openDocumentDetails(page, "Properties");
   const panel = page.locator('[data-slot="document-context-panel"]');
   const edit = panel.getByRole("button", { name: "Edit properties", exact: true });
   await edit.click();
@@ -1684,7 +1791,7 @@ test("properties enter unified authoring while relation dialogs retain their ins
   await expect(panel).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeFocused();
 
-  await rail.getByRole("button", { name: "Relations", exact: true }).click();
+  await openDocumentDetails(page, "Related documents");
   await panel.getByRole("button", { name: "Add", exact: true }).click();
   const relation = page.getByRole("dialog", { name: "Add relation", exact: true });
   await relation.getByRole("button", { name: "Relation type", exact: true }).click();
@@ -1696,36 +1803,32 @@ test("properties enter unified authoring while relation dialogs retain their ins
   await expect(panel).toBeVisible();
 });
 
-test("floating context dismisses inside a preview without closing the preview", async ({ page }) => {
+test("docked details close inside a preview and outline navigation preserves its route", async ({ page }) => {
   await page.setViewportSize({ width: 2560, height: 1000 });
   await fixture(page);
   await page.goto("/search?q=reading&source=document");
   await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
   const preview = page.getByTestId("document-preview-dialog");
-  const info = preview.getByRole("button", { name: "Document info", exact: true });
-  await info.click();
-  const panel = page.getByRole("complementary", { name: "Document info", exact: true });
-  await expect(panel).toBeVisible();
+  const trigger = preview.getByRole("button", { name: "Document details", exact: true });
+  const panel = await openDocumentDetails(page);
+  await expect(panel).toHaveAttribute("data-mode", "docked");
   await page.keyboard.press("Escape");
   await expect(panel).toHaveCount(0);
   await expect(preview).toBeVisible();
-  await expect(info).toBeFocused();
-  await info.click();
+  await expect(trigger).toBeFocused();
+  await openDocumentDetails(page);
   await preview.locator("#document-reading-canvas").click({ position: { x: 40, y: 80 } });
-  await expect(panel).toHaveCount(0);
-  await expect(preview).toBeVisible();
+  await expect(panel).toBeVisible();
   const previewUrl = page.url();
   const previewHistory = await page.evaluate(() => history.state);
-  await preview.getByRole("button", { name: "Table of contents", exact: true }).click();
-  const outline = page.getByRole("complementary", { name: "On this page", exact: true });
-  const headingLink = outline.getByRole("link", { name: "Authored heading", exact: true });
+  const headingLink = panel.getByRole("link", { name: "Authored heading", exact: true });
   await headingLink.click();
-  await expect(outline).toBeVisible();
+  await expect(panel).toBeVisible();
   await expect(headingLink).toBeFocused();
   await expect(page).toHaveURL(previewUrl);
   expect(await page.evaluate(() => history.state)).toEqual(previewHistory);
   await page.keyboard.press("Escape");
-  await expect(outline).toHaveCount(0);
+  await expect(panel).toHaveCount(0);
   await expect(preview).toBeVisible();
 });
 
@@ -1753,8 +1856,8 @@ test("outline navigation in a short document never scrolls the Vault shell under
     const rect = element.getBoundingClientRect();
     return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, parents };
   });
+  await openDocumentDetails(page);
   const before = await workspaceMetrics();
-  await page.locator('[data-slot="document-context-rail"]').getByRole("button", { name: "Table of contents", exact: true }).click();
   const outlineLink = page.getByRole("navigation", { name: "Document outline" }).getByRole("link", { name: "Checklist", exact: true });
   await outlineLink.click();
   await expect(outlineLink).toBeFocused();
@@ -1784,7 +1887,6 @@ for (const scenario of ["desktop", "mobile", "preview"] as const) {
       const rect = element.getBoundingClientRect();
       return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, parents };
     });
-    const before = await workspaceMetrics();
     const innerMetrics = () => canvas.getByRole("heading", { name: "Section 12", exact: true, includeHidden: true }).evaluate(element => {
       const parents = [];
       for (let node = element.parentElement; node && node.id !== "document-reading-canvas"; node = node.parentElement) {
@@ -1795,11 +1897,11 @@ for (const scenario of ["desktop", "mobile", "preview"] as const) {
     const innerBefore = await innerMetrics();
     const url = page.url();
     const history = await page.evaluate(() => window.history.state);
-    const rail = page.locator('[data-slot="document-context-rail"]');
-    await rail.getByRole("button", { name: "Table of contents", exact: true }).click();
+    const rail = page.getByRole("group", { name: "Document reading tools", exact: true });
+    await openDocumentDetails(page);
     const panel = page.locator('[data-slot="document-context-panel"]');
     await expect(panel.getByRole("navigation", { name: "Document outline" })).toBeVisible();
-    expect(await workspaceMetrics()).toEqual(before);
+    const before = await workspaceMetrics();
     const sectionLink = panel.getByRole("link", { name: "Section 12", exact: true });
     await sectionLink.click();
     await expect(panel).toBeVisible();
@@ -1827,9 +1929,9 @@ for (const scenario of ["desktop", "mobile", "preview"] as const) {
     await expect(finalLink).toBeFocused();
     await expect(canvas.getByRole("heading", { name: "Final section", exact: true, includeHidden: true })).toBeInViewport();
     expect(await workspaceMetrics()).toEqual(before);
-    await panel.getByRole("button", { name: "Close document panel", exact: true }).click();
+    await page.getByRole("button", { name: "Close document panel", exact: true }).click();
     await expect(panel).toHaveCount(0);
-    await expect(rail.getByRole("button", { name: "Table of contents", exact: true })).toBeFocused();
+    await expect(scenario === "preview" ? rail.getByRole("button", { name: "Document details", exact: true }) : documentActions(page)).toBeFocused();
   });
 }
 
@@ -1838,14 +1940,13 @@ test("resizing defers context mode changes until nested editing closes", async (
   await fixture(page);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
   const panel = page.locator('[data-slot="document-context-panel"]');
-  const rail = page.locator('[data-slot="document-context-rail"]');
-  await rail.getByRole("button", { name: "Relations", exact: true }).click();
+  await openDocumentDetails(page, "Related documents");
   await panel.getByRole("button", { name: "Add", exact: true }).click();
   const relation = page.getByRole("dialog", { name: "Add relation", exact: true });
   await expect(relation).toBeVisible();
   await page.setViewportSize({ width: 375, height: 800 });
   await expect(relation).toBeVisible();
-  await expect(panel).toHaveAttribute("data-mode", "floating");
+  await expect(panel).toHaveAttribute("data-mode", "docked");
   await relation.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(relation).toHaveCount(0);
   await expect(panel).toHaveAttribute("data-mode", "overlay");
@@ -1853,7 +1954,7 @@ test("resizing defers context mode changes until nested editing closes", async (
   await expect(panel).toHaveCount(0);
 
   await page.setViewportSize({ width: 2560, height: 1000 });
-  await rail.getByRole("button", { name: "Document info", exact: true }).click();
+  await openDocumentDetails(page, "Properties");
   await panel.getByRole("button", { name: "Edit properties", exact: true }).click();
   const details = page.getByRole("complementary", { name: "Document details", exact: true });
   await details.getByRole("textbox", { name: "Summary", exact: true }).fill("Preserve on resize");
@@ -1865,10 +1966,10 @@ test("resizing defers context mode changes until nested editing closes", async (
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
   await page.getByRole("dialog", { name: "Discard unsaved changes?", exact: true }).getByRole("button", { name: "Discard changes", exact: true }).click();
   await expect(details).toHaveCount(0);
-  await rail.getByRole("button", { name: "Document info", exact: true }).click();
+  await openDocumentDetails(page, "Properties");
   await expect(panel).toHaveAttribute("data-mode", "overlay");
 
-  await panel.getByRole("button", { name: "Relations", exact: true }).click();
+  await openDocumentDetails(page, "Related documents");
   await panel.getByRole("button", { name: "Add", exact: true }).click();
   await expect(relation).toBeVisible();
   await page.setViewportSize({ width: 2560, height: 1000 });
@@ -1876,8 +1977,8 @@ test("resizing defers context mode changes until nested editing closes", async (
   await expect(panel).toHaveAttribute("data-mode", "overlay");
   await relation.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(relation).toHaveCount(0);
-  await expect(panel).toHaveAttribute("data-mode", "floating");
-  await expect(panel.getByRole("button", { name: "Close document panel", exact: true })).toBeFocused();
+  await expect(panel).toHaveAttribute("data-mode", "docked");
+  await expect(panel.getByRole("button", { name: "Add", exact: true })).toBeFocused();
 });
 
 test("preview geometry is independent of its search entry and background sidebars", async ({ page }) => {
@@ -1894,7 +1995,6 @@ test("preview geometry is independent of its search entry and background sidebar
       await page.goto("/search");
       await page.evaluate(folded => {
         localStorage.setItem("akb.treeVisible", folded ? "0" : "1");
-        localStorage.setItem("akb.vaultRailCollapsed", folded ? "1" : "0");
       }, folded);
       await page.goto(entry.route);
       if (entry.global) {
@@ -1902,7 +2002,7 @@ test("preview geometry is independent of its search entry and background sidebar
         const search = page.getByTestId("global-search-dialog");
         await search.getByRole("combobox").fill("reading");
         await search.getByRole("option", { name: /문서 읽기 작업공간/ }).click();
-      } else await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
+      } else await page.getByRole("region", { name: "Search results", exact: true }).getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
       const preview = page.getByTestId("document-preview-dialog");
       await expect(preview.locator(".document-reading-flow")).toBeVisible();
       const box = (await preview.boundingBox())!;
@@ -1923,27 +2023,26 @@ test("reading gutters adapt to the reader container and align Preview with Raw",
   await page.setViewportSize({ width: 2560, height: 1440 });
   await fixture(page, false, true);
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
-  await page.getByRole("button", { name: `Actions for ${title}`, exact: true }).click();
-  await page.getByRole("menuitemradio", { name: "Wide", exact: true }).click();
   const content = page.getByRole("region", { name: "Document content", exact: true });
-  await expect(content.locator(".document-reading-flow")).toHaveClass(/document-reading-wide/);
+  await expect(content.locator(".document-reading-flow")).not.toHaveClass(/document-reading-wide/);
   const paragraph = content.locator(".ProseMirror > p").first();
   // Simulate the same component embedded in a narrow or wide reading canvas,
   // without changing the viewport (sidebar/panel changes must reflow it too).
-  for (const { width, gutter } of [{ width: 600, gutter: 16 }, { width: 1200, gutter: 24 }, { width: 1800, gutter: 32 }]) {
+  for (const { width, gutter } of [{ width: 600, gutter: 20 }, { width: 1200, gutter: 36 }, { width: 1800, gutter: 48 }]) {
     await content.evaluate((el, width) => { el.style.width = `${width}px`; }, width);
     const outer = (await content.boundingBox())!;
     const rendered = (await paragraph.boundingBox())!;
     const firstBlock = (await content.locator(".ProseMirror > :first-child").boundingBox())!;
-    expect(rendered.x - outer.x).toBeCloseTo(gutter, 0);
-    expect(rendered.width).toBeCloseTo(width - gutter * 2, 0);
-    await page.getByRole("tab", { name: "Raw", exact: true }).click();
+    const measure = Math.min(672, width - gutter * 2);
+    expect(rendered.x - outer.x).toBeCloseTo((width - measure) / 2, 0);
+    expect(rendered.width).toBeCloseTo(measure, 0);
+    await page.getByRole("radio", { name: "Raw markdown", exact: true }).click();
     const raw = (await page.getByTestId("doc-raw").boundingBox())!;
     expect(raw.x).toBeCloseTo(rendered.x, 0);
     expect(raw.width).toBeCloseTo(rendered.width, 0);
-    expect(raw.y).toBeCloseTo(firstBlock.y, 0);
-    await page.getByRole("tab", { name: "Preview", exact: true }).click();
-    await expect(content.locator(".document-reading-flow")).toHaveClass(/document-reading-wide/);
+    expect((await content.locator(".document-source-identity").boundingBox())!.y).toBeCloseTo(firstBlock.y, 0);
+    await page.getByRole("radio", { name: "Preview", exact: true }).click();
+    await expect(content.locator(".document-reading-flow")).not.toHaveClass(/document-reading-wide/);
   }
 });
 
@@ -1973,14 +2072,15 @@ for (const scenario of [
   await expect(paragraph).toBeVisible();
   const canvasBox = (await canvas.boundingBox())!;
   const canvasWidth = await canvas.evaluate(el => el.clientWidth);
-  const inset = (await paragraph.boundingBox())!.x - canvasBox.x;
-  expect(inset).toBeGreaterThanOrEqual(16);
-  expect(inset).toBeLessThanOrEqual(32);
-  if (scenario.width >= 1920) expect(inset).toBeCloseTo(32, 0);
+  const gutter = await preview.locator(".document-reading-inset").evaluate(element => parseFloat(getComputedStyle(element).paddingLeft));
+  expect(gutter).toBeGreaterThanOrEqual(16);
+  expect(gutter).toBeLessThanOrEqual(32);
+  const measure = Math.min(832, canvasWidth - gutter * 2);
+  const inset = (canvasWidth - measure) / 2;
   for (const block of await flow.locator(":scope > h2, :scope > p, :scope > ul, :scope > pre, :scope > .akb-md-table, :scope > .tableWrapper").all()) {
     const box = (await block.boundingBox())!;
     expect(box.x - canvasBox.x).toBeCloseTo(inset, 0);
-    expect(box.width).toBeCloseTo(canvasWidth - inset * 2, 0);
+    expect(box.width).toBeCloseTo(measure, 0);
   }
   // A long code line scrolls locally, never widening the overlay or its canvas.
   expect(await flow.locator(":scope > pre").evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
@@ -2004,9 +2104,11 @@ for (const scenario of [
       }
       const canvasBox = (await canvas.boundingBox())!;
       const paragraphBox = (await paragraph.boundingBox())!;
-      const gutter = paragraphBox.x - canvasBox.x;
-      expect(gutter).toBeGreaterThanOrEqual(16);
-      expect(gutter).toBeLessThanOrEqual(32);
+      const gutter = await preview.locator(".document-reading-inset").evaluate(element => parseFloat(getComputedStyle(element).paddingLeft));
+      const canvasWidth = await canvas.evaluate(element => element.clientWidth);
+      const measure = Math.min(832, canvasWidth - gutter * 2);
+      expect(paragraphBox.width).toBeCloseTo(measure, 0);
+      expect(paragraphBox.x - canvasBox.x).toBeCloseTo((canvasWidth - measure) / 2, 0);
       expect(await canvas.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
     }
   }
@@ -2022,7 +2124,7 @@ for (const scenario of [
   } else {
     await preview.getByRole("button", { name: "Open document in vault", exact: true }).click();
     await expect(preview).toHaveCount(0);
-    // Full-page reading retains its own Standard default.
+    // Full-page and preview share the automatic reading measure.
     await expect(page.locator(".document-reading-flow")).not.toHaveClass(/document-reading-wide/);
   }
 });
@@ -2090,11 +2192,11 @@ test("Escape closes only the nested context overlay inside a document preview", 
   await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
   const preview = page.getByTestId("document-preview-dialog");
   await expect(preview).toBeVisible();
-  const info = preview.getByRole("button", { name: "Document info", exact: true });
+  const info = preview.getByRole("button", { name: "Document details", exact: true });
   await info.click();
-  const context = page.getByRole("dialog", { name: "Document info", exact: true });
+  const context = page.getByRole("dialog", { name: "Document details", exact: true });
   await expect(context).toHaveAttribute("data-mode", "overlay");
-  await expect(context.getByRole("button", { name: "Close document panel", exact: true })).toBeFocused();
+  await expect(page.getByRole("button", { name: "Close document panel", exact: true })).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(context).toHaveCount(0);
   await expect(preview).toBeVisible();
@@ -2102,8 +2204,8 @@ test("Escape closes only the nested context overlay inside a document preview", 
   await expect(page).toHaveURL(new RegExp(`/doc/${encodeURIComponent(path)}$`));
   const previewUrl = page.url();
   const previewHistory = await page.evaluate(() => history.state);
-  await preview.getByRole("button", { name: "Table of contents", exact: true }).click();
-  const outline = page.getByRole("dialog", { name: "On this page", exact: true });
+  await preview.getByRole("button", { name: "Document details", exact: true }).click();
+  const outline = page.getByRole("dialog", { name: "Document details", exact: true });
   const headingLink = outline.getByRole("link", { name: "Authored heading", exact: true });
   await headingLink.click();
   await expect(outline).toBeVisible();
@@ -2114,7 +2216,7 @@ test("Escape closes only the nested context overlay inside a document preview", 
   await page.keyboard.press("Escape");
   await expect(outline).toHaveCount(0);
   await expect(preview).toBeVisible();
-  await expect(preview.getByRole("button", { name: "Table of contents", exact: true })).toBeFocused();
+  await expect(preview.getByRole("button", { name: "Document details", exact: true })).toBeFocused();
 });
 
 test("foreground access verification preserves the live editor draft", async ({ page }) => {
@@ -2146,7 +2248,7 @@ test("foreground access verification preserves the live editor draft", async ({ 
   await expect(editor).toContainText("A local draft that must survive verification and continues safely");
 });
 
-for (const dark of [false, true]) test(`code blocks follow Standard and Wide reading width (${dark ? "dark" : "light"})`, async ({ page }, testInfo) => {
+for (const dark of [false, true]) test(`code blocks follow the automatic reading measure (${dark ? "dark" : "light"})`, async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 2560, height: 1000 });
   await fixture(page, dark, true, [
     "# Code alignment", "The code blocks should share this paragraph’s edges.",
@@ -2170,21 +2272,19 @@ for (const dark of [false, true]) test(`code blocks follow Standard and Wide rea
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     return text.width;
   };
-  expect(await checkEdges()).toBe(1024);
-  const standardBox = (await paragraph.boundingBox())!;
-  await page.getByRole("tab", { name: "Raw", exact: true }).click();
+  expect(await checkEdges()).toBe(672);
+  const readingBox = (await paragraph.boundingBox())!;
+  await page.getByRole("radio", { name: "Raw markdown", exact: true }).click();
   const rawBox = (await page.getByTestId("doc-raw").boundingBox())!;
-  expect(rawBox.x).toBeCloseTo(standardBox.x, 0);
-  expect(rawBox.width).toBe(1024);
-  await page.getByRole("tab", { name: "Preview", exact: true }).click();
-  await page.screenshot({ path: testInfo.outputPath("standard-code-width.png") });
-  const actions = page.getByRole("button", { name: `Actions for ${title}`, exact: true });
-  await actions.click();
-  await page.getByRole("menuitemradio", { name: "Wide", exact: true }).click();
-  expect(await checkEdges()).toBeGreaterThan(1024);
-  await actions.click();
-  await page.getByRole("menuitemradio", { name: "Standard", exact: true }).click();
-  expect(await checkEdges()).toBe(1024);
+  expect(rawBox.x).toBeCloseTo(readingBox.x, 0);
+  expect(rawBox.width).toBe(672);
+  await page.getByRole("radio", { name: "Preview", exact: true }).click();
+  await page.screenshot({ path: testInfo.outputPath("automatic-code-width.png") });
+  await documentActions(page).click();
+  await expect(page.getByRole("menuitemradio", { name: /^(Standard|Wide)$/ })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  expect(await checkEdges()).toBeLessThanOrEqual(672);
   await page.setViewportSize({ width: 375, height: 812 });
   expect(await checkEdges()).toBeLessThan(375);
   const longCode = blocks.last();
@@ -2272,15 +2372,11 @@ for (const dark of [false, true]) for (const entry of ["document", "search", "qu
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
       return heading.width;
     };
-    const actions = page.getByRole("button", { name: `Actions for ${title}`, exact: true });
-    if (entry !== "document") expect(await checkAlignment()).toBeGreaterThan(1024);
-    await actions.click();
-    await page.getByRole("menuitemradio", { name: "Standard", exact: true }).click();
-    expect(await checkAlignment()).toBe(1024);
-    await page.screenshot({ path: testInfo.outputPath("standard-image-alignment.png") });
-    await actions.click();
-    await page.getByRole("menuitemradio", { name: "Wide", exact: true }).click();
-    expect(await checkAlignment()).toBeGreaterThan(1024);
+    expect(await checkAlignment()).toBe(entry === "document" ? 672 : 832);
+    await documentActions(page).click();
+    await expect(page.getByRole("menuitemradio", { name: /^(Standard|Wide)$/ })).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await page.screenshot({ path: testInfo.outputPath("automatic-image-alignment.png") });
     for (const width of [1440, 375]) {
       await page.setViewportSize({ width, height: 900 });
       await checkAlignment();
@@ -2290,11 +2386,13 @@ for (const dark of [false, true]) for (const entry of ["document", "search", "qu
 }
 
 test("short prose has no artificial body height", async ({ page }) => {
-  await fixture(page, false, false, "One line of knowledge.");
+  await fixture(page, false, false, "One line of knowledge.", undefined, { summary: "" });
   await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
   const body = page.locator(".document-reading-flow");
-  await expect(body).toHaveText("One line of knowledge.");
-  expect((await body.boundingBox())!.height).toBeLessThan(100);
+  const paragraph = body.locator(".ProseMirror > p");
+  await expect(paragraph).toHaveText("One line of knowledge.");
+  expect((await paragraph.boundingBox())!.height).toBeLessThan(40);
+  expect((await body.boundingBox())!.height).toBeLessThan(240);
 });
 
 test("wide tables stay locally scrollable at 200 percent CSS zoom", async ({ page }, testInfo) => {
@@ -2353,8 +2451,8 @@ test("wide tables stay locally scrollable at 200 percent CSS zoom", async ({ pag
     contentType: "application/json",
   });
   await expect(currentTitle).toBeInViewport({ ratio: 1 });
-  await expect(page.getByRole("button", { name: "Navigate in fixture", exact: true })).toBeInViewport({ ratio: 1 });
-  await expect(page.getByRole("button", { name: /^(Open vault navigation|Expand collections)$/ })).toBeInViewport();
+  await expect(vaultBreadcrumb(page)).toBeInViewport({ ratio: 1 });
+  await expect(page.getByRole("button", { name: "Open vault navigation", exact: true })).toBeInViewport();
   await region.focus();
   await page.keyboard.press("ArrowRight");
   await expect.poll(() => region.evaluate(element => element.scrollLeft)).toBeGreaterThan(0);
@@ -2374,7 +2472,7 @@ for (const width of [375, 1440]) for (const kind of ["file", "table"] as const) 
     await page.route("**/api/v1/files/fixture/f-reading/download", route => route.fulfill({ json: {
       name: "Reading notes.txt", mime_type: "text/plain", download_url: "/reading-file.txt", size_bytes: 22,
     } }));
-    await page.route("**/api/v1/tables/fixture", route => route.fulfill({ json: { items: [{
+    await page.route(/\/api\/v1\/tables\/fixture(?:\?.*)?$/, route => route.fulfill({ json: { items: [{
       name: "reading_catalog", collection: "guides/team/operations", description: "Reading inventory", row_count: 1,
       columns: [{ name: "title", type: "text", required: true }],
     }] } }));
@@ -2393,8 +2491,12 @@ for (const width of [375, 1440]) for (const kind of ["file", "table"] as const) 
       await expect(page.locator(".app-header").getByRole("navigation", { name: "Resource location", exact: true })).toBeVisible();
     }
     const drawer = await revealVaultNavigation(page);
-    await expect(page.locator('[data-slot="vault-collections-sidebar"]').getByRole("tree", { name: "fixture explorer", exact: true })).toBeVisible();
-    if (drawer) await page.keyboard.press("Escape");
+    await expect(page.locator('[data-slot="vault-collections-sidebar"]').getByRole("navigation", { name: "fixture explorer", exact: true })).toBeVisible();
+    if (drawer) {
+      await page.getByRole("navigation", { name: "fixture explorer", exact: true }).getByRole("button").first().focus();
+      await page.keyboard.press("Escape");
+      await expect(page.locator("#vault-workspace-navigation")).toBeHidden();
+    }
     await expect(page.getByRole("button", { name: /^Explore vault:/ })).toHaveCount(0);
     const navigation = page.getByRole("navigation", { name: "Vault sections", exact: true });
     await expectVaultDestinationsReachable(page);
@@ -2418,8 +2520,77 @@ for (const width of [375, 1440]) for (const kind of ["file", "table"] as const) 
     await expect(page).toHaveURL(/\/vault\/fixture\/settings$/);
     await expectQuietVaultTrail(page, "Settings");
     await page.goBack();
+    await page.goBack();
     await expect(trail).toContainText(kind === "file" ? "Reading notes.txt" : "reading_catalog");
     await expect(navigation).toHaveCount(0);
     await expectVaultDestinationsReachable(page);
   });
 }
+
+for (const scenario of [
+  { width: 375, dark: false, preview: false },
+  { width: 375, dark: true, preview: true },
+  { width: 1440, dark: false, preview: true },
+  { width: 1440, dark: true, preview: false },
+]) test(`document metadata byline wraps authors at ${scenario.width}px ${scenario.dark ? "dark" : "light"} ${scenario.preview ? "preview" : "route"}`, async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: scenario.width, height: 900 });
+  const author = "김민정 플랫폼 지식 운영팀 — " + "한글작성자이름".repeat(12);
+  await fixture(page, scenario.dark, false, body, undefined, {
+    created_by_name: author, created_by: "0c37e906-6db0-48c2-ac5d-576d0797b3f7",
+  });
+  if (scenario.preview) {
+    await page.goto("/search?q=reading&source=document");
+    await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
+  } else await page.goto(`/vault/fixture/doc/${encodeURIComponent(path)}`);
+  const tools = page.getByRole("group", { name: "Document reading tools", exact: true });
+  const byline = (scenario.preview ? tools : page.locator("#document-reading-canvas")).getByRole("group", { name: "Document metadata", exact: true });
+  const name = byline.getByText(author, { exact: true });
+  await expect(name).toBeVisible();
+  await expect(byline.getByText("Author", { exact: true })).toBeVisible();
+  await expect(byline).not.toContainText("Last edited by");
+  await expect(byline).not.toContainText("0c37e906");
+  await expect(byline.locator("time")).toHaveCount(1);
+  const timestamp = byline.locator("time");
+  await expect(timestamp).toHaveAttribute("datetime", new Date(lastEdited).toISOString());
+  await expect(tools.getByRole("button", { name: "Edit", exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(scenario.preview ? tools.getByRole("button", { name: "Document details", exact: true }) : documentActions(page)).toBeInViewport({ ratio: 1 });
+  await expect(page.getByRole("region", { name: "Document preview", exact: true })).toContainText("Authored heading");
+  expect(await byline.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect(await name.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+
+  const contrast = await byline.locator(':scope > span > span, time > [aria-hidden="true"]').evaluateAll(elements => {
+    const channels = (color: string) => (color.match(/[\d.]+/g) || []).map(Number);
+    const luminance = (rgb: number[]) => rgb.slice(0, 3).map(v => {
+      const c = v / 255;
+      return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    }).reduce((sum, c, i) => sum + c * [0.2126, 0.7152, 0.0722][i], 0);
+    return elements.map(element => {
+      let parent: Element | null = element;
+      let background = [255, 255, 255];
+      while (parent) {
+        const color = channels(getComputedStyle(parent).backgroundColor);
+        if (color.length === 3 || color[3] === 1) { background = color; break; }
+        parent = parent.parentElement;
+      }
+      const foreground = luminance(channels(getComputedStyle(element).color));
+      const bg = luminance(background);
+      return { text: element.textContent, ratio: (Math.max(foreground, bg) + 0.05) / (Math.min(foreground, bg) + 0.05) };
+    });
+  });
+  expect(contrast).toHaveLength(3);
+  for (const sample of contrast) expect(sample.ratio, sample.text || "Document metadata contrast").toBeGreaterThanOrEqual(4.5);
+  await timestamp.focus();
+  await expect(timestamp).toBeFocused();
+  await expect(page.getByRole("tooltip")).toContainText("Last edited:");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("tooltip")).toHaveCount(0);
+  await expect(timestamp).toBeFocused();
+  await page.screenshot({ path: testInfo.outputPath("document-byline.png"), animations: "disabled" });
+
+  const panel = await openDocumentDetails(page, "Properties");
+  const propertyAuthor = panel.getByText(author, { exact: true });
+  await expect(propertyAuthor).toBeVisible();
+  expect(await panel.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect(await propertyAuthor.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+});

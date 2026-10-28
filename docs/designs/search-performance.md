@@ -10,15 +10,14 @@ A read-only investigation of an older deployed backend found:
 
 - The active driver was **pgvector, posting shape**, not Qdrant. Query embedding
   and reranking used external services; reranking was already enabled.
-- Catalog estimates were approximately 998,000 vector chunks and **71.5 million
-  posting rows**. Posting heap storage was about 4.5 GB, total storage about 11 GB.
-- Two frequently executed sparse-query fingerprints had historical mean
-  execution times of **6,276 ms / 23,879 calls** and **4,825 ms / 6,450 calls**;
-  maxima were close to 30 seconds. Dense fingerprints also had substantial
-  latency, including a 1,359 ms mean over 27,351 calls.
-- These are cumulative `pg_stat_statements` observations since July 8, 2026,
-  not a controlled current-request sample or an end-to-end latency percentile.
-  Query variants, parameters, concurrency and cache states differ.
+- Catalog estimates placed the corpus in the million-chunk range, with tens
+  of millions of posting rows and multi-gigabyte indexes.
+- Cumulative `pg_stat_statements` observations showed multi-second mean sparse
+  retrieval latency and slower dense queries. Exact deployment counts and
+  observation windows are omitted from this public design.
+- These historical observations are not a controlled current-request sample
+  or an end-to-end latency percentile. Query variants, parameters,
+  concurrency and cache states differ.
 - Existing posting indexes covered `term_id` and `chunk_id`, but not `weight`.
   A representative **EXPLAIN without ANALYZE** showed a posting index scan,
   a scoped chunk lookup, a join, and score aggregation. Scoring requires heap
@@ -214,23 +213,22 @@ real-pgvector suite runs in the existing CI database job rather than silently
 skipping in both jobs. These adjustments do not change ranking or measured SQL.
 
 **Status:** a bounded first improvement, not a claim that every slow production
-search is resolved. Production remains unchanged. Existing installations need
+search is resolved. The documented investigation did not modify a deployment. Existing installations need
 an explicitly approved index-maintenance step to receive the index benefit.
 
 ## Production-scale validation
 
-A further read-only settings check found production `shared_buffers=2 GiB`,
-`effective_cache_size=6 GiB`, `work_mem=32 MiB`, `random_page_cost=1.1`, and
-`track_io_timing=off`. The HNSW index alone occupied **8,384,167,936 bytes**
-(7.81 GiB); the posting primary key occupied 4,882,440,192 bytes. This makes
-cache pressure plausible, but does not prove cache misses are the sole cause.
-An HNSW query need not read the entire index. `effective_cache_size` is a planner
-estimate, not allocated cache memory.
+A historical read-only inspection found indexes larger than the configured
+PostgreSQL buffer cache and substantial shared-buffer reads in cumulative query
+statistics. Exact deployment settings, index sizes and access counts are omitted.
+This makes cache pressure plausible, but does not prove cache misses are the
+sole cause. An HNSW query need not read the entire index.
+`effective_cache_size` is a planner estimate, not allocated cache memory.
 
-The earlier dominant sparse fingerprint accumulated 2,143,933,393 shared hits
-and 1,405,117,752 shared reads (about 39.6% PG-buffer misses among these accesses).
-This is further historical evidence of buffer-read pressure, not a cold-start
-experiment, a current miss rate, or proof of physical-disk latency.
+This is historical evidence of buffer-read pressure, not a cold-start experiment,
+a current miss rate, or proof of physical-disk latency. The synthetic experiments
+below retain their measured results and limitations; no production measurement
+has been relabeled as synthetic evidence.
 
 PostgreSQL's buffer cache and the operating system page cache are distinct.
 `EXPLAIN ... BUFFERS` shared reads mean a miss in PG shared buffers, **not

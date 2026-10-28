@@ -297,7 +297,7 @@ class CollectionService:
                 sub_rows_locked = await conn.fetch(
                     "SELECT id, path FROM collections "
                     "WHERE vault_id = $1 AND path LIKE $2 ESCAPE '\\' "
-                    "FOR UPDATE",
+                    "ORDER BY path, id FOR UPDATE",
                     vault_id,
                     CollectionRepository._like_escape(norm.rstrip("/")) + "/%",
                 )
@@ -306,7 +306,7 @@ class CollectionService:
                 docs = await coll_repo.list_docs_under(vault_id, norm, conn=conn)
                 if native_authority:
                     docs = docs + await _native_docs_under(conn, vault_id, norm)
-                files = await coll_repo.list_files_under(vault_id, norm, conn=conn)
+                files = await coll_repo.list_files_under(vault_id, norm, conn=conn, for_update=True)
                 # Tables living in this collection (FK collection_id is
                 # ON DELETE SET NULL, so deleting the collection rows
                 # would otherwise silently re-home them to vault root and

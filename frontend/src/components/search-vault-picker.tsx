@@ -12,16 +12,19 @@ interface SearchVaultPickerProps {
   error: boolean;
   onRetry: () => void;
   onChange: (vaults: string[]) => void;
+  variant?: "chips" | "summary";
 }
 
 /** A search scope, not a workspace switch: selecting never navigates away. */
-export function SearchVaultPicker({ selected, contextVault, vaults, error, onRetry, onChange }: SearchVaultPickerProps) {
+export function SearchVaultPicker({ selected, contextVault, vaults, error, onRetry, onChange, variant = "chips" }: SearchVaultPickerProps) {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const label = selected.length ? selected.join(", ") : "All vaults";
+  const summary = variant === "summary";
+  const summaryLabel = selected.length > 1 ? `${selected.length} vaults` : selected[0] || "All vaults";
+  const label = summary ? summaryLabel : selected.length ? selected.join(", ") : "All vaults";
   const needle = filter.trim().toLocaleLowerCase();
   // Scope names are already explicit user choices. Keep every selected name
   // removable even while directory refresh fails or an entry becomes stale.
@@ -40,14 +43,17 @@ export function SearchVaultPicker({ selected, contextVault, vaults, error, onRet
     return () => cancelAnimationFrame(frame);
   }, [open]);
 
-  const itemClass = "relative flex min-h-11 cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2 py-2 text-sm outline-none transition-token data-[highlighted]:bg-surface-hover data-[state=checked]:text-link sm:min-h-9";
+  const itemClass = "relative flex min-h-11 cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2 py-2 text-sm outline-none transition-token data-[highlighted]:bg-surface-hover data-[state=checked]:text-link search-scope-option";
 
   function toggle(name: string) {
     onChange(selected.includes(name) ? selected.filter(item => item !== name) : [...selected, name]);
   }
 
-  return <div className="flex w-full min-w-0 max-w-full items-center gap-1 @min-[30rem]/scope-query:w-auto @min-[30rem]/scope-query:max-w-[45%] @min-[30rem]/scope-query:shrink-0" role="group" aria-label="Vault search scope">
-    {visibleSelected.map(name => <span key={name} className="inline-flex min-w-0 max-w-36 flex-1 items-center gap-1 rounded-[var(--radius-sm)] border border-border bg-surface-selected pl-1.5 text-xs font-medium text-surface-selected-foreground">
+  return <div className={cn(
+    "flex min-w-0 items-center gap-1",
+    summary ? "max-w-44" : "w-full max-w-full @min-[30rem]/scope-query:w-auto @min-[30rem]/scope-query:max-w-[45%] @min-[30rem]/scope-query:shrink-0",
+  )} role="group" aria-label="Vault search scope">
+    {!summary && visibleSelected.map(name => <span key={name} className="inline-flex min-w-0 max-w-36 flex-1 items-center gap-1 rounded-[var(--radius-sm)] border border-border bg-surface-selected pl-1.5 text-xs font-medium text-surface-selected-foreground">
       <Box className="h-3 w-3 shrink-0" aria-hidden />
       <TooltipText className="min-w-0 truncate" tip={name}>{name}</TooltipText>
       <button type="button" aria-label={`Remove ${name} from search scope`}
@@ -61,11 +67,19 @@ export function SearchVaultPicker({ selected, contextVault, vaults, error, onRet
       type="button"
       ref={triggerRef}
       aria-label={`Search scope: ${label}`}
-      title={selected.length ? `Change search scope (${selected.length} selected)` : "Choose vaults to search"}
-      className="flex h-9 min-w-9 max-w-full shrink-0 items-center justify-center gap-1 rounded-[var(--radius-sm)] px-1.5 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      title={summary && selected.length === 1 ? selected[0] : selected.length ? `Change search scope (${selected.length} selected)` : "Choose vaults to search"}
+      className={cn(
+        "flex min-w-9 max-w-full items-center justify-center gap-1 rounded-[var(--radius-sm)] px-1.5 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        summary ? "search-compact-control h-11 min-w-0" : "h-9 shrink-0",
+      )}
     >
-      {!selected.length && <Globe className="h-3.5 w-3.5 shrink-0" aria-hidden />}
-      {!selected.length ? <span>All vaults</span> : overflowCount > 0 ? <span className="tabular-nums">+{overflowCount}</span> : null}
+      {summary ? <>
+        {selected.length ? <Box className="h-3.5 w-3.5 shrink-0" aria-hidden /> : <Globe className="h-3.5 w-3.5 shrink-0" aria-hidden />}
+        <span className="truncate">{summaryLabel}</span>
+      </> : <>
+        {!selected.length && <Globe className="h-3.5 w-3.5 shrink-0" aria-hidden />}
+        {!selected.length ? <span>All vaults</span> : overflowCount > 0 ? <span className="tabular-nums">+{overflowCount}</span> : null}
+      </>}
       <ChevronDown className="h-3.5 w-3.5 shrink-0" aria-hidden />
     </DropdownMenu.Trigger>
     <DropdownMenu.Portal>
@@ -78,7 +92,7 @@ export function SearchVaultPicker({ selected, contextVault, vaults, error, onRet
           <div className="relative">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-foreground-muted" aria-hidden />
             <Input ref={inputRef} type="search" aria-label="Filter vaults" placeholder="Filter vaults…"
-              value={filter} onChange={event => setFilter(event.target.value)} className="h-9 pl-8"
+              value={filter} onChange={event => setFilter(event.target.value)} className="search-compact-control h-11 pl-8"
               onKeyDown={event => {
                 if (event.key === "Escape") return;
                 event.stopPropagation();

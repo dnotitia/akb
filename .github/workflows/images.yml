@@ -53,6 +53,8 @@ jobs:
         with:
           context: backend
           file: backend/Dockerfile
+          build-args: |
+            AKB_SOURCE_REVISION=${{ github.sha }}
           push: false
           cache-from: type=gha,scope=akb-ci-backend
           cache-to: type=gha,mode=max,scope=akb-ci-backend

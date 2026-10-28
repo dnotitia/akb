@@ -355,21 +355,40 @@ patches.
 `bm25_catalog.bm25_limit` is the size of the extension's internal top-k. A search
 asks for one finite page first. When that page comes back full, it is the answer.
 When it comes back short, the same query runs again with `-1` and that result is
-the answer (akb#673).
+the answer (akb#673). That correctness fallback remains in place.
 
 A short finite page is not proof that nothing else matches:
 
-- Growing-segment rows are scored without the query's filter, and they take top-k
-  slots. So can rows the current snapshot cannot see.
+- An operator can disable `bm25_catalog.enable_prefilter`, and executor hooks
+  may not be available on an external extension build. A finite candidate page
+  can then contain rows the query's filter or snapshot excludes.
+
+The bundled image's patch `0006` fixes an inconsistency in upstream 0.3.0:
+sealed candidates checked the executor's snapshot and SQL quals before entering
+top-k, but growing candidates did not. Recent invisible or out-of-scope rows
+could fill top-k, raise its pruning threshold and displace authorized matches.
+An empty filtered page then forced the exact fallback even for a common term.
+Both segment types now use the existing prefilter. Growing rows are scored
+first, and only candidates above the current threshold incur a heap check;
+zero-score/no-overlap rows retain their original cost. Prefiltering is not a
+replacement for SQL authorization and still respects the operator's opt-out.
+
+Deploy a rebuilt image from this directory and restart PostgreSQL sessions to
+load the new library. Updating only the backend does not apply an extension
+fix. The on-disk index format, SQL extension version, scores and corpus
+statistics are unchanged; no REINDEX, ALTER EXTENSION or data migration is
+required for this patch. Other documented index-repair requirements still
+apply to damage left by earlier builds.
 
 `-1` reads every posting of the query terms and leaves visibility and the
 filter to the executor, so it is the only complete scan. What it costs is those
 postings plus the growing segment, and one heap check for each candidate the
-executor reads before the page fills. The corpus size is not the measure. A page
-that came back short had already read every posting it could, because pruning
-only starts once the internal top-k holds more than twice its size. Completing it
-therefore repeats work of the same order. On a 2.1M-chunk corpus, completing took
-60 ms to 2.5 s.
+executor reads before the page fills. The corpus size alone is not the measure.
+Exact completion can be much more expensive than a finite scan: it reads every
+matching posting and sorts the matches even when SQL asks for a small page.
+Earlier measurements on a 2.1M-chunk corpus ranged from 60 ms to 2.5 s; these
+are observations, not a latency guarantee. Patch `0006` avoids an unnecessary
+completion, not the inherent cost of a genuinely short/empty exact search.
 
 Before this, a short page widened the finite budget up to 65,535 and then refused
 exact work whenever the corpus held more than 10,000 rows, which is always in
@@ -398,6 +417,12 @@ covers:
 - scoped materialised ranking;
 - every exact route, and a rebuilt index answering a bounded page in full;
 - connection recovery.
+
+`test_vchord_growing_prefilter_postgres.py` additionally requires the bundled
+patch: finite Vault/source/type filters must match an exact oracle across mixed
+sealed/growing rows, and deleted, uncommitted and old-snapshot growing TIDs must
+not displace visible results. The prefilter-off control still demonstrates the
+short page. CI runs both suites against the rebuilt image.
 
 Hybrid and service regressions cover:
 

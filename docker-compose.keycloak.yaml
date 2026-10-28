@@ -22,7 +22,7 @@
 #
 # In config/secret.yaml:
 #   keycloak_client_secret: "local-akb-dev-secret"
-#   keycloak_admin_client_secret: "local-akb-admin-dev-secret"
+#   keycloak_admin_client_secret: "local-akb-admin-client-secret"
 #   sso_browser_session_encryption_key: <independent 32-byte base64url value>
 #   sso_session_epoch: <generate and persist an installation UUID>
 #
@@ -71,7 +71,7 @@
 # walkthrough.
 #
 # The realm import ships FIXED dev client secrets ("local-akb-dev-secret",
-# "local-akb-mcp-test-secret", "local-akb-admin-dev-secret"). Throwaway local values (same spirit as
+# "local-akb-mcp-test-secret", "local-akb-admin-client-secret"). Throwaway local values (same spirit as
 # the hard-coded `akb` Postgres password in docker-compose.yaml) — never
 # reuse them anywhere real.
 

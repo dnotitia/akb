@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import hashlib
 import json
 import re
 from collections.abc import Iterable
@@ -86,16 +87,57 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def validate_model_input_evidence(value: Any, secrets: Iterable[str] = ()) -> None:
+    """Reject serialized model inputs whose canonical payload or digest drifted."""
+
+    secret_values = tuple(secret for secret in secrets if secret)
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            has_input = "model_input_canonical_json" in item
+            has_hash = "model_input_sha256" in item
+            if has_input or has_hash:
+                serialized = item.get("model_input_canonical_json")
+                digest = item.get("model_input_sha256")
+                if not isinstance(serialized, str) or not isinstance(digest, str):
+                    raise ValueError("model input evidence is incomplete")
+                try:
+                    parsed = json.loads(serialized)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("model input evidence is invalid JSON") from exc
+                if (
+                    canonical_json(parsed) != serialized
+                    or hashlib.sha256(serialized.encode("utf-8")).hexdigest() != digest
+                    or any(secret in serialized for secret in secret_values)
+                ):
+                    raise ValueError("model input evidence integrity validation failed")
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, (list, tuple, set)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+
+
 def serialize_report(report: EvaluationReport[Any, Any, Any], secrets: Iterable[str] = ()) -> dict[str, Any]:
     raw = EvaluationReportAdapter.dump_python(report, mode="json")
-    return safe_json(raw, secrets)
+    secret_values = tuple(secrets)
+    serialized = safe_json(raw, secret_values)
+    validate_model_input_evidence(serialized, secret_values)
+    return serialized
 
 
 def write_json(path: Path, value: Any, secrets: Iterable[str] = ()) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    safe = safe_json(value, secrets)
+    secret_values = tuple(secrets)
+    safe = safe_json(value, secret_values)
+    try:
+        validate_model_input_evidence(safe, secret_values)
+    except ValueError as exc:
+        raise RuntimeError("model input evidence integrity validation failed") from exc
     encoded = json.dumps(safe, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    for secret in secrets:
+    for secret in secret_values:
         if secret and secret in encoded:
             raise RuntimeError("evidence redaction failed")
     path.write_text(encoded, encoding="utf-8")

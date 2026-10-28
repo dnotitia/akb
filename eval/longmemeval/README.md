@@ -45,14 +45,14 @@ the top 5, the reranker mostly reorders correct hits — it costs more in
 
 Full report: [`results/2026-05-20-longmemeval-s.md`](results/2026-05-20-longmemeval-s.md)
 — headline, per-category breakdown, the reranker ablation, and a reproduce
-recipe.  Both runs use `bge-m3@1024` + pgvector, `search_prefetch: 30`; the
+historical recipe (not executable against the current backend). Both runs use `bge-m3@1024` + pgvector, `search_prefetch: 30`; the
 rerank-on run adds `rerank_enabled: true` with `cohere/rerank-v3.5` via
 OpenRouter and `rerank_fusion_k: 60`.
 
 The raw per-question NDJSON (`eval/reports/longmemeval-akb-rerank-{off,on}-final.ndjson`,
-500 records each, `run_meta_start` header on line 1) is a reproducible local
-artifact — `eval/reports/` is gitignored, like the dataset.  Re-run the
-[runner](#runner) to regenerate it.
+500 records each, `run_meta_start` header on line 1) was a local experiment
+artifact — `eval/reports/` is gitignored, like the dataset. New runs produce
+new results; they do not reproduce the historical numbers by assumption.
 
 ---
 
@@ -110,81 +110,39 @@ signals; the runner therefore prefixes each rendered session with
 
 ---
 
-## Stack
+## Historical benchmark environment
 
-Self-contained `docker-compose.yaml`. Coexists with the main `akb` dev
-stack — ports are shifted (`18000`/`19000`/`19001`) and the compose
-project name (`longmemeval`, taken from this directory) keeps volumes
-isolated. `docker compose down -v` resets only `longmemeval_*` volumes;
-your main dev data is untouched.
+The results above describe the historical benchmark configuration, not a
+validated result for the current branch. The files in this directory retain
+that configuration for comparison: bge-m3/1024 embeddings, pgvector posting
+sparse vectors, reranking disabled, and a first-stage prefetch of 30.
 
-### Effective config (pinned from the cluster's `akb-app-config`)
+**The bundled Compose recipe is archival and unsupported with the current
+backend.** It builds the current checkout but retains HS256-era configuration;
+it lacks the current RS256 signing key setup and explicit storage initialization.
+No immutable backend image or complete historical revision is pinned here, so
+these files alone cannot reproduce the published scores. Do not use this
+recipe as an installation guide or infer current performance from those scores.
+The local-only example credentials are not suitable for a shared deployment.
 
-| Setting | Value | Note |
-|---|---|---|
-| `vector_store_driver` | `pgvector` | same PG instance, separate `vector_index` schema; visibility lag = 0 |
-| `vector_store_sparse_shape` | `posting` | production-recommended |
-| `embed_model` / `embed_dimensions` | `baai/bge-m3` / `1024` | multilingual, within pgvector HNSW 2000-dim limit |
-| `embed_base_url` | `https://openrouter.ai/api/v1` | |
-| `rerank_enabled` / `rerank_model` | `false` / `cohere/rerank-v3.5` | rerank-off ablation, model config retained for toggles |
-| `rerank_base_url` | `https://openrouter.ai/api/v1` | explicit — see [run #3](#known-issues) |
-| `rerank_prefetch` | `30` | RRF top-30 → rerank → top-K |
-| `search_prefetch` | `30` | rerank-off first-stage dedup pool, mirrors gbrain-style candidate headroom |
-| `bm25_k1` / `bm25_b` | `1.5` / `0.75` | standard Lucene values |
-
-`config/app.yaml` is committed because it's part of the benchmark
-definition.  Anything sensitive lives in `config/secret.yaml`
-(gitignored).
-
-### Secrets
-
-Copy `config/secret.yaml.example` → `config/secret.yaml` and fill in:
-
-```yaml
-db_password: akb                            # matches docker-compose hardcoded value
-jwt_secret: <local-only dev string>
-embed_api_key: ${OPENROUTER_API_KEY}        # bge-m3 embedding
-llm_api_key:   ${OPENROUTER_API_KEY}        # SAME key — rerank fallback target
-rerank_api_key: ""                          # leave blank; rerank_service falls back to llm_api_key
-```
-
-**One OpenRouter key is enough.** [rerank_service.py:56](../../backend/app/services/rerank_service.py:56)
-resolves the rerank URL from `rerank_base_url or llm_base_url` and the key
-from `rerank_api_key or llm_api_key`.  OpenRouter routes `/v1/rerank`
-calls to `cohere/rerank-v3.5` — verified live against the cluster's
-backend pod.  Putting a Cohere key under `rerank_api_key` would send a
-Cohere credential to the OpenRouter URL → 401 → backend silently falls
-back to RRF-only output, making the `akb-hybrid+rerank` label a lie.
-
----
-
-## Setup and smoke test
+For a current installation, use the [Native quickstart](../../README.md#quick-start)
+and [installation guide](../../docs/operations/native-installation.md), including
+key generation and installation identity preparation. Verify that deployment:
 
 ```bash
-cd eval/longmemeval
-cp config/secret.yaml.example config/secret.yaml
-# edit config/secret.yaml — fill embed_api_key and llm_api_key with the same OpenRouter key
-docker compose up -d --build                  # first run takes a few minutes for backend build
-curl http://localhost:18000/livez             # {"status":"alive"}
-curl http://localhost:18000/readyz            # {"status":"ready", ...}
-
-cd ../..
-python3 eval/longmemeval/run.py \
-  --dataset ~/datasets/longmemeval/longmemeval_s.json \
-  --ndjson eval/reports/smoke.ndjson \
-  --limit 5
+curl --fail http://localhost:8000/livez
+curl --fail http://localhost:8000/readyz
 ```
 
-Expected smoke output (current baseline): 5/5 OK, ~4 hits, R@5 ≈ 80%,
-~45s per question of indexing wait.
+These checks verify service availability, not benchmark correctness. Before
+porting `run.py` to a current installation, validate its auth, ingestion, indexing
+wait, and cleanup contracts against the selected backend. Run only in a disposable
+instance: it creates and deletes accounts and per-question vaults. Record the
+backend revision, effective configuration, dataset revision, embedding model, and
+provider settings alongside any new results. Never commit provider credentials.
 
-### Reset between full runs
-
-```bash
-cd eval/longmemeval
-docker compose down -v
-docker compose up -d
-```
+The historical runner options and pseudocode below document the original
+experiment; they are not a claim of compatibility with today's API.
 
 ---
 
@@ -203,7 +161,7 @@ docker compose up -d
 
 ### Adapter scope
 
-The current wired adapter is `akb-hybrid`: dense + BM25 with rerank off,
+The retained adapter is `akb-hybrid`: dense + BM25 with rerank off,
 embedding fixed, and `search_prefetch` widened so source-level dedup sees
 the same kind of candidate headroom that gbrain's no-rerank path uses.
 
@@ -368,22 +326,20 @@ for all 500 questions.
 
 ---
 
-## Known issues
+## Historical runner limitations
 
 1. **`SearchResult.path` round-trip stability.** Backend `_slugify`
-   currently lowercases and appends `.md`.  If that normalization
+   lowercased and appended `.md` in the original run.  If that normalization
    changes, ground-truth matching breaks silently.  Worth a single
    PUT→GET sanity check before each round.
 2. **HF deprecated label on the dataset.** Raw file is still served,
    but if HF removes it, the `curl` command breaks.  Save a local
    SHA256 of the downloaded JSON for reproducibility.
 
-Two backend gaps surfaced while building this runner are tracked outside
-this benchmark: `rerank_service` should fail fast at startup when both
-`rerank_base_url` and `llm_base_url` are blank (it currently raises a
-per-query `RerankError` instead), and `backend/app/db/init.sql` omits
-`CREATE EXTENSION IF NOT EXISTS vector` — worked around here via
-`postgres-init/01-pgvector.sql`.
+The historical stack installed pgvector through `postgres-init/01-pgvector.sql`
+and configured an explicit reranker URL. These are experiment-era choices,
+not a current backend defect list. Check the selected revision's bootstrap
+and validation behavior before reusing them.
 
 ---
 
@@ -410,8 +366,8 @@ per-query `RerankError` instead), and `backend/app/db/init.sql` omits
 - LongMemEval paper + eval code: https://github.com/xiaowu0162/LongMemEval
 - AKB internal regression harness (small, different purpose): `backend/tests/eval/`
 - Cluster effective config: `kubectl -n akb get configmap akb-app-config -o yaml`
-- AKB config loader (justifies "yaml only, no env vars"): [backend/app/config.py:12](../../backend/app/config.py:12)
-- SearchResult schema (path-based mapping rationale): [backend/app/models/document.py:137](../../backend/app/models/document.py:137)
-- Vault-scoped health endpoint: [backend/app/main.py:207](../../backend/app/main.py:207)
-- Vault name regex: [backend/app/services/document_service.py:845](../../backend/app/services/document_service.py:845)
-- rerank dispatch: [backend/app/services/rerank_service.py:56](../../backend/app/services/rerank_service.py:56)
+- AKB config loader (application YAML settings; deployment overrides are documented separately): [backend/app/config.py](../../backend/app/config.py)
+- SearchResult schema (path-based mapping rationale): [backend/app/models/document.py](../../backend/app/models/document.py)
+- Vault-scoped health endpoint: [backend/app/main.py](../../backend/app/main.py)
+- Vault name regex: [backend/app/services/document_service.py](../../backend/app/services/document_service.py)
+- rerank dispatch: [backend/app/services/rerank_service.py](../../backend/app/services/rerank_service.py)

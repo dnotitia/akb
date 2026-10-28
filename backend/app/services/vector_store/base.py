@@ -316,8 +316,8 @@ class VectorStore(Protocol):
           caller's `vault_path_eligible` gate is False for them) and keep
           filtering by `source_ids`. The caller sends EXACTLY ONE of the two,
           never both — capable drivers assert this.
-        - `source_types` is an orthogonal resource-kind filter (workbench
-          #1069): the caller passes the active Document arm (e.g. exactly one
+        - `source_types` is an orthogonal resource-kind filter: the caller
+          passes the active Document arm (e.g. exactly one
           of `document` / `native_document`) so stale points from the other arm
           can never consume the top-K before hydration drops them. It ANDs
           with whichever of `vault_ids` / `source_ids` is present. `None`

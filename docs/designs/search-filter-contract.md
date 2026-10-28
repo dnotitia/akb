@@ -167,7 +167,7 @@ AKB_FRONTEND_URL=http://127.0.0.1:4176 pnpm exec playwright test search-contract
 These browser tests exercise HTTP request serialization, filter selection, reload,
 history, viewport overflow, and light/dark rendering. They do not prove real login,
 database SQL execution, or indexing. Use the isolated runtime documented in
-`backend/scripts/ci/README.md` for live-backend verification; never point fixture
+[`scripts/ci/README.md`](../../scripts/ci/README.md) for live-backend verification; never point fixture
 tests at a production endpoint.
 
 Live HTTP/DB scenario, against an isolated local runtime:

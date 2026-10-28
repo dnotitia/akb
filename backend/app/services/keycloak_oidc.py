@@ -242,6 +242,7 @@ class KeycloakOIDC:
         *,
         provider_alias: str,
         allowed_provider_aliases: list[str] | None = None,
+        login_challenge_id: str | None = None,
     ) -> BrowserAuthorizationRequest:
         """Build the ordinary AKB browser's nonce+PKCE authorization request.
 
@@ -265,6 +266,8 @@ class KeycloakOIDC:
             "browser_binding_hash": hashlib.sha256(browser_binding.encode("ascii")).hexdigest(),
             "login_sequence": str(login_sequence),
         }
+        if login_challenge_id is not None:
+            payload["login_challenge_id"] = login_challenge_id
         if allowed_provider_aliases is not None:
             payload["allowed_provider_aliases"] = list(
                 browser_login_provider_aliases(provider_alias, allowed_provider_aliases)

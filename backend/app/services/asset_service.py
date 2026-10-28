@@ -23,6 +23,7 @@ from app.repositories.vault_files_repo import DocumentAssetOwner
 from app.repositories.vault_repo import lock_vault_for_child_write
 from app.services.adapters import s3_adapter
 from app.services.m1_file_measurement import measurement_enabled
+from app.services.image_decode import run_bounded_decode
 from app.services.s3_delete_worker import enqueue_delete
 from app.services.uri_service import file_uri
 
@@ -314,15 +315,7 @@ async def create_image_asset(
     # Cancelling ``to_thread`` does not stop Pillow. Shield and settle the real
     # decoder task before returning so the route-level admission slot remains
     # an actual concurrency bound even when clients disconnect repeatedly.
-    inspect_task = asyncio.create_task(
-        asyncio.to_thread(inspect_image, body),
-        name="document-image-inspect",
-    )
-    try:
-        actual_mime, width, height = await asyncio.shield(inspect_task)
-    except BaseException:
-        await _settle_must_complete_task(inspect_task)
-        raise
+    actual_mime, width, height = await run_bounded_decode(inspect_image, body)
     claimed = declared_mime.split(";", 1)[0].strip().lower()
     if claimed not in _ALLOWED_MIMES or claimed != actual_mime:
         raise AKBError("Image content does not match its declared MIME type", status_code=415)
@@ -482,7 +475,7 @@ async def copy_file_to_attachment(
 
     if len(body) != size:
         raise AKBError("File content is temporarily unavailable", status_code=502)
-    actual_mime, _width, _height = await asyncio.to_thread(inspect_image, body)
+    actual_mime, _width, _height = await run_bounded_decode(inspect_image, body)
     attachment = await create_image_asset(
         vault_id=vault_id,
         vault_name=vault_name,

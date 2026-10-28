@@ -15,7 +15,7 @@ import logging
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import NoReturn
+from typing import Any, NoReturn
 from app.services.role_authority import role_authority_transaction
 from app.services.search_filters import ArchiveScope
 
@@ -326,10 +326,17 @@ class NativeDocumentService(DocumentService):
 
     async def _legacy_projection_rows(
         self, vault_id: uuid.UUID, resource_ids: list[uuid.UUID],
+        *, conn: asyncpg.Connection | None = None,
     ) -> dict[uuid.UUID, dict]:
         """Batch form of the ``_document_frontmatter`` legacy read."""
         if not resource_ids:
             return {}
+        if conn is not None:
+            rows = await conn.fetch(
+                "SELECT id, title, doc_type, status, summary, domain, created_by, created_at, updated_at, tags "
+                "FROM documents WHERE vault_id = $1 AND id = ANY($2::uuid[])", vault_id, resource_ids,
+            )
+            return {row["id"]: dict(row) for row in rows}
         pool = await self._pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -1323,6 +1330,8 @@ class NativeDocumentService(DocumentService):
         max_depth: int,
         include_hashes: bool,
         include_archived: bool,
+        resource_ids: list[uuid.UUID] | None = None,
+        conn: asyncpg.Connection | None = None,
     ) -> list[BrowseItem]:
         """Read current Native document Heads for the public browse view.
 
@@ -1333,11 +1342,17 @@ class NativeDocumentService(DocumentService):
         """
         depth_offset = prefix.count("/") + 1 if prefix else 0
         native = await self._native()
+        bounded: dict[str, Any] = {}
+        if resource_ids is not None:
+            bounded["resource_ids"] = resource_ids
+        if conn is not None:
+            bounded["conn"] = conn
         snapshots = await native.list_live_head_snapshots(
             namespace_id=vault_id,
             surface="document",
             path_like=like_escape(prefix) + "/%" if prefix else None,
             max_slashes=max_depth + depth_offset if max_depth >= 0 else None,
+            **bounded,
         )
         # Parsing every body is CPU-bound; keep it off the event loop.
         parsed = await asyncio.to_thread(lambda: [_parse_markdown(s.text) for s in snapshots])
@@ -1345,7 +1360,7 @@ class NativeDocumentService(DocumentService):
             snapshot.resource_id
             for snapshot, (frontmatter, _) in zip(snapshots, parsed, strict=True)
             if not self._has_complete_native_frontmatter(frontmatter)
-        ])
+        ], **({"conn": conn} if conn is not None else {}))
         items: list[BrowseItem] = []
         for snapshot, (frontmatter, body) in zip(snapshots, parsed, strict=True):
             if snapshot.resource_id in legacy:
@@ -1465,9 +1480,22 @@ class NativeDocumentService(DocumentService):
         include_hashes: bool = False,
         include_archived: bool = False,
         archive_scope: ArchiveScope | None = None,
+        page_size: int | None = None,
+        cursor: str | None = None,
+        name_query: str | None = None,
     ) -> BrowseResponse:
         """Return the legacy browse envelope with Native document Heads."""
         from app.services.search_filters import resolve_archive_scope, status_matches
+
+        if page_size is not None or cursor is not None or name_query is not None or content_type in ("collections", "resources"):
+            from app.services.browse_pages import browse_page
+
+            return await browse_page(
+                self, await self._pool(), vault, native=True, collection=collection, depth=depth,
+                content_type=content_type, include_hashes=include_hashes,
+                include_archived=include_archived, archive_scope=archive_scope,
+                page_size=page_size if page_size is not None else 100, cursor=cursor, name_query=name_query,
+            )
 
         scope = resolve_archive_scope(archive_scope, include_archived)
         include_archived = scope != "unarchived"

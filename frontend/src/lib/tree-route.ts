@@ -163,6 +163,8 @@ export function filterTreeByKind(
 }
 
 interface FlattenVisibleOptions {
+  /** Paged explorers already bound their input and can reveal all loaded leaves. */
+  previewSize?: number;
   /** Groups are open by default. Keys in this set are explicitly collapsed. */
   collapsedKindGroups?: ReadonlySet<string>;
   /** Per-group visible leaf limits; absent groups use RESOURCE_PREVIEW_SIZE. */
@@ -243,7 +245,7 @@ export function flattenVisible(
       if (!isOpen) continue;
 
       const previewCount = Math.min(
-        Math.max(limits.get(key) ?? RESOURCE_PREVIEW_SIZE, RESOURCE_PREVIEW_SIZE),
+        Math.max(limits.get(key) ?? options.previewSize ?? RESOURCE_PREVIEW_SIZE, RESOURCE_PREVIEW_SIZE),
         kindLeaves.length,
       );
       const visibleLeaves = kindLeaves.slice(0, previewCount);

@@ -1,6 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Box, FileText, Paperclip, Table2, type LucideIcon } from "lucide-react";
-import { getWorkspaceSummary, validCount, WorkspaceSummaryAccessDenied, type WorkspaceCountField } from "@/lib/workspace-summary";
+import { getWorkspaceSummary, validCount, WorkspaceSummaryAccessDenied, type WorkspaceCountField, type WorkspaceSummary } from "@/lib/workspace-summary";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 
@@ -18,16 +18,27 @@ export function HomeWorkspaceSummary({ userId, accessKey, accessChecking, vaultC
   vaultCount: number | undefined;
   directoryLoading: boolean;
 }) {
+  const queryClient = useQueryClient();
   const verified = !!userId && !accessChecking;
   const directoryVerified = verified && validCount(vaultCount) && !directoryLoading;
   const query = useQuery({
     queryKey: ["workspace-summary", userId, accessKey],
-    queryFn: async ({ signal }) => {
+    queryFn: async ({ signal }): Promise<WorkspaceSummary | null> => {
       // Let immediate observer cleanup (including StrictMode's mount probe)
       // abort before sending an otherwise redundant authenticated request.
       await Promise.resolve();
       signal.throwIfAborted();
-      return getWorkspaceSummary(signal);
+      try {
+        return await getWorkspaceSummary(signal);
+      } catch (error) {
+        if (!signal.aborted && error instanceof WorkspaceSummaryAccessDenied) {
+          // Remove revoked totals from the cache, not just this render. The
+          // null tombstone also blocks directory fallback through later 503s
+          // and remounts until an authorized request returns fresh totals.
+          queryClient.setQueryData<WorkspaceSummary | null>(["workspace-summary", userId, accessKey], null);
+        }
+        throw error;
+      }
     },
     enabled: verified,
     retry: false,
@@ -42,8 +53,9 @@ export function HomeWorkspaceSummary({ userId, accessKey, accessChecking, vaultC
     refetchOnReconnect: "always",
   });
   const requestPending = accessChecking || (verified && (query.isPending || query.fetchStatus !== "idle"));
-  const snapshot = verified && query.isSuccess ? query.data : undefined;
-  const totalVaults = snapshot?.vault_count ?? (directoryVerified && !(query.error instanceof WorkspaceSummaryAccessDenied) ? vaultCount : undefined);
+  const denied = query.data === null || query.error instanceof WorkspaceSummaryAccessDenied;
+  const snapshot = verified && !denied ? query.data : undefined;
+  const totalVaults = snapshot?.vault_count ?? (directoryVerified && !denied ? vaultCount : undefined);
   const shown = totalVaults === 0 ? metrics.slice(0, 1) : metrics;
   const values = { ...snapshot, vault_count: totalVaults };
   const isLoading = (field: WorkspaceCountField) => !validCount(values[field]) &&
@@ -67,10 +79,11 @@ export function HomeWorkspaceSummary({ userId, accessKey, accessChecking, vaultC
     </div>)}
   </dl>;
 
-  return <section aria-label="Workspace summary" className="mb-6 space-y-3">
+  return <section aria-label="Workspace summary" aria-busy={query.isFetching || accessChecking} className="mb-6 space-y-3">
     <span className="sr-only">Resources in vaults you can access.</span>
     {loading && <span role="status" aria-live="polite" aria-label="Loading workspace totals" className="sr-only">Loading workspace totals</span>}
     {summary}
-    {unavailable && <p className="text-xs text-foreground-muted" title="Complete workspace totals are unavailable. You can still open your vaults and documents.">Totals unavailable{query.isError && verified && <Button variant="link" size="sm" onClick={() => void query.refetch()}>Retry totals</Button>}</p>}
+    {snapshot && query.isError && <p className="text-xs text-foreground-muted">Totals could not be updated; previous totals shown.<Button variant="link" size="sm" loading={query.isFetching} onClick={() => void query.refetch()}>Retry totals</Button></p>}
+    {unavailable && !(snapshot && query.isError) && <p className="text-xs text-foreground-muted" title="Complete workspace totals are unavailable. You can still open your vaults and documents.">Totals unavailable{query.isError && verified && <Button variant="link" size="sm" onClick={() => void query.refetch()}>Retry totals</Button>}</p>}
   </section>;
 }

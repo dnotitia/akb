@@ -695,7 +695,7 @@ async def test_head_body_query_rejects_aggregate_before_materializing_bodies(
     conn = _Conn(_row(), aggregate=aggregate)
     service = M1NativeGrepService(_Pool(conn))
 
-    with pytest.raises(ValidationError, match=message):
+    with pytest.raises(ValidationError, match=message) as caught:
         await service._head_bodies(
             user_id=uuid.uuid4(),
             vaults=None,
@@ -706,6 +706,10 @@ async def test_head_body_query_rejects_aggregate_before_materializing_bodies(
 
     assert conn.body_fetches == 0
     assert "canonical_bytes" not in conn.aggregate_sql
+    assert caught.value.status_code == 422
+    assert caught.value.code == "grep_scope_too_large"
+    assert "collection" in caught.value.hint
+    assert "result limit does not reduce" in caught.value.message
 
 
 def test_public_surface_selection_keeps_w3a_document_only_and_guards_w3b():
@@ -1046,3 +1050,36 @@ async def test_missing_payload_cannot_turn_nonempty_scope_into_success():
             resource_id=None, surfaces=("document",),
         )
     assert error.value.code == "grep_payload_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_file_catalogue_ceiling_has_actionable_scope_error():
+    from unittest.mock import AsyncMock
+
+    conn = AsyncMock()
+    conn.fetchval.return_value = False
+    conn.fetch.return_value = [{}] * (native_grep.NATIVE_GREP_MAX_RESOURCES + 1)
+    service = M1NativeGrepService(object())
+    with pytest.raises(ValidationError) as caught:
+        await service._verify_file_scope(
+            conn, user_id=uuid.uuid4(), vaults=["engineering"],
+            collection=None, resource_id=None,
+        )
+    assert caught.value.status_code == 422
+    assert caught.value.code == "grep_scope_too_large"
+    assert "collection" in caught.value.hint
+    assert "result limit does not reduce" in caught.value.message
+
+
+@pytest.mark.asyncio
+async def test_post_hydration_byte_guard_has_actionable_scope_error(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    service = M1NativeGrepService(object())
+    monkeypatch.setattr(service, "_head_bodies", AsyncMock(return_value=[_grep_body(text="needle")]))
+    monkeypatch.setattr(native_grep, "NATIVE_GREP_MAX_SEARCH_BYTES", 1)
+    with pytest.raises(ValidationError) as caught:
+        await service.grep("needle", user_id=uuid.uuid4(), include_text_files=True)
+    assert caught.value.status_code == 422
+    assert caught.value.code == "grep_scope_too_large"
+    assert "collection" in caught.value.hint

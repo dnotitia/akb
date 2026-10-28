@@ -7,10 +7,8 @@ access to a private upstream.
 
 ## Source
 
-- Upstream:  `github.com/dn-inc/SeahorseDB` (private), branch
-  `SDDEV-244/monorepo-coral-sparse`
+- Upstream: SeahorseDB (private source; the vendored files are sufficient to build AKB)
 - Vendored at commit:  `e1364f27158a0df69b8f528c3f701635f777fdaf`
-  (`[SDDEV-244] ci: fix seahorse smoke deploy`)
 - Files copied from:  `coral/proto/coral/**/v1/*.proto`
 
 ## Regenerate after an upstream proto bump
@@ -22,8 +20,7 @@ pass so they stay in lockstep with what Coral actually serves.
 
 ```bash
 # 1. update source — point at the SeahorseDB checkout you want to
-#    track. (For dn-inc engineers: the same monorepo branch the
-#    Coral image was built from.)
+#    track. Use a revision compatible with the target Coral service.
 SEAHORSE_REPO=/path/to/SeahorseDB
 
 # 2. refresh the vendored .proto tree

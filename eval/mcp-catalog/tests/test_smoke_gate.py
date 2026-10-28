@@ -9,9 +9,10 @@ import pytest
 
 import mcp_catalog.runner as runner_module
 from mcp_catalog.contracts import load_run_manifest, load_task_corpus
-from mcp_catalog.execution import BudgetExceeded, BudgetLedger, TrialOutcome
+from mcp_catalog.execution import BudgetExceeded, BudgetLedger, ToolCallRecord, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunner, RuntimeContractError
 from mcp_catalog.runtime import RuntimeDescriptor
+from paired_artifact_factory import provider_registry_snapshot
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
@@ -37,6 +38,12 @@ class _SmokeFixture:
         self.reset_calls += 1
 
 
+def _runner(manifest, tasks, descriptor, **kwargs) -> BenchmarkRunner:
+    runner = BenchmarkRunner(manifest, tasks, descriptor, **kwargs)
+    runner.provider_registry = provider_registry_snapshot(manifest)
+    return runner
+
+
 def _smoke_outcome(
     task,
     model_spec,
@@ -49,12 +56,23 @@ def _smoke_outcome(
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
+        locale=task.locale,
         arm="baseline",
         model_class=model_spec.class_name,
         model_id=model_id or model_spec.model_id,
         transport=transport,
         final_answer_text="OK",
+        tool_calls=[
+            ToolCallRecord(
+                order=1,
+                tool_name="fixture_tool",
+                logical_operation="search",
+                transport_succeeded=True,
+                server_succeeded=True,
+            )
+        ] if successful_mcp_tool_calls else [],
         successful_mcp_tool_calls=successful_mcp_tool_calls,
+        first_logical_operation="search" if successful_mcp_tool_calls else "none",
         follow_up_terminal_response=follow_up_terminal_response,
         input_tokens=10,
         output_tokens=2,
@@ -75,6 +93,28 @@ def _smoke_outcome(
         cost_source="provider_response",
         routing_observed=True,
         routing_valid=True,
+        state_available_before=True,
+        state_available_after=True,
+        state_before={},
+        state_after={},
+        state_observations_before=[
+            {
+                "available": True,
+                "status_code": item.resolved_before_expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
+        state_observations_after=[
+            {
+                "available": True,
+                "status_code": item.probe.expected_status,
+                "payload": {},
+                "error": None,
+            }
+            for item in task.expected_final_state.observation_sets
+        ],
     )
 
 
@@ -89,7 +129,7 @@ def _parallel_descriptor() -> RuntimeDescriptor:
 async def test_smoke_gate_executes_all_model_transport_cells(monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     fixture = _SmokeFixture()
     calls: list[tuple[str, str]] = []
 
@@ -131,7 +171,7 @@ async def test_smoke_gate_rejects_outcome_for_a_different_requested_model(
 ) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def mismatched_smoke(task, *, model_spec, transport, **_kwargs):
@@ -158,7 +198,7 @@ async def test_smoke_gate_requires_provider_evidence_for_each_model_request(
 ) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def missing_terminal_request_evidence(task, *, model_spec, transport, **_kwargs):
@@ -189,7 +229,7 @@ async def test_smoke_gate_rejects_response_without_positive_usage_and_cost(
 ) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def incomplete_usage_smoke(task, *, model_spec, transport, **_kwargs):
@@ -212,7 +252,7 @@ async def test_smoke_gate_rejects_response_without_positive_usage_and_cost(
 async def test_smoke_gate_blocks_when_cell_has_no_successful_mcp_call(monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = load_run_manifest(ROOT / "config" / "run.json")
     tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
-    runner = BenchmarkRunner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()))
     monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
 
     async def failed_smoke(task, *, model_spec, transport, **_kwargs):
@@ -252,7 +292,7 @@ async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_
         for transport in manifest.transports
     ]
 
-    first_runner = BenchmarkRunner(
+    first_runner = _runner(
         manifest,
         tasks,
         _parallel_descriptor(),
@@ -355,7 +395,7 @@ async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_
     assert first_store.document.reserved_cost_usd == 0
     assert first_ledger.reserved_cost_usd == Decimal("0")
 
-    resumed_runner = BenchmarkRunner(
+    resumed_runner = _runner(
         manifest,
         tasks,
         _parallel_descriptor(),

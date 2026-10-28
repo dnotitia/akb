@@ -102,4 +102,37 @@ describe("Vault content creation contracts", () => {
 
     expect(result.name).toBe("incidents");
   });
+
+  it.each(["transfer", "confirm", "lost-response"])(
+    "does not delete a File after %s failure",
+    async (failure) => {
+      const fileId = "4f9d5609-c6c7-4b62-a8be-79308c18cb8d";
+      let deleted = false;
+      server.use(
+        http.post("*/api/v1/files/ops/upload", () => HttpResponse.json({
+          uri: `akb://ops/file/${fileId}`,
+          upload_url: "http://storage.test/upload/uncertain",
+        })),
+        http.put("http://storage.test/upload/uncertain", () =>
+          new HttpResponse(null, { status: failure === "transfer" ? 503 : 200 }),
+        ),
+        http.post(`*/api/v1/files/ops/${fileId}/confirm`, () =>
+          failure === "lost-response" ? HttpResponse.error() :
+            HttpResponse.json({ detail: "Confirmation failed" }, { status: 409 }),
+        ),
+        http.get(`*/api/v1/files/ops/${fileId}`, () =>
+          new HttpResponse(null, { status: 404 }),
+        ),
+        http.post(`*/api/v1/files/ops/${fileId}/cancel-upload`, () =>
+          HttpResponse.json({ cancelled: true, state: "cancelled" }),
+        ),
+        http.delete(`*/api/v1/files/ops/${fileId}`, () => {
+          deleted = true;
+          return HttpResponse.json({ deleted: true });
+        }),
+      );
+      await expect(uploadVaultFile("ops", new File(["bytes"], "runbook.pdf"))).rejects.toThrow();
+      expect(deleted).toBe(false);
+    },
+  );
 });

@@ -17,6 +17,15 @@ step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 # a prerequisite", which is the most expensive way for a gate to be wrong.
 step "preflight (analyzer parsers, node deps)"
 
+node --input-type=module -e '
+import { readFileSync } from "node:fs";
+const required = JSON.parse(readFileSync("frontend/package.json", "utf8")).engines.node;
+if (process.versions.node !== required) {
+  console.error(`Node.js ${required} is required for repository checks; found ${process.versions.node}`);
+  process.exit(1);
+}
+'
+
 PREFLIGHT_TMP="$(mktemp -d)"
 trap 'rm -rf "${PREFLIGHT_TMP}"' EXIT
 

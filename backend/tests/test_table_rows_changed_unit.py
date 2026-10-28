@@ -14,6 +14,12 @@ class _Conn:
     def __init__(self) -> None:
         self.executed: list[tuple[str, tuple[Any, ...]]] = []
 
+    async def fetchval(self, sql: str, user_id: uuid.UUID) -> bool:
+        # Actor propagation is tested using an active human administrator.
+        assert "FROM users WHERE id=$1 FOR SHARE" in sql
+        assert user_id == uuid.UUID("00000000-0000-0000-0000-000000000001")
+        return True
+
     async def execute(self, sql: str, *args: Any) -> str:
         self.executed.append((sql, args))
         return "OK"
@@ -66,7 +72,7 @@ async def test_user_sql_executor_accepts_actor_context() -> None:
     executor = UserSqlExecutor(_Pool())
 
     await executor.execute(
-        user_id="user-id",
+        user_id="00000000-0000-0000-0000-000000000001",
         actor_id="actor-name",
         sql="UPDATE vt_demo__orders SET value = 'next'",
         is_admin=True,

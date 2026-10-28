@@ -19,8 +19,9 @@ need two values:
   - `AKB_PAT` = sign up at <https://akb-demo.agent.seahorse.dnotitia.ai> with
     any email (a throwaway is fine) and create a token.
   - ⚠️ Public, weekly-wiped demo — don't store anything real or sensitive.
-- **Self-hosted:** run AKB (`docker compose up -d`, see the README quick
-  start), then create a PAT in the web UI or via
+- **Self-hosted:** follow the [Native quickstart](README.md#quick-start),
+  including persistent RS256 key generation, installation identity preparation,
+  and the Native Compose overlay. Then create a PAT in the web UI or via
   `POST /api/v1/auth/tokens`. Your `AKB_MCP_URL` is `https://<your-host>/mcp/`.
 
 ## MCP server configuration

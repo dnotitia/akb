@@ -11,6 +11,8 @@ import {
 import { parseUri } from "@/lib/uri";
 import { edgeFor, hrefFor, relationIsInVault } from "@/components/relations/relation-row-utils";
 import { Alert } from "@/components/ui/alert";
+import { LoadingState, InlineLoadingState } from "@/components/ui/loading-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -49,6 +51,9 @@ interface RelationsPanelProps {
   sourceUri: string;
   relations: RelationRow[];
   relationsError: boolean;
+  initialLoading?: boolean;
+  refreshing?: boolean;
+  hasSnapshot?: boolean;
   canWrite: boolean;
   graphHref: string;
   onReload: () => void;
@@ -59,6 +64,9 @@ export function RelationsPanel({
   sourceUri,
   relations,
   relationsError,
+  initialLoading = false,
+  refreshing = false,
+  hasSnapshot = true,
   canWrite,
   graphHref,
   onReload,
@@ -71,10 +79,10 @@ export function RelationsPanel({
   const visibleRelations = relations.filter((row) => relationIsInVault(row, vault));
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full flex-col" aria-busy={initialLoading || refreshing}>
       <div className="mb-2 flex items-center justify-between gap-2">
         <span className="coord">
-          {visibleRelations.length} relation{visibleRelations.length === 1 ? "" : "s"}
+          {hasSnapshot && !initialLoading ? `${visibleRelations.length} relation${visibleRelations.length === 1 ? "" : "s"}` : "Relations"}
         </span>
         {canWrite && (
           <Button variant="ghost" size="sm" onClick={() => setAddOpen(true)}>
@@ -84,9 +92,14 @@ export function RelationsPanel({
         )}
       </div>
 
-      {relationsError ? (
-        <Alert variant="destructive">Failed to load relations.</Alert>
-      ) : visibleRelations.length === 0 ? (
+      {refreshing && !initialLoading && <InlineLoadingState label="Updating relations" />}
+      {relationsError && <Alert variant="destructive">
+        {hasSnapshot ? "Relations could not be updated. Previous relations shown." : "Failed to load relations."}
+        <Button size="sm" variant="outline" loading={refreshing} onClick={onReload}>Retry relations</Button>
+      </Alert>}
+      {initialLoading ? <LoadingState label="Loading relations" className="space-y-2">
+        <Skeleton className="h-8 w-full" /><Skeleton className="h-8 w-full" /><Skeleton className="h-8 w-full" />
+      </LoadingState> : !hasSnapshot && relationsError ? null : visibleRelations.length === 0 ? (
         <div className="coord">No relations yet.</div>
       ) : (
         <ol className="space-y-0.5 font-mono text-[11px] leading-[1.9]">

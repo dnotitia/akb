@@ -1005,6 +1005,8 @@ class CollectionRepository:
         vault_id: uuid.UUID,
         path: str,
         conn=None,
+        *,
+        for_update: bool = False,
     ) -> list[dict]:
         """Return vault_files whose collection path equals `path` exactly
         or starts with `{path}/`. Covers the folder itself plus every
@@ -1013,7 +1015,12 @@ class CollectionRepository:
         Implementation joins `collections` on the new `collection_id`
         FK (migration 020). Pre-migration callers that relied on the
         legacy `vault_files.collection` TEXT column are not supported.
+        ``for_update`` is reserved for cascade deletion and requires the
+        caller's transaction. It locks current File rows, not just their
+        collections, before cleanup keys are selected.
         """
+        if for_update and conn is None:
+            raise ValueError("File row locks require the caller's transaction")
         bare = path.rstrip("/")
         like = self._like_escape(bare) + "/%"
         sql = (
@@ -1024,6 +1031,8 @@ class CollectionRepository:
             "   AND vf.kind = 'file' "
             "   AND (c.path = $2 OR c.path LIKE $3 ESCAPE '\\')"
         )
+        if for_update:
+            sql += " ORDER BY vf.id FOR UPDATE OF vf"
         async def _do(c):
             rows = await c.fetch(sql, vault_id, bare, like)
             return [dict(r) for r in rows]

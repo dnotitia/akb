@@ -407,6 +407,17 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "111_bm25_recompute_resume.py",  # durable BM25 recompute cursor + term accumulator (akb#616)
         "112_edges_resource_identity.py",  # anchor graph edges to native resource identity (akb#654/#655/#656)
         "113_bm25_vocab_epoch.py",  # term-id numbering epoch; writers refuse ids from an earlier one (akb#687)
+        "114_user_avatars.py",  # private account photo state/revisions and bounded writes
+        "115_legacy_adoption_history.py",  # retain adoption history without preventing Vault deletion
+        "116_publication_password_budgets.py",  # shared password-attempt accounting across API replicas
+        "117_native_recent_order.py",  # newest-first live document feed, without a catalog-wide sort
+        "118_table_page_order.py",  # default stable table pages use an ordered index, not a full-table sort
+        "121_sso_identity_operations.py",  # exact short-lived migration authority and provider ownership
+        "122_sso_management_targets.py",
+        "123_sso_callback_evidence.py",
+        "124_prepared_sso_targets.py",  # adopt an explicitly prepared target without replacing source history
+        "125_sso_operation_attempts.py",
+        "126_platform_service_bootstrap.py",  # permanent fixed-purpose service credential lineage
     ):
         if filename in applied:
             continue

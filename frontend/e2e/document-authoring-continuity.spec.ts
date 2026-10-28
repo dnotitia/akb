@@ -176,12 +176,12 @@ for (const presentation of ["page", "preview"]) test(`${presentation} returns to
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeFocused();
   await expect.poll(() => canvas.evaluate(element => element.scrollTop)).toBe(position);
-  await page.getByRole("tab", { name: "Raw", exact: true }).click();
-  await expect(page.getByRole("tab", { name: "Raw", exact: true })).toHaveAttribute("aria-selected", "true");
+  await page.getByRole("radio", { name: "Raw markdown", exact: true }).click();
+  await expect(page.getByRole("radio", { name: "Raw markdown", exact: true })).toBeChecked();
   await page.getByRole("button", { name: "Edit", exact: true }).click();
   await page.getByRole("textbox", { name: "Summary", exact: true }).fill("Updated summary");
   await page.getByRole("button", { name: "Save changes", exact: true }).click();
-  await expect(page.getByRole("tab", { name: "Raw", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("radio", { name: "Raw markdown", exact: true })).toBeChecked();
   await expect(page.getByTestId("document-preview-dialog")).toHaveCount(presentation === "preview" ? 1 : 0);
 });
 

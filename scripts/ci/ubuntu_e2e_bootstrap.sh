@@ -104,18 +104,30 @@ SYSCTL_VALUE=$("${SUDO[@]}" sysctl -n net.ipv4.tcp_mtu_probing) \
 "${SUDO[@]}" apt-get install -y curl ca-certificates \
   || die "curl/CA package installation failed"
 
-# The transport profiles execute the repository's real zero-dependency Node
-# consumer after this host layer completes.  Use the Ubuntu 24.04 archive
-# rather than an unpinned third-party installer so a clean VM gets the same
-# package-managed node/npm toolchain as the rest of its base image.
+# The archive's npm bootstraps the pinned Node runtime below. Never run the
+# transport consumer on the archive Node version, even without the frontend.
 "${SUDO[@]}" apt-get install -y nodejs npm \
   || die "Node.js/npm package installation failed"
 command -v node >/dev/null 2>&1 \
   || die "Node.js executable is unavailable after package installation"
 command -v npm >/dev/null 2>&1 \
   || die "npm executable is unavailable after package installation"
+FRONTEND_PACKAGE_JSON="$CHECKOUT/frontend/package.json"
+[ -f "$FRONTEND_PACKAGE_JSON" ] \
+  || die "frontend package.json is required for Node.js toolchain discovery"
+FRONTEND_NODE_VERSION=$(node -e \
+  'const fs=require("fs"); const p=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(p.engines?.node ?? "")' \
+  "$FRONTEND_PACKAGE_JSON") \
+  || die "Node.js version could not be read from frontend/package.json"
+[[ "$FRONTEND_NODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || die "frontend engines.node must declare a pinned Node.js version"
+"${SUDO[@]}" npm install --global --prefix /usr/local "node@$FRONTEND_NODE_VERSION" \
+  || die "Node.js toolchain installation failed"
+export PATH="/usr/local/bin:$PATH"
 NODE_VERSION=$(node --version) \
   || die "Node.js version check failed"
+[ "$NODE_VERSION" = "v$FRONTEND_NODE_VERSION" ] \
+  || die "Node.js version verification failed (expected $FRONTEND_NODE_VERSION, found $NODE_VERSION)"
 NPM_VERSION=$(npm --version) \
   || die "npm version check failed"
 echo "Node.js ${NODE_VERSION}, npm ${NPM_VERSION} ready" >&2
@@ -201,13 +213,6 @@ case "$PYTHON_VERSION" in
 esac
 
 if [ "$WITH_FRONTEND" -eq 1 ]; then
-  FRONTEND_PACKAGE_JSON="$CHECKOUT/frontend/package.json"
-  [ -f "$FRONTEND_PACKAGE_JSON" ] \
-    || die "frontend package.json is required for frontend toolchain discovery"
-  FRONTEND_NODE_VERSION=$(node -e \
-    'const fs=require("fs"); const p=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(p.engines?.node ?? "")' \
-    "$FRONTEND_PACKAGE_JSON") \
-    || die "frontend Node.js version could not be read from package.json"
   FRONTEND_PACKAGE_MANAGER=$(node -e \
     'const fs=require("fs"); const p=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(p.packageManager ?? "")' \
     "$FRONTEND_PACKAGE_JSON") \
@@ -216,19 +221,12 @@ if [ "$WITH_FRONTEND" -eq 1 ]; then
     pnpm@*) FRONTEND_PNPM_VERSION="${FRONTEND_PACKAGE_MANAGER#pnpm@}" ;;
     *) die "frontend packageManager must declare a pinned pnpm version" ;;
   esac
-  [ -n "$FRONTEND_NODE_VERSION" ] \
-    || die "frontend engines.node must declare a pinned Node.js version"
   [ -n "$FRONTEND_PNPM_VERSION" ] \
     || die "frontend packageManager must declare a pinned pnpm version"
 
   "${SUDO[@]}" npm install --global --prefix /usr/local \
-    "node@$FRONTEND_NODE_VERSION" "pnpm@$FRONTEND_PNPM_VERSION" \
-    || die "Node.js/pnpm frontend toolchain installation failed"
-  export PATH="/usr/local/bin:$PATH"
-  NODE_VERSION=$(node --version) \
-    || die "Node.js version check failed for the frontend runtime"
-  [ "$NODE_VERSION" = "v$FRONTEND_NODE_VERSION" ] \
-    || die "frontend Node.js version verification failed (expected $FRONTEND_NODE_VERSION, found $NODE_VERSION)"
+    "pnpm@$FRONTEND_PNPM_VERSION" \
+    || die "pnpm frontend toolchain installation failed"
 
   command -v pnpm >/dev/null 2>&1 \
     || die "pnpm is unavailable after frontend toolchain installation"

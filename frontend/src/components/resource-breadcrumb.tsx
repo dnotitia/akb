@@ -4,7 +4,7 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { File, FileText, MoreHorizontal, Table2 } from "lucide-react";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { VaultBreadcrumb } from "@/components/vault-breadcrumb";
-import { vaultTreeQueryOptions } from "@/hooks/use-vault-tree";
+import { browseVault } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import type { ResourceLocation } from "@/contexts/resource-location-context";
@@ -17,7 +17,10 @@ export function ResourceBreadcrumb({ location, className }: { location: Resource
   const user = useCurrentUser();
   const { checking, revision } = useAccessVerification();
   const directory = useQuery({
-    ...vaultTreeQueryOptions(user?.user_id, revision, location.vault),
+    queryKey: ["collection-ancestry", user?.user_id, revision, location.vault, location.collectionPath],
+    queryFn: () => browseVault(location.vault, location.collectionPath, 0, { content_type: "collections", page_size: 1 }),
+    staleTime: 30_000,
+    retry: false,
     enabled: !!user && !checking && !!location.collectionPath,
   });
   const collectionNames = new Map<string, string>();
@@ -25,6 +28,7 @@ export function ResourceBreadcrumb({ location, className }: { location: Resource
     for (const item of directory.data?.items ?? []) {
       if (item.type === "collection" && typeof item.name === "string") collectionNames.set(item.path, item.name);
     }
+    for (const item of directory.data?.context?.ancestry ?? []) collectionNames.set(item.path, item.name);
   }
   const vaultHref = `/vault/${encodeURIComponent(location.vault)}`;
   const segments = location.collectionPath?.split("/").filter(Boolean) ?? [];

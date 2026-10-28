@@ -421,9 +421,8 @@ async def test_confirm_replace_switches_metadata_only_after_locked_recheck(monke
     assert staging_key != old["s3_key"]
     assert final_key != old["s3_key"]
     assert final_key != staging_key
-    assert final_key.split("/")[-1].startswith(
-        "99999999888877776666555555555555_"
-    )
+    candidate_id = uuid.UUID(final_key.split("/")[-1].split("_", 1)[0])
+    assert candidate_id != uuid.UUID("99999999-8888-7777-6666-555555555555")
     assert replaced[0]["s3_key"] == final_key
     assert replaced[0]["content_hash"] == _NEW_HASH
     assert enqueued == [
@@ -526,6 +525,72 @@ async def test_confirm_replace_rejects_mismatched_uploaded_bytes(monkeypatch):
     assert set(deleted) == set(copied[0])
 
 
+@pytest.mark.parametrize("staging", ["missing", "tampered", "same"])
+async def test_repeated_confirmation_never_reuses_the_published_candidate(monkeypatch, staging):
+    service, _pool = await _service(monkeypatch)
+    current = _row()
+    rid = uuid.uuid4()
+    staging_key = fs._replacement_staging_key("team", current["id"], rid)
+    objects = {current["s3_key"]: _OLD_BYTES, staging_key: _NEW_BYTES}
+    copies: list[str] = []
+    deleted: list[str] = []
+
+    async def _find(*_args):
+        return dict(current)
+
+    async def _replace(_conn, _fid, **values):
+        current.update(values)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    def _copy(source, destination):
+        copies.append(destination)
+        if source not in objects:
+            raise RuntimeError("missing staging object")
+        objects[destination] = objects[source]
+        return {"ContentLength": len(objects[destination]), "ETag": '"etag-new"'}
+
+    def _delete(key):
+        deleted.append(key)
+        objects.pop(key, None)
+
+    monkeypatch.setattr(fs.vault_files_repo, "find_by_id", _find)
+    monkeypatch.setattr(fs.vault_files_repo, "find_by_id_for_update", _find)
+    monkeypatch.setattr(fs.vault_files_repo, "replace_confirmed_metadata", _replace)
+    for name in ("_enqueue_s3_delete", "_cancel_s3_delete", "emit_event", "index_file_metadata"):
+        monkeypatch.setattr(fs, name, _noop)
+    monkeypatch.setattr(fs.s3_adapter, "copy", _copy)
+    monkeypatch.setattr(fs.s3_adapter, "iter_chunks", lambda key: iter([objects[key]]))
+    monkeypatch.setattr(fs.s3_adapter, "delete", _delete)
+    kwargs = dict(actor_id="tester", content_hash=_NEW_HASH)
+    await service.confirm_replace("team", current["vault_id"], str(current["id"]), str(rid), **kwargs)
+    published = current["s3_key"]
+
+    if staging == "missing":
+        objects.pop(staging_key)
+        with pytest.raises(RuntimeError, match="missing staging"):
+            await service.confirm_replace(
+                "team", current["vault_id"], str(current["id"]), str(rid), **kwargs,
+            )
+    elif staging == "tampered":
+        objects[staging_key] = b"different bytes after successful confirmation"
+        with pytest.raises(ConflictError, match="hash mismatch"):
+            await service.confirm_replace(
+                "team", current["vault_id"], str(current["id"]), str(rid), **kwargs,
+            )
+    else:
+        replay = await service.confirm_replace(
+            "team", current["vault_id"], str(current["id"]), str(rid), **kwargs,
+        )
+        assert replay["unchanged"] is True
+
+    assert len(copies) == 2 and len(set(copies)) == 2
+    assert current["s3_key"] == published
+    assert objects[published] == _NEW_BYTES
+    assert published not in deleted
+
+
 async def test_confirm_replace_never_deletes_candidate_on_ambiguous_commit(monkeypatch):
     """A successful COMMIT can still surface a transport error to the caller.
 
@@ -592,9 +657,7 @@ async def test_confirm_replace_never_deletes_candidate_on_ambiguous_commit(monke
         )
 
     staging_key = fs._replacement_staging_key("team", old["id"], replacement_id)
-    final_key = fs._replacement_final_key(
-        "team", old["collection"], old["name"], replacement_id,
-    )
+    final_key = enqueued[0][0]
     assert staging_key in deleted
     assert final_key not in deleted
     assert (final_key, fs._REPLACEMENT_CANDIDATE_DELETE_DELAY) in enqueued

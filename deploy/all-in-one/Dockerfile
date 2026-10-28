@@ -28,7 +28,7 @@
 #       dnseahorse/akb
 
 # ---------- frontend build ----------
-FROM node:22-slim AS frontend-builder
+FROM node:22.23.4-slim AS frontend-builder
 
 WORKDIR /src
 COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./frontend/

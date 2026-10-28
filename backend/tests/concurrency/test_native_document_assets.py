@@ -407,3 +407,39 @@ async def test_repair_serializes_with_delete_without_resurrecting_refs(monkeypat
             if delete is not None:
                 await asyncio.wait_for(delete, 5)
         assert await _refs(pool, created.resource_id) == set()
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+async def test_default_repair_reports_missing_images_without_any_attachment_rows(monkeypatch, dry_run):
+    async with _fresh_database() as (pool, vault_id):
+        service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        await service.create_text(
+            **{**_create_args(vault_id), "payload": _body(uuid.uuid4())},
+            allow_unavailable_asset_refs=True,
+        )
+
+        async def fixture_pool():
+            return pool
+
+        monkeypatch.setattr(native_asset_ref_backfill, "get_pool", fixture_pool)
+        report = await native_asset_ref_backfill.backfill_native_asset_refs(dry_run=dry_run)
+        assert report.scanned == 1
+        assert report.unresolved == 1 and report.failed == 0
+        assert report.refs_written == report.refs_removed == 0
+
+
+async def test_repair_limit_reports_incomplete_and_rejects_nonpositive_limits(monkeypatch):
+    async with _fresh_database() as (pool, vault_id):
+        service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        for index in range(3):
+            await service.create_text(**{**_create_args(vault_id), "path": f"notes/{index}.md"})
+
+        async def fixture_pool():
+            return pool
+
+        monkeypatch.setattr(native_asset_ref_backfill, "get_pool", fixture_pool)
+        report = await native_asset_ref_backfill.backfill_native_asset_refs(limit=1)
+        assert report.scanned == 1 and not report.complete
+        for limit in (0, -1):
+            with pytest.raises(ValueError, match="positive integer"):
+                await native_asset_ref_backfill.backfill_native_asset_refs(limit=limit)

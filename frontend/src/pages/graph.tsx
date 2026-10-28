@@ -209,8 +209,8 @@ function GraphWorkspace({ vault, mode, setMode }: { vault: string; mode: GraphDi
       <div className="pointer-events-none absolute bottom-3 left-3 right-16 flex flex-wrap items-end gap-2 text-xs text-foreground-muted @min-[48rem]/graph:right-40">
         <details className="pointer-events-auto relative rounded-[var(--radius-sm)] border border-border bg-surface shadow-xs">
           <summary className="flex min-h-9 cursor-pointer list-none items-center gap-2 px-3 focus-visible:outline-2 focus-visible:outline-ring">
-            <Info className="h-3.5 w-3.5" aria-hidden /><span className="tabular-nums">{displayed.nodes.length} resources · {displayed.edges.length} relationships</span>
-            <span className="hidden @min-[40rem]/graph:inline">· {coverage.label}</span>
+            <Info className="h-3.5 w-3.5" aria-hidden /><span className="tabular-nums">{base ? `${displayed.nodes.length} resources · ${displayed.edges.length} relationships` : query.isFetching ? "Checking graph counts…" : "Graph counts unavailable"}</span>
+            <span className="hidden @min-[40rem]/graph:inline">· {base ? coverage.label : "Coverage unknown"}</span>
           </summary>
           <div className="absolute bottom-full left-0 mb-2 w-72 max-w-[80vw] rounded-[var(--radius-md)] border border-border bg-surface p-3 leading-relaxed shadow-md">{coverage.detail}</div>
         </details>

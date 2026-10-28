@@ -1,0 +1,55 @@
+{
+  "status": 200,
+  "payload": {
+    "kind": "table_schema",
+    "uri": "akb://catalog-bench-schema/table/events",
+    "vault": "catalog-bench-schema",
+    "collection": null,
+    "name": "events",
+    "table": "events",
+    "sql_name": "events",
+    "description": "",
+    "columns": [
+      {
+        "name": "event_id",
+        "type": "text",
+        "required": false,
+        "default": null,
+        "check": null,
+        "enum": null,
+        "unique": false,
+        "index": false,
+        "references": null,
+        "on_delete": null,
+        "pg_type": "text",
+        "drift": {
+          "missing": false,
+          "type_mismatch": false
+        }
+      }
+    ],
+    "unique_keys": [],
+    "indexes": [],
+    "pg_types": {
+      "created_at": "timestamp with time zone",
+      "created_by": "text",
+      "event_id": "text",
+      "id": "uuid",
+      "row_commit": "text",
+      "updated_at": "timestamp with time zone"
+    },
+    "system_columns": [
+      "created_at",
+      "created_by",
+      "id",
+      "row_commit",
+      "updated_at"
+    ],
+    "drift": {
+      "has_drift": false,
+      "missing_columns": [],
+      "extra_columns": [],
+      "type_mismatches": []
+    }
+  }
+}

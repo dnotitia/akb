@@ -8,9 +8,12 @@
   },
   "scripts": {
     "inspect": "node scripts/mcp-inspector-smoke.mjs",
-    "test": "node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs && node test/usage-log.test.mjs && node --test test/mcp-inspector-smoke.test.mjs"
+    "test": "node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs && node test/usage-log.test.mjs && node --test test/mcp-inspector-smoke.test.mjs test/packed-runtime.test.mjs"
   },
   "type": "module",
+  "engines": {
+    "node": "^22.23.4 || ^24.22.1 || ^26.12.1"
+  },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/inspector": "2.4.0"

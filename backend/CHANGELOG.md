@@ -7,6 +7,108 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- Add opt-in identity/Native-body-bounded Vault browse pages with scoped
+  keyset cursors and explicit completeness. The web explorer requests pages
+  rather than a full Vault, keeps prior rows on retry, and labels loaded-only
+  counts. Collection/kind narrowing is applied before paging; breadcrumbs use
+  a bounded ancestry lookup. Existing full-list callers remain supported.
+- Keep Native grep scan ceilings unchanged, but return an actionable
+  `grep_scope_too_large` error for protective scope rejections. Search and MCP
+  help distinguish candidate limits, returned previews, client byte budgets
+  and service failures. See the [large-Vault navigation guide](../docs/operations/large-vault-navigation.md).
+
+### Reliability
+
+- Return sanitized `503` dependency/timeout errors consistently over REST
+  and MCP, rather than invalid-SQL errors, generic HTTP 500s, or false zero Table
+  counts. Preserve connection-loss errors masked by asyncpg transaction cleanup.
+- Cancel and drain abandoned bodyless document, recent-feed and Table GET
+  requests. Keep writes, raw SQL, authentication callbacks and streams out of
+  automatic disconnect cancellation; no operation is automatically replayed.
+- Bound readiness DB initialization and ping together, preserve the successful
+  30-second readiness cache and soft vector-store check, and omit connection
+  details from public probe errors. See `docs/operations/database-recovery.md`.
+
+### Search
+
+- The bundled PostgreSQL image applies VChord-BM25's existing snapshot and SQL
+  prefilter to growing-segment candidates before they enter the finite top-k.
+  Invisible or out-of-scope rows no longer displace authorized results and
+  trigger avoidable exact scans of common-term postings. Zero-score and
+  below-threshold candidates still avoid heap checks. Exact completion,
+  operator prefilter opt-out, ranking, timeouts, and ACL enforcement remain
+  unchanged. Deploy the rebuilt PostgreSQL image to apply this fix; a backend
+  restart alone is insufficient. No index rebuild or data migration is needed.
+
+### Performance
+
+- Bound routine Table browsing to a page plus one row, with an explicit exact
+  count action and a schema-only catalog option. Existing counted API defaults
+  and row/ACL contracts are unchanged; unknown counts are no longer rendered
+  as zero in Table deletion warnings. A denied recount discards the previous
+  count snapshot so a later transient failure cannot restore denied metadata.
+- Index live document updates and the default stable Table page order, including
+  existing registered tables (migrations 117–118). This avoids catalog-wide
+  sorting and large-table sorts during ordinary navigation. Initial index builds
+  can block writes; schedule large upgrades accordingly.
+
+### Fixed
+
+- File replacement upload capabilities now write to their own staging object
+  instead of being mistaken for a confirmed-file replay. Obsolete original
+  upload capabilities are rejected after a replacement, and every confirmation
+  uses a fresh candidate so retries cannot overwrite or delete published bytes.
+- Ordinary upload confirmation now transitions only the inspected pending
+  reservation. Replays of confirmed Files return current metadata or a
+  non-destructive hash conflict, and browser upload failures no longer issue a
+  general File DELETE. Collection cascades lock current File rows before
+  enqueueing object cleanup, preventing a concurrent replacement from leaking
+  its newly published object.
+- The S3 delete worker periodically inventories the private replacement-staging
+  prefix, so an accepted upload completing after its original cleanup is
+  rediscovered. The existing outbox still performs deletion; no timeout or
+  upload-grant lifetime is increased. See
+  [file-storage cleanup](../docs/operations/file-storage-cleanup.md) for the
+  prefix-list permission and retention boundaries.
+
+- Password-protected publications now share their attempt budget across API
+  replicas and process restarts. PostgreSQL atomically reserves each attempt
+  before verification; per-IP and publication-wide backoff retain their
+  existing thresholds and quiet-hour decay. Manager/token access remains
+  available during anonymous lockout. Reservation failures return 503 rather
+  than silently disabling protection; failed refunds retain conservative state
+  without failing an already-verified view. State is bounded per publication
+  and removed with the publication. Migration 116 is required on every API;
+  the shared guarantee begins once all API replicas run this version. Manager
+  password requests also return 503 if reservations are unavailable; existing
+  valid publication tokens continue to bypass password accounting.
+
+- Apps can observe and resume their own rollout while its only installation
+  is installing, upgrading, or blocked. Authority is checked against that
+  job's live targets and current grants, including original request and resume replays;
+  unrelated active installations no longer confer access to old jobs.
+  New rollout requests, ordinary data and inventory access retain their active-only policy.
+
+- Deleting a Vault no longer fails after a legacy app adoption plan or apply.
+  Adoption plans and immutable audit evidence retain their original Vault and
+  installation UUIDs after deletion. New writes still validate live references;
+  stale plan replays return a conflict rather than recreating installations.
+  Target projections expose `vault_deleted`, and history authorization remains
+  bound to the original UUID even if a Vault name is reused.
+  Forward migration 115 preserves existing evidence without rewriting migration 077.
+
+- Native document provenance and graph orphan/name reads now use current,
+  verified Native Heads instead of requiring a legacy document mirror.
+  REST and MCP provenance share the same authorized, stable-identity lookup;
+  deleted documents are excluded and archived documents remain excluded
+  from orphan scans. Graph metadata is read in bounded pages on one
+  connection and snapshot, preserving migrated metadata and graph totals.
+
+- Table and Vault schema reads omit the optional `enum` field for
+  unconstrained columns instead of returning `null`, matching the published
+  OpenAPI response contract. Declared enum values, table data, constraints,
+  and drift reporting are unchanged.
+
 ### Documents
 
 - **Breaking:** whole-body document updates, including empty bodies and proxy
@@ -16,6 +118,19 @@ specifically; the proxy has its own log in
   malformed and normalized-away version tokens are rejected. REST, MCP,
   help and SDK types describe the same rules; MCP rejects invalid input
   without echoing the rejected body. See `docs/operations/document-write-preconditions.md`.
+
+## 0.17.0 — 2026-10-19
+
+### Accounts
+
+- Add private profile photos for human local and SSO browser sessions. Upload,
+  replace and remove a photo in Settings without changing SSO-managed identity
+  fields. Photos use authenticated self-only reads, revision conflict checks,
+  bounded image normalization and durable object cleanup. Migration 114 and
+  matching API/worker versions are required; see
+  [profile photo operations](../docs/operations/profile-photos.md).
+
+### Documents
 
 - Publish Native document image claims, current references and revision
   retention in the same transaction as the document Head. Concurrent saves,
@@ -36,6 +151,33 @@ specifically; the proxy has its own log in
   pinned; rejected callbacks return to the sign-in page instead of a JSON error.
   Upgrade all callback-serving API processes together before issuing the new
   workspace states; see the standalone SSO deployment guide (#768).
+
+### Identity and resource handling
+
+- Separate stable account handles and UUIDs from mutable profile display names,
+  including member selection, mentions and user-directory lookup (#738).
+- Improve file-upload recovery and idempotent retries, document metadata clearing,
+  and effective access reporting for public Vaults (#741).
+
+### Bundled web application
+
+- Reorganize workspace navigation, reading and editing flows, Settings, Vault
+  management and accessible resource dialogs while preserving user state (#741).
+- Center Search on its query and results, with compact filters and clearly
+  separated recent searches, recently viewed items and suggestions (#772).
+- Simplify the notifications dropdown and align document images (#770).
+
+### Upgrade notes
+
+- Apply additive migration 114 and replace the deletion worker before enabling
+  the new API's photo writes; do not run an older deletion worker against live
+  account photos. Retain photo-aware cleanup and the new tables during rollback.
+- Replace all callback-serving API processes together, using Recreate or a
+  drained fleet switch. Old callback readers reject the new workspace states.
+  Keep the existing SSO session generation, epoch and Native installation
+  identity for this ordinary image upgrade.
+- Update the bundled frontend after the backend. The CI fixture/reset changes
+  in #739 do not require a production data reset or search-index rebuild.
 
 ## 0.16.2 — 2026-10-13
 
@@ -2386,7 +2528,7 @@ and all three `hybrid_search` legs via a shared `_qdrant_errors` async context
 manager. A `TypeError`/`ValueError` (a programming bug — e.g. a bad `qm.*`
 argument) is re-raised unmasked rather than mislabelled as an outage; the
 previously over-broad `ensure_collection` catch is narrowed the same way.
-qdrant-only and pre-existing (production runs pgvector). New driver unit tests +
+qdrant-only and pre-existing. New driver unit tests +
 a live connection-failure check confirm the conversion.
 
 ## 0.8.14 — 2026-06-17  *(feature — vault filter extended to qdrant + seahorse)*
@@ -2548,7 +2690,7 @@ New optional setting **`keycloak_post_login_allowed_origins`** (list, default em
 - **Re-validated at delivery.** The origin is checked at `begin_login` *and* again in the callback, so a config change during the ≤10-min flow window can only ever tighten where the code goes; flow-state values are never trusted blindly.
 - No new trust in the companion: it still stores no Keycloak client/secret/realm — identity stays owned by AKB.
 
-This is the AKB-side counterpart to the reef SSO-delegation work (reef-test REEF-102 / REEF-112) and supersedes the "point `keycloak_post_login_path` at the companion's absolute URL" workaround, which could satisfy only one origin per instance.
+This supersedes the "point `keycloak_post_login_path` at the companion's absolute URL" workaround, which could satisfy only one origin per instance.
 
 `backend/app/api/routes/auth.py` gains `_normalize_origin` / `_allowed_companion_origin` / `_with_query_param` / `_post_login_target`; `keycloak_login` and `keycloak_callback` route through them. `backend/app/config.py` adds the setting (default empty). `config/app.yaml.example` and `docs/designs/keycloak-oidc/00-overview.md` document it.
 
@@ -2668,9 +2810,10 @@ The "SeahorseDB has no PK-aware upsert" caveat is real and now appears in the pe
 - `backend/app/services/vector_store/pgvector.py`, `qdrant.py`, `seahorse_cloud.py`, `seahorse_db_grpc.py` — fallback `upsert_batch` delegating to `loop_upsert_batch`.
 - `backend/scripts/migrate_pgvector_to_seahorsedb.py` — batch path, checkpoint resume, per-row fallback, `--progress-file` / `--checkpoint-every` CLI.
 
-### Not deployed
+### Deployment scope
 
-prod + demo remain on pgvector. The dogfood stack we built to validate this path (gitignored manifests under `deploy/k8s/internal/seahorse-db/`) still runs against an out-of-band Coral; throughput observations from that run will be appended to the AKB product vault rather than to this release.
+This release does not migrate existing installations to another vector driver.
+Select and validate the driver explicitly before changing deployment configuration.
 
 ---
 
@@ -2813,7 +2956,7 @@ A second SeahorseDB driver that talks gRPC to the same Coral coordinator (port a
     - `delete_point` → `IngestService.DeleteTableData`
     - `hybrid_search` → `QueryService.HybridSearch` (server streaming; chunks are Arrow IPC stream bytes decoded with pyarrow)
   - Sparse + label helpers (`_chunk_id_to_label`, `_encode_sparse_string`, `_validate_uuid_for_sql`) are imported from `seahorse_db.py` so encoder bugs fixed in one place don't drift between drivers.
-- `backend/app/services/vector_store/_grpc/proto/coral/**` — vendored Coral `.proto` files and `grpc_tools.protoc`-generated stubs. Source pinned at SeahorseDB monorepo commit `e1364f27` (`SDDEV-244/monorepo-coral-sparse`). Regeneration procedure documented in `_grpc/README.md`.
+- `backend/app/services/vector_store/_grpc/proto/coral/**` — vendored Coral `.proto` files and `grpc_tools.protoc`-generated stubs. Source pinned at SeahorseDB monorepo commit `e1364f27`. Regeneration procedure documented in `_grpc/README.md`.
 - `backend/app/services/vector_store/factory.py` — new `elif driver == "seahorse-db-grpc":` branch that reuses the existing `seahorsedb_*` settings (same Coral, same port, same auto-create flag).
 - `backend/app/config.py` — `vector_store_driver` Literal extended with `"seahorse-db-grpc"`.
 - `backend/pyproject.toml` — three new runtime deps:
@@ -2857,9 +3000,10 @@ Before merging, an independent reviewer walked the week's changes (0.5.x → 0.8
 - `seahorse-db-grpc` could have been a `seahorsedb_transport: rest|grpc` flag on a single `seahorse-db` enum value instead of a separate enum entry; that would have moved the choice off the driver-factory axis. Worth considering before a third Coral transport (Arrow IPC streaming ingest, eventually).
 - 0.7.0's split was completed at the wrong altitude — sparse weight ownership ended up on the wrong side of the seam. 0.7.7 plumbed driver-awareness *backwards* into `sparse_encoder` to compensate, and 0.8.0 now leans on that workaround. The next time we touch this area, the goal should be to move BM25 convention ownership onto the driver and stop the encoder from reading config.
 
-### Not deployed
+### Deployment scope
 
-prod + demo are unchanged (pgvector). The dogfood stack we built to evaluate `seahorse-db-grpc` lives outside this repo (gitignored internal manifests); details in `deploy/k8s/internal/seahorse-db/README.md` and the AKB product vault `seahorsedb-rust-on-prem-dogfood-k8s-deployment-reference.md`.
+The gRPC driver is opt-in; existing installations are not migrated by this release.
+The experimental status and validation limits above apply.
 
 ---
 
@@ -2891,15 +3035,16 @@ The default driver-switch path (flip `vector_store_driver`, restart, let `embed_
 
 - `backend/scripts/migrate_pgvector_to_seahorsedb.py` — new
 
-### Not deployed
+### Deployment scope
 
-prod + demo unchanged (pgvector). Running this script against production is now an option an operator can reach for during a future seahorse-db evaluation — it is not yet a recommended operation.
+The migration script is an opt-in evaluation tool, not an automatic migration
+or a recommended production operation in this release.
 
 ---
 
 ## 0.7.7 — 2026-06-05  *(patch — `seahorse-db` two real bugs in our own driver, not Coral: unsigned i64 PK label + double-BM25 sparse weights)*
 
-The Coral `error_code 500233` we filed as [SeahorseDB#433](https://github.com/dn-inc/SeahorseDB/issues/433) and the 4 retrieval-side failures from 0.7.3 (`dense`, `bm25-en`, `bm25-ko`, `isolation-B`) both turned out to be bugs in **this driver**, not in SeahorseDB. Reading Coral's source code with the actual log lines in hand isolated both in about an hour.
+The Coral `error_code 500233` reported during integration and the 4 retrieval-side failures from 0.7.3 (`dense`, `bm25-en`, `bm25-ko`, `isolation-B`) both turned out to be bugs in **this driver**, not in SeahorseDB. The driver investigation isolated both causes.
 
 ### Real cause #1 — unsigned i64 PK label
 
@@ -3045,12 +3190,12 @@ Three workarounds were considered and rejected:
   recovers. Use `pgvector` or `qdrant` if that's the failure mode
   you need to absorb.
 
-### Not deployed
+### Historical validation limits
 
-prod + demo still pgvector. The 4 e2e fails 0.7.3 reported stay open
-— this release closes the BM25-only path as "won't fix in driver";
-the other three (Coral 500 #SeahorseDB/433, Kafka eventual
-consistency budget, retry policy) are still upstream-side.
+The four E2E failures reported in 0.7.3 remained open at this release.
+The BM25-only limitation was not fixed in the driver. The Coral error,
+visibility budget and retry behavior remained under investigation; see 0.7.6
+for the later correction of the original upstream attribution.
 
 ### Verification
 
@@ -3096,7 +3241,7 @@ with a real PASS again.
 `SEAHORSEDB_CORAL_URL` unset → script exits 0 with a help blurb. CI
 still skips cleanly; developers with a local Coral run it.
 
-### Verified locally against a Coral built from `SDDEV-244/monorepo-coral-sparse`
+### Verified locally against a compatible Coral build
 
 **13/13 PASS.** Every response checked for `application/json`;
 zero gRPC fallbacks observed.
@@ -3199,10 +3344,9 @@ message: "BM25 sparse scoring requires sparse_model=bm25 index"
 This means **every `seahorse-db` table created by 0.7.0/0.7.1/0.7.2 is
 unusable for hybrid_search** — there is no online migration; the
 table has to be dropped and recreated by the driver on next startup.
-At time of writing, no production or demo cluster runs this driver,
-so the practical blast radius is zero. (If you've been experimenting
-locally: drop the table on Coral and `UPDATE chunks SET
-vector_indexed_at = NULL` to re-emit.)
+Affected installations must recreate the derived Coral table and reset
+`vector_indexed_at` to re-emit chunks. This release does not migrate that
+derived index automatically.
 
 ### BM25 metadata is now sent per query
 
@@ -3227,9 +3371,7 @@ once and hoping it doesn't drift.
 ### AKB `test_hybrid_search_e2e.sh` against live `seahorse-db`
 
 First real run of AKB's 25-scenario hybrid retrieval e2e with the
-driver pointed at a live Coral (built from SeahorseDB monorepo's
-`SDDEV-244/monorepo-coral-sparse` branch, infra-only scenario kept
-up via `--no-cleanup`). **21/25 PASS** vs **25/25 PASS** for the
+driver pointed at a live Coral. **21/25 PASS** vs **25/25 PASS** for the
 same backend running pgvector against the same chunks.
 
 Failures (all four are recall-side, not driver-side):
@@ -3251,8 +3393,8 @@ Two interacting causes:
    `vector_indexed_at IS NULL` past the e2e's 180s
    `wait_for_indexing` budget, so the docs they belong to never
    become searchable.
-   Filed upstream as [SeahorseDB#433](https://github.com/dn-inc/SeahorseDB/issues/433)
-   with a standalone Python repro.
+   Investigated with a standalone Python reproduction; the subsequent 0.7.6
+   entry corrects the original upstream attribution.
 
 2. **Kafka eventual consistency** — `POST /data` returns on
    Kafka-accept, not on segment-visible. Even chunks that DO get
@@ -3507,8 +3649,8 @@ key fails the app launch loudly with the bad key name — no silent
 fallback. That's intentional; a half-migrated config silently
 sending writes to the wrong driver is the worst possible outcome.
 
-Default driver is unchanged (`qdrant`). prod + demo run `pgvector`,
-so neither is affected by this rename.
+The default driver in this release remains `qdrant`. Installations configured
+for `pgvector` are unaffected by this rename.
 
 ### New driver implementation notes
 
@@ -3534,7 +3676,7 @@ so neither is affected by this rename.
 
 ### What this PR does NOT do
 
-- No production migration. prod + demo stay on `pgvector`. A future
+- No automatic driver migration. A future
   PR may add an opt-in seahorse-db validation tier; that's a separate
   decision based on operational ergonomics of running the 7-container
   SeahorseDB stack.

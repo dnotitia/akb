@@ -25,6 +25,7 @@ from typing import Any, Iterator, NamedTuple
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError
 
 from app.config import settings
 from app.exceptions import AKBError, NotFoundError
@@ -230,6 +231,33 @@ def get_bytes(key: str) -> bytes:
         raise StorageError(wrap_error(e, f"read {key}").message) from e
 
 
+def get_bounded_bytes(key: str, max_bytes: int) -> bytes:
+    """Read a small server-owned object without trusting storage metadata."""
+    try:
+        obj = client().get_object(Bucket=settings.s3_bucket, Key=key)
+        body = obj["Body"]
+        try:
+            data = body.read(max_bytes + 1)
+            if not data or len(data) > max_bytes:
+                raise StorageError("Invalid account image size")
+            return data
+        finally:
+            body.close()
+    except ClientError as e:
+        raise StorageError("Private account image is unavailable") from e
+    except BotoCoreError as e:
+        raise StorageError("Private account image is unavailable") from e
+
+
+def put_private_bytes(key: str, body: bytes, content_type: str) -> None:
+    """Account-asset transfer errors must not reveal private physical keys."""
+    try:
+        ensure_bucket(settings.s3_bucket)
+        client().put_object(Bucket=settings.s3_bucket, Key=key, Body=body, ContentType=content_type)
+    except (ClientError, BotoCoreError, AKBError) as exc:
+        raise StorageError("Private account image is unavailable") from exc
+
+
 def iter_chunks(
     key: str,
     chunk_size: int = _STREAM_CHUNK_SIZE,
@@ -362,7 +390,23 @@ def delete(key: str) -> None:
     try:
         client().delete_object(Bucket=settings.s3_bucket, Key=key)
     except ClientError as e:
+        if key.startswith(".akb-account-assets/avatars/"):
+            raise StorageError("Private account image cleanup is unavailable") from e
         raise wrap_error(e, f"delete {key}") from e
+
+
+def list_objects_page(
+    prefix: str, *, continuation_token: str | None = None, limit: int = 100,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Bound one inventory request; callers own traversal and retention policy."""
+    kwargs: dict[str, Any] = {"Bucket": settings.s3_bucket, "Prefix": prefix, "MaxKeys": limit}
+    if continuation_token is not None:
+        kwargs["ContinuationToken"] = continuation_token
+    try:
+        page = client().list_objects_v2(**kwargs)
+    except ClientError as e:
+        raise wrap_error(e, "list temporary file objects") from e
+    return page.get("Contents", []), page.get("NextContinuationToken")
 
 
 # ── Presign ──────────────────────────────────────────────────────
@@ -426,5 +470,3 @@ def presign_internal_get(
         raise StorageError(wrap_error(e, f"sign read {key}").message) from e
     finally:
         _signing_snapshot.reset(context_token)
-
-

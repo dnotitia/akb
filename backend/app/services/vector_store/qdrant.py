@@ -109,7 +109,7 @@ class QdrantStore:
         # for the same reason as source_id. Created OUTSIDE the `if not exists`
         # block (idempotent server-side) so an ALREADY-deployed collection
         # — created before vault_id existed — also gets the index on first ensure.
-        # source_type joins them as a driver-side pre-filter (workbench #1069):
+        # source_type joins them as a driver-side pre-filter:
         # same treatment — every search carrying `source_types` filters on it.
         # Best-effort (non-fatal) — but a TypeError/ValueError is a programming
         # bug, not a transient index hiccup, so let it surface.
@@ -355,8 +355,8 @@ async def _qdrant_errors(op: str):
 
 
 def _validated_source_types(source_types: list[str] | None) -> list[str] | None:
-    """Validate the driver-owned `source_type` discriminator filter (workbench
-    #1069). Returns the list unchanged (None stays None = no constraint); an
+    """Validate the driver-owned `source_type` discriminator filter.
+    Returns the list unchanged (None stays None = no constraint); an
     unknown value is a caller bug and fails loud instead of silently matching
     nothing."""
     if source_types is None:
@@ -379,7 +379,7 @@ def _acl_filter(
     of pgvector's `WHERE {vault_id|source_id} = ANY(...)`. vault_id is stored as
     UUID text (like source_id), so MatchAny over the keyword index is exact.
 
-    `source_types` (workbench #1069) ANDs an additional `source_type` MatchAny
+    `source_types` ANDs an additional `source_type` MatchAny
     onto the `must` list — stale points from the non-active Document arm can
     never consume the top-K. Orthogonal to the ACL filter, so it combines with
     either branch (or with no ACL filter at all)."""

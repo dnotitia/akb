@@ -7,19 +7,20 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
+from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
+from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_ai.models.openrouter import OpenRouterProviderConfig
+
+from .evidence import canonical_json
 
 PROTOCOL_REVISION = "2026-07-28"
 CONTRACT_SCHEMA_VERSION = 2
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_BASE_URL_ENV = "MCP_BENCH_OPENROUTER_BASE_URL"
 OPENROUTER_PROVIDER_KEY_ENV = "MCP_BENCH_OPENROUTER_API_KEY"
-OPENROUTER_PRICE_CEILINGS = {
-    "deepseek/deepseek-v4-flash-0731": (0.14, 0.28),
-    "qwen/qwen3.8-27b": (0.24, 2.20),
-}
 OPENROUTER_CLASSES = {
     "primary": "deepseek/deepseek-v4-flash-0731",
     "lightweight": "qwen/qwen3.8-27b",
@@ -107,18 +108,34 @@ Transport = Literal["http", "stdio"]
 ArmName = Literal["baseline", "candidate"]
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
-EXPECTED_LOCALE_COUNTS: dict[TaskLocale, int] = {"ko-KR": 8, "en-US": 8}
+EXPECTED_LOCALE_COUNTS: dict[TaskLocale, int] = {"ko-KR": 20, "en-US": 20}
 EXPECTED_PAIR_CATEGORIES: dict[str, Category] = {
     "read-vaults": "single_operation",
     "create-vault": "single_operation",
-    "ambiguous-find": "ambiguous_action",
-    "multi-step": "multi_step",
+    "knowledge-workflow": "multi_step",
+    "table-publication": "multi_step",
+    "identity-access": "single_operation",
+    "import-export": "multi_step",
+    "stdio-local": "stdio_local",
+    "ambiguous-clarification": "ambiguous_action",
+    "exhaustive-inspection": "ambiguous_action",
     "destructive-confirm": "destructive_confirmation",
     "authorization-readonly": "authorization",
     "invalid-recovery": "invalid_input_recovery",
-    "stdio-local": "stdio_local",
+    "overlapping-document": "multi_step",
+    "grep-write": "multi_step",
+    "document-revisions": "multi_step",
+    "history-provenance": "multi_step",
+    "collection-relation-lifecycle": "multi_step",
+    "table-schema-conflict": "multi_step",
+    "access-ownership-public": "multi_step",
+    "stdio-image-files": "stdio_local",
 }
 PAIR_ID_RE = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
+
+
+def _is_git_revision(value: str) -> bool:
+    return re.fullmatch(r"[0-9a-f]{40}", value) is not None
 
 
 def default_transports() -> list[Transport]:
@@ -145,33 +162,74 @@ class ContractModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
+class StateProbeResultBinding(ContractModel):
+    source_stage: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    source_field: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    transform: Literal["document_asset_id_from_url", "publication_slug", "uri_query"]
+
+
 class StateProbe(ContractModel):
     """A read-only state endpoint owned by the runtime or application."""
 
     service: Literal["app", "fixture"]
     method: Literal["GET", "POST"] = "GET"
-    path: str = Field(pattern=r"^/[A-Za-z0-9_./{}?=&-]*$")
+    path: str = Field(pattern=r"^/[A-Za-z0-9_./{}?=&:%-]*$")
     body: dict[str, JsonValue] | None = None
     expected_status: int = Field(default=200, ge=100, le=599)
+    result_binding: StateProbeResultBinding | None = None
+
+    @model_validator(mode="after")
+    def validate_result_binding(self) -> StateProbe:
+        marker = {
+            "document_asset_id_from_url": "{asset_id}",
+            "publication_slug": "{slug}",
+            "uri_query": "{uri}",
+        }
+        if self.result_binding is None and any(item in self.path for item in marker.values()):
+            raise ValueError("state probe path templates require a result binding")
+        if self.result_binding is not None and self.path.count(marker[self.result_binding.transform]) != 1:
+            raise ValueError("state probe path must contain the single placeholder required by its binding")
+        return self
 
 
 class StateExpectation(ContractModel):
     pointer: str = Field(pattern=JSON_POINTER_RE.pattern)
-    operator: Literal["equals", "contains", "not_contains", "exists"]
+    operator: Literal["equals", "contains", "not_contains", "exists", "nonempty", "okf_document"]
     value: JsonValue = None
 
     @model_validator(mode="after")
     def validate_value(self) -> StateExpectation:
         if self.operator == "exists" and not isinstance(self.value, bool):
             raise ValueError("exists expectations require a boolean value")
+        if self.operator == "nonempty" and self.value is not None:
+            raise ValueError("nonempty expectations do not accept a value")
+        if self.operator == "okf_document":
+            fields = {"type", "resource_uri", "body"}
+            if not isinstance(self.value, dict) or set(self.value) != fields:
+                raise ValueError("okf_document expectations require type, canonical resource_uri, and body strings")
+            document_type = self.value["type"]
+            resource_uri = self.value["resource_uri"]
+            body = self.value["body"]
+            if (
+                not isinstance(document_type, str)
+                or not document_type
+                or not isinstance(resource_uri, str)
+                or not resource_uri.startswith("akb://")
+                or not isinstance(body, str)
+            ):
+                raise ValueError("okf_document expectations require type, canonical resource_uri, and body strings")
+            return self
         if self.operator in {"equals", "contains", "not_contains"} and self.value is None:
             raise ValueError(f"{self.operator} expectations require value")
         return self
 
 
-class StateContract(ContractModel):
+class StateExpectationSet(ContractModel):
     probe: StateProbe
     before_expected_status: int | None = Field(default=None, ge=100, le=599)
+    check_before: bool = True
+    before_must: list[StateExpectation] = Field(default_factory=list)
+    before_must_not: list[StateExpectation] = Field(default_factory=list)
     must: list[StateExpectation] = Field(default_factory=list)
     must_not: list[StateExpectation] = Field(default_factory=list)
     unchanged: list[str] = Field(default_factory=list)
@@ -187,6 +245,22 @@ class StateContract(ContractModel):
             if JSON_POINTER_RE.fullmatch(value) is None:
                 raise ValueError(f"invalid JSON pointer: {value}")
         return values
+
+
+class StateCheckpointContract(ContractModel):
+    after_attempt: int = Field(ge=1)
+    probe: StateProbe
+    must: list[StateExpectation] = Field(default_factory=list)
+    must_not: list[StateExpectation] = Field(default_factory=list)
+
+
+class StateContract(StateExpectationSet):
+    additional_observations: list[StateExpectationSet] = Field(default_factory=list, max_length=8)
+    checkpoints: list[StateCheckpointContract] = Field(default_factory=list, max_length=8)
+
+    @property
+    def observation_sets(self) -> list[StateExpectationSet]:
+        return [self, *self.additional_observations]
 
 
 class FixtureContract(ContractModel):
@@ -324,11 +398,13 @@ class ExpectedMaterialOutcome(ContractModel):
 
 
 class ExpectedMaterialAttempt(ContractModel):
+    stage_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
     logical_operation: str
     tool_name: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
     resource_type: ResourceType | None = None
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
     local_file_arguments: dict[str, str] = Field(default_factory=dict)
+    capture_result_fields: list[str] = Field(default_factory=list)
     outcome: Literal["success", "permission_denied", "rejected"]
     status_code: int | None = Field(default=None, ge=100, le=599)
     error_code: str | None = None
@@ -359,34 +435,52 @@ class ExpectedMaterialAttempt(ContractModel):
             raise ValueError("local file arguments must map fields to file names")
         return values
 
+    @field_validator("capture_result_fields")
+    @classmethod
+    def validate_capture_result_fields(cls, values: list[str]) -> list[str]:
+        if any(re.fullmatch(r"^[A-Za-z][A-Za-z0-9_]*$", value) is None for value in values):
+            raise ValueError("captured result fields must be identifier names")
+        if len(set(values)) != len(values):
+            raise ValueError("captured result fields must be unique")
+        return values
+
 
 class ExpectedResultBinding(ContractModel):
-    source_attempt: int = Field(ge=1)
+    source_stage: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
     source_field: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
-    target_attempt: int = Field(ge=1)
+    target_stage: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
     target_argument: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
-    relation: Literal["equals", "contains"] = "contains"
-
-    @model_validator(mode="after")
-    def validate_binding_order(self) -> ExpectedResultBinding:
-        if self.source_attempt >= self.target_attempt:
-            raise ValueError("material result bindings must reference an earlier attempt")
-        return self
-
+    relation: Literal["equals", "contains", "collection_uri"] = "contains"
 
 class ProviderRouting(ContractModel):
-    order: list[Literal["parasail"]] = Field(min_length=1, max_length=1)
-    allow_fallbacks: Literal[True] = True
+    order: list[str] = Field(min_length=1, max_length=1)
+    allow_fallbacks: bool = False
     require_parameters: Literal[True] = True
+    quantizations: list[Literal["fp8"]] = Field(min_length=1, max_length=1)
 
-    def request_body(self, *, input_price: float, output_price: float) -> dict[str, JsonValue]:
-        return {
-            "provider": {
-                "order": ["parasail"],
-                "allow_fallbacks": True,
-                "require_parameters": True,
+    @field_validator("order")
+    @classmethod
+    def validate_provider_slug(cls, value: list[str]) -> list[str]:
+        if len(value) != 1 or re.fullmatch(
+            r"[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*",
+            value[0],
+        ) is None:
+            raise ValueError("provider routing preference must contain one lowercase OpenRouter provider slug")
+        return value
+
+    def request_body(self, *, input_price: float, output_price: float) -> dict[str, Any]:
+        provider = cast(
+            OpenRouterProviderConfig,
+            {
+                "order": self.order,
+                "allow_fallbacks": self.allow_fallbacks,
+                "require_parameters": self.require_parameters,
+                "quantizations": self.quantizations,
                 "max_price": {"prompt": input_price, "completion": output_price},
-            }
+            },
+        )
+        return {
+            "provider": provider,
         }
 
 
@@ -522,6 +616,10 @@ class TaskManifest(ContractModel):
         expected_attempt_operations = [item.logical_operation for item in self.expected_material_attempts]
         if not set(expected_attempt_operations) <= set(self.allowed_material_operations):
             raise ValueError("expected material attempts must be material operations")
+        stage_ids = [item.stage_id for item in self.expected_material_attempts]
+        if len(set(stage_ids)) != len(stage_ids):
+            raise ValueError("expected material stage identifiers must be unique")
+        stage_positions = {stage_id: index for index, stage_id in enumerate(stage_ids, start=1)}
         accepted_operations = set(self.allowed_preparatory_operations) | set(self.allowed_material_operations)
         if any(
             not set(behavior.required_operations) <= accepted_operations
@@ -555,17 +653,53 @@ class TaskManifest(ContractModel):
         ]
         if Counter(attempted_local_files) != Counter(self.fixture.local_files):
             raise ValueError("every fixture local file must be used by exactly one expected material attempt")
-        binding_targets: set[tuple[int, str]] = set()
+        binding_targets: set[tuple[str, str]] = set()
         for binding in self.expected_result_bindings:
-            if binding.target_attempt > len(self.expected_material_attempts) or binding.source_attempt > len(self.expected_material_attempts):
-                raise ValueError("material result binding attempt is outside the expected attempt sequence")
-            target = self.expected_material_attempts[binding.target_attempt - 1]
+            if binding.source_stage not in stage_positions or binding.target_stage not in stage_positions:
+                raise ValueError("material result binding references an unknown stage")
+            if stage_positions[binding.source_stage] >= stage_positions[binding.target_stage]:
+                raise ValueError("material result bindings must reference an earlier stage")
+            target = self.expected_material_attempts[stage_positions[binding.target_stage] - 1]
             if binding.target_argument in target.arguments or binding.target_argument in target.local_file_arguments:
                 raise ValueError("bound target arguments cannot also have static expected values")
-            target_key = (binding.target_attempt, binding.target_argument)
+            target_key = (binding.target_stage, binding.target_argument)
             if target_key in binding_targets:
                 raise ValueError("material result binding targets must be unique")
             binding_targets.add(target_key)
+        captured_fields = {
+            (attempt.stage_id, field_name)
+            for attempt in self.expected_material_attempts
+            for field_name in attempt.capture_result_fields
+        } | {
+            (binding.source_stage, binding.source_field)
+            for binding in self.expected_result_bindings
+        }
+        for observation in self.expected_final_state.observation_sets:
+            probe_binding = observation.probe.result_binding
+            if probe_binding is not None and observation.check_before:
+                raise ValueError("result-bound state probes can only be checked after their source attempt")
+            if probe_binding is not None and (
+                probe_binding.source_stage not in stage_positions
+                or (probe_binding.source_stage, probe_binding.source_field) not in captured_fields
+            ):
+                raise ValueError("dynamic state probes must bind a captured result from an expected material attempt")
+        for checkpoint in self.expected_final_state.checkpoints:
+            checkpoint_binding = checkpoint.probe.result_binding
+            if checkpoint_binding is not None and (
+                checkpoint_binding.source_stage not in stage_positions
+                or stage_positions[checkpoint_binding.source_stage] > checkpoint.after_attempt
+            ):
+                raise ValueError("state checkpoint bindings must reference an earlier material result")
+            if checkpoint_binding is not None and (
+                (checkpoint_binding.source_stage, checkpoint_binding.source_field) not in captured_fields
+            ):
+                raise ValueError("dynamic state checkpoints must bind a captured material result")
+        checkpoint_attempts = [item.after_attempt for item in self.expected_final_state.checkpoints]
+        if (
+            len(set(checkpoint_attempts)) != len(checkpoint_attempts)
+            or any(index > len(self.expected_material_attempts) for index in checkpoint_attempts)
+        ):
+            raise ValueError("state checkpoints must reference unique expected material attempts")
         if not set(self.expected_material_arguments) <= set(self.allowed_material_operations):
             raise ValueError("expected material arguments must be material operations")
         if not set(self.required_attempted_operations) <= set(expected_operations):
@@ -628,6 +762,15 @@ class ToolCoverageMatrix(ContractModel):
             missing = sorted(registered_tools - matrix_tools)
             extra = sorted(matrix_tools - registered_tools)
             raise ValueError(f"coverage matrix/catalog mismatch: missing={missing}, extra={extra}")
+        declared_transport = {item.operation: set(item.transports) for item in manifest.public_operations}
+        mismatched = [
+            entry.tool
+            for entry in self.entries
+            if set(("http", "stdio") if entry.transport == "both" else (entry.transport,))
+            != declared_transport[entry.tool]
+        ]
+        if mismatched:
+            raise ValueError(f"coverage transports do not match the public operation contract: {sorted(mismatched)}")
 
 
 class LocalizedTaskDefinition(ContractModel):
@@ -665,8 +808,8 @@ class ModelSpec(ContractModel):
     provider_key_env: str = Field(min_length=1, max_length=100)
     routing: ProviderRouting
     settings: dict[str, JsonValue] = Field(default_factory=dict)
-    input_cost_per_million_usd: float = Field(gt=0)
-    output_cost_per_million_usd: float = Field(gt=0)
+    input_cost_per_million_usd: float = Field(gt=0, allow_inf_nan=False)
+    output_cost_per_million_usd: float = Field(gt=0, allow_inf_nan=False)
 
     @field_validator("base_url_env", "provider_key_env")
     @classmethod
@@ -678,13 +821,11 @@ class ModelSpec(ContractModel):
     @model_validator(mode="after")
     def validate_openrouter_model(self) -> ModelSpec:
         expected_model = OPENROUTER_CLASSES[self.class_name]
-        if self.model_id != expected_model or self.version != expected_model:
-            raise ValueError(f"{self.class_name} model/version must be pinned to {expected_model}")
+        expected_version = {"primary": "20260731", "lightweight": "20260814"}[self.class_name]
+        if self.model_id != expected_model or self.version != expected_version:
+            raise ValueError(f"{self.class_name} alias/version must be pinned to {expected_model}@{expected_version}")
         if self.base_url_env != OPENROUTER_BASE_URL_ENV or self.provider_key_env != OPENROUTER_PROVIDER_KEY_ENV:
             raise ValueError("OpenRouter model credentials must use the declared environment names")
-        expected_prices = OPENROUTER_PRICE_CEILINGS[self.model_id]
-        if (self.input_cost_per_million_usd, self.output_cost_per_million_usd) != expected_prices:
-            raise ValueError(f"price ceiling for {self.model_id} does not match the registered model contract")
         if set(self.settings) != {"temperature", "max_tokens"}:
             raise ValueError("model settings must contain only temperature and max_tokens")
         max_tokens = self.settings.get("max_tokens")
@@ -696,28 +837,45 @@ class ModelSpec(ContractModel):
 
 
 class Budget(ContractModel):
-    max_model_requests: int = Field(gt=0)
-    max_total_cost_usd: float = Field(gt=0)
-    max_wall_seconds: int = Field(gt=0)
+    max_total_cost_usd: float = Field(gt=0, allow_inf_nan=False)
     request_timeout_seconds: int = Field(gt=0)
-    max_requests_per_trial: int = Field(gt=0)
-    max_cost_per_trial_usd: float = Field(gt=0)
-
-    @model_validator(mode="after")
-    def validate_limits(self) -> Budget:
-        if self.max_requests_per_trial > self.max_model_requests:
-            raise ValueError("per-trial request cap cannot exceed global request cap")
-        if self.request_timeout_seconds > self.max_wall_seconds:
-            raise ValueError("request timeout cannot exceed the global wall limit")
-        return self
+    max_cost_per_trial_usd: float = Field(gt=0, allow_inf_nan=False)
 
 
 class StatisticalProcedure(ContractModel):
-    method: Literal["paired_task_mean_normal_approximation"]
+    method: Literal["paired_cluster_bca_bootstrap"]
+    implementation: Literal["scipy==1.18.1"] = "scipy==1.18.1"
     confidence: float = Field(default=0.95, gt=0, lt=1)
     noninferiority_margin: float = Field(default=0.03, ge=0, lt=1)
-    repeated_trials_are_averaged_per_task: Literal[True] = True
-    z_value: float = Field(default=1.644854, gt=0)
+    resamples: Literal[20000] = 20000
+    seed: Literal[358] = 358
+    cluster: Literal["pair_id"] = "pair_id"
+    paired: Literal[True] = True
+    cluster_weight: Literal["equal"] = "equal"
+    resampling: Literal["BCa"] = "BCa"
+
+
+class ArmOperationRoute(ContractModel):
+    tool: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
+    action: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]*$")
+
+
+class PublicOperation(ContractModel):
+    """One stable logical operation and its physical public-tool route in each arm."""
+
+    operation: str = Field(pattern=r"^akb_[a-z0-9_]+$")
+    logical_operation: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    resource_type: ResourceType
+    transports: list[Transport] = Field(min_length=1)
+    baseline: ArmOperationRoute
+    candidate: ArmOperationRoute
+
+    @field_validator("transports")
+    @classmethod
+    def unique_transports(cls, values: list[Transport]) -> list[Transport]:
+        if len(set(values)) != len(values):
+            raise ValueError("public operation transports must be unique")
+        return values
 
 
 class ProviderSensitivity(ContractModel):
@@ -748,11 +906,19 @@ class BenchmarkRunManifest(ContractModel):
     budget: Budget
     operation_map: dict[str, list[str]]
     tool_resources: dict[str, ResourceType]
+    public_operations: list[PublicOperation] = Field(default_factory=list)
     credential_profiles: dict[str, str | None] = Field(default_factory=dict)
     fixture_scenario: str = Field(min_length=1, max_length=100)
     locales: list[TaskLocale] = Field(default_factory=default_locales)
     locale_counts: dict[TaskLocale, int] = Field(default_factory=default_locale_counts)
     pair_categories: dict[str, Category] = Field(default_factory=default_pair_categories)
+
+    @field_validator("source_revision")
+    @classmethod
+    def validate_source_revision(cls, value: str) -> str:
+        if value != "runtime_descriptor" and not _is_git_revision(value):
+            raise ValueError("source_revision must be runtime_descriptor or a full git revision")
+        return value
 
     @field_validator("arms", "transports")
     @classmethod
@@ -854,6 +1020,49 @@ class BenchmarkRunManifest(ContractModel):
         duplicates = [tool for tool, count in Counter(tool for tools in self.operation_map.values() for tool in tools).items() if count > 1]
         if duplicates:
             raise ValueError(f"tools cannot map to multiple logical operations: {sorted(duplicates)}")
+        stdio_only = {
+            "akb_get_file",
+            "akb_put_file",
+            "akb_update_file",
+            "akb_delete_file",
+            "akb_put_image",
+            "akb_discard_image",
+        }
+        derived_operations = [
+            PublicOperation(
+                operation=operation,
+                logical_operation=logical_operation,
+                resource_type=self.tool_resources[operation],
+                transports=["stdio"] if operation in stdio_only else ["http", "stdio"],
+                baseline=ArmOperationRoute(tool=operation),
+                candidate=ArmOperationRoute(tool=operation),
+            )
+            for logical_operation, tools in self.operation_map.items()
+            for operation in tools
+        ]
+        derived_by_operation = {item.operation: item for item in derived_operations}
+        if len(derived_by_operation) != len(derived_operations):
+            raise ValueError("derived public operations must map every canonical operation exactly once")
+        supplied_by_operation = {item.operation: item for item in self.public_operations}
+        if self.public_operations and (
+            len(supplied_by_operation) != len(self.public_operations)
+            or supplied_by_operation != derived_by_operation
+        ):
+            raise ValueError("expanded public_operations do not match the derived execution contract")
+        if not self.public_operations:
+            object.__setattr__(self, "public_operations", derived_operations)
+        for arm in ("baseline", "candidate"):
+            for transport in ("http", "stdio"):
+                routes = [item for item in self.public_operations if transport in item.transports]
+                physical = [getattr(item, arm).tool for item in routes]
+                if len(set(physical)) != len(physical):
+                    raise ValueError(f"{arm} {transport} public surface maps multiple operations to one tool")
+                for item in routes:
+                    route = getattr(item, arm)
+                    if route.action is None and route.tool != item.operation:
+                        raise ValueError(f"{arm} direct public route for {item.operation} must retain its canonical tool name")
+                    if route.action is not None and route.tool == item.operation:
+                        raise ValueError(f"{arm} grouped public route for {item.operation} requires an action selector")
         return self
 
     def validate_tasks(self, tasks: list[TaskManifest]) -> None:
@@ -916,7 +1125,13 @@ class BenchmarkRunManifest(ContractModel):
             f"{task.id}:{attempt.tool_name}"
             for task in tasks
             for attempt in task.expected_material_attempts
-            if attempt.tool_name is not None and attempt.tool_name not in self.operation_map.get(attempt.logical_operation, [])
+            if attempt.tool_name is not None
+            and attempt.tool_name not in self.operation_map.get(attempt.logical_operation, [])
+            and not (
+                attempt.tool_name == "akb_grep"
+                and attempt.logical_operation == "update"
+                and isinstance(attempt.arguments.get("replace"), str)
+            )
         )
         if unregistered_attempt_tools:
             raise ValueError(
@@ -938,14 +1153,10 @@ class BenchmarkRunManifest(ContractModel):
         if source_blind_violations:
             details = "; ".join(f"{task_id}: {term}" for task_id, term in source_blind_violations)
             raise ValueError(f"task corpus contains source-aware tool hints: {details}")
-        trials_per_arm = sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats
-        required_trials = trials_per_arm * len(self.arms)
-        smoke_cells = len(self.models) * len(self.transports) * len(self.arms)
-        if self.budget.max_model_requests < required_trials + smoke_cells:
-            raise ValueError("max_model_requests is below the registered trial and smoke-gate count")
-        reserved_cost = self.budget.max_cost_per_trial_usd * (required_trials + smoke_cells)
-        if reserved_cost > self.budget.max_total_cost_usd:
-            raise ValueError("the preregistered trial and smoke-gate cost reservations exceed max_total_cost_usd")
+        if len(self.pair_categories) != 20 or len(tasks) != 40:
+            raise ValueError("the preregistered benchmark requires 20 semantic clusters and 40 locale tasks")
+        if sum(len(task.fixture.transports) for task in tasks) * len(self.models) * self.repeats * len(self.arms) != 608:
+            raise ValueError("the preregistered benchmark plan must contain exactly 608 trials")
 
     def _validate_locale_pairs(self, tasks: list[TaskManifest]) -> None:
         if len(tasks) != sum(self.locale_counts.values()):
@@ -1018,7 +1229,7 @@ class BenchmarkRunManifest(ContractModel):
 
 
 class CatalogSnapshot(ContractModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     source: Literal["server_tools_list"] = "server_tools_list"
     protocol_revision: Literal["2026-07-28"] = "2026-07-28"
     transport: Transport
@@ -1029,6 +1240,7 @@ class CatalogSnapshot(ContractModel):
     catalog_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     catalog_token_estimate: int = Field(ge=0)
     token_estimator: Literal["utf8_bytes_div_4_ceiling"] = "utf8_bytes_div_4_ceiling"
+    server_discover: dict[str, JsonValue]
     tools: list[dict[str, JsonValue]]
     harness_filtering: Literal[False] = False
     lazy_discovery: Literal[False] = False
@@ -1036,6 +1248,12 @@ class CatalogSnapshot(ContractModel):
 
     @model_validator(mode="after")
     def validate_catalog(self) -> CatalogSnapshot:
+        versions = self.server_discover.get("supportedVersions")
+        instructions = self.server_discover.get("instructions")
+        if not isinstance(versions, list) or self.protocol_revision not in versions:
+            raise ValueError("server_discover does not confirm the pinned protocol revision")
+        if not isinstance(instructions, str) or not instructions.strip():
+            raise ValueError("server_discover must include the actual non-empty server instructions")
         if self.tool_count != len(self.tools):
             raise ValueError("tool_count must match tools length")
         expected_hash = hash_json(self.tools)
@@ -1047,8 +1265,96 @@ class CatalogSnapshot(ContractModel):
         return self
 
 
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+def validate_public_catalog(
+    snapshot: CatalogSnapshot,
+    *,
+    arm: ArmName,
+    public_operations: list[PublicOperation],
+) -> None:
+    """Require the complete, unfiltered per-arm operation surface and action selectors."""
+
+    required = [item for item in public_operations if snapshot.transport in item.transports]
+    routes = [getattr(item, arm) for item in required]
+    expected_names = {route.tool for route in routes}
+    actual_names = {
+        tool.get("name")
+        for tool in snapshot.tools
+        if isinstance(tool.get("name"), str)
+    }
+    expected_count = len(routes)
+    if (
+        len(expected_names) != expected_count
+        or snapshot.tool_count != expected_count
+        or actual_names != expected_names
+    ):
+        raise ValueError(
+            f"{arm} {snapshot.transport} catalog does not match the complete public operation map "
+            f"(expected {expected_count}, observed {snapshot.tool_count})"
+        )
+    by_name = {
+        tool.get("name"): tool
+        for tool in snapshot.tools
+        if isinstance(tool.get("name"), str)
+    }
+    for item in required:
+        route = getattr(item, arm)
+        if route.action is None:
+            continue
+        tool = by_name.get(route.tool, {})
+        schema = tool.get("inputSchema", tool.get("input_schema", {}))
+        if not isinstance(schema, dict) or not _input_schema_exposes_action(schema, route.action):
+            raise ValueError(
+                f"{arm} catalog action {route.tool}:{route.action} is missing from the public input schema"
+            )
+
+
+def _input_schema_exposes_action(schema: dict[str, Any], action: str) -> bool:
+    validator_type = validator_for(schema)
+    try:
+        validator_type.check_schema(schema)
+    except SchemaError:
+        return False
+
+    properties = schema.get("properties")
+    action_schema = properties.get("action") if isinstance(properties, dict) else None
+    enum_declared = isinstance(action_schema, dict) and "enum" in action_schema
+    if enum_declared and not validator_type(action_schema).is_valid(action):
+        return False
+
+    if "oneOf" not in schema:
+        return enum_declared
+
+    branches = schema.get("oneOf")
+    if not isinstance(branches, list) or not branches:
+        return False
+    matching_branches = 0
+    for branch in branches:
+        if not isinstance(branch, dict) or branch.get("type") != "object":
+            return False
+        required = branch.get("required")
+        branch_properties = branch.get("properties")
+        branch_action = branch_properties.get("action") if isinstance(branch_properties, dict) else None
+        if (
+            not isinstance(required, list)
+            or "action" not in required
+            or not isinstance(branch_action, dict)
+            or "const" not in branch_action
+        ):
+            return False
+        if validator_type(branch_action).is_valid(action):
+            matching_branches += 1
+    return matching_branches == 1
+
+
+def public_arguments_match_schema(arguments: Any, schema: dict[str, Any]) -> bool:
+    """Validate decoded model arguments against the captured public JSON Schema."""
+
+    validator_type = validator_for(schema)
+    try:
+        validator_type.check_schema(schema)
+    except SchemaError:
+        return False
+    return validator_type(schema).is_valid(arguments)
 
 
 def hash_json(value: Any) -> str:

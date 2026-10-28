@@ -24,6 +24,24 @@ class AKBError(Exception):
         super().__init__(message)
 
 
+class TransientDependencyError(AKBError):
+    """A dependency failed; this is not evidence that a write did not commit."""
+
+    code: str
+
+    def __init__(self, *, code: str, message: str):
+        super().__init__(
+            message,
+            status_code=503,
+            code=code,
+            hint=(
+                "Retry a read after a brief delay. For writes, check the operation's "
+                "result and use its CAS/idempotency contract before retrying; "
+                "completion may be unknown."
+            ),
+        )
+
+
 class NotFoundError(AKBError):
     def __init__(self, resource: str, identifier: str):
         super().__init__(f"{resource} not found: {identifier}", status_code=404)
@@ -449,6 +467,22 @@ class ValidationError(AKBError, ValueError):
 
     def __init__(self, message: str):
         super().__init__(message, status_code=422)
+
+
+class GrepScopeTooLargeError(ValidationError):
+    """A protective scan rejection, not zero matches or a service outage."""
+
+    def __init__(self, unit: str, limit: int):
+        from app.util.errors import GREP_SCOPE_TOO_LARGE
+
+        AKBError.__init__(
+            self,
+            f"native grep candidate {unit} exceed {limit}. Narrow the Vault or collection scope; "
+            "lowering the result limit does not reduce candidate scanning.",
+            status_code=422, code=GREP_SCOPE_TOO_LARGE,
+            hint="Use collection=<path> (includes descendants). path is not a supported grep parameter. Do not retry the unchanged broad scope.",
+            details={"limit_kind": unit, "candidate_limit": limit},
+        )
 
 
 class InvalidColumnTypeError(AKBError, ValueError):

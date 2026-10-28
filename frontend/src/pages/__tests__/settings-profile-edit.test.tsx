@@ -6,6 +6,7 @@ import * as api from "@/lib/api";
 import { ProfileSection } from "../settings/profile-section";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { ResourceNavigationProvider } from "@/contexts/resource-navigation-context";
+import { Profiler } from "react";
 
 // Mock the entire api module so the test doesn't touch network. Only
 // the call surface used by the Profile tab matters here; other tabs
@@ -99,6 +100,35 @@ describe("settings — profile edit", () => {
   });
 
   afterEach(() => cleanup());
+
+  it.each(["Display name", "Current password"])("publishes the %s dirty guard in the edited commit, before passive effects", label => {
+    const onDirtyChange = vi.fn();
+    const committed: boolean[] = [];
+    render(<Profiler id="profile-guard" onRender={() => {
+      // Profiler observes committed DOM after child layout effects and before
+      // passive effects. Do not inject a second event into an unfinished render.
+      const input = document.getElementById(label === "Display name" ? "profile-display-name" : "pw-current") as HTMLInputElement | null;
+      if (input?.value === "Immediate draft") committed.push(onDirtyChange.mock.lastCall?.[0] === true);
+    }}><ProfileSection user={USER} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} onDirtyChange={onDirtyChange} /></Profiler>);
+    fireEvent.change(screen.getByLabelText(label), { target: { value: "Immediate draft" } });
+    expect(committed.length).toBeGreaterThan(0);
+    expect(committed.every(Boolean)).toBe(true);
+  });
+
+  it("publishes the busy guard in the saving commit, before passive effects", async () => {
+    let finish!: (value: Awaited<ReturnType<typeof api.updateProfile>>) => void;
+    vi.mocked(api.updateProfile).mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    const onBusyChange = vi.fn();
+    const committed: boolean[] = [];
+    render(<Profiler id="profile-busy-guard" onRender={() => {
+      if (document.querySelector('form[aria-busy="true"]')) committed.push(onBusyChange.mock.lastCall?.[0] === true);
+    }}><ProfileSection user={USER} localPasswordEnabled localProfileEditingEnabled onUserUpdate={vi.fn()} onBusyChange={onBusyChange} /></Profiler>);
+    fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Alice Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save profile" }));
+    expect(committed.length).toBeGreaterThan(0);
+    expect(committed.every(Boolean)).toBe(true);
+    await act(async () => finish({ updated: true, username: USER.username, display_name: "Alice Renamed", email: USER.email }));
+  });
 
   it("shows typed wrong-current-password feedback on that field without clearing any draft", async () => {
     vi.mocked(api.changePassword).mockRejectedValue(Object.assign(new Error("Current password is incorrect"), { detail: { code: "current_password_incorrect" } }));

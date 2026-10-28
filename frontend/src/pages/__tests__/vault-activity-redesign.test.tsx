@@ -206,4 +206,23 @@ describe("Activity page redesign", () => {
     expect(await screen.findByText(/No matches in the latest 50/)).toBeVisible();
     expect(screen.getByText(/Older matches may exist/)).toBeVisible();
   });
+  it("ends busy after initial failure and offers recovery", async () => {
+    getVaultActivityMock.mockRejectedValueOnce(new Error("Offline")).mockResolvedValueOnce({ activity: [activity(0)] });
+    const actor = userEvent.setup(); const { container } = renderPage();
+    await screen.findByText("Failed to load");
+    expect(container.querySelector('[aria-busy="true"]')).toBeNull();
+    await actor.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Change 1")).toBeVisible();
+  });
+  it("retains rows after a filter failure and retries the requested filter", async () => {
+    getVaultActivityMock.mockResolvedValueOnce({ activity: [activity(0)] }).mockRejectedValueOnce(new Error("Offline")).mockResolvedValueOnce({ activity: [activity(1)] });
+    const actor = userEvent.setup(); renderPage();
+    await actor.click(await screen.findByRole("button", { name: "Filter by JY Kim (1 change)" }));
+    await screen.findByText("Activity could not be refreshed");
+    expect(screen.getByText("Change 1")).toBeVisible();
+    await actor.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Change 2")).toBeVisible();
+    expect(getVaultActivityMock).toHaveBeenLastCalledWith("platform-docs", { author: "JY Kim", limit: 50 });
+  });
+
 });

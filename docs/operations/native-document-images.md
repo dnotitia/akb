@@ -31,8 +31,10 @@ python -m app.cli native-asset-refs-backfill --vault example --dry-run
 python -m app.cli native-asset-refs-backfill --vault example
 ```
 
-Omit `--vault` to inspect candidate Vaults owning attachments. `--limit N`
-bounds a run; a truncated run deliberately exits nonzero. The command locks
+Omit `--vault` to inspect Vaults with Native documents, including those whose
+referenced attachments have all disappeared. `--limit N` requires a positive
+integer and bounds the document selection and repair work; a truncated run
+deliberately exits nonzero. The command locks
 each resource and reads its current verified Head, so a concurrent move,
 update or delete cannot make it attach a stale path's images to another
 document. Empty bodies and deleted documents have obsolete current references

@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     # Includes runtime preparation, API suites, and the full browser regression.
     # Playwright has a shorter global budget so failures can upload diagnostics.
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +38,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22.19.0"
+          node-version: "22.23.4"
           cache: npm
           cache-dependency-path: packages/akb-mcp-client/package-lock.json
 
@@ -116,7 +116,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22.19.0"
+          node-version: "22.23.4"
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
@@ -138,6 +138,13 @@ jobs:
           CI: "1"
         run: pnpm run test:e2e:mock
 
+      - name: Check Markdown links and plain-text affordance in both themes
+        working-directory: frontend
+        env:
+          CI: "1"
+          AKB_FE_E2E_SCENARIO: markdown-reference-adapters
+        run: pnpm run test:e2e:mock e2e/markdown-link-search.spec.ts
+
   keycloak-theme:
     name: keycloak login theme (real Keycloak)
     runs-on: ubuntu-latest
@@ -152,7 +159,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22.19.0"
+          node-version: "22.23.4"
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 

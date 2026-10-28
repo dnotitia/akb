@@ -1,29 +1,8 @@
-# LongMemEval benchmark stack — self-contained, isolated from local dev.
-#
-# Why a separate stack:
-#   - Pins the runtime config to the cluster's effective `akb-app-config`
-#     (bge-m3 + cohere/rerank-v3.5 + pgvector) regardless of what the
-#     dev `config/app.yaml` at repo root says.
-#   - `down -v` between full runs starts from a clean baseline without
-#     touching the main dev volumes.
-#   - Ports shifted (18000/19000/19001) so it can coexist with the main
-#     `akb` stack on `:8000`/`:9000`/`:9001`.
-#
-# Project name comes from this directory: `longmemeval`. Volumes and
-# containers are auto-prefixed (e.g. `longmemeval_postgres_data`).
-#
-# Usage:
-#   cd eval/longmemeval
-#   cp config/secret.yaml.example config/secret.yaml
-#   # edit config/secret.yaml — fill embed_api_key (OpenRouter) and
-#   # rerank_api_key (Cohere production)
-#   docker compose up -d
-#   curl http://localhost:18000/livez
-#
-# Reset for a clean run:
-#   docker compose down -v && docker compose up -d
-#
-# Frontend is intentionally omitted — benchmark runner talks REST only.
+# Historical LongMemEval recipe; unsupported with the current backend.
+# See README.md before use. This retains HS256-era configuration and does
+# not pin a complete historical backend revision. Use the root Native
+# quickstart for a supported current installation.
+# Loopback-only ports keep local demo credentials off external interfaces.
 
 services:
   postgres:
@@ -54,8 +33,8 @@ services:
     volumes:
       - minio_data:/data
     ports:
-      - "19000:9000"
-      - "19001:9001"
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
       interval: 5s
@@ -93,7 +72,7 @@ services:
       - ./config:/etc/akb:ro
       - vault_data:/data/vaults
     ports:
-      - "18000:8000"
+      - "127.0.0.1:18000:8000"
 
 volumes:
   postgres_data:

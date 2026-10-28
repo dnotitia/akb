@@ -84,7 +84,7 @@ test("Overview shows only its own pending count", async ({ page }, testInfo) => 
   state.pending = 3;
   await page.goto("/vault/Research");
   await expect(page.getByRole("heading", { name: "Research", exact: true })).toBeVisible();
-  await expect(page.getByTestId("header-indexing-status").getByText("9 indexing", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("header-indexing-status")).toHaveCount(0);
   await expect(page.locator("#main").getByText("6 indexing", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /Search status/i })).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("vault-indexing.png"), fullPage: true });

@@ -58,11 +58,10 @@ class NativeAssetRefReport:
 
 
 async def _candidate_vaults(conn, vault: str | None) -> list[tuple[uuid.UUID, str]]:
-    """Vaults that own at least one confirmed attachment.
+    """Vaults with Native documents, including references to missing images.
 
-    A vault with no attachment cannot have a document referencing one, so this
-    is what keeps the walk proportional to the problem instead of to the
-    corpus.
+    Missing attachment rows are exactly what an audit must report. Selecting
+    only attachment owners silently declares those Vaults healthy after GC.
     """
     if vault is not None:
         rows = await conn.fetch(
@@ -73,10 +72,17 @@ async def _candidate_vaults(conn, vault: str | None) -> list[tuple[uuid.UUID, st
         return [(row["id"], row["name"]) for row in rows]
     rows = await conn.fetch(
         """
-        SELECT DISTINCT v.id, v.name
+        SELECT v.id, v.name
           FROM vaults v
-          JOIN vault_files vf ON vf.vault_id = v.id
-         WHERE vf.kind = 'attachment'
+         WHERE EXISTS (
+             SELECT 1 FROM native_resources resource
+              WHERE resource.namespace_id = v.id AND resource.surface = 'document'
+                AND (resource.lifecycle = 'live' OR EXISTS (
+                    SELECT 1 FROM document_asset_refs refs
+                     WHERE refs.vault_id = v.id
+                       AND refs.native_document_id = resource.resource_id
+                ))
+         )
          ORDER BY v.name
         """
     )
@@ -90,6 +96,8 @@ async def backfill_native_asset_refs(
     dry_run: bool = False,
 ) -> NativeAssetRefReport:
     """Publish live image references for Native documents that lack them."""
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be a positive integer")
     report = NativeAssetRefReport()
     pool = await get_pool()
     repository = NativeRevisionRepository(pool)
@@ -113,14 +121,16 @@ async def backfill_native_asset_refs(
                               AND refs.vault_id = native_resources.namespace_id
                        ))
                      ORDER BY current_path
+                     LIMIT $2
                     """,
                     vault_id,
+                    None if limit is None else limit - len(rows) + 1,
                 )
             )
-
-    if limit is not None and len(rows) > limit:
-        rows = rows[:limit]
-        report.complete = False
+            if limit is not None and len(rows) > limit:
+                rows = rows[:limit]
+                report.complete = False
+                break
 
     for vault_id, vault_name, resource_id, path in rows:
         report.scanned += 1

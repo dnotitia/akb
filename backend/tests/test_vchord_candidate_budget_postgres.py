@@ -71,12 +71,14 @@ async def _candidate_budget(
     conn: asyncpg.Connection,
     *,
     budget: int = _BUDGET,
+    prefilter: bool = True,
 ) -> AsyncIterator[None]:
     # Small isolated tables otherwise choose a sequential scan, which cannot
     # exercise the extension's candidate budget. The product's index-led SQL
     # branches remain unchanged; this makes their physical index path explicit.
     await conn.execute("SET enable_seqscan = off")
     await conn.execute(f"SET bm25_catalog.bm25_limit = {budget}")
+    await conn.execute(f"SET bm25_catalog.enable_prefilter = {'on' if prefilter else 'off'}")
     actual = await conn.fetchval("SHOW bm25_catalog.bm25_limit")
     assert int(actual) == budget
     assert await conn.fetchval("SHOW enable_seqscan") == "off"
@@ -84,6 +86,7 @@ async def _candidate_budget(
         yield
     finally:
         await conn.execute("RESET bm25_catalog.bm25_limit")
+        await conn.execute("RESET bm25_catalog.enable_prefilter")
         await conn.execute("RESET enable_seqscan")
 
 
@@ -323,13 +326,14 @@ async def _seed_rare(
     return target_vault, scoped_ids
 
 
-async def test_index_led_acl_completes_exactly_and_restores_pooled_budget():
+@pytest.mark.parametrize("prefilter", [True, False])
+async def test_index_led_acl_respects_prefilter_and_restores_pooled_budget(prefilter):
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             target_vault, scoped_ids, _ = await _seed(store, conn)
             async with _record_queries(conn) as queries:
                 async with _record_budget_calls() as budgets:
-                    async with _candidate_budget(conn):
+                    async with _candidate_budget(conn, prefilter=prefilter):
                         hits = await _acl_hits(
                             store, conn, target_vault, selective=False,
                         )
@@ -344,22 +348,22 @@ async def test_index_led_acl_completes_exactly_and_restores_pooled_budget():
                 if "ranked WHERE score < 0" in query[0]
             ]
             assert set(hits) == scoped_ids
-            # The finite page comes back short (the thirty higher-scoring
-            # distractors take its slots) and the exact scan completes it. No
-            # widening probes in between.
-            assert budgets == [5, -1]
-            assert len(ranked) == 2
+            # Growing prefiltering now fills the authorized finite page. With
+            # the operator opting out, the exact correctness fallback remains.
+            assert budgets == ([5] if prefilter else [5, -1])
+            assert len(ranked) == (1 if prefilter else 2)
             assert not any("global_candidates" in query[0] for query in queries)
             await _assert_bm25_index_scan(conn, *ranked[-1], budget=-1)
     assert restored == _BUDGET
 
 
-async def test_source_type_filter_adapts_candidate_budget():
+@pytest.mark.parametrize("prefilter", [True, False])
+async def test_source_type_filter_adapts_candidate_budget(prefilter):
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             _, scoped_ids, _ = await _seed(store, conn)
             async with _record_budget_calls() as budgets:
-                async with _candidate_budget(conn):
+                async with _candidate_budget(conn, prefilter=prefilter):
                     hits = await store._search_sparse(
                         conn,
                         terms=[_QUERY_TERM],
@@ -371,7 +375,7 @@ async def test_source_type_filter_adapts_candidate_budget():
                     )
 
     assert set(hits) == scoped_ids
-    assert budgets == [5, -1]
+    assert budgets == ([5] if prefilter else [5, -1])
 
 
 async def test_filtered_short_page_uses_exact_fallback_in_order():
@@ -520,7 +524,8 @@ async def test_local_budget_restores_after_error():
     assert restored == _BUDGET
 
 
-async def test_dead_index_entries_use_exact_unfiltered_fallback():
+@pytest.mark.parametrize("prefilter", [True, False])
+async def test_dead_index_entries_respect_prefilter_and_exact_fallback(prefilter):
     async with _store() as (store, pool):
         async with pool.acquire() as conn:
             _, scoped_ids, distractor_ids = await _seed(store, conn)
@@ -533,7 +538,7 @@ async def test_dead_index_entries_use_exact_unfiltered_fallback():
                 [uuid.UUID(chunk_id) for chunk_id in distractor_ids],
             )
             async with _record_budget_calls() as budgets:
-                async with _candidate_budget(conn):
+                async with _candidate_budget(conn, prefilter=prefilter):
                     hits = await store._search_sparse(
                         conn,
                         terms=[_QUERY_TERM],
@@ -544,7 +549,7 @@ async def test_dead_index_entries_use_exact_unfiltered_fallback():
                     )
 
     assert set(hits) == scoped_ids
-    assert budgets == [5, -1]
+    assert budgets == ([5] if prefilter else [5, -1])
 
 
 @pytest.mark.parametrize("mode,expected_budgets", [

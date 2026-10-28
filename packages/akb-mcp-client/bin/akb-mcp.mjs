@@ -10,7 +10,17 @@
  *   claude mcp add akb -- akb-mcp --url https://akb.example.com/mcp/ --pat akb_xxx
  */
 
-import { AKBProxy } from "../lib/proxy.mjs";
+import { requireSupportedNode } from "../lib/node-runtime.mjs";
+
+try {
+  requireSupportedNode();
+} catch (error) {
+  process.stderr.write(`[akb-mcp] ${error.message}\n`);
+  process.exit(1);
+}
+
+// Load the proxy only after rejecting unsupported runtimes.
+const { AKBProxy } = await import("../lib/proxy.mjs");
 
 function parseArgs(argv) {
   const args = { url: null, pat: null, insecure: false };

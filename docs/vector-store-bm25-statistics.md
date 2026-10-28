@@ -43,15 +43,22 @@ available when this process disables refresh.
 
 ## Returning to posting
 
-Keeping external statistics fresh is necessary but insufficient for rollback.
-VChord uses raw TF whereas posting/arrays use precomputed saturated weights;
-VChord writes do not keep the posting representation current. Record the first
-VChord write boundary, and retain the source corpus and vocabulary. Before serving
-posting again, restore `required`, finish any necessary statistics recomputation,
-re-encode/reindex affected documents into the posting representation, drain writes
-and deletes, and validate filtered search. Do not merely switch the shape on old
-posting rows or copy raw VChord weights into them. The acceptable statistics lag
-and rollback window must be set for each deployment; this mode grants neither.
+Rollback depends on whether posting rows have stayed current. With the current
+backend, a VChord installation that retains a `posting` table and external
+statistics consumers (`required`, or `auto` with that table) writes both shapes:
+raw TF for VChord and converted saturated weights for posting. New VChord
+installations have no posting table to maintain. Selecting
+`vchord_only_verified` stops this rollback maintenance.
+
+Before returning to posting, verify that every writer has used the compatible
+dual-write implementation throughout the rollback window, statistics are current,
+and filtered search plus update/delete behavior is correct. Drain writes and
+deletes for the transition. If maintenance was disabled, older writers were
+active, or posting rows were already stale before the upgrade, restore `required`
+and re-encode/reindex the affected corpus before serving posting. Enabling
+maintenance does not repair earlier gaps. Never copy raw VChord weights directly
+into posting rows. Retain the source corpus and vocabulary until the rollback
+window is closed.
 
 Deploying this policy requires a backend image containing the configuration,
 lifecycle and encoder changes on every participating API/worker process. Changing
@@ -70,6 +77,7 @@ scores do not depend on IDs, so rankings stay the same, and the command checks
 that before it commits.
 
 ```bash
+cd backend  # commands below use the backend Python environment
 python -m scripts.compact_bm25_term_ids            # dry run: what it would do, and what forbids it
 python -m scripts.compact_bm25_term_ids --apply    # renumber, verify, commit (or roll back)
 python -m scripts.compact_bm25_term_ids --revert   # put the recorded numbering back

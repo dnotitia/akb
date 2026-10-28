@@ -480,6 +480,7 @@ class LegacyAdoptionCreateRequest(ControlPlaneRequest):
 class LegacyAdoptionTargetProjection(ControlPlaneModel):
     target_id: uuid.UUID
     vault_id: uuid.UUID
+    vault_deleted: bool = False
     table_allowlist: list[str]
     included_tables: list[str] = Field(default_factory=list)
     excluded_tables: list[str] = Field(default_factory=list)
