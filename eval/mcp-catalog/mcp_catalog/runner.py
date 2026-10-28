@@ -2840,7 +2840,13 @@ def _validate_trial_evidence(
     actual_dump = outcome.model_dump(mode="json")
     verified_dump = verified.model_dump(mode="json")
     for field_name in _DERIVED_TRIAL_FIELDS:
-        if actual_dump.get(field_name) != verified_dump.get(field_name):
+        actual = actual_dump.get(field_name)
+        expected = verified_dump.get(field_name)
+        if field_name == "state_checks":
+            # Reasons are display text and can change when JSON key order changes.
+            actual = [{key: value for key, value in item.items() if key != "reason"} for item in actual_dump["state_checks"]]
+            expected = [{key: value for key, value in item.items() if key != "reason"} for item in verified_dump["state_checks"]]
+        if actual != expected:
             raise ValueError(f"trial {field_name} does not match the recorded state and call evidence")
 
 

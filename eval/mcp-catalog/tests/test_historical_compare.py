@@ -61,7 +61,7 @@ def _historical_pair(
     manifest["candidate_route_overrides"] = {
         item["operation"]: item["candidate"]
         for item in manifest["public_operations"]
-        if item["candidate"] != {"tool": item["operation"], "action": None}
+        if item["candidate"] != item["baseline"]
     }
     manifest_hash = hash_json(manifest)
 
@@ -430,3 +430,8 @@ def test_compare_cli_rejects_malformed_historical_pre_smoke_seal(monkeypatch: py
     assert report["verdict"] == "inconclusive"
     assert "observed_historical_diagnostics" not in report
     assert "pre-smoke seal omits the selection" in report["gate"]["reasons"][0]
+
+
+def test_historical_identity_routes_do_not_create_overrides() -> None:
+    baseline, _candidate = _historical_pair()
+    assert baseline["manifest"]["candidate_route_overrides"] == {}

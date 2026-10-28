@@ -309,3 +309,20 @@ def test_one_sided_unbounded_interval_is_strict_json() -> None:
     assert greater["upper_bound"] is None
     assert less["lower_bound"] is None
     json.dumps({"greater": greater, "less": less}, allow_nan=False)
+
+
+def test_state_check_reason_is_diagnostic_but_semantics_remain_verified() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    trial = next(item for item in candidate["runs"]["primary:http"]["trials"] if item["state_checks"])
+    trial["state_checks"][0]["reason"] = "Equivalent diagnostic text in a different order"
+    _seal(candidate)
+    assert compare_artifacts(baseline, candidate)["verdict"] == "adopt"
+
+    for field, value in (("passed", False), ("pointer", "/different"), ("operator", "different")):
+        baseline, candidate = complete_paired_artifacts()
+        trial = next(item for item in candidate["runs"]["primary:http"]["trials"] if item["state_checks"] and item["state_checks"][0]["passed"])
+        trial["state_checks"][0][field] = value
+        _seal(candidate)
+        result = compare_artifacts(baseline, candidate)
+        assert result["verdict"] == "inconclusive"
+        assert "state_checks" in result["gate"]["reasons"][0]
