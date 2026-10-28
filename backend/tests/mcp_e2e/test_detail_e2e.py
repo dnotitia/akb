@@ -7,6 +7,7 @@ import hashlib
 import os
 from typing import Any
 
+import httpx
 from mcp import Client
 
 from .conftest import SecondaryMcpSession
@@ -85,6 +86,48 @@ async def test_whole_body_update_requires_original_read_predicates(
     })
     current = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": uri})
     assert current["content"] == "" and current["summary"] == "metadata only"
+
+
+async def test_conflict_recovery_reapplies_intent_to_latest_without_token_replacement(
+    mcp_client: Client, runtime_session: RuntimeContext,
+) -> None:
+    vault = await _create_vault(mcp_client, runtime_session, "recover-intent")
+    created = await _call_json(mcp_client, runtime_session, "akb_put", {
+        "vault": vault, "collection": "notes", "title": "Shared note",
+        "content": "Original spelling: teh\n",
+    })
+    uri = created["uri"]
+    original = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": uri})
+    local_draft = original["content"].replace("teh", "the")
+    headers = {"Authorization": f"Bearer {runtime_session.pat}"}
+    async with httpx.AsyncClient(base_url=runtime_session.descriptor.app_origin, headers=headers) as web:
+        path = f"/api/v1/documents/{vault}/{created['path']}"
+        remote = await web.patch(path, json={
+            "content": original["content"] + "Added by the web editor\n",
+            "title": "Web title", "expected_commit": original["current_commit"],
+        })
+        assert remote.status_code == 200
+        head = await web.get(f"/api/v1/document-head/{vault}/{created['path']}")
+        assert head.status_code == 200
+        assert head.json()["current_commit"] == remote.json()["current_commit"]
+        assert "content" not in head.json() and head.headers["cache-control"] == "no-store"
+        rejected = await _call_json(mcp_client, runtime_session, "akb_update", {
+            "uri": uri, "content": local_draft, "expected_commit": original["current_commit"],
+        }, expect_error=True)
+        assert rejected["code"] == "conflict"
+        latest = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": uri})
+        assert "Added by the web editor" not in local_draft
+        assert original["current_commit"] != latest["current_commit"]
+        combined = latest["content"].replace("teh", "the")
+        await _call_json(mcp_client, runtime_session, "akb_update", {
+            "uri": uri, "content": combined, "expected_commit": latest["current_commit"],
+        })
+        final = await web.get(path)
+        assert final.status_code == 200
+        assert final.json()["content"] == combined
+        assert "Added by the web editor" in final.json()["content"]
+        assert "spelling: the" in final.json()["content"]
+        assert final.json()["title"] == "Web title"
 
 
 async def test_exact_text_edit_contract_and_permissions(

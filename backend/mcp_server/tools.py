@@ -221,7 +221,11 @@ TOOLS = [
             "partial fragment such as a newly uploaded image. Use a targeted "
             "akb_edit for inline insertion or replacement. Whole-body updates require "
             "expected_commit or expected_content_hash from the original akb_get read; "
-            "both supplied conditions must match. This also applies to proxy file input."
+            "both supplied conditions must match. This also applies to proxy file input. "
+            "On conflict, retain the original base and draft, read latest with akb_get, "
+            "reapply the original intent preserving concurrent changes, and save the "
+            "reviewed composed draft with that read's token; never replace only the "
+            "token or retry blindly."
         ),
         input_schema={
             "type": "object",

@@ -398,6 +398,13 @@ export const handlers = [
       ],
     });
   }),
+  http.get(/\/api\/v1\/document-head\/fixture\/.+$/, async ({ request }) => {
+    await syncPublicReset();
+    const path = decodeURIComponent(new URL(request.url).pathname.split("/document-head/fixture/")[1] || "");
+    const document = documentForPath(path);
+    return HttpResponse.json({ kind: "document_head", uri: document.uri, vault: "fixture", path: document.path,
+      current_commit: document.current_commit, updated_at: document.updated_at });
+  }),
   http.get(/\/api\/v1\/documents\/fixture\/.+$/, async ({ request }) => {
     await syncPublicReset();
     if (isReferenceScenario()) {

@@ -353,7 +353,9 @@ export async function throwJsonApiError(res: Response): Promise<never> {
       body.detail,
     );
   }
-  throw new ApiError(typeof body?.error === "string" ? body.error : typeof body?.detail === "string" ? body.detail : `${res.status} ${res.statusText}`, res.status, body?.detail ?? (typeof body?.code === "string" ? body : null));
+  // The canonical envelope can retain a legacy string in `detail`. Its
+  // top-level code still owns classification (for example, OCC recovery).
+  throw new ApiError(typeof body?.error === "string" ? body.error : typeof body?.detail === "string" ? body.detail : `${res.status} ${res.statusText}`, res.status, typeof body?.code === "string" ? body : body?.detail ?? null);
 }
 
 async function api<T>(
@@ -1325,12 +1327,31 @@ export const deleteCollection = (vault: string, path: string, recursive: boolean
 // ── Documents ──
 export const putDocument = (data: any) =>
   api<any>("/documents", { method: "POST", body: JSON.stringify(data) });
-export const getDocument = (vault: string, id: string, version?: string) => {
-  const path = `/documents/${vault}/${encodeURIComponent(id)}`;
+export const getDocument = (vault: string, id: string, version?: string, recovery?: { signal?: AbortSignal; preserveSession?: boolean }) => {
+  const path = `/documents/${encodeURIComponent(vault)}/${encodeURIComponent(id)}`;
   return api<any>(
     version ? `${path}?version=${encodeURIComponent(version)}` : path,
+    recovery ? { signal: recovery.signal, cache: "no-store" } : undefined,
+    recovery?.preserveSession ? "preserve-session" : "expire-and-redirect",
   );
 };
+
+export interface DocumentHead {
+  kind: "document_head";
+  uri: string;
+  vault: string;
+  path: string;
+  current_commit: string | null;
+  updated_at: string | null;
+}
+
+/** A background editor check must report lost access without navigating away from its draft. */
+export const getDocumentHead = (vault: string, id: string, signal?: AbortSignal) =>
+  api<DocumentHead>(
+    `/document-head/${encodeURIComponent(vault)}/${encodeURIComponent(id)}`,
+    { signal, cache: "no-store" },
+    "preserve-session",
+  );
 
 export interface DocumentHistoryEntry {
   hash: string;

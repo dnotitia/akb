@@ -1,6 +1,6 @@
 """REST API routes for document CRUD."""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user
@@ -12,6 +12,7 @@ from app.services.access_service import (
 )
 from app.models.document import (
     DocumentDeleteResponse,
+    DocumentHeadResponse,
     DocumentMoveRequest,
     DocumentPutRequest,
     DocumentPutResponse,
@@ -126,6 +127,23 @@ async def move_document(
         title_conflict_policy=req.title_conflict_policy,
         agent_id=user.username,
     )
+
+
+@router.get(
+    "/document-head/{vault}/{doc_id:path}",
+    response_model=DocumentHeadResponse,
+    summary="Get a document's current revision without its body",
+    operation_id="documentsGetDocumentHead",
+)
+async def get_document_head(
+    vault: str,
+    doc_id: str,
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    await check_vault_access(user.user_id, vault, required_role="reader")
+    response.headers["Cache-Control"] = "no-store"
+    return await doc_service.get_head(vault, doc_id)
 
 
 @router.get(

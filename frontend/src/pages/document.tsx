@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import {
   ApiError,
+  authSessionSnapshot,
   browseVault,
   discardAsset,
   deleteDocument,
@@ -38,6 +39,7 @@ import {
   getDocumentHistoryWithFallback,
   getRelations,
   getVaultInfo,
+  isCurrentAuthSession,
   type DocumentUpdateInput,
   type DocumentHistoryEntry,
   unpublishDoc,
@@ -61,6 +63,10 @@ import { usePublishResourceLocation } from "@/contexts/resource-location-context
 import { useResourceNavigationGuard } from "@/contexts/resource-navigation-context";
 import { usePreviewEditorSession } from "@/contexts/document-preview-editor-context";
 import { useDocumentHistoryGuard } from "@/hooks/use-document-history-guard";
+import { useDocumentHead } from "@/hooks/use-document-head";
+import { extractMarkdownTargets } from "@akb/markdown-editor";
+import { assetIdFromUrl } from "@/lib/image-assets";
+import type { DocumentConflictResolution, DocumentConflictResult } from "@/lib/document-conflict";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -174,7 +180,12 @@ function DocumentPageContent({
   const currentUser = useCurrentUser();
   const readingChrome = useReadingChrome();
   const { checking: accessChecking, revision: accessRevision } = useAccessVerification();
+  const ownerScope = JSON.stringify([name, id, currentUser?.user_id]);
   const resourceScope = JSON.stringify([name, id, currentUser?.user_id, accessRevision]);
+  const liveEditor = useRef({ ownerScope, resourceScope, accessRevision, checking: accessChecking });
+  liveEditor.current = { ownerScope, resourceScope, accessRevision, checking: accessChecking };
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const viewId = useId();
   const navigate = useNavigate();
   const routeLocation = useLocation();
@@ -279,6 +290,7 @@ function DocumentPageContent({
   const [serverTitleConflict, setServerTitleConflict] = useState<DocumentTitleConflict | null>(null);
   const [editorKey, setEditorKey] = useState(0);
   const [savingBody, setSavingBody] = useState(false);
+  useEffect(() => { setSavingBody(false); }, [ownerScope]);
   const [uploadingImage, setUploadingImage] = useState(false);
   const [claimedAssetIds, setClaimedAssetIds] = useState<readonly string[] | null>(null);
   const [bodyError, setBodyError] = useState("");
@@ -291,8 +303,24 @@ function DocumentPageContent({
     local: DocumentConflictSnapshot;
     latest: DocumentConflictSnapshot | null;
     latestError?: string;
+    headAtReview?: string | null;
+    resolution?: DocumentConflictResolution;
   } | null>(null);
-  const [rebasing, setRebasing] = useState(false);
+  const [loadingComparison, setLoadingComparison] = useState(false);
+  const latestReadGeneration = useRef(0);
+  const latestReadController = useRef<AbortController | null>(null);
+  const liveResourceScope = useRef(resourceScope);
+  liveResourceScope.current = resourceScope;
+  useEffect(() => {
+    // The previous access proof no longer owns an in-flight comparison read.
+    // Its response will be discarded, so release its busy state here while
+    // preserving the same author's reviewed snapshots and composed result.
+    setLoadingComparison(false);
+    return () => {
+      latestReadGeneration.current += 1;
+      latestReadController.current?.abort();
+    };
+  }, [resourceScope, accessChecking]);
   const [draftStatus, setDraftStatus] = useState<
     "idle" | "restored" | "saving" | "saved" | "error" | "expired" | "incompatible" | "unavailable"
   >("idle");
@@ -687,6 +715,24 @@ function DocumentPageContent({
   const canManageGuide = doc?.path === VAULT_SKILL_PATH && !vaultReadOnly &&
     vaultRole === "owner" && !isHistorical && !isDiffMode;
 
+  const observedHead = useDocumentHead({
+    vault: name ?? "",
+    document: docId,
+    scope: resourceScope,
+    baseCommit: editBaseCommit,
+    enabled: active && view === "edit" && !!doc && canEdit && !accessChecking && !savingBody,
+  });
+  const headUnavailable = observedHead.error instanceof ApiError && [401, 403, 404].includes(observedHead.error.status);
+  const editorWritable = canEdit && !headUnavailable;
+  const observedCommit = observedHead.head?.current_commit ?? null;
+  const latestObservedCommit = useRef(observedCommit);
+  latestObservedCommit.current = observedCommit;
+  // Either authorized source may discover a change first. An older polling
+  // receipt must not mask a newer full-document refresh (or vice versa).
+  const remoteCommit = [observedCommit, latestServerDocument?.current_commit]
+    .find((commit) => validRevision(commit) && commit !== editBaseCommit) ?? null;
+  const changedElsewhere = validRevision(editBaseCommit) && validRevision(remoteCommit);
+
   // Publishing has its own policy: the guide's owner-only editing restriction
   // does not apply to public links, but historical/diff views must not publish HEAD.
   const publishDisabledReason = accessChecking || vaultInfoQuery.isPending
@@ -743,12 +789,15 @@ function DocumentPageContent({
     // Effect replay must not replace a recovered draft with the same cached
     // server snapshot before the restored state has committed.
     hydratedDocumentSnapshotRef.current = d;
+    // The override bridges a write response to its next full read. It must
+    // never hide an authorized newer read of the same document indefinitely.
+    setOverride(current => current?.scope === resourceScope ? null : current);
 
     const identity = documentIdentity(name, d);
     const identityChanged = documentIdentityRef.current !== identity;
     const preserveEditState =
       view === "edit" &&
-      (isDirty ||
+      (hasUnsavedWork || savingBody ||
         draftStatus === "restored" ||
         draftStatus === "saving" ||
         draftStatus === "saved" ||
@@ -854,6 +903,9 @@ function DocumentPageContent({
             draftId: createDocumentEditDraftId(),
             tabId: draftTabIdRef.current,
           };
+      // A restored copy owns these uploads even before its first keystroke.
+      // Persist its own reference so another tab cannot clean them up on save.
+      const copySaved = sameTab || result.status === "expired" || saveDocumentEditDraft(draftSessionRef.current);
       skipNextDraftSaveRef.current = true;
       restoredDraftRevisionRef.current = draftRevisionRef.current;
       setOriginalContent(stored.baseBody);
@@ -874,7 +926,7 @@ function DocumentPageContent({
       setDraftNotice(
         result.status === "expired"
           ? "This draft has expired. Its text is kept for copying; attached images may no longer be available."
-          : "Local draft restored",
+          : copySaved ? "Local draft restored" : "Local draft restored, but this tab's copy could not be saved locally.",
       );
       if (result.status === "expired") {
         const protectedAssetIds = new Set(
@@ -1042,6 +1094,8 @@ function DocumentPageContent({
   }
 
   async function showTitleConflict(conflict: DocumentTitleConflict) {
+    const owner = ownerScope;
+    const session = authSessionSnapshot();
     let exactContent = false;
     try {
       const existing = await getDocument(name!, conflict.existingPath);
@@ -1051,6 +1105,7 @@ function DocumentPageContent({
     } catch {
       // The structured conflict still gives enough information to recover.
     }
+    if (!mounted.current || liveEditor.current.ownerScope !== owner || !isCurrentAuthSession(session)) return;
     setServerTitleConflict({ ...conflict, exactContent });
     window.requestAnimationFrame(() => titleConflictRef.current?.focus());
   }
@@ -1066,64 +1121,111 @@ function DocumentPageContent({
   }
 
   async function readLatestForConflict(): Promise<any | null> {
+    const generation = ++latestReadGeneration.current;
+    const scope = liveEditor.current.resourceScope;
+    latestReadController.current?.abort();
+    if (liveEditor.current.checking) {
+      setLatestServer(null, "Wait for access verification before loading the latest document. Your draft remains available.");
+      return null;
+    }
+    const session = authSessionSnapshot();
+    const controller = new AbortController();
+    latestReadController.current = controller;
     try {
-      const latest = await getDocument(name!, docId);
+      const latest = await getDocument(name!, docId, undefined, { signal: controller.signal, preserveSession: true });
+      if (generation !== latestReadGeneration.current || liveResourceScope.current !== scope || !isCurrentAuthSession(session)) return null;
       setLatestServer(latest);
       return latest;
-    } catch {
+    } catch (error) {
+      if (generation !== latestReadGeneration.current || liveResourceScope.current !== scope || !isCurrentAuthSession(session)) return null;
       setLatestServer(
         null,
-        "The latest version could not be loaded. Your draft remains available.",
+        error instanceof ApiError && error.status === 401
+          ? "Sign in again to load the latest version. Your draft remains available."
+          : "The latest version could not be loaded. Your draft remains available.",
       );
+      if (error instanceof ApiError && [401, 403, 404].includes(error.status)) void observedHead.check();
       return null;
     }
   }
 
-  async function applyDraftToLatest() {
-    const latest = latestServerDocument || (await readLatestForConflict());
-    if (!latest || !validRevision(latest.current_commit)) return;
-    setRebasing(true);
-    try {
-      const baseBody = typeof latest.content === "string" ? latest.content : "";
-      const baseTitle = typeof latest.title === "string" ? latest.title : "";
-      const nextBody = contentChanged ? editingContent : baseBody;
-      const nextTitle = titleChanged ? editingTitle : baseTitle;
-      setEditingTitle(nextTitle);
-      if (!contentChanged) {
-        setEditingContent(nextBody);
-        setEditorInitialContent(nextBody);
-        editorHydrationModeRef.current = "draft";
-        setEditorKey((key) => key + 1);
-      }
-      const baseDetails = documentDetailsFrom(latest);
-      const rebasedDetails = documentDetailsFrom({ ...baseDetails, ...changedDocumentDetails(editingDetails, originalDetails) });
-      setOriginalDetails(baseDetails);
-      setEditingDetails(rebasedDetails);
-      setOriginalContent(baseBody);
-      setOriginalTitle(baseTitle);
-      setBaseCommit(latest.current_commit);
-      setDocOverride(latest);
-      queryClient.setQueryData(
-        ["document", name, docId, undefined, currentUser?.user_id, accessRevision],
-        latest,
-      );
-      setLatestServer(null);
-      setSaveConflict(null);
-      setBodyError("");
-      persistEditDraft({
-        baseCommit: latest.current_commit,
-        baseTitle,
-        baseBody,
-        baseDetails,
-        details: rebasedDetails,
-        title: nextTitle,
-        body: nextBody,
-        assetIds: editingAssetIds,
-        assetExpiresAt: editingAssetExpirations,
-      });
-    } finally {
-      setRebasing(false);
-    }
+  async function openComparison() {
+    if (!editorWritable || savingBody || uploadingImage) return;
+    persistEditDraft();
+    setSaveConflict({
+      base: makeConflictSnapshot("Original base", editBaseCommitRef.current, originalTitle, originalContent, originalDetails),
+      local: makeConflictSnapshot("Your draft", editBaseCommitRef.current, editingTitle, editingContent, editingDetails),
+      latest: null,
+    });
+    await reloadComparison();
+  }
+
+  async function reloadComparison() {
+    const scope = resourceScope;
+    setLoadingComparison(true);
+    const pending = readLatestForConflict();
+    const generation = latestReadGeneration.current;
+    const latest = await pending;
+    if (liveResourceScope.current !== scope || generation !== latestReadGeneration.current) return;
+    setSaveConflict((current) => current ? {
+      ...current,
+      latest: latest ? makeConflictSnapshot("Latest server version", latest.current_commit, latest.title || "", latest.content || "", documentDetailsFrom(latest)) : null,
+      latestError: latest ? undefined : latestServerErrorRef.current,
+      headAtReview: latestObservedCommit.current,
+      resolution: undefined,
+    } : null);
+    setLoadingComparison(false);
+  }
+
+  function applyCombinedChanges(result: DocumentConflictResult) {
+    // Use precisely the displayed snapshot, never a newer observation that
+    // arrived while the user was reviewing or composing this result.
+    const reviewed = saveConflict?.latest;
+    if (!reviewed || !validRevision(reviewed.commit) || !editorWritable || savingBody || uploadingImage) return;
+    const latest = {
+      ...doc, ...reviewed.details, title: reviewed.title,
+      content: reviewed.body, current_commit: reviewed.commit,
+    };
+    const baseBody = typeof latest.content === "string" ? latest.content : "";
+    const baseTitle = typeof latest.title === "string" ? latest.title : "";
+    const nextBody = result.body;
+    const nextTitle = result.title;
+    const assetIds = [...new Set(extractMarkdownTargets(nextBody)
+      .filter((target) => target.kind === "attachment")
+      .map((target) => assetIdFromUrl(target.target)).filter((id): id is string => !!id))];
+    setEditingTitle(nextTitle);
+    setEditingContent(nextBody);
+    setEditingAssetIds(assetIds);
+    setEditorInitialContent(nextBody);
+    editorHydrationModeRef.current = "draft";
+    setEditorKey((key) => key + 1);
+    draftRevisionRef.current += 1;
+    const baseDetails = documentDetailsFrom(latest);
+    const rebasedDetails = result.details;
+    setOriginalDetails(baseDetails);
+    setEditingDetails(rebasedDetails);
+    setOriginalContent(baseBody);
+    setOriginalTitle(baseTitle);
+    setBaseCommit(latest.current_commit);
+    setDocOverride(latest);
+    queryClient.setQueryData(
+      ["document", name, docId, undefined, currentUser?.user_id, accessRevision],
+      latest,
+    );
+    setLatestServer(null);
+    setSaveConflict(null);
+    setBodyError("");
+    persistEditDraft({
+      baseCommit: latest.current_commit,
+      baseTitle,
+      baseBody,
+      baseDetails,
+      details: rebasedDetails,
+      title: nextTitle,
+      body: nextBody,
+      assetIds,
+      assetExpiresAt: editingAssetExpirations,
+    });
   }
 
   async function copyDraftText(text: string, message: string) {
@@ -1139,8 +1241,12 @@ function DocumentPageContent({
     titleConflictPolicy: "allow" | "reject" = "reject",
   ) {
     if (!name || !docId || uploadingImage) return;
-    if (!canEdit) {
+    if (!editorWritable) {
       setBodyError("Editing is unavailable with the current vault access. Your draft is preserved.");
+      return;
+    }
+    if (changedElsewhere) {
+      await openComparison();
       return;
     }
     setTitleTouched(true);
@@ -1172,14 +1278,22 @@ function DocumentPageContent({
     payload.expected_commit = baseCommit;
 
     const saveRevision = draftRevisionRef.current;
+    const saveScope = ownerScope;
+    const session = authSessionSnapshot();
+    const currentOperation = () => mounted.current && liveEditor.current.ownerScope === saveScope && isCurrentAuthSession(session);
     setSavingBody(true);
     setBodyError("");
     try {
       const saved = await updateDocument(name, docId, payload);
+      if (!currentOperation()) return;
       const savedCommit = saved.current_commit ?? saved.commit_hash ?? null;
       if (!validRevision(savedCommit)) {
         throw new Error("The server did not return a document revision after saving.");
       }
+      // Discard pre-save reads before reconciling the acknowledged snapshot.
+      // Cancellation can yield: account/session ownership must still match.
+      await queryClient.cancelQueries({ queryKey: ["document", name, docId] });
+      if (!currentOperation()) return;
       const titleToSave = titleChanged ? normalizedEditingTitle : originalTitle;
       const hasFollowupEdits = draftRevisionRef.current !== saveRevision;
       const followup = editingSnapshotRef.current;
@@ -1195,14 +1309,14 @@ function DocumentPageContent({
         current_commit: savedCommit,
       };
       setBaseCommit(savedCommit);
-      setDocOverride(nextDoc);
-      queryClient.setQueryData(
-        ["document", name, docId, undefined, currentUser?.user_id, accessRevision],
-        (cached: Record<string, unknown> | undefined) => ({
-          ...(cached || {}),
-          ...nextDoc,
-        }),
-      );
+      const currentProof = liveEditor.current;
+      const currentQueryKey = ["document", name, docId, undefined, currentUser?.user_id, currentProof.accessRevision];
+      // A successful write acknowledges this owner's buffer, not permission
+      // to seed a new, still-unverified read scope with private content.
+      if (!currentProof.checking && queryClient.getQueryState(currentQueryKey)?.status === "success") {
+        setOverride({ scope: currentProof.resourceScope, value: nextDoc });
+        queryClient.setQueryData(currentQueryKey, (cached: Record<string, unknown> | undefined) => ({ ...cached, ...nextDoc }));
+      }
       setOriginalContent(contentToSave);
       setOriginalTitle(titleToSave);
       const savedDetails = documentDetailsFrom(nextDoc);
@@ -1267,6 +1381,7 @@ function DocumentPageContent({
       void queryClient.invalidateQueries({ queryKey: ["document", name, docId] });
       void queryClient.invalidateQueries({ queryKey: ["document-history", name] });
     } catch (e: unknown) {
+      if (!currentOperation()) return;
       const conflict = documentTitleConflictFromError(e);
       if (conflict) {
         await showTitleConflict(conflict);
@@ -1274,6 +1389,7 @@ function DocumentPageContent({
       }
       if (isRevisionConflict(e)) {
         const latest = await readLatestForConflict();
+        if (!currentOperation()) return;
         setSaveConflict({
           base: makeConflictSnapshot(
             "Original base",
@@ -1299,6 +1415,7 @@ function DocumentPageContent({
               )
             : null,
           latestError: latest ? undefined : latestServerErrorRef.current,
+          headAtReview: latestObservedCommit.current,
         });
         setDraftNotice("Your local draft is preserved after the conflict.");
         return;
@@ -1318,7 +1435,7 @@ function DocumentPageContent({
     } finally {
       // Always clear the spinner — a post-await setState throwing must not
       // leave the editor stuck on "Saving…".
-      setSavingBody(false);
+      if (mounted.current && liveEditor.current.ownerScope === saveScope) setSavingBody(false);
     }
   }
 
@@ -1560,7 +1677,7 @@ function DocumentPageContent({
           {inEditMode ? <>
             <Button ref={cancelEditButtonRef} type="button" variant="outline" size="sm" data-reader-control onClick={handleCancelBody} disabled={savingBody}>Cancel</Button>
             <Button type="button" variant="accent" size="sm" aria-label="Save changes" loading={savingBody}
-              data-reader-control onClick={() => void handleSaveDocument("reject")} disabled={!canEdit || uploadingImage || !isDirty}>
+              data-reader-control onClick={() => void handleSaveDocument("reject")} disabled={!editorWritable || uploadingImage || !isDirty}>
               {savingBody ? "Saving…" : "Save changes"}
             </Button>
           </> : <>
@@ -1634,6 +1751,14 @@ function DocumentPageContent({
             </ResourceActionsMenu>
           </>}
         </ResourceCommandRow>
+        {inEditMode && <div className="flex flex-wrap items-center gap-2 border-t border-border px-4 py-2 text-xs text-foreground-muted sm:px-6">
+          {headUnavailable ? <span role="status">{observedHead.error instanceof ApiError && observedHead.error.status === 404 ? "This document is no longer available. Your draft is preserved." : "Document access could not be verified. Your draft is preserved; saving is disabled."}</span>
+            : changedElsewhere ? <>
+              <span role="status" aria-live="polite" className="text-warning">A newer version is available. Your draft and original version are preserved.</span>
+              <Button size="sm" variant="outline" onClick={() => void openComparison()} disabled={uploadingImage || savingBody}>Compare changes</Button>
+            </> : observedHead.error ? <span role="status">Could not check for newer changes. Your draft is preserved; saving still checks its original version.</span> : null}
+          <Button size="sm" variant="ghost" onClick={() => void observedHead.check()} loading={observedHead.checking} disabled={savingBody}>Check for changes</Button>
+        </div>}
         </div>
   );
 
@@ -1767,7 +1892,7 @@ function DocumentPageContent({
                       idPrefix="document-edit"
                       value={editingDetails}
                       onChange={(next) => { setEditingDetails(next); draftRevisionRef.current += 1; }}
-                      disabled={savingBody || !canEdit}
+                      disabled={savingBody || !editorWritable}
                       showStatus
                       firstFieldRef={(node) => {
                         summaryFieldRef.current = node;
@@ -1863,8 +1988,10 @@ function DocumentPageContent({
                           setEditingAssetExpirations(expirations);
                         }}
                         onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
+                        isAssetReferencedByOtherDraft={assetId =>
+                          protectedDraftAssetIds(draftSessionRef.current?.draftId).has(assetId)}
                         ariaLabel="Document body (markdown)"
-                        readOnly={savingBody || !canEdit}
+                        readOnly={savingBody || !editorWritable}
                         vault={name!}
                         document={doc?.path}
                         commit={editBaseCommit ?? undefined}
@@ -1878,6 +2005,7 @@ function DocumentPageContent({
                         onSlashOpenChange={handleEditorMenuChange}
                         preserveUploadsOnUnmount={
                           pendingNavigation !== null ||
+                          saveConflict !== null ||
                           savingBody ||
                           draftStatus === "saving" ||
                           draftStatus === "saved" ||
@@ -1885,7 +2013,7 @@ function DocumentPageContent({
                           draftStatus === "expired"
                         }
                         claimedAssetIds={claimedAssetIds}
-                        initialUnclaimedAssetIds={editingAssetIds}
+                        initialUnclaimedAssetIds={unclaimedAssetIds}
                         initialUnclaimedAssetExpirations={editingAssetExpirations}
                       />
                     </Suspense>
@@ -1926,15 +2054,23 @@ function DocumentPageContent({
                         </div>
                       </Alert>
                     )}
-                    {saveConflict && (
+                    {saveConflict && canEdit && (
                       <DocumentConflictNotice
+                        key={saveConflict.latest?.commit ?? "loading-comparison"}
                         base={saveConflict.base}
                         local={saveConflict.local}
                         latest={saveConflict.latest}
                         latestError={saveConflict.latestError}
-                        rebasing={rebasing}
-                        onRebase={() => void applyDraftToLatest()}
-                        onRetryLatest={() => void readLatestForConflict()}
+                        loading={loadingComparison}
+                        accessError={headUnavailable ? "Document access could not be verified." : undefined}
+                        checkingAccess={observedHead.checking}
+                        onCheckAccess={() => void observedHead.check()}
+                        resolution={saveConflict.resolution}
+                        onResolutionChange={(resolution) => setSaveConflict(current => current ? { ...current, resolution } : null)}
+                        newerRevision={observedCommit !== saveConflict.headAtReview && observedCommit !== editBaseCommit ? observedCommit : null}
+                        onApply={applyCombinedChanges}
+                        onRetryLatest={() => void reloadComparison()}
+                        onCancel={() => { latestReadGeneration.current += 1; latestReadController.current?.abort(); setLoadingComparison(false); setSaveConflict(null); }}
                       />
                     )}
                     {bodyError && <Alert variant="destructive" className="mt-4">{bodyError}</Alert>}

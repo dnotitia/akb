@@ -22,6 +22,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...actual,
     getDocument: vi.fn(),
+    getDocumentHead: vi.fn(),
     discardAsset: vi.fn(),
     getDocumentDiff: vi.fn(),
     getDocumentHistoryWithFallback: vi.fn(),
@@ -70,6 +71,7 @@ import {
   deleteDocument,
   createPublication,
   getDocument,
+  getDocumentHead,
   getDocumentDiff,
   getDocumentHistoryWithFallback,
   getVaultInfo,
@@ -80,6 +82,7 @@ import {
 } from "@/lib/api";
 
 const getDocumentMock = getDocument as unknown as ReturnType<typeof vi.fn>;
+const getDocumentHeadMock = vi.mocked(getDocumentHead);
 const discardAssetMock = discardAsset as unknown as ReturnType<typeof vi.fn>;
 const deleteDocumentMock = deleteDocument as unknown as ReturnType<typeof vi.fn>;
 const getDocumentDiffMock = getDocumentDiff as unknown as ReturnType<typeof vi.fn>;
@@ -388,6 +391,8 @@ async function openVersionHistory(user: ReturnType<typeof userEvent.setup>) {
 beforeEach(() => {
   localStorage.clear();
   getDocumentMock.mockReset();
+  getDocumentHeadMock.mockReset();
+  getDocumentHeadMock.mockResolvedValue({ kind: "document_head", uri: "akb://v/coll/notes/doc/hello.md", vault: "v", path: "notes/hello.md", current_commit: null, updated_at: null });
   discardAssetMock.mockReset();
   discardAssetMock.mockResolvedValue(undefined);
   deleteDocumentMock.mockReset();
@@ -941,6 +946,131 @@ describe("DocumentPage view toggle", () => {
     expect(await screen.findByRole("button", { name: "Edit" })).toBeInTheDocument();
   });
 
+  it.each(["during", "after"])("accepts a successful document save %s same-account access verification", async when => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    let current = makeDoc();
+    getDocumentMock.mockImplementation(async () => current);
+    let finish!: (saved: { current_commit: string }) => void;
+    updateDocumentMock.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    const view = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    const content = `${SAMPLE_CONTENT} accepted edit`;
+    await user.type(await screen.findByRole("textbox", { name: "Document body (markdown)" }), " accepted edit");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    view.rerenderAccess({ checking: true, revision: 0 });
+    if (when === "after") {
+      view.rerenderAccess({ checking: false, revision: 1 });
+      await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    }
+    current = makeDoc({ content, current_commit: UPDATED_COMMIT });
+    await act(async () => { finish({ current_commit: UPDATED_COMMIT }); });
+    if (when === "during") {
+      expect(view.queryClient.getQueryData(["document", "v", "notes/hello.md", undefined, CURRENT_USER.user_id, 1])).toBeUndefined();
+      view.rerenderAccess({ checking: false, revision: 1 });
+    }
+    expect(await screen.findByRole("button", { name: /^Edit$/ })).toBeVisible();
+    expect(updateDocumentMock).toHaveBeenCalledOnce();
+    expect(listDocumentEditDrafts(CURRENT_USER.user_id, "v", "v:notes/hello.md")).toHaveLength(0);
+    await waitFor(() => expect(view.queryClient.getQueryData(["document", "v", "notes/hello.md", undefined, CURRENT_USER.user_id, 1])).toMatchObject({ content, current_commit: UPDATED_COMMIT }));
+  });
+
+  it("keeps a failed save draft through same-account access verification", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    let fail!: (error: Error) => void;
+    updateDocumentMock.mockReturnValueOnce(new Promise((_resolve, reject) => { fail = reject; }));
+    const view = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    await user.type(await screen.findByRole("textbox", { name: "Document body (markdown)" }), " retained edit");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    view.rerenderAccess({ checking: true, revision: 0 });
+    view.rerenderAccess({ checking: false, revision: 1 });
+    await act(async () => { fail(new ApiError("Unavailable", 503, null)); });
+    expect(await screen.findByText("The server hit an error while saving. Please retry.")).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue(`${SAMPLE_CONTENT} retained edit`);
+  });
+
+  it.each(["during", "after"])("recovers a document conflict received %s same-account access verification", async when => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    let fail!: (error: Error) => void;
+    updateDocumentMock.mockReturnValueOnce(new Promise((_resolve, reject) => { fail = reject; }));
+    const view = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    await user.type(await screen.findByRole("textbox", { name: "Document body (markdown)" }), " retained edit");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    view.rerenderAccess({ checking: true, revision: 0 });
+    if (when === "after") {
+      view.rerenderAccess({ checking: false, revision: 1 });
+      await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    }
+    const reads = getDocumentMock.mock.calls.length;
+    getDocumentMock.mockResolvedValue(makeDoc({ content: "New remote body", current_commit: "r1" }));
+    await act(async () => { fail(new ApiError("Conflict", 409, { code: "conflict" })); });
+    if (when === "during") {
+      expect(getDocumentMock).toHaveBeenCalledTimes(reads);
+      view.rerenderAccess({ checking: false, revision: 1 });
+      await user.click(await screen.findByRole("button", { name: "Try loading latest" }));
+    }
+    expect(await screen.findByRole("textbox", { name: "Combined document body" })).toHaveValue("New remote body");
+    expect(screen.getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue(`${SAMPLE_CONTENT} retained edit`);
+  });
+
+  it.each(["account", "session"])("ignores an old document save after the %s changes", async boundary => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    let finish!: (saved: { current_commit: string }) => void;
+    updateDocumentMock.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    const view = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    await user.type(await screen.findByRole("textbox", { name: "Document body (markdown)" }), " old owner edit");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    if (boundary === "account") {
+      getDocumentMock.mockResolvedValue(makeDoc({ content: "New account body" }));
+      view.rerenderAccess({ user: { ...CURRENT_USER, user_id: "another-account" }, revision: 1 });
+      await waitFor(() => expect(screen.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue("New account body"));
+    } else localStorage.setItem("akb_token", "synthetic-new-session");
+    await act(async () => { finish({ current_commit: UPDATED_COMMIT }); });
+    expect(screen.queryByRole("button", { name: /^Edit$/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue(boundary === "account" ? "New account body" : `${SAMPLE_CONTENT} old owner edit`);
+  });
+
+  it("does not publish a save receipt into a new scope whose document read was denied", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    let finish!: (saved: { current_commit: string }) => void;
+    updateDocumentMock.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    const view = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    await user.type(await screen.findByRole("textbox", { name: "Document body (markdown)" }), " accepted edit");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    getDocumentMock.mockRejectedValue(new ApiError("Access denied", 403, null));
+    view.rerenderAccess({ checking: true, revision: 0 });
+    view.rerenderAccess({ checking: false, revision: 1 });
+    await waitFor(() => expect(view.queryClient.getQueryState(["document", "v", "notes/hello.md", undefined, CURRENT_USER.user_id, 1])?.status).toBe("error"));
+    const deniedKey = ["document", "v", "notes/hello.md", undefined, CURRENT_USER.user_id, 1];
+    const deniedSnapshot = view.queryClient.getQueryData(deniedKey);
+    expect(deniedSnapshot).toBeNull();
+    await act(async () => { finish({ current_commit: UPDATED_COMMIT }); });
+    expect(view.queryClient.getQueryData(deniedKey)).toBe(deniedSnapshot);
+  });
+
+  it("lets an authorized newer read replace the saved display snapshot", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    let current = makeDoc();
+    getDocumentMock.mockImplementation(async () => current);
+    updateDocumentMock.mockImplementation(async (_vault, _ref, patch) => {
+      current = { ...current, ...patch, current_commit: UPDATED_COMMIT };
+      return { current_commit: UPDATED_COMMIT };
+    });
+    const view = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    await user.type(await screen.findByRole("textbox", { name: "Document body (markdown)" }), " saved edit");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByRole("button", { name: /^Edit$/ });
+    current = makeDoc({ title: "Latest title", content: "Latest full read after save", current_commit: "newer-remote-revision" });
+    await act(async () => { await view.queryClient.refetchQueries({ queryKey: ["document", "v", "notes/hello.md"] }); });
+    expect(await screen.findByRole("heading", { name: "Latest title" })).toBeVisible();
+  });
+
   it("saves title, body and details through one revision-checked update", async () => {
     const user = userEvent.setup();
     let current = makeDoc({ summary: "Before", type: "note", status: "active", domain: "engineering" });
@@ -1026,12 +1156,157 @@ describe("DocumentPage view toggle", () => {
     getDocumentMock.mockResolvedValue(latest);
     updateDocumentMock.mockRejectedValueOnce(new ApiError("revision moved", 409, { code: "conflict" }));
     await user.click(screen.getByRole("button", { name: "Save changes" }));
-    await user.click(await screen.findByRole("button", { name: "Apply draft to latest" }));
+    await user.click(await screen.findByRole("button", { name: "Apply combined changes" }));
     expect(screen.getByRole("textbox", { name: "Document title" })).toHaveValue("New server title");
     expect(screen.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue("New server body");
     expect(screen.getByRole("textbox", { name: "Domain" })).toHaveValue("server domain");
     await user.click(screen.getByRole("button", { name: "Save changes" }));
     expect(updateDocumentMock).toHaveBeenLastCalledWith("v", "notes/hello.md", { summary: "Local summary", expected_commit: "bbbbbbbbbbbbb" });
+  });
+
+  it("notifies before saving, preserves the draft and opens comparison without a stale PATCH", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    const initial = makeDoc();
+    getDocumentHeadMock.mockResolvedValue({ kind: "document_head", uri: "akb://v/coll/notes/doc/hello.md", vault: "v", path: initial.path, current_commit: initial.current_commit, updated_at: null });
+    const view = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    const body = await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    await user.clear(body);
+    await user.type(body, "My draft");
+    const latest = makeDoc({ content: "Remote addition", current_commit: "r1" });
+    getDocumentMock.mockResolvedValue(latest);
+    // A full-document refresh must not be hidden by the earlier R0 head receipt.
+    await act(async () => { await view.queryClient.refetchQueries({ queryKey: ["document", "v", "notes/hello.md"] }); });
+    expect(await screen.findByText(/A newer version is available/)).toBeVisible();
+    expect(body).toHaveValue("My draft");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("dialog", { name: "Review document changes" })).toBeVisible();
+    expect(updateDocumentMock).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByRole("textbox", { name: "Document body (markdown)" })).toHaveValue("My draft");
+  });
+
+  it("releases an invalidated comparison read after same-account access verification", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    const view = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    const body = await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    await user.type(body, " local draft");
+    const latest = makeDoc({ content: "Remote body", current_commit: "r1" });
+    let finish!: (value: ReturnType<typeof makeDoc>) => void;
+    let signal!: AbortSignal;
+    getDocumentMock.mockImplementation((_vault, _ref, _version, options) => {
+      if (options?.preserveSession) {
+        signal = options.signal;
+        return new Promise(resolve => { finish = resolve; });
+      }
+      return Promise.resolve(latest);
+    });
+    getDocumentHeadMock.mockResolvedValue({ kind: "document_head", uri: "akb://v/coll/notes/doc/hello.md", vault: "v", path: "notes/hello.md", current_commit: "r1", updated_at: null });
+    act(() => { window.dispatchEvent(new Event("online")); });
+    await user.click(await screen.findByRole("button", { name: "Compare changes" }));
+    expect(await screen.findByRole("dialog", { name: "Review document changes" })).toBeVisible();
+    view.rerenderAccess({ checking: true, revision: 0 });
+    view.rerenderAccess({ checking: false, revision: 1 });
+    await act(async () => { finish(makeDoc({ content: "Stale proof response", current_commit: "stale" })); });
+    expect(signal.aborted).toBe(true);
+    await waitFor(() => expect(view.queryClient.getQueryState(["document", "v", "notes/hello.md", undefined, CURRENT_USER.user_id, 1])?.status).toBe("success"));
+    const dialog = await screen.findByRole("dialog", { name: "Review document changes" });
+    expect(within(dialog).queryByText("Stale proof response")).not.toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Try loading latest" })).toBeEnabled();
+    getDocumentMock.mockResolvedValue(latest);
+    await user.click(within(dialog).getByRole("button", { name: "Try loading latest" }));
+    const combined = await screen.findByRole("textbox", { name: "Combined document body" });
+    await user.clear(combined);
+    await user.type(combined, "Remote body with local draft");
+    await user.click(screen.getByRole("button", { name: "Apply combined changes" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(updateDocumentMock).toHaveBeenLastCalledWith("v", "notes/hello.md", expect.objectContaining({
+      content: "Remote body with local draft", expected_commit: "r1",
+    }));
+  });
+
+  it("updates the comparison after a failed latest read is retried", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    const body = await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    await user.type(body, " my change");
+    updateDocumentMock.mockRejectedValueOnce(new ApiError("moved", 409, { code: "conflict" }));
+    getDocumentMock.mockRejectedValueOnce(new Error("offline"));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("button", { name: "Try loading latest" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    getDocumentMock.mockResolvedValue(makeDoc({ content: "Recovered remote body", current_commit: "r2" }));
+    await user.click(screen.getByRole("button", { name: "Try loading latest" }));
+    expect(await screen.findByRole("textbox", { name: "Combined document body" })).toHaveValue("Recovered remote body");
+    await user.type(screen.getByRole("textbox", { name: "Combined document body" }), " my change");
+    await user.click(screen.getByRole("button", { name: "Apply combined changes" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(updateDocumentMock).toHaveBeenLastCalledWith("v", "notes/hello.md", expect.objectContaining({ expected_commit: "r2", content: "Recovered remote body my change" }));
+  });
+
+  it.each([401, 403, 404])("preserves the combined body, title and details through head status %s and transient retry", async status => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    getDocumentMock.mockResolvedValue(makeDoc({ summary: "Before" }));
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    await user.type(await screen.findByRole("textbox", { name: "Document body (markdown)" }), " my change");
+    await user.clear(screen.getByRole("textbox", { name: "Document title" }));
+    await user.type(screen.getByRole("textbox", { name: "Document title" }), "My title");
+    await user.clear(screen.getByRole("textbox", { name: "Summary" }));
+    await user.type(screen.getByRole("textbox", { name: "Summary" }), "My summary");
+    updateDocumentMock.mockRejectedValueOnce(new ApiError("moved", 409, { code: "conflict" }));
+    getDocumentMock.mockResolvedValue(makeDoc({ title: "Remote title", content: "Reviewed remote", summary: "Remote summary", current_commit: "r1" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    const combined = await screen.findByRole("textbox", { name: "Combined document body" });
+    await user.type(combined, " manually combined work");
+    await user.click(screen.getByRole("button", { name: "Use my title" }));
+    await user.click(screen.getByRole("button", { name: "Use my summary" }));
+    getDocumentHeadMock.mockRejectedValueOnce(new ApiError("Unavailable", status, null));
+    await act(async () => { window.dispatchEvent(new Event("online")); });
+    const dialog = screen.getByRole("dialog", { name: "Review document changes" });
+    expect(combined).toHaveValue("Reviewed remote manually combined work");
+    expect(within(dialog).getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save changes", hidden: true })).toBeDisabled();
+    await user.type(combined, " while offline");
+    getDocumentHeadMock.mockRejectedValueOnce(new ApiError("Unavailable", 503, null));
+    await user.click(within(dialog).getByRole("button", { name: "Check access" }));
+    expect(within(dialog).getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save changes", hidden: true })).toBeDisabled();
+    expect(combined).toHaveValue("Reviewed remote manually combined work while offline");
+    getDocumentHeadMock.mockResolvedValue({ kind: "document_head", uri: "akb://v/coll/notes/doc/hello.md", vault: "v", path: "notes/hello.md", current_commit: "r1", updated_at: null });
+    await user.click(within(dialog).getByRole("button", { name: "Check access" }));
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Apply combined changes" })).toBeEnabled());
+    expect(within(dialog).getByRole("textbox", { name: "Combined title" })).toHaveValue("My title");
+    await user.click(within(dialog).getByRole("button", { name: "Apply combined changes" }));
+    expect(screen.getByRole("textbox", { name: "Summary" })).toHaveValue("My summary");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(updateDocumentMock).toHaveBeenLastCalledWith("v", "notes/hello.md", expect.objectContaining({
+      expected_commit: "r1", title: "My title", summary: "My summary", content: "Reviewed remote manually combined work while offline",
+    }));
+  });
+
+  it("keeps a displayed comparison revision even when a newer head arrives", async () => {
+    const user = userEvent.setup();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    const body = await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    await user.type(body, " my change");
+    updateDocumentMock.mockRejectedValueOnce(new ApiError("moved", 409, { code: "conflict" }));
+    getDocumentMock.mockResolvedValue(makeDoc({ content: "Reviewed body", current_commit: "r1" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    const result = await screen.findByRole("textbox", { name: "Combined document body" });
+    await user.type(result, " my change");
+    getDocumentHeadMock.mockResolvedValue({ kind: "document_head", uri: "akb://v/coll/notes/doc/hello.md", vault: "v", path: "notes/hello.md", current_commit: "r2", updated_at: null });
+    act(() => { window.dispatchEvent(new Event("online")); });
+    expect(await screen.findByText(/The server changed again/)).toBeVisible();
+    expect(result).toHaveValue("Reviewed body my change");
+    await user.click(screen.getByRole("button", { name: "Apply combined changes" }));
+    // The known R2 prevents a stale save; it does not substitute its token.
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(updateDocumentMock).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("dialog", { name: "Review document changes" })).toBeVisible();
   });
 
   it("uses the automatic reading measure in previews without exposing a width preference", async () => {
@@ -1882,7 +2157,7 @@ describe("DocumentPage view toggle", () => {
     expect(screen.getByRole("textbox", { name: "Document title" })).toHaveValue("DocTitle");
   });
 
-  it("shows a three-way OCC conflict, preserves the image draft, and rebases only explicitly", async () => {
+  it("shows an OCC comparison, preserves the image draft, and requires a combined body", async () => {
     const user = userEvent.setup();
     getVaultInfoMock.mockResolvedValue({ role: "owner" });
     let serverDoc = makeDoc();
@@ -1920,14 +2195,17 @@ describe("DocumentPage view toggle", () => {
     );
     expect(discardAssetMock).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole("button", { name: "Apply draft to latest" }));
+    expect(screen.getByRole("button", { name: "Apply combined changes" })).toBeDisabled();
+    await user.clear(screen.getByRole("textbox", { name: "Combined document body" }));
+    await user.type(screen.getByRole("textbox", { name: "Combined document body" }), "Server changed body\nLocal image draft");
+    await user.click(screen.getByRole("button", { name: "Apply combined changes" }));
     await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() =>
       expect(updateDocumentMock).toHaveBeenLastCalledWith(
         "v",
         "notes/hello.md",
-        expect.objectContaining({ expected_commit: "server-commit" }),
+        expect.objectContaining({ expected_commit: "server-commit", content: "Server changed body\nLocal image draft" }),
       ),
     );
     expect(discardAssetMock).not.toHaveBeenCalled();

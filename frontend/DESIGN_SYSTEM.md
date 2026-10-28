@@ -1419,6 +1419,26 @@ an `sr-only` summary, never the only signal.
   unsaved Cancel retains its confirmation. Same-account access verification must
   preserve the live editor draft even if a permission-scoped query remounts it;
   switching accounts resets local editor state.
+  Active editors check the lightweight document head only while visible. A
+  newer revision is a polite status near Save changes; it never replaces the
+  draft or steals focus. Compare changes opens a bounded, scrollable dialog
+  showing the original, draft and immutable server snapshot. Independent
+  fields combine; overlapping body changes require explicit composition.
+  Apply combined changes updates the editor, not the server. The next save
+  still checks the reviewed revision. Cancelling preserves the original draft;
+  access loss disables saving without navigating away from recovery text.
+  Own the composed result and field choices in the editor comparison, not its
+  presentation lifetime. Preserve them through Head access errors and view
+  remounts. Disable Apply and reload, and offer Check access without resetting the
+  candidate. Transient failures never clear a known access failure; a successful
+  scoped check restores those actions. An explicitly confirmed comparison reload
+  disables result inputs and field choices until its read finishes, so edits
+  cannot race with replacement of the reviewed snapshot.
+  Same-owner foreground access checks hide or disable recovery, never delete
+  its composition. Reader availability is not proof of Guide owner capability;
+  a rejected write stays blocked until fresh role verification succeeds. Save
+  acknowledgments belong to the document/account/session rather than a read
+  verification counter; never populate an unverified private read cache.
   Full-viewer Vault links ask before leaving unsaved edits and keep the existing
   local-draft recovery behavior. Keep editing is always available; navigation
   cannot abandon an active save or image upload. Modified/new-tab link gestures

@@ -129,6 +129,7 @@ from app.models.document import (
     BrowseContext,
     BrowseItem,
     BrowseResponse,
+    DocumentHeadResponse,
     DocumentPutRequest,
     DocumentPutResponse,
     DocumentResponse,
@@ -833,6 +834,23 @@ class DocumentService:
         )
 
     # ── Get ───────────────────────────────────────────────────
+
+    async def get_head(self, vault: str, doc_ref: str) -> DocumentHeadResponse:
+        """Read the live catalog token without Git, body hashes, or cache writes."""
+        vault_repo, doc_repo, _ = await self._repos()
+        vault_id = await vault_repo.get_id_by_name(vault)
+        if not vault_id:
+            raise NotFoundError("Vault", vault)
+        row = await doc_repo.find_by_ref(vault_id, doc_ref)
+        if not row:
+            raise NotFoundError("Document", doc_ref)
+        return DocumentHeadResponse(
+            uri=doc_uri(row["vault_name"], row["path"]),
+            vault=row["vault_name"],
+            path=row["path"],
+            current_commit=row["current_commit"],
+            updated_at=row["updated_at"],
+        )
 
     async def get(self, vault: str, doc_ref: str) -> DocumentResponse:
         vault_repo, doc_repo, _ = await self._repos()

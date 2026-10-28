@@ -718,6 +718,10 @@ akb_put(vault="eng", collection="decisions", title="Adopt gRPC",
 
 ## Returns
 Full document: title, content, metadata (type, tags, status, created_by, dates), relations.
+`current_commit` is the revision for this read; keep it with the original base
+and any draft composed from that base. Pass it as `expected_commit` for a
+whole-body update or `base_commit` for a revision-pinned exact-text edit.
+`content_hash` is an alternative body-only condition for `akb_update`.
 
 ## Examples
 ```
@@ -741,8 +745,23 @@ blank or malformed tokens are invalid arguments.
 `expected_commit` protects the exact revision. A body hash protects only body
 equality: metadata-only changes and intermediate A→B→A body changes may pass.
 Use the revision for a combined body/metadata change. On conflict, read and
-review/merge the latest document; never fetch a fresh token solely to resend
-an already-composed stale body. No automatic merge or force overwrite occurs.
+review the latest document while retaining the original base and local draft.
+Reapply the original intent to the latest content, preserving concurrent
+changes, then save the reviewed composed draft with that latest read's token.
+Never replace only the token on an already-composed stale body. No automatic
+merge, blind retry, global URI-to-revision cache, or force overwrite occurs.
+
+## Conflict recovery
+
+1. Keep the original base, its `current_commit`, and the unsaved local draft.
+2. Call `akb_get(uri)` again for the complete latest document. Reading latest
+   alone does not merge the old draft.
+3. Compare original base, local draft, and latest. Reapply only the intended
+   changes to latest while retaining other writers' changes. Resolve overlapping
+   body or metadata edits explicitly; do not resend unchanged old fields.
+4. Submit the reviewed composed body as `content`, with
+   `expected_commit=latest.current_commit`. If it conflicts again, retain that
+   draft and repeat review against another latest read; do not retry blindly.
 
 ## Parameters
 | Param | Required | Description |
@@ -804,11 +823,16 @@ or set `replace_all=true` to replace every occurrence.
 For an inline image, upload it first with `akb_put_image`, then use the exact
 returned `markdown` as part of `new_string`. Pass the `current_commit` returned
 by `akb_get` as `base_commit` when concurrent writers are possible.
+On a revision conflict, retain the original base and intended replacement,
+read latest with `akb_get`, and review the surrounding context before deriving
+a new exact-text edit with that read's `base_commit`. Never replace only the
+token to retry the same edit blindly.
 
 ## Error Handling
 Errors return `error: "edit_failed"` with a message explaining:
 - `old_string cannot be empty`
-- `old_string not found` — fetch fresh content and retry
+- `old_string not found` — retain the intended change, read latest, and review
+  its context before composing a new exact-text edit
 - `old_string appears N times` — add context or set replace_all=true
 
 ## Examples

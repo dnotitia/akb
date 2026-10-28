@@ -124,6 +124,17 @@ class DocumentEditRequest(VersionedDocumentRequest):
     base_commit: RevisionToken | None = None
 
 
+class DocumentHeadResponse(BaseModel):
+    """Live document metadata for revision checks, without reading its body."""
+
+    kind: Literal["document_head"] = "document_head"
+    uri: str
+    vault: str
+    path: str
+    current_commit: str | None = None
+    updated_at: datetime | None = None
+
+
 class DocumentResponse(BaseModel):
     """Response for a single document. Internal IDs are never exposed — `uri`
     is the sole identifier for the resource."""
