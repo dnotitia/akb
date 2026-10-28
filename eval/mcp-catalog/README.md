@@ -1,6 +1,6 @@
 # MCP tool catalog benchmark
 
-This source-blind benchmark compares the baseline and mixed MCP catalogs using
+This source-blind benchmark compares the baseline and candidate MCP catalogs using
 the same task contracts, resettable fixture, provider setup, and paired run
 ledger. The benchmark evaluates behavior through logical operations and state
 outcomes; task prompts do not name MCP tools.
@@ -142,9 +142,6 @@ terminal outcome. The paired ledger is restored once from its shared parent
 receipt, and the child records parent artifact/checkpoint hashes plus any
 accounting residual separately from per-trial receipts. It does not assign an
 unattributed residual to a trial.
-
-`--selection` runs an approved source-bound subset with its own operator plan
-and resume validation. It does not use the full-resume input contract above.
 
 Standalone `run --arm ...` is for diagnostics. Independently run arms do not
 have shared execution evidence and produce an `inconclusive` comparison.

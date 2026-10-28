@@ -67,6 +67,7 @@ from .execution import (
     validate_model_configuration,
     worst_case_cost,
 )
+from .historical_compare import compare_historical_artifacts, has_historical_shape
 from .runtime import RuntimeContractError, RuntimeDescriptor, RuntimeFixture, StateObservation
 from .statistics import InconclusiveBootstrap, paired_cluster_bca
 from .timing import TimingCategory, TimingTracker
@@ -3298,6 +3299,12 @@ def _artifact_integrity_error(artifact: dict[str, Any], arm: ArmName) -> str | N
 def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     """Compare a sealed paired run using only the preregistered BCa gates."""
 
+    if has_historical_shape(baseline) or has_historical_shape(candidate):
+        return compare_historical_artifacts(
+            baseline,
+            candidate,
+            current_hash_builder=_build_artifact_hash_input,
+        )
     for artifact, arm in ((baseline, cast(ArmName, "baseline")), (candidate, cast(ArmName, "candidate"))):
         integrity_error = _artifact_integrity_error(artifact, arm)
         if integrity_error is not None:
