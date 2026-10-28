@@ -3522,20 +3522,17 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         cell_success_clear_failure: dict[str, dict[str, Any]] = {}
         for model_class, transport in cells:
             cell = (model_class, transport)
-            expected_pairs = sorted({
-                task_pairs[outcome.task_id]
-                for outcome in baseline_outcomes
-                if (outcome.model_class, outcome.transport) == cell
-            })
-            expected_count = 18 if transport == "http" else 20
-            if len(expected_pairs) != expected_count:
-                raise InconclusiveBootstrap(f"{model_class}:{transport} has an incomplete cluster sample")
+            expected_pairs = list(dict.fromkeys(
+                task.pair_id for task in tasks if transport in task.fixture.transports
+            ))
             base_values = _cluster_samples(
                 baseline_outcomes, task_pairs=task_pairs, metric="success", cell=cell
             )
             candidate_values = _cluster_samples(
                 candidate_outcomes, task_pairs=task_pairs, metric="success", cell=cell
             )
+            if set(base_values) != set(expected_pairs) or set(candidate_values) != set(expected_pairs):
+                raise InconclusiveBootstrap(f"{model_class}:{transport} has an incomplete cluster sample")
             base_cell_values = [base_values[pair_id] for pair_id in expected_pairs]
             candidate_cell_values = [candidate_values[pair_id] for pair_id in expected_pairs]
             cell_key = f"{model_class}:{transport}"

@@ -326,3 +326,46 @@ def test_state_check_reason_is_diagnostic_but_semantics_remain_verified() -> Non
         result = compare_artifacts(baseline, candidate)
         assert result["verdict"] == "inconclusive"
         assert "state_checks" in result["gate"]["reasons"][0]
+
+
+def test_compare_uses_registered_clusters_for_each_transport(monkeypatch) -> None:
+    import mcp_catalog.runner as runner
+    import paired_artifact_factory as factory
+    from mcp_catalog.contracts import BenchmarkRunManifest
+
+    selected = load_run_manifest(ROOT / "config" / "unified-read.json").model_dump(mode="json")
+    selected["candidate_read_routes"] = {}
+    selected["public_operations"] = []
+    manifest = BenchmarkRunManifest.model_validate(selected)
+    tasks = load_task_corpus(ROOT / "corpus" / "unified-read-tasks.json")
+    monkeypatch.setattr(factory, "load_run_manifest", lambda _path: manifest)
+    monkeypatch.setattr(factory, "load_task_corpus", lambda _path: tasks)
+    baseline, candidate = factory.complete_paired_artifacts()
+    observed_sizes = []
+
+    def interval(base, candidate, **kwargs):
+        observed_sizes.append((len(base), len(candidate)))
+        return {"lower_bound": 0.0, "upper_bound": 0.0}
+
+    monkeypatch.setattr(runner, "paired_cluster_bca", interval)
+    result = runner.compare_artifacts(baseline, candidate)
+    assert "incomplete cluster sample" not in str(result.get("gate"))
+    assert observed_sizes.count((5, 5)) == 4
+    assert observed_sizes.count((6, 6)) >= 6
+
+
+def test_compare_full_plan_keeps_registered_transport_clusters(monkeypatch) -> None:
+    import mcp_catalog.runner as runner
+
+    baseline, candidate = complete_paired_artifacts()
+    observed_sizes = []
+
+    def interval(base, candidate, **kwargs):
+        observed_sizes.append((len(base), len(candidate)))
+        return {"lower_bound": 0.0, "upper_bound": 0.0}
+
+    monkeypatch.setattr(runner, "paired_cluster_bca", interval)
+    result = runner.compare_artifacts(baseline, candidate)
+    assert "incomplete cluster sample" not in str(result.get("gate"))
+    assert observed_sizes.count((18, 18)) == 4
+    assert observed_sizes.count((20, 20)) >= 6
