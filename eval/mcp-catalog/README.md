@@ -175,8 +175,10 @@ outline-only inspection, full-read/history control, read-only authorization,
 and the stdio file workflow. The corpus has 176 trials (88 per arm) across the two
 models, two repeats, and the applicable transports. Both arms receive the
 complete catalog; the candidate maps the former section reader to `akb_get`
-using its `mode` selector. A full read is an acceptable alternative for the
-outline task. The independent state oracles are identical for both arms.
+using its `mode` selector. A full read of the same document can also satisfy
+an outline or section-information goal. Additional reads are observed through
+usage and overshoot; wrong targets and actual goal violations remain errors.
+The independent state oracles are identical for both arms.
 This selected sample cannot establish noninferiority for the entire corpus.
 The existing BCa, provider, budget, and paired-order contracts remain in force.
 

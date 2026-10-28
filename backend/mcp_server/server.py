@@ -3,7 +3,7 @@
 Provides MCP tools for:
 - akb_put/get/update/delete: Document CRUD
 - akb_browse: Unified vault content view (documents, tables, files)
-- akb_search/drill_down: Search and read documents
+- akb_search: Search documents; akb_get also reads sections and outlines
 - akb_link/unlink: Create/remove cross-type relations (doc↔table↔file)
 - akb_relations/graph: Query the knowledge graph
 - akb_create_table/sql: Structured data tables
@@ -1031,7 +1031,8 @@ async def _read_sections(args: dict, uid: str, mode: str) -> dict:
 
 def _sub_sections_of(section_paths: list[str], parent: str | None) -> list[str]:
     """Return the immediate children of ``parent`` that appear in
-    ``section_paths``. The ``section`` argument to ``drill_down`` is
+    ``section_paths``. The ``section`` argument to the internal
+    ``search_service.drill_down`` is
     an ILIKE substring (``section_path ILIKE '%' || $section || '%'``),
     not an exact match — so the returned chunks may also include the
     parent heading itself plus deeper grandchildren. We collapse
