@@ -366,13 +366,16 @@ async def test_authorization_arguments_use_public_schema_defaults_and_keep_core_
 
 @pytest.mark.asyncio
 async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_bypass() -> None:
-    _manifest, tasks = _loaded()
+    manifest, tasks = _loaded()
     recovery_task = next(task for task in tasks if task.id == "invalid-recovery-en")
     auth_task = next(task for task in tasks if task.id == "authorization-readonly-en")
     recovery_recorder = ToolCallRecorder(
         operation_map={"create": ["akb_create_vault"]},
         secrets=(),
         task=recovery_task,
+        public_operations=manifest.public_operations,
+        arm="baseline",
+        transport="http",
     )
     recovery_recorder.set_input_schemas(
         {"akb_create_vault": {"properties": {"public_access": {"default": "none"}}}}
@@ -404,6 +407,9 @@ async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_b
         recovery_recorder.operation_map,
         (),
         input_schemas=recovery_recorder.input_schemas,
+        public_operations=manifest.public_operations,
+        arm="baseline",
+        transport="http",
     )
     recovery_outcome = TrialOutcome(
         task_id=recovery_task.id,
@@ -429,7 +435,10 @@ async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_b
     assert recovery_outcome.tool_outcome_match is True
     assert recovery_outcome.success is True
 
-    success_recorder = ToolCallRecorder(operation_map={"create": ["akb_put"]}, secrets=())
+    success_recorder = ToolCallRecorder(
+        operation_map={"create": ["akb_put"]}, secrets=(),
+        public_operations=manifest.public_operations, arm="baseline", transport="http",
+    )
 
     async def successful_write(_name: str, _arguments: dict[str, object]) -> dict[str, str]:
         return {"uri": "akb://catalog-bench-vault-authorization/doc/created"}
@@ -455,6 +464,9 @@ async def test_public_mcp_envelopes_score_recovery_sequence_and_reject_success_b
         success_recorder.calls,
         success_recorder.operation_map,
         (),
+        public_operations=manifest.public_operations,
+        arm="baseline",
+        transport="http",
     )
     success_outcome = TrialOutcome(
         task_id=auth_task.id,
