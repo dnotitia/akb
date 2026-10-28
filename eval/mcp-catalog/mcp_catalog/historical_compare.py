@@ -826,7 +826,7 @@ def _rescore_arm(
             outcome.finalize(task, _observations(outcome.state_observations_before), _observations(outcome.state_observations_after))
         except (TypeError, ValueError, KeyError) as exc:
             raise HistoricalArtifactError(f"historical {arm} trial cannot be rescored: {type(exc).__name__}") from exc
-        invalid_reason = _invalid_condition_reason(task, outcome) if artifact.get("selection") is not None else None
+        invalid_reason = _invalid_condition_reason(task, outcome)
         condition_error_kinds = _condition_error_kinds(task, outcome, invalid_reason)
         model_error_kinds = [kind for kind in outcome.trial_error_kinds if kind not in set(condition_error_kinds)]
         model_error = bool(model_error_kinds)
@@ -839,7 +839,7 @@ def _rescore_arm(
             totals["route_evidence_failures"] += 1
         totals["recorded_trial_error_trials"] += bool(recorded["recorded_trial_error"])
         totals["recorded_execution_error_trials"] += recorded["recorded_execution_error"] is not None
-        totals["final_successes"] += outcome.success
+        totals["final_successes"] += outcome.success and invalid_reason is None
         totals["observed_trial_error_trials"] += outcome.trial_error
         totals["rescored_trial_error_trials"] += model_error
         totals["invalid_condition_trials"] += invalid_reason is not None
@@ -847,7 +847,8 @@ def _rescore_arm(
         totals["evaluated_trials"] += invalid_reason is None
         totals["task_error_trials"] += model_error and invalid_reason is None
         totals["unsafe_mutation_trials"] += outcome.unsafe_mutation
-        parsed.append(outcome)
+        if invalid_reason is None:
+            parsed.append(outcome)
         rescored.append(
             {
                 "model_class": model_class,

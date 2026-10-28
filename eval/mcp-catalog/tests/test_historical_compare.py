@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import sys
 from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from mcp_catalog import cli
-from mcp_catalog.contracts import ModelSpec, hash_json
+from mcp_catalog.contracts import ModelSpec, TaskManifest, hash_json
 from mcp_catalog.execution import registered_route_target
 from mcp_catalog.runner import _build_artifact_hash_input
 from paired_artifact_factory import complete_paired_artifacts
@@ -46,7 +47,11 @@ def _historical_seal(artifact: dict[str, Any]) -> None:
     artifact["artifact_hash"] = hash_json(hash_input)
 
 
-def _historical_pair(*, with_selection: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
+def _historical_pair(
+    *,
+    with_selection: bool = True,
+    include_invalid_condition: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     baseline, candidate = complete_paired_artifacts()
     artifacts = {"baseline": baseline, "candidate": candidate}
     source_revisions = {"baseline": "a" * 40, "candidate": "b" * 40}
@@ -74,6 +79,10 @@ def _historical_pair(*, with_selection: bool = True) -> tuple[dict[str, Any], di
         plan = artifact["artifact_hash_input"]["trial_order"]
         count = (13 if arm == "baseline" else 10) if with_selection else len(plan)
         chosen = plan[:count]
+        if with_selection and include_invalid_condition:
+            condition_row = next(item for item in plan if item["task_id"] == "history-provenance-en")
+            if condition_row not in chosen:
+                chosen = [*chosen[:-1], condition_row]
         identities = {
             (item["model_class"], item["transport"], item["task_id"], item["repeat_index"])
             for item in chosen
@@ -231,6 +240,47 @@ def _historical_pair(*, with_selection: bool = True) -> tuple[dict[str, Any], di
     return baseline, candidate
 
 
+def _hide_preregistered_revision_body(pair: tuple[dict[str, Any], dict[str, Any]]) -> None:
+    task_id = "history-provenance-en"
+    for artifact in pair:
+        task = next(item for item in artifact["task_contracts"] if item["id"] == task_id)
+        body = next(
+            attempt["arguments"]["content"]
+            for attempt in task["expected_material_attempts"]
+            if attempt["logical_operation"] in {"create", "update"}
+            and isinstance(attempt["arguments"].get("content"), str)
+        )
+        task["prompt"] = task["prompt"].replace(body, "omitted revision body", 1)
+        corpus = [TaskManifest.model_validate(item).model_dump(mode="json") for item in artifact["task_contracts"]]
+        artifact["task_corpus_hash"] = hash_json(corpus)
+        artifact["pre_smoke_seal_inputs"]["task_corpus_hash"] = artifact["task_corpus_hash"]
+        _historical_seal(artifact)
+    seal_hash = hash_json({artifact["arm"]: hash_json(artifact["pre_smoke_seal_inputs"]) for artifact in pair})
+    for artifact in pair:
+        artifact["pre_smoke_seal_hash"] = seal_hash
+        _historical_seal(artifact)
+
+
+def _assert_raw_evidence_preserved(summary: dict[str, Any], artifact: dict[str, Any]) -> None:
+    rows = [row for run in artifact["runs"].values() for row in run["trials"]]
+    rescored_by_hash = {row["record_sha256"]: row for row in summary["rescored_trials"]}
+    for field in ("model_requests", "input_tokens", "output_tokens", "total_tokens"):
+        assert summary[field] == sum(row[field] for row in rows)
+    assert Decimal(summary["cost_usd"]) == sum((Decimal(str(row["cost_usd"])) for row in rows), Decimal("0"))
+    assert set(rescored_by_hash) == {hash_json(row) for row in rows}
+    for raw in rows:
+        rescored = rescored_by_hash[hash_json(raw)]
+        for field in ("model_requests", "input_tokens", "output_tokens", "total_tokens"):
+            assert rescored[field] == raw[field]
+        assert Decimal(rescored["cost_usd"]) == Decimal(str(raw["cost_usd"]))
+        assert rescored["recorded_success"] == raw["success"]
+        assert rescored["recorded_trial_error"] == raw["trial_error"]
+        assert rescored["recorded_trial_error_kinds"] == raw["trial_error_kinds"]
+        assert rescored["recorded_execution_error"] == raw["error"]
+    assert summary["observed_trial_error_trials"] == sum(row["observed_trial_error"] for row in summary["rescored_trials"])
+    assert summary["rescored_trial_error_trials"] == sum(row["final_trial_error"] for row in summary["rescored_trials"])
+
+
 def _invoke_compare(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pair: tuple[dict[str, Any], dict[str, Any]]) -> dict[str, Any]:
     baseline, candidate = pair
     baseline_path = tmp_path / "baseline.json"
@@ -265,7 +315,9 @@ def _reseal_manifest_change(pair: tuple[dict[str, Any], dict[str, Any]]) -> None
 
 
 def test_compare_cli_rescores_selected_historical_artifacts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    report = _invoke_compare(monkeypatch, tmp_path, _historical_pair())
+    pair = _historical_pair(include_invalid_condition=True)
+    _hide_preregistered_revision_body(pair)
+    report = _invoke_compare(monkeypatch, tmp_path, pair)
 
     assert report["verdict"] == "inconclusive"
     assert report["observed_historical_diagnostics"]["classification"] == "historical_diagnostic_only"
@@ -278,10 +330,28 @@ def test_compare_cli_rescores_selected_historical_artifacts(monkeypatch: pytest.
     assert arms["candidate"]["cost_usd"] != "0"
     assert len(arms["baseline"]["rescored_trials"]) == 13
     assert all("recorded_trial_error" in row and "final_success" in row for row in arms["baseline"]["rescored_trials"])
+    for arm in ("baseline", "candidate"):
+        summary = arms[arm]
+        evaluated = [row for row in summary["rescored_trials"] if row["evaluated"]]
+        assert summary["excluded_invalid_condition_trials"] > 0
+        assert summary["efficiency_metrics"]["trials"] == summary["evaluated_trials"]
+        assert summary["final_successes"] == sum(row["final_success"] for row in evaluated)
+        assert summary["efficiency_metrics"]["success_rate"] == pytest.approx(
+            sum(row["final_success"] for row in evaluated) / len(evaluated)
+        )
+        _assert_raw_evidence_preserved(summary, pair[0 if arm == "baseline" else 1])
+    baseline_rows = arms["baseline"]["rescored_trials"]
+    for row in (
+        next(row for row in baseline_rows if row["evaluated"] and row["observed_trial_error"]),
+        next(row for row in baseline_rows if not row["evaluated"] and row["observed_trial_error"]),
+    ):
+        assert row["final_trial_error"] is True
 
 
 def test_compare_cli_rescores_full_historical_pair_without_adoption(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    report = _invoke_compare(monkeypatch, tmp_path, _historical_pair(with_selection=False))
+    pair = _historical_pair(with_selection=False)
+    _hide_preregistered_revision_body(pair)
+    report = _invoke_compare(monkeypatch, tmp_path, pair)
 
     assert report["verdict"] == "inconclusive"
     diagnostics = report["observed_historical_diagnostics"]
@@ -292,6 +362,16 @@ def test_compare_cli_rescores_full_historical_pair_without_adoption(monkeypatch:
     assert diagnostics["arms"]["candidate"]["observed_trials"] == 304
     assert diagnostics["arms"]["baseline"]["model_requests"] > 0
     assert diagnostics["arms"]["candidate"]["cost_usd"] != "0"
+    for arm_index, arm in enumerate(("baseline", "candidate")):
+        summary = diagnostics["arms"][arm]
+        evaluated = [row for row in summary["rescored_trials"] if row["evaluated"]]
+        assert summary["excluded_invalid_condition_trials"] > 0
+        assert summary["efficiency_metrics"]["trials"] == summary["evaluated_trials"]
+        assert summary["final_successes"] == sum(row["final_success"] for row in evaluated)
+        assert summary["efficiency_metrics"]["success_rate"] == pytest.approx(
+            sum(row["final_success"] for row in evaluated) / len(evaluated)
+        )
+        _assert_raw_evidence_preserved(summary, pair[arm_index])
 
 
 @pytest.mark.parametrize(
