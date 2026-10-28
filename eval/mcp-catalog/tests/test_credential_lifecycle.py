@@ -209,3 +209,46 @@ async def test_reset_stale_pat_403_is_idempotent_but_active_pat_403_fails() -> N
         await active.cleanup(fixture)
     assert active.minted_tokens == [("active-token", "active-token-id")]
     await fixture.close()
+
+
+def test_model_input_redaction_survives_evidence_serialization(monkeypatch, tmp_path):
+    import hashlib
+    import json
+
+    from pydantic_ai.messages import InstructionPart, ModelRequest, UserPromptPart
+
+    from mcp_catalog.evidence import write_json
+    from mcp_catalog.execution import _model_input_evidence_for
+
+    username = "synthetic-user-marker"
+    password = "synthetic-password-marker"  # pragma: allowlist secret
+    token = "synthetic-pat-marker"
+    monkeypatch.setenv("AKB_E2E_USERNAME", username)
+    monkeypatch.setenv("AKB_E2E_PASSWORD", password)
+    monkeypatch.setenv("AKB_E2E_PAT", token)
+    resolver = _resolver()
+    instructions = "Synthetic server instructions."
+    messages = [ModelRequest(parts=[InstructionPart(content=instructions), UserPromptPart(content=f"{username} {password} {token}")])]
+    evidence = _model_input_evidence_for(messages, instructions, 1, secrets=resolver.secrets_for("default"))
+    path = tmp_path / "evidence.json"
+    write_json(path, {"evidence": evidence.model_dump(mode="json")}, resolver.secret_values())
+    first = path.read_text()
+    saved = json.loads(first)["evidence"]
+    assert hashlib.sha256(saved["model_input_canonical_json"].encode()).hexdigest() == saved["model_input_sha256"]
+    assert saved == evidence.model_dump(mode="json")
+    assert not any(value in first for value in (username, password, token))
+    write_json(path, json.loads(first), resolver.secret_values())
+    assert path.read_text() == first
+
+
+def test_capture_secrets_include_all_issued_tokens_and_require_profile(monkeypatch):
+    monkeypatch.setenv("AKB_E2E_USERNAME", "synthetic-username")
+    monkeypatch.setenv("AKB_E2E_PASSWORD", "synthetic-password")
+    resolver = _resolver()
+    resolver.tokens = {"default": "current-token", "read_only": "other-token"}
+    resolver.issued_tokens = {"previous-token"}
+    assert set(resolver.secrets_for("default")) == set(resolver.secret_values())
+    assert {"current-token", "other-token", "previous-token"} <= set(resolver.secrets_for("default"))
+    monkeypatch.delenv("MCP_BENCH_AUTHORIZATION_PAT", raising=False)
+    with pytest.raises(NeedsUserInput):
+        resolver.secrets_for("authorization")
