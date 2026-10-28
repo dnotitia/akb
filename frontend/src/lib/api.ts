@@ -353,7 +353,9 @@ export async function throwJsonApiError(res: Response): Promise<never> {
       body.detail,
     );
   }
-  throw new ApiError(typeof body?.error === "string" ? body.error : typeof body?.detail === "string" ? body.detail : `${res.status} ${res.statusText}`, res.status, body?.detail ?? (typeof body?.code === "string" ? body : null));
+  // The canonical envelope can retain a legacy string in `detail`. Its
+  // top-level code still owns classification (for example, OCC recovery).
+  throw new ApiError(typeof body?.error === "string" ? body.error : typeof body?.detail === "string" ? body.detail : `${res.status} ${res.statusText}`, res.status, typeof body?.code === "string" ? body : body?.detail ?? null);
 }
 
 async function api<T>(

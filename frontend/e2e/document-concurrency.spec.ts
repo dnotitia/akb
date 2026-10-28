@@ -439,6 +439,89 @@ test.describe("document concurrency against the real API", () => {
     });
   }
 
+  for (const saveSharedDraft of [true, false]) {
+    test(`retains a shared pending image until the other tab ${saveSharedDraft ? "saves" : "discards"} its restored draft`, async ({ page, request }) => {
+      const fixture = await setup(page, request);
+      await page.getByRole("button", { name: /^Editor mode:/ }).click();
+      await page.getByRole("menuitemradio", { name: "Visual", exact: true }).click();
+      const upload = page.waitForResponse(response => response.request().method() === "POST" && response.url().includes("/api/v1/assets/"));
+      await page.getByTestId("markdown-editor").locator('input[type="file"]').setInputFiles({
+        name: "shared-draft.png", mimeType: "image/png",
+        buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+      });
+      const uploaded = await upload;
+      expect(uploaded.status()).toBe(201);
+      const image = await uploaded.json();
+      await expect(page.getByTestId("markdown-editor").locator('img[alt="shared-draft"]')).toBeVisible();
+      await expect(page.getByText("Draft saved locally", { exact: true })).toBeVisible();
+
+      const second = await page.context().newPage();
+      try {
+        await second.goto("/vault/" + fixture.name + "/doc/" + encodeURIComponent(fixture.document.path) + "?view=edit");
+        await expect(second.getByText("Local draft restored", { exact: true })).toBeVisible();
+        await second.getByRole("button", { name: /^Editor mode:/ }).click();
+        await second.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();
+        const source = second.getByRole("textbox", { name: "Document body (markdown)" });
+        await expect(source).toHaveValue(new RegExp(image.id));
+        let retained = await source.inputValue();
+        if (saveSharedDraft) {
+          retained += "\nSecond tab retains this image\n";
+          await source.fill(retained);
+          await expect(second.getByText("Draft saved locally", { exact: true })).toBeVisible();
+        }
+        const remote = await request.patch(fixture.path, { headers: fixture.headers, data: {
+          content: "Remote text without image\n", expected_commit: fixture.document.current_commit,
+        } });
+        expect(remote.ok()).toBeTruthy();
+        await page.getByRole("button", { name: "Check for changes" }).click();
+        await page.getByRole("button", { name: "Compare changes" }).click();
+        await page.getByRole("textbox", { name: "Combined document body" }).fill("Remote text without image\nFirst tab completed\n");
+        await page.getByRole("button", { name: "Apply combined changes" }).click();
+        const receipt = page.waitForResponse(response => response.request().method() === "PATCH" && new URL(response.url()).pathname === fixture.path);
+        await page.getByRole("button", { name: "Save changes" }).click();
+        const saved = await receipt;
+        expect(saved.ok()).toBeTruthy();
+        const revision = (await saved.json()).current_commit;
+        await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
+        await page.waitForLoadState("networkidle");
+        const metadata = "/api/v1/assets/" + fixture.name + "/" + image.id + "/metadata";
+        const pending = await request.get(metadata, { headers: fixture.headers });
+        expect(pending.status()).toBe(200);
+        expect((await pending.json()).status).toBe("unclaimed");
+        await expect(source).toHaveValue(retained);
+
+        if (!saveSharedDraft) {
+          await second.getByRole("button", { name: "Cancel", exact: true }).click();
+          await second.getByRole("dialog", { name: "Discard unsaved changes?" })
+            .getByRole("button", { name: "Discard changes", exact: true }).click();
+          await expect.poll(async () => (await request.get(metadata, { headers: fixture.headers })).status()).toBe(404);
+          return;
+        }
+
+        await second.getByRole("button", { name: "Check for changes" }).click();
+        await second.getByRole("button", { name: "Compare changes" }).click();
+        const result = "Remote text without image\nFirst tab completed\n" + retained;
+        await second.getByRole("textbox", { name: "Combined document body" }).fill(result);
+        await second.getByRole("button", { name: "Apply combined changes" }).click();
+        const finalReceipt = second.waitForResponse(response => response.request().method() === "PATCH" && new URL(response.url()).pathname === fixture.path);
+        await second.getByRole("button", { name: "Save changes" }).click();
+        const finalSave = await finalReceipt;
+        expect(finalSave.ok()).toBeTruthy();
+        expect(finalSave.request().postDataJSON().expected_commit).toBe(revision);
+        expect((await (await request.get(metadata, { headers: fixture.headers })).json()).status).toBe("claimed");
+        const final = await request.get(fixture.path, { headers: fixture.headers });
+        expect((await final.json()).content.trim()).toBe(result.trim());
+        const bytes = await request.get("/api/assets/" + image.id + "?" + new URLSearchParams({
+          vault: fixture.name, document: fixture.document.path,
+        }), { headers: fixture.headers });
+        expect(bytes.status()).toBe(200);
+        expect(bytes.headers()["content-type"]).toContain("image/png");
+      } finally {
+        await second.close();
+      }
+    });
+  }
+
   test("cancels comparison without replacing the draft and detects a second change before saving", async ({ page, request }) => {
     const fixture = await setup(page, request);
     await fixture.source.fill("Base line\nMy addition\n");
@@ -454,13 +537,23 @@ test.describe("document concurrency against the real API", () => {
     await expect(fixture.source).toHaveValue("Base line\nMy addition\n");
     await page.getByRole("button", { name: "Compare changes" }).click();
     await page.getByRole("textbox", { name: "Combined document body" }).fill("Base line\nFirst remote\nMy addition\n");
+    // Keep the last authorized head observation at R1. This forces the
+    // server's R2 write rejection to drive recovery instead of allowing a
+    // lucky polling observation to open the comparison before PATCH.
+    const head = await request.get("/api/v1/document-head/" + fixture.name + "/" + encodeURIComponent(fixture.document.path), { headers: fixture.headers });
+    expect(head.ok()).toBeTruthy();
+    const observed = await head.json();
+    await page.route("**/api/v1/document-head/**", route => route.fulfill({ json: observed }));
     const second = await request.patch(fixture.path, { headers: fixture.headers, data: {
       content: "Base line\nFirst remote\nSecond remote\n", expected_commit: revision.current_commit,
     } });
     expect(second.ok()).toBeTruthy();
     await page.getByRole("button", { name: "Apply combined changes" }).click();
-    // Whether polling has observed R2 or not, Save must not overwrite it.
+    const rejected = page.waitForResponse(response => response.request().method() === "PATCH" && new URL(response.url()).pathname === fixture.path);
     await page.getByRole("button", { name: "Save changes" }).click();
+    const receipt = await rejected;
+    expect(receipt.status()).toBe(409);
+    expect(receipt.request().postDataJSON().expected_commit).toBe(revision.current_commit);
     await expect(page.getByRole("dialog", { name: "Review document changes" })).toBeVisible();
     await expect(page.getByRole("textbox", { name: "Combined document body" })).toHaveValue("Base line\nFirst remote\nSecond remote");
     const final = await request.get(fixture.path, { headers: fixture.headers });

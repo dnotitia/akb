@@ -903,6 +903,9 @@ function DocumentPageContent({
             draftId: createDocumentEditDraftId(),
             tabId: draftTabIdRef.current,
           };
+      // A restored copy owns these uploads even before its first keystroke.
+      // Persist its own reference so another tab cannot clean them up on save.
+      const copySaved = sameTab || result.status === "expired" || saveDocumentEditDraft(draftSessionRef.current);
       skipNextDraftSaveRef.current = true;
       restoredDraftRevisionRef.current = draftRevisionRef.current;
       setOriginalContent(stored.baseBody);
@@ -923,7 +926,7 @@ function DocumentPageContent({
       setDraftNotice(
         result.status === "expired"
           ? "This draft has expired. Its text is kept for copying; attached images may no longer be available."
-          : "Local draft restored",
+          : copySaved ? "Local draft restored" : "Local draft restored, but this tab's copy could not be saved locally.",
       );
       if (result.status === "expired") {
         const protectedAssetIds = new Set(
@@ -1985,6 +1988,8 @@ function DocumentPageContent({
                           setEditingAssetExpirations(expirations);
                         }}
                         onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
+                        isAssetReferencedByOtherDraft={assetId =>
+                          protectedDraftAssetIds(draftSessionRef.current?.draftId).has(assetId)}
                         ariaLabel="Document body (markdown)"
                         readOnly={savingBody || !editorWritable}
                         vault={name!}

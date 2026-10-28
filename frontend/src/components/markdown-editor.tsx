@@ -182,6 +182,8 @@ export interface MarkdownEditorProps {
     expirations: Readonly<Record<string, string>>,
   ) => void;
   onUnclaimedAssetIdsChange?: (assetIds: readonly string[]) => void;
+  /** Recheck sibling drafts at cleanup time; they can share a restored upload. */
+  isAssetReferencedByOtherDraft?: (assetId: string) => boolean;
 }
 
 function MarkdownEditorContent({
@@ -208,6 +210,7 @@ function MarkdownEditorContent({
   initialUnclaimedAssetExpirations = {},
   onAssetExpirationsChange,
   onUnclaimedAssetIdsChange,
+  isAssetReferencedByOtherDraft,
 }: MarkdownEditorProps) {
   const [resolutionMarkdown, setResolutionMarkdown] = React.useState(value);
   const unclaimedAssetIdsRef = React.useRef(new Set(initialUnclaimedAssetIds));
@@ -219,6 +222,7 @@ function MarkdownEditorContent({
   const onUploadingChangeRef = React.useRef(onUploadingChange);
   const onAssetExpirationsChangeRef = React.useRef(onAssetExpirationsChange);
   const onUnclaimedAssetIdsChangeRef = React.useRef(onUnclaimedAssetIdsChange);
+  const isAssetReferencedByOtherDraftRef = React.useRef(isAssetReferencedByOtherDraft);
   const adapters = React.useMemo(
     () => createAkbMarkdownAdapters({ vault, document, commit }),
     [commit, document, vault],
@@ -266,6 +270,10 @@ function MarkdownEditorContent({
     ),
   });
 
+  React.useLayoutEffect(() => {
+    isAssetReferencedByOtherDraftRef.current = isAssetReferencedByOtherDraft;
+  }, [isAssetReferencedByOtherDraft]);
+
   React.useEffect(() => {
     onUploadingChangeRef.current = onUploadingChange;
     onAssetExpirationsChangeRef.current = onAssetExpirationsChange;
@@ -290,7 +298,8 @@ function MarkdownEditorContent({
     (assetId: string) => {
       if (
         !unclaimedAssetIdsRef.current.has(assetId) ||
-        discardingAssetIdsRef.current.has(assetId)
+        discardingAssetIdsRef.current.has(assetId) ||
+        isAssetReferencedByOtherDraftRef.current?.(assetId)
       )
         return;
       discardingAssetIdsRef.current.add(assetId);

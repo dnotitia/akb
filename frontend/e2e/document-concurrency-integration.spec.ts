@@ -47,6 +47,8 @@ test.describe("concurrency recovery in the reading workspace", () => {
     await page.locator(`a[href="${fixture.href(fixture.documents[1].path)}"]`).first().click();
     await expect(page.getByRole("tab", { name: "Second integration note", exact: true })).toBeVisible();
     await page.getByRole("tab", { name: "First integration note", exact: true }).click();
+    await expect(page.getByRole("tab", { name: "First integration note", exact: true })).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByRole("heading", { name: "First integration note", exact: true }).first()).toBeVisible();
     await page.getByRole("button", { name: "Edit", exact: true }).click();
     await page.getByRole("button", { name: /^Editor mode:/ }).click();
     await page.getByRole("menuitemradio", { name: "Markdown", exact: true }).click();

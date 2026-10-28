@@ -435,6 +435,41 @@ describe("MarkdownEditor image insertion", () => {
     expect(apiMocks.discardAsset).not.toHaveBeenCalled();
   });
 
+  it("retains another draft's upload while cleaning excluded uploads after save", async () => {
+    const excluded = "59acbf03-c67e-43b8-b512-c91d469950bf";
+    const retained = new Set([ASSET_ID]);
+    const { rerender, unmount } = render(
+      <MarkdownEditor value="Draft" vault="team"
+        initialUnclaimedAssetIds={[ASSET_ID, excluded]}
+        isAssetReferencedByOtherDraft={id => retained.has(id)} />,
+    );
+    rerender(
+      <MarkdownEditor value="Draft" vault="team" claimedAssetIds={[]}
+        isAssetReferencedByOtherDraft={id => retained.has(id)} />,
+    );
+    await waitFor(() => expect(apiMocks.discardAsset).toHaveBeenCalledWith("team", excluded));
+    expect(apiMocks.discardAsset).not.toHaveBeenCalledWith("team", ASSET_ID);
+
+    // The other draft was removed before this editor's final cleanup.
+    retained.clear();
+    unmount();
+    await waitFor(() => expect(apiMocks.discardAsset).toHaveBeenCalledWith("team", ASSET_ID));
+  });
+
+  it("checks the latest draft ownership before save and unmount cleanup", async () => {
+    const { rerender, unmount } = render(
+      <MarkdownEditor value="Draft" vault="team" initialUnclaimedAssetIds={[ASSET_ID]}
+        isAssetReferencedByOtherDraft={() => false} />,
+    );
+    rerender(
+      <MarkdownEditor value="Draft" vault="team" claimedAssetIds={[]}
+        isAssetReferencedByOtherDraft={() => true} />,
+    );
+    unmount();
+    await Promise.resolve();
+    expect(apiMocks.discardAsset).not.toHaveBeenCalled();
+  });
+
   it("retries the failed image and every remaining file in a batch", async () => {
     const ids = [
       "4f18f05e-d1cf-44ce-a39e-74737fb88e7c",
