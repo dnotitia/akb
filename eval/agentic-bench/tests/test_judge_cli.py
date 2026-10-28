@@ -43,7 +43,7 @@ def _seed_run(
     if calls is None:
         calls = [
             {"name": "akb_search", "result_chars": 1800, "result_text": "x"},
-            {"name": "akb_drill_down", "result_chars": 5200, "result_text": "y"},
+            {"name": "akb_get", "result_chars": 5200, "result_text": "y"},
         ]
     for index, verdict in enumerate(verdicts, start=1):
         qid = f"q{index:03d}"

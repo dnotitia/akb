@@ -26,9 +26,9 @@ ARM_TOOLS: dict[str, set[str]] = {
     # paradigms is synergy or distraction.
     "A1_search_only": {"akb_search", "akb_get"},
     "A2_grep_only":   {"akb_grep", "akb_get"},
-    "A3_tree":        {"akb_list_vaults", "akb_browse", "akb_drill_down", "akb_get"},
+    "A3_tree":        {"akb_list_vaults", "akb_browse", "akb_get"},
     "A4_all":         {"akb_search", "akb_grep",
-                       "akb_list_vaults", "akb_browse", "akb_drill_down", "akb_get"},
+                       "akb_list_vaults", "akb_browse", "akb_get"},
 }
 
 
@@ -56,20 +56,20 @@ Available tools: `akb_grep`, `akb_get`.
 - You have no semantic search — work from exact strings only.
 """,
     "A3_tree": """
-Available tools: `akb_list_vaults`, `akb_browse`, `akb_drill_down`, `akb_get`.
+Available tools: `akb_list_vaults`, `akb_browse`, `akb_get`.
 - `akb_list_vaults(filter="키워드")` — discover vaults filtered by name/description substring. 도메인 키워드 (예: filter="법령") 로 좁혀 호출. 인자 없이 호출하면 응답이 잘릴 수 있음.
 - `akb_browse(vault=..., filter="키워드", limit=10)` — list collections / docs. filter 인자로 collection name substring 매칭 권장 (e.g. filter="민법"). depth=1 만 인자 없이 호출하면 70+ collection 잘림. 응답에 `total`, `returned` 포함.
-- `akb_drill_down(uri=..., section="제N조", pattern="키워드")` — extract section + 그 안 substring grep (pattern 인자). section 이 안 맞아도 응답에 `outline` (available headings list) 자동 포함 — 그 heading 중 하나로 retry. 큰 section (예: 부칙) 안에서 fine-grained query 는 pattern 활용.
-- `akb_get(uri=...)` — fetch full doc. drill_down outline 도 막혔을 때.
-- Typical flow: list_vaults(filter="도메인") → browse(vault, filter="법령명") → drill_down(uri, section=..., pattern=...).
+- `akb_get(uri=..., mode="sections", section="제N조", pattern="키워드")` — extract section + 그 안 substring grep (pattern 인자). section 이 안 맞아도 응답에 `outline` (available headings list) 자동 포함 — 그 heading 중 하나로 retry. 큰 section (예: 부칙) 안에서 fine-grained query 는 pattern 활용.
+- `akb_get(uri=...)` — fetch full doc. outline 도 막혔을 때.
+- Typical flow: list_vaults(filter="도메인") → browse(vault, filter="법령명") → akb_get(uri, mode="sections", section=..., pattern=...).
 """,
     "A4_all": """
-Available tools: `akb_search`, `akb_grep`, `akb_list_vaults`, `akb_browse`, `akb_drill_down`, `akb_get`.
+Available tools: `akb_search`, `akb_grep`, `akb_list_vaults`, `akb_browse`, `akb_get`.
 - You have every search paradigm. Pick the best tool per question:
   - 의미 검색: `akb_search`.
   - 조항·약칭 정확 매칭: `akb_grep`.
   - vault·structure 발견: `akb_list_vaults(filter="키워드")` → `akb_browse(vault=..., filter="법령명")` (둘 다 filter 인자로 좁혀 호출 권장).
-  - 깊은 §본문: `akb_drill_down(uri, section=..., pattern="키워드")` — pattern 으로 section 안 substring grep. section 못 찾으면 응답의 `outline` 으로 retry.
+  - 깊은 §본문: `akb_get(uri, mode="sections", section=..., pattern="키워드")` — pattern 으로 section 안 substring grep. section 못 찾으면 응답의 `outline` 으로 retry.
   - 전체 doc: `akb_get`.
 """,
 }

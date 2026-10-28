@@ -20,7 +20,7 @@ right one*.
 |---|---|---|
 | `A1_search_only` | `akb_search` + `akb_get` | Hybrid retrieval (dense + BM25) |
 | `A2_grep_only` | `akb_grep` + `akb_get` | Literal / regex match |
-| `A3_tree` | `akb_list_vaults` + `akb_browse` + `akb_drill_down` + `akb_get` | Tree routing — discover → navigate → drill |
+| `A3_tree` | `akb_list_vaults` + `akb_browse` + `akb_get` | Tree routing — discover → navigate → drill |
 | `A4_all` | Union of A1 + A2 + A3 | Full toolbox |
 
 For each (arm, query) pair the runner:
@@ -175,7 +175,7 @@ harness will not invent it.
 The harness assumes an AKB backend at version **0.2.3 or later**,
 because the four-arm tree-routing arm needs the slim + filterable
 versions of `akb_list_vaults` / `akb_browse` and the `mode='outline'`
-path on `akb_drill_down`. Earlier backends will run but the tree
+path on `akb_get`. Earlier backends will run but the tree
 arm will look much worse than it should — the early-version
 benchmarks in our own history demonstrate exactly that failure mode.
 

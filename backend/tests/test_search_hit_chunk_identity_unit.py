@@ -3,7 +3,7 @@
 `matched_section` is the chunk body. Without the chunk's own address a
 caller that wants the surrounding section has to search again or read the
 whole document; `section_path` + `chunk_index` are the two values that
-turn a hit into an `akb_drill_down(section=...)` call. Both are additive —
+turn a hit into an `akb_get(mode="sections", section=...)` call. Both are additive —
 every field a hit carried before is asserted here too.
 """
 

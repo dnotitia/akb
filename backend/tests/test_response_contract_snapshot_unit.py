@@ -226,7 +226,7 @@ async def test_grep_response_keeps_its_baseline_keys(monkeypatch):
     assert BASELINE_GREP_RESULT <= set(response["results"][0])
 
 
-# ── MCP akb_drill_down envelopes ────────────────────────────────────
+# ── MCP section read envelopes ────────────────────────────────────
 
 
 @pytest.fixture
