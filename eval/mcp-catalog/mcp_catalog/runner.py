@@ -2657,15 +2657,14 @@ def _state_observations(
         error = raw["error"]
         if not isinstance(available, bool):
             raise ValueError(f"{label}-state availability is invalid")
-        if status_code is not None and (not isinstance(status_code, int) or isinstance(status_code, bool)):
+        if status_code is not None and (
+            not isinstance(status_code, int) or isinstance(status_code, bool) or not 100 <= status_code <= 599
+        ):
             raise ValueError(f"{label}-state HTTP status is invalid")
         if error is not None and not isinstance(error, str):
             raise ValueError(f"{label}-state error is invalid")
-        expected_status = (
-            expectation.resolved_before_expected_status if before else expectation.probe.expected_status
-        )
-        if available and status_code != expected_status:
-            raise ValueError(f"{label}-state availability does not match its registered HTTP status")
+        if available and status_code is None and not (before and not expectation.check_before and raw["payload"] is None):
+            raise ValueError(f"{label}-state HTTP status is missing")
         if available and error is not None:
             raise ValueError(f"{label}-state observation reports an error despite being available")
         if not available and not error:
