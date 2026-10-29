@@ -144,3 +144,21 @@ def test_initial_grant_openapi_advertises_explicit_legacy_approval_contract():
         "baseline_release_id",
         "capabilities",
     ]
+
+
+def test_member_active_vault_collection_openapi():
+    schema = app.openapi()
+    operation = schema["paths"]["/api/v1/apps/{app_id}/installations/active/vaults"]["get"]
+    assert operation["operationId"] == "appsListMemberActiveInstallationVaults"
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/MemberInstallationVaults"
+    }
+    summary = schema["components"]["schemas"]["MemberInstallationVault"]
+    assert set(summary["properties"]) == {
+        "id", "name", "description", "status", "role", "managed_by", "created_at"
+    }
+    assert summary["additionalProperties"] is False
+    for status in ("401", "403", "422", "503"):
+        assert operation["responses"][status]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/AkbError"
+        }

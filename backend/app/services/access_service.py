@@ -922,6 +922,35 @@ async def explain_vault_access(
     }
 
 
+async def list_member_active_app_vaults(user_id: str, app_id: uuid.UUID) -> list[dict]:
+    """Read member Vault summaries with a canonical active installation in one query."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT v.id, v.name, v.description, v.status, v.created_at,
+                   CASE WHEN v.owner_id = $1 THEN 'owner'
+                        WHEN va.role = 'admin' THEN 'admin'
+                        WHEN va.role = 'writer' OR v.public_access = 'writer' THEN 'writer'
+                        ELSE 'reader' END AS role,
+                   vwp.managed_by
+              FROM vaults v
+              LEFT JOIN vault_access va ON va.vault_id = v.id AND va.user_id = $1
+              LEFT JOIN vault_write_policy vwp ON vwp.vault_id = v.id
+             WHERE (v.owner_id = $1 OR va.role = ANY($3::text[]))
+               AND EXISTS (SELECT 1 FROM vault_app_installations i
+                            WHERE i.vault_id = v.id AND i.app_id = $2
+                              AND i.lifecycle = 'active')
+             ORDER BY v.name, v.id
+            """,
+            uuid.UUID(user_id), app_id, ["reader", "writer", "admin"],
+        )
+    return [{"id": str(r["id"]), "name": r["name"], "description": r["description"],
+             "status": r["status"], "role": r["role"], "managed_by": r["managed_by"],
+             "created_at": r["created_at"].isoformat() if r["created_at"] else None}
+            for r in rows]
+
+
 async def list_accessible_vaults(user_id: str, *, conn=None) -> list[dict]:
     """List all readable vaults; an optional connection keeps aggregate reads
     on the same snapshot as this directory's authoritative access policy."""

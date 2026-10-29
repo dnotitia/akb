@@ -23,6 +23,18 @@ installation, inventory, and rollout routes use the shared models in
 IDs. The checked-in control-plane fixture is compared with `app.openapi()` so
 route status, request, success, and error references cannot drift silently.
 
+`GET /api/v1/apps/{app_id}/installations/active/vaults` is a read-only member
+collection for human, non-system-admin sessions with read scope. It returns
+`{"vaults": [...]}` with the ordinary Vault summary fields: `id`, `name`,
+`description`, `status`, `role`, `managed_by`, and `created_at`. Each item
+represents a current owner or member Vault with a canonical active installation
+of the requested app. Public access alone does not qualify. Results are complete,
+unique and ordered by name and id; an unknown app UUID returns an empty array.
+Installation active does not imply application readiness. Authentication,
+scope, validation and unavailable errors use the existing error envelope; all
+responses are `no-store`. A storage error returns a retryable 503 instead of a
+partial or empty success.
+
 ## App Release Manifest v2
 
 Release registration accepts one strict, immutable v2 manifest. It contains

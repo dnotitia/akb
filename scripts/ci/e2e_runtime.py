@@ -951,6 +951,12 @@ class E2ERuntime:
                         "app_id": app_id,
                         "vault_id": vault_id,
                     }
+                    catalog["member_installation_vaults"] = {
+                        "service": "app",
+                        "method": "GET",
+                        "path": f"/api/v1/apps/{app_id}/installations/active/vaults",
+                        "app_id": app_id,
+                    }
             installation_id = (
                 active_fixture.get("installation_id")
                 if isinstance(active_fixture, dict)
@@ -3986,6 +3992,7 @@ class E2ERuntime:
             ("reader", "reader"),
             ("writer", "writer"),
             ("foreign_admin", "foreign-admin"),
+            ("outsider", "outsider"),
         )
         actors: dict[str, dict[str, object]] = {
             "system_admin": {"id": str(system_admin_id), "role": "system_admin"}
@@ -4006,8 +4013,11 @@ class E2ERuntime:
                 "reader": "reader",
                 "writer": "writer",
                 "foreign_admin": "owner",
+                "outsider": "none",
             }[role]
-            vault_scope = "foreign" if role == "foreign_admin" else "target"
+            vault_scope = "foreign" if role == "foreign_admin" else (
+                "none" if role == "outsider" else "target"
+            )
             actors[role] = {
                 "id": str(user_id),
                 "username": username,
@@ -4171,6 +4181,44 @@ class E2ERuntime:
             release_id=release_a,
             installation_id=active_id,
         )
+
+        collection_vaults = []
+        for index in range(32):
+            vault_id, vault_name = await self._insert_fixture_vault(
+                connection, namespace=namespace, label=f"collection-{index:02d}",
+                owner_id=actor_ids["target_owner"], grants=target_grants,
+                granted_by=system_admin_id,
+            )
+            await self._insert_fixture_installation(
+                connection, app_id=target_app_id, vault_id=vault_id,
+                desired_release_id=release_a, current_release_id=release_a,
+                lifecycle="active", capabilities=["installation:read"], resources=[],
+            )
+            collection_vaults.append({"id": str(vault_id), "name": vault_name})
+        fixtures["member_collection"] = {"vaults": collection_vaults}
+
+        public_id, public_name = await self._insert_fixture_vault(
+            connection, namespace=namespace, label="collection-public",
+            owner_id=actor_ids["foreign_admin"], grants=[], granted_by=system_admin_id,
+        )
+        await connection.execute("UPDATE vaults SET public_access='reader' WHERE id=$1", public_id)
+        await self._insert_fixture_installation(
+            connection, app_id=target_app_id, vault_id=public_id,
+            desired_release_id=release_a, current_release_id=release_a,
+            lifecycle="active", capabilities=["installation:read"], resources=[],
+        )
+        fixtures["member_collection_public"] = {"vault_id": str(public_id), "name": public_name}
+        other_id, other_name = await self._insert_fixture_vault(
+            connection, namespace=namespace, label="collection-other-app",
+            owner_id=actor_ids["target_owner"], grants=target_grants,
+            granted_by=system_admin_id,
+        )
+        await self._insert_fixture_installation(
+            connection, app_id=foreign_app_id, vault_id=other_id,
+            desired_release_id=foreign_release, current_release_id=foreign_release,
+            lifecycle="active", capabilities=["installation:read"], resources=[],
+        )
+        fixtures["member_collection_other_app"] = {"vault_id": str(other_id), "name": other_name}
 
         blocked_id = await self._insert_fixture_installation(
             connection,

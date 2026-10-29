@@ -458,6 +458,12 @@ def test_member_installation_discovery_declares_http_contract_and_fixture_contro
         "app_id": app_id,
         "vault_id": vault_id,
     }
+    assert discovery["member_installation_vaults"] == {
+        "service": "app",
+        "method": "GET",
+        "path": f"/api/v1/apps/{app_id}/installations/active/vaults",
+        "app_id": app_id,
+    }
     assert discovery["controls"]["member_installation_state"] == {
         "service": "fixture",
         "method": "POST",

@@ -326,6 +326,24 @@ class InstallationActiveStatus(BaseModel):
     active: StrictBool
 
 
+class MemberInstallationVault(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: uuid.UUID
+    name: str
+    description: str | None
+    status: str
+    role: str
+    managed_by: str | None
+    created_at: datetime | None
+
+
+class MemberInstallationVaults(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    vaults: list[MemberInstallationVault]
+
+
 class ObservedStateRequest(ControlPlaneRequest):
     installation_id: uuid.UUID
     observed_generation: int = Field(ge=0)

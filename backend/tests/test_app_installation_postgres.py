@@ -971,3 +971,98 @@ async def test_fresh_rejects_retained_resources_and_clears_old_current_pointer(
     assert fresh["current_release"] is None
     assert fresh["desired_release"]["id"] == str(release_b)
     assert fresh["desired_grant_generation"] == 2
+
+
+async def test_member_active_vault_collection_is_complete_current_and_read_only(lifecycle_pool, monkeypatch):
+    app_id = await _app(lifecycle_pool, "member-list")
+    other_app = await _app(lifecycle_pool, "other-list")
+    release = await _release(lifecycle_pool, app_id, "1.0.0")
+    other_release = await _release(lifecycle_pool, other_app, "1.0.0")
+    owner = await _user(lifecycle_pool, "list-owner")
+    member = await _user(lifecycle_pool, "list-member")
+    outsider = await _user(lifecycle_pool, "list-outsider")
+    vaults = [await _vault(lifecycle_pool, f"list-{i:02d}", owner_id=owner) for i in range(32)]
+    roles = ("reader", "writer", "admin")
+    async with lifecycle_pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO vault_access (vault_id,user_id,role,granted_by) VALUES ($1,$2,$3,$4)",
+            [(vault_id, member, roles[i % 3], _ADMIN_ID) for i, vault_id in enumerate(vaults[:30])],
+        )
+        await conn.execute("UPDATE vaults SET public_access='reader' WHERE id=$1", vaults[30])
+    for vault_id in vaults:
+        await _command(lifecycle_pool, app_id, vault_id, release)
+    await _command(lifecycle_pool, other_app, vaults[0], other_release)
+    async with lifecycle_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE vault_app_installations SET lifecycle='active', current_release_id=desired_release_id WHERE app_id=$1 AND vault_id=ANY($2::uuid[])",
+            app_id, vaults[:31],
+        )
+        before = await conn.fetchval("SELECT json_agg(row_to_json(i) ORDER BY id)::text FROM vault_app_installations i")
+
+    user = _member_session(member, "member")
+    query_count = 0
+
+    class CountingConnection:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def fetch(self, *args):
+            nonlocal query_count
+            query_count += 1
+            return await self.conn.fetch(*args)
+
+    class CountingAcquire:
+        async def __aenter__(self):
+            self.acquisition = lifecycle_pool.acquire()
+            return CountingConnection(await self.acquisition.__aenter__())
+
+        async def __aexit__(self, *args):
+            return await self.acquisition.__aexit__(*args)
+
+    class CountingPool:
+        def acquire(self):
+            return CountingAcquire()
+
+    async def counting_pool():
+        return CountingPool()
+
+    monkeypatch.setattr(access_service, "get_pool", counting_pool)
+
+    async def read(selected_app=app_id):
+        return (await installation.list_member_active_installation_vaults(
+            selected_app, user=user, correlation_id=str(uuid.uuid4())
+        ))["vaults"]
+    result = await read()
+    large_query_count = query_count
+    assert len(result) == 30
+    assert {row["id"] for row in result} == {str(v) for v in vaults[:30]}
+    assert [(r["name"], r["id"]) for r in result] == sorted((r["name"], r["id"]) for r in result)
+    assert {r["id"]: r["role"] for r in result} == {str(v): roles[i % 3] for i, v in enumerate(vaults[:30])}
+    assert await read(other_app) == []
+    assert await read(uuid.uuid4()) == []
+    query_count = 0
+    await read(other_app)
+    assert query_count == large_query_count
+    assert (await installation.list_member_active_installation_vaults(
+        app_id, user=_member_session(owner, "owner"), correlation_id="owner"
+    ))["vaults"] and len((await installation.list_member_active_installation_vaults(
+        app_id, user=_member_session(owner, "owner"), correlation_id="owner"
+    ))["vaults"]) == 31
+    assert (await installation.list_member_active_installation_vaults(
+        app_id, user=_member_session(outsider, "outsider"), correlation_id="outsider"
+    ))["vaults"] == []
+    assert await read() == result
+    async with lifecycle_pool.acquire() as conn:
+        assert await conn.fetchval("SELECT json_agg(row_to_json(i) ORDER BY id)::text FROM vault_app_installations i") == before
+        await conn.execute("DELETE FROM vault_access WHERE vault_id=$1 AND user_id=$2", vaults[0], member)
+        await conn.execute("UPDATE vault_app_installations SET lifecycle='uninstalled', desired_release_id=NULL WHERE app_id=$1 AND vault_id=$2", app_id, vaults[1])
+    result = await read()
+    assert len(result) == 28
+    assert str(vaults[0]) not in {r["id"] for r in result}
+    assert str(vaults[1]) not in {r["id"] for r in result}
+    async with lifecycle_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE vault_app_installations SET lifecycle='active', desired_release_id=$3 WHERE app_id=$1 AND vault_id=$2",
+            app_id, vaults[1], release,
+        )
+    assert str(vaults[1]) in {r["id"] for r in await read()}

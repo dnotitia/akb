@@ -11,6 +11,7 @@ from app.api.control_plane_models import (
     InstallationActiveStatus,
     InstallationCommandRequest,
     InstallationProjection,
+    MemberInstallationVaults,
 )
 
 from app.api.deps import get_current_app, get_current_user, request_correlation_id
@@ -20,6 +21,7 @@ from app.services.app_installation_service import (
     get_admin_installation_status,
     get_app_installation_status,
     get_member_installation_active_status,
+    list_member_active_installation_vaults,
     approve_initial_installation_grant,
     uninstall_installation,
 )
@@ -115,6 +117,26 @@ async def get_installation(
         vault_id,
         user=user,
         correlation_id=request_correlation_id(request),
+    )
+    _mark_no_store(response)
+    return result
+
+
+@router.get(
+    "/apps/{app_id}/installations/active/vaults",
+    response_model=MemberInstallationVaults,
+    operation_id="appsListMemberActiveInstallationVaults",
+    tags=["app-member-installations"],
+    summary="List member Vaults with an active app installation",
+)
+async def list_active_vaults(
+    app_id: uuid.UUID,
+    request: Request,
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    result = await list_member_active_installation_vaults(
+        app_id, user=user, correlation_id=request_correlation_id(request)
     )
     _mark_no_store(response)
     return result

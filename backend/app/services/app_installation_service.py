@@ -23,7 +23,7 @@ from app.exceptions import (
     ValidationError,
 )
 from app.services import app_rollout_service
-from app.services.access_service import check_vault_access
+from app.services.access_service import check_vault_access, list_member_active_app_vaults
 from app.services.app_identity_service import (
     SUPPORTED_APP_CAPABILITIES,
     AppPrincipal,
@@ -1176,6 +1176,28 @@ async def get_admin_installation_status(
         generation=projection["desired_grant_generation"],
     )
     return projection
+
+
+async def list_member_active_installation_vaults(
+    app_id: uuid.UUID | str, *, user: AuthenticatedUser, correlation_id: str
+) -> dict[str, list[dict]]:
+    app_id = _as_uuid(app_id, field="app_id")
+    if user.account_kind != "human" or user.is_admin:
+        raise ForbiddenError("Installation request denied")
+    try:
+        vaults = await list_member_active_app_vaults(user.user_id, app_id)
+    except (asyncpg.PostgresError, OSError, TimeoutError):
+        raise AKBError(
+            "Installation status is temporarily unavailable",
+            status_code=503,
+            code="member_installation_status_unavailable",
+        ) from None
+    record_app_audit(
+        "app.installation.member_active_vaults", correlation_id=correlation_id,
+        outcome="ok", reason="read", actor=user.username, actor_id=user.user_id,
+        app_id=app_id,
+    )
+    return {"vaults": vaults}
 
 
 async def get_member_installation_active_status(

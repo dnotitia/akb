@@ -324,3 +324,80 @@ def test_lifecycle_auth_errors_are_also_no_store():
     assert response.status_code == 401
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
+
+
+def test_member_active_vault_collection_returns_summary(monkeypatch):
+    app_id = uuid.uuid4()
+    user = _user(is_admin=False)
+    vault = {"id": str(uuid.uuid4()), "name": "workspace", "description": None,
+             "status": "active", "role": "reader", "managed_by": None, "created_at": None}
+
+    async def list_vaults(requested_app_id, **kwargs):
+        assert requested_app_id == app_id
+        assert kwargs["user"] is user
+        return {"vaults": [vault]}
+
+    monkeypatch.setattr(app_installations, "list_member_active_installation_vaults", list_vaults)
+    response = _client(user=user).get(f"/api/v1/apps/{app_id}/installations/active/vaults")
+    assert response.status_code == 200
+    assert response.json() == {"vaults": [vault]}
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_member_active_vault_collection_rejects_unauthorized_and_invalid(monkeypatch):
+    client = TestClient(main_app, raise_server_exceptions=False)
+    app_id = uuid.uuid4()
+    path = f"/api/v1/apps/{app_id}/installations/active/vaults"
+    response = client.get(path)
+    assert response.status_code == 401
+    assert response.headers["cache-control"] == "no-store"
+    monkeypatch.setitem(main_app.dependency_overrides, get_current_user, lambda: _user())
+    response = client.get(path)
+    assert response.status_code == 403
+    assert response.headers["cache-control"] == "no-store"
+    service_user = _user(is_admin=False)
+    service_user.account_kind = "service"
+    monkeypatch.setitem(main_app.dependency_overrides, get_current_user, lambda: service_user)
+    response = client.get(path)
+    assert response.status_code == 403
+    assert response.headers["cache-control"] == "no-store"
+    response = client.get("/api/v1/apps/not-a-uuid/installations/active/vaults")
+    assert response.status_code == 422
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_member_active_vault_collection_database_failure_is_safe(monkeypatch, caplog):
+    user = _user(is_admin=False)
+    raw_error_marker = "synthetic-database-failure"
+
+    async def fail(*_args):
+        raise asyncpg.PostgresError(raw_error_marker)
+
+    monkeypatch.setattr(installation, "list_member_active_app_vaults", fail)
+    monkeypatch.setitem(main_app.dependency_overrides, get_current_user, lambda: user)
+    with caplog.at_level(logging.ERROR):
+        response = TestClient(main_app, raise_server_exceptions=False).get(
+            f"/api/v1/apps/{uuid.uuid4()}/installations/active/vaults"
+        )
+    assert response.status_code == 503
+    assert response.json()["code"] == "member_installation_status_unavailable"
+    assert response.headers["cache-control"] == "no-store"
+    assert raw_error_marker not in response.text
+    assert raw_error_marker not in caplog.text
+
+
+def test_member_active_vault_collection_requires_read_scope(monkeypatch):
+    user = _user(is_admin=False)
+    user.token_scopes = frozenset({"write"})
+
+    async def authorize(_authorization):
+        return user
+
+    monkeypatch.setattr(deps, "resolve_rest_user_authorization", authorize)
+    response = TestClient(main_app).get(
+        f"/api/v1/apps/{uuid.uuid4()}/installations/active/vaults",
+        headers={"Authorization": "Bearer fixture-token"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "insufficient_scope"
+    assert response.headers["cache-control"] == "no-store"
