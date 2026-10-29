@@ -15,6 +15,13 @@ and Claude Desktop connect to one AKB server, Cursor, Windsurf, Cline, and
 Continue reach the same server through the `akb-mcp` stdio proxy, and custom
 agents call `POST /mcp/` directly.
 
+Sharing memory across your own tools is different from sharing knowledge
+across a team. Clients authenticated as the same user can access that user's
+private memory. Team knowledge is accessed through vaults with the appropriate
+permissions; connecting to the same server does not automatically share
+private session memory with colleagues. Automatic session capture also depends
+on the client integration, as described below.
+
 ## Why per-agent memory drifts
 
 Memory that ships inside an agent or framework lives in that tool's own format
@@ -75,8 +82,11 @@ vault as an Open Knowledge Format bundle.
 
 ## Connect your clients
 
-Every client needs the same two values: the MCP endpoint
-(`https://<your-host>/mcp/`) and a PAT.
+For the PAT-based examples below, use your AKB MCP endpoint and your own
+Personal Access Token (PAT). Replace `https://akb.example.com/mcp/` with your
+deployment's endpoint and `<your PAT>` with your token. Each team member
+should use their own credentials. Do not commit tokens to a repository or
+include them in shared screenshots.
 
 Cursor (`~/.cursor/mcp.json`), Cline, and other clients that read an
 `mcpServers` block:
@@ -99,7 +109,7 @@ Cursor (`~/.cursor/mcp.json`), Cline, and other clients that read an
 Claude Code:
 
 ```bash
-claude mcp add --scope user akb -- npx akb-mcp --url https://akb.example.com/mcp/ --pat <your PAT>
+claude mcp add --scope user akb -- npx akb-mcp --url https://akb.example.com/mcp/ --pat "<your PAT>"
 ```
 
 After connecting, call `akb_whoami` from each client. Every client should

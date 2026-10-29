@@ -1,11 +1,10 @@
 # Keeping document structure in retrieval: heading-aware chunks and section reads
 
-Fixed-length chunking cuts documents wherever the character count runs out. A
-rule can land in one chunk and its exception in the next, and a chunk from
-deep inside a long document carries no sign of which document it came from.
-An agent that retrieves only part of that context can answer the opposite of
-what the document says. This guide describes what structure-aware retrieval
-needs, and how AKB splits and serves Markdown documents.
+Fixed-length chunking can separate a rule from its exception. If chunks also
+lack document metadata and heading paths, an agent may retrieve a passage
+without enough context to interpret it correctly. This guide explains how AKB
+uses Markdown headings, contextual metadata, and section reads to help agents
+retrieve relevant passages and inspect their surrounding context.
 
 ## Short answer
 
@@ -36,7 +35,7 @@ sections.
 | Splits on headings rather than a fixed window | Sections stay intact. |
 | Keeps the heading hierarchy with each chunk | The chunk keeps its place in the document. |
 | Adds document title and summary to each chunk | Deep chunks still match document-level queries. |
-| Splits large sections at paragraph boundaries, with overlap | No sentence is cut mid-way; context carries across the cut. |
+| Prefers paragraph boundaries when splitting oversized sections, with overlap | Helps preserve nearby context. A paragraph that exceeds the size limit may still require a character-based split. |
 | Handles text without headings honestly | Plain files are split by size without inventing structure. |
 | Offers an outline read and a section read | The agent can skim, then open only what it needs. |
 | Can still return the whole document | Some questions need everything. |
@@ -106,9 +105,10 @@ Look for heading-based splitting, a heading path and document metadata on every
 chunk, and paragraph-boundary splits with overlap. AKB applies all of these to
 Markdown documents.
 
-**Can an agent skim summaries first and open only the section it needs?** In
-AKB, `akb_drill_down` with `mode="outline"` lists the headings, and a
-second call with `section` returns just that section's text.
+**Can an agent inspect the headings first and open only the section it needs?**
+Yes. In AKB, `akb_drill_down` with `mode="outline"` lists heading paths rather
+than generated summaries. A second call with `section` returns the matching
+section's text.
 
 **What if a clause still ends up in a different chunk from its rule?** Keep the
 two under one heading and below the size limit, or read the section with

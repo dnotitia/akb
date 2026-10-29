@@ -37,8 +37,14 @@ AKB publishes its result and harness in
 
 - **Dataset**: LongMemEval `_s` split, 500 questions, about 50 chat sessions
   per question.
-- **Metric**: Recall@5.
-- **Result**: 98.4% (492/500) with hybrid retrieval and no reranker.
+- **Metric**: Recall@5, defined here as the percentage of questions whose top
+  five retrieved results contain at least one of the annotated answer
+  sessions. It does not measure generated-answer accuracy or whether every
+  required piece of evidence was retrieved.
+- **Historical result**: 98.4% (492/500 questions) with hybrid retrieval and
+  no reranker, measured on 2026-05-20 using backend revision `b54184a`. This
+  result describes that benchmark configuration, not a performance guarantee
+  for the current release or another dataset.
 - **Embedding**: `bge-m3` at 1024 dimensions, pgvector driver,
   `search_prefetch: 30`.
 - **Revision**: measured 2026-05-20 on backend `b54184a`.
@@ -59,12 +65,18 @@ The breakdown shows why one number is not enough. The reranker helped
 preference questions and hurt literal-match questions, and the two effects
 nearly cancelled in the total.
 
-The comparison table in the harness README lists other published systems on
-the same split. Their embedding models differ from AKB's, so read it as a
-stack-level comparison, not a model-for-model one. The raw per-question output
-from the 2026-05-20 run was a local artifact and is not in the repository.
-New runs against the current backend produce new numbers rather than
-reproducing the historical ones by assumption.
+The comparison table in the harness README provides context from other
+published systems, but differences in embeddings and evaluation coverage
+prevent a controlled, like-for-like comparison. The raw per-question output
+from AKB's historical run is not included in the repository.
+
+The bundled evaluation setup is archival and is not supported against the
+current backend as-is. Before running a new evaluation, adapt and validate the
+runner's authentication, ingestion, indexing, and cleanup steps for the
+selected backend version. Use a disposable test instance because the runner
+creates and deletes accounts and vaults. Record new results with their
+configuration; the published files alone cannot reproduce the historical
+score.
 
 ## Hybrid search: one call or two
 
@@ -120,10 +132,11 @@ number of questions scored.
 harness runs against the current product and your own data. A published score
 from an old revision is a historical record, not a guarantee.
 
-**Can a knowledge layer reach good recall without a reranker?** On
-LongMemEval `_s`, AKB's hybrid retrieval reached Recall@5 of 98.4% with no
-reranker. Whether that holds for your corpus is something to measure with the
-harness.
+**Can a knowledge layer reach good recall without a reranker?** Yes. In AKB's
+historical LongMemEval `_s` run, hybrid retrieval achieved Recall@5 of 98.4%
+without a reranker. Whether a reranker helps your deployment should be tested
+on representative questions using an evaluation setup validated for your
+backend version.
 
 ## Related guides
 
