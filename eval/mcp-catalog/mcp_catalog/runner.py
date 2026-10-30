@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.metadata
+import json
 import math
 import os
 import platform
@@ -31,6 +32,7 @@ from .checkpoint import (
     SmokeTransport,
     valid_completed_outcome,
     valid_smoke_outcome,
+    _smoke_response_has_usage,
 )
 from .contracts import (
     ArmName,
@@ -45,7 +47,7 @@ from .contracts import (
     load_tool_coverage,
     validate_public_catalog,
 )
-from .evidence import redact_exception, redact_text, serialize_report, write_json, safe_json
+from .evidence import SECRET_KEY_RE, redact_exception, redact_text, serialize_report, write_json, safe_json
 from .execution import (
     BudgetLedger,
     _public_route,
@@ -1210,6 +1212,39 @@ class BenchmarkRunner:
         if any(value is None for value in cell_fixtures.values()):
             raise RuntimeContractError("smoke gate fixtures are incomplete", stage="smoke_gate")
 
+        observed_cells: dict[str, dict[str, Any]] = {}
+
+        def observe_cell(cell_key: str, status: str, outcome: TrialOutcome, *, reused: bool = False) -> dict[str, Any]:
+            cell = {
+                "cell": cell_key,
+                "status": status,
+                "reused": reused,
+                "outcome": safe_json(outcome.model_dump(mode="json"), self.secrets),
+            }
+            observed_cells[cell_key] = cell
+            self._smoke_gate["cells"] = [observed_cells[key] for key in required_cells if key in observed_cells]
+            return cell
+
+        async def write_smoke(cell_key: str, outcome: TrialOutcome, status: Literal["completed", "failed", "incomplete"]) -> None:
+            assert self._checkpoint_store is not None
+            await asyncio.to_thread(
+                self._checkpoint_store.record_smoke_cell,
+                cell_key,
+                outcome,
+                status=status,
+                timing=self._timing_snapshot(),
+                elapsed_wall_seconds=self._ledger.current_wall_seconds() if self._ledger is not None else None,
+                reserved_cost_usd=float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0,
+            )
+
+        async def finish_smoke_work(write: Awaitable[Any]) -> Any:
+            pending = asyncio.ensure_future(write)
+            try:
+                return await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                await asyncio.shield(pending)
+                raise
+
         async def run_cell(model_spec: Any, transport: str) -> dict[str, Any]:
             cell_key = f"{model_spec.class_name}:{transport}"
             cell_fixture = cell_fixtures[cell_key]
@@ -1220,12 +1255,7 @@ class BenchmarkRunner:
                 else None
             )
             if cached is not None:
-                return {
-                    "cell": cell_key,
-                    "status": "completed",
-                    "reused": True,
-                    "outcome": safe_json(cached.model_dump(mode="json"), self.secrets),
-                }
+                return observe_cell(cell_key, "completed", cached, reused=True)
 
             task = self._smoke_task(transport)
             model = build_model(model_spec)
@@ -1255,27 +1285,20 @@ class BenchmarkRunner:
                     error=f"benchmark incomplete: {redact_exception(exc, self.secrets)}",
                     failure_kind="budget",
                 )
+                reservation_outcome = outcome
+                observe_cell(cell_key, "incomplete", reservation_outcome)
                 if self._checkpoint_store is not None:
-                    async with self._checkpoint_lock:
-                        self._refresh_store_secrets()
-                        await asyncio.to_thread(
-                            self._checkpoint_store.record_smoke_cell,
-                            cell_key,
-                            outcome,
-                            status="incomplete",
-                            timing=self._timing_snapshot(),
-                            elapsed_wall_seconds=(
-                                self._ledger.current_wall_seconds()
-                                if self._ledger is not None
-                                else None
-                            ),
-                            reserved_cost_usd=(float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0),
-                        )
+                    async def persist_reservation_failure() -> None:
+                        async with self._checkpoint_lock:
+                            self._refresh_store_secrets()
+                            await write_smoke(cell_key, reservation_outcome, "incomplete")
+                    await finish_smoke_work(persist_reservation_failure())
                 raise RuntimeContractError(
                     f"smoke gate cell {cell_key} could not reserve its registered budget",
                     stage="smoke_gate",
                 ) from exc
 
+            cancelled = False
             try:
                 await cell_fixture.reset()
                 self._resolver = resolver
@@ -1321,7 +1344,13 @@ class BenchmarkRunner:
                             expected_server_instructions=(catalog_server_instructions or {}).get(catalog_key),
                             timing_sink=self._timing.record if self._timing is not None else None,
                         )
-                await ledger.charge(outcome, guard=request_guard)
+                await finish_smoke_work(ledger.charge(outcome, guard=request_guard))
+            except asyncio.CancelledError:
+                if outcome is None:
+                    raise
+                outcome.error = "benchmark incomplete: benchmark interrupted"
+                outcome.failure_kind = "interrupted"
+                cancelled = True
             except Exception as exc:
                 with_context = exc if isinstance(exc, RuntimeContractError) else RuntimeContractError(
                     f"smoke gate cell {cell_key} failed: {redact_exception(exc, self.secrets)}",
@@ -1343,54 +1372,95 @@ class BenchmarkRunner:
                     outcome.error = f"benchmark incomplete: {redact_exception(exc, self.secrets)}"
                     outcome.failure_kind = "budget"
             finally:
-                await request_guard.release()
+                release = asyncio.create_task(request_guard.release())
+                try:
+                    await asyncio.shield(release)
+                except asyncio.CancelledError:
+                    await asyncio.shield(release)
+                    cancelled = True
 
             assert outcome is not None
-            identity_matches = (
-                outcome.model_class == model_spec.class_name
-                and outcome.model_id == model_spec.model_id
-                and outcome.transport == transport
-                and all(
-                    item.get("model") == model_spec.model_id
-                    for item in outcome.provider_evidence
+            completed_outcome = outcome
+            valid_before_redaction = valid_smoke_outcome(completed_outcome, task)
+
+            def classify_smoke(safe_outcome: TrialOutcome) -> tuple[TrialOutcome, Literal["completed", "failed", "incomplete"]]:
+                identity_matches = (
+                    safe_outcome.task_id == task.id
+                    and safe_outcome.locale == task.locale
+                    and safe_outcome.arm == self.arm
+                    and safe_outcome.model_class == model_spec.class_name
+                    and safe_outcome.model_id == model_spec.model_id
+                    and safe_outcome.transport == transport
+                    and all(item.get("model") == model_spec.model_id for item in safe_outcome.provider_evidence)
                 )
-            )
-            valid = identity_matches and valid_smoke_outcome(outcome)
-            if not valid and outcome.error is None:
-                if not identity_matches:
-                    outcome.error = "smoke gate outcome did not match the requested model and transport"
-                    outcome.failure_kind = "provider"
-                elif outcome.successful_mcp_tool_calls == 0:
-                    outcome.error = "smoke gate did not observe a successful MCP tool call"
-                    outcome.failure_kind = "tool"
-                else:
-                    outcome.error = "smoke gate did not observe a follow-up terminal response"
-                    outcome.failure_kind = "terminal_response"
-            status: Literal["completed", "failed", "incomplete"] = "completed" if valid else (
-                "incomplete" if outcome.error and outcome.error.startswith("benchmark incomplete:") else "failed"
-            )
+                valid = identity_matches and valid_smoke_outcome(safe_outcome, task)
+                if not valid and safe_outcome.error is None:
+                    if not identity_matches:
+                        safe_outcome.error = "smoke gate outcome did not match the requested task, model and transport"
+                        safe_outcome.failure_kind = "provider"
+                    elif safe_outcome.successful_mcp_tool_calls == 0:
+                        safe_outcome.error = "smoke gate did not observe a successful MCP tool call"
+                        safe_outcome.failure_kind = "tool"
+                    elif not safe_outcome.follow_up_terminal_response:
+                        safe_outcome.error = "smoke gate did not observe a follow-up terminal response"
+                        safe_outcome.failure_kind = "terminal_response"
+                    else:
+                        if valid_before_redaction:
+                            reason = "evidence is invalid after redaction"
+                            safe_outcome.failure_kind = "unknown"
+                        elif (
+                            not safe_outcome.routing_observed or not safe_outcome.routing_valid
+                            or safe_outcome.model_requests < 2
+                            or len(safe_outcome.provider_evidence) != safe_outcome.model_requests
+                            or not all(_smoke_response_has_usage(item, safe_outcome.model_id) for item in safe_outcome.provider_evidence)
+                        ):
+                            reason = "provider usage or routing evidence is incomplete"
+                            safe_outcome.failure_kind = "provider"
+                        elif valid_smoke_outcome(safe_outcome):
+                            reason = "task-specific measurement evidence is missing"
+                            safe_outcome.failure_kind = "unknown"
+                        else:
+                            reason = "state or raw call evidence is incomplete"
+                            safe_outcome.failure_kind = "unknown"
+                        safe_outcome.error = f"benchmark incomplete: smoke gate {reason}"
+                status: Literal["completed", "failed", "incomplete"] = "completed" if valid else (
+                    "incomplete" if safe_outcome.error and safe_outcome.error.startswith("benchmark incomplete:") else "failed"
+                )
+                for call in safe_outcome.tool_calls:
+                    raw = call.raw_model_args
+                    if not isinstance(raw, str):
+                        continue
+                    try:
+                        decoded = json.loads(raw)
+                    except json.JSONDecodeError:
+                        if SECRET_KEY_RE.search(raw):
+                            call.raw_model_args = "[redacted]"
+                        continue
+                    redacted = safe_json(decoded, self.secrets)
+                    if redacted != decoded:
+                        call.raw_model_args = json.dumps(redacted, ensure_ascii=False)
+                if status == "completed" and not valid_smoke_outcome(safe_outcome, task):
+                    safe_outcome.error = "benchmark incomplete: smoke gate evidence is invalid after redaction"
+                    safe_outcome.failure_kind = "unknown"
+                    status = "incomplete"
+                return safe_outcome, status
+
             if self._checkpoint_store is not None:
-                async with self._checkpoint_lock:
-                    self._refresh_store_secrets()
-                    await asyncio.to_thread(
-                        self._checkpoint_store.record_smoke_cell,
-                        cell_key,
-                        outcome,
-                        status=status,
-                        timing=self._timing_snapshot(),
-                        elapsed_wall_seconds=(
-                            self._ledger.current_wall_seconds()
-                            if self._ledger is not None
-                            else None
-                        ),
-                        reserved_cost_usd=(float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0),
-                    )
-            return {
-                "cell": cell_key,
-                "status": status,
-                "reused": False,
-                "outcome": safe_json(outcome.model_dump(mode="json"), self.secrets),
-            }
+                async def persist_outcome() -> tuple[TrialOutcome, Literal["completed", "failed", "incomplete"]]:
+                    assert self._checkpoint_store is not None
+                    async with self._checkpoint_lock:
+                        self._refresh_store_secrets()
+                        safe_outcome, status = classify_smoke(self._checkpoint_store._safe_outcome(completed_outcome))
+                        observe_cell(cell_key, status, safe_outcome)
+                        await write_smoke(cell_key, safe_outcome, status)
+                        return safe_outcome, status
+                outcome, status = await finish_smoke_work(persist_outcome())
+            else:
+                outcome, status = classify_smoke(TrialOutcome.model_validate(safe_json(outcome.model_dump(mode="json"), self.secrets)))
+            cell = observe_cell(cell_key, status, outcome)
+            if cancelled:
+                raise asyncio.CancelledError
+            return cell
 
         jobs = [
             (model_spec, transport)
@@ -1398,7 +1468,12 @@ class BenchmarkRunner:
             for transport in self.manifest.transports
         ]
         if self.descriptor.benchmark_cells:
-            results = await asyncio.gather(*(run_cell(model, transport) for model, transport in jobs))
+            try:
+                async with asyncio.TaskGroup() as group:
+                    pending = [group.create_task(run_cell(model, transport)) for model, transport in jobs]
+            except ExceptionGroup as exc:
+                raise _normalize_task_group_error(exc) from exc
+            results = [item.result() for item in pending]
         else:
             results = [await run_cell(model, transport) for model, transport in jobs]
         cells = {item["cell"]: item for item in results}

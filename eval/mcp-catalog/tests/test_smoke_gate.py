@@ -213,6 +213,7 @@ async def test_smoke_gate_requires_provider_evidence_for_each_model_request(
             resolver=_SmokeResolver(),
             ledger=BudgetLedger(manifest),
         )
+    assert all(cell["outcome"]["failure_kind"] == "provider" for cell in runner._smoke_gate["cells"])
 
 
 @pytest.mark.asyncio
@@ -447,3 +448,329 @@ async def test_smoke_accounting_failure_is_checkpointed_and_resume_reuses_other_
     assert all(record.status == "completed" for record in resumed_store.document.smoke_gate.values())
     assert resumed_store.document.smoke_status == "passed"
     assert resumed_ledger.reserved_cost_usd == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_smoke_checkpoint_preserves_missing_required_before_observation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp_catalog.checkpoint import CheckpointError, valid_smoke_outcome
+
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()), checkpoint_path=tmp_path / "smoke.json")
+    resolver = _SmokeResolver()
+    runner._checkpoint_store = runner._checkpoint_store_for(source_revision="a" * 40, resolver=resolver, planned_keys={})
+    store = runner._checkpoint_store
+    assert store is not None
+    task = runner._smoke_task("http")
+    assert task.expected_final_state.observation_sets[0].check_before
+    model = manifest.models[0]
+    outcome = _smoke_outcome(task, model, "http")
+    outcome.state_before = None
+    outcome.state_observations_before[0] = {"available": True, "status_code": None, "payload": None, "error": None}
+    safe = store._safe_outcome(outcome)
+    assert valid_smoke_outcome(outcome)
+    assert valid_smoke_outcome(safe)
+    assert not valid_smoke_outcome(outcome, task)
+    assert not valid_smoke_outcome(safe, task)
+    with pytest.raises(CheckpointError, match="completed smoke"):
+        store.record_smoke_cell("primary:http", outcome, status="completed")
+
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+    async def smoke(task, *, model_spec, transport, **_kwargs):
+        result = _smoke_outcome(task, model_spec, transport)
+        if model_spec.class_name == "primary" and transport == "http":
+            result.state_before = None
+            result.state_observations_before[0] = {"available": True, "status_code": None, "payload": None, "error": None}
+        return result
+    monkeypatch.setattr(runner_module, "execute_smoke", smoke)
+    with pytest.raises(RuntimeContractError, match="smoke gate cell"):
+        await runner._run_smoke_gate(fixture=_SmokeFixture(), resolver=resolver, ledger=BudgetLedger(manifest))
+    failed = store.document.smoke_gate["primary:http"]
+    assert failed.status != "completed"
+    assert failed.outcome.state_observations_before[0]["status_code"] is None
+    assert failed.outcome.error and "evidence" in failed.outcome.error
+
+
+@pytest.mark.asyncio
+async def test_smoke_cell_exception_drains_cancelled_siblings_before_return(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    runner = _runner(manifest, tasks, _parallel_descriptor(), checkpoint_path=tmp_path / "smoke.json")
+    resolver = _SmokeResolver()
+    runner._checkpoint_store = runner._checkpoint_store_for(source_revision="a" * 40, resolver=resolver, planned_keys={})
+    store = runner._checkpoint_store
+    assert store is not None
+    ledger = BudgetLedger(manifest)
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+    all_started = asyncio.Event()
+    started: list[str] = []
+    cleaned: list[str] = []
+    blocked = asyncio.Event()
+    async def smoke(task, *, model_spec, transport, **_kwargs):
+        cell = f"{model_spec.class_name}:{transport}"
+        started.append(cell)
+        if len(started) == 4:
+            all_started.set()
+        if cell == "primary:http":
+            await all_started.wait()
+            return _smoke_outcome(task, model_spec, transport)
+        try:
+            await blocked.wait()
+        finally:
+            await asyncio.sleep(0.02)
+            cleaned.append(cell)
+    monkeypatch.setattr(runner_module, "execute_smoke", smoke)
+    def fail_checkpoint(*_args, **_kwargs):
+        raise RuntimeError("checkpoint write failed")
+    monkeypatch.setattr(store, "record_smoke_cell", fail_checkpoint)
+    try:
+        with pytest.raises(RuntimeError, match="checkpoint write failed"):
+            await runner._run_smoke_gate(fixture=_SmokeFixture(), resolver=resolver, ledger=ledger)
+        assert len(cleaned) == 3
+        assert ledger.reserved_cost_usd == Decimal("0")
+        cell = next(item for item in runner._smoke_gate["cells"] if item["cell"] == "primary:http")
+        assert cell["outcome"]["provider_evidence"]
+        assert cell["outcome"]["model_requests"] == 2
+    finally:
+        blocked.set()
+        await asyncio.sleep(0.05)
+
+
+def test_safe_outcome_can_change_raw_argument_equality(tmp_path: Path) -> None:
+    from mcp_catalog.checkpoint import valid_smoke_outcome
+
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()), checkpoint_path=tmp_path / "smoke.json")
+    runner._checkpoint_store = runner._checkpoint_store_for(source_revision="a" * 40, resolver=_SmokeResolver(), planned_keys={})
+    store = runner._checkpoint_store
+    assert store is not None
+    task = runner._smoke_task("http")
+    outcome = _smoke_outcome(task, manifest.models[0], "http")
+    call = outcome.tool_calls[0]
+    call.raw_model_args = '{"password":"fixture"}'  # pragma: allowlist secret
+    call.server_args = {"password": "fixture"}  # pragma: allowlist secret
+    call.effective_server_args = {"password": "fixture"}  # pragma: allowlist secret
+    call.raw_args_valid = True
+    call.server_args_equal_raw = True
+    assert valid_smoke_outcome(outcome, task)
+    safe = store._safe_outcome(outcome)
+    assert safe.tool_calls[0].server_args == {"password": "[redacted]"}
+    assert not valid_smoke_outcome(safe, task)
+
+
+@pytest.mark.asyncio
+async def test_smoke_checkpoint_classifies_after_redaction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    resolver = _SmokeResolver()
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()), checkpoint_path=tmp_path / "smoke.json")
+    runner._checkpoint_store = runner._checkpoint_store_for(source_revision="a" * 40, resolver=resolver, planned_keys={})
+    store = runner._checkpoint_store
+    assert store is not None
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+    async def smoke(task, *, model_spec, transport, **_kwargs):
+        outcome = _smoke_outcome(task, model_spec, transport)
+        if model_spec.class_name == "primary" and transport == "http":
+            call = outcome.tool_calls[0]
+            call.raw_model_args = '{"password":"fixture"}'  # pragma: allowlist secret
+            call.server_args = {"password": "fixture"}  # pragma: allowlist secret
+            call.effective_server_args = {"password": "fixture"}  # pragma: allowlist secret
+            call.raw_args_valid = True
+            call.server_args_equal_raw = True
+        return outcome
+    monkeypatch.setattr(runner_module, "execute_smoke", smoke)
+    with pytest.raises(RuntimeContractError, match="smoke gate cell"):
+        await runner._run_smoke_gate(fixture=_SmokeFixture(), resolver=resolver, ledger=BudgetLedger(manifest))
+    recorded = store.document.smoke_gate["primary:http"]
+    assert recorded.status == "incomplete"
+    assert recorded.outcome.error and "redaction" in recorded.outcome.error
+    assert recorded.outcome.provider_evidence
+    assert recorded.outcome.tool_calls[0].server_args == {"password": "[redacted]"}
+    assert "fixture" not in recorded.outcome.tool_calls[0].raw_model_args
+
+
+@pytest.mark.asyncio
+async def test_smoke_cancellation_waits_for_inflight_checkpoint_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    resolver = _SmokeResolver()
+    runner = _runner(manifest, tasks, _parallel_descriptor(), checkpoint_path=tmp_path / "smoke.json")
+    runner._checkpoint_store = runner._checkpoint_store_for(source_revision="a" * 40, resolver=resolver, planned_keys={})
+    store = runner._checkpoint_store
+    assert store is not None
+    ledger = BudgetLedger(manifest)
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+    async def smoke(task, *, model_spec, transport, **_kwargs):
+        return _smoke_outcome(task, model_spec, transport)
+    monkeypatch.setattr(runner_module, "execute_smoke", smoke)
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    original = store.record_smoke_cell
+    def slow_record(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            finished.set()
+    monkeypatch.setattr(store, "record_smoke_cell", slow_record)
+    run = asyncio.create_task(runner._run_smoke_gate(fixture=_SmokeFixture(), resolver=resolver, ledger=ledger))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 3), timeout=4)
+        run.cancel()
+        await asyncio.sleep(0.05)
+        assert not run.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        assert finished.is_set()
+        assert len(store.document.smoke_gate) == 4
+        assert ledger.reserved_cost_usd == Decimal("0")
+    finally:
+        release.set()
+        if not run.done():
+            run.cancel()
+            try:
+                await run
+            except asyncio.CancelledError:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_smoke_cancellation_settles_reservation_and_records_completed_outcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    resolver = _SmokeResolver()
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()), checkpoint_path=tmp_path / "smoke.json")
+    runner._checkpoint_store = runner._checkpoint_store_for(source_revision="a" * 40, resolver=resolver, planned_keys={})
+    store = runner._checkpoint_store
+    assert store is not None
+    ledger = BudgetLedger(manifest)
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+    async def smoke(task, *, model_spec, transport, **_kwargs):
+        return _smoke_outcome(task, model_spec, transport)
+    monkeypatch.setattr(runner_module, "execute_smoke", smoke)
+    started, release = asyncio.Event(), asyncio.Event()
+    original = BudgetLedger.release_reservation
+    async def slow_release(self, guard):
+        started.set()
+        await release.wait()
+        return await original(self, guard)
+    monkeypatch.setattr(BudgetLedger, "release_reservation", slow_release)
+    run = asyncio.create_task(runner._run_smoke_gate(fixture=_SmokeFixture(), resolver=resolver, ledger=ledger))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        run.cancel()
+        await asyncio.sleep(0.05)
+        assert not run.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        assert store.document.smoke_gate["primary:http"].outcome.provider_evidence
+        assert ledger.reserved_cost_usd == Decimal("0")
+    finally:
+        release.set()
+        if not run.done():
+            run.cancel()
+            try:
+                await run
+            except asyncio.CancelledError:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_smoke_cancellation_during_charge_preserves_accounting_and_outcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    resolver = _SmokeResolver()
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()), checkpoint_path=tmp_path / "smoke.json")
+    runner._checkpoint_store = runner._checkpoint_store_for(source_revision="a" * 40, resolver=resolver, planned_keys={})
+    store = runner._checkpoint_store
+    assert store is not None
+    ledger = BudgetLedger(manifest)
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+    async def smoke(task, *, model_spec, transport, **_kwargs):
+        return _smoke_outcome(task, model_spec, transport)
+    monkeypatch.setattr(runner_module, "execute_smoke", smoke)
+    started, release = asyncio.Event(), asyncio.Event()
+    original = BudgetLedger.charge
+    async def slow_charge(self, outcome, *, guard):
+        started.set()
+        await release.wait()
+        return await original(self, outcome, guard=guard)
+    monkeypatch.setattr(BudgetLedger, "charge", slow_charge)
+    run = asyncio.create_task(runner._run_smoke_gate(fixture=_SmokeFixture(), resolver=resolver, ledger=ledger))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        run.cancel()
+        await asyncio.sleep(0.05)
+        assert not run.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        assert store.document.smoke_gate["primary:http"].outcome.provider_evidence
+        assert ledger.requests == 2
+        assert ledger.cost_usd == Decimal("0.00001")
+        assert ledger.reserved_cost_usd == Decimal("0")
+    finally:
+        release.set()
+        if not run.done():
+            run.cancel()
+            try:
+                await run
+            except asyncio.CancelledError:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_smoke_raw_redaction_does_not_hide_original_argument_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    resolver = _SmokeResolver()
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()), checkpoint_path=tmp_path / "smoke.json")
+    runner._checkpoint_store = runner._checkpoint_store_for(source_revision="a" * 40, resolver=resolver, planned_keys={})
+    store = runner._checkpoint_store
+    assert store is not None
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+    async def smoke(task, *, model_spec, transport, **_kwargs):
+        outcome = _smoke_outcome(task, model_spec, transport)
+        if model_spec.class_name == "primary" and transport == "http":
+            call = outcome.tool_calls[0]
+            call.raw_model_args = '{"password":"first"}'  # pragma: allowlist secret
+            call.server_args = {"password": "second"}  # pragma: allowlist secret
+            call.effective_server_args = {"password": "second"}  # pragma: allowlist secret
+            call.raw_args_valid = True
+            call.server_args_equal_raw = False
+        return outcome
+    monkeypatch.setattr(runner_module, "execute_smoke", smoke)
+    with pytest.raises(RuntimeContractError, match="smoke gate cell"):
+        await runner._run_smoke_gate(fixture=_SmokeFixture(), resolver=resolver, ledger=BudgetLedger(manifest))
+    record = store.document.smoke_gate["primary:http"]
+    assert record.status == "incomplete"
+    assert not record.outcome.tool_calls[0].server_args_equal_raw
+    assert "first" not in record.outcome.tool_calls[0].raw_model_args
+    assert record.outcome.tool_calls[0].server_args == {"password": "[redacted]"}
+
+
+@pytest.mark.asyncio
+async def test_smoke_redacts_sensitive_field_in_malformed_raw_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
+    resolver = _SmokeResolver()
+    runner = _runner(manifest, tasks, RuntimeDescriptor.from_dict(descriptor_dict()), checkpoint_path=tmp_path / "smoke.json")
+    runner._checkpoint_store = runner._checkpoint_store_for(source_revision="a" * 40, resolver=resolver, planned_keys={})
+    store = runner._checkpoint_store
+    assert store is not None
+    monkeypatch.setattr(runner_module, "build_model", lambda _spec: object())
+    async def smoke(task, *, model_spec, transport, **_kwargs):
+        outcome = _smoke_outcome(task, model_spec, transport)
+        if model_spec.class_name == "primary" and transport == "http":
+            outcome.tool_calls.append(ToolCallRecord(order=2, tool_name="fixture_tool", logical_operation="read", raw_model_args='{"password":"fixture"'))  # pragma: allowlist secret
+        return outcome
+    monkeypatch.setattr(runner_module, "execute_smoke", smoke)
+    result = await runner._run_smoke_gate(fixture=_SmokeFixture(), resolver=resolver, ledger=BudgetLedger(manifest))
+    assert result["status"] == "passed"
+    raw = store.document.smoke_gate["primary:http"].outcome.tool_calls[1].raw_model_args
+    assert raw == "[redacted]"
