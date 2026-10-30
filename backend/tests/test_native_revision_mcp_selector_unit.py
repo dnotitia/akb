@@ -86,6 +86,7 @@ async def test_history_rejects_invalid_arguments(monkeypatch, tmp_path, argument
     monkeypatch.setattr(server.tool_usage, "record", lambda *_args, **_kwargs: None)
     result = await server.call_tool("akb_history", {"uri": "akb://v/doc/doc.md", **arguments})
     assert result.is_error
+    assert json.loads(result.content[0].text)["code"] == "invalid_argument"
 
 
 async def test_history_list_and_diff_dispatch_same_uri_and_commit(monkeypatch, tmp_path):
@@ -142,3 +143,44 @@ async def test_history_checks_access_before_examining_commit(monkeypatch, tmp_pa
     monkeypatch.setattr(server, "check_vault_access", AsyncMock(side_effect=ForbiddenError("denied")))
     with pytest.raises(ForbiddenError):
         await server._handle_history({"uri": "akb://v/doc/doc.md", "mode": "diff", "commit": "bad"}, "uid", server._MCPUser())
+
+
+@pytest.mark.parametrize("limit", ["2", True, 2.0, None])
+async def test_history_list_rejects_non_integer_limit_before_backend(monkeypatch, tmp_path, limit):
+    from unittest.mock import AsyncMock
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    from mcp_server import server
+
+    backend = type("Revision", (), {})()
+    backend.document_history = AsyncMock(return_value={"uri": "akb://v/doc/doc.md", "history": []})
+    monkeypatch.setattr(server, "revision_backend", backend)
+    monkeypatch.setattr(server, "check_vault_access", AsyncMock())
+    monkeypatch.setattr(server, "_get_user", AsyncMock(return_value=server._MCPUser()))
+    monkeypatch.setattr(server.audit_log, "record_tool", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server.tool_usage, "record", lambda *_args, **_kwargs: None)
+    result = await server.call_tool("akb_history", {"uri": "akb://v/doc/doc.md", "mode": "list", "limit": limit})
+    assert result.is_error
+    assert json.loads(result.content[0].text)["code"] == "invalid_argument"
+    backend.document_history.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("arguments", "expected"), [({}, 20), ({"limit": 3}, 3), ({"limit": 0}, 0), ({"limit": -1}, -1)])
+async def test_history_list_passes_integer_limit_unchanged(monkeypatch, tmp_path, arguments, expected):
+    from unittest.mock import AsyncMock
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    from mcp_server import server
+
+    backend = type("Revision", (), {})()
+    backend.document_history = AsyncMock(return_value={"uri": "akb://v/doc/doc.md", "history": []})
+    monkeypatch.setattr(server, "revision_backend", backend)
+    monkeypatch.setattr(server, "check_vault_access", AsyncMock())
+    monkeypatch.setattr(server, "_get_user", AsyncMock(return_value=server._MCPUser()))
+    monkeypatch.setattr(server.audit_log, "record_tool", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server.tool_usage, "record", lambda *_args, **_kwargs: None)
+    result = await server.call_tool("akb_history", {"uri": "akb://v/doc/doc.md", **arguments})
+    assert not result.is_error
+    backend.document_history.assert_awaited_once_with("v", "doc.md", limit=expected)

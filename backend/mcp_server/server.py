@@ -1590,12 +1590,14 @@ async def _handle_history(args: dict, uid: str, user: _MCPUser) -> dict:
         return err("commit is only allowed in diff mode", code=INVALID_ARGUMENT)
     if mode == "diff" and "limit" in args:
         return err("limit is only allowed in list mode", code=INVALID_ARGUMENT)
+    if mode == "list" and type(args.get("limit", 20)) is not int:
+        return err("limit must be an integer", code=INVALID_ARGUMENT)
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="reader")
-    commit = args.get("commit")
-    if mode == "diff" and (not isinstance(commit, str) or not HEX_COMMIT_RE.fullmatch(commit)):
-        return err("commit must be a 7-64 char lowercase hex hash; symbolic refs are not accepted", code=INVALID_ARGUMENT)
-    if mode == "diff" and isinstance(commit, str):
+    if mode == "diff":
+        commit = args.get("commit")
+        if not isinstance(commit, str) or not HEX_COMMIT_RE.fullmatch(commit):
+            return err("commit must be a 7-64 char lowercase hex hash; symbolic refs are not accepted", code=INVALID_ARGUMENT)
         result = await revision_backend.document_diff(vault, doc_path, commit)
         if result is None:
             return err(f"Document not found: {args['uri']}", code=NOT_FOUND)
