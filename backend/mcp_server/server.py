@@ -318,7 +318,6 @@ _TOOL_SCOPES: dict[str, str] = {
     "akb_grep": _READ_SCOPE,
     "akb_drill_down": _READ_SCOPE,
     "akb_activity": _READ_SCOPE,
-    "akb_diff": _READ_SCOPE,
     "akb_history": _READ_SCOPE,
     "akb_relations": _READ_SCOPE,
     "akb_graph": _READ_SCOPE,
@@ -1087,23 +1086,6 @@ async def _handle_activity(args: dict, uid: str, user: _MCPUser) -> dict:
     }
 
 
-@_h("akb_diff")
-async def _handle_diff(args: dict, uid: str, user: _MCPUser) -> dict:
-    vault, doc_path = split_uri(args["uri"], expected_type="doc")
-    await check_vault_access(uid, vault, required_role="reader")
-    commit = args.get("commit", "")
-    if not HEX_COMMIT_RE.fullmatch(commit):
-        return err(
-            "commit must be a 7-64 char lowercase hex hash; "
-            "symbolic refs are not accepted",
-            code=INVALID_ARGUMENT,
-        )
-    result = await revision_backend.document_diff(vault, doc_path, commit)
-    if result is None:
-        return err(f"Document not found: {args['uri']}", code=NOT_FOUND)
-    return result
-
-
 @_h("akb_relations")
 async def _handle_relations(args: dict, uid: str, user: _MCPUser) -> dict:
     uri = args["uri"]
@@ -1601,8 +1583,29 @@ async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dic
 
 @_h("akb_history")
 async def _handle_history(args: dict, uid: str, user: _MCPUser) -> dict:
+    mode = args.get("mode", "list")
+    if mode not in ("list", "diff"):
+        return err("mode must be list or diff", code=INVALID_ARGUMENT)
+    if mode == "list" and "commit" in args:
+        return err("commit is only allowed in diff mode", code=INVALID_ARGUMENT)
+    if mode == "diff" and "limit" in args:
+        return err("limit is only allowed in list mode", code=INVALID_ARGUMENT)
+    if mode == "list" and type(args.get("limit", 20)) is not int:
+        return err("limit must be an integer", code=INVALID_ARGUMENT)
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     await check_vault_access(uid, vault, required_role="reader")
+    if mode == "diff":
+        commit = args.get("commit")
+        if not isinstance(commit, str) or not HEX_COMMIT_RE.fullmatch(commit):
+            return err("commit must be a 7-64 char lowercase hex hash; symbolic refs are not accepted", code=INVALID_ARGUMENT)
+        result = await revision_backend.document_diff(vault, doc_path, commit)
+        if result is None:
+            return err(f"Document not found: {args['uri']}", code=NOT_FOUND)
+        if result.get("type") == "unchanged" or (
+            result.get("type") == "unknown" and result.get("error") in (None, "commit not found")
+        ):
+            return err("commit is not a revision of this document", code=INVALID_ARGUMENT)
+        return result
     # Doc resolution, the created_at lineage boundary, and author
     # annotation all live in DocumentService.history() so this tool and
     # GET /history stay byte-for-byte identical. A missing doc raises

@@ -142,9 +142,9 @@ async def test_mcp_diff_offloads_file_diff(mods, monkeypatch):
     )
     monkeypatch.setattr(server.revision_backend._git, "file_diff", rec)
 
-    await server._handle_diff({"uri": "akb://v/doc/docs/p.md", "commit": "abc1234"}, "uid", _User())
+    await server._handle_history({"uri": "akb://v/doc/docs/p.md", "mode": "diff", "commit": "abc1234"}, "uid", _User())
 
-    assert_offloaded("MCP akb_diff ran git.file_diff ON the event loop (not offloaded)")
+    assert_offloaded("MCP akb_history diff ran git.file_diff ON the event loop (not offloaded)")
 
 
 async def test_mcp_versioned_get_offloads_read_file(mods, monkeypatch):
@@ -184,3 +184,18 @@ async def test_mcp_versioned_get_preserves_missing_document_distinction(mods, mo
     )
 
     assert result == {"error": "Document not found", "code": "not_found"}
+
+
+async def test_history_diff_rejects_other_document_commit_with_real_git(mods, monkeypatch):
+    _activity, server, _GitService = mods
+    git = server.revision_backend._git
+    git.init_vault("v")
+    first_commit = git.commit_file("v", "first.md", "first body", "first")
+    other_commit = git.commit_file("v", "second.md", "second body", "second")
+    monkeypatch.setattr(server, "check_vault_access", _anoop)
+    monkeypatch.setattr(server.revision_backend, "_find_document", AsyncMock(return_value={"path": "first.md"}))
+    args = {"uri": "akb://v/doc/first.md", "mode": "diff"}
+    valid = await server._handle_history({**args, "commit": first_commit}, "uid", _User())
+    foreign = await server._handle_history({**args, "commit": other_commit}, "uid", _User())
+    assert valid["commit"] == first_commit and "+first body" in valid["diff"]
+    assert foreign["code"] == "invalid_argument"

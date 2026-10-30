@@ -68,6 +68,7 @@ MAX_CAPTURED_RESULT_FIELD_BYTES = 2048
 MAX_CAPTURED_RESULT_ENVELOPE_BYTES = 8192
 MAX_CAPTURED_RESULT_FIELDS = 8
 
+MODEL_TOOL_RECORDER: contextvars.ContextVar[Any] = contextvars.ContextVar("mcp_catalog_model_tools", default=None)
 CURRENT_TRIAL: contextvars.ContextVar[TrialContext | None] = contextvars.ContextVar("mcp_catalog_trial", default=None)
 MODEL_RESPONSES: contextvars.ContextVar[list[ModelResponse] | None] = contextvars.ContextVar(
     "mcp_catalog_model_responses",
@@ -205,6 +206,11 @@ class OpenRouterChatModel(OpenAIChatModel):
     """PydanticAI's OpenAI-compatible model with OpenRouter response evidence."""
 
     async def request(self, messages: list[Any], model_settings: Any, model_request_parameters: Any) -> ModelResponse:
+        recorder = MODEL_TOOL_RECORDER.get()
+        if recorder is not None:
+            model_schemas = {tool.name: tool.parameters_json_schema for tool in model_request_parameters.function_tools}
+            if model_schemas != recorder.input_schemas:
+                raise ModelConfigurationError("model tool schemas differ from the sealed MCP catalog")
         instructions = SERVER_INSTRUCTIONS.get()
         evidence = MODEL_INPUT_EVIDENCE.get()
         if evidence is not None:
@@ -287,8 +293,8 @@ class ToolCallRecord(BaseModel):
     @field_validator("result_fields")
     @classmethod
     def validate_result_fields(cls, values: dict[str, str]) -> dict[str, str]:
-        if any(not value or len(value.encode("utf-8")) > MAX_CAPTURED_RESULT_FIELD_BYTES for value in values.values()):
-            raise ValueError("captured result fields must be non-empty and bounded")
+        if any(len(value.encode("utf-8")) > MAX_CAPTURED_RESULT_FIELD_BYTES for value in values.values()):
+            raise ValueError("captured result fields must be bounded")
         return values
 
     @property
@@ -799,6 +805,7 @@ def _rebind_independent_readonly_suffix_stages(
             call.logical_operation,
             call.resource_type,
             arguments,
+            canonical_operation=call.canonical_operation,
         )
 
 
@@ -1992,6 +1999,7 @@ def _public_route(
         if transport in item.transports
         and getattr(item, arm).tool == tool_name
         and getattr(item, arm).action == (action if isinstance(action, str) else None)
+        and (getattr(item, arm).mode is None or getattr(item, arm).mode == arguments.get("mode", "list"))
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -2059,6 +2067,9 @@ def _trial_error_kinds(outcome: TrialOutcome, task: TaskManifest) -> list[str]:
     for call, expected in zip(stage_calls, task.expected_material_attempts):
         if expected.outcome == "success":
             continue
+        if expected.outcome == "no_document_diff" and call.server_error_code == "invalid_argument":
+            intended_error_calls.add(id(call))
+            continue
         if (
             call.stage_id == expected.stage_id
             and call.logical_operation == expected.logical_operation
@@ -2085,6 +2096,9 @@ def _trial_error_kinds(outcome: TrialOutcome, task: TaskManifest) -> list[str]:
         ):
             intended_error_calls.add(id(call))
     for call in outcome.tool_calls:
+        raw_args, _ = decode_raw_args(call.raw_model_args)
+        if call.tool_name == "akb_history" and isinstance(raw_args, dict) and "mode" in raw_args and raw_args["mode"] not in ("list", "diff"):
+            kinds.add("wrong_mode")
         if not call.tool_exists or call.canonical_operation is None:
             kinds.add("unintended_tool_action")
         if call.logical_operation in task.forbidden_operations or _forbidden_mutation_hit(call, task):
@@ -2116,6 +2130,8 @@ def _trial_error_kinds(outcome: TrialOutcome, task: TaskManifest) -> list[str]:
         kinds.add("protocol_handshake_invalid")
     if outcome.wrong_target_calls:
         kinds.add("wrong_target_payload")
+    if not outcome.result_binding_accuracy:
+        kinds.add("result_binding_error")
     if outcome.unsupported_success_claims:
         kinds.add("unsupported_success_claim")
     return sorted(kinds)
@@ -2172,6 +2188,8 @@ class ToolCallRecorder:
         logical_operation: str,
         resource_type: ResourceType,
         arguments: dict[str, Any],
+        *,
+        canonical_operation: str | None = None,
     ) -> str | None:
         if self.task is None:
             return None
@@ -2222,7 +2240,7 @@ class ToolCallRecorder:
             ):
                 continue
             if (
-                (expected.tool_name is not None and expected.tool_name != name)
+                (expected.tool_name is not None and expected.tool_name != (canonical_operation or name))
                 or expected.logical_operation != logical_operation
                 or not _resource_matches(resource_type, expected.resource_type)
             ):
@@ -2251,7 +2269,7 @@ class ToolCallRecorder:
             arm=self.arm,
             transport=self.transport,
         )
-        logical_operation = logical_operation_for(name, self.operation_map, server_args)
+        logical_operation = logical_operation_for(route.operation if route else name, self.operation_map, server_args) if route is not None or not self.public_operations else "unknown"
         canonical_operation = route.operation if route is not None else None
         operation_kind: Literal["preparatory", "material", "unknown"] = "unknown"
         retry_ack = server_args.get("_vault_skill_ack")
@@ -2265,6 +2283,7 @@ class ToolCallRecorder:
                     logical_operation,
                     route.resource_type if route is not None else "unknown",
                     server_args,
+                    canonical_operation=canonical_operation,
                 )
                 if stage_id is not None or logical_operation in self.task.allowed_material_operations:
                     operation_kind = "material"
@@ -2389,7 +2408,7 @@ def _capture_structured_result_fields(
             continue
         candidate = safe_json(value, secrets)
         serialized = candidate if isinstance(candidate, str) else canonical_json(candidate)
-        if serialized and len(serialized.encode("utf-8")) <= MAX_CAPTURED_RESULT_FIELD_BYTES:
+        if len(serialized.encode("utf-8")) <= MAX_CAPTURED_RESULT_FIELD_BYTES:
             captured[name] = serialized
     return captured
 
@@ -3295,6 +3314,7 @@ class TrialExecutor:
             model_input_evidence: list[ModelInputEvidence] = []
             server_instructions_sha256: str | None = None
             capture_token = MODEL_RESPONSES.set(partial_messages)
+            recorder_token = MODEL_TOOL_RECORDER.set(recorder)
             input_evidence_token = MODEL_INPUT_EVIDENCE.set(model_input_evidence)
             instructions_token = SERVER_INSTRUCTIONS.set(None)
             try:
@@ -3352,6 +3372,7 @@ class TrialExecutor:
             finally:
                 SERVER_INSTRUCTIONS.reset(instructions_token)
                 MODEL_INPUT_EVIDENCE.reset(input_evidence_token)
+                MODEL_TOOL_RECORDER.reset(recorder_token)
                 MODEL_RESPONSES.reset(capture_token)
             latency = time.perf_counter() - started
             outcome = outcome_from_run(
@@ -3458,6 +3479,7 @@ async def execute_smoke(
     model_input_evidence: list[ModelInputEvidence] = []
     server_instructions_sha256: str | None = None
     capture_token = MODEL_RESPONSES.set(partial_messages)
+    recorder_token = MODEL_TOOL_RECORDER.set(recorder)
     input_evidence_token = MODEL_INPUT_EVIDENCE.set(model_input_evidence)
     instructions_token = SERVER_INSTRUCTIONS.set(None)
     input_secrets_token = MODEL_INPUT_SECRET_VALUES.set(secret_values)
@@ -3516,6 +3538,7 @@ async def execute_smoke(
         MODEL_INPUT_SECRET_VALUES.reset(input_secrets_token)
         SERVER_INSTRUCTIONS.reset(instructions_token)
         MODEL_INPUT_EVIDENCE.reset(input_evidence_token)
+        MODEL_TOOL_RECORDER.reset(recorder_token)
         MODEL_RESPONSES.reset(capture_token)
     outcome = outcome_from_run(
         task=task,
@@ -4085,7 +4108,7 @@ def bind_tool_calls(
                 tool_name=name,
                 canonical_operation=route.operation if route is not None else None,
                 surface_action=(getattr(route, arm).action if route is not None else None),
-                logical_operation=logical_operation_for(name, operation_map, raw_dict),
+                logical_operation=logical_operation_for(route.operation if route else name, operation_map, raw_dict) if route is not None or not public_operations else "unknown",
                 resource_type=route.resource_type if route is not None else "unknown",
                 operation_kind=observed.operation_kind if observed else "unknown",
                 tool_exists=name in input_schemas if input_schemas is not None else observed is not None,
@@ -4136,7 +4159,7 @@ def bind_tool_calls(
                 tool_name=observed.tool_name,
                 canonical_operation=route.operation if route is not None else None,
                 surface_action=(getattr(route, arm).action if route is not None else None),
-                logical_operation=logical_operation_for(observed.tool_name, operation_map, observed.server_args),
+                logical_operation=logical_operation_for(route.operation if route else observed.tool_name, operation_map, observed.server_args) if route is not None or not public_operations else "unknown",
                 resource_type=route.resource_type if route is not None else "unknown",
                 operation_kind=observed.operation_kind,
                 tool_exists=(
@@ -4636,7 +4659,7 @@ def _material_attempt_matches(
     }
     if (
         call.stage_id != expected.stage_id
-        or (expected.tool_name is not None and call.tool_name != expected.tool_name)
+        or (expected.tool_name is not None and (call.canonical_operation or call.tool_name) != expected.tool_name)
         or not _resource_matches(call.resource_type, expected.resource_type)
         or call.logical_operation != expected.logical_operation
         or not _material_arguments_include(call.tool_name, static_arguments, expected.arguments)
@@ -4649,6 +4672,11 @@ def _material_attempt_matches(
         return False
     if expected.outcome == "success":
         return call.server_succeeded
+    if expected.outcome == "no_document_diff":
+        return (
+            call.server_succeeded and call.result_fields.get("type") in {"unchanged", "unknown"}
+            and call.result_fields.get("diff") == ""
+        ) or (not call.server_succeeded and call.server_error_code == "invalid_argument")
     return (
         not call.server_succeeded
         and (
@@ -4760,13 +4788,10 @@ def _material_result_binding_matches(
     task: TaskManifest,
     tool_calls: list[ToolCallRecord],
 ) -> bool:
-    calls_by_stage = {
-        call.stage_id: call
-        for call in tool_calls
-        if call.stage_id is not None and call.server_succeeded
-    }
-    source_call = calls_by_stage.get(binding.source_stage)
-    target_call = calls_by_stage.get(binding.target_stage)
+    source_call = next((call for call in tool_calls if call.stage_id == binding.source_stage and call.server_succeeded), None)
+    target_call = next((call for call in reversed(tool_calls) if call.stage_id == binding.target_stage and call.server_succeeded), None)
+    if target_call is None:
+        target_call = next((call for call in reversed(tool_calls) if call.stage_id == binding.target_stage), None)
     if source_call is None or target_call is None:
         return False
     source = source_call.result_fields.get(binding.source_field)
@@ -4778,6 +4803,14 @@ def _material_result_binding_matches(
         return False
     if binding.relation == "equals":
         return isinstance(target, str) and target == source
+    if binding.relation == "history_commit":
+        try:
+            history = json.loads(source)
+        except (TypeError, ValueError):
+            return False
+        return isinstance(target, str) and isinstance(history, list) and any(
+            isinstance(entry, dict) and entry.get("hash") == target for entry in history
+        )
     if binding.relation == "collection_uri":
         if "/doc/" not in source or target_arguments is None:
             return False

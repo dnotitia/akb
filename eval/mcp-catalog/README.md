@@ -110,9 +110,7 @@ actor so the attempted write reaches vault ACL enforcement.
 ## Paired execution and resume
 
 The paired command runs both arms under one coordinator and one common budget
-ledger. The baseline and candidate descriptors must report the same exact
-runtime source revision, and each captured catalog must match every registered
-tool for its transport.
+ledger. Each descriptor must report the source revision registered for its arm. Each captured catalog must match every registered tool for its transport.
 
 ```bash
 uv run --locked --project eval/mcp-catalog \
@@ -147,6 +145,34 @@ Standalone `run --arm ...` is for diagnostics. Independently run arms do not
 have shared execution evidence and produce an `inconclusive` comparison.
 Incomplete, drifted, or undersampled runs still write a comparison artifact
 with the appropriate verdict. The CLI exits successfully only for `adopt`.
+
+## Compare document history modes
+
+The selected history experiment uses `config/history.json`,
+`corpus/history-tasks.json`, and `corpus/history-coverage.json`. The baseline
+catalog has 44 HTTP and 50 stdio tools. The candidate has 43 and 49. Both arms
+use the same tasks and oracle. The boundary task accepts the baseline's empty
+foreign-commit diff or the candidate's explicit rejection. A non-empty diff
+fails the control.
+
+Before `run-paired`, copy the manifest outside the checkout and set
+`source_pins.baseline` and `source_pins.candidate` to the full Git revisions
+of the two runtime checkouts. The baseline revision is
+`0c6d8920b943c14b5beffee1f634a723c830f5c1`. Use the committed candidate's
+full revision for the candidate. The runner refuses the history experiment
+without both pins and checks each descriptor against its arm's pin. Pass the
+copied manifest with `--manifest`, the selected tasks with `--corpus`, and the
+selected coverage with `--coverage` to `run-paired`. Keep the two runtime
+checkouts and their fixture services isolated.
+
+To validate the selected contracts without a runtime or model call, run:
+
+```bash
+uv run --locked --project eval/mcp-catalog mcp-catalog-bench validate \
+  --manifest eval/mcp-catalog/config/history.json \
+  --corpus eval/mcp-catalog/corpus/history-tasks.json \
+  --coverage eval/mcp-catalog/corpus/history-coverage.json
+```
 
 ## Source and contributor checks
 

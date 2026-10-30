@@ -167,9 +167,9 @@ HIST_COUNT=$(echo "$R" | python3 -c "import sys,json; d=json.loads(json.loads(sy
 # Grab the first commit and diff it.
 FIRST_COMMIT=$(echo "$R" | python3 -c "import sys,json; d=json.loads(json.loads(sys.stdin.read())['result']['content'][0]['text']); print(d['history'][0]['hash'])" 2>/dev/null)
 if [ -n "$FIRST_COMMIT" ]; then
-  R=$(mcp_call akb_diff "{\"uri\":\"$README_URI\",\"commit\":\"$FIRST_COMMIT\"}")
+  R=$(mcp_call akb_history "{\"uri\":\"$README_URI\",\"mode\":\"diff\",\"commit\":\"$FIRST_COMMIT\"}")
   DIFF=$(echo "$R" | mcp_result_field "['diff']")
-  [ -n "$DIFF" ] && pass "akb_diff returns patch for $FIRST_COMMIT" || fail "akb_diff" "empty diff"
+  [ -n "$DIFF" ] && pass "akb_history diff returns patch for $FIRST_COMMIT" || fail "akb_history diff" "empty diff"
 fi
 
 # ── 6. Health surface — new workers visible ─────────────────

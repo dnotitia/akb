@@ -61,7 +61,7 @@ def _historical_pair(
     manifest["candidate_route_overrides"] = {
         item["operation"]: item["candidate"]
         for item in manifest["public_operations"]
-        if item["candidate"] != {"tool": item["operation"], "action": None}
+        if item["candidate"] != item["baseline"]
     }
     manifest_hash = hash_json(manifest)
 

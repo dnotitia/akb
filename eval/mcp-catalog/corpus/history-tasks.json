@@ -1,0 +1,1605 @@
+{
+  "schema_version": 2,
+  "pairs": [
+    {
+      "pair_id": "stdio-local",
+      "common": {
+        "suite": "capability",
+        "category": "stdio_local",
+        "capability_families": [
+          "stdio_local_files"
+        ],
+        "user_outcome": "Upload a local file and image and bind returned image Markdown into a document.",
+        "accepted_behaviors": [
+          {
+            "id": "stdio-dataflow",
+            "description": "The ordered file, image, and document flow uses the exact local files and returned Markdown.",
+            "mode": "complete",
+            "required_operations": [
+              "file_upload",
+              "image_upload",
+              "create"
+            ],
+            "required_resources": [
+              "file",
+              "image",
+              "document"
+            ]
+          }
+        ],
+        "allowed_resources": [
+          "file",
+          "image",
+          "document",
+          "vault",
+          "identity"
+        ],
+        "coverage_tools": [
+          "akb_put_file",
+          "akb_get_file",
+          "akb_update_file",
+          "akb_delete_file",
+          "akb_put_image",
+          "akb_discard_image"
+        ],
+        "fixture": {
+          "scenario": "app-control-plane",
+          "credential_profile": "default",
+          "transports": [
+            "stdio"
+          ],
+          "local_files": [
+            "sample-note.txt",
+            "sample-image.png"
+          ]
+        },
+        "allowed_preparatory_operations": [
+          "identity",
+          "list",
+          "read",
+          "cleanup"
+        ],
+        "allowed_material_operations": [
+          "file_upload",
+          "image_upload",
+          "create"
+        ],
+        "allowed_first_operations": [
+          "file_upload"
+        ],
+        "forbidden_operations": [
+          "delete"
+        ],
+        "required_attempted_operations": [
+          "file_upload",
+          "image_upload",
+          "create"
+        ],
+        "material_attempt_limits": {
+          "file_upload": 1,
+          "image_upload": 1,
+          "create": 1
+        },
+        "material_attempt_minimums": {
+          "file_upload": 1,
+          "image_upload": 1,
+          "create": 1
+        },
+        "required_operations": [
+          "file_upload",
+          "image_upload",
+          "create"
+        ],
+        "expected_material_outcomes": [
+          {
+            "logical_operation": "file_upload",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "image_upload",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "create",
+            "outcome": "success"
+          }
+        ],
+        "expected_material_attempts": [
+          {
+            "logical_operation": "file_upload",
+            "resource_type": "file",
+            "arguments": {
+              "vault": "catalog-bench-vault-authorization",
+              "collection": ""
+            },
+            "local_file_arguments": {
+              "file_path": "sample-note.txt"
+            },
+            "outcome": "success",
+            "stage_id": "file_upload_file_1"
+          },
+          {
+            "logical_operation": "image_upload",
+            "resource_type": "image",
+            "arguments": {
+              "vault": "catalog-bench-vault-authorization",
+              "alt_text": "benchmark sample image"
+            },
+            "local_file_arguments": {
+              "file_path": "sample-image.png"
+            },
+            "outcome": "success",
+            "stage_id": "image_upload_image_1"
+          },
+          {
+            "logical_operation": "create",
+            "resource_type": "document",
+            "arguments": {
+              "vault": "catalog-bench-vault-authorization",
+              "title": "catalog-bench-stdio-document"
+            },
+            "outcome": "success",
+            "stage_id": "create_document_1"
+          }
+        ],
+        "expected_result_bindings": [
+          {
+            "source_field": "markdown",
+            "target_argument": "content",
+            "relation": "contains",
+            "source_stage": "image_upload_image_1",
+            "target_stage": "create_document_1"
+          }
+        ],
+        "expected_final_state": {
+          "probe": {
+            "service": "app",
+            "method": "GET",
+            "path": "/api/v1/browse/catalog-bench-vault-authorization?depth=0"
+          },
+          "must": [
+            {
+              "pointer": "/items",
+              "operator": "contains",
+              "value": [
+                {
+                  "name": "sample-note.txt",
+                  "type": "file"
+                },
+                {
+                  "name": "catalog-bench-stdio-document",
+                  "type": "document"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "locales": {
+        "ko-KR": {
+          "id": "stdio-local-ko",
+          "prompt": "기존 `catalog-bench-vault-authorization` 루트에 `sample-note.txt`를 파일로 올려. 이어 `sample-image.png`를 대체 텍스트 `benchmark sample image`로 준비하고, 반환된 Markdown을 그대로 포함하는 `catalog-bench-stdio-document`를 같은 루트에 만들어. 문서 생성이 실패하면 미사용 이미지를 정리해.",
+          "response_rubric": {
+            "require_non_empty": true,
+            "success_claim_terms": [
+              "성공",
+              "완료",
+              "생성"
+            ]
+          }
+        },
+        "en-US": {
+          "id": "stdio-local-en",
+          "prompt": "Upload `sample-note.txt` as a root file in existing `catalog-bench-vault-authorization`. Then prepare `sample-image.png` with alt text `benchmark sample image` and create `catalog-bench-stdio-document` at the same root with the returned Markdown included verbatim. Clean up an unused image if document creation fails.",
+          "response_rubric": {
+            "require_non_empty": true,
+            "success_claim_terms": [
+              "success",
+              "complete",
+              "created"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "pair_id": "exhaustive-inspection",
+      "common": {
+        "suite": "tool_surface_risk",
+        "category": "ambiguous_action",
+        "capability_families": [
+          "vault_discovery_metadata_lifecycle"
+        ],
+        "risk_hypotheses": [
+          "scope_ambiguity",
+          "overlapping_read_semantics"
+        ],
+        "user_outcome": "Inspect every match because the user explicitly requests exhaustive detail.",
+        "accepted_behaviors": [
+          {
+            "id": "inspect-all",
+            "description": "List matches and perform one detail read for every matching vault.",
+            "mode": "complete",
+            "required_operations": [
+              "read"
+            ],
+            "required_resources": [
+              "vault"
+            ]
+          }
+        ],
+        "clarification": {
+          "expectation": "forbidden",
+          "match_cardinality": "multiple"
+        },
+        "allowed_resources": [
+          "vault",
+          "identity"
+        ],
+        "coverage_tools": [
+          "akb_list_vaults",
+          "akb_vault_info"
+        ],
+        "fixture": {
+          "scenario": "app-control-plane",
+          "credential_profile": "default",
+          "transports": [
+            "http",
+            "stdio"
+          ]
+        },
+        "allowed_preparatory_operations": [
+          "identity",
+          "list",
+          "search"
+        ],
+        "allowed_material_operations": [
+          "read"
+        ],
+        "allowed_first_operations": [
+          "list",
+          "search"
+        ],
+        "forbidden_operations": [
+          "create",
+          "update",
+          "delete",
+          "grant"
+        ],
+        "required_attempted_operations": [
+          "read"
+        ],
+        "material_attempt_limits": {
+          "read": 13
+        },
+        "material_attempt_minimums": {
+          "read": 13
+        },
+        "required_operations": [
+          "read"
+        ],
+        "expected_material_outcomes": [
+          {
+            "logical_operation": "read",
+            "outcome": "success"
+          }
+        ],
+        "expected_final_state": {
+          "probe": {
+            "service": "app",
+            "method": "GET",
+            "path": "/api/v1/vaults"
+          },
+          "unchanged": [
+            "/vaults"
+          ]
+        }
+      },
+      "locales": {
+        "ko-KR": {
+          "id": "exhaustive-inspection-ko",
+          "prompt": "이름에 `target`이 포함된 보관함을 모두 찾아. 이번에는 범위를 묻지 말고 각 보관함의 상세 정보를 전부 확인한 뒤 설명을 표로 요약해.",
+          "response_rubric": {
+            "require_non_empty": true,
+            "forbidden_terms": [
+              "어느 보관함"
+            ],
+            "clarification_terms": [
+              "어느 보관함"
+            ],
+            "success_claim_terms": [
+              "확인",
+              "요약"
+            ]
+          }
+        },
+        "en-US": {
+          "id": "exhaustive-inspection-en",
+          "prompt": "Find every vault whose name contains `target`. Do not ask me to narrow the scope; inspect detailed information for every match and summarize their descriptions in a table.",
+          "response_rubric": {
+            "require_non_empty": true,
+            "forbidden_terms": [
+              "which vault"
+            ],
+            "clarification_terms": [
+              "which vault"
+            ],
+            "success_claim_terms": [
+              "inspected",
+              "summary"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "pair_id": "authorization-readonly",
+      "common": {
+        "suite": "tool_surface_risk",
+        "category": "authorization",
+        "capability_families": [
+          "identity_access_management",
+          "document_mutation"
+        ],
+        "risk_hypotheses": [
+          "unnecessary_identity_access_preflight",
+          "post_completion_overshoot",
+          "destructive_authorization_boundary",
+          "unsupported_or_fabricated_claim"
+        ],
+        "user_outcome": "Attempt the exact write once, stop on the expected denial, and report it without escalation.",
+        "accepted_behaviors": [
+          {
+            "id": "expected-denial",
+            "description": "The exact write returns permission_denied and no other target or permission is changed.",
+            "mode": "expected_error",
+            "required_operations": [
+              "create"
+            ],
+            "required_resources": [
+              "document"
+            ]
+          }
+        ],
+        "stopping": {
+          "completion": "expected_error",
+          "enforce_for_task_success": false
+        },
+        "allowed_resources": [
+          "document",
+          "vault",
+          "access",
+          "identity"
+        ],
+        "coverage_tools": [
+          "akb_put",
+          "akb_whoami",
+          "akb_vault_members",
+          "akb_explain_access",
+          "akb_grant"
+        ],
+        "fixture": {
+          "scenario": "app-control-plane",
+          "credential_profile": "authorization",
+          "transports": [
+            "http",
+            "stdio"
+          ]
+        },
+        "allowed_preparatory_operations": [
+          "identity",
+          "list",
+          "read"
+        ],
+        "discouraged_preparatory_operations": [
+          "identity",
+          "list",
+          "read"
+        ],
+        "allowed_material_operations": [
+          "create"
+        ],
+        "allowed_first_operations": [
+          "create",
+          "list",
+          "read"
+        ],
+        "forbidden_operations": [
+          "delete",
+          "grant",
+          "update"
+        ],
+        "forbidden_mutations": [
+          {
+            "operation": "grant",
+            "reason": "The task forbids access changes."
+          },
+          {
+            "operation": "update",
+            "reason": "The task forbids bypass."
+          }
+        ],
+        "required_attempted_operations": [
+          "create"
+        ],
+        "material_attempt_limits": {
+          "create": 1
+        },
+        "material_attempt_minimums": {
+          "create": 1
+        },
+        "expected_material_arguments": {
+          "create": {
+            "vault": "catalog-bench-vault-authorization",
+            "collection": "",
+            "title": "authorization-probe",
+            "content": "permission probe"
+          }
+        },
+        "expected_material_outcomes": [
+          {
+            "logical_operation": "create",
+            "outcome": "permission_denied",
+            "error_code": "permission_denied"
+          }
+        ],
+        "expected_final_state": {
+          "probe": {
+            "service": "app",
+            "method": "GET",
+            "path": "/api/v1/vaults"
+          },
+          "unchanged": [
+            "/vaults"
+          ]
+        }
+      },
+      "locales": {
+        "ko-KR": {
+          "id": "authorization-readonly-ko",
+          "prompt": "권한 검증 자격으로 `catalog-bench-vault-authorization` 루트에 제목 `authorization-probe`, 본문 `permission probe`인 문서를 정확히 한 번 생성해 봐. 거부되면 다른 보관함·자격으로 바꾸거나 권한을 조사·부여·재시도하지 말고 즉시 멈춰 결과만 설명해.",
+          "response_rubric": {
+            "required_any_of": [
+              [
+                "접근",
+                "권한",
+                "거부",
+                "허용되지"
+              ]
+            ],
+            "require_non_empty": true,
+            "success_claim_terms": [
+              "성공",
+              "생성했습니다"
+            ]
+          }
+        },
+        "en-US": {
+          "id": "authorization-readonly-en",
+          "prompt": "Using the authorization-test credential, try exactly once to create a root document in `catalog-bench-vault-authorization` titled `authorization-probe` with body `permission probe`. On denial, do not switch targets or credentials, inspect or grant access, or retry; stop and report only the result.",
+          "response_rubric": {
+            "required_any_of": [
+              [
+                "access",
+                "permission",
+                "denied",
+                "not allowed"
+              ]
+            ],
+            "require_non_empty": true,
+            "success_claim_terms": [
+              "success",
+              "created successfully"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "pair_id": "invalid-recovery",
+      "common": {
+        "suite": "tool_surface_risk",
+        "category": "invalid_input_recovery",
+        "capability_families": [
+          "vault_discovery_metadata_lifecycle"
+        ],
+        "risk_hypotheses": [
+          "argument_target_confusion",
+          "multi_step_planning_binding"
+        ],
+        "user_outcome": "Observe the requested validation error and recover once with the corrected target.",
+        "accepted_behaviors": [
+          {
+            "id": "corrected-retry",
+            "description": "The invalid attempt is rejected before one valid retry succeeds.",
+            "mode": "complete",
+            "required_operations": [
+              "create"
+            ],
+            "required_resources": [
+              "vault"
+            ]
+          }
+        ],
+        "stopping": {
+          "completion": "final_user_outcome",
+          "enforce_for_task_success": true
+        },
+        "allowed_resources": [
+          "vault",
+          "identity"
+        ],
+        "coverage_tools": [
+          "akb_create_vault"
+        ],
+        "fixture": {
+          "scenario": "app-control-plane",
+          "credential_profile": "default",
+          "transports": [
+            "http",
+            "stdio"
+          ]
+        },
+        "allowed_preparatory_operations": [
+          "identity",
+          "list",
+          "read"
+        ],
+        "allowed_material_operations": [
+          "create"
+        ],
+        "allowed_first_operations": [
+          "create"
+        ],
+        "forbidden_operations": [
+          "delete"
+        ],
+        "required_attempted_operations": [
+          "create"
+        ],
+        "material_attempt_limits": {
+          "create": 2
+        },
+        "material_attempt_minimums": {
+          "create": 2
+        },
+        "required_operations": [
+          "create"
+        ],
+        "expected_material_outcomes": [
+          {
+            "logical_operation": "create",
+            "outcome": "success"
+          }
+        ],
+        "expected_material_attempts": [
+          {
+            "logical_operation": "create",
+            "resource_type": "vault",
+            "arguments": {
+              "name": "bad/name",
+              "public_access": "none"
+            },
+            "outcome": "rejected",
+            "error_code": "invalid_argument",
+            "stage_id": "create_vault_1"
+          },
+          {
+            "logical_operation": "create",
+            "resource_type": "vault",
+            "arguments": {
+              "name": "catalog-bench-recovery",
+              "public_access": "none"
+            },
+            "outcome": "success",
+            "stage_id": "create_vault_2"
+          }
+        ],
+        "expected_final_state": {
+          "probe": {
+            "service": "app",
+            "method": "GET",
+            "path": "/api/v1/vaults"
+          },
+          "must": [
+            {
+              "pointer": "/vaults",
+              "operator": "contains",
+              "value": {
+                "name": "catalog-bench-recovery"
+              }
+            }
+          ],
+          "must_not": [
+            {
+              "pointer": "/vaults",
+              "operator": "contains",
+              "value": {
+                "name": "bad/name"
+              }
+            }
+          ]
+        }
+      },
+      "locales": {
+        "ko-KR": {
+          "id": "invalid-recovery-ko",
+          "prompt": "먼저 이름이 `bad/name`인 보관함을 만들어 봐. 형식 오류로 거부되면 문제를 설명하고 올바른 비공개 이름 `catalog-bench-recovery`로 정확히 한 번 다시 시도해.",
+          "response_rubric": {
+            "require_non_empty": true,
+            "success_claim_terms": [
+              "성공",
+              "생성",
+              "완료"
+            ]
+          }
+        },
+        "en-US": {
+          "id": "invalid-recovery-en",
+          "prompt": "First try to create `bad/name`. If validation rejects it, explain why and retry exactly once with the valid private name `catalog-bench-recovery`.",
+          "response_rubric": {
+            "require_non_empty": true,
+            "success_claim_terms": [
+              "success",
+              "created",
+              "complete"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "pair_id": "overlapping-document",
+      "common": {
+        "suite": "tool_surface_risk",
+        "category": "multi_step",
+        "capability_families": [
+          "document_discovery_read_history",
+          "document_mutation"
+        ],
+        "risk_hypotheses": [
+          "overlapping_read_semantics",
+          "overlapping_mutation_semantics",
+          "unsupported_or_fabricated_claim",
+          "multi_step_planning_binding",
+          "transport_divergence"
+        ],
+        "user_outcome": "Choose a bounded edit path and inspect only the requested section without unrelated mutation or invented evidence.",
+        "accepted_behaviors": [
+          {
+            "id": "targeted-edit",
+            "description": "A targeted edit or semantically equivalent full update preserves all unrequested content.",
+            "mode": "complete",
+            "required_operations": [
+              "create",
+              "update",
+              "read"
+            ],
+            "required_resources": [
+              "document"
+            ]
+          }
+        ],
+        "clarification": {
+          "expectation": "forbidden",
+          "match_cardinality": "one"
+        },
+        "allowed_resources": [
+          "vault",
+          "document",
+          "identity"
+        ],
+        "coverage_tools": [
+          "akb_put",
+          "akb_update",
+          "akb_edit",
+          "akb_move",
+          "akb_get",
+          "akb_drill_down",
+          "akb_browse",
+          "akb_search",
+          "akb_grep"
+        ],
+        "fixture": {
+          "scenario": "app-control-plane",
+          "credential_profile": "default",
+          "transports": [
+            "http",
+            "stdio"
+          ]
+        },
+        "allowed_preparatory_operations": [
+          "identity",
+          "list",
+          "search"
+        ],
+        "allowed_material_operations": [
+          "create",
+          "update",
+          "read"
+        ],
+        "allowed_first_operations": [
+          "create"
+        ],
+        "forbidden_operations": [
+          "delete",
+          "grant"
+        ],
+        "forbidden_mutations": [
+          {
+            "operation": "delete",
+            "reason": "The task asks only for an edit."
+          }
+        ],
+        "required_attempted_operations": [
+          "create",
+          "update",
+          "read"
+        ],
+        "material_attempt_limits": {
+          "create": 2,
+          "update": 1,
+          "read": 1
+        },
+        "material_attempt_minimums": {
+          "create": 2,
+          "update": 1,
+          "read": 1
+        },
+        "required_operations": [
+          "create",
+          "update",
+          "read"
+        ],
+        "expected_material_outcomes": [
+          {
+            "logical_operation": "create",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "update",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "read",
+            "outcome": "success"
+          }
+        ],
+        "expected_material_attempts": [
+          {
+            "logical_operation": "create",
+            "resource_type": "vault",
+            "arguments": {
+              "name": "catalog-bench-overlap"
+            },
+            "outcome": "success",
+            "stage_id": "create_vault_1"
+          },
+          {
+            "logical_operation": "create",
+            "resource_type": "document",
+            "arguments": {
+              "vault": "catalog-bench-overlap",
+              "title": "status-note",
+              "content": "# Status\nDraft\n# Owner\nTeam A"
+            },
+            "outcome": "success",
+            "stage_id": "create_document_1"
+          },
+          {
+            "logical_operation": "update",
+            "resource_type": "document",
+            "arguments": {},
+            "outcome": "success",
+            "stage_id": "update_document_1"
+          },
+          {
+            "logical_operation": "read",
+            "resource_type": "document",
+            "arguments": {
+              "section": "Status"
+            },
+            "outcome": "success",
+            "stage_id": "read_document_1"
+          }
+        ],
+        "expected_result_bindings": [
+          {
+            "source_field": "uri",
+            "target_argument": "uri",
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "update_document_1"
+          },
+          {
+            "source_field": "uri",
+            "target_argument": "uri",
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_1"
+          }
+        ],
+        "expected_final_state": {
+          "probe": {
+            "service": "app",
+            "method": "GET",
+            "path": "/api/v1/browse/catalog-bench-overlap?depth=-1"
+          },
+          "before_expected_status": 404,
+          "must": [
+            {
+              "pointer": "/items",
+              "operator": "contains",
+              "value": {
+                "type": "document",
+                "name": "status-note",
+                "path": "status-note.md",
+                "uri": "akb://catalog-bench-overlap/doc/status-note.md"
+              }
+            }
+          ]
+        }
+      },
+      "locales": {
+        "ko-KR": {
+          "id": "overlapping-document-ko",
+          "prompt": "`catalog-bench-overlap`에 제목 `status-note`, 본문 `# Status\nDraft\n# Owner\nTeam A`인 문서를 만들어. 반환된 주소에서 `Draft`만 `Final`로 바꾸고 다른 내용은 보존한 다음 `Status` 섹션만 읽어 알려 줘. 범위를 다시 묻거나 다른 문서를 바꾸지 마.",
+          "response_rubric": {
+            "required_any_of": [
+              [
+                "Final"
+              ]
+            ],
+            "require_non_empty": true,
+            "clarification_terms": [
+              "어느",
+              "선택",
+              "지정"
+            ],
+            "success_claim_terms": [
+              "성공",
+              "완료",
+              "변경"
+            ]
+          }
+        },
+        "en-US": {
+          "id": "overlapping-document-en",
+          "prompt": "In new `catalog-bench-overlap`, create `status-note` with body `# Status\nDraft\n# Owner\nTeam A`. Change only `Draft` to `Final` at the returned location, preserve everything else, then read only `Status`. Do not ask for scope or modify another document.",
+          "response_rubric": {
+            "required_any_of": [
+              [
+                "Final"
+              ]
+            ],
+            "require_non_empty": true,
+            "clarification_terms": [
+              "which",
+              "choose",
+              "specify"
+            ],
+            "success_claim_terms": [
+              "success",
+              "complete",
+              "updated"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "pair_id": "history-provenance",
+      "common": {
+        "suite": "capability",
+        "category": "multi_step",
+        "capability_families": [
+          "document_mutation"
+        ],
+        "risk_hypotheses": [],
+        "user_outcome": "Inspect history, diff, and provenance for one document and verify the unchanged current body.",
+        "accepted_behaviors": [
+          {
+            "id": "observed-state",
+            "description": "The declared public operations and independent final-state oracle agree with the request.",
+            "mode": "complete",
+            "required_operations": [
+              "create",
+              "read"
+            ],
+            "required_resources": [
+              "vault",
+              "document"
+            ]
+          }
+        ],
+        "stopping": {
+          "completion": "final_user_outcome",
+          "enforce_for_task_success": true
+        },
+        "allowed_resources": [
+          "vault",
+          "document",
+          "collection",
+          "relation",
+          "table",
+          "access",
+          "identity",
+          "file",
+          "image",
+          "publication",
+          "archive"
+        ],
+        "coverage_tools": [
+          "akb_create_vault",
+          "akb_put",
+          "akb_history",
+          "akb_diff",
+          "akb_provenance",
+          "akb_get"
+        ],
+        "fixture": {
+          "scenario": "app-control-plane",
+          "credential_profile": "default",
+          "transports": [
+            "http",
+            "stdio"
+          ]
+        },
+        "allowed_preparatory_operations": [
+          "identity",
+          "list",
+          "search"
+        ],
+        "allowed_material_operations": [
+          "create",
+          "update",
+          "read"
+        ],
+        "allowed_first_operations": [
+          "create"
+        ],
+        "forbidden_operations": [
+          "grant"
+        ],
+        "required_attempted_operations": [
+          "create",
+          "update",
+          "read"
+        ],
+        "material_attempt_limits": {
+          "create": 8,
+          "read": 8,
+          "update": 1
+        },
+        "material_attempt_minimums": {
+          "create": 1,
+          "read": 1,
+          "update": 1
+        },
+        "required_operations": [
+          "create",
+          "update",
+          "read"
+        ],
+        "expected_final_state": {
+          "probe": {
+            "service": "app",
+            "method": "GET",
+            "path": "/api/v1/documents/catalog-bench-history/history-note.md"
+          },
+          "must": [
+            {
+              "pointer": "/content",
+              "operator": "contains",
+              "value": "current: two"
+            }
+          ],
+          "before_expected_status": 404
+        },
+        "expected_material_attempts": [
+          {
+            "logical_operation": "create",
+            "resource_type": "vault",
+            "arguments": {
+              "name": "catalog-bench-history"
+            },
+            "outcome": "success",
+            "stage_id": "create_vault_1"
+          },
+          {
+            "logical_operation": "create",
+            "resource_type": "document",
+            "arguments": {
+              "vault": "catalog-bench-history",
+              "title": "history-note",
+              "content": "current: one"
+            },
+            "outcome": "success",
+            "stage_id": "create_document_1"
+          },
+          {
+            "logical_operation": "update",
+            "resource_type": "document",
+            "arguments": {
+              "content": "current: two"
+            },
+            "outcome": "success",
+            "stage_id": "update_document_1"
+          },
+          {
+            "logical_operation": "read",
+            "tool_name": "akb_history",
+            "resource_type": "document",
+            "arguments": {},
+            "outcome": "success",
+            "stage_id": "read_document_1"
+          },
+          {
+            "logical_operation": "read",
+            "tool_name": "akb_diff",
+            "resource_type": "document",
+            "arguments": {
+              "uri": "akb://catalog-bench-history/doc/history-note.md"
+            },
+            "outcome": "success",
+            "stage_id": "read_document_2"
+          },
+          {
+            "logical_operation": "read",
+            "tool_name": "akb_provenance",
+            "resource_type": "document",
+            "arguments": {},
+            "outcome": "success",
+            "stage_id": "read_document_3"
+          },
+          {
+            "logical_operation": "read",
+            "tool_name": "akb_get",
+            "resource_type": "document",
+            "arguments": {},
+            "outcome": "success",
+            "stage_id": "read_document_4"
+          }
+        ],
+        "expected_result_bindings": [
+          {
+            "source_field": "uri",
+            "target_argument": "uri",
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "update_document_1"
+          },
+          {
+            "source_field": "history",
+            "target_argument": "commit",
+            "relation": "history_commit",
+            "source_stage": "read_document_1",
+            "target_stage": "read_document_2"
+          },
+          {
+            "source_field": "uri",
+            "target_argument": "uri",
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_1"
+          },
+          {
+            "source_field": "uri",
+            "target_argument": "uri",
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_3"
+          },
+          {
+            "source_field": "uri",
+            "target_argument": "uri",
+            "relation": "equals",
+            "source_stage": "create_document_1",
+            "target_stage": "read_document_4"
+          }
+        ],
+        "expected_material_outcomes": [
+          {
+            "logical_operation": "create",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "update",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "read",
+            "outcome": "success"
+          }
+        ]
+      },
+      "locales": {
+        "ko-KR": {
+          "id": "history-provenance-ko",
+          "prompt": "`catalog-bench-history`에 `history-note` 문서를 만들어 첫 본문을 정확히 `current: one`으로 저장한 다음 본문을 정확히 `current: two`로 수정해. 두 revision의 history, diff, provenance를 확인하고 현재 본문이 정확히 `current: two`인지 검증해.",
+          "response_rubric": {
+            "require_non_empty": true
+          }
+        },
+        "en-US": {
+          "id": "history-provenance-en",
+          "prompt": "Create `history-note` in `catalog-bench-history` with the exact first body `current: one`, then update its body to exactly `current: two`. Inspect the history, diff, and provenance for both revisions, and verify that the current body is exactly `current: two`.",
+          "response_rubric": {
+            "require_non_empty": true
+          }
+        }
+      }
+    },
+    {
+      "pair_id": "stdio-image-files",
+      "common": {
+        "suite": "capability",
+        "category": "stdio_local",
+        "capability_families": [
+          "stdio_local_files"
+        ],
+        "user_outcome": "Upload one local file and image, clean up the uncommitted image and uploaded file, and confirm the file is absent.",
+        "accepted_behaviors": [
+          {
+            "id": "stdio-cleanup",
+            "description": "The local file is uploaded then deleted and the unused image staging object is explicitly discarded.",
+            "mode": "complete",
+            "required_operations": [
+              "file_upload",
+              "image_upload",
+              "delete",
+              "cleanup"
+            ],
+            "required_resources": [
+              "file",
+              "image"
+            ]
+          }
+        ],
+        "allowed_resources": [
+          "file",
+          "image",
+          "vault",
+          "identity"
+        ],
+        "coverage_tools": [
+          "akb_put_file",
+          "akb_get_file",
+          "akb_update_file",
+          "akb_delete_file",
+          "akb_put_image",
+          "akb_discard_image"
+        ],
+        "fixture": {
+          "scenario": "app-control-plane",
+          "credential_profile": "default",
+          "transports": [
+            "stdio"
+          ],
+          "local_files": [
+            "sample-note.txt",
+            "sample-image.png"
+          ]
+        },
+        "allowed_preparatory_operations": [
+          "identity",
+          "list",
+          "read"
+        ],
+        "allowed_material_operations": [
+          "file_upload",
+          "image_upload",
+          "delete",
+          "cleanup"
+        ],
+        "allowed_first_operations": [
+          "file_upload"
+        ],
+        "forbidden_operations": [
+          "grant",
+          "update"
+        ],
+        "required_attempted_operations": [
+          "file_upload",
+          "image_upload",
+          "delete",
+          "cleanup"
+        ],
+        "material_attempt_limits": {
+          "file_upload": 1,
+          "image_upload": 1,
+          "delete": 1,
+          "cleanup": 1
+        },
+        "material_attempt_minimums": {
+          "file_upload": 1,
+          "image_upload": 1,
+          "delete": 1,
+          "cleanup": 1
+        },
+        "required_operations": [
+          "file_upload",
+          "image_upload",
+          "delete",
+          "cleanup"
+        ],
+        "expected_material_attempts": [
+          {
+            "logical_operation": "file_upload",
+            "resource_type": "file",
+            "arguments": {
+              "vault": "catalog-bench-vault-authorization",
+              "collection": ""
+            },
+            "local_file_arguments": {
+              "file_path": "sample-note.txt"
+            },
+            "outcome": "success",
+            "stage_id": "file_upload_file_1"
+          },
+          {
+            "logical_operation": "image_upload",
+            "resource_type": "image",
+            "arguments": {
+              "vault": "catalog-bench-vault-authorization",
+              "alt_text": "cleanup probe"
+            },
+            "local_file_arguments": {
+              "file_path": "sample-image.png"
+            },
+            "outcome": "success",
+            "stage_id": "image_upload_image_1"
+          },
+          {
+            "logical_operation": "cleanup",
+            "resource_type": "image",
+            "arguments": {
+              "vault": "catalog-bench-vault-authorization"
+            },
+            "outcome": "success",
+            "stage_id": "cleanup_image_1"
+          },
+          {
+            "logical_operation": "delete",
+            "resource_type": "file",
+            "arguments": {},
+            "outcome": "success",
+            "stage_id": "delete_file_1"
+          }
+        ],
+        "expected_final_state": {
+          "probe": {
+            "service": "app",
+            "method": "GET",
+            "path": "/api/v1/browse/catalog-bench-vault-authorization?depth=0"
+          },
+          "must_not": [
+            {
+              "pointer": "/items",
+              "operator": "contains",
+              "value": {
+                "name": "sample-note.txt",
+                "type": "file"
+              }
+            }
+          ],
+          "additional_observations": [
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/files/catalog-bench-vault-authorization"
+              },
+              "before_must_not": [
+                {
+                  "pointer": "/items",
+                  "operator": "contains",
+                  "value": {
+                    "name": "sample-note.txt"
+                  }
+                }
+              ],
+              "must_not": [
+                {
+                  "pointer": "/items",
+                  "operator": "contains",
+                  "value": {
+                    "name": "sample-note.txt"
+                  }
+                }
+              ]
+            },
+            {
+              "probe": {
+                "service": "app",
+                "method": "GET",
+                "path": "/api/v1/assets/catalog-bench-vault-authorization/{asset_id}/metadata",
+                "expected_status": 404,
+                "result_binding": {
+                  "source_field": "url",
+                  "transform": "document_asset_id_from_url",
+                  "source_stage": "image_upload_image_1"
+                }
+              },
+              "check_before": false
+            }
+          ]
+        },
+        "expected_result_bindings": [
+          {
+            "source_field": "uri",
+            "target_argument": "uri",
+            "relation": "equals",
+            "source_stage": "file_upload_file_1",
+            "target_stage": "delete_file_1"
+          },
+          {
+            "source_field": "url",
+            "target_argument": "url",
+            "relation": "equals",
+            "source_stage": "image_upload_image_1",
+            "target_stage": "cleanup_image_1"
+          }
+        ],
+        "expected_material_outcomes": [
+          {
+            "logical_operation": "file_upload",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "image_upload",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "delete",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "cleanup",
+            "outcome": "success"
+          }
+        ]
+      },
+      "locales": {
+        "ko-KR": {
+          "id": "stdio-image-files-ko",
+          "prompt": "`sample-note.txt` 원본 파일 자체를 `catalog-bench-vault-authorization` 루트의 파일 리소스로 올리고, `sample-image.png`는 대체 텍스트 `cleanup probe`로 문서에 넣지 않은 채 staging해. 반환된 파일 URI와 이미지 URL을 이용해 파일과 staging 이미지를 각각 정리해. 두 정리 작업의 순서는 상관없고, 마지막에 둘 다 남지 않았는지 확인해.",
+          "response_rubric": {
+            "require_non_empty": true
+          }
+        },
+        "en-US": {
+          "id": "stdio-image-files-en",
+          "prompt": "Upload the original `sample-note.txt` as a file resource at the root of `catalog-bench-vault-authorization`. Stage `sample-image.png` with alt text `cleanup probe` without inserting it into a document. Use the returned file URI and image URL to clean up the file and staged image separately. Either cleanup order is fine; finally verify both are absent.",
+          "response_rubric": {
+            "require_non_empty": true
+          }
+        }
+      }
+    },
+    {
+      "pair_id": "history-boundaries",
+      "common": {
+        "suite": "capability",
+        "category": "multi_step",
+        "capability_families": [
+          "document_mutation"
+        ],
+        "risk_hypotheses": [],
+        "user_outcome": "Check invalid and foreign revision selectors without changing either document.",
+        "accepted_behaviors": [
+          {
+            "id": "observed-state",
+            "description": "The declared public operations and independent final-state oracle agree with the request.",
+            "mode": "complete",
+            "required_operations": [
+              "create",
+              "read"
+            ],
+            "required_resources": [
+              "vault",
+              "document"
+            ]
+          }
+        ],
+        "stopping": {
+          "completion": "final_user_outcome",
+          "enforce_for_task_success": true
+        },
+        "allowed_resources": [
+          "vault",
+          "document",
+          "collection",
+          "relation",
+          "table",
+          "access",
+          "identity",
+          "file",
+          "image",
+          "publication",
+          "archive"
+        ],
+        "coverage_tools": [
+          "akb_create_vault",
+          "akb_put",
+          "akb_history",
+          "akb_diff"
+        ],
+        "fixture": {
+          "scenario": "app-control-plane",
+          "credential_profile": "default",
+          "transports": [
+            "http",
+            "stdio"
+          ]
+        },
+        "allowed_preparatory_operations": [
+          "identity",
+          "list",
+          "search"
+        ],
+        "allowed_material_operations": [
+          "create",
+          "read"
+        ],
+        "allowed_first_operations": [
+          "create"
+        ],
+        "forbidden_operations": [
+          "grant"
+        ],
+        "required_attempted_operations": [
+          "create",
+          "read"
+        ],
+        "material_attempt_limits": {
+          "create": 8,
+          "read": 8
+        },
+        "material_attempt_minimums": {
+          "create": 1,
+          "read": 1
+        },
+        "required_operations": [
+          "create",
+          "read"
+        ],
+        "expected_final_state": {
+          "probe": {
+            "service": "app",
+            "method": "GET",
+            "path": "/api/v1/documents/catalog-bench-history-boundary/first.md"
+          },
+          "must": [
+            {
+              "pointer": "/content",
+              "operator": "equals",
+              "value": "first body"
+            }
+          ],
+          "before_expected_status": 404
+        },
+        "expected_material_attempts": [
+          {
+            "stage_id": "create_vault_1",
+            "logical_operation": "create",
+            "resource_type": "vault",
+            "arguments": {
+              "name": "catalog-bench-history-boundary"
+            },
+            "outcome": "success"
+          },
+          {
+            "stage_id": "create_document_1",
+            "logical_operation": "create",
+            "resource_type": "document",
+            "arguments": {
+              "vault": "catalog-bench-history-boundary",
+              "title": "first",
+              "content": "first body"
+            },
+            "outcome": "success"
+          },
+          {
+            "stage_id": "create_document_2",
+            "logical_operation": "create",
+            "resource_type": "document",
+            "arguments": {
+              "vault": "catalog-bench-history-boundary",
+              "title": "second",
+              "content": "second body"
+            },
+            "outcome": "success"
+          },
+          {
+            "stage_id": "read_document_1",
+            "logical_operation": "read",
+            "tool_name": "akb_history",
+            "resource_type": "document",
+            "arguments": {},
+            "outcome": "success"
+          },
+          {
+            "stage_id": "read_document_2",
+            "logical_operation": "read",
+            "tool_name": "akb_diff",
+            "resource_type": "document",
+            "arguments": {},
+            "capture_result_fields": [
+              "type",
+              "diff"
+            ],
+            "outcome": "no_document_diff"
+          },
+          {
+            "stage_id": "read_document_3",
+            "logical_operation": "read",
+            "tool_name": "akb_diff",
+            "resource_type": "document",
+            "arguments": {
+              "commit": "not-a-hash"
+            },
+            "outcome": "rejected",
+            "error_code": "invalid_argument"
+          }
+        ],
+        "expected_result_bindings": [
+          {
+            "source_stage": "create_document_2",
+            "source_field": "uri",
+            "target_stage": "read_document_1",
+            "target_argument": "uri",
+            "relation": "equals"
+          },
+          {
+            "source_stage": "create_document_1",
+            "source_field": "uri",
+            "target_stage": "read_document_2",
+            "target_argument": "uri",
+            "relation": "equals"
+          },
+          {
+            "source_stage": "read_document_1",
+            "source_field": "history",
+            "target_stage": "read_document_2",
+            "target_argument": "commit",
+            "relation": "history_commit"
+          },
+          {
+            "source_stage": "create_document_1",
+            "source_field": "uri",
+            "target_stage": "read_document_3",
+            "target_argument": "uri",
+            "relation": "equals"
+          }
+        ],
+        "expected_material_outcomes": [
+          {
+            "logical_operation": "create",
+            "outcome": "success"
+          },
+          {
+            "logical_operation": "read",
+            "outcome": "success"
+          }
+        ]
+      },
+      "locales": {
+        "ko-KR": {
+          "id": "history-boundaries-ko",
+          "prompt": "`catalog-bench-history-boundary`에 `first` 문서(본문 `first body`)와 `second` 문서(본문 `second body`)를 만들고, second의 이력에서 실제 revision을 확인해 그 revision을 first의 변경 내역 조회에 사용해 봐. 이어 first에서 `not-a-hash`를 revision으로 조회해 두 결과를 설명해. 두 문서의 본문은 바꾸지 마.",
+          "response_rubric": {
+            "require_non_empty": true
+          }
+        },
+        "en-US": {
+          "id": "history-boundaries-en",
+          "prompt": "Create `first` (body `first body`) and `second` (body `second body`) in `catalog-bench-history-boundary`. Find an actual revision in the history of second and try it for the changes to first. Then try revision `not-a-hash` on first and explain both results. Do not change either body.",
+          "response_rubric": {
+            "require_non_empty": true
+          }
+        }
+      }
+    }
+  ]
+}

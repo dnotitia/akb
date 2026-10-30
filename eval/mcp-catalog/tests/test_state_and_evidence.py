@@ -339,3 +339,13 @@ def test_exception_evidence_keeps_redacted_nested_cause_and_status() -> None:
     assert "StatusError: request body rejected: [redacted]" in detail
     assert "status=413" in detail
     assert marker not in detail
+
+
+def test_failed_state_status_is_preserved_for_scoring() -> None:
+    from mcp_catalog.runner import _state_observations
+
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "history-tasks.json") if task.id == "history-provenance-en")
+    outcome = TrialOutcome(task_id=task.id, category=task.category, arm="candidate", model_class="primary", model_id="fixture", transport="http")
+    outcome.state_observations_after = [{"available": True, "status_code": 404, "payload": {"detail": "missing"}, "error": None}]
+    observation = _state_observations(outcome, task, before=False)[0]
+    assert observation.available and observation.status_code == 404

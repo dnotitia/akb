@@ -604,7 +604,7 @@ TOOLS = [
         description=(
             "Get activity history for a vault — who changed what, when, and why. "
             "Returns Git commit history with changed file list. "
-            "Use akb_diff to see the actual content changes for a specific commit."
+            "Use akb_history in diff mode to see content changes for a specific commit."
         ),
         input_schema={
             "type": "object",
@@ -616,22 +616,6 @@ TOOLS = [
                 "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
             },
             "required": ["vault"],
-        },
-    ),
-    Tool(
-        name="akb_diff",
-        description=(
-            "Get the content diff for a document at a specific commit. "
-            "Shows what was added/removed/modified. "
-            "Use akb_history or akb_activity to find commit hashes first."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "uri": {"type": "string", "description": "Document URI"},
-                "commit": {"type": "string", "description": "Commit hash (from akb_history or akb_activity)"},
-            },
-            "required": ["uri", "commit"],
         },
     ),
     Tool(
@@ -1328,13 +1312,16 @@ TOOLS = [
         name="akb_history",
         description=(
             "Get version history of a document — who changed it, when, and why. "
-            "Each entry is a Git commit. Use the commit hash with akb_get to read a previous version."
+            "Use mode=diff with a commit from the list to see that revision’s changes. "
+            "Use the commit hash with akb_get to read a previous version."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI"},
-                "limit": {"type": "integer", "default": 20, "description": "Max entries"},
+                "limit": {"type": "integer", "default": 20, "description": "Max entries in list mode"},
+                "mode": {"type": "string", "enum": ["list", "diff"], "default": "list", "description": "List revisions or show one revision diff."},
+                "commit": {"type": "string", "description": "Required in diff mode: a 7–64 character lowercase hexadecimal revision from this document. Do not combine with limit."},
             },
             "required": ["uri"],
         },

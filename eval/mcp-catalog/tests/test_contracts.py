@@ -317,3 +317,64 @@ def test_public_catalog_accepts_the_complete_current_main_stdio_surface() -> Non
     snapshot = _public_catalog_for_manifest(manifest, transport="stdio")
 
     validate_public_catalog(snapshot, arm="candidate", public_operations=manifest.public_operations)
+
+
+def test_history_candidate_catalog_uses_distinct_modes() -> None:
+    from mcp_catalog.contracts import ArmOperationRoute
+    from mcp_catalog.execution import _public_route
+
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    routes = [item.model_copy(deep=True) for item in manifest.public_operations]
+    for item in routes:
+        if item.operation == "akb_history":
+            item.candidate = ArmOperationRoute(tool="akb_history", mode="list")
+        if item.operation == "akb_diff":
+            item.candidate = ArmOperationRoute(tool="akb_history", mode="diff")
+    listed = _public_route("akb_history", {}, routes, arm="candidate", transport="http")
+    diff = _public_route("akb_history", {"mode": "diff"}, routes, arm="candidate", transport="http")
+    assert listed is not None and listed.operation == "akb_history"
+    assert diff is not None and diff.operation == "akb_diff"
+    assert _public_route("akb_history", {"mode": "wrong"}, routes, arm="candidate", transport="http") is None
+
+
+def test_history_experiment_registers_arm_routes_and_pins() -> None:
+    raw = json.loads((ROOT / "config" / "run.json").read_text())
+    raw["candidate_history_routes"] = True
+    raw["source_pins"] = {"baseline": "a" * 40, "candidate": "b" * 40}
+    manifest = BenchmarkRunManifest.model_validate(raw)
+    routes = {item.operation: item for item in manifest.public_operations}
+    assert routes["akb_history"].candidate.mode == "list"
+    assert routes["akb_diff"].candidate.tool == "akb_history"
+    assert routes["akb_diff"].candidate.mode == "diff"
+    assert len({x.candidate.tool for x in manifest.public_operations if "http" in x.transports}) == 43
+    assert len({x.candidate.tool for x in manifest.public_operations if "stdio" in x.transports}) == 49
+    with pytest.raises(ValueError):
+        BenchmarkRunManifest.model_validate({**raw, "source_pins": {"baseline": "a" * 40}})
+
+
+def test_selected_history_contract_is_source_neutral_and_pins_both_arms() -> None:
+    manifest = load_run_manifest(ROOT / "config" / "history.json")
+    tasks = load_task_corpus(ROOT / "corpus" / "history-tasks.json")
+    coverage = load_tool_coverage(ROOT / "corpus" / "history-coverage.json")
+    manifest.validate_tasks(tasks)
+    coverage.validate_tasks(tasks)
+    coverage.validate_manifest(manifest)
+    assert {task.pair_id for task in tasks} >= {"history-provenance", "authorization-readonly", "overlapping-document", "stdio-local", "stdio-image-files"}
+    task = next(task for task in tasks if task.id == "history-provenance-en")
+    binding = next(item for item in task.expected_result_bindings if item.target_stage == "read_document_2" and item.target_argument == "commit")
+    assert (binding.source_stage, binding.source_field, binding.relation) == ("read_document_1", "history", "history_commit")
+    assert "current: one" in task.prompt and "current: two" in task.prompt
+
+
+def test_history_candidate_catalog_requires_complete_raw_mode_schema() -> None:
+    raw = json.loads((ROOT / "config" / "history.json").read_text())
+    manifest = BenchmarkRunManifest.model_validate(raw)
+    tools = [{"name": name, "inputSchema": {"type": "object", "properties": {}}} for name in sorted({x.candidate.tool for x in manifest.public_operations if "http" in x.transports})]
+    history = next(item for item in tools if item["name"] == "akb_history")
+    history["inputSchema"] = {"type": "object", "properties": {"uri": {"type": "string"}, "mode": {"type": "string", "enum": ["list", "diff"], "default": "list"}, "commit": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["uri"]}
+    snapshot = CatalogSnapshot(transport="http", source_revision="b" * 40, artifact_version="test", tool_count=len(tools), catalog_hash=hash_json(tools), catalog_token_estimate=token_estimate(tools), server_discover={"supportedVersions": ["2026-07-28"], "capabilities": {}, "instructions": "test"}, tools=tools)
+    validate_public_catalog(snapshot, arm="candidate", public_operations=manifest.public_operations)
+    del history["inputSchema"]["properties"]["commit"]
+    mutated = snapshot.model_copy(update={"tools": tools, "catalog_hash": hash_json(tools), "catalog_token_estimate": token_estimate(tools)})
+    with pytest.raises(ValueError, match="history"):
+        validate_public_catalog(mutated, arm="candidate", public_operations=manifest.public_operations)
