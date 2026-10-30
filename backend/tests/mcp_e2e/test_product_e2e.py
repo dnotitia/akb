@@ -405,13 +405,21 @@ async def test_relations_activity_provenance_and_document_deletion(
     activity = await _call_json(mcp_client, runtime_session, "akb_activity", {"vault": vault})
     assert type(activity.get("returned")) is int and activity["returned"] >= 2
     assert activity["activity"] and activity["activity"][0].get("files")
-    first_hash = activity["activity"][0].get("hash")
+    history = await _call_json(mcp_client, runtime_session, "akb_history", {"uri": first["uri"]})
+    first_hash = history["history"][0].get("hash")
     assert isinstance(first_hash, str)
+    second_history = await _call_json(mcp_client, runtime_session, "akb_history", {"uri": second["uri"]})
+    other_hash = second_history["history"][0]["hash"]
+    boundary_error = await _call_json(
+        mcp_client, runtime_session, "akb_history",
+        {"uri": first["uri"], "mode": "diff", "commit": other_hash}, expect_error=True,
+    )
+    assert boundary_error.get("code") == "invalid_argument"
     diff = await _call_json(
         mcp_client,
         runtime_session,
-        "akb_diff",
-        {"uri": first["uri"], "commit": first_hash},
+        "akb_history",
+        {"uri": first["uri"], "mode": "diff", "commit": first_hash},
     )
     assert diff.get("type")
 

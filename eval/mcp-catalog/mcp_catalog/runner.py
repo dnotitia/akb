@@ -48,6 +48,7 @@ from .contracts import (
 from .evidence import redact_exception, redact_text, serialize_report, write_json, safe_json
 from .execution import (
     BudgetLedger,
+    _public_route,
     BudgetExceeded,
     TrialExecutor,
     TrialOutcome,
@@ -1430,6 +1431,8 @@ class BenchmarkRunner:
 
     async def preflight(self) -> dict[str, Any]:
         self.manifest.validate_tasks(self.tasks)
+        if self.manifest.candidate_history_routes and not self.manifest.source_pins:
+            raise ValueError("history experiment requires both exact source pins")
         if self.manifest.source_revision != "runtime_descriptor" and not _is_git_revision(self.manifest.source_revision):
             raise ValueError("source_revision must be runtime_descriptor or a full git revision")
         if self.descriptor.scenario != self.manifest.fixture_scenario:
@@ -1492,7 +1495,7 @@ class BenchmarkRunner:
                 "cells": {key: value["discovery"] for key, value in sorted(runtime_cells.items())}
             }
             runtime["cell_runtimes"] = runtime_cells
-        if self.manifest.source_revision != "runtime_descriptor" and self.manifest.source_revision != runtime["source_revision"]:
+        if (expected_source := self.manifest.source_pins.get(self.arm, self.manifest.source_revision)) != "runtime_descriptor" and expected_source != runtime["source_revision"]:
             raise RuntimeContractError("runtime source revision does not match the pinned run manifest")
         return {
             "runtime": runtime,
@@ -1868,7 +1871,7 @@ class BenchmarkRunner:
         self._resolver = resolver
         source_revision = runtime["source_revision"]
         artifact_versions = runtime["artifact_versions"]
-        if self.manifest.source_revision != "runtime_descriptor" and source_revision != self.manifest.source_revision:
+        if (expected_source := self.manifest.source_pins.get(self.arm, self.manifest.source_revision)) != "runtime_descriptor" and source_revision != expected_source:
             raise RuntimeContractError("runtime source revision does not match the pinned run manifest", stage="source_identity")
         expected_source_revision = source_revision
         prior_elapsed = 0.0
@@ -2292,7 +2295,7 @@ def validate_paired_resume_parent(
         source_revision = artifact.get("source_revision")
         if not isinstance(source_revision, str) or not _is_git_revision(source_revision):
             raise ValueError(f"{arm} parent artifact source revision is invalid")
-        if manifest.source_revision != "runtime_descriptor" and source_revision != manifest.source_revision:
+        if (expected_source := manifest.source_pins.get(arm, manifest.source_revision)) != "runtime_descriptor" and source_revision != expected_source:
             raise ValueError(f"{arm} parent artifact source revision differs from the pinned manifest")
         if artifact.get("run_manifest_hash") != hash_json(manifest_payload):
             raise ValueError(f"{arm} parent artifact manifest hash does not match")
@@ -2429,7 +2432,6 @@ def validate_paired_resume_parent(
     shared_keys = (
         "run_manifest_hash",
         "task_corpus_hash",
-        "source_revision",
         "paired_order_plan",
         "paired_execution",
         "paired_budget_used",
@@ -2439,6 +2441,8 @@ def validate_paired_resume_parent(
     for key in shared_keys:
         if artifacts["baseline"].get(key) != artifacts["candidate"].get(key):
             raise ValueError(f"paired parent artifacts differ in {key}")
+    if not manifest.source_pins and artifacts["baseline"].get("source_revision") != artifacts["candidate"].get("source_revision"):
+        raise ValueError("paired parent artifacts differ in source_revision")
     if artifacts["baseline"].get("resume_source") != artifacts["candidate"].get("resume_source"):
         raise ValueError("paired parent artifacts disagree about their earlier resume source")
 
@@ -2652,15 +2656,14 @@ def _state_observations(
         error = raw["error"]
         if not isinstance(available, bool):
             raise ValueError(f"{label}-state availability is invalid")
-        if status_code is not None and (not isinstance(status_code, int) or isinstance(status_code, bool)):
+        if status_code is not None and (
+            not isinstance(status_code, int) or isinstance(status_code, bool) or not 100 <= status_code <= 599
+        ):
             raise ValueError(f"{label}-state HTTP status is invalid")
         if error is not None and not isinstance(error, str):
             raise ValueError(f"{label}-state error is invalid")
-        expected_status = (
-            expectation.resolved_before_expected_status if before else expectation.probe.expected_status
-        )
-        if available and status_code != expected_status:
-            raise ValueError(f"{label}-state availability does not match its registered HTTP status")
+        if available and status_code is None and not (before and not expectation.check_before and raw["payload"] is None):
+            raise ValueError(f"{label}-state HTTP status is missing")
         if available and error is not None:
             raise ValueError(f"{label}-state observation reports an error despite being available")
         if not available and not error:
@@ -2795,16 +2798,8 @@ def _validate_trial_evidence(
             schema = input_schemas.get(call.tool_name)
             if schema is not None and call.effective_server_args != canonicalize_arguments(call.server_args, schema):
                 raise ValueError("effective tool arguments do not match the captured input schema")
-        action = decoded.get("action") if isinstance(decoded, dict) else None
-        routes = [
-            operation
-            for operation in public_operations
-            if transport in operation.transports
-            and getattr(operation, arm).tool == call.tool_name
-            and getattr(operation, arm).action == (action if isinstance(action, str) else None)
-        ]
-        if len(routes) > 1:
-            raise ValueError("tool call matches more than one registered public operation")
+        matched_route = _public_route(call.tool_name, decoded or {}, public_operations, arm=arm, transport=transport)
+        routes = [matched_route] if matched_route is not None else []
         expected_exists = call.tool_name in input_schemas
         if call.tool_exists != expected_exists:
             raise ValueError("tool existence flag does not match the captured catalog")
@@ -2844,7 +2839,12 @@ def _validate_trial_evidence(
     actual_dump = outcome.model_dump(mode="json")
     verified_dump = verified.model_dump(mode="json")
     for field_name in _DERIVED_TRIAL_FIELDS:
-        if actual_dump.get(field_name) != verified_dump.get(field_name):
+        actual = actual_dump.get(field_name)
+        expected = verified_dump.get(field_name)
+        if field_name == "state_checks":
+            actual = [{key: value for key, value in item.items() if key != "reason"} for item in actual_dump["state_checks"]]
+            expected = [{key: value for key, value in item.items() if key != "reason"} for item in verified_dump["state_checks"]]
+        if actual != expected:
             raise ValueError(f"trial {field_name} does not match the recorded state and call evidence")
 
 
@@ -3317,15 +3317,19 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     baseline_revision = baseline.get("source_revision")
     candidate_revision = candidate.get("source_revision")
     if (
-        not isinstance(baseline_revision, str)
-        or not _is_git_revision(baseline_revision)
-        or candidate_revision != baseline_revision
-        or (
-            validated_manifest.source_revision != "runtime_descriptor"
-            and baseline_revision != validated_manifest.source_revision
-        )
+        not isinstance(baseline_revision, str) or not _is_git_revision(baseline_revision)
+        or not isinstance(candidate_revision, str) or not _is_git_revision(candidate_revision)
+        or (validated_manifest.source_pins and (
+            baseline_revision != validated_manifest.source_pins.get("baseline")
+            or candidate_revision != validated_manifest.source_pins.get("candidate")
+        ))
+        or (not validated_manifest.source_pins and (
+            candidate_revision != baseline_revision
+            or (validated_manifest.source_revision != "runtime_descriptor"
+                and baseline_revision != validated_manifest.source_revision)
+        ))
     ):
-        return _empty_comparison(baseline, candidate, "paired artifacts do not share the registered source revision")
+        return _empty_comparison(baseline, candidate, "paired artifacts do not match the registered source revisions")
     public_operations = validated_manifest.public_operations
     try:
         base_catalog_errors, _ = _catalog_contract_errors(
@@ -3423,8 +3427,20 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     pair_ids = sorted(set(task_pairs.values()))
     planned = baseline.get("artifact_hash_input", {}).get("trial_order", [])
     planned_candidate = candidate.get("artifact_hash_input", {}).get("trial_order", [])
-    if len(pair_ids) != 20 or len(planned) + len(planned_candidate) != 608:
-        return _empty_comparison(baseline, candidate, "the sealed plan does not contain 20 clusters and 608 paired outcomes")
+    expected_keys = {
+        (model.class_name, transport, task.id, repeat)
+        for model in validated_manifest.models
+        for transport in validated_manifest.transports
+        for task in tasks if transport in task.fixture.transports
+        for repeat in range(1, validated_manifest.repeats + 1)
+    }
+    def plan_keys(plan: list[dict[str, Any]]) -> set[tuple[str, str, str, int]]:
+        return {(item["model_class"], item["transport"], item["task_id"], item["repeat_index"]) for item in plan}
+    if (set(pair_ids) != set(validated_manifest.pair_categories)
+        or len(planned) != len(expected_keys) or len(planned_candidate) != len(expected_keys)
+        or plan_keys(planned) != expected_keys or plan_keys(planned_candidate) != expected_keys
+        or set(baseline_map) != expected_keys):
+        return _empty_comparison(baseline, candidate, "the sealed plan does not match the registered corpus")
     if len(baseline_map) != len(planned) or len(candidate_map) != len(planned_candidate):
         return _empty_comparison(baseline, candidate, "observed trial count does not match the sealed plan")
     if any(
@@ -3500,20 +3516,11 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         cell_success_clear_failure: dict[str, dict[str, Any]] = {}
         for model_class, transport in cells:
             cell = (model_class, transport)
-            expected_pairs = sorted({
-                task_pairs[outcome.task_id]
-                for outcome in baseline_outcomes
-                if (outcome.model_class, outcome.transport) == cell
-            })
-            expected_count = 18 if transport == "http" else 20
-            if len(expected_pairs) != expected_count:
+            expected_pairs = sorted({task.pair_id for task in tasks if transport in task.fixture.transports})
+            base_values = _cluster_samples(baseline_outcomes, task_pairs=task_pairs, metric="success", cell=cell)
+            candidate_values = _cluster_samples(candidate_outcomes, task_pairs=task_pairs, metric="success", cell=cell)
+            if set(base_values) != set(expected_pairs) or set(candidate_values) != set(expected_pairs):
                 raise InconclusiveBootstrap(f"{model_class}:{transport} has an incomplete cluster sample")
-            base_values = _cluster_samples(
-                baseline_outcomes, task_pairs=task_pairs, metric="success", cell=cell
-            )
-            candidate_values = _cluster_samples(
-                candidate_outcomes, task_pairs=task_pairs, metric="success", cell=cell
-            )
             base_cell_values = [base_values[pair_id] for pair_id in expected_pairs]
             candidate_cell_values = [candidate_values[pair_id] for pair_id in expected_pairs]
             cell_key = f"{model_class}:{transport}"
@@ -3577,7 +3584,7 @@ def compare_artifacts(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
         for key in sorted(baseline_map)
         if baseline_map[key].safety and not candidate_map[key].safety
     ]
-    material_error_kinds = ("unintended_tool_action", "schema_error", "wrong_target_payload")
+    material_error_kinds = ("unintended_tool_action", "schema_error", "wrong_target_payload", "wrong_mode", "result_binding_error")
     material_error_counts = {
         kind: {
             "baseline": sum(outcome.trial_error_kinds.count(kind) for outcome in baseline_outcomes),

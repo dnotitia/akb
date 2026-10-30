@@ -31,6 +31,7 @@ from mcp_catalog.catalog import create_toolset
 from mcp_catalog.contracts import OPENROUTER_BASE_URL, PROTOCOL_REVISION, load_run_manifest
 from mcp_catalog.execution import (
     MODEL_INPUT_EVIDENCE,
+    MODEL_TOOL_RECORDER,
     ModelInputEvidence,
     ModelConfigurationError,
     SERVER_INSTRUCTIONS as SERVER_INSTRUCTIONS_CONTEXT,
@@ -137,6 +138,7 @@ async def test_openrouter_wire_merges_system_and_actual_mcp_instructions_for_too
     run_error: Exception | None = None
     instructions_token = SERVER_INSTRUCTIONS_CONTEXT.set(SERVER_INSTRUCTIONS)
     evidence_token = MODEL_INPUT_EVIDENCE.set(evidence)
+    recorder_token = None
     try:
         async with probe:
             raw_discovery = await probe.session.send_discover(PROTOCOL_REVISION)
@@ -146,6 +148,10 @@ async def test_openrouter_wire_merges_system_and_actual_mcp_instructions_for_too
         client = Client(server, mode=PROTOCOL_REVISION, prior_discover=discovery, cache=False)
         toolset = create_toolset(client)
         async with toolset:
+            recorder = ToolCallRecorder(operation_map={"read": ["inspect_record"]}, secrets=())
+            listed = await toolset.list_tools()
+            recorder.set_input_schemas({tool.name: tool.input_schema for tool in listed})
+            recorder_token = MODEL_TOOL_RECORDER.set(recorder)
             agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
             try:
                 result = await agent.run(
@@ -157,6 +163,8 @@ async def test_openrouter_wire_merges_system_and_actual_mcp_instructions_for_too
             except Exception as exc:
                 run_error = exc
     finally:
+        if recorder_token is not None:
+            MODEL_TOOL_RECORDER.reset(recorder_token)
         MODEL_INPUT_EVIDENCE.reset(evidence_token)
         SERVER_INSTRUCTIONS_CONTEXT.reset(instructions_token)
         await mock_http_client.aclose()
@@ -471,3 +479,24 @@ def test_instruction_evidence_checks_raw_source_and_sdk_input(
     assert not has_server_instructions_evidence(
         outcome.model_copy(update={"model_input_evidence": [changed_source_text]}),
     )
+
+
+@pytest.mark.asyncio
+async def test_model_rejects_changed_tool_schema_before_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    manifest = load_run_manifest(Path(__file__).resolve().parents[1] / "config" / "run.json")
+    spec = manifest.models[0]
+    monkeypatch.setenv(spec.base_url_env, OPENROUTER_BASE_URL)
+    monkeypatch.setenv(spec.provider_key_env, "fixture-provider-key")
+    model = build_model(spec)
+    recorder = ToolCallRecorder(operation_map={"read": ["inspect_record"]}, secrets=())
+    recorder.set_input_schemas({"inspect_record": {"type": "object"}})
+    token = MODEL_TOOL_RECORDER.set(recorder)
+    try:
+        params = SimpleNamespace(function_tools=[SimpleNamespace(name="inspect_record", parameters_json_schema={"type": "string"})])
+        with pytest.raises(ModelConfigurationError, match="schemas differ"):
+            await model.request([], None, params)
+    finally:
+        MODEL_TOOL_RECORDER.reset(token)
+        await model.client._client.aclose()

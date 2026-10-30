@@ -35,7 +35,7 @@ All connected via a unified knowledge graph with AKB URI scheme.
 | `files` | put_file, get_file, delete_file | Binary files (S3-backed) |
 | `images` | put_image, discard_image | Inline images for Markdown documents |
 | `access` | grant, revoke, vault_members, vault_info, ... | Permissions and vault management |
-| `history` | activity, diff, history | Vault activity + git-based change history |
+| `history` | activity, history | Vault activity + git-based change history |
 | `publishing` | publish, unpublish, publications, publication_snapshot | Public sharing for docs/tables/files |
 | `relations` | link, unlink, relations, graph, provenance | Knowledge graph — cross-type connections |
 
@@ -319,7 +319,7 @@ Templates: `engineering`, `qa`, `hr`, `finance`, `management`, `issue-tracking`,
 
     "history": """# Activity & Diff — Vault History
 
-Audit who changed what and when via Git history. Use `akb_diff` to
+Audit who changed what and when via Git history. Use `akb_history` in diff mode to
 inspect the actual content change for a specific commit.
 
 ## Activity History (Git-based)
@@ -332,7 +332,7 @@ akb_activity(vault="eng", since="2026-04-01", limit=5) # Recent 5 since April
 
 ## Content Diff
 ```
-akb_diff(uri="akb://eng/doc/specs/api.md", commit="abc123")  # What changed in this commit?
+akb_history(mode="diff", uri="akb://eng/doc/specs/api.md", commit="abcdef0")  # What changed in this commit?
 ```""",
 
     "publishing": """# Public Sharing — Documents, Tables, and Files
@@ -1232,13 +1232,16 @@ akb_provenance(uri="akb://eng/doc/specs/api.md")
 
 ```
 akb_history(uri="akb://eng/doc/specs/api.md")
-→ [{"hash": "abc123def456", "date": "2026-04-03T12:00:00", "author": "admin", "message": "Update specs"}]
+→ {"uri": "akb://eng/doc/specs/api.md", "history": [{"hash": "abc123def456", "date": "2026-04-03T12:00:00", "author": "admin", "message": "Update specs"}]}
+
+akb_history(uri="akb://eng/doc/specs/api.md", mode="diff", commit="abc123def456")
+→ unified diff for that revision
 
 akb_get(uri="akb://eng/doc/specs/api.md", version="abc123def456")
 → content at that specific version
 ```
 
-Each document change creates a Git commit. Use akb_history to see all versions, then akb_get with version= to read any past version.""",
+List mode accepts limit and does not accept commit. Diff mode requires a 7–64 character lowercase hexadecimal commit from the same document and does not accept limit. Use akb_get with version= to read a past version.""",
 
     "akb_activity": """# akb_activity — Vault Activity History (Git-based)
 
@@ -1252,31 +1255,14 @@ akb_activity(vault="eng", since="2026-04-01", limit=5) # Since date
 ```
 
 Each entry includes:
-- hash: commit hash (use with akb_diff)
+- hash: commit hash (use with akb_history in diff mode)
 - subject: commit message
 - author/agent: who made the change
 - action: create/update/delete
 - summary: change description
 - files: [{path, change: added/modified/deleted}]
 
-Use `akb_diff(uri, commit=hash)` to see the actual content diff.""",
-
-    "akb_diff": """# akb_diff — Document Content Diff
-
-Shows what was added/removed in a specific commit.
-
-```
-akb_diff(uri="akb://eng/doc/specs/api.md", commit="abc123def456")
-```
-
-Returns:
-- file: document path
-- type: added/modified/deleted
-- diff: unified diff (+ for additions, - for removals)
-
-Find commit hashes via:
-- akb_history(uri) → per-document versions
-- akb_activity(vault) → vault-wide activity""",
+Use `akb_history(uri, mode="diff", commit=hash)` to see the actual content diff.""",
 
     "akb_publish": """# akb_publish — Create a Public Share
 

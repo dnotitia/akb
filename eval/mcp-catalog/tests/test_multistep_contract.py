@@ -303,3 +303,121 @@ def test_manifest_rejects_unknown_semantic_operation() -> None:
     with pytest.raises(ValueError, match="operation_map"):
         all_tasks = load_task_corpus(ROOT / "corpus" / "tasks.json")
         manifest.validate_tasks([changed_by_id.get(task.id, task) for task in all_tasks])
+
+
+def test_diff_commit_must_appear_in_same_document_history() -> None:
+    from mcp_catalog.contracts import ExpectedResultBinding
+    from mcp_catalog.execution import _material_result_binding_matches
+
+    binding = ExpectedResultBinding(source_stage="read_document_1", source_field="history", target_stage="read_document_2", target_argument="commit", relation="history_commit")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "history-provenance-en")
+    calls = [
+        _call(1, "akb_history", "read", "document", {"uri": URI}, result_fields={"history": '[{"hash":"abcdef0"}]'}, stage_id="read_document_1"),
+        _call(2, "akb_diff", "read", "document", {"uri": URI, "commit": "abcdef0"}, stage_id="read_document_2"),
+    ]
+    assert _material_result_binding_matches(binding, task, calls)
+    calls[1].server_args["commit"] = "deadbeef"
+    calls[1].effective_server_args["commit"] = "deadbeef"
+    assert not _material_result_binding_matches(binding, task, calls)
+
+
+def test_candidate_history_modes_match_only_their_registered_stages() -> None:
+    from mcp_catalog.contracts import ArmOperationRoute
+    from mcp_catalog.execution import ToolCallRecorder, _public_route
+
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "tasks.json") if task.id == "history-provenance-en")
+    routes = [item.model_copy(deep=True) for item in manifest.public_operations]
+    for item in routes:
+        if item.operation in {"akb_history", "akb_diff"}:
+            item.candidate = ArmOperationRoute(tool="akb_history", mode="list" if item.operation == "akb_history" else "diff")
+    recorder = ToolCallRecorder(operation_map=manifest.operation_map, secrets=(), task=task)
+    recorder.next_expected_stage = 3
+    uri = "akb://catalog-bench-history/doc/history-note.md"
+    route = _public_route("akb_history", {"uri": uri}, routes, arm="candidate", transport="http")
+    assert route is not None
+    assert recorder._stage_id_for_material_call("akb_history", "read", "document", {"uri": uri}, canonical_operation=route.operation) == "read_document_1"
+    route = _public_route("akb_history", {"uri": uri, "mode": "diff", "commit": "abcdef0"}, routes, arm="candidate", transport="http")
+    assert route is not None
+    assert recorder._stage_id_for_material_call("akb_history", "read", "document", {"uri": uri, "mode": "diff", "commit": "abcdef0"}, canonical_operation=route.operation) == "read_document_2"
+
+
+def test_foreign_commit_control_accepts_only_empty_diff_or_explicit_rejection() -> None:
+    from mcp_catalog.contracts import ExpectedMaterialAttempt
+    from mcp_catalog.execution import _material_attempt_matches
+
+    expected = ExpectedMaterialAttempt(stage_id="read_document_1", logical_operation="read", tool_name="akb_diff", resource_type="document", arguments={"uri": URI}, outcome="no_document_diff")
+    call = _call(1, "akb_diff", "read", "document", {"uri": URI, "commit": "abcdef0"}, result_fields={"type": "unchanged", "diff": ""}, stage_id="read_document_1")
+    assert _material_attempt_matches(call, expected, dynamic_arguments={"commit"}, consumer_root=None)
+    call.result_fields["diff"] = "+leak"
+    assert not _material_attempt_matches(call, expected, dynamic_arguments={"commit"}, consumer_root=None)
+    call.server_succeeded = False
+    call.server_error_code = "invalid_argument"
+    assert _material_attempt_matches(call, expected, dynamic_arguments={"commit"}, consumer_root=None)
+
+
+@pytest.mark.parametrize("arm", ["baseline", "candidate"])
+def test_history_boundary_control_binds_foreign_revision_and_target(arm) -> None:
+    from mcp_catalog.execution import material_outcome_matches
+
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "history-tasks.json") if task.id == "history-boundaries-en")
+    first = "akb://catalog-bench-history-boundary/doc/first.md"
+    second = "akb://catalog-bench-history-boundary/doc/second.md"
+    diff_tool = "akb_diff" if arm == "baseline" else "akb_history"
+    diff_mode = {} if arm == "baseline" else {"mode": "diff"}
+    calls = [
+        _call(1, "akb_create_vault", "create", "vault", {"name": "catalog-bench-history-boundary"}, stage_id="create_vault_1"),
+        _call(2, "akb_put", "create", "document", {"vault": "catalog-bench-history-boundary", "title": "first", "content": "first body"}, result_fields={"uri": first}, stage_id="create_document_1"),
+        _call(3, "akb_put", "create", "document", {"vault": "catalog-bench-history-boundary", "title": "second", "content": "second body"}, result_fields={"uri": second}, stage_id="create_document_2"),
+        _call(4, "akb_history", "read", "document", {"uri": second}, result_fields={"history": '[{"hash":"abcdef0"}]'}, stage_id="read_document_1"),
+        _call(5, diff_tool, "read", "document", {"uri": first, "commit": "abcdef0", **diff_mode}, result_fields={"type": "unchanged", "diff": ""}, stage_id="read_document_2"),
+        _call(6, diff_tool, "read", "document", {"uri": first, "commit": "not-a-hash", **diff_mode}, succeeded=False, stage_id="read_document_3"),
+    ]
+    calls[5].server_error_code = "invalid_argument"
+    calls[5].server_status_code = None
+    calls[4].canonical_operation = calls[5].canonical_operation = "akb_diff"
+    if arm == "candidate":
+        calls[4].server_succeeded = False
+        calls[4].server_error_code = "invalid_argument"
+    assert material_outcome_matches(task, calls)[0]
+    calls[4].server_args["uri"] = second
+    calls[4].effective_server_args["uri"] = second
+    assert not material_outcome_matches(task, calls)[0]
+
+
+def test_history_mode_and_commit_binding_errors_are_reported_separately() -> None:
+    from mcp_catalog.execution import _trial_error_kinds
+
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "history-tasks.json") if task.id == "history-provenance-en")
+    call = _call(1, "akb_history", "unknown", "unknown", {"uri": URI, "mode": "other"})
+    outcome = TrialOutcome(task_id=task.id, category=task.category, locale=task.locale, arm="candidate", model_class="primary", model_id="model", transport="http", tool_calls=[call])
+    outcome.result_binding_accuracy = False
+    errors = _trial_error_kinds(outcome, task)
+    assert "wrong_mode" in errors and "result_binding_error" in errors
+
+
+@pytest.mark.parametrize("arm", ["baseline", "candidate"])
+def test_history_provenance_requires_returned_commit_and_correct_document(arm) -> None:
+    from mcp_catalog.execution import material_outcome_matches
+
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "history-tasks.json") if task.id == "history-provenance-en")
+    uri = "akb://catalog-bench-history/doc/history-note.md"
+    tool = "akb_diff" if arm == "baseline" else "akb_history"
+    mode = {} if arm == "baseline" else {"mode": "diff"}
+    calls = [
+        _call(1, "akb_create_vault", "create", "vault", {"name": "catalog-bench-history"}, stage_id="create_vault_1"),
+        _call(2, "akb_put", "create", "document", {"vault": "catalog-bench-history", "title": "history-note", "content": "current: one"}, result_fields={"uri": uri}, stage_id="create_document_1"),
+        _call(3, "akb_update", "update", "document", {"uri": uri, "content": "current: two"}, stage_id="update_document_1"),
+        _call(4, "akb_history", "read", "document", {"uri": uri}, result_fields={"history": '[{"hash":"abcdef0"}]'}, stage_id="read_document_1"),
+        _call(5, tool, "read", "document", {"uri": uri, "commit": "abcdef0", **mode}, stage_id="read_document_2"),
+        _call(6, "akb_provenance", "read", "document", {"uri": uri}, stage_id="read_document_3"),
+        _call(7, "akb_get", "read", "document", {"uri": uri}, stage_id="read_document_4"),
+    ]
+    calls[4].canonical_operation = "akb_diff"
+    assert material_outcome_matches(task, calls)[0]
+    calls[4].server_args["commit"] = "deadbeef"
+    calls[4].effective_server_args["commit"] = "deadbeef"
+    assert not material_outcome_matches(task, calls)[0]
+    calls[4].server_args["commit"] = calls[4].effective_server_args["commit"] = "abcdef0"
+    calls[3].server_args["uri"] = calls[3].effective_server_args["uri"] = "akb://wrong/doc/other.md"
+    assert not material_outcome_matches(task, calls)[0]

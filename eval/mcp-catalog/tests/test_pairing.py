@@ -309,3 +309,27 @@ def test_one_sided_unbounded_interval_is_strict_json() -> None:
     assert greater["upper_bound"] is None
     assert less["lower_bound"] is None
     json.dumps({"greater": greater, "less": less}, allow_nan=False)
+
+
+def test_paired_source_pins_distinguish_expected_difference_from_drift(monkeypatch) -> None:
+    import mcp_catalog.runner as runner
+
+    manifest = load_run_manifest(ROOT / "config" / "history.json").model_dump(mode="json")
+    manifest["source_pins"] = {"baseline": "a" * 40, "candidate": "b" * 40}
+    baseline = {"manifest": manifest, "source_revision": "a" * 40}
+    candidate = {"manifest": manifest, "source_revision": "b" * 40}
+    monkeypatch.setattr(runner, "_artifact_integrity_error", lambda *_args: None)
+    monkeypatch.setattr(runner, "_catalog_contract_errors", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("catalog reached")))
+    result = runner.compare_artifacts(baseline, candidate)
+    assert "catalog reached" in result["gate"]["reasons"][0]
+    candidate["source_revision"] = "c" * 40
+    result = runner.compare_artifacts(baseline, candidate)
+    assert "source revisions" in result["gate"]["reasons"][0]
+
+
+def test_state_check_reasons_are_diagnostic_but_semantics_remain_verified() -> None:
+    baseline, candidate = complete_paired_artifacts()
+    trial = next(item for item in candidate["runs"]["primary:http"]["trials"] if item["state_checks"])
+    trial["state_checks"][0]["reason"] = "Equivalent diagnostic text in another order"
+    _seal(candidate)
+    assert compare_artifacts(baseline, candidate)["verdict"] == "adopt"
