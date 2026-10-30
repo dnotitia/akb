@@ -124,6 +124,41 @@ def _store(path: Path, *, resume: bool = False, secrets: tuple[str, ...] = ()) -
     )
 
 
+def test_smoke_input_seal_survives_redaction_checkpoint_and_failure_export(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp_catalog.evidence import safe_json, validate_model_input_evidence, write_json
+    from mcp_catalog.execution import _model_input_evidence_for
+    from mcp_catalog.runner import CredentialResolver
+    from mcp_catalog.runtime import RuntimeDescriptor
+    from test_runtime_contract import descriptor_dict
+
+    marker = "synthetic-account-name"
+    monkeypatch.setenv("AKB_E2E_USERNAME", marker)
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    resolver = CredentialResolver(manifest, RuntimeDescriptor.from_dict(descriptor_dict()), (), tokens={"default": "fixture-pat"})
+    captured = _model_input_evidence_for(
+        [{"content": "server instructions"}, {"content": {"username": marker}}],
+        "server instructions", 1, secrets=resolver.secrets_for("default"),
+    )
+    original = captured.model_dump(mode="json")
+    validate_model_input_evidence(original)
+    assert marker not in captured.model_input_canonical_json
+    validate_model_input_evidence(safe_json(original, resolver.secret_values()))
+
+    store, key = _store(tmp_path / "checkpoint.json", secrets=resolver.secret_values())
+    outcome = _outcome(key, error="benchmark incomplete: output limit")
+    outcome.model_input_evidence = [captured]
+    store.record_smoke_cell("primary:http", outcome, status="incomplete")
+    store.set_smoke_status("failed")
+    stored = json.loads(store.path.read_text())
+    saved = stored["smoke_gate"]["primary:http"]["outcome"]
+    validate_model_input_evidence(saved, resolver.secret_values())
+    assert saved["model_input_evidence"][0] == original
+    path = tmp_path / "failure.json"
+    write_json(path, {"failure": "output limit", "smoke_gate": stored["smoke_gate"]}, resolver.secret_values())
+    assert marker not in path.read_text()
+    assert json.loads(path.read_text())["smoke_gate"]["primary:http"]["outcome"]["model_input_evidence"][0] == original
+
+
 def test_checkpoint_keeps_provider_setup_requests_separate(tmp_path: Path) -> None:
     store, _key = _store(tmp_path / "checkpoint.json")
 

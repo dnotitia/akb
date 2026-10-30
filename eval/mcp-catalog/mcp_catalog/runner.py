@@ -203,7 +203,7 @@ class CredentialResolver:
         return value
 
     def secrets_for(self, profile: str) -> tuple[str, ...]:
-        return tuple(dict.fromkeys((*self.model_secrets, self.token_for(profile))))
+        return tuple(dict.fromkeys((*self.secret_values(), self.token_for(profile))))
 
     def required_profiles(self, tasks: list[TaskManifest]) -> list[str]:
         return sorted({task.fixture.credential_profile for task in tasks})
