@@ -103,6 +103,7 @@ for (const width of [375, 1440, 1920, 2560]) for (const dark of [false, true]) {
       await expect(collection).toBeInViewport({ ratio: 1 });
     }
     await composer.getByLabel("Summary", { exact: true }).fill("Decisions and context");
+    await composer.getByLabel("Summary", { exact: true }).press("Tab");
     await composer.getByLabel("Domain", { exact: true }).fill("engineering");
     await expect(body).toContainText("Write decisions");
     await expect(composer.getByLabel("Summary", { exact: true })).toHaveValue("Decisions and context");

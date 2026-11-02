@@ -100,7 +100,12 @@ for (const width of [375, 1440]) for (const source of ["title", "sidebar"] as co
   await confirmation.getByRole("button", { name: "Keep editing", exact: true }).click();
   await expect(editor).toContainText(draft);
   await expect(page.getByRole("textbox", { name: "Document title", exact: true })).toBeFocused();
-  if (source === "sidebar") await revealVaultNavigation(page);
+  if (source === "sidebar") {
+    // Keeping the editor closes the covering drawer and restores title focus.
+    // Wait for that close before toggling it open for the second attempt.
+    if (width < 1024) await expect(page.locator("#vault-workspace-navigation")).toBeHidden();
+    await revealVaultNavigation(page);
+  }
   await back.click();
   await confirmation.getByRole("button", { name: "Leave document", exact: true }).click();
   await expect(page).toHaveURL(source === "sidebar" ? /\/vault$/ : /\/vault\/fixture$/);
