@@ -212,15 +212,60 @@ def test_runtime_load_refuses_jwt_secret_with_the_safe_rename(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    """Only jwt_secret set: it was the secret in effect, so its value moves."""
     secret = "must-not-appear-in-rename-diagnostic"  # pragma: allowlist secret
 
     with pytest.raises(RuntimeError) as exc_info:
         _load(monkeypatch, tmp_path, {"auth_mode": "local", "jwt_secret": secret})
 
     message = str(exc_info.value)
-    assert "system_hmac_secret" in message
-    assert "unchanged" in message
+    assert "move its value unchanged to system_hmac_secret" in message
     assert secret not in message
+
+
+@pytest.mark.parametrize("legacy", ["legacy-hmac-material", ""])
+def test_runtime_load_keeps_the_canonical_secret_when_both_names_are_set(
+    monkeypatch,
+    tmp_path: Path,
+    legacy: str,
+) -> None:
+    """system_hmac_secret won over jwt_secret, so the advice must not overwrite it."""
+    canonical = "canonical-hmac-material-in-effect"  # pragma: allowlist secret
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _load(
+            monkeypatch,
+            tmp_path,
+            {"auth_mode": "local", "system_hmac_secret": canonical, "jwt_secret": legacy},
+        )
+
+    message = str(exc_info.value)
+    assert "remove it and keep system_hmac_secret as it is" in message
+    assert "move its value" not in message
+    assert canonical not in message
+    assert legacy == "" or legacy not in message
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "jwt_secret",
+        "local_auth_enabled",
+        "keycloak_sso_only",
+        "keycloak_link_by_email",
+        "keycloak_redirect_uri",
+        "keycloak_post_login_path",
+        "keycloak_post_login_allowed_origins",
+        "keycloak_exchange_code_ttl_secs",
+    ],
+)
+def test_settings_model_rejects_every_retired_input(key: str) -> None:
+    """The fields are gone from the model, not only intercepted by the loader."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_config.Settings(document_revision_backend="bare_git", **{key: "x"})
+
+    assert key in str(exc_info.value)
+    assert "extra_forbidden" in str(exc_info.value)
 
 
 def test_local_mode_keeps_keycloak_separate_for_mcp_oauth(

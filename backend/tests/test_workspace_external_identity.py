@@ -432,7 +432,7 @@ async def test_first_keycloak_api_principal_is_never_bootstrap_admin(
         monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
         monkeypatch.setattr(settings, "keycloak_enrollment_mode", "open", raising=False)
         monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
-    
+
         actor = await auth_service.resolve_rest_user_authorization(
             "Bearer verified-keycloak-api-token"
         )

@@ -128,17 +128,28 @@ def _reject_renamed_hmac_input(values: Mapping[str, object]) -> None:
     """Refuse the retired HMAC key with the one safe migration step.
 
     Since 0.15.0 the non-session HMAC material is `system_hmac_secret`;
-    `jwt_secret` was its fallback and is no longer read. Unknown keys fail
-    anyway, but this one gets its own message because the obvious repair
-    (delete the line, generate a fresh secret) would invalidate every signed
-    public link and event cursor. The value never enters the message.
+    `jwt_secret` was only its fallback, used when `system_hmac_secret` was
+    empty, and is no longer read. Unknown keys fail anyway, but this one gets
+    its own message because the obvious repairs can silently change the key
+    that signed existing public links and event cursors: generating a fresh
+    secret, or copying `jwt_secret` over a `system_hmac_secret` that was
+    already in effect. The step therefore depends on which value was in
+    effect. No value enters the message.
     """
-    if "jwt_secret" in values:
+    if "jwt_secret" not in values:
+        return
+    canonical = values.get("system_hmac_secret")
+    if isinstance(canonical, str) and canonical:
         raise RuntimeError(
-            "jwt_secret is no longer read: move its value unchanged to "
-            "system_hmac_secret and remove jwt_secret. A new value invalidates "
-            "public links and event cursors signed with the old one."
+            "jwt_secret is no longer read: remove it and keep system_hmac_secret "
+            "as it is. system_hmac_secret was already the secret in effect; "
+            "replacing it invalidates public links and event cursors."
         )
+    raise RuntimeError(
+        "jwt_secret is no longer read: move its value unchanged to "
+        "system_hmac_secret and remove jwt_secret. A new value invalidates "
+        "public links and event cursors signed with the old one."
+    )
 
 
 def _normalize_authority_domain(value: object) -> str:

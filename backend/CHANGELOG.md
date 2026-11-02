@@ -16,9 +16,10 @@ specifically; the proxy has its own log in
   `keycloak_exchange_code_ttl_secs`. A config that still sets one fails to
   load and names the key; delete the line.
 - `jwt_secret` is no longer read as a fallback for `system_hmac_secret`. A
-  config that still sets it fails to load with a message to move the value,
-  unchanged, to `system_hmac_secret`. A new value invalidates public links
-  and event cursors signed with the old one.
+  config that still sets it fails to load and says how to keep the secret in
+  effect. If `system_hmac_secret` is set, delete `jwt_secret`; otherwise move
+  the `jwt_secret` value, unchanged, to `system_hmac_secret`. A new value
+  invalidates public links and event cursors signed with the old one.
 
 - Add opt-in identity/Native-body-bounded Vault browse pages with scoped
   keyset cursors and explicit completeness. The web explorer requests pages
