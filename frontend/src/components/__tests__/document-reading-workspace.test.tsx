@@ -263,6 +263,8 @@ describe("Reading Studio", () => {
     await user.click(screen.getByRole("link", { name: "Reference B" }));
     await user.click(await screen.findByRole("button", { name: "Keep side by side" }));
     const side = await screen.findByRole("complementary", { name: "Side document: Document B" });
+    fireEvent.click(within(side).getByRole("link", { name: "Open as main document" }), { ctrlKey: true });
+    expect(screen.getByRole("complementary", { name: "Side document: Document B" })).toBe(side);
     const splitter = screen.getByRole("separator", { name: "Resize side document" });
     const before = Number(splitter.getAttribute("aria-valuenow"));
     fireEvent.keyDown(splitter, { key: "ArrowLeft" });

@@ -336,7 +336,9 @@ function ReferencePreview({ target, narrow, headerHost, panelControl, canGoBack,
               className="document-reading-flow reading-preview-markdown" headingIdPrefix={`${prefix}-`}
               assetContext={{ mode: "authenticated", vault: target.vault, document: doc.path, commit: doc.current_commit }} /></div>}
     </div>
-    {resolved && <footer className="reading-preview-footer"><Link to={resolved.href} onClick={onClose}>Open as main document<ArrowUpRight size={14} aria-hidden /></Link></footer>}
+    {resolved && <footer className="reading-preview-footer"><Link to={resolved.href} onClick={event => {
+      if (!event.defaultPrevented && event.button === 0 && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) onClose();
+    }}>Open as main document<ArrowUpRight size={14} aria-hidden /></Link></footer>}
   </>;
   return narrow ? <Dialog open={modalOpen && !hidden} onOpenChange={open => { if (!open) (onDismiss ?? onClose)(); }}>
     <DialogContent hideClose className="reading-studio reading-reference-dialog" aria-describedby={undefined} onCloseAutoFocus={event => { event.preventDefault(); if (persistent) returnFocusRef?.current?.focus({ preventScroll: true }); }}>

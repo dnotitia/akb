@@ -117,6 +117,10 @@ export function ReaderImageZoom({ image, onClose, returnFocusRef }: { image: { s
   const [scale, setScale] = useState(1);
   const [stage, setStage] = useState<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ natural: 0, fit: 0 });
+  const originalScale = size.fit ? size.natural / size.fit : 1;
+  const effectiveScale = scale || originalScale;
+  const maxScale = Math.max(8, originalScale);
+  const zoomBy = (factor: number) => setScale(value => Math.min(maxScale, Math.max(.25, (value || originalScale) * factor)));
   useEffect(() => { setScale(1); }, [image]);
   useEffect(() => {
     const element = stage;
@@ -134,15 +138,15 @@ export function ReaderImageZoom({ image, onClose, returnFocusRef }: { image: { s
   }}>
     <DialogTitle className="sr-only">{image?.alt || "Image preview"}</DialogTitle>
     <div className="reader-image-controls" role="group" aria-label="Image zoom controls">
-      <Button size="icon" variant="ghost" aria-label="Zoom out" disabled={scale <= .25} onClick={() => setScale(value => Math.max(.25, value / 1.25))}><ZoomOut size={17} aria-hidden /></Button>
+      <Button size="icon" variant="ghost" aria-label="Zoom out" disabled={effectiveScale <= .25} onClick={() => zoomBy(1 / 1.25)}><ZoomOut size={17} aria-hidden /></Button>
       <output className="text-xs tabular-nums">{scale === 0 ? "1:1" : scale === 1 ? "Fit" : `${Math.round(scale * 100)}%`}</output>
-      <Button size="icon" variant="ghost" aria-label="Zoom in" disabled={scale >= 8} onClick={() => setScale(value => Math.min(8, value * 1.25))}><ZoomIn size={17} aria-hidden /></Button>
+      <Button size="icon" variant="ghost" aria-label="Zoom in" disabled={effectiveScale >= maxScale} onClick={() => zoomBy(1.25)}><ZoomIn size={17} aria-hidden /></Button>
       <Button size="sm" variant="ghost" onClick={() => setScale(1)}><Maximize size={14} aria-hidden />Fit</Button>
       <Button size="sm" variant="ghost" onClick={() => setScale(0)}>1:1</Button>
     </div>
     <div ref={setStage} className="reader-image-stage rail-scroll" tabIndex={0} role="region" aria-label="Image preview; scroll to pan" onKeyDown={event => {
-      if (event.key === "+" || event.key === "=") { event.preventDefault(); setScale(value => Math.min(8, (value || 1) * 1.25)); }
-      if (event.key === "-") { event.preventDefault(); setScale(value => Math.max(.25, (value || 1) / 1.25)); }
+      if (event.key === "+" || event.key === "=") { event.preventDefault(); zoomBy(1.25); }
+      if (event.key === "-") { event.preventDefault(); zoomBy(1 / 1.25); }
       if (event.key === "0") { event.preventDefault(); setScale(1); }
     }}>
       {image && <img src={image.src} alt={image.alt} referrerPolicy="no-referrer" style={{ width: size.fit ? scale === 0 ? size.natural : size.fit * scale : "100%", maxWidth: "none" }} />}

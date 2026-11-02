@@ -55,6 +55,11 @@ for (const width of [1440, 390]) {
     await expect.poll(async () => (await picture.boundingBox())!.width).toBeGreaterThan(fitted.width);
     await zoom.getByRole("button", { name: "1:1", exact: true }).click();
     await expect.poll(async () => (await picture.boundingBox())!.width).toBe(1000);
+    await zoom.getByRole("button", { name: "Zoom in", exact: true }).click();
+    await expect.poll(async () => (await picture.boundingBox())!.width).toBeGreaterThan(1000);
+    await zoom.getByRole("button", { name: "1:1", exact: true }).click();
+    await zoom.getByRole("button", { name: "Zoom out", exact: true }).click();
+    await expect.poll(async () => (await picture.boundingBox())!.width).toBeLessThan(1000);
     await page.keyboard.press("Escape");
     await expect(enlarge).toBeFocused();
     await canvas.getByRole("link", { name: "Inspect reference", exact: true }).click();
