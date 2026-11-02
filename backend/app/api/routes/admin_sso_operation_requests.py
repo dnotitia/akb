@@ -14,7 +14,8 @@ from pydantic import Field
 
 from app.api.routes.admin_auth import ProductAdminActor, get_current_product_admin, get_product_admin_mutation
 from app.api.routes.admin_sso_operations import RequestModel, SourceTuple, ValueLessRoute
-from app.exceptions import ForbiddenError
+from app.config import settings
+from app.exceptions import AuthenticationError, ForbiddenError
 from app.sso import operation_requests
 
 
@@ -34,8 +35,19 @@ async def get_requesting_service_key(request: Request, authorization: str | None
 
 
 async def get_request_reader(request: Request, authorization: str | None = Header(default=None)):
-    """A human administrator session, or the administrator service key."""
+    """A human administrator, or the administrator service key.
+
+    The human is the product-admin session in SSO mode and the local
+    product-admin bearer in local mode, resolved the way the existing
+    operation metadata reader does it: a local human bearer first, then the
+    service key. A bearer that is neither is refused by the service-key path.
+    """
     if authorization:
+        if settings.require_auth_mode() == "local":
+            try:
+                return await get_current_product_admin(request, authorization=authorization)
+            except AuthenticationError:
+                pass
         return await get_requesting_service_key(request, authorization=authorization)
     return await get_current_product_admin(request, authorization=None)
 

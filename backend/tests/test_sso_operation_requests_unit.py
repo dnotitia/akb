@@ -104,3 +104,64 @@ def test_configure_summary_keeps_every_field_but_the_secret():
 
 def test_capability_is_advertised():
     assert "sso.operation-requests.v1" in ops.CAPABILITIES
+
+
+def _reader_request(authorization):
+    from starlette.requests import Request
+
+    headers = [(b"authorization", authorization.encode())] if authorization else []
+    return Request({"type": "http", "method": "GET", "path": "/api/v1/admin/sso/operation-requests", "headers": headers})
+
+
+@pytest.mark.asyncio
+async def test_a_local_human_administrator_bearer_reads_operation_requests(monkeypatch):
+    """Local mode authenticates the human product admin with a bearer; the reader accepts it."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.api.routes import admin_sso_operation_requests as routes
+    from app.config import settings
+
+    human = SimpleNamespace(kind="human")
+    service = AsyncMock(side_effect=AssertionError("a local human must not reach the service-key path"))
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    monkeypatch.setattr(routes, "get_current_product_admin", AsyncMock(return_value=human))
+    monkeypatch.setattr(routes, "get_requesting_service_key", service)
+
+    assert await routes.get_request_reader(_reader_request("Bearer local"), authorization="Bearer local") is human
+    service.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_local_bearer_that_is_not_a_human_administrator_falls_to_the_service_key(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.api.routes import admin_sso_operation_requests as routes
+    from app.config import settings
+    from app.exceptions import AuthenticationError
+
+    service_actor = SimpleNamespace(kind="service")
+    monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
+    monkeypatch.setattr(routes, "get_current_product_admin", AsyncMock(side_effect=AuthenticationError("no")))
+    monkeypatch.setattr(routes, "get_requesting_service_key", AsyncMock(return_value=service_actor))
+
+    assert await routes.get_request_reader(_reader_request("Bearer akb_key"), authorization="Bearer akb_key") is service_actor
+
+
+@pytest.mark.asyncio
+async def test_an_sso_mode_bearer_is_only_ever_a_service_key(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.api.routes import admin_sso_operation_requests as routes
+    from app.config import settings
+
+    service_actor = SimpleNamespace(kind="service")
+    human = AsyncMock(side_effect=AssertionError("SSO mode reads the human from the session, not a bearer"))
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+    monkeypatch.setattr(routes, "get_current_product_admin", human)
+    monkeypatch.setattr(routes, "get_requesting_service_key", AsyncMock(return_value=service_actor))
+
+    assert await routes.get_request_reader(_reader_request("Bearer akb_key"), authorization="Bearer akb_key") is service_actor
+    human.assert_not_awaited()
