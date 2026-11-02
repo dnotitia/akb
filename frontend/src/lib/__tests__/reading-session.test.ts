@@ -7,7 +7,7 @@ afterEach(() => vi.restoreAllMocks());
 describe("reading session storage", () => {
   it("restores ordered canonical identifiers, versions and positions without persisting content or titles", () => {
     const session = emptyReadingSession();
-    const doc = { vault: "team", path: "한글/reading.md", title: "Private title", content: "Private body", token: "never-store", version: "abcdef123", href: "/vault/team/doc/reading.md?view=raw" };
+    const doc = { vault: "team", path: "한글/reading.md", title: "Private title", content: "Private body", token: "never-store", version: "aaaaaaa", href: "/vault/team/doc/reading.md?view=raw" };
     session.tabs = [doc]; session.companion = doc; session.active = readingDocumentKey(doc);
     session.positions.set(readingDocumentKey(doc) + ":rendered", 625);
     session.positions.set(readingDocumentKey(doc) + ":raw", 710);
@@ -16,7 +16,7 @@ describe("reading session storage", () => {
     const stored = localStorage.getItem(READING_SESSION_PREFIX + "owner")!;
     for (const secret of ["Private title", "Private body", "never-store", '"href"']) expect(stored).not.toContain(secret);
     const restored = readReadingSession("owner");
-    expect(restored.tabs[0]).toMatchObject({ vault: "team", path: "한글/reading.md", title: "", version: "abcdef123" });
+    expect(restored.tabs[0]).toMatchObject({ vault: "team", path: "한글/reading.md", title: "", version: "aaaaaaa" });
     expect(restored.tabs[0].href).toContain("view=raw");
     expect(restored.active).toBe(readingDocumentKey(doc));
     expect(restored.positions.get(readingDocumentKey(doc) + ":side")).toBe(380);
