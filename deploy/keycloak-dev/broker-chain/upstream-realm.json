@@ -29,6 +29,28 @@
       "optionalClientScopes": []
     },
     {
+      "clientId": "akb-broker-rotated",
+      "name": "AKB broker fixture, replacement client",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "fixture-only-rotated-upstream-client-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "implicitFlowEnabled": false,
+      "fullScopeAllowed": false,
+      "redirectUris": [
+        "https://broker.localhost:19443/realms/akb/broker/workforce/endpoint"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": ["basic", "profile", "email"],
+      "optionalClientScopes": []
+    },
+    {
       "clientId": "upstream-probe",
       "name": "Upstream token rejection probe",
       "enabled": true,

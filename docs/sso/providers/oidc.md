@@ -116,6 +116,10 @@ In the Microsoft Entra admin center:
    registrations when isolation is required.
 4. Under **Certificates & secrets**, give AKB the client secret **Value** at
    creation time. The Secret ID is metadata and cannot authenticate a client.
+   Before a secret expires, add a new one here, send its Value to AKB's
+   client-credentials request while the provider stays enabled (see
+   [Rotating upstream client credentials](../README.md#rotating-upstream-client-credentials)),
+   and delete the old secret afterwards.
 5. Ensure the workforce profile supplies an email claim before using open
    enrollment. Email is profile/admission data only; AKB still keys identity
    by the signed broker issuer and subject and never adopts an existing user

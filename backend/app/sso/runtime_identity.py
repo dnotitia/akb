@@ -15,7 +15,7 @@ BASE_CAPABILITIES = [
     "sso.provider-security-profile.v1", "sso.browser-theme.v1",
     "sso.provider-ownership.v1", "sso.identity-operation.v1", "sso.enabled-exact-admission.v1",
     "sso.preparation-target.v1", "auth.callback-login-evidence.v1",
-    "sso.operation-attempts.v1",
+    "sso.operation-attempts.v1", "sso.provider-client-credentials.v1",
     "auth.prepared-target-adoption.v1",
     "auth.platform-service-bootstrap.v1",
 ]

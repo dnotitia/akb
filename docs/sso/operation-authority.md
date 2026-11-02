@@ -28,6 +28,7 @@ Capabilities return `schema_version: 1`, the database-owned `installation_id`,
 - `sso.preparation-target.v1`
 - `auth.callback-login-evidence.v1`
 - `sso.operation-attempts.v1`
+- `sso.provider-client-credentials.v1`
 
 `realm_identity` is `{realm_id, realm_name, issuer}` from an actual Admin REST
 read of the configured realm. Missing permission, delegated management and
@@ -61,11 +62,21 @@ A human can release its ownership with the live CAS values and repair it through
 the ordinary configuration API; new grants and execution remain blocked until
 the provider is valid.
 
-Ordinary configure and enable requests for an owned alias are forbidden. A
-human administrator may still disable it through the existing API. This records
-`emergency_disabled`, advances the revision and fences earlier grants. Clearing
-the emergency intent requires another explicit human CAS ownership request with
-`clear_emergency: true`; a controller cannot clear it.
+Ordinary configure, enable and client-credential requests for an owned alias
+are forbidden. A human administrator may still disable it through the existing
+API. This records `emergency_disabled`, advances the revision and fences earlier
+grants. Clearing the emergency intent requires another explicit human CAS
+ownership request with `clear_emergency: true`; a controller cannot clear it.
+
+`provider_secret_revision` is an opaque label for the configured client secret.
+A client-credential change of an unowned provider
+(`PUT /admin/sso/providers/{alias}/client-credentials`, see the SSO README)
+records it together with the new fingerprint and revision, creating an unowned
+row if none exists; that request is refused while the emergency latch is set.
+Enabling and disabling, a human emergency disable included, keep the label,
+because neither changes the secret, so after the latch is cleared the ownership
+read still names the configured secret version. An ordinary configure and a
+release of ownership clear it.
 
 ## Issue an operation
 

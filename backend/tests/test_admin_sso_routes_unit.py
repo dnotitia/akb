@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 import uuid
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 import pytest
 
 from app.api.routes import admin_auth, admin_sso, admin_sso_operations
 from app.config import settings
-from app.exceptions import AuthenticationError, ForbiddenError
+from app.exceptions import AKBError, AuthenticationError, ForbiddenError
 from app.services.admin_auth_service import ProductAdminIdentity
 from app.services.auth_service import AuthenticatedUser
 from app.sso.keycloak_admin import ProviderControlError
@@ -75,6 +78,7 @@ class Control:
         self.providers = [_provider()]
         self.configured_secret: str | None = None
         self.toggles: list[tuple[str, bool]] = []
+        self.credential_writes: list[tuple[str, str, str]] = []
 
     async def list_providers(self, **_kwargs):
         return tuple(self.providers)
@@ -97,6 +101,15 @@ class Control:
             ),
         )
 
+    async def set_client_credentials(self, alias: str, *, client_id: str, client_secret: str, precondition=None):
+        current = self.providers[0]
+        if precondition is not None:
+            precondition(current)
+        self.credential_writes.append((alias, client_id, client_secret))
+        after = replace(current, client_id=client_id)
+        self.providers = [after]
+        return ProviderMutationReadback(before=current, after=after)
+
     async def verify_identity_prelink(
         self,
         alias: str,
@@ -115,14 +128,25 @@ class Control:
         )
 
 
-def _client(monkeypatch, control: Control, *, admin=None) -> TestClient:
+def _client(monkeypatch, control: Control, *, admin=None, guard_calls=None) -> TestClient:
+    guard_calls = [] if guard_calls is None else guard_calls
+
     @asynccontextmanager
     async def unowned_provider_guard(*_args, **_kwargs):
         async def complete(_provider):
             pass
         yield complete
 
+    @asynccontextmanager
+    async def unowned_credentials_guard(alias, _actor, *, expected_fingerprint, secret_revision):
+        guard_calls.append((alias, expected_fingerprint, secret_revision))
+
+        async def complete(_mutation):
+            pass
+        yield SimpleNamespace(check=lambda _provider: None, complete=complete)
+
     monkeypatch.setattr(admin_sso, "provider_mutation_guard", unowned_provider_guard)
+    monkeypatch.setattr(admin_sso, "provider_credentials_guard", unowned_credentials_guard)
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
     monkeypatch.setattr(
         admin_sso,
@@ -460,7 +484,7 @@ def _route_dependency_callables(route) -> set:
     }
 
 
-def test_only_provider_catalog_configuration_and_toggle_use_machine_control():
+def test_only_provider_catalog_configuration_credentials_and_toggle_use_machine_control():
     provider_routes = {
         (route.path, method)
         for route in admin_sso.router.routes
@@ -470,6 +494,7 @@ def test_only_provider_catalog_configuration_and_toggle_use_machine_control():
     machine_routes = {
         ("/admin/sso/providers", "GET"),
         ("/admin/sso/providers/{alias}", "PUT"),
+        ("/admin/sso/providers/{alias}/client-credentials", "PUT"),
         ("/admin/sso/providers/{alias}/enable", "POST"),
         ("/admin/sso/providers/{alias}/disable", "POST"),
     }
@@ -850,3 +875,173 @@ def test_identity_migration_openapi_keeps_all_identifiers_required_strings():
         "upstream_subject": "string",
         "broker_subject": "string",
     }
+
+
+_FINGERPRINT = "a" * 64
+
+
+def _credentials(**changes: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "client_id": "akb-broker-next",
+        "client_secret": _SECRET,
+        "expected_fingerprint": _FINGERPRINT,
+        "secret_revision": "secret-v2",
+    }
+    body.update(changes)
+    return {key: value for key, value in body.items() if value is not _OMIT}
+
+
+_OMIT = object()
+
+
+def test_client_credentials_change_is_secret_free_in_response_and_audit(monkeypatch):
+    control = Control()
+    control.providers = [_provider(state="enabled")]
+    records: list[dict[str, object]] = []
+    guard_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(admin_sso.audit_log, "record", lambda **value: records.append(value))
+
+    response = _client(monkeypatch, control, guard_calls=guard_calls).put(
+        "/api/v1/admin/sso/providers/workforce/client-credentials",
+        json=_credentials(),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["provider"]["client_id"] == "akb-broker-next"
+    assert response.json()["provider"]["state"] == "enabled"
+    assert control.credential_writes == [("workforce", "akb-broker-next", _SECRET)]
+    assert control.toggles == []
+    assert guard_calls == [("workforce", _FINGERPRINT, "secret-v2")]
+    assert _SECRET not in response.text
+    assert _SECRET not in repr(records)
+    assert [record["action"] for record in records] == [
+        "admin.sso.provider.client_credentials.requested",
+        "admin.sso.provider.client_credentials",
+    ]
+    assert records[-1]["meta"] == {
+        "before": _provider(state="enabled").audit_view(),
+        "after": replace(_provider(state="enabled"), client_id="akb-broker-next").audit_view(),
+    }
+
+
+def test_client_credentials_label_is_optional(monkeypatch):
+    guard_calls: list[tuple[object, ...]] = []
+    response = _client(monkeypatch, Control(), guard_calls=guard_calls).put(
+        "/api/v1/admin/sso/providers/workforce/client-credentials",
+        json=_credentials(secret_revision=_OMIT),
+    )
+
+    assert response.status_code == 200
+    assert guard_calls == [("workforce", _FINGERPRINT, None)]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _credentials(clientSecret=_SECRET),
+        _credentials(unexpected=_SECRET),
+        _credentials(expected_fingerprint=_OMIT),
+        _credentials(client_id=_OMIT),
+        _credentials(expected_fingerprint="not-a-fingerprint"),
+        _credentials(client_id=["akb-broker-next"]),
+        _credentials(secret_revision=""),
+        _credentials(secret_revision="x" * 256),
+        _credentials(secret_revision=7),
+    ],
+)
+def test_malformed_client_credential_requests_are_refused_without_reflection(monkeypatch, body):
+    control = Control()
+    response = _client(monkeypatch, control).put(
+        "/api/v1/admin/sso/providers/workforce/client-credentials",
+        json=body,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "message": "SSO provider configuration is invalid",
+        "code": "provider_client_credentials_request_invalid",
+    }
+    assert _SECRET not in response.text
+    assert control.credential_writes == []
+
+
+@pytest.mark.parametrize(
+    ("secret", "code"),
+    [
+        (_OMIT, "provider_client_secret_required"),
+        (None, "provider_client_secret_required"),
+        ({"value": _SECRET}, "provider_client_secret_invalid"),
+        ([_SECRET], "provider_client_secret_invalid"),
+        (42, "provider_client_secret_invalid"),
+    ],
+)
+def test_missing_or_non_string_client_secret_is_refused_without_reflection(monkeypatch, secret, code):
+    control = Control()
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(admin_sso.audit_log, "record", lambda **value: records.append(value))
+
+    response = _client(monkeypatch, control).put(
+        "/api/v1/admin/sso/providers/workforce/client-credentials",
+        json=_credentials(client_secret=secret),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == code
+    assert _SECRET not in response.text
+    assert _SECRET not in repr(records)
+    assert control.credential_writes == []
+    assert records[-1]["code"] == code
+
+
+@pytest.mark.parametrize(
+    ("code", "status_code"),
+    [
+        ("provider_not_found", 404),
+        ("provider_alias_conflict", 409),
+        ("provider_configuration_invalid", 409),
+        ("keycloak_provider_readback_failed", 409),
+        ("provider_client_id_invalid", 422),
+        ("provider_client_secret_invalid", 422),
+        ("keycloak_provider_credentials_update_failed", 502),
+    ],
+)
+def test_client_credential_control_errors_are_status_mapped(monkeypatch, code, status_code):
+    class Broken(Control):
+        async def set_client_credentials(self, alias, **_kwargs):
+            raise ProviderControlError(code)
+
+    response = _client(monkeypatch, Broken()).put(
+        "/api/v1/admin/sso/providers/workforce/client-credentials",
+        json=_credentials(),
+    )
+
+    assert response.status_code == status_code
+    assert response.json()["detail"]["code"] == code
+    assert _SECRET not in response.text
+
+
+def test_client_credential_authority_refusal_is_audited_with_its_code(monkeypatch):
+    control = Control()
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(admin_sso.audit_log, "record", lambda **value: records.append(value))
+    client = _client(monkeypatch, control)
+
+    @asynccontextmanager
+    async def owned_guard(*_args, **_kwargs):
+        raise AKBError("SSO operation authority rejected", status_code=403, code="sso_provider_owned_mutation_forbidden")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(admin_sso, "provider_credentials_guard", owned_guard)
+
+    @client.app.exception_handler(AKBError)
+    async def error(_request, exc):
+        return JSONResponse({"code": exc.code}, status_code=exc.status_code)
+
+    response = client.put("/api/v1/admin/sso/providers/workforce/client-credentials", json=_credentials())
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "sso_provider_owned_mutation_forbidden"}
+    assert control.credential_writes == []
+    assert records[-1]["outcome"] == "error"
+    assert records[-1]["code"] == "sso_provider_owned_mutation_forbidden"
+    assert _SECRET not in repr(records)

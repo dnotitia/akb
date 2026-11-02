@@ -260,6 +260,38 @@ def with_enabled(
     return updated
 
 
+def validate_client_credentials(client_id: str, client_secret: str) -> tuple[str, str]:
+    """Validate a credential pair for an existing provider, without a definition.
+
+    Keycloak treats its masked sentinel as "keep the stored secret", so it can
+    never stand for a new one here: a rotation always carries the real value.
+    """
+    if not isinstance(client_id, str):
+        raise ProviderDefinitionError("provider_client_id_invalid")
+    cleaned_id = _clean_text(client_id, maximum=255, code="provider_client_id_invalid")
+    if not _CLIENT_ID_RE.fullmatch(cleaned_id):
+        raise ProviderDefinitionError("provider_client_id_invalid")
+    if not isinstance(client_secret, str) or client_secret == MASKED_SECRET:
+        raise ProviderDefinitionError("provider_client_secret_invalid")
+    secret = _opaque_secret(client_secret, code="provider_client_secret_invalid")
+    return cleaned_id, secret
+
+
+def with_client_credentials(
+    representation: Mapping[str, object],
+    *,
+    client_id: str,
+    client_secret: str,
+) -> dict[str, object]:
+    """Return the stored representation with only its client credentials changed."""
+    config = representation.get("config")
+    if not isinstance(config, dict):
+        raise ProviderDefinitionError("provider_configuration_invalid")
+    updated = dict(representation)
+    updated["config"] = {**config, "clientId": client_id, "clientSecret": client_secret}
+    return updated
+
+
 def _config_string(config: Mapping[str, object], key: str) -> str | None:
     value = config.get(key)
     return value if isinstance(value, str) and value else None

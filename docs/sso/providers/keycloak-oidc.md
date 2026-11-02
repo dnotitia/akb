@@ -67,9 +67,26 @@ that does not grant an AKB role or administrator status. AKB account projection
 and authorization remain separate and exact; email and username remain
 collision/profile inputs, never automatic AKB account-linking keys.
 
-To rotate the upstream client secret, disable the provider, edit it with the
-new secret, save, and enable it again. Leaving the secret field blank preserves
-the existing value; no UI or API can read it back.
+To rotate the upstream client secret, or to move the provider to a new
+upstream client, keep the provider enabled:
+
+1. In the upstream realm, regenerate the client secret or create the new
+   client with the same redirect URI. Keep the old credential valid for now.
+2. Read the provider's current `fingerprint` from
+   `GET /api/v1/admin/sso/providers/<alias>/ownership`.
+3. Send the client ID and secret to
+   `PUT /api/v1/admin/sso/providers/<alias>/client-credentials` with that
+   `expected_fingerprint` and, optionally, a `secret_revision` label.
+4. After the response, retire the old secret or client upstream.
+
+Only `clientId` and `clientSecret` change; the provider stays enabled and
+visible throughout. Federated links are keyed by provider alias and upstream
+subject, so existing accounts keep their links as long as both clients give a
+person the same subject, which clients of one Keycloak realm do. The request,
+its refusals and the one sign-in that can fail at the moment of the swap are
+described in [Rotating upstream client credentials](../README.md#rotating-upstream-client-credentials).
+Changing the issuer still requires disable, configure and enable. No UI or API
+can read a stored secret back.
 
 ## Existing-account continuity
 
@@ -146,4 +163,7 @@ Run `deploy/keycloak-dev/broker-chain/run.sh` before enabling a release. The
 disposable two-Keycloak fixture completes Authorization Code + PKCE login,
 projects the broker access token to the same AKB user, proves PAT and Vault
 continuity, rejects an upstream token even when it carries the AKB API
-audience, then exercises rollback and operator cleanup.
+audience, moves the enabled provider to a second upstream client while a
+once-a-second readback shows it never disabled and a real sign-in through the
+new client reaches the same account and federated link, then exercises
+rollback and operator cleanup.

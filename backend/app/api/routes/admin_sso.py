@@ -7,6 +7,8 @@ import re
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 from app.api.deps import get_current_user
@@ -16,7 +18,7 @@ from app.api.routes.admin_auth import (
     get_product_admin_mutation,
 )
 from app.config import settings
-from app.exceptions import ForbiddenError
+from app.exceptions import AKBError, ForbiddenError
 from app.models.admin_sso import (
     SsoIdentityMigrationResponse,
     SsoProviderCatalogResponse,
@@ -41,7 +43,10 @@ from app.sso.models import (
     ProviderReadback,
 )
 from app.sso.registry import provider_types
-from app.sso.identity_operations import provider_mutation_guard
+from app.sso.identity_operations import (
+    provider_credentials_guard,
+    provider_mutation_guard,
+)
 from app.api.routes.admin_sso_operations import router as operations_router
 
 
@@ -57,6 +62,41 @@ class ConfigureProviderRequest(BaseModel):
     # authenticated route validates the raw value and returns a value-less
     # provider error, while OpenAPI still describes a nullable string.
     client_secret: SkipValidation[str] | None = Field(default=None, repr=False)
+
+
+class ProviderClientCredentialsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_id: str = Field(min_length=1, max_length=255)
+    # Write-only, validated in the value-less domain boundary like configure.
+    client_secret: SkipValidation[str] | None = Field(default=None, repr=False)
+    expected_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    secret_revision: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class _ValueLessValidationRoute(APIRoute):
+    """Refuse a malformed credential request without reflecting any of it.
+
+    FastAPI's validation error carries the rejected input, and for a missing or
+    unknown field that input is the whole body, client secret included.
+    """
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def value_less_handler(request):
+            try:
+                return await handler(request)
+            except RequestValidationError:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail={
+                        "message": "SSO provider configuration is invalid",
+                        "code": "provider_client_credentials_request_invalid",
+                    },
+                ) from None
+
+        return value_less_handler
 
 
 class IdentityMigrationRequest(BaseModel):
@@ -151,6 +191,10 @@ def _require_sso_mode() -> None:
 
 
 router = APIRouter(dependencies=[Depends(_require_sso_mode)])
+credentials_router = APIRouter(
+    dependencies=[Depends(_require_sso_mode)],
+    route_class=_ValueLessValidationRoute,
+)
 
 
 async def get_sso_provider_control_actor(
@@ -160,8 +204,8 @@ async def get_sso_provider_control_actor(
 ) -> ProductAdminActor:
     """Resolve the browser administrator or the platform's service administrator.
 
-    The bearer exception is deliberately local to provider catalog/configuration
-    and enable/disable routes. It does not change the general product-admin
+    The bearer exception is deliberately local to provider catalog/configuration,
+    client-credential and enable/disable routes. It does not change the general product-admin
     dependency and therefore does not turn a service token into a browser admin
     session. ``get_current_user`` still enforces the token's method scope before
     this stricter service-admin conjunction is checked.
@@ -446,6 +490,50 @@ async def disable_sso_provider(
     return await _toggle_sso_provider(alias, enabled=False, actor=actor)
 
 
+@credentials_router.put(
+    "/admin/sso/providers/{alias}/client-credentials",
+    response_model=SsoProviderMutationResponse,
+    summary="Change an SSO provider's upstream client credentials without disabling it",
+)
+async def change_sso_provider_client_credentials(
+    alias: str,
+    request: ProviderClientCredentialsRequest,
+    actor: ProductAdminActor = Depends(get_sso_provider_control_actor),
+):
+    action = "admin.sso.provider.client_credentials"
+    _audit(f"{action}.requested", actor, alias)
+    try:
+        raw_secret: object = request.client_secret
+        if raw_secret is None:
+            raise ProviderControlError("provider_client_secret_required")
+        if not isinstance(raw_secret, str):
+            raise ProviderControlError("provider_client_secret_invalid")
+        async with provider_credentials_guard(
+            alias,
+            actor,
+            expected_fingerprint=request.expected_fingerprint,
+            secret_revision=request.secret_revision,
+        ) as guard:
+            mutation = await get_keycloak_provider_control().set_client_credentials(
+                alias,
+                client_id=request.client_id,
+                client_secret=raw_secret,
+                precondition=guard.check,
+            )
+            await guard.complete(mutation)
+    except ProviderControlError as error:
+        _audit(action, actor, alias, outcome="error", code=error.code)
+        _raise_control_error(error)
+    except AKBError as error:
+        _audit(action, actor, alias, outcome="error", code=error.code)
+        raise
+    except Exception:
+        _audit(action, actor, alias, outcome="error", code="internal_error")
+        raise
+    _audit(action, actor, alias, mutation=mutation)
+    return {"provider": mutation.after.admin_view()}
+
+
 def _prelink_response(
     prelink: IdentityPrelinkReadback,
     migration: IdentityMigrationReadback,
@@ -667,4 +755,5 @@ async def rollback_sso_identity_migration(
 legacy_router = router
 router = APIRouter()
 router.include_router(legacy_router)
+router.include_router(credentials_router)
 router.include_router(operations_router)
