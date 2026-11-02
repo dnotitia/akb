@@ -13,7 +13,6 @@ import { DocumentPreviewDialog } from "@/components/document-preview-dialog";
 import AdminPage from "@/pages/admin";
 import AuthPage from "@/pages/auth";
 import AuthForgotPage from "@/pages/auth-forgot";
-import AuthCallbackPage from "@/pages/auth-callback";
 import HomePage from "@/pages/home";
 import VaultPage from "@/pages/vault";
 import VaultIndexPage from "@/pages/vault-index";
@@ -52,7 +51,6 @@ const routeComponents = {
   AdminPage,
   AuthPage,
   AuthForgotPage,
-  AuthCallbackPage,
   PublicationPage,
   HomePage,
   VaultNewPage,

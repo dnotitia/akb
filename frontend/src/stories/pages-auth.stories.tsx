@@ -124,22 +124,3 @@ export const ForgotPasswordGuidance: Story = {
     await expect(canvas.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
   },
 };
-
-export const CallbackFailClosed: Story = {
-  name: "SSO callback / fail closed",
-  parameters: {
-    authToken: false,
-    router: { initialEntries: ["/auth/callback?code=story-code&redirect=/"] },
-    msw: {
-      handlers: [
-        http.get(`${API}/auth/config`, () => HttpResponse.json(localAuthConfig)),
-      ],
-    },
-  },
-  render: () => <AkbRouteTree />,
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { name: "Legacy SSO callback retired" })).toBeInTheDocument();
-    await expect(canvas.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
-  },
-};

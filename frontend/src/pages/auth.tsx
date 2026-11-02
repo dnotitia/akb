@@ -4,7 +4,6 @@ import { ArrowRight, Database, Boxes, Eye, EyeOff, GitBranch } from "lucide-reac
 import {
   authLogin,
   authRegister,
-  clearLegacySsoSession,
   getAuthConfig,
   getMe,
   getToken,
@@ -60,16 +59,15 @@ export default function AuthPage() {
   const next = safeNext(new URLSearchParams(window.location.search).get("next"));
   const localAuthEnabled =
     authConfig?.available === true &&
-    (authConfig.auth_mode === "local" || authConfig.auth_mode === "hybrid") &&
+    authConfig.auth_mode === "local" &&
     authConfig.local_auth.enabled;
   const ssoConfigEnabled =
     authConfig?.available === true &&
-    (authConfig.auth_mode === "sso" || authConfig.auth_mode === "hybrid") &&
+    authConfig.auth_mode === "sso" &&
     authConfig.keycloak.enabled;
   const ssoProviders = ssoConfigEnabled ? authConfig.providers : [];
   const usableSsoProviders =
-    ssoConfigEnabled &&
-    (authConfig.schema_version === 1 || authConfig.keycloak.browser_session_ready)
+    ssoConfigEnabled && authConfig.keycloak.browser_session_ready
       ? ssoProviders.filter((provider) => provider.login_url !== null)
       : [];
 
@@ -185,7 +183,6 @@ export default function AuthPage() {
         return;
       }
       setToken(r.token);
-      clearLegacySsoSession();
       try {
         if ("PasswordCredential" in window) {
           const cred = new PasswordCredential({ id: username, password });

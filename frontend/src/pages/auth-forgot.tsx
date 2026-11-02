@@ -15,7 +15,7 @@ export default function AuthForgotPage() {
   const [configAttempt, setConfigAttempt] = useState(0);
   const localPasswordHelp =
     authConfig?.available === true &&
-    (authConfig.auth_mode === "local" || authConfig.auth_mode === "hybrid") &&
+    authConfig.auth_mode === "local" &&
     authConfig.local_auth.enabled;
   // This route sits outside the Layout auth gate — bounce signed-in users home.
   useEffect(() => {

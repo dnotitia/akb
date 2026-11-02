@@ -139,7 +139,7 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
   } : null);
   useDocumentHistoryGuard(dirty || busy, proceed => request({ type: "history", proceed }));
   const localPasswordEnabled = authConfig?.available === true &&
-    (authConfig.auth_mode === "local" || authConfig.auth_mode === "hybrid") && authConfig.local_auth.enabled;
+    authConfig.auth_mode === "local" && authConfig.local_auth.enabled;
   function updateUser(patch: ProfileUserPatch) {
     setUser(current => current ? { ...current, ...patch } : current);
     // Refresh the shared identity without remounting the underlying workspace.
