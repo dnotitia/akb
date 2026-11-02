@@ -872,10 +872,12 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     if (docked) {
       const panelBox = (await panel.boundingBox())!;
       const contextBox = (await page.locator(".reading-details-host").boundingBox())!;
+      const divider = (await page.getByRole("separator", { name: "Resize context panel", exact: true }).boundingBox())!;
       expect(contextBox.width).toBe(288);
-      expect(panelBox.width).toBe(contextBox.width - 1);
-      expect(contextBox.x).toBeCloseTo(afterDetails.x + afterDetails.width, 0);
-      expect(afterDetails.width + contextBox.width).toBeCloseTo(beforeDetails.width, 0);
+      expect(panelBox.width).toBe(contextBox.width);
+      expect(divider.width).toBeGreaterThan(0);
+      expect(contextBox.x).toBeCloseTo(afterDetails.x + afterDetails.width + divider.width, 0);
+      expect(afterDetails.width + contextBox.width + divider.width).toBeCloseTo(beforeDetails.width, 0);
       expect(afterDetails.x).toBe(beforeDetails.x);
       expect(afterDetails.height).toBe(beforeDetails.height);
     } else {
@@ -1752,7 +1754,8 @@ test("docked details preserve article scroll and remain open during reading", as
   await expect(panel).toHaveAttribute("data-mode", "docked");
   expect(await canvas.evaluate(element => element.scrollTop)).toBe(240);
   const after = (await canvas.boundingBox())!;
-  expect(after.width + (await page.locator(".reading-details-host").boundingBox())!.width).toBeCloseTo(before.width, 0);
+  const divider = (await page.getByRole("separator", { name: "Resize context panel", exact: true }).boundingBox())!;
+  expect(after.width + (await page.locator(".reading-details-host").boundingBox())!.width + divider.width).toBeCloseTo(before.width, 0);
   await panel.getByText(title, { exact: true }).click({ clickCount: 3 });
   await expect(panel).toBeVisible();
   await canvas.hover({ position: { x: 40, y: 80 } });

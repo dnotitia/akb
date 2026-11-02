@@ -73,7 +73,7 @@ export default function GuidePreview({ vault, content, onNavigate }: {
     <div className="mt-4 border-t border-border pt-4" onClick={followLink}>
       <div ref={previewRef} id={id} role="region" aria-label="Vault guide preview"
         className={cn("max-w-prose", !showAll && "[&_.ProseMirror>:nth-child(n+5)]:hidden")}>
-        <MarkdownRender markdown={markdown}
+        <MarkdownRender markdown={markdown} readingTools={false}
           assetContext={{ mode: "authenticated", vault, document: VAULT_SKILL_PATH }}
           headingIdPrefix={headingPrefix} headingLevelOffset={3}
           className="text-ui leading-relaxed prose-headings:mb-1.5 prose-headings:mt-3 prose-headings:text-ui prose-headings:font-semibold prose-p:my-1.5 prose-li:my-0.5 prose-pre:my-3 [&_.ProseMirror>:first-child]:mt-0 [&_.ProseMirror>:last-child]:mb-0 [&_img]:max-h-40 [&_img]:object-contain" />

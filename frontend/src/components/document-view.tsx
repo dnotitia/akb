@@ -11,6 +11,7 @@ import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
+import { RawDocumentText } from "@/components/document-reader-tools";
 
 type ViewMode = "rendered" | "raw";
 
@@ -34,6 +35,7 @@ interface DocumentViewProps {
   bodyOnly?: boolean;
   idPrefix?: string;
   leadingMetadata?: ReactNode;
+  searchable?: boolean;
 }
 
 /**
@@ -62,6 +64,7 @@ export function DocumentView({
   bodyOnly = false,
   idPrefix = "docview",
   leadingMetadata,
+  searchable = false,
 }: DocumentViewProps) {
   const queryClient = useQueryClient();
   const user = useCurrentUser();
@@ -134,6 +137,7 @@ export function DocumentView({
           style={{ maxWidth: "100%" }}
         >
           <MarkdownRender
+            searchable={searchable}
             markdown={doc.content || ""}
             summary={doc.summary}
             leadingMetadata={leadingMetadata}
@@ -159,7 +163,7 @@ export function DocumentView({
             data-testid="doc-raw"
             className="document-reading-source m-0 wrap-anywhere overflow-x-auto whitespace-pre-wrap font-mono text-[13px] leading-[1.65] text-foreground"
           >
-            {doc.content || ""}
+            <RawDocumentText text={doc.content || ""} searchable={searchable} />
           </pre>
         </div>
       )}

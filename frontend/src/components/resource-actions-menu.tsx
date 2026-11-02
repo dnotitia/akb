@@ -81,7 +81,8 @@ export function ResourceActionsMenu({
           side={side}
           align={align}
           sideOffset={4}
-          className="z-[var(--z-popover)] min-w-48 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
+          collisionPadding={8}
+          className="z-[var(--z-popover)] max-h-[min(32rem,var(--radix-dropdown-menu-content-available-height))] min-w-48 max-w-[calc(100vw-1rem)] overflow-y-auto overscroll-contain rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
           {children}
           {children && (showMoveAction || showPublishAction || showDeleteAction || archiveAction) && <DropdownMenu.Separator className="my-1 h-px bg-border" />}
