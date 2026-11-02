@@ -2825,6 +2825,32 @@ export const listPublications = (vault: string, resource_type?: string) => {
   return api<{ publications: Publication[] }>(`/publications/${vault}${qs}`);
 };
 
+export type PublicLinkStatus = "active" | "all" | "unavailable";
+export type PublicLinkExpiry = "any" | "none" | "soon" | "long-running";
+export interface DirectoryPublication extends Publication {
+  resource_path: string;
+  availability: "active" | "expired" | "view-limit-reached";
+  can_unpublish: boolean;
+  unpublish_disabled_reason: string | null;
+}
+export interface PublicationDirectoryPage {
+  publications: DirectoryPublication[];
+  total: number;
+  complete: boolean;
+  next_cursor: string | null;
+  observed_at: string;
+}
+export const listPublicationDirectory = (options: {
+  vault?: string; q?: string; status?: PublicLinkStatus; expiry?: PublicLinkExpiry;
+  cursor?: string; page_size?: number; signal?: AbortSignal;
+}) => {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(options)) {
+    if (key !== "signal" && value !== undefined && value !== "") qs.set(key, String(value));
+  }
+  return api<PublicationDirectoryPage>(`/publications?${qs}`, { signal: options.signal });
+};
+
 export const deletePublication = (vault: string, slug: string) =>
   api<{ deleted: number }>(`/publications/${vault}/${slug}`, { method: "DELETE" });
 

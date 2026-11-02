@@ -2,6 +2,10 @@
  * Do not edit: change src/index.css and run `pnpm run theme:tokens`. */
 :root {
   --akb-color-graph-edge: #526675;
+  --akb-color-settings-preview-light: #f6f7f9;
+  --akb-color-settings-preview-dark: #0b0f14;
+  --akb-color-settings-preview-line: #dfe3e8;
+  --akb-color-settings-preview-dark-line: #26303c;
   --akb-color-teal: #004059;
   --akb-color-teal-2: #0a6f86;
   --akb-color-orange: #e55e2c;
@@ -79,7 +83,6 @@
   --akb-spacing-document-command-row: 3rem;
   --akb-spacing-document-command-touch-row: 4rem;
   --akb-spacing-document-command-inset: 1.25rem;
-  --akb-spacing-vault-box-depth: 1rem;
   --akb-radius: 0.875rem;
   --akb-radius-xs: 0.1875rem;
   --akb-radius-sm: 0.5rem;

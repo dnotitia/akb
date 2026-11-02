@@ -39,6 +39,7 @@ from pydantic import ConfigDict
 
 from app.api.deps import get_current_user, get_optional_user
 from app.api.routes import assets
+from app.api.routes.publication_directory import router as publication_directory_router
 from app.api.routes.files import _download_capability_slots
 from app.exceptions import ForbiddenError, NotFoundError
 from app.config import settings
@@ -65,6 +66,7 @@ from app.services.publication_service import (
 )
 
 router = APIRouter()
+router.include_router(publication_directory_router)
 logger = logging.getLogger("akb.publications.public")
 
 

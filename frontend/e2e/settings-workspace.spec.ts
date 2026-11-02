@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-for (const width of [1440, 2560, 375]) {
+for (const width of [375, 767, 768, 874, 1024, 1440, 2560]) {
   test(`Account settings dialog ${width}px`, async ({ page }, testInfo) => {
     test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Uses isolated HTTP fixtures.");
     await page.setViewportSize({ width, height: 1000 });
@@ -21,7 +21,7 @@ for (const width of [1440, 2560, 375]) {
     await expect(page.getByTestId("profile-identity")).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath("profile.png"), fullPage: true, animations: "disabled" });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-    if (width >= 1024) {
+    if (width >= 768) {
       const dialog = page.getByTestId("account-settings-dialog");
       const bounds = (await dialog.boundingBox())!;
       const rail = (await page.getByRole("complementary", { name: "Settings navigation" }).boundingBox())!;
@@ -41,11 +41,13 @@ for (const width of [1440, 2560, 375]) {
       await page.getByRole("menuitemradio", { name: "Appearance", exact: true }).click();
     }
     await expect(page.getByRole("radio", { name: "Dark", exact: true })).toBeVisible();
-    if (width >= 1024) await expect(page.getByRole("tab", { name: "Appearance", exact: true })).toHaveAttribute("aria-selected", "true");
+    if (width >= 768) await expect(page.getByRole("tab", { name: "Appearance", exact: true })).toHaveAttribute("aria-selected", "true");
     await page.screenshot({ path: testInfo.outputPath("settings-light.png"), fullPage: true, animations: "disabled" });
     await page.getByRole("radio", { name: "Dark", exact: true }).locator("..").click();
     await expect(page.locator("html")).toHaveClass(/dark/);
-    await expect(page.getByTestId("account-settings-dialog")).toHaveCSS("background-color", "rgb(18, 24, 33)");
+    // Compare both surfaces in one settled read during the theme change.
+    await expect.poll(() => page.getByTestId("account-settings-dialog").evaluate(node =>
+      getComputedStyle(node).backgroundColor === getComputedStyle(document.body).backgroundColor)).toBe(true);
     await page.screenshot({ path: testInfo.outputPath("settings-dark.png"), fullPage: true, animations: "disabled" });
     if (width >= 1024) {
       await page.getByRole("button", { name: "Close settings", exact: true }).click();

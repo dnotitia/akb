@@ -44,7 +44,7 @@ async function fixture(page: Page, dark = false, navigationVisible = "1") {
 const routes = {
   settings: { label: "Settings", action: "Vault settings" },
   members: { label: "Members", action: "Members" },
-  publications: { label: "Public links", action: "Public links" },
+  publications: { label: "Publications", action: "Publications" },
   graph: { label: "Graph", action: "Graph" },
   activity: { label: "Activity", action: "Activity" },
 } as const;
@@ -72,7 +72,7 @@ for (const width of [375, 1920]) for (const dark of [false, true]) for (const [r
       await expect(page.getByRole("tablist")).toHaveCount(0);
       await expect(page.getByRole("complementary", { name: "Vault details" })).toHaveCount(0);
     } else if (route === "members") await expect(page.getByRole("table", { name: "Vault members" })).toBeVisible();
-    else if (route === "publications") await expect(page.getByText("No public links yet", { exact: true })).toBeVisible();
+    else if (route === "publications") await expect(page.getByText("Nothing published yet", { exact: true })).toBeVisible();
     else if (route === "graph") await expect(page.getByRole("region", { name: "Graph exploration workspace" })).toBeVisible();
     else await expect(page.getByRole("region", { name: "Activity", exact: true })).toBeVisible();
 

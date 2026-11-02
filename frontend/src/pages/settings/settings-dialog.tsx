@@ -3,7 +3,7 @@ import { useNavigate, type NavigateOptions } from "react-router-dom";
 import { useResourceNavigation, useResourceNavigationGuard } from "@/contexts/resource-navigation-context";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import { useDocumentHistoryGuard } from "@/hooks/use-document-history-guard";
-import { Settings, X } from "lucide-react";
+import { Circle, SlidersHorizontal, X } from "lucide-react";
 import { SETTINGS_SECTIONS as SECTIONS, settingsSection } from "@/lib/settings-sections";
 import { getAuthConfig, getMe, listPATs, adminListUsers, type AuthConfig, type AdminUser } from "@/lib/api";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -20,6 +20,7 @@ import { PreferencesSection } from "./preferences-section";
 import { AdminSection } from "./admin-section";
 import { NotificationsSection } from "./notifications-section";
 import { SecuritySection } from "./security-section";
+import { UserAvatar } from "@/components/user-avatar";
 
 type TabId = (typeof SECTIONS)[number]["id"];
 type Pending = { type: "close" } | { type: "tab"; tab: TabId } | { type: "navigation"; href: string; options?: NavigateOptions } | { type: "history"; proceed: () => void };
@@ -146,37 +147,39 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
     window.dispatchEvent(new Event("akb:revalidate-access"));
   }
   const navItem = ({ id, label, icon: Icon }: (typeof SECTIONS)[number]) => <TabsTrigger key={id} value={id} disabled={busy}
-    className="min-h-10 w-full justify-start gap-2.5 whitespace-normal rounded-[var(--radius-sm)] px-3 py-2 text-left text-sm font-normal leading-5 hover:bg-surface-hover data-[state=active]:bg-surface-selected data-[state=active]:font-medium data-[state=active]:text-surface-selected-foreground data-[state=active]:shadow-none">
-    <Icon className="h-4 w-4 shrink-0" aria-hidden /><span>{label}</span>
+    className="settings-nav-item">
+    <Icon aria-hidden /><span>{label}</span>
   </TabsTrigger>;
 
   // Own actual close gestures explicitly. A native photo picker can move
   // focus outside Radix before its selected-file/dirty state is observable.
   return <Dialog open>
     <DialogContent hideClose data-testid="account-settings-dialog"
-      className="left-0 top-0 flex h-dvh max-h-dvh w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none p-0 sm:left-1/2 sm:top-1/2 sm:h-[min(47.5rem,calc(100dvh-3rem))] sm:max-h-[calc(100dvh-3rem)] sm:w-[calc(100%-3rem)] sm:max-w-[65rem] sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-[var(--radius-xl)]"
+      className="settings-studio settings-studio-dialog"
+      overlayProps={{ className: "settings-studio-overlay" }}
       onOpenAutoFocus={event => { event.preventDefault(); heading.current?.focus(); }}
       onEscapeKeyDown={event => { event.preventDefault(); request({ type: "close" }); }}
       onPointerDownOutside={event => { event.preventDefault(); request({ type: "close" }); }}
       onInteractOutside={event => event.preventDefault()}
       onCloseAutoFocus={event => { event.preventDefault(); onRestoreFocus?.(); }}>
-      <header className="flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-border px-4 sm:px-5">
-        <div className="flex items-center gap-2.5"><Settings className="h-4 w-4 text-foreground-muted" aria-hidden /><DialogTitle ref={heading} tabIndex={-1} className="text-base outline-none">Settings</DialogTitle></div>
+      <header className="settings-studio-header">
+        <div className="settings-studio-brand"><span className="settings-studio-mark"><SlidersHorizontal aria-hidden /></span><div><DialogTitle ref={heading} tabIndex={-1}>Settings</DialogTitle><p>Account &amp; workspace</p></div></div>
         <DialogDescription className="sr-only">Manage your account, appearance and agent connections without leaving your workspace.</DialogDescription>
-        <Button variant="ghost" size="icon" disabled={busy} aria-label="Close settings" className="h-10 w-10 shrink-0 text-foreground-muted" onClick={() => request({ type: "close" })}><X className="h-4 w-4" aria-hidden /></Button>
+        <div className="settings-header-actions">{dirty && !busy && <span className="settings-draft-indicator"><Circle aria-hidden />Unsaved changes</span>}<Button variant="ghost" size="icon" disabled={busy} aria-label="Close settings" className="settings-close" onClick={() => request({ type: "close" })}><X aria-hidden /></Button></div>
       </header>
-      <Tabs value={activeTab} onValueChange={tab => request({ type: "tab", tab: tab as TabId })} orientation="vertical" activationMode="manual" className="flex min-h-0 flex-1 flex-col md:flex-row">
-        <aside aria-label="Settings navigation" className="shrink-0 border-b border-border md:flex md:w-52 md:flex-col md:border-b-0 md:border-r">
-          <div className="p-3 md:hidden"><SelectMenu aria-label="Settings section" value={activeTab} disabled={busy} onValueChange={tab => request({ type: "tab", tab: tab as TabId })} options={sections.map(({ id, label }) => ({ value: id, label }))} className="min-h-11 w-full" /></div>
-          <TabsList aria-label="Account settings" className="hidden min-h-0 flex-1 flex-col items-stretch justify-start gap-1 overflow-y-auto rounded-none bg-transparent p-3 md:flex rail-scroll">
-            <span className="px-3 pb-2 pt-1 text-xs font-medium text-foreground-muted">Account</span>
-            {sections.filter(section => !["tokens", "admin"].includes(section.id)).map(navItem)}
-            <span className="px-3 pb-2 pt-5 text-xs font-medium text-foreground-muted">Connections</span>
-            {sections.filter(section => section.id === "tokens").map(navItem)}
-            {user?.is_admin && <><span className="px-3 pb-2 pt-5 text-xs font-medium text-foreground-muted">Workspace</span>{sections.filter(section => section.id === "admin").map(navItem)}</>}
+      <Tabs value={activeTab} onValueChange={tab => request({ type: "tab", tab: tab as TabId })} orientation="vertical" activationMode="manual" className="settings-studio-body">
+        <aside aria-label="Settings navigation" className="settings-studio-sidebar">
+          <div className="settings-mobile-navigation"><SelectMenu aria-label="Settings section" value={activeTab} disabled={busy} onValueChange={tab => request({ type: "tab", tab: tab as TabId })} options={sections.map(({ id, label }) => ({ value: id, label }))} className="min-h-11 w-full" contentClassName="settings-studio settings-studio-menu" /></div>
+          <TabsList aria-label="Account settings" className="settings-studio-navigation rail-scroll">
+            <span className="settings-nav-label">Personal</span>
+            {sections.filter(section => ["profile", "preferences", "notifications"].includes(section.id)).map(navItem)}
+            <span className="settings-nav-label">Access &amp; connections</span>
+            {sections.filter(section => ["security", "tokens"].includes(section.id)).map(navItem)}
+            {user?.is_admin && <><span className="settings-nav-label">Workspace</span>{sections.filter(section => section.id === "admin").map(navItem)}</>}
           </TabsList>
+          <div className="settings-sidebar-account">{verified && user ? <><UserAvatar user={user} size="md" /><div><p>{user.display_name || user.username}</p><span>@{user.username}</span></div></> : <Skeleton className="h-10 w-full" />}</div>
         </aside>
-        <div ref={content} data-slot="settings-content" className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain p-5 sm:p-7 rail-scroll">
+        <div ref={content} data-slot="settings-content" className="settings-studio-content rail-scroll">
           {busy && <p role="status" className="mb-4 text-sm text-foreground-muted">Saving changes… Keep settings open until this finishes.</p>}
           {accountError ? <Alert variant="destructive">Could not load your account settings. <Button variant="outline" size="sm" disabled={checking} onClick={() => void loadAccount()}>Retry</Button></Alert> : !verified ? <SettingsLoading /> : null}
           {/* Profile's operation owner stays active during proof; only its UI is

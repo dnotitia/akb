@@ -3,6 +3,7 @@ import { Link, matchPath, useLocation, useNavigate, type LinkProps } from "react
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { InlineLoadingState } from "@/components/ui/loading-state";
 import { ErrorBoundary } from "@/components/error-boundary";
+import { Skeleton } from "@/components/ui/skeleton";
 
 const SettingsDialog = lazy(() => import("@/pages/settings/settings-dialog"));
 type SettingsControls = {
@@ -45,11 +46,11 @@ export function SettingsDialogProvider({ children, identity }: { children: React
   return <SettingsContext.Provider value={controls}>
     {children}
     {request && request.identity === identity && <ErrorBoundary resetKeys={[request.path]}>
-      <Suspense fallback={<Dialog open onOpenChange={open => { if (!open) dismiss(); }}><DialogContent onCloseAutoFocus={event => {
+      <Suspense fallback={<Dialog open onOpenChange={open => { if (!open) dismiss(); }}><DialogContent className="settings-studio settings-studio-dialog" overlayProps={{ className: "settings-studio-overlay" }} onCloseAutoFocus={event => {
         event.preventDefault();
         // A lazy handoff is not a dismissal: the real dialog owns focus now.
         if (currentRequest.current === null) restoreFocus();
-      }}><DialogTitle>Settings</DialogTitle><DialogDescription className="sr-only">Loading your account settings.</DialogDescription><InlineLoadingState label="Loading settings" /></DialogContent></Dialog>}>
+      }}><header className="settings-studio-header"><div className="settings-studio-brand"><DialogTitle>Settings</DialogTitle></div></header><DialogDescription className="sr-only">Loading your account settings.</DialogDescription><div className="settings-studio-body"><div className="settings-studio-sidebar"><div className="hidden space-y-3 p-5 md:block">{[0, 1, 2, 3].map(row => <Skeleton key={row} className="h-9 w-full" />)}</div></div><div className="settings-studio-content"><InlineLoadingState label="Loading settings" /><Skeleton className="mt-6 h-28 w-full" /><Skeleton className="mt-5 h-52 w-full" /></div></div></DialogContent></Dialog>}>
         <SettingsDialog key={`${request.identity}:${request.routeKey}`} initialTab={request.section} onClose={dismiss} onNavigate={closeSettings} onRestoreFocus={restoreFocus} />
       </Suspense>
     </ErrorBoundary>}

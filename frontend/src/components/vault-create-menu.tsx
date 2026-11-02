@@ -3,7 +3,8 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { FilePlus, FolderPlus, Plus, Table2, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
-export function VaultCreateMenu({ triggerRef, onDocument, onTable, onUpload, onCollection }: {
+export function VaultCreateMenu({ triggerRef, onDocument, onTable, onUpload, onCollection, label }: {
+  label?: string;
   triggerRef: RefObject<HTMLButtonElement | null>;
   onDocument: () => void;
   onTable: () => void;
@@ -13,8 +14,9 @@ export function VaultCreateMenu({ triggerRef, onDocument, onTable, onUpload, onC
   const launching = useRef(false);
   return <DropdownMenu.Root modal={false} onOpenChange={open => { if (open) launching.current = false; }}>
     <DropdownMenu.Trigger asChild>
-      <Button ref={triggerRef} variant="outline" size="icon" className="h-9 w-9 shrink-0 text-link max-sm:h-11 max-sm:w-11 pointer-coarse:h-11 pointer-coarse:w-11" aria-label="New content" title="Add content">
+      <Button ref={triggerRef} variant="accent" size={label ? "sm" : "icon"} className={label ? "vault-overview-create h-9 shrink-0 gap-1.5 shadow-none max-sm:h-11 pointer-coarse:h-11" : "h-9 w-9 shrink-0 shadow-none max-sm:h-11 max-sm:w-11 pointer-coarse:h-11 pointer-coarse:w-11"} aria-label="New content" title="Add content">
         <Plus className="h-4 w-4" aria-hidden />
+        {label}
       </Button>
     </DropdownMenu.Trigger>
     <DropdownMenu.Portal>

@@ -7,6 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Alert } from "@/components/ui/alert";
 import { useFlashStatus } from "@/hooks/use-flash-status";
 import { ProfilePhotoEditor, useProfilePhotoEditor } from "./profile-photo-editor";
+import { SettingsHeading } from "./settings-ui";
 
 export type User = Pick<CurrentUser, "user_id" | "username" | "email" | "display_name" | "is_admin">
   & Partial<Pick<CurrentUser, "auth_method" | "key_class" | "account_kind" | "avatar" | "profile_capabilities">>;
@@ -181,20 +182,19 @@ export function ProfileSection({
   }
 
   return (
-    <Activity mode={visible ? "visible" : "hidden"}><div className="@container/profile min-w-0 space-y-8">
+    <Activity mode={visible ? "visible" : "hidden"}><div className="@container/profile settings-profile">
       <section aria-labelledby="profile-heading">
-        <header className="border-b border-border pb-4">
-          <h2 id="profile-heading" className="text-base font-semibold text-foreground">Profile</h2>
-          <p className="mt-1 text-sm text-foreground-muted">Your display name and AKB account identity.</p>
-        </header>
+        <SettingsHeading id="profile-heading" title="Profile" description="The details people see when you share and collaborate." />
 
         <div data-testid="profile-identity"><ProfilePhotoEditor editor={photo} /></div>
-        <form onSubmit={handleSaveProfile} aria-busy={profileBusy || undefined}>
-          <div className="space-y-4">
-            <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
-              <span className="text-sm font-medium @min-[28rem]/profile:pt-2">Username</span>
+        <form onSubmit={handleSaveProfile} className="settings-group" aria-busy={profileBusy || undefined}>
+          <header className="settings-group-heading"><h3>Account details</h3><p>Your identity across your workspace.</p></header>
+          <div className="settings-form-body">
+          <div className="settings-fields">
+            <div className="settings-field">
+              <span className="settings-field-label">Username</span>
               <div>
-                <p className="min-h-10 break-all rounded-[var(--radius-md)] border border-border bg-surface-2 px-3 py-2 text-sm text-foreground">
+                <p className="settings-readonly-value">
                   @{user.username}
                 </p>
                 <p className="mt-1.5 text-xs leading-relaxed text-foreground-muted">
@@ -202,8 +202,8 @@ export function ProfileSection({
                 </p>
               </div>
             </div>
-            <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
-              <Label htmlFor="profile-display-name" className="@min-[28rem]/profile:pt-3">Display name</Label>
+            <div className="settings-field">
+              <Label htmlFor="profile-display-name" className="settings-field-label">Display name</Label>
               <div>
                 <Input
                   id="profile-display-name"
@@ -220,8 +220,8 @@ export function ProfileSection({
                 </p>
               </div>
             </div>
-            <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
-              <Label htmlFor="profile-email" className="@min-[28rem]/profile:pt-3">Email address</Label>
+            <div className="settings-field">
+              <Label htmlFor="profile-email" className="settings-field-label">Email address</Label>
               <Input
                 id="profile-email"
                 type="email"
@@ -235,7 +235,7 @@ export function ProfileSection({
           </div>
 
           {localProfileEditingEnabled ? (
-            <div className="mt-4 flex flex-wrap items-center gap-3 @min-[28rem]/profile:pl-40">
+            <div className="settings-form-actions">
               <Button type="submit" loading={profileBusy} disabled={!profileDirty || profileBusy || photo.busy}>
                 Save profile
               </Button>
@@ -260,18 +260,20 @@ export function ProfileSection({
               Profile details are managed by your identity provider.
             </Alert>
           )}
+          </div>
         </form>
       </section>
 
       {localPasswordEnabled ? (
-        <section aria-labelledby="change-pw-heading">
-          <header className="border-b border-border pb-4">
-            <h2 id="change-pw-heading" className="text-base font-semibold text-foreground">Change password</h2>
+        <section aria-labelledby="change-pw-heading" className="settings-group">
+          <header className="settings-group-heading">
+            <h3 id="change-pw-heading">Change password</h3>
+            <p>Use a password you don't use for another account.</p>
           </header>
-          <form onSubmit={handleChangePassword} className="pt-5" aria-busy={pwBusy || undefined}>
+          <form onSubmit={handleChangePassword} className="settings-form-body" aria-busy={pwBusy || undefined}>
             <div className="space-y-4">
-              <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
-                <Label htmlFor="pw-current" className="@min-[28rem]/profile:pt-3">Current password</Label>
+              <div className="settings-field">
+                <Label htmlFor="pw-current" className="settings-field-label">Current password</Label>
                 <Input
                   id="pw-current"
                   ref={currentPasswordInput}
@@ -285,8 +287,8 @@ export function ProfileSection({
                   disabled={pwBusy}
                 />
               </div>
-              <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
-                <Label htmlFor="pw-new" className="@min-[28rem]/profile:pt-3">New password</Label>
+              <div className="settings-field">
+                <Label htmlFor="pw-new" className="settings-field-label">New password</Label>
                 <div className="min-w-0">
                   <Input
                     id="pw-new"
@@ -305,8 +307,8 @@ export function ProfileSection({
                   </p>
                 </div>
               </div>
-              <div className="grid min-w-0 gap-2 @min-[28rem]/profile:grid-cols-[9rem_minmax(0,1fr)] @min-[28rem]/profile:gap-4">
-                <Label htmlFor="pw-confirm" className="leading-5 @min-[28rem]/profile:pt-2.5">Confirm new password</Label>
+              <div className="settings-field">
+                <Label htmlFor="pw-confirm" className="settings-field-label">Confirm new password</Label>
                 <div className="min-w-0">
                   <Input
                     id="pw-confirm"
@@ -338,7 +340,7 @@ export function ProfileSection({
                 {passwordFlash.message}
               </p>
             )}
-            <div className="mt-4 flex flex-wrap items-center gap-3 @min-[28rem]/profile:pl-40">
+            <div className="settings-form-actions">
               <Button type="submit" loading={pwBusy} disabled={pwSubmitDisabled} aria-disabled={pwSubmitDisabled}>
                 Change password
               </Button>
@@ -350,11 +352,12 @@ export function ProfileSection({
           </form>
         </section>
       ) : (
-        <section aria-labelledby="managed-access-heading">
-          <header className="border-b border-border pb-3">
-            <h2 id="managed-access-heading" className="text-base font-semibold text-foreground">Managed access</h2>
+        <section aria-labelledby="managed-access-heading" className="settings-group">
+          <header className="settings-group-heading">
+            <h3 id="managed-access-heading">Managed access</h3>
+            <p>Your organization manages sign-in for this account.</p>
           </header>
-          <div className="max-w-xl pt-2">
+          <div className="settings-form-body">
             <dl className="divide-y divide-border">
               <div className="flex items-center justify-between gap-4 py-3 text-sm">
                 <dt className="text-foreground-muted">Sign-in method</dt>

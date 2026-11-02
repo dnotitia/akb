@@ -14,6 +14,7 @@ import { ConnectionSetup } from "@/components/connection-setup";
 
 import { LoadingState, InlineLoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
+import { SettingsHeading } from "./settings-ui";
 
 export type PAT = PatMetadata;
 interface Props {
@@ -67,9 +68,9 @@ export function TokensSection({ pats, patsError, patsLoading = false, mcpOauthEn
     } finally { revokePending.current = false; setRevoking(false); }
   }
   return <>
-    <div className="space-y-8">
+    <div className="settings-connections space-y-7">
       {notice && <Alert variant="warning">{notice}</Alert>}
-      <section aria-labelledby="connection-heading"><header className="mb-5"><h2 id="connection-heading" className="text-base font-semibold">Connect an agent</h2><p className="mt-1 text-sm text-foreground-muted">Choose your tool. Follow the three steps below.</p></header>
+      <section aria-labelledby="connection-heading"><SettingsHeading id="connection-heading" title="Agent connections" description="Give your tools access to the knowledge they need." />
         <div id="setup-guide-body"><ConnectionSetup ownsOperation={ownsOperation} layout="settings" mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onReloadPats} onDirtyChange={setSetupDirty} onBusyChange={setSetupBusy} invalidatedTokenId={invalidatedTokenId} /></div>
       </section>
       <section aria-labelledby="tokens-heading" aria-busy={patsLoading}><header className="mb-3 flex items-start justify-between gap-4 border-b border-border pb-3"><div><h2 id="tokens-heading" className="text-base font-semibold">Saved tokens</h2><p className="mt-1 text-sm text-foreground-muted">Manage access separately from setup. Last use is not a live connection status.</p></div><Badge variant="default">{visiblePats?.length ?? "··"}</Badge></header>
@@ -91,8 +92,8 @@ export function TokensSection({ pats, patsError, patsLoading = false, mcpOauthEn
         })}</div>}
       </section>
     </div>
-    <Dialog open={replacement !== null} onOpenChange={open => { if (!open) requestCloseReplacement(); }}><DialogContent hidden={!visible} className="max-h-[90dvh] max-w-3xl overflow-y-auto"><DialogHeader><DialogTitle>Replace token {replacement?.token.name}</DialogTitle><DialogDescription>Review expiration, permissions and Vault write restrictions before creating a replacement. The original is retained.</DialogDescription></DialogHeader>
-      {replacement && <ConnectionSetup ownsOperation={ownsOperation} key={replacement.token.token_id} mcpOauthEnabled={false} initialDraft={replacement.draft} replacement onTokenCreated={onReloadPats} onDirtyChange={setReplacementDirty} onBusyChange={setReplacementBusy} invalidatedTokenId={invalidatedTokenId} onReceipt={() => setReplacementCreated(true)} />}
+    <Dialog open={replacement !== null} onOpenChange={open => { if (!open) requestCloseReplacement(); }}><DialogContent hidden={!visible} className="settings-studio max-h-[90dvh] max-w-3xl overflow-y-auto"><DialogHeader><DialogTitle>Replace token {replacement?.token.name}</DialogTitle><DialogDescription>Review expiration, permissions and Vault write restrictions before creating a replacement. The original is retained.</DialogDescription></DialogHeader>
+      {replacement && <ConnectionSetup ownsOperation={ownsOperation} layout="settings" key={replacement.token.token_id} mcpOauthEnabled={false} initialDraft={replacement.draft} replacement onTokenCreated={onReloadPats} onDirtyChange={setReplacementDirty} onBusyChange={setReplacementBusy} invalidatedTokenId={invalidatedTokenId} onReceipt={() => setReplacementCreated(true)} />}
       {replacementCreated && <Alert variant="info">{originalRevoked ? "The original token was revoked. Keep the replacement secret somewhere private." : "Both tokens now exist. Update your agents, save the replacement, then explicitly revoke the original."}</Alert>}
       <DialogFooter><Button variant="outline" disabled={replacementBusy || revoking} onClick={requestCloseReplacement}>Close replacement</Button>{replacementCreated && !originalRevoked && replacement && <Button variant="destructive" disabled={replacementBusy || revoking} onClick={() => setPendingRevoke({ token: replacement.token, snapshot: replacement.snapshot })}>Revoke original token</Button>}</DialogFooter>
     </DialogContent></Dialog>

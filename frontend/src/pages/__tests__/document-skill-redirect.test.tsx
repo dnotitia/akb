@@ -88,7 +88,7 @@ describe("canonical vault-guide routing", () => {
   it("keeps the plain guide URL on the shared reader", async () => {
     renderAt(`/vault/v/doc/${encodeURIComponent(VAULT_SKILL_PATH)}`);
     await waitFor(() =>
-      expect(screen.getByRole("link", { name: "Edit guide" })).toHaveAttribute("href", "/vault/v/settings?edit=guide#skill"),
+      expect(screen.getByRole("button", { name: "Edit guide" })).toBeVisible(),
     );
     expect(screen.getByRole("heading", { level: 1, name: "Vault guide" })).toBeInTheDocument();
     expect(screen.getByTestId("location")).toHaveTextContent("/vault/v/doc/overview%2Fvault-skill.md");

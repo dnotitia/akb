@@ -6,8 +6,8 @@ import { TonalIcon, type TonalIconTone } from "@/components/ui/tonal-icon";
 /**
  * Compact route identity for Vault workspaces. Unlike a marketing-style page
  * masthead, this keeps the H1, current resource, state, and actions in one row.
- * Overview can remove the default card surface so the identity sits above the
- * first data panel; operational workspaces may retain the bounded tool-row form.
+ * Page identities share the Vault title and icon scale; embedded tools can
+ * retain the bounded tool-row form.
  */
 export function WorkspacePageHeader({
   icon: Icon,
@@ -16,6 +16,9 @@ export function WorkspacePageHeader({
   meta,
   actions,
   iconTone = "neutral",
+  variant = "tool",
+  titleId,
+  testId,
   className,
 }: {
   icon: LucideIcon;
@@ -24,22 +27,42 @@ export function WorkspacePageHeader({
   meta?: ReactNode;
   actions?: ReactNode;
   iconTone?: TonalIconTone;
+  variant?: "tool" | "page";
+  titleId?: string;
+  testId?: string;
   className?: string;
 }) {
   return (
     <header
+      data-slot="workspace-page-header"
+      data-testid={testId}
       className={cn(
-        "flex min-h-14 flex-wrap items-center justify-between gap-3 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2.5 shadow-xs",
+        "flex min-w-0 flex-wrap items-center justify-between gap-3",
+        variant === "page"
+          ? "mb-4 border-b border-border pb-3"
+          : "min-h-14 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2.5 shadow-xs",
         className,
       )}
     >
-      <div className="flex min-w-0 items-center gap-3">
-        <TonalIcon tone={iconTone}>
-          <Icon className="h-4 w-4" />
-        </TonalIcon>
+      <div className="flex min-w-0 items-center gap-2.5">
+        {variant === "page" ? (
+          <span className="workspace-route-mark"><Icon aria-hidden /></span>
+        ) : (
+          <TonalIcon tone={iconTone}>
+            <Icon className="h-4 w-4" aria-hidden />
+          </TonalIcon>
+        )}
         <div className="min-w-0">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <h1 className="truncate font-display text-base font-semibold tracking-tight text-foreground">
+            <h1
+              id={titleId}
+              className={cn(
+                "min-w-0 font-display text-foreground",
+                variant === "page"
+                  ? "workspace-route-title break-words [overflow-wrap:anywhere]"
+                  : "truncate text-base font-semibold tracking-tight",
+              )}
+            >
               {title}
             </h1>
             {meta}

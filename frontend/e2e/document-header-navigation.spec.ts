@@ -9,7 +9,7 @@ const title = "Reading decisions for a shared workspace";
 const destinations = [
   ["Overview", "/vault/fixture"],
   ["Graph", "/vault/fixture/graph"],
-  ["Public links", "/vault/fixture/publications"],
+  ["Publications", "/vault/fixture/publications"],
   ["Members", "/vault/fixture/members"],
   ["Settings", "/vault/fixture/settings"],
 ] as const;
@@ -299,7 +299,7 @@ for (const width of [375, 1440]) test(`header navigation waits for an active ima
 });
 
 for (const width of [375, 1440]) for (const aggregate of [false, true]) {
-  test(`Vault breadcrumb protects ${aggregate ? "all settings drafts" : "the description draft"} while local history remains usable at ${width}px`, async ({ page }) => {
+  test(`Vault breadcrumb protects ${aggregate ? "description and access drafts" : "the description draft"} while local history remains usable at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
     await fixture(page);
     const mutations: string[] = [];
@@ -312,9 +312,8 @@ for (const width of [375, 1440]) for (const aggregate of [false, true]) {
     await vaultBreadcrumb(page).click();
     await page.getByRole("navigation", { name: "Vault pages", exact: true }).getByRole("link", { name: "Settings", exact: true }).click();
     const trigger = aggregate ? page.getByRole("link", { name: "Back to vault fixture", exact: true }) : vaultBreadcrumb(page);
-    const description = page.getByRole("textbox", { name: "Description", exact: true });
+    const description = page.getByRole("textbox", { name: "Description", exact: true, includeHidden: true });
     const draft = "An unsaved description stays here until I choose to leave.";
-    const guideDraft = "# Unsaved guide\n\nKeep this guide with the other settings drafts.";
     await expect(description).toHaveValue("Shared reading decisions.");
     await description.fill(draft);
     await page.evaluate(() => { location.hash = "access"; });
@@ -322,8 +321,7 @@ for (const width of [375, 1440]) for (const aggregate of [false, true]) {
     if (aggregate) {
       await page.getByRole("radio", { name: "Everyone can view", exact: true }).click();
       await page.evaluate(() => { location.hash = "skill"; });
-      await page.getByRole("button", { name: "Edit guide", exact: true }).click();
-      await page.getByRole("textbox", { name: "Vault guide body", exact: true }).fill(guideDraft);
+      await expect(page.getByRole("tabpanel", { name: "Vault guide", exact: true })).toBeVisible();
       await page.goBack();
       await expect(page).toHaveURL(/\/settings#access$/);
     }
@@ -333,9 +331,9 @@ for (const width of [375, 1440]) for (const aggregate of [false, true]) {
     await expect(page.getByRole("dialog")).toHaveCount(0);
     if (aggregate) {
       await page.goForward();
-      await expect(page.getByRole("radio", { name: "Everyone can view", exact: true })).toBeChecked();
+      await expect(page.getByRole("radio", { name: "Everyone can view", exact: true, includeHidden: true })).toBeChecked();
       await page.goForward();
-      await expect(page.getByRole("textbox", { name: "Vault guide body", exact: true })).toHaveValue(guideDraft);
+      await expect(page.getByRole("tabpanel", { name: "Vault guide", exact: true })).toBeVisible();
       await expect(page.getByRole("dialog")).toHaveCount(0);
     }
     await trigger.click();
@@ -347,12 +345,12 @@ for (const width of [375, 1440]) for (const aggregate of [false, true]) {
     await confirmation.getByRole("button", { name: "Keep editing", exact: true }).click();
     await expect(trigger).toBeFocused();
     if (aggregate) {
-      await expect(page.getByRole("textbox", { name: "Vault guide body", exact: true })).toHaveValue(guideDraft);
+      await expect(page.getByRole("tabpanel", { name: "Vault guide", exact: true })).toBeVisible();
     }
     await expect(description).toHaveValue(draft);
     if (aggregate) {
-      await expect(page.getByRole("radio", { name: "Everyone can view", exact: true })).toBeChecked();
-      await expect(page.getByRole("textbox", { name: "Vault guide body", exact: true })).toHaveValue(guideDraft);
+      await expect(page.getByRole("radio", { name: "Everyone can view", exact: true, includeHidden: true })).toBeChecked();
+      await expect(page.getByRole("tabpanel", { name: "Vault guide", exact: true })).toBeVisible();
     }
     await expect(page.getByRole("dialog")).toHaveCount(0);
     await trigger.click();
@@ -369,3 +367,27 @@ for (const width of [375, 1440]) for (const aggregate of [false, true]) {
     expect(mutations).toEqual([]);
   });
 }
+
+
+for (const width of [375, 1440]) test(`Guide preview protects a dirty body on browser Back and restores its local draft at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  await fixture(page);
+  await page.goto("/vault/fixture/settings#skill");
+  await page.getByRole("button", { name: "Edit guide", exact: true }).click();
+  const reader = page.getByRole("dialog", { name: "Document preview", exact: true });
+  const body = reader.getByRole("textbox", { name: "Vault guide body", exact: true });
+  const draft = "Guide draft preserved through browser Back.";
+  await body.fill(draft);
+  await expect(reader.getByRole("button", { name: "Save changes", exact: true })).toBeEnabled();
+  await page.goBack();
+  const leave = page.getByRole("dialog", { name: "Leave this document?", exact: true });
+  await expect(leave).toBeVisible();
+  await leave.getByRole("button", { name: "Keep editing", exact: true }).click();
+  await expect(body).toContainText(draft);
+  await expect(page).toHaveURL(/\?view=edit$/);
+  await reader.getByRole("button", { name: "Close dialog", exact: true }).click();
+  await leave.getByRole("button", { name: "Leave document", exact: true }).click();
+  await expect(page).toHaveURL(/\/vault\/fixture\/settings#skill$/);
+  await page.getByRole("button", { name: "Edit guide", exact: true }).click();
+  await expect(body).toContainText(draft);
+});

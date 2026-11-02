@@ -27,6 +27,7 @@ import SearchPage from "@/pages/search";
 import SettingsPage from "@/pages/settings";
 import NotificationsPage from "@/pages/notifications";
 import PublicationsPage from "@/pages/publications";
+import PublicLinksPage from "@/pages/public-links";
 import PublicationPage from "@/pages/public-publication";
 import VaultMembersPage from "@/pages/vault-members";
 import VaultSettingsPage from "@/pages/vault-settings";
@@ -64,6 +65,7 @@ const routeComponents = {
   FilePage,
   GraphPage,
   PublicationsPage,
+  PublicLinksPage,
   VaultMembersPage,
   VaultSettingsPage,
   VaultActivityPage,

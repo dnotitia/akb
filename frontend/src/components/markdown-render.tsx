@@ -42,6 +42,8 @@ export interface MarkdownRenderProps {
   headingLevelOffset?: number;
   leadingMetadata?: ReactNode;
   fallbackTitle?: string;
+  /** Named read-only document surface for embedded previews. */
+  contentLabel?: string;
 }
 
 export function MarkdownRender({
@@ -53,6 +55,7 @@ export function MarkdownRender({
   headingLevelOffset = 1,
   leadingMetadata,
   fallbackTitle,
+  contentLabel,
 }: MarkdownRenderProps) {
   const body = useMemo(() => stripFrontmatter(markdown || ""), [markdown]);
   const authenticated =
@@ -109,6 +112,7 @@ export function MarkdownRender({
     <MarkdownLocaleProvider locale="en">
       <MarkdownViewer
         markdown={body}
+        contentAttributes={contentLabel ? { role: "document", "aria-label": contentLabel } : undefined}
         afterLeadingHeading={adornment}
         className={cn(
           "akb-md min-w-0 text-[15px] text-foreground prose dark:prose-invert !max-w-none",

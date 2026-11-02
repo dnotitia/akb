@@ -25,7 +25,7 @@ describe("App page location", () => {
 
   it.each([
     ["", "Overview"], ["/members", "Members"], ["/settings", "Settings"],
-    ["/publications", "Public links"], ["/graph", "Graph"], ["/search", "Search"],
+    ["/publications", "Publications"], ["/graph", "Graph"], ["/search", "Search"],
     ["/activity", "Activity"], ["/doc/new", "New document"],
     ["/doc/d-12345678", "Document"], ["/table/data", "Table"], ["/file/uuid", "File"],
   ])("keeps named Vault section %s in the top location trail", (tail, label) => {
