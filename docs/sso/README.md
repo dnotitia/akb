@@ -282,4 +282,7 @@ Email and username never select the target account.
 - [Keycloak Admin REST API: identity-provider instances](https://www.keycloak.org/docs-api/latest/rest-api/index.html#_identity_providers)
 
 Provider ownership and short-lived controller grants are documented in
-[operation authority](operation-authority.md).
+[operation authority](operation-authority.md), including operation requests: an
+administrator service key proposes an ownership claim or a provider operation,
+a human approves the exact request in `/admin`, and only the requesting token
+collects the credential, sealed to its own key.

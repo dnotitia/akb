@@ -11,6 +11,8 @@ import {
   getAdminRealmAccountResidue,
   getAdminSession,
   getAdminSsoCatalog,
+  getAdminSsoOperationRequests,
+  getAdminSsoOwnership,
   setAdminSsoProviderEnabled,
   setToken,
 } from "@/lib/api";
@@ -27,6 +29,8 @@ vi.mock("@/lib/api", async () => {
     adminLogout: vi.fn(),
     getAdminSsoCatalog: vi.fn(),
     getAdminRealmAccountResidue: vi.fn(),
+    getAdminSsoOwnership: vi.fn(),
+    getAdminSsoOperationRequests: vi.fn(),
     configureAdminSsoProvider: vi.fn(),
     setAdminSsoProviderEnabled: vi.fn(),
     setToken: vi.fn(),
@@ -100,6 +104,19 @@ function renderPage(initialEntry = "/admin") {
 
 beforeEach(() => {
   vi.mocked(getAdminSession).mockResolvedValue(null);
+  // An unowned provider and no operation request: the standalone defaults.
+  vi.mocked(getAdminSsoOwnership).mockImplementation(async (alias) => ({
+    schema_version: 1,
+    target_id: "00000000-0000-4000-8000-000000000001",
+    provider_alias: alias,
+    owner_id: null,
+    revision: 0,
+    fingerprint: "0".repeat(64),
+    provider_secret_revision: null,
+    drifted: false,
+    emergency_disabled: false,
+  }));
+  vi.mocked(getAdminSsoOperationRequests).mockResolvedValue([]);
   vi.mocked(getAdminSsoCatalog).mockResolvedValue(directCatalog);
   vi.mocked(getAdminRealmAccountResidue).mockResolvedValue({
     schema_version: 1,

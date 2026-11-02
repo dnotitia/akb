@@ -11,6 +11,9 @@ import { Panel, PanelHeader } from "@/components/ui/panel";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { Logo } from "@/components/logo";
 import { RealmAccountResidue } from "@/components/admin-realm-account-residue";
+import { SsoOperationRequests } from "@/components/admin-sso-operation-requests";
+import { ProviderOwnershipDetails } from "@/components/admin-sso-ownership";
+import { ownershipQueryKey, useProviderOwnership } from "@/lib/admin-sso-queries";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -308,6 +311,7 @@ function SsoProviderControl() {
         ...(form.clientSecret ? { client_secret: form.clientSecret } : {}),
       });
       if (!mounted.current) return;
+      void queryClient.invalidateQueries({ queryKey: ownershipQueryKey(alias) });
       const refreshed = await catalogQuery.refetch();
       if (!mounted.current) return;
       if (revision === editRevision.current && generation === saveGeneration.current) {
@@ -349,6 +353,7 @@ function SsoProviderControl() {
       if (revision === editRevision.current && generation === toggleGeneration.current) {
         setNotice(`${updated.display_name} was ${updated.enabled ? "enabled" : "disabled"}.`);
       }
+      void queryClient.invalidateQueries({ queryKey: ownershipQueryKey(updated.alias) });
       await catalogQuery.refetch();
     } catch (caught) {
       if (mounted.current && revision === editRevision.current && generation === toggleGeneration.current) {
@@ -401,39 +406,20 @@ function SsoProviderControl() {
           <PanelHeader label="Configured providers" count={catalog.providers.length} />
           <div className="divide-y divide-border">
             {catalog.providers.map((provider) => (
-              <div key={provider.alias} className="p-4">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="font-medium">{provider.display_name}</p>
-                      {providerBadge(provider.state)}
-                    </div>
-                    <p className="coord mt-1">{provider.alias} · {provider.provider_type}</p>
-                    <p className="mt-2 break-all text-xs leading-5 text-foreground-muted">
-                      Redirect URI: {provider.redirect_uri}
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 gap-2">
-                    <Button type="button" size="sm" variant="outline" onClick={() => editProvider(provider)}>
-                      Edit
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant={provider.enabled ? "outline" : "default"}
-                      disabled={togglingAlias !== null || (provider.state === "configuration_error" && !provider.enabled)}
-                      loading={togglingAlias === provider.alias}
-                      onClick={() => toggleProvider(provider)}
-                    >
-                      {provider.enabled ? "Disable" : "Enable"}
-                    </Button>
-                  </div>
-                </div>
-              </div>
+              <ProviderRow
+                key={provider.alias}
+                provider={provider}
+                togglingAlias={togglingAlias}
+                onEdit={editProvider}
+                onToggle={toggleProvider}
+                onOwnershipChanged={(message) => { setError(""); setNotice(message); }}
+              />
             ))}
           </div>
         </Panel>
       )}
+
+      <SsoOperationRequests />
 
       <Panel inset={false} flush>
         <PanelHeader label="OIDC provider" />
@@ -509,6 +495,68 @@ function SsoProviderControl() {
           </div>
         </form>
       </Panel>
+    </div>
+  );
+}
+
+function ProviderRow({
+  provider,
+  togglingAlias,
+  onEdit,
+  onToggle,
+  onOwnershipChanged,
+}: {
+  provider: AdminSsoProvider;
+  togglingAlias: string | null;
+  onEdit: (provider: AdminSsoProvider) => void;
+  onToggle: (provider: AdminSsoProvider) => void;
+  onOwnershipChanged: (message: string) => void;
+}) {
+  const ownershipQuery = useProviderOwnership(provider.alias);
+  // Until ownership is known the ordinary controls stay; the server refuses
+  // ordinary writes to an owned provider either way.
+  const owned = ownershipQuery.data?.owner_id != null && !ownershipQuery.isError;
+  const toggle = (
+    <Button
+      type="button"
+      size="sm"
+      variant={provider.enabled ? "outline" : "default"}
+      disabled={togglingAlias !== null || (provider.state === "configuration_error" && !provider.enabled)}
+      loading={togglingAlias === provider.alias}
+      onClick={() => onToggle(provider)}
+    >
+      {provider.enabled ? "Disable" : "Enable"}
+    </Button>
+  );
+  return (
+    <div className="p-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="font-medium">{provider.display_name}</p>
+            {providerBadge(provider.state)}
+          </div>
+          <p className="coord mt-1">{provider.alias} · {provider.provider_type}</p>
+          <p className="mt-2 break-all text-xs leading-5 text-foreground-muted">
+            Redirect URI: {provider.redirect_uri}
+          </p>
+          <ProviderOwnershipDetails alias={provider.alias} query={ownershipQuery} onChanged={onOwnershipChanged} />
+        </div>
+        {owned ? (
+          <div className="flex shrink-0 flex-col gap-2 sm:items-end">
+            <Badge variant="info">Managed by an external owner</Badge>
+            {/* A human emergency disable of an owned provider stays available. */}
+            {provider.enabled && toggle}
+          </div>
+        ) : (
+          <div className="flex shrink-0 gap-2">
+            <Button type="button" size="sm" variant="outline" onClick={() => onEdit(provider)}>
+              Edit
+            </Button>
+            {toggle}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

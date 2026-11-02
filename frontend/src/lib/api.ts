@@ -1107,6 +1107,393 @@ export async function getAdminRealmAccountResidue(): Promise<AdminRealmAccountRe
   return parseAdminRealmAccountResidue(await response.json());
 }
 
+// ── Provider ownership and operation requests (product admin) ──
+
+/** Who owns a provider alias, and what the screen must echo to change it. */
+export interface AdminSsoOwnership {
+  schema_version: 1;
+  target_id: string;
+  provider_alias: string;
+  owner_id: string | null;
+  revision: number;
+  fingerprint: string;
+  provider_secret_revision: string | null;
+  drifted: boolean;
+  emergency_disabled: boolean;
+}
+
+const OWNERSHIP_KEYS = [
+  "schema_version", "target_id", "provider_alias", "owner_id", "revision", "fingerprint",
+  "provider_secret_revision", "drifted", "emergency_disabled",
+] as const;
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const PROVIDER_ALIAS_PATTERN = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+
+function isNullableText(value: unknown, max: number): value is string | null {
+  return value === null || isBoundedText(value, max);
+}
+
+export function parseAdminSsoOwnership(value: unknown): AdminSsoOwnership {
+  const root = record(value);
+  if (
+    !hasExactKeys(root, OWNERSHIP_KEYS) ||
+    root.schema_version !== 1 ||
+    typeof root.target_id !== "string" || !UUID_PATTERN.test(root.target_id) ||
+    typeof root.provider_alias !== "string" || !PROVIDER_ALIAS_PATTERN.test(root.provider_alias) ||
+    !isNullableText(root.owner_id, 255) ||
+    !isCount(root.revision, Number.MAX_SAFE_INTEGER) ||
+    typeof root.fingerprint !== "string" || !SHA256_PATTERN.test(root.fingerprint) ||
+    !isNullableText(root.provider_secret_revision, 255) ||
+    typeof root.drifted !== "boolean" ||
+    typeof root.emergency_disabled !== "boolean"
+  ) {
+    throw new Error("Invalid SSO provider ownership response");
+  }
+  return {
+    schema_version: 1,
+    target_id: root.target_id,
+    provider_alias: root.provider_alias,
+    owner_id: root.owner_id,
+    revision: root.revision,
+    fingerprint: root.fingerprint,
+    provider_secret_revision: root.provider_secret_revision,
+    drifted: root.drifted,
+    emergency_disabled: root.emergency_disabled,
+  };
+}
+
+export async function getAdminSsoOwnership(alias: string): Promise<AdminSsoOwnership> {
+  const response = await fetch(`${API_BASE}/admin/sso/providers/${encodeURIComponent(alias)}/ownership`, {
+    credentials: "same-origin",
+    headers: adminSsoHeaders(),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSsoOwnership(await response.json());
+}
+
+/** A compare-and-set on exactly the revision and fingerprint the screen showed. */
+export interface AdminSsoOwnershipChange {
+  owner_id: string | null;
+  expected_revision: number;
+  expected_fingerprint: string;
+  clear_emergency: boolean;
+}
+
+export async function setAdminSsoOwnership(
+  alias: string,
+  input: AdminSsoOwnershipChange,
+): Promise<AdminSsoOwnership> {
+  const response = await fetch(`${API_BASE}/admin/sso/providers/${encodeURIComponent(alias)}/ownership`, {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: adminSsoHeaders({ mutation: true }),
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSsoOwnership(await response.json());
+}
+
+export type AdminSsoOperationRequestStatus =
+  | "pending" | "approved" | "denied" | "cancelled" | "expired" | "collected";
+export type AdminSsoProviderVerb = "configure" | "enable" | "disable";
+
+export interface AdminSsoConfigureSummary {
+  provider_type: string;
+  display_name: string;
+  issuer: string;
+  discovery_url: string;
+  client_id: string;
+  client_secret_supplied: boolean;
+}
+
+export interface AdminSsoOperationRequestDocument {
+  schema_version: 1;
+  request_id: string;
+  kind: "ownership_claim" | "provider_grant";
+  installation_id: string;
+  target_id: string;
+  provider_alias: string;
+  owner_id: string;
+  requested_by: string;
+  requested_token_id: string;
+  claim: { expected_revision: number; expected_fingerprint: string } | null;
+  grant: {
+    operation_id: string;
+    source: {
+      auth_mode: "local" | "sso";
+      issuer: string | null;
+      runtime_generation: number;
+      sso_session_epoch: string | null;
+      source_revision: string | null;
+    };
+    expected_provider_revision: number;
+    verbs: AdminSsoProviderVerb[];
+    provider_payload_sha256: Partial<Record<AdminSsoProviderVerb, string>>;
+    configure_summary: AdminSsoConfigureSummary | null;
+    ttl_seconds: number;
+    provider_secret_revision: string | null;
+    recipient_public_key: string;
+  } | null;
+}
+
+/**
+ * A secret-free operation request. The parser accepts exactly these keys, so a
+ * response that ever carried a credential would be refused, not rendered.
+ */
+export interface AdminSsoOperationRequest {
+  schema_version: 1;
+  request_id: string;
+  request_sha256: string;
+  request: AdminSsoOperationRequestDocument;
+  status: AdminSsoOperationRequestStatus;
+  created_at: string;
+  expires_at: string;
+  requester_username: string | null;
+  decided_by: string | null;
+  decider_username: string | null;
+  decided_at: string | null;
+  operation_expires_at: string | null;
+  closed_at: string | null;
+}
+
+const OPERATION_REQUEST_KEYS = [
+  "schema_version", "request_id", "request_sha256", "request", "status", "created_at", "expires_at",
+  "requester_username", "decided_by", "decider_username", "decided_at", "operation_expires_at", "closed_at",
+] as const;
+const OPERATION_REQUEST_DOCUMENT_KEYS = [
+  "schema_version", "request_id", "kind", "installation_id", "target_id", "provider_alias", "owner_id",
+  "requested_by", "requested_token_id", "claim", "grant",
+] as const;
+const OPERATION_GRANT_KEYS = [
+  "operation_id", "source", "expected_provider_revision", "verbs", "provider_payload_sha256",
+  "configure_summary", "ttl_seconds", "provider_secret_revision", "recipient_public_key",
+] as const;
+const CONFIGURE_SUMMARY_KEYS = [
+  "provider_type", "display_name", "issuer", "discovery_url", "client_id", "client_secret_supplied",
+] as const;
+const OPERATION_REQUEST_STATUSES: readonly AdminSsoOperationRequestStatus[] = [
+  "pending", "approved", "denied", "cancelled", "expired", "collected",
+];
+const PROVIDER_VERBS: readonly AdminSsoProviderVerb[] = ["configure", "enable", "disable"];
+const OPERATION_REQUEST_LIST_MAX = 100;
+
+function isUuid(value: unknown): value is string {
+  return typeof value === "string" && UUID_PATTERN.test(value);
+}
+
+function isNullableTimestamp(value: unknown): value is string | null {
+  return value === null || isTimestamp(value);
+}
+
+function parseConfigureSummary(value: unknown): AdminSsoConfigureSummary {
+  const summary = record(value);
+  if (
+    !hasExactKeys(summary, CONFIGURE_SUMMARY_KEYS) ||
+    !isBoundedText(summary.provider_type, 80) ||
+    !isBoundedText(summary.display_name, 80) ||
+    !isBoundedText(summary.issuer, 2048) ||
+    !isBoundedText(summary.discovery_url, 2048) ||
+    !isBoundedText(summary.client_id, 255) ||
+    typeof summary.client_secret_supplied !== "boolean" // pragma: allowlist secret
+  ) {
+    throw new Error("Invalid SSO operation request response");
+  }
+  return {
+    provider_type: summary.provider_type,
+    display_name: summary.display_name,
+    issuer: summary.issuer,
+    discovery_url: summary.discovery_url,
+    client_id: summary.client_id,
+    client_secret_supplied: summary.client_secret_supplied,
+  };
+}
+
+function parseOperationGrant(value: unknown): NonNullable<AdminSsoOperationRequestDocument["grant"]> {
+  const grant = record(value);
+  const source = record(grant?.source);
+  const hashes = record(grant?.provider_payload_sha256);
+  const verbs = grant?.verbs;
+  if (
+    !hasExactKeys(grant, OPERATION_GRANT_KEYS) ||
+    !hasExactKeys(source, ["auth_mode", "issuer", "runtime_generation", "sso_session_epoch", "source_revision"]) ||
+    (source.auth_mode !== "local" && source.auth_mode !== "sso") ||
+    !isNullableText(source.issuer, 2048) ||
+    !isCount(source.runtime_generation, Number.MAX_SAFE_INTEGER) ||
+    (source.sso_session_epoch !== null && !isUuid(source.sso_session_epoch)) ||
+    (source.source_revision !== null && (typeof source.source_revision !== "string" || !/^[a-f0-9]{40}$/.test(source.source_revision))) ||
+    !isUuid(grant.operation_id) ||
+    !isCount(grant.expected_provider_revision, Number.MAX_SAFE_INTEGER) ||
+    !Array.isArray(verbs) ||
+    verbs.length === 0 ||
+    verbs.some((verb) => !PROVIDER_VERBS.includes(verb as AdminSsoProviderVerb)) ||
+    new Set(verbs).size !== verbs.length ||
+    !hashes ||
+    Object.keys(hashes).sort().join() !== [...verbs].sort().join() ||
+    Object.values(hashes).some((hash) => typeof hash !== "string" || !SHA256_PATTERN.test(hash)) ||
+    !isCount(grant.ttl_seconds, 600) ||
+    grant.ttl_seconds < 1 ||
+    !isNullableText(grant.provider_secret_revision, 255) ||
+    typeof grant.recipient_public_key !== "string" ||
+    !/^[A-Za-z0-9_-]{43}$/.test(grant.recipient_public_key) ||
+    (verbs.includes("configure") !== (grant.configure_summary !== null))
+  ) {
+    throw new Error("Invalid SSO operation request response");
+  }
+  return {
+    operation_id: grant.operation_id,
+    source: {
+      auth_mode: source.auth_mode,
+      issuer: source.issuer,
+      runtime_generation: source.runtime_generation,
+      sso_session_epoch: source.sso_session_epoch as string | null,
+      source_revision: source.source_revision as string | null,
+    },
+    expected_provider_revision: grant.expected_provider_revision,
+    verbs: verbs as AdminSsoProviderVerb[],
+    provider_payload_sha256: hashes as Partial<Record<AdminSsoProviderVerb, string>>,
+    configure_summary: grant.configure_summary === null ? null : parseConfigureSummary(grant.configure_summary),
+    ttl_seconds: grant.ttl_seconds,
+    provider_secret_revision: grant.provider_secret_revision,
+    recipient_public_key: grant.recipient_public_key,
+  };
+}
+
+function parseOperationRequestDocument(value: unknown): AdminSsoOperationRequestDocument {
+  const document = record(value);
+  const claim = document?.claim === null ? null : record(document?.claim);
+  if (
+    !hasExactKeys(document, OPERATION_REQUEST_DOCUMENT_KEYS) ||
+    document.schema_version !== 1 ||
+    !isUuid(document.request_id) ||
+    (document.kind !== "ownership_claim" && document.kind !== "provider_grant") ||
+    !isUuid(document.installation_id) ||
+    !isUuid(document.target_id) ||
+    typeof document.provider_alias !== "string" || !PROVIDER_ALIAS_PATTERN.test(document.provider_alias) ||
+    !isBoundedText(document.owner_id, 255) ||
+    !isUuid(document.requested_by) ||
+    !isUuid(document.requested_token_id) ||
+    (document.kind === "ownership_claim") !== (claim !== null && document.grant === null) ||
+    (claim !== null && (
+      !hasExactKeys(claim, ["expected_revision", "expected_fingerprint"]) ||
+      !isCount(claim.expected_revision, Number.MAX_SAFE_INTEGER) ||
+      typeof claim.expected_fingerprint !== "string" || !SHA256_PATTERN.test(claim.expected_fingerprint)
+    ))
+  ) {
+    throw new Error("Invalid SSO operation request response");
+  }
+  return {
+    schema_version: 1,
+    request_id: document.request_id,
+    kind: document.kind,
+    installation_id: document.installation_id,
+    target_id: document.target_id,
+    provider_alias: document.provider_alias,
+    owner_id: document.owner_id,
+    requested_by: document.requested_by,
+    requested_token_id: document.requested_token_id,
+    claim: claim === null ? null : {
+      expected_revision: claim.expected_revision as number,
+      expected_fingerprint: claim.expected_fingerprint as string,
+    },
+    grant: document.kind === "provider_grant" ? parseOperationGrant(document.grant) : null,
+  };
+}
+
+export function parseAdminSsoOperationRequest(value: unknown): AdminSsoOperationRequest {
+  const root = record(value);
+  if (
+    !hasExactKeys(root, OPERATION_REQUEST_KEYS) ||
+    root.schema_version !== 1 ||
+    !isUuid(root.request_id) ||
+    typeof root.request_sha256 !== "string" || !SHA256_PATTERN.test(root.request_sha256) ||
+    !OPERATION_REQUEST_STATUSES.includes(root.status as AdminSsoOperationRequestStatus) ||
+    !isTimestamp(root.created_at) ||
+    !isTimestamp(root.expires_at) ||
+    !isNullableText(root.requester_username, 255) ||
+    (root.decided_by !== null && !isUuid(root.decided_by)) ||
+    !isNullableText(root.decider_username, 255) ||
+    !isNullableTimestamp(root.decided_at) ||
+    !isNullableTimestamp(root.operation_expires_at) ||
+    !isNullableTimestamp(root.closed_at) ||
+    ((root.status === "approved" || root.status === "denied" || root.status === "collected") &&
+      (root.decided_by === null || root.decided_at === null))
+  ) {
+    throw new Error("Invalid SSO operation request response");
+  }
+  const request = parseOperationRequestDocument(root.request);
+  if (request.request_id !== root.request_id) {
+    throw new Error("Invalid SSO operation request response");
+  }
+  return {
+    schema_version: 1,
+    request_id: root.request_id,
+    request_sha256: root.request_sha256,
+    request,
+    status: root.status as AdminSsoOperationRequestStatus,
+    created_at: root.created_at,
+    expires_at: root.expires_at,
+    requester_username: root.requester_username,
+    decided_by: root.decided_by as string | null,
+    decider_username: root.decider_username,
+    decided_at: root.decided_at,
+    operation_expires_at: root.operation_expires_at,
+    closed_at: root.closed_at,
+  };
+}
+
+export function parseAdminSsoOperationRequests(value: unknown): AdminSsoOperationRequest[] {
+  const root = record(value);
+  const values = root?.requests;
+  if (
+    !hasExactKeys(root, ["schema_version", "requests"]) ||
+    root.schema_version !== 1 ||
+    !Array.isArray(values) ||
+    values.length > OPERATION_REQUEST_LIST_MAX
+  ) {
+    throw new Error("Invalid SSO operation request list response");
+  }
+  const requests = values.map(parseAdminSsoOperationRequest);
+  if (new Set(requests.map((request) => request.request_id)).size !== requests.length) {
+    throw new Error("Invalid SSO operation request list response");
+  }
+  return requests;
+}
+
+export async function getAdminSsoOperationRequests(): Promise<AdminSsoOperationRequest[]> {
+  const response = await fetch(`${API_BASE}/admin/sso/operation-requests`, {
+    credentials: "same-origin",
+    headers: adminSsoHeaders(),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSsoOperationRequests(await response.json());
+}
+
+async function decideAdminSsoOperationRequest(
+  requestId: string,
+  decision: "approve" | "deny",
+  requestSha256: string,
+): Promise<AdminSsoOperationRequest> {
+  const response = await fetch(
+    `${API_BASE}/admin/sso/operation-requests/${encodeURIComponent(requestId)}/${decision}`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: adminSsoHeaders({ mutation: true }),
+      body: JSON.stringify({ expected_request_sha256: requestSha256 }),
+    },
+  );
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSsoOperationRequest(await response.json());
+}
+
+/** Approve exactly the request digest the screen showed. */
+export const approveAdminSsoOperationRequest = (requestId: string, requestSha256: string) =>
+  decideAdminSsoOperationRequest(requestId, "approve", requestSha256);
+
+/** Deny exactly the request digest the screen showed. */
+export const denyAdminSsoOperationRequest = (requestId: string, requestSha256: string) =>
+  decideAdminSsoOperationRequest(requestId, "deny", requestSha256);
+
 // ── Auth (ordinary browser session) ──
 export interface AvatarState {
   revision: string | null;
