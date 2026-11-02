@@ -47,6 +47,17 @@ def test_realms_are_distinct_and_upstream_client_is_code_pkce_only():
     assert client["serviceAccountsEnabled"] is False
     assert client["fullScopeAllowed"] is False
     assert client["attributes"]["pkce.code.challenge.method"] == "S256"
+    # The replacement client the rotation phase moves the enabled provider to
+    # has exactly the same confidential code + PKCE profile and callback.
+    replacement = next(
+        value
+        for value in upstream["clients"]
+        if value["clientId"] == "akb-broker-rotated"
+    )
+    assert {key: value for key, value in replacement.items() if key not in {"clientId", "name", "secret"}} == {
+        key: value for key, value in client.items() if key not in {"clientId", "name", "secret"}
+    }
+    assert replacement["secret"] != client["secret"]
     browser = next(
         value for value in broker["clients"] if value["clientId"] == "fixture-browser"
     )

@@ -164,6 +164,19 @@ def _same_provider_configuration(
     )
 
 
+def _without_client_credentials(representation: Mapping[str, object]) -> dict[str, object]:
+    """Return the raw representation minus the two fields a rotation changes."""
+    result = dict(representation)
+    config = result.get("config")
+    if isinstance(config, dict):
+        result["config"] = {
+            key: value
+            for key, value in config.items()
+            if key not in {"clientId", "clientSecret"}
+        }
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class KeycloakAdminConfig:
     internal_base_url: str
@@ -746,6 +759,87 @@ class KeycloakProviderControl:
         if not enabled and not (
             representation.get("enabled") is False
             and representation.get("hideOnLogin") is True
+        ):
+            raise _fail("keycloak_provider_readback_failed")
+        self._catalog = None
+        self._catalog_at = 0.0
+        self._catalog_error_code = None
+        self._catalog_error_at = 0.0
+        return ProviderMutationReadback(before=current, after=readback)
+
+    async def set_client_credentials(
+        self,
+        alias: str,
+        *,
+        client_id: str,
+        client_secret: str,
+        precondition: Callable[[ProviderReadback], None] | None = None,
+    ) -> ProviderMutationReadback:
+        """Change only ``clientId`` and ``clientSecret`` of a managed provider.
+
+        The provider may be enabled: the stored representation is read, the
+        two credential fields are replaced and everything else is written back
+        as read. Discovery is not re-imported, so issuer, endpoints, enabled
+        and hidden state, mappers and flows stay as they are. ``precondition``
+        sees the exact current readback before any write and may refuse it.
+
+        A readback that differs anywhere but in the two credential fields, or
+        that no longer reports a configured secret, is an error. Nothing is
+        rolled back automatically: a person inspects the provider instead.
+        """
+        self._require_direct()
+        try:
+            validated_alias = keycloak_oidc.validate_alias(alias)
+            validated_id, validated_secret = keycloak_oidc.validate_client_credentials(
+                client_id,
+                client_secret,
+            )
+        except ProviderDefinitionError as exc:
+            raise _fail(exc.code) from exc
+        async with self._client() as client:
+            token = await self._token(client)
+            representation = await self._get_exact(client, token, validated_alias)
+            if representation is None:
+                raise _fail("provider_not_found")
+            definition = self._definition_for_representation(representation)
+            if definition is None:
+                raise _fail("provider_alias_conflict")
+            current = self._readback(definition, representation)
+            if current.state == "configuration_error":
+                raise _fail("provider_configuration_invalid")
+            if precondition is not None:
+                precondition(current)
+            # The provider may be enabled, so people can arrive through it the
+            # moment the new client works. Check the mark first, as enabling does.
+            await self._ensure_brokered_account_mark(client, token, validated_alias)
+            try:
+                desired = definition.module.with_client_credentials(
+                    representation,
+                    client_id=validated_id,
+                    client_secret=validated_secret,
+                )
+            except ProviderDefinitionError as exc:
+                raise _fail(exc.code) from exc
+            await self._request(
+                client,
+                "PUT",
+                f"{self._instances_path()}/{_path(validated_alias)}",
+                token=token,
+                json_body=desired,
+                expected=frozenset({204}),
+                code="keycloak_provider_credentials_update_failed",
+            )
+            stored = await self._get_exact(client, token, validated_alias)
+        if stored is None:
+            raise _fail("keycloak_provider_readback_failed")
+        readback = self._readback(definition, stored)
+        if (
+            _without_client_credentials(stored)
+            != _without_client_credentials(representation)
+            or readback.alias != validated_alias
+            or readback.client_id != validated_id
+            or not readback.client_secret_configured
+            or readback.state != current.state
         ):
             raise _fail("keycloak_provider_readback_failed")
         self._catalog = None

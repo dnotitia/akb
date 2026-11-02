@@ -89,14 +89,75 @@ not configured → configured_disabled → enabled
 ```
 
 Configuration and activation are deliberately separate. Updating an enabled
-provider is refused until it is disabled. Every mutation is read back from
-Keycloak before AKB reports success, and a drifted representation enters
-`configuration_error` rather than being advertised for login.
+provider is refused until it is disabled, with one exception: its upstream
+client ID and secret can be changed in place (below). Every mutation is read
+back from Keycloak before AKB reports success, and a drifted representation
+enters `configuration_error` rather than being advertised for login.
 
 Client secrets are write-only. They may be supplied when a provider is created
 or rotated, but are never returned by an AKB API, included in the public login
-catalog, or written to audit metadata. Leaving the secret blank while editing
-an existing disabled provider preserves Keycloak's stored value.
+catalog, or written to audit metadata or events. Leaving the secret blank while
+editing an existing disabled provider preserves Keycloak's stored value.
+
+### Rotating upstream client credentials
+
+A routine secret rotation, or a move to a new upstream client, does not need
+the provider to be disabled. Create the new secret or client at the upstream
+first, keeping the old one valid, then send both values to AKB:
+
+```text
+PUT /api/v1/admin/sso/providers/<alias>/client-credentials
+```
+
+```json
+{
+  "client_id": "<upstream client ID, new or unchanged>",
+  "client_secret": "<upstream client secret>",
+  "expected_fingerprint": "<fingerprint from GET .../ownership>",
+  "secret_revision": "<optional opaque label for this secret version>"
+}
+```
+
+The caller is the product administrator in the browser, with the
+`X-AKB-Admin-CSRF` header, or an administrator service key. AKB reads the
+provider's current Keycloak representation, checks that its fingerprint is
+still `expected_fingerprint`, makes sure the provider marks the accounts it
+brings (as enabling does), and writes the same representation back with only
+`clientId` and `clientSecret` replaced. Discovery is not re-imported; the
+issuer, endpoints, enabled and hidden state, mappers and flows stay as they
+were. The readback must match everything but those two fields and still report
+a configured secret. Any other readback is an error and nothing is rolled back
+automatically: inspect the provider in Keycloak before retrying.
+
+On success the provider's ownership row records the new fingerprint, advances
+its revision and stores `secret_revision` (a request without one clears it), so
+`GET .../ownership` returns it as `provider_secret_revision`. Enabling and
+disabling keep that label; an ordinary configure clears it. Sending the same
+client ID and secret again leaves Keycloak's representation unchanged and only
+records the label again, which is how a caller restores the evidence after it
+was cleared.
+
+The request is refused for an owned provider (`403
+sso_provider_owned_mutation_forbidden`), a provider whose emergency latch is
+set (`409 sso_provider_emergency_disabled`), a stale fingerprint (`409
+sso_provider_fingerprint_conflict`), a provider in `configuration_error`
+(`409 provider_configuration_invalid`), unknown or malformed fields (`422
+provider_client_credentials_request_invalid`, without echoing the request), and
+a missing or non-string secret (`422 provider_client_secret_required` /
+`provider_client_secret_invalid`).
+
+When the client ID changes, a sign-in that was already on the upstream login
+page at the moment of the swap can fail once, because its authorization code
+was issued to the previous client; signing in again works. A secret-only
+rotation keeps the client ID, so an in-flight sign-in is not bound to a
+different client; keep both secrets valid at the upstream until the change has
+been read back. No other session is affected. Remove the old secret or client
+at the upstream only after the change has been read back.
+
+Changing the issuer or discovery URL still requires disable, configure and
+enable. This endpoint does not rotate anything at the upstream; it only tells
+AKB about credentials that already exist there. Installations advertise it as
+`sso.provider-client-credentials.v1`.
 
 ## Control ownership
 

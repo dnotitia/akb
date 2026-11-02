@@ -8,7 +8,9 @@ idempotency receipts commit together. Keycloak is only read by this module.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -32,6 +34,7 @@ CAPABILITIES = [
     "sso.preparation-target.v1",
     "auth.callback-login-evidence.v1",
     "sso.operation-attempts.v1",
+    "sso.provider-client-credentials.v1",
 ]
 IDENTITY_VERBS = frozenset({"preflight", "postcheck", "apply", "rollback", "admit"})
 EVIDENCE_VERBS = frozenset({"login-evidence"})
@@ -176,10 +179,74 @@ async def provider_mutation_guard(alias: str, actor, *, enabled: bool | None = N
 
         async def complete(provider):
             if row:
+                # Enabling or disabling, a human emergency disable included,
+                # does not touch the client secret, so the recorded secret
+                # revision stays true. Only a configure can replace the secret
+                # without recording which version it wrote.
                 await conn.execute("""UPDATE sso_provider_ownership SET revision=revision+1,fingerprint=$2,
-                    emergency_disabled=emergency_disabled OR $3,updated_by=$4,updated_at=NOW(),secret_revision=NULL WHERE alias=$1 AND target_id=$5""",
-                    alias, provider_fingerprint(provider), emergency, uuid.UUID(str(actor.user_id)), target.target_id)
+                    emergency_disabled=emergency_disabled OR $3,updated_by=$4,updated_at=NOW(),
+                    secret_revision=CASE WHEN $6 THEN secret_revision ELSE NULL END WHERE alias=$1 AND target_id=$5""",
+                    alias, provider_fingerprint(provider), emergency, uuid.UUID(str(actor.user_id)), target.target_id,
+                    enabled is not None)
         yield complete
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCredentialsGuard:
+    check: Callable[[Any], None]
+    complete: Callable[[Any], Awaitable[None]]
+
+
+def _secret_revision_label(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if (not isinstance(value, str) or not value or len(value) > 255
+            or any(ord(character) < 0x20 or ord(character) == 0x7f for character in value)):
+        raise _error("sso_provider_secret_revision_invalid", 422)
+    return value
+
+
+@asynccontextmanager
+async def provider_credentials_guard(alias: str, actor, *, expected_fingerprint: str,
+                                     secret_revision: str | None):
+    """Serialize one client-credential change of an unowned provider.
+
+    Only an unowned provider without an emergency latch qualifies; an owned
+    one needs a bounded operation verb instead. ``check`` compares the caller's
+    fingerprint with the exact readback the write starts from. ``complete``
+    records, in the same transaction, the new fingerprint and revision and the
+    caller's opaque ``secret_revision`` label (none clears the stored one), and
+    creates the row without an owner when none exists. The secret itself never
+    reaches this module.
+    """
+    alias = _canonical_alias(alias)
+    label = _secret_revision_label(secret_revision)
+    actor_id = uuid.UUID(str(actor.user_id))
+    pool = await get_pool()
+    async with pool.acquire() as conn, conn.transaction():
+        target = await management_targets.resolve(conn)
+        await _alias_lock(conn, alias, target)
+        row = await conn.fetchrow("SELECT * FROM sso_provider_ownership WHERE alias=$1 AND target_id=$2 FOR UPDATE", alias, target.target_id)
+        if row and row["owner_id"] is not None:
+            raise _error("sso_provider_owned_mutation_forbidden", 403)
+        if row and row["emergency_disabled"]:
+            raise _error("sso_provider_emergency_disabled")
+
+        def check(provider) -> None:
+            if provider_fingerprint(provider) != expected_fingerprint:
+                raise _error("sso_provider_fingerprint_conflict")
+
+        async def complete(mutation) -> None:
+            revision = await conn.fetchval("""INSERT INTO sso_provider_ownership
+                (alias,owner_id,revision,fingerprint,emergency_disabled,updated_by,target_id,secret_revision)
+                VALUES($1,NULL,1,$2,FALSE,$3,$4,$5) ON CONFLICT(target_id,alias) DO UPDATE SET
+                revision=sso_provider_ownership.revision+1,fingerprint=EXCLUDED.fingerprint,
+                updated_by=EXCLUDED.updated_by,updated_at=NOW(),secret_revision=EXCLUDED.secret_revision
+                RETURNING revision""",
+                alias, provider_fingerprint(mutation.after), actor_id, target.target_id, label)
+            await emit_event(conn, "auth.sso_provider_client_credentials_changed", actor_id=str(actor_id),
+                             payload={"provider_alias": alias, "provider_revision": revision, **mutation.audit_view()})
+        yield ProviderCredentialsGuard(check=check, complete=complete)
 
 
 async def _live_actor(conn, row):
