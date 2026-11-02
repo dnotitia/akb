@@ -120,7 +120,13 @@ async def read_akb_records(
     issuer: str,
     subjects: tuple[str, ...],
 ) -> tuple[frozenset[str], dict[str, ArrivalRecord]]:
-    """Read the exact bindings and live recorded arrivals for these subjects."""
+    """Read the exact bindings and live recorded arrivals for these subjects.
+
+    Neither query has a LIMIT, and neither needs one: both tables are unique on
+    ``(issuer, subject)``, so each returns at most one row per subject passed
+    in, and the subjects are already bounded by the realm read. Only the realm
+    read can be truncated, and it says so.
+    """
     if not subjects:
         return frozenset(), {}
     pool = await get_pool()

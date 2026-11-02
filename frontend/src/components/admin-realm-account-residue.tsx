@@ -110,11 +110,12 @@ function RealmAccountResidueBody({
       ) : (
         <Panel flush>
           <PanelHeader label="Unbound realm accounts" count={unbound} />
-          {residue.accounts.length < unbound && (
-            <p className="border-b border-border px-4 py-2 text-xs leading-5 text-foreground-muted">
-              Showing {residue.accounts.length} of {unbound}, residue first and oldest first.
-            </p>
-          )}
+          <p className="border-b border-border px-4 py-2 text-xs leading-5 text-foreground-muted">
+            Accounts marked Residue have no binding and no recorded arrival; they are the residue
+            count. Accounts with a pending arrival await approval and are counted separately.
+            {residue.accounts.length < unbound &&
+              ` Showing ${residue.accounts.length} of ${unbound}, residue first and oldest first.`}
+          </p>
           <ul className="divide-y divide-border">
             {residue.accounts.map((account) => (
               <ResidueRow key={account.realm_user_id} account={account} />
@@ -146,7 +147,12 @@ function ResidueRow({ account }: { account: AdminRealmResidueAccount }) {
             <p className="coord mt-1 break-all">{account.arrival.admission_id}</p>
           </>
         ) : (
-          <Badge variant="outline">No record in AKB</Badge>
+          <>
+            <Badge variant="warning">Residue</Badge>
+            <p className="mt-1 text-xs leading-5 text-foreground-muted">
+              No binding and no recorded arrival
+            </p>
+          </>
         )}
       </div>
     </li>

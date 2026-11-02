@@ -44,7 +44,8 @@ function renderSection() {
 }
 
 function tile(label: string): HTMLElement {
-  const element = screen.getByText(label).parentElement;
+  // The tile's label, not a row badge that shares its word.
+  const element = screen.getAllByText(label).find((candidate) => !candidate.closest("li"))?.parentElement;
   if (!element) throw new Error(`no tile ${label}`);
   return element;
 }
@@ -70,7 +71,11 @@ describe("RealmAccountResidue", () => {
       "unknown.visitor",
       "invited.person",
     ]);
-    expect(within(rows[0]).getByText("No record in AKB")).toBeInTheDocument();
+    // The UI names the arrival-less rows as the residue, and only those.
+    expect(within(rows[0]).getByText("Residue")).toBeInTheDocument();
+    expect(within(rows[1]).getByText("Residue")).toBeInTheDocument();
+    expect(within(rows[2]).queryByText("Residue")).toBeNull();
+    expect(screen.getByText(/Accounts marked Residue have no binding and no recorded arrival/)).toBeInTheDocument();
     expect(within(rows[0]).getByText(/Created Aug 14, 2026/)).toBeInTheDocument();
     expect(within(rows[1]).getByText("Created at an unknown time")).toBeInTheDocument();
     expect(within(rows[2]).getByText("Arrival pending")).toBeInTheDocument();
