@@ -190,8 +190,9 @@ administrator is not filtered by search
 ## 6. Mutation success, explanation, events and audit
 
 **Grant, revoke and transfer.** Each runs in one transaction under
-`role_authority_transaction`, which is a READ COMMITTED transaction holding a
-shared advisory lock (`backend/app/services/role_authority.py:11-22`). Inside
+`role_authority_transaction`, which is a READ COMMITTED transaction holding
+the exclusive transaction-scoped advisory lock that every authority path takes
+(`pg_advisory_xact_lock`, `backend/app/services/role_authority.py:11-22`). Inside
 it, the operation does four things:
 
 - writes the catalog;
@@ -324,7 +325,8 @@ out of scope for this record and needs its own decision.
 
 At `4698900`, a search of `backend/app` outside migrations for SQL that
 selects from, joins, inserts into or updates `vault_access`
-(`(FROM|JOIN|INTO|UPDATE) +vault_access`) finds these modules:
+(`(FROM|JOIN|INTO|UPDATE) +vault_access\b`, so `vault_access_contributions` is
+not counted) finds these modules:
 
 - `services/access_service.py` (12 sites)
 - `services/search_service.py` (4)
