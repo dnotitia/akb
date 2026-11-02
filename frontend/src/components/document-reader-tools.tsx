@@ -95,22 +95,30 @@ export function RawDocumentText({ text, searchable }: { text: string; searchable
 }
 
 export function DocumentImageOpenButton({ index, alt, rootRef, onOpen }: { index: number; alt: string; rootRef: RefObject<HTMLDivElement | null>; onOpen: (image: { src: string; alt: string }, opener: HTMLElement) => void }) {
-  const [ready, setReady] = useState(false);
+  const [placement, setPlacement] = useState<{ left: number; top: number } | null>(null);
   const getImage = () => rootRef.current?.querySelectorAll<HTMLImageElement>("img[data-markdown-image], img[data-markdown-target]")[index];
   useEffect(() => {
     const root = rootRef.current;
     if (!root) return;
     const measure = () => {
       const picture = root.querySelectorAll<HTMLImageElement>("img[data-markdown-image], img[data-markdown-target]")[index];
-      setReady(Boolean(picture?.complete && picture.naturalWidth && !picture.hidden && !picture.closest("a")));
+      const bounds = picture?.getBoundingClientRect();
+      if (!picture?.complete || !picture.naturalWidth || picture.hidden || picture.closest("a") || !bounds?.width || !bounds.height) { setPlacement(previous => previous === null ? previous : null); return; }
+      const origin = root.getBoundingClientRect();
+      const scale = root.offsetWidth ? origin.width / root.offsetWidth : 1;
+      const control = (window.matchMedia("(pointer: coarse), (max-width: 40rem)").matches ? 2.75 : 2) * (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16);
+      const next = { left: Math.max((bounds.left - origin.left) / scale, (bounds.right - origin.left) / scale - control - 4), top: (bounds.top - origin.top) / scale + 4 };
+      setPlacement(previous => previous?.left === next.left && previous.top === next.top ? previous : next);
     };
     measure(); root.addEventListener("load", measure, true); root.addEventListener("error", measure, true);
-    const observer = new MutationObserver(measure); observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "hidden"] });
-    return () => { root.removeEventListener("load", measure, true); root.removeEventListener("error", measure, true); observer.disconnect(); };
+    const observer = new MutationObserver(measure); observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["src", "hidden", "style", "class"] });
+    const resize = new ResizeObserver(measure); resize.observe(root); window.addEventListener("resize", measure);
+    return () => { root.removeEventListener("load", measure, true); root.removeEventListener("error", measure, true); observer.disconnect(); resize.disconnect(); window.removeEventListener("resize", measure); };
   }, [index, rootRef]);
-  return <button type="button" className="reader-image-open" data-reader-image-index={index} disabled={!ready} aria-label={`Enlarge image${alt ? `: ${alt}` : ""}`} onClick={event => {
+  if (!placement) return null;
+  return <button type="button" className="reader-image-open" style={placement} data-reader-image-index={index} aria-label={`Enlarge image${alt ? `: ${alt}` : ""}`} onClick={event => {
     const picture = getImage(); if (picture?.complete && picture.naturalWidth && !picture.closest("a")) onOpen({ src: picture.currentSrc || picture.src, alt: picture.alt }, event.currentTarget);
-  }}>Enlarge</button>;
+  }}><ZoomIn size={16} aria-hidden /></button>;
 }
 
 export function ReaderImageZoom({ image, onClose, returnFocusRef }: { image: { src: string; alt: string } | null; onClose: () => void; returnFocusRef?: RefObject<HTMLElement | null> }) {

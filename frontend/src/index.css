@@ -1570,7 +1570,7 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 .reading-details-host .document-details-docked { width: 100%; height: 100%; border: 0; }
 .reading-context-header-host .document-panel-heading { min-height: calc(3rem - 1px); height: 100%; padding: .25rem .5rem .25rem 1rem; border: 0; }
 .reading-context-header-host .document-panel-heading h2 { font-size: .75rem; }
-.reading-context-header-host .document-panel-heading > button { width: 2rem; height: 2rem; }
+.reading-context-header-host .document-panel-heading > button { width: 2rem; height: 2rem; min-height: 2rem; }
 .reading-studio .document-reading-inset { padding: 2rem clamp(1.25rem, 3cqi, 3rem) 4rem; }
 .document-byline { display: flex; align-items: baseline; flex-wrap: wrap; gap: .5rem 1rem; min-width: 0; margin-block: .65rem 1.5rem; font-size: .75rem; line-height: 1.6; color: var(--color-foreground-muted); }
 .document-byline:empty { display: none; }
@@ -1653,6 +1653,7 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 /* Reader tools are presentation only; authored Markdown and editor layout stay intact. */
 .reading-primary { display: flex; flex-direction: column; min-height: 0; }
 .reading-primary-content { flex: 1; min-height: 0; }
+.reader-render { position: relative; }
 .reader-render .document-reading-flow { font-size: var(--reader-font-size, 1rem); }
 .reading-studio .document-reading-source { --document-reading-measure: var(--reader-measure, 42rem); }
 .reader-render .ProseMirror > [data-markdown-code-tools] { width: 100%; max-width: var(--document-reading-measure, 52rem); margin: 1.25rem auto 0; }
@@ -1665,9 +1666,8 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 .reader-code-toolbar button[aria-expanded] { width: 1.875rem; padding: 0; }
 .reader-code-toolbar:has([aria-expanded=false]) { border-radius: var(--radius-md); }
 .reader-render img:not(a img) { cursor: zoom-in; }
-.reader-image-open { display: inline-flex; min-height: 2rem; padding: .25rem .6rem; margin: .25rem; border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface); color: var(--color-link); font: .75rem/1.5 var(--font-sans); cursor: pointer; }
+.reader-image-open { position: absolute; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; padding: 0; border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface); color: var(--color-link); cursor: pointer; }
 .reader-image-open:hover { background: var(--color-surface-hover); }
-.reader-image-open:disabled { opacity: .5; cursor: default; }
 .reader-render[data-table-fit=true] table { table-layout: fixed; width: 100%; min-width: 0 !important; }
 .reader-render[data-table-fit=true] :is(th,td) { overflow-wrap: anywhere; min-width: 0; }
 .markdown-reading-match { background: var(--color-surface-selected); color: var(--color-surface-selected-foreground); border-radius: 2px; box-shadow: 0 1px 0 var(--color-link); }
@@ -1711,6 +1711,8 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 .reader-image-stage img { display: block; height: auto; margin: auto; }
 .reader-image-stage:focus-visible { outline: 2px solid var(--color-ring); outline-offset: 2px; }
 @media (pointer: coarse), (max-width: 40rem) {
+  .reader-image-open { width: 2.75rem; height: 2.75rem; }
+  .reading-context-header-host .document-panel-heading > button { width: 2.75rem; height: 2.75rem; min-height: 2.75rem; }
   .reader-outline-copy { opacity: 1; }
   .reader-outline :is(button,a), .reader-image-open, .reader-setting-check, .reader-width-options label { min-height: 2.75rem; }
   .reader-outline :is(button) { width: 2.75rem; }

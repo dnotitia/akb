@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -75,6 +75,10 @@ describe("reader tools", () => {
 
   it("gives images an explicit enlarge button without changing image semantics", async () => {
     render(<MarkdownRender markdown={'![Diagram](https://example.invalid/a.png)'} />);
+    const image = await screen.findByRole("img", { name: "Diagram" });
+    Object.defineProperties(image, { complete: { configurable: true, value: true }, naturalWidth: { configurable: true, value: 100 } });
+    vi.spyOn(image, "getBoundingClientRect").mockReturnValue({ x: 0, y: 0, top: 0, left: 0, right: 100, bottom: 100, width: 100, height: 100, toJSON: () => ({}) });
+    fireEvent.load(image);
     expect(await screen.findByRole("button", { name: "Enlarge image: Diagram" })).toBeInTheDocument();
     expect(screen.getByRole("img", { name: "Diagram" })).toBeInTheDocument();
   });

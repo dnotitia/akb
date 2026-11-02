@@ -2072,7 +2072,6 @@ export function MarkdownViewer({
 
   return (
     <>
-      <MarkdownViewerReadingTools editor={rawEditor} options={reading} />
       <MarkdownSurface
         {...props}
         editor={editor}
@@ -2082,6 +2081,7 @@ export function MarkdownViewer({
         referenceResolutions={referenceResolutions}
         resolvingReferences={Boolean(referenceAdapter?.resolve)}
       />
+      <MarkdownViewerReadingTools editor={rawEditor} options={reading} />
       {hasAdornment && adornmentHost && createPortal(afterLeadingHeading, adornmentHost)}
     </>
   )

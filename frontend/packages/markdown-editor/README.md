@@ -131,7 +131,9 @@ updates are applied by the package and never become serialized Markdown:
 ```
 
 `MarkdownViewer.reading` optionally provides `renderCodeToolbar(block)` and
-`renderImageToolbar(image)` React slots. Code blocks expose their index, code,
+`renderImageToolbar(image)` React slots. Image controls render outside the
+editable document DOM, so hosts can position them over the displayed image
+without changing prose text or its layout. Code blocks expose their index, code,
 language and effective collapsed state. Image slots identify the image index
 and alt text; products must use their already-resolved image surface rather
 than fetching canonical private targets independently. `collapseCodeBlocks`,

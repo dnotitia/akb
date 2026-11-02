@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { Fragment, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import type { Editor } from '@tiptap/core'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
@@ -40,7 +40,7 @@ type CodeSlot = MarkdownViewerCodeBlock & { pos: number; size: number; host: HTM
 /** Viewer-only decorations. Neither toolbar widgets, folds nor matches enter the document model. */
 export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor | null; options?: MarkdownViewerReadingOptions }) {
   const [slots, setSlots] = useState<CodeSlot[]>([])
-  const [imageSlots, setImageSlots] = useState<{ index: number; pos: number; alt: string; host: HTMLElement }[]>([])
+  const [imageSlots, setImageSlots] = useState<{ index: number; alt: string }[]>([])
   const latest = useRef(options)
   const refresh = useRef<(() => void) | null>(null)
   const enabled = Boolean(options)
@@ -50,10 +50,9 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
     const key = new PluginKey('markdownViewerReadingTools')
     let blocks: CodeSlot[] = []
     let matches: ReadingTextMatch[] = []
-    let images: { index: number; pos: number; alt: string; host: HTMLElement }[] = []
+    let images: { index: number; alt: string }[] = []
     let lastScroll = ''
     const hosts = new Map<number, HTMLElement>()
-    const imageHosts = new Map<number, HTMLElement>()
     const sync = () => {
       if (editor.isDestroyed) return
       const settings = latest.current
@@ -66,9 +65,7 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
         if (node.type.name === 'image') {
           const index = imageIndex++
           if (!node.marks.some(mark => mark.type.name === 'link')) {
-            let host = imageHosts.get(index)
-            if (!host) { host = editor.view.dom.ownerDocument.createElement('span'); host.dataset.markdownImageTools = 'true'; host.setAttribute('contenteditable', 'false'); imageHosts.set(index, host) }
-            images.push({ index, pos: pos + node.nodeSize, alt: String(node.attrs.alt || ''), host })
+            images.push({ index, alt: String(node.attrs.alt || '') })
           }
         }
         if (settings?.search?.query && node.isTextblock && !limited) {
@@ -117,9 +114,6 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
           }))
           if (block.collapsed) decorations.push(Decoration.node(block.pos, block.pos + block.size, { 'data-reading-folded': 'true' }))
         }
-        if (settings?.renderImageToolbar) for (const image of images) {
-          if (image.pos <= state.doc.content.size) decorations.push(Decoration.widget(image.pos, image.host, { key: `reading-image-${image.index}`, side: 1, ignoreSelection: true, stopEvent: () => true }))
-        }
         matches.forEach((match, index) => {
           if (match.to <= state.doc.content.size) decorations.push(Decoration.inline(match.from, match.to, {
             class: 'markdown-reading-match', 'data-reading-match': index === (settings?.search?.current ?? 0) ? 'current' : 'other',
@@ -134,5 +128,5 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
     return () => { refresh.current = null; editor.off('update', sync); editor.unregisterPlugin(key) }
   }, [editor, enabled])
   useLayoutEffect(() => { refresh.current?.() }, [options])
-  return <>{slots.map(slot => createPortal(options?.renderCodeToolbar?.(slot), slot.host, `code-${slot.index}`))}{imageSlots.map(slot => createPortal(options?.renderImageToolbar?.(slot), slot.host, `image-${slot.index}`))}</>
+  return <>{slots.map(slot => createPortal(options?.renderCodeToolbar?.(slot), slot.host, `code-${slot.index}`))}{imageSlots.map(slot => <Fragment key={`image-${slot.index}`}>{options?.renderImageToolbar?.(slot)}</Fragment>)}</>
 }

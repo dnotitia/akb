@@ -33,3 +33,18 @@ it('keeps widgets, folds and highlights out of authored Markdown and restores th
   expect(screen.queryByRole('button', { name: 'Needle toolbar ts' })).toBeNull()
   expect(serializeEditorMarkdown(getMarkdownEditor(handle)!)).toBe(source)
 })
+
+it('keeps image controls outside the prose and its serialized text', async () => {
+  const source = 'Before ![Diagram](https://example.invalid/diagram.png) after.'
+  let handle: MarkdownEditorHandle | null = null
+  function Harness() {
+    const current = useMarkdownEditor({ initialMarkdown: source, editable: false, slash: false })
+    useEffect(() => { handle = current }, [current])
+    return <><MarkdownSurface editor={current} editable={false} /><MarkdownViewerReadingTools editor={getMarkdownEditor(current)} options={{ renderImageToolbar: () => <button type="button">Image controls</button> }} /></>
+  }
+  const { container } = render(<Harness />)
+  await screen.findByRole('button', { name: 'Image controls' })
+  expect(container.querySelector('.ProseMirror')?.textContent).not.toContain('Image controls')
+  expect(serializeEditorMarkdown(getMarkdownEditor(handle)!)).not.toContain('Image controls')
+  expect(serializeEditorMarkdown(getMarkdownEditor(handle)!)).toContain('![Diagram]')
+})
