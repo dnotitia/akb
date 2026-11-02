@@ -36,8 +36,7 @@ async def pool(monkeypatch):
         return pool
 
     monkeypatch.setattr(auth_service, "get_pool", _get_pool)
-    monkeypatch.setattr(settings, "local_auth_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "jwt_secret", "status-test-secret-at-least-32-bytes", raising=False)
+    monkeypatch.setattr(settings, "system_hmac_secret", "status-test-secret-at-least-32-bytes", raising=False)
     yield pool
 
     async with pool.acquire() as conn:

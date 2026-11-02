@@ -77,7 +77,7 @@ async def pool(monkeypatch):
     monkeypatch.setattr(access_service, "get_pool", _get_pool)
     monkeypatch.setattr(table_service, "get_pool", _get_pool)
     monkeypatch.setattr(
-        settings, "jwt_secret", "vwp-test-secret-at-least-32-bytes-long", raising=False
+        settings, "system_hmac_secret", "vwp-test-secret-at-least-32-bytes-long", raising=False
     )
 
     yield pg_pool

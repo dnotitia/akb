@@ -223,7 +223,7 @@ def _challenge_token(key: tuple[str, str, str | None], version: str) -> str:
     by the change: the token was already stable for that key until the guide
     version changed, and without the secret it stays unguessable.
     """
-    secret = settings.system_hmac_secret_effective
+    secret = settings.system_hmac_secret
     if not secret:
         # Startup refuses to boot without this secret, so this branch is
         # reachable only from tests. Say so rather than silently returning to

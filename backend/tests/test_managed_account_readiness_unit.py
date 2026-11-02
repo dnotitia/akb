@@ -49,7 +49,6 @@ def _managed_settings(monkeypatch, account_service, *, enabled: bool = True):
         "auth_mode": "sso" if enabled else "local",
         "keycloak_enabled": enabled,
         "keycloak_enrollment_mode": "invite_only" if enabled else "open",
-        "keycloak_link_by_email": False if enabled else True,
         "keycloak_require_verified_email": True,
         "keycloak_server_url": "https://id.example.com",
         "keycloak_realm": "akb-platform",

@@ -86,7 +86,7 @@ async def identity_pool(monkeypatch):
         monkeypatch.setattr(auth_service, "get_pool", _get_pool)
         monkeypatch.setattr(
             settings,
-            "jwt_secret",
+            "system_hmac_secret",
             "live-user-signing-material-long-enough",
             raising=False,
         )

@@ -780,7 +780,7 @@ def test_legacy_publication_view_grant_remains_valid_during_rollout(
     monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
     message = f"grant:share:{now}".encode()
     signature = hmac.new(
-        public.settings.jwt_secret.encode(), message, hashlib.sha256,
+        public.settings.system_hmac_secret.encode(), message, hashlib.sha256,
     ).hexdigest()
     legacy_grant = f"{now}.{signature}"
 
@@ -963,7 +963,7 @@ async def test_legacy_view_grant_cannot_be_promoted_to_a_longer_session(
     monkeypatch.setattr(public.settings, "publication_view_grant_ttl_secs", 600)
     monkeypatch.setattr(public.settings, "publication_view_grant_session_secs", 3600)
     signature = hmac.new(
-        public.settings.jwt_secret.encode(),
+        public.settings.system_hmac_secret.encode(),
         f"grant:share:{now}".encode(),
         hashlib.sha256,
     ).hexdigest()

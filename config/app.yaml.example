@@ -221,10 +221,6 @@ app_credential_overlap_seconds: 300
 # keycloak_enabled: true. Local mode may configure Keycloak only when
 # mcp_oauth_enabled: true needs it as an OAuth resource-server authority.
 #
-# Legacy compatibility inputs local_auth_enabled and keycloak_sso_only are
-# derived from auth_mode for fresh configs. Do not set them independently;
-# an explicit mismatch fails startup.
-#
 # Keycloak human access resolves an exact (issuer, subject) binding. The
 # default `open` enrollment mode may create a brand-new AKB account and exact
 # binding when email/username do not collide; it never adopts or links an
@@ -296,8 +292,7 @@ app_credential_overlap_seconds: 300
 #                                         # realm as its own upstream provider stays
 #                                         # refused; that would be an authorize loop.
 # sso_local_realm_display_name: "This workspace"  # label shown for that choice
-# keycloak_link_by_email is a deprecated migration marker; omit it. Setting it
-# to true fails canonical startup. Exact pre-binding is the only account-link path.
+# Exact pre-binding is the only account-link path.
 # Ordinary AKB browser login uses authorization code + PKCE/nonce and a fixed
 # callback derived from public_base_url:
 #   <public_base_url>/api/v1/auth/keycloak/callback
