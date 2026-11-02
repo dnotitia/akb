@@ -9,7 +9,6 @@ import {
   getMe,
   getToken,
   logoutOrdinarySession,
-  markLegacySsoSession,
   setToken,
 } from "../api";
 
@@ -34,17 +33,6 @@ const ssoConfig = {
     display_name: "Company SSO",
     login_url: "/api/v1/auth/sso/workforce/login",
   }],
-  mcp_oauth: { enabled: true },
-};
-
-const legacyHybridConfig = {
-  local_auth: { enabled: true },
-  keycloak: {
-    enabled: true,
-    enrollment_mode: "open",
-    login_url: "/api/v1/auth/keycloak/login",
-    sso_only: false,
-  },
   mcp_oauth: { enabled: true },
 };
 
@@ -90,22 +78,6 @@ describe("ordinary browser auth transport", () => {
     expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/auth/me");
     expect((fetchMock.mock.calls[1]?.[1] as RequestInit).credentials).toBe("same-origin");
     expect(headersAt(fetchMock, 1).get("Authorization")).toBe("Bearer local-session-jwt");
-    expect(headersAt(fetchMock, 1).has("X-AKB-CSRF")).toBe(false);
-  });
-
-  it("uses the Bearer carrier for an adapted legacy hybrid session", async () => {
-    setToken("legacy-session-jwt");
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse(legacyHybridConfig))
-      .mockResolvedValueOnce(jsonResponse({ username: "alice" }));
-
-    const config = await getAuthConfig();
-    await getMe({ redirectOnUnauthorized: false });
-
-    expect(config.auth_mode).toBe("hybrid");
-    expect(headersAt(fetchMock, 1).get("Authorization")).toBe(
-      "Bearer legacy-session-jwt",
-    );
     expect(headersAt(fetchMock, 1).has("X-AKB-CSRF")).toBe(false);
   });
 
@@ -231,22 +203,6 @@ describe("ordinary browser auth transport", () => {
     });
 
     expect(getToken()).toBeNull();
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("ends an adapted legacy SSO session through its same-origin logout route", async () => {
-    configureAuthTransport("local");
-    setToken("legacy-sso-jwt");
-    markLegacySsoSession("legacy-id-token");
-
-    await expect(logoutOrdinarySession()).resolves.toEqual({
-      mode: "sso",
-      logout_url:
-        "/api/v1/auth/keycloak/logout?id_token_hint=legacy-id-token",
-    });
-
-    expect(getToken()).toBeNull();
-    expect(sessionStorage.getItem("akb_legacy_sso")).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
