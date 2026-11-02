@@ -61,7 +61,6 @@ async def services(monkeypatch):
     monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
     monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
     monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
-    monkeypatch.setattr(settings, "keycloak_link_by_email", False, raising=False)
     assert settings.keycloak_issuer == _ISSUER
 
     yield pool, auth_service, admission_service, account_service

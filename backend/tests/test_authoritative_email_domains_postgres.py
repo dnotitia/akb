@@ -61,7 +61,6 @@ async def pool(monkeypatch):
     monkeypatch.setattr(auth_service, "get_pool", _get_pool)
     monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
     monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
-    monkeypatch.setattr(settings, "keycloak_link_by_email", False, raising=False)
     monkeypatch.setattr(
         settings,
         "keycloak_authoritative_email_domains_by_provider",

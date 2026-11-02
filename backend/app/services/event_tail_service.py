@@ -87,7 +87,7 @@ def normalize_kind_filter(values: list[str] | tuple[str, ...] | None) -> tuple[s
 class EventCursorCodec:
     """Encode and authenticate opaque cursors with the system HMAC secret.
 
-    AES-SIV uses a key derived from ``system_hmac_secret_effective``. Its
+    AES-SIV uses a key derived from ``system_hmac_secret``. Its
     authentication tag provides the signature/integrity guarantee while the
     encrypted payload keeps the database position, Vault identity, and kind
     filter set out of the public cursor. Deterministic encryption keeps the
@@ -95,7 +95,7 @@ class EventCursorCodec:
     """
 
     def __init__(self, secret: str | None = None):
-        effective = settings.system_hmac_secret_effective if secret is None else secret
+        effective = settings.system_hmac_secret if secret is None else secret
         if not isinstance(effective, str) or not effective:
             raise ValueError("system HMAC secret is required for Event Cursors")
         self._key = hashlib.sha512(_CURSOR_AAD + b"\0" + effective.encode("utf-8")).digest()

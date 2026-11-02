@@ -745,7 +745,6 @@ async def get_managed_account_state(
         settings.sso_human_auth_enabled
         and settings.keycloak_enabled
         and settings.keycloak_enrollment_mode == "invite_only"
-        and not settings.keycloak_link_by_email
         and settings.keycloak_require_verified_email
     )
     if not profile_ready:

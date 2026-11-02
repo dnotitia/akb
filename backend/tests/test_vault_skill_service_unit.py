@@ -183,7 +183,6 @@ def test_signed_fields_are_length_prefixed_so_two_bindings_cannot_collide():
 async def test_without_a_shared_secret_the_challenge_is_still_issued(monkeypatch):
     """The fallback is test-only, but it must not be broken code."""
     monkeypatch.setattr(vss.settings, "system_hmac_secret", "")
-    monkeypatch.setattr(vss.settings, "jwt_secret", "")
     monkeypatch.setattr(vss, "_fetch_skill", _fake_fetch())
 
     challenge = await vss.preflight_payload("sess", "v1", "vault-id")

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from app import config as app_config
 
@@ -43,8 +44,6 @@ def test_runtime_load_accepts_explicit_local_auth_mode(
     assert loaded.auth_mode == "local"
     assert loaded.local_human_auth_enabled is True
     assert loaded.sso_human_auth_enabled is False
-    assert loaded.local_auth_enabled is True
-    assert loaded.keycloak_sso_only is False
 
 
 def test_retired_account_self_service_flag_still_loads_and_is_ignored(
@@ -76,8 +75,6 @@ def test_runtime_load_accepts_explicit_sso_auth_mode(
     assert loaded.auth_mode == "sso"
     assert loaded.local_human_auth_enabled is False
     assert loaded.sso_human_auth_enabled is True
-    assert loaded.local_auth_enabled is False
-    assert loaded.keycloak_sso_only is True
 
 
 def test_runtime_generation_is_positive_and_upgrade_ack_is_versioned(
@@ -118,24 +115,18 @@ def test_programmatic_settings_construction_does_not_require_runtime_mode() -> N
     configured = app_config.Settings(document_revision_backend="bare_git")
 
     assert configured.auth_mode is None
-    assert configured.local_auth_enabled is True
 
 
-def test_runtime_load_rejects_missing_mode_without_legacy_inference(
+def test_runtime_load_rejects_missing_mode_without_inference(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     with pytest.raises(app_config.AuthModeConfigurationError) as exc_info:
-        _load(
-            monkeypatch,
-            tmp_path,
-            {"local_auth_enabled": True, "keycloak_enabled": False},
-        )
+        _load(monkeypatch, tmp_path, {"keycloak_enabled": False})
 
     message = str(exc_info.value)
     assert "auth_mode is required" in message
-    assert "local_only" in message
-    assert "will not infer" in message
+    assert "does not infer" in message
 
 
 def test_runtime_load_rejects_unknown_mode_without_echoing_secrets(
@@ -148,7 +139,7 @@ def test_runtime_load_rejects_unknown_mode_without_echoing_secrets(
         _load(
             monkeypatch,
             tmp_path,
-            {"auth_mode": "hybrid", "jwt_secret": secret},
+            {"auth_mode": "hybrid", "db_password": secret},
         )
 
     message = str(exc_info.value)
@@ -160,32 +151,8 @@ def test_runtime_load_rejects_unknown_mode_without_echoing_secrets(
     ("values", "expected_detail"),
     [
         (
-            {"auth_mode": "local", "local_auth_enabled": False},
-            "local_auth_enabled=false",
-        ),
-        (
-            {"auth_mode": "local", "keycloak_sso_only": True},
-            "keycloak_sso_only=true",
-        ),
-        (
             {"auth_mode": "local", "keycloak_enabled": True},
             "requires mcp_oauth_enabled=true",
-        ),
-        (
-            {
-                "auth_mode": "sso",
-                "keycloak_enabled": True,
-                "local_auth_enabled": True,
-            },
-            "local_auth_enabled=true",
-        ),
-        (
-            {
-                "auth_mode": "sso",
-                "keycloak_enabled": True,
-                "keycloak_sso_only": False,
-            },
-            "keycloak_sso_only=false",
         ),
         (
             {"auth_mode": "sso", "keycloak_enabled": False},
@@ -211,53 +178,49 @@ def test_runtime_load_rejects_mode_contradictions(
     assert secret not in message
 
 
-def test_legacy_hybrid_is_diagnostic_only_and_runtime_rejects_it(
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("local_auth_enabled", True),
+        ("keycloak_sso_only", True),
+        ("keycloak_link_by_email", True),
+        ("keycloak_redirect_uri", "https://akb.example.com/api/v1/auth/keycloak/callback"),
+        ("keycloak_post_login_path", "/auth/callback"),
+        ("keycloak_post_login_allowed_origins", ["https://app.example.com"]),
+        ("keycloak_exchange_code_ttl_secs", 60),
+    ],
+)
+def test_runtime_load_refuses_retired_auth_inputs(
     monkeypatch,
     tmp_path: Path,
+    key: str,
+    value: object,
 ) -> None:
-    classification = app_config.classify_legacy_auth_mode(
-        local_auth_enabled=True,
-        keycloak_enabled=True,
-        keycloak_sso_only=False,
-    )
-
-    assert classification.status == "ambiguous_hybrid"
-    assert classification.derived_mode is None
-
-    with pytest.raises(app_config.AuthModeConfigurationError) as exc_info:
+    """Removed inputs fail the load by name instead of being silently ignored."""
+    with pytest.raises(ValidationError) as exc_info:
         _load(
             monkeypatch,
             tmp_path,
-            {"local_auth_enabled": True, "keycloak_enabled": True},
+            {"auth_mode": "sso", "keycloak_enabled": True, key: value},
         )
 
-    assert "ambiguous_hybrid" in str(exc_info.value)
+    assert key in str(exc_info.value)
+    assert "extra_forbidden" in str(exc_info.value)
 
 
-@pytest.mark.parametrize(
-    ("local_enabled", "keycloak_enabled", "sso_only", "status", "derived"),
-    [
-        (True, False, False, "local_only", "local"),
-        (False, True, False, "strict_sso", "sso"),
-        (False, False, False, "invalid", None),
-        (True, False, True, "invalid", None),
-    ],
-)
-def test_legacy_classification_is_pure_and_never_activates_runtime(
-    local_enabled: bool,
-    keycloak_enabled: bool,
-    sso_only: bool,
-    status: str,
-    derived: str | None,
+def test_runtime_load_refuses_jwt_secret_with_the_safe_rename(
+    monkeypatch,
+    tmp_path: Path,
 ) -> None:
-    classification = app_config.classify_legacy_auth_mode(
-        local_auth_enabled=local_enabled,
-        keycloak_enabled=keycloak_enabled,
-        keycloak_sso_only=sso_only,
-    )
+    secret = "must-not-appear-in-rename-diagnostic"  # pragma: allowlist secret
 
-    assert classification.status == status
-    assert classification.derived_mode == derived
+    with pytest.raises(RuntimeError) as exc_info:
+        _load(monkeypatch, tmp_path, {"auth_mode": "local", "jwt_secret": secret})
+
+    message = str(exc_info.value)
+    assert "system_hmac_secret" in message
+    assert "unchanged" in message
+    assert secret not in message
 
 
 def test_local_mode_keeps_keycloak_separate_for_mcp_oauth(
@@ -280,25 +243,6 @@ def test_local_mode_keeps_keycloak_separate_for_mcp_oauth(
     assert loaded.sso_human_auth_enabled is False
     assert loaded.keycloak_enabled is True
     assert loaded.mcp_oauth_enabled is True
-
-
-def test_canonical_runtime_rejects_deprecated_email_linking(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    with pytest.raises(
-        app_config.AuthModeConfigurationError,
-        match="keycloak_link_by_email",
-    ):
-        _load(
-            monkeypatch,
-            tmp_path,
-            {
-                "auth_mode": "sso",
-                "keycloak_enabled": True,
-                "keycloak_link_by_email": True,
-            },
-        )
 
 
 def test_local_mcp_oauth_startup_does_not_require_human_oidc_client_config(
@@ -353,7 +297,6 @@ def test_sso_startup_requires_active_human_api_verifier_config_only(
 
     message = str(exc_info.value)
     assert "human API client allowlist" in message
-    assert "keycloak_redirect_uri" not in message
     assert "keycloak_client_secret" not in message
 
 
@@ -372,7 +315,6 @@ def test_sso_startup_defers_ordinary_browser_inputs_but_requires_admin_client(
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "keycloak_client_id": "akb-web",
-            "keycloak_redirect_uri": "",
             "keycloak_client_secret": "",
             "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
             "db_password": "test-db-password",  # pragma: allowlist secret
@@ -560,7 +502,6 @@ def test_sso_startup_rejects_missing_system_hmac_secret(
             "sso_session_epoch": _VALID_SSO_EPOCH,
             "keycloak_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
-            "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",
             "keycloak_client_secret": "test-keycloak-client-secret",  # pragma: allowlist secret
             "keycloak_admin_client_secret": "test-admin-client-secret",  # pragma: allowlist secret
             "db_password": "test-db-password",  # pragma: allowlist secret
@@ -573,34 +514,6 @@ def test_sso_startup_rejects_missing_system_hmac_secret(
     assert loaded.app_token_secret == ""
     with pytest.raises(RuntimeError, match="system_hmac_secret"):
         lifecycle._validate_required_settings()
-
-
-def test_sso_startup_accepts_legacy_jwt_secret_only_as_system_hmac_migration_input(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    from app.services import lifecycle
-
-    loaded = _load(
-        monkeypatch,
-        tmp_path,
-        {
-            "auth_mode": "sso",
-            "sso_session_epoch": _VALID_SSO_EPOCH,
-            "keycloak_enabled": True,
-            "keycloak_server_url": "https://auth.example.com",
-            "keycloak_redirect_uri": "https://akb.example.com/auth/keycloak/callback",
-            "keycloak_client_secret": "test-keycloak-client-secret",  # pragma: allowlist secret
-            "keycloak_admin_client_secret": "test-admin-client-secret",  # pragma: allowlist secret
-            "jwt_algorithm": "RS256",
-            "jwt_secret": "compatibility-hmac-secret",  # pragma: allowlist secret
-            "db_password": "test-db-password",  # pragma: allowlist secret
-            "public_base_url": "https://akb.example.com",
-        },
-    )
-    monkeypatch.setattr(lifecycle, "settings", loaded)
-
-    lifecycle._validate_required_settings()
 
 
 def test_local_startup_requires_system_hmac_and_persistent_signing_keys(
@@ -659,7 +572,7 @@ def test_startup_rejects_equal_api_and_mcp_audiences(
             "keycloak_server_url": "https://auth.example.com",
             "api_oauth_audience": shared_audience,
             "mcp_oauth_audience": shared_audience,
-            "jwt_secret": "test-jwt-secret",  # pragma: allowlist secret
+            "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
             "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
         },

@@ -499,9 +499,10 @@ deployment issuer/audience, `jti`, and a public-only JWKS at
 boundary: generate and persist the v2 keyset before rollout, set
 `jwt_algorithm: RS256`, and restart all backends together. Existing HS256 user
 sessions then receive 401 and must sign in again; PATs and service keys are not
-revoked. The old `jwt_secret` may be retained for one release only as migration
-input for short-lived internal HMAC capabilities, or renamed unchanged to
-`system_hmac_secret`; it is never accepted as human-session signing material.
+revoked. Internal HMAC capabilities use `system_hmac_secret`. An old
+`jwt_secret` key now fails startup: rename it to `system_hmac_secret` with the
+value unchanged, because a new value invalidates links and cursors signed with
+the old one.
 
 For routine v2 key rotation, generate a new directory while retaining the
 current public JWKS, publish the new immutable Secret/config revision, and

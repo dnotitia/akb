@@ -77,7 +77,6 @@ async def test_managed_account_query_uses_one_exact_database_snapshot(monkeypatc
             "auth_mode": "sso",
             "keycloak_enabled": True,
             "keycloak_enrollment_mode": "invite_only",
-            "keycloak_link_by_email": False,
             "keycloak_require_verified_email": True,
             "keycloak_server_url": "https://id.example.com",
             "keycloak_realm": "akb-platform",

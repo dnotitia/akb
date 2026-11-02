@@ -94,7 +94,7 @@ def _make_token(slug: str) -> str:
     # _verify_token re-check it) or those tokens won't revoke. (M3.)
     ts = str(int(time.time()))
     msg = f"{slug}:{ts}".encode("utf-8")
-    sig = hmac.new(settings.system_hmac_secret_effective.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    sig = hmac.new(settings.system_hmac_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     return f"{ts}.{sig}"
 
 
@@ -109,7 +109,7 @@ def _verify_token(slug: str, token: str) -> bool:
     if abs(time.time() - ts) > _TOKEN_TTL:
         return False
     msg = f"{slug}:{ts_str}".encode("utf-8")
-    expected = hmac.new(settings.system_hmac_secret_effective.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    expected = hmac.new(settings.system_hmac_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     return _matches_hmac_hexdigest(expected, sig)
 
 
@@ -129,7 +129,7 @@ def _make_bounded_view_grant(slug: str, *, issued_at: int | None = None) -> str:
         issued + settings.publication_view_grant_session_secs,
     )
     msg = f"grant:{slug}:{issued}:{expires}".encode("utf-8")
-    sig = hmac.new(settings.system_hmac_secret_effective.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    sig = hmac.new(settings.system_hmac_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     return f"{issued}.{expires}.{sig}"
 
 
@@ -138,7 +138,7 @@ def _make_view_grant(slug: str, *, issued_at: int | None = None) -> str:
         return _make_bounded_view_grant(slug, issued_at=issued_at)
     issued = int(time.time()) if issued_at is None else issued_at
     msg = f"grant:{slug}:{issued}".encode("utf-8")
-    sig = hmac.new(settings.system_hmac_secret_effective.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    sig = hmac.new(settings.system_hmac_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     return f"{issued}.{sig}"
 
 
@@ -175,7 +175,7 @@ def _parse_view_grant(slug: str, grant: str | None) -> tuple[int, int] | None:
         return None
     if expires > issued + settings.publication_view_grant_session_secs:
         return None
-    expected = hmac.new(settings.system_hmac_secret_effective.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    expected = hmac.new(settings.system_hmac_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     if not _matches_hmac_hexdigest(expected, sig):
         return None
     return issued, expires

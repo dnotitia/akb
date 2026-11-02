@@ -11,7 +11,6 @@ import asyncpg
 import pytest
 
 from app.config import settings
-from app.config import AuthModeConfigurationError
 from app.exceptions import (
     AccountSuspendedError,
     ConflictError,
@@ -46,7 +45,6 @@ async def pool(monkeypatch):
     monkeypatch.setattr(auth_service, "get_pool", _get_pool)
     monkeypatch.setattr(settings, "keycloak_enrollment_mode", "open", raising=False)
     monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
-    monkeypatch.setattr(settings, "keycloak_link_by_email", False, raising=False)
     yield pool
 
     async with pool.acquire() as conn:
@@ -237,20 +235,6 @@ async def test_open_mode_never_adopts_existing_user_by_email(
             "SELECT auth_provider FROM users WHERE id = $1",
             user_id,
         ) == auth_provider
-
-
-async def test_deprecated_email_link_flag_cannot_bypass_exact_projection(
-    pool,
-    monkeypatch,
-):
-    from app.services.auth_service import _resolve_or_provision_keycloak_user
-
-    monkeypatch.setattr(settings, "keycloak_link_by_email", True, raising=False)
-
-    with pytest.raises(AuthModeConfigurationError, match="keycloak_link_by_email"):
-        await _resolve_or_provision_keycloak_user(
-            _claims("link-flag", f"wsg-link-{uuid.uuid4().hex[:8]}@example.com")
-        )
 
 
 async def test_concurrent_open_mode_creation_of_same_subject_is_idempotent(
@@ -448,8 +432,7 @@ async def test_first_keycloak_api_principal_is_never_bootstrap_admin(
         monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
         monkeypatch.setattr(settings, "keycloak_enrollment_mode", "open", raising=False)
         monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
-        monkeypatch.setattr(settings, "keycloak_link_by_email", False, raising=False)
-
+    
         actor = await auth_service.resolve_rest_user_authorization(
             "Bearer verified-keycloak-api-token"
         )

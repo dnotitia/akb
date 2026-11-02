@@ -67,7 +67,6 @@ def test_v2_local_config_derives_human_capabilities_without_control_read(
             raise AssertionError("local mode must not inspect Keycloak providers")
 
     monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
-    monkeypatch.setattr(settings, "local_auth_enabled", False, raising=False)
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
     monkeypatch.setattr(auth, "get_keycloak_provider_control", lambda: MustNotRead())
@@ -87,7 +86,6 @@ def test_v2_local_config_derives_human_capabilities_without_control_read(
 
 def test_v2_sso_config_lists_only_enabled_provider_buttons(monkeypatch):
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
-    monkeypatch.setattr(settings, "local_auth_enabled", True, raising=False)
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", False, raising=False)
     monkeypatch.setattr(auth, "get_keycloak_provider_control", lambda: Control())

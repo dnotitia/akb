@@ -20,7 +20,6 @@ import ipaddress
 import re
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 from urllib.parse import quote, urlsplit
@@ -63,58 +62,10 @@ _NATIVE_RUNTIME_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _AUTHORITY_DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 AuthMode = Literal["local", "sso"]
-LegacyAuthModeStatus = Literal["local_only", "strict_sso", "ambiguous_hybrid", "invalid"]
 
 
 class AuthModeConfigurationError(RuntimeError):
     """Safe-to-log failure at the canonical human-auth mode boundary."""
-
-
-@dataclass(frozen=True, slots=True)
-class LegacyAuthModeClassification:
-    """Diagnostic-only classification for a later explicit migration command."""
-
-    status: LegacyAuthModeStatus
-    derived_mode: AuthMode | None
-    diagnostic: str
-
-
-def classify_legacy_auth_mode(
-    *,
-    local_auth_enabled: bool,
-    keycloak_enabled: bool,
-    keycloak_sso_only: bool,
-) -> LegacyAuthModeClassification:
-    """Classify legacy flags without selecting a mode for normal startup."""
-    if keycloak_sso_only and not keycloak_enabled:
-        return LegacyAuthModeClassification(
-            status="invalid",
-            derived_mode=None,
-            diagnostic=("keycloak_sso_only is enabled while the Keycloak authority is disabled"),
-        )
-    if local_auth_enabled and not keycloak_enabled:
-        return LegacyAuthModeClassification(
-            status="local_only",
-            derived_mode="local",
-            diagnostic="only local human authentication is enabled",
-        )
-    if not local_auth_enabled and keycloak_enabled:
-        return LegacyAuthModeClassification(
-            status="strict_sso",
-            derived_mode="sso",
-            diagnostic="local human authentication is disabled and Keycloak is enabled",
-        )
-    if local_auth_enabled and keycloak_enabled:
-        return LegacyAuthModeClassification(
-            status="ambiguous_hybrid",
-            derived_mode=None,
-            diagnostic="legacy local and Keycloak human login paths are both enabled",
-        )
-    return LegacyAuthModeClassification(
-        status="invalid",
-        derived_mode=None,
-        diagnostic="both legacy human authentication paths are disabled",
-    )
 
 
 def _auth_config_bool(
@@ -136,47 +87,20 @@ def _resolve_auth_mode_config(
     *,
     require_mode: bool,
 ) -> dict[str, object]:
-    """Validate canonical mode and derive deprecated compatibility booleans."""
+    """Validate the canonical mode and the authority settings it depends on."""
     resolved = dict(values)
     if "auth_mode" not in values or values["auth_mode"] in (None, ""):
         if not require_mode:
             return resolved
-        classification = classify_legacy_auth_mode(
-            local_auth_enabled=_auth_config_bool(values, "local_auth_enabled", default=True),
-            keycloak_enabled=_auth_config_bool(values, "keycloak_enabled", default=False),
-            keycloak_sso_only=_auth_config_bool(values, "keycloak_sso_only", default=False),
-        )
         raise AuthModeConfigurationError(
             "auth_mode is required in runtime YAML and must be explicitly set to "
-            "'local' or 'sso'; legacy flags classify as "
-            f"{classification.status} ({classification.diagnostic}), but startup "
-            "will not infer or persist a mode. Set auth_mode explicitly before restart."
+            "'local' or 'sso'; startup does not infer a mode."
         )
 
     raw_mode = values["auth_mode"]
     if raw_mode not in ("local", "sso"):
         raise AuthModeConfigurationError("auth_mode must be 'local' or 'sso'; no other or hybrid mode is supported")
     mode = cast(AuthMode, raw_mode)
-
-    local_auth_enabled = _auth_config_bool(values, "local_auth_enabled", default=mode == "local")
-    expected_local_auth = mode == "local"
-    if "local_auth_enabled" in values and local_auth_enabled is not expected_local_auth:
-        configured = str(local_auth_enabled).lower()
-        expected = str(expected_local_auth).lower()
-        raise AuthModeConfigurationError(
-            f"auth_mode={mode} contradicts local_auth_enabled={configured}; remove "
-            f"the deprecated flag or set local_auth_enabled={expected}"
-        )
-
-    keycloak_sso_only = _auth_config_bool(values, "keycloak_sso_only", default=mode == "sso")
-    expected_sso_only = mode == "sso"
-    if "keycloak_sso_only" in values and keycloak_sso_only is not expected_sso_only:
-        configured = str(keycloak_sso_only).lower()
-        expected = str(expected_sso_only).lower()
-        raise AuthModeConfigurationError(
-            f"auth_mode={mode} contradicts keycloak_sso_only={configured}; remove "
-            f"the deprecated flag or set keycloak_sso_only={expected}"
-        )
 
     keycloak_enabled = _auth_config_bool(values, "keycloak_enabled", default=False)
     mcp_oauth_enabled = _auth_config_bool(values, "mcp_oauth_enabled", default=False)
@@ -196,17 +120,25 @@ def _resolve_auth_mode_config(
             "mcp_oauth_enabled=true contradicts keycloak_enabled=false; the MCP OAuth "
             "resource server requires a configured Keycloak authority"
         )
-    if _auth_config_bool(values, "keycloak_link_by_email", default=False):
-        raise AuthModeConfigurationError(
-            "keycloak_link_by_email=true is no longer accepted by canonical runtime; "
-            "external identities must be prebound or created from an unclaimed "
-            "issuer/subject without adopting an account by email"
-        )
-
     resolved["auth_mode"] = mode
-    resolved["local_auth_enabled"] = expected_local_auth
-    resolved["keycloak_sso_only"] = expected_sso_only
     return resolved
+
+
+def _reject_renamed_hmac_input(values: Mapping[str, object]) -> None:
+    """Refuse the retired HMAC key with the one safe migration step.
+
+    Since 0.15.0 the non-session HMAC material is `system_hmac_secret`;
+    `jwt_secret` was its fallback and is no longer read. Unknown keys fail
+    anyway, but this one gets its own message because the obvious repair
+    (delete the line, generate a fresh secret) would invalidate every signed
+    public link and event cursor. The value never enters the message.
+    """
+    if "jwt_secret" in values:
+        raise RuntimeError(
+            "jwt_secret is no longer read: move its value unchanged to "
+            "system_hmac_secret and remove jwt_secret. A new value invalidates "
+            "public links and event cursors signed with the old one."
+        )
 
 
 def _normalize_authority_domain(value: object) -> str:
@@ -562,8 +494,7 @@ class Settings(BaseModel):
     @classmethod
     def resolve_explicit_auth_mode(cls, values: object) -> object:
         # Direct Settings() construction remains available to isolated unit
-        # tests. Whenever a canonical mode is supplied, however, it is already
-        # authoritative and the deprecated booleans are only checked/derived.
+        # tests. Whenever a canonical mode is supplied, it is validated here.
         if isinstance(values, Mapping) and "auth_mode" in values:
             return _resolve_auth_mode_config(values, require_mode=False)
         return values
@@ -1013,11 +944,6 @@ class Settings(BaseModel):
     document_asset_gc_interval_secs: int = Field(default=300, ge=10, le=86400)
     document_asset_upload_body_timeout_secs: float = Field(default=60.0, ge=1.0, le=900.0)
 
-    # Deprecated Phase-1 compatibility input. It is never a human-session
-    # signing authority after the local-session-rs256-v2 cutover. Canonical
-    # runtime config rejects it when supplied; `system_hmac_secret` owns the
-    # remaining publication/cursor HMAC capabilities.
-    jwt_secret: str = ""
     jwt_algorithm: str = "RS256"
     jwt_expire_hours: int = 24
 
@@ -1056,11 +982,6 @@ class Settings(BaseModel):
     app_token_ttl_seconds: int = Field(default=300, ge=30, le=3600)
     app_credential_overlap_seconds: int = Field(default=300, ge=0, le=86400)
 
-    # Deprecated compatibility input. Runtime YAML derives this from auth_mode
-    # and rejects an explicit mismatch; later slices should consume the
-    # canonical mode helpers instead of treating this as an authority.
-    local_auth_enabled: bool = True
-
     # Auth — Keycloak OIDC authority configuration. Disabled by default.
     #
     # Human login is selected only by auth_mode. `keycloak_enabled` says an
@@ -1075,9 +996,6 @@ class Settings(BaseModel):
     #
     # See docs/designs/keycloak-oidc/00-overview.md.
     keycloak_enabled: bool = False
-    # Deprecated compatibility/UI input. Runtime YAML derives this from
-    # auth_mode and rejects an explicit mismatch. It is not an auth authority.
-    keycloak_sso_only: bool = False
     keycloak_server_url: str = ""  # e.g. https://auth.example.com (no /realms suffix)
     # Optional backchannel base URL for server→Keycloak calls (token
     # exchange + JWKS). Defaults to keycloak_server_url. Set this only
@@ -1204,11 +1122,6 @@ class Settings(BaseModel):
     # still unbounded.
     keycloak_pending_admission_retention_hours: int = Field(default=336, ge=1, le=8760)
     keycloak_pending_admission_cap: int = Field(default=500, ge=1, le=100000)
-    # Deprecated migration input retained so Phase 3 readiness tooling can
-    # identify legacy installations. Canonical config loading rejects true,
-    # and the projection service repeats that guard for directly constructed
-    # Settings. Runtime email adoption has no compatibility bypass.
-    keycloak_link_by_email: bool = False
     # Per-provider email-domain authority for the browser login path
     # (dnotitia/akb#529). ``alias -> [domains]``; empty (the default) keeps
     # every installation on today's behaviour. A declared domain lets a
@@ -1218,8 +1131,8 @@ class Settings(BaseModel):
     # selected, and never for the local realm. Flat key so the shallow
     # app.yaml+secret.yaml merge cannot clobber a nested block.
     #
-    # This is deliberately NOT keycloak_link_by_email under another name:
-    # that flag (still rejected at canonical load) was install-wide,
+    # This is deliberately NOT the removed keycloak_link_by_email under another
+    # name: that flag was install-wide,
     # unverified, unguarded, and unaudited. This one is per-provider,
     # domain-scoped, browser-only, verified-email-gated, guard-checked
     # (active human, no issuer binding, never the recovery admin), and
@@ -1227,18 +1140,9 @@ class Settings(BaseModel):
     # None normalizes to {} (explicit null in YAML is "not configured",
     # not a type error); anything else non-mapping fails the load.
     keycloak_authoritative_email_domains_by_provider: dict[str, list[str]] | None = Field(default_factory=dict)
-    # Deprecated pre-custody callback input. The active ordinary browser
-    # callback is derived from public_base_url and never trusts this value.
-    keycloak_redirect_uri: str = ""
-    # Deprecated callback-delivery compatibility input; inactive.
-    keycloak_post_login_path: str = "/auth/callback"
-    # Deprecated callback-origin compatibility input; inactive.
-    keycloak_post_login_allowed_origins: list[str] = Field(default_factory=list)
     # Companion client IDs remain active as accepted `azp` values for the
     # human API profile. They never select AKB's own browser callback.
     keycloak_companion_client_ids_by_origin: dict[str, str] = Field(default_factory=dict)
-    # Deprecated legacy exchange-code input; no route issues or redeems it.
-    keycloak_exchange_code_ttl_secs: int = 60
 
     # Audience required on Keycloak access tokens presented to human REST or
     # delegated-human routes in SSO mode. Its effective default follows the
@@ -1627,16 +1531,6 @@ class Settings(BaseModel):
             return self.local_session_audience
         return f"{self.public_base_url.rstrip('/')}/api"
 
-    @property
-    def system_hmac_secret_effective(self) -> str:
-        """Non-session HMAC authority with one-release legacy input support.
-
-        `jwt_secret` is accepted only as migration input for capabilities that
-        were already HMAC-backed.  It is never consulted by a human-session
-        issuer or verifier after the RS256 v2 cutover.
-        """
-        return self.system_hmac_secret or self.jwt_secret
-
     # ── Keycloak OIDC derived endpoints ───────────────────────────
     # All computed off the realm issuer so only server_url + realm are
     # configured. Standard Keycloak OIDC paths under /realms/<realm>.
@@ -1821,6 +1715,7 @@ def _load_settings() -> Settings:
         if not isinstance(data, dict):
             raise RuntimeError(f"{path} must be a YAML mapping at the top level")
         merged.update(data)
+    _reject_renamed_hmac_input(merged)
     resolved = _resolve_auth_mode_config(merged, require_mode=True)
     return Settings.model_validate(resolved)
 

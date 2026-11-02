@@ -44,9 +44,8 @@ When deploying AKB beyond local development:
       when replacing keys, retaining prior public JWKs for an overlap window.
 - [ ] Set independent strong values for `system_hmac_secret` and other
       configured capability/session secrets in `secret.yaml` (for example,
-      `openssl rand -hex 32` for each). `jwt_secret` is legacy migration input
-      for non-session HMAC capabilities; changing it does not rotate RS256
-      human-session signing keys.
+      `openssl rand -hex 32` for each). Changing `system_hmac_secret` does not
+      rotate RS256 human-session signing keys.
 - [ ] Set strong `db_password`; never reuse the docker-compose default.
 - [ ] If using Qdrant with an API key, set `vector_api_key`.
 - [ ] Restrict MCP `/mcp/` and REST `/api/` endpoints to authenticated

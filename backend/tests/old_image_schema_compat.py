@@ -52,7 +52,7 @@ def _configure_old_backend(backend: Path, dsn: str):
     settings.db_name = parsed.path.lstrip("/")
     settings.db_user = unquote(parsed.username or "")
     settings.db_password = unquote(parsed.password or "")
-    settings.jwt_secret = (  # pragma: allowlist secret
+    settings.system_hmac_secret = (  # pragma: allowlist secret
         "old-image-compatibility-secret-32-bytes"
     )
     return settings
