@@ -2,7 +2,7 @@
 status: accepted
 stage: accepted
 created: 2026-08-26
-updated: 2026-08-26
+updated: 2026-11-02
 head: 6db98bf
 implemented: 1e8c086
 method: source reading of `backend/app` at 6db98bf — the `vault_access` schema, both of its writers, every module that reads it in SQL, and the RoleSync catalog — plus the requirements of two independent automated grantors; accepted after implementation against the seven gates and verification of the deployed artifact
@@ -163,6 +163,9 @@ drift"*, with `/admin/role-state` exposing the diff and `/admin/reconcile-roles`
 applying it. (A) adds a third layer above the catalog in the shape AKB already
 has, instead of introducing a second, different one.
 
+*(This paragraph describes `6db98bf`. For grant, revoke and ownership transfer,
+see the 2026-11-02 amendment at the end of §4.4.)*
+
 ### 4.2 The shape of the source key
 
 **Options.** (A) One opaque `TEXT`, with `direct` reserved. (B) A two-part
@@ -220,6 +223,29 @@ still cannot do.
 
 So: keep the semantics, name both states, and let a caller that needs to wait,
 wait.
+
+> **Amendment, 2026-11-02: grant, revoke and transfer.** The text above, and the
+> shape paragraph in §4.1, describe the behaviour measured at `6db98bf`. Commit
+> `d6ed12b` (#696) changed it for three operations: `grant_access`,
+> `revoke_access` and `transfer_ownership` no longer rely on a best-effort
+> post-commit hook. Each one applies the PostgreSQL membership change with
+> `sync_vault_user_in_conn`, on the same connection, inside
+> `role_authority_transaction` and before commit:
+>
+> - grant: `backend/app/services/access_service.py:594`, `:651`
+> - revoke: `access_service.py:695`, `:762`
+> - transfer: `access_service.py:1259`, `:1310-1311`
+> - the projection itself: `backend/app/services/role_sync.py:592-609`
+>
+> If a membership cannot be brought to the catalog's answer, the projection
+> raises (`role_sync.py:1492-1501`, `:1512-1515`). The whole transaction then
+> rolls back, including the catalog change. So for these three operations,
+> success means the catalog and the PostgreSQL membership both changed, and
+> there is no second state to observe. The recommendation above stays as the
+> record of what was decided at the time. This amendment says nothing about
+> other lifecycle paths. The evidence, including the PostgreSQL test runs, is in
+> [Vault-Grain Authorization Contract](../2026-11-02-vault-grain-authorization-contract/README.md)
+> §6 and §11.
 
 ### 4.5 Existing rows
 
@@ -313,7 +339,9 @@ fail proves nothing.
   the existing access endpoints or their own.
 - Whether readback shows a caller contributions they did not create.
 - How a consumer observes PostgreSQL convergence (§4.4) — a status field, an
-  event, or reuse of the existing role-state diff.
+  event, or reuse of the existing role-state diff. *(Amended 2026-11-02: for
+  grant, revoke and ownership transfer there is no separate state left to
+  observe. See the amendment at the end of §4.4.)*
 - Everything in #407's second and third questions, which this proposal does not
   touch.
 
@@ -386,3 +414,12 @@ defect: the downgraded member loses the direct `reader` they still held.
 **Still open.** Everything in §7, unchanged. In particular the subject question
 — user or set — remains deliberately undecided, and contributions are the
 substrate either way.
+
+> **Amendment, 2026-11-02: subject.** The subject question was decided after
+> acceptance, on 2026-08-27, in
+> [the last comment on #407](https://github.com/dnotitia/akb/issues/407#issuecomment-5435843810):
+> a contribution's subject is a **user**, and AKB Core has no native group
+> subject. Contributions remain the substrate.
+> [Vault-Grain Authorization Contract](../2026-11-02-vault-grain-authorization-contract/README.md)
+> §2 records the decision, and its §7 records when to reopen it. The paragraph
+> above is kept as it stood at acceptance.
