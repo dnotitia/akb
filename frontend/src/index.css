@@ -424,9 +424,9 @@ h1.workspace-route-title, .vault-directory-heading h1, .vault-overview-title h1,
   .vault-overview-actions > [role="group"] { flex: none; }
   .vault-overview-meta-row { row-gap: .75rem; }
   .vault-overview-links { width: 100%; justify-content: flex-start; gap: .25rem 1rem; padding-bottom: .5rem; }
-  .vault-overview-link-group { flex: 1 1 10.5rem; }
+  .vault-overview-link-group { flex: 1 1 10.5rem; flex-wrap: wrap; }
   .vault-overview-link-group + .vault-overview-link-group { border-left: 0; padding-left: 0; }
-  .vault-overview-page-link { min-height: 2.75rem; flex: 1; justify-content: flex-start; }
+  .vault-overview-page-link { min-height: 2.75rem; flex: 1 1 auto; justify-content: flex-start; white-space: normal; overflow-wrap: anywhere; }
   .vault-overview-description, .vault-overview-meta-row { margin-left: 0; }
   .vault-content-tabs { justify-content: space-between; gap: .25rem .5rem; }
   .vault-content-tabs [role="tab"] { gap: .3125rem; font-size: .75rem; }

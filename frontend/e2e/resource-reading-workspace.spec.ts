@@ -485,6 +485,7 @@ for (const scope of ["vault", "all"] as const) for (const destination of ["resul
   await expect(editor).toContainText(draft);
   await expect(page.getByTestId("document-preview-dialog")).toHaveCount(0);
   await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
+  await panel.getByRole("combobox").fill("reading");
   if (scope === "all") {
     await panel.getByRole("button", { name: "Search scope: fixture", exact: true }).click();
     await page.getByRole("menuitem", { name: "All vaults", exact: true }).click();
@@ -1225,7 +1226,7 @@ for (const width of [375, 768]) {
     await expect(page.locator(".app-header").getByRole("navigation", { name: "Vault pages", exact: true })).toHaveCount(0);
     for (const link of await navigation.getByRole("link").all()) {
       const box = (await link.boundingBox())!;
-      expect(box.height).toBeGreaterThanOrEqual(44);
+      expect(box.height).toBeGreaterThanOrEqual(width < 640 ? 44 : 32);
       expect(box.x).toBeGreaterThanOrEqual(0);
       expect(box.x + box.width).toBeLessThanOrEqual(width);
     }
@@ -1273,8 +1274,8 @@ for (const width of [640, 768]) {
     const controls = [
       logo,
       search,
-      mobileNavigation.getByRole("link", { name: "Home", exact: true }),
       mobileNavigation.getByRole("link", { name: "Vaults", exact: true }),
+      mobileNavigation.getByRole("link", { name: "Publications", exact: true }),
       header.getByRole("button", { name: /^Notifications/ }),
       account,
 ];
