@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "state": "available",
+  "unavailable_code": null,
+  "scan_limit": 1000,
+  "truncated": false,
+  "realm_account_count": 12,
+  "bound_count": 9,
+  "pending_arrival_count": 1,
+  "residue_count": 2,
+  "accounts": [
+    {
+      "realm_user_id": "0f6c1d9e-5b7a-4f43-9a51-2c7e1b8d4a10",
+      "username": "former.contractor",
+      "created_at": "2026-08-14T03:12:45.120000+00:00",
+      "arrival": null
+    },
+    {
+      "realm_user_id": "8a2e4b61-93cd-4e0f-b1a7-6d5f0c9e2b34",
+      "username": "unknown.visitor",
+      "created_at": null,
+      "arrival": null
+    },
+    {
+      "realm_user_id": "c4d1f7a2-0e83-4b59-a6c2-91b8e3f05d67",
+      "username": "invited.person",
+      "created_at": "2026-10-30T09:41:07.004000+00:00",
+      "arrival": {
+        "admission_id": "5e9b0c3a-7f21-4d68-8b4e-a03c6d2f1e95",
+        "last_seen_at": "2026-11-01T08:02:31.550000+00:00"
+      }
+    }
+  ]
+}

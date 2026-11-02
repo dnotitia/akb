@@ -932,6 +932,181 @@ export function setAdminSsoProviderEnabled(
   ).then(parseAdminSsoMutation);
 }
 
+export interface AdminRealmResidueAccount {
+  realm_user_id: string;
+  username: string;
+  created_at: string | null;
+  /** Null for residue: nothing in AKB refers to this realm account. */
+  arrival: { admission_id: string; last_seen_at: string } | null;
+}
+
+interface AdminRealmAccountResidueBase {
+  schema_version: 1;
+  scan_limit: number;
+}
+
+/**
+ * Realm accounts minus (exact AKB bindings and recorded arrivals). An
+ * unavailable read carries no counts at all, so it can never render as zero.
+ */
+export type AdminRealmAccountResidue =
+  | (AdminRealmAccountResidueBase & {
+      state: "available";
+      unavailable_code: null;
+      truncated: boolean;
+      realm_account_count: number;
+      bound_count: number;
+      pending_arrival_count: number;
+      residue_count: number;
+      accounts: AdminRealmResidueAccount[];
+    })
+  | (AdminRealmAccountResidueBase & {
+      state: "unavailable";
+      unavailable_code: string;
+      truncated: null;
+      realm_account_count: null;
+      bound_count: null;
+      pending_arrival_count: null;
+      residue_count: null;
+      accounts: null;
+    });
+
+const REALM_RESIDUE_KEYS = [
+  "schema_version", "state", "unavailable_code", "scan_limit", "truncated",
+  "realm_account_count", "bound_count", "pending_arrival_count",
+  "residue_count", "accounts",
+] as const;
+const REALM_RESIDUE_SCAN_LIMIT_MAX = 10_000;
+const REALM_RESIDUE_LIST_MAX = 1_000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function isCount(value: unknown, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= max;
+}
+
+function isBoundedText(value: unknown, max: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= max && !hasControlCharacters(value);
+}
+
+function isTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 64 && /^\d{4}-\d{2}-\d{2}T/.test(value) && !Number.isNaN(Date.parse(value));
+}
+
+function parseRealmResidueAccount(value: unknown): AdminRealmResidueAccount {
+  const account = record(value);
+  if (!hasExactKeys(account, ["realm_user_id", "username", "created_at", "arrival"])) {
+    throw new Error("Invalid realm account residue response");
+  }
+  const arrival = account.arrival === null ? null : record(account.arrival);
+  if (
+    !isBoundedText(account.realm_user_id, 1024) ||
+    !isBoundedText(account.username, 255) ||
+    (account.created_at !== null && !isTimestamp(account.created_at)) ||
+    (account.arrival !== null && (
+      !hasExactKeys(arrival, ["admission_id", "last_seen_at"]) ||
+      typeof arrival.admission_id !== "string" ||
+      !UUID_PATTERN.test(arrival.admission_id) ||
+      !isTimestamp(arrival.last_seen_at)
+    ))
+  ) {
+    throw new Error("Invalid realm account residue response");
+  }
+  return {
+    realm_user_id: account.realm_user_id,
+    username: account.username,
+    created_at: account.created_at as string | null,
+    arrival: arrival === null
+      ? null
+      : { admission_id: arrival.admission_id as string, last_seen_at: arrival.last_seen_at as string },
+  };
+}
+
+export function parseAdminRealmAccountResidue(value: unknown): AdminRealmAccountResidue {
+  const root = record(value);
+  if (
+    !hasExactKeys(root, REALM_RESIDUE_KEYS) ||
+    root.schema_version !== 1 ||
+    !isCount(root.scan_limit, REALM_RESIDUE_SCAN_LIMIT_MAX) ||
+    root.scan_limit < 1
+  ) {
+    throw new Error("Invalid realm account residue response");
+  }
+  const scanLimit = root.scan_limit;
+  if (root.state === "unavailable") {
+    if (
+      typeof root.unavailable_code !== "string" ||
+      !/^[a-z0-9_]{1,80}$/.test(root.unavailable_code) ||
+      root.truncated !== null ||
+      root.realm_account_count !== null ||
+      root.bound_count !== null ||
+      root.pending_arrival_count !== null ||
+      root.residue_count !== null ||
+      root.accounts !== null
+    ) {
+      throw new Error("Invalid realm account residue response");
+    }
+    return {
+      schema_version: 1,
+      state: "unavailable",
+      unavailable_code: root.unavailable_code,
+      scan_limit: scanLimit,
+      truncated: null,
+      realm_account_count: null,
+      bound_count: null,
+      pending_arrival_count: null,
+      residue_count: null,
+      accounts: null,
+    };
+  }
+  const values = root.accounts;
+  if (
+    root.state !== "available" ||
+    root.unavailable_code !== null ||
+    typeof root.truncated !== "boolean" ||
+    !isCount(root.realm_account_count, scanLimit) ||
+    !isCount(root.bound_count, scanLimit) ||
+    !isCount(root.pending_arrival_count, scanLimit) ||
+    !isCount(root.residue_count, scanLimit) ||
+    // Every account read lands in exactly one partition.
+    root.realm_account_count !== root.bound_count + root.pending_arrival_count + root.residue_count ||
+    !Array.isArray(values) ||
+    values.length > REALM_RESIDUE_LIST_MAX ||
+    values.length > root.pending_arrival_count + root.residue_count
+  ) {
+    throw new Error("Invalid realm account residue response");
+  }
+  const accounts = values.map(parseRealmResidueAccount);
+  const listedResidue = accounts.filter((account) => account.arrival === null).length;
+  if (
+    new Set(accounts.map((account) => account.realm_user_id)).size !== accounts.length ||
+    listedResidue > root.residue_count ||
+    accounts.length - listedResidue > root.pending_arrival_count
+  ) {
+    throw new Error("Invalid realm account residue response");
+  }
+  return {
+    schema_version: 1,
+    state: "available",
+    unavailable_code: null,
+    scan_limit: scanLimit,
+    truncated: root.truncated,
+    realm_account_count: root.realm_account_count,
+    bound_count: root.bound_count,
+    pending_arrival_count: root.pending_arrival_count,
+    residue_count: root.residue_count,
+    accounts,
+  };
+}
+
+export async function getAdminRealmAccountResidue(): Promise<AdminRealmAccountResidue> {
+  const response = await fetch(`${API_BASE}/admin/sso/realm-account-residue`, {
+    credentials: "same-origin",
+    headers: adminSsoHeaders(),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminRealmAccountResidue(await response.json());
+}
+
 // ── Auth (ordinary browser session) ──
 export interface AvatarState {
   revision: string | null;
