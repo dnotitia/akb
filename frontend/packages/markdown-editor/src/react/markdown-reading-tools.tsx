@@ -3,6 +3,11 @@ import { createPortal } from 'react-dom'
 import type { Editor } from '@tiptap/core'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { Decoration, DecorationSet } from '@tiptap/pm/view'
+import type { Node as ProseMirrorNode } from '@tiptap/pm/model'
+
+export function revealMarkdownTarget(target: HTMLElement): void {
+  target.dispatchEvent(new CustomEvent('markdown-reading-reveal', { bubbles: true }))
+}
 
 export interface ReadingTextMatch { from: number; to: number }
 
@@ -23,11 +28,17 @@ export interface MarkdownViewerCodeBlock {
   language: string
   code: string
   collapsed: boolean
+  searchMatch?: boolean
 }
+
+export interface MarkdownViewerSection { index: number; title: string; level: number; collapsed: boolean }
 
 export interface MarkdownViewerReadingOptions {
   renderCodeToolbar?: (block: MarkdownViewerCodeBlock) => ReactNode
   renderImageToolbar?: (image: { index: number; alt: string }) => ReactNode
+  renderSectionToggle?: (section: MarkdownViewerSection) => ReactNode
+  collapsedSections?: readonly number[]
+  onRevealSections?: (indices: readonly number[]) => void
   collapseCodeBlocks?: boolean
   collapsedCodeBlocks?: readonly number[]
   expandedCodeBlocks?: readonly number[]
@@ -36,11 +47,13 @@ export interface MarkdownViewerReadingOptions {
 }
 
 type CodeSlot = MarkdownViewerCodeBlock & { pos: number; size: number; host: HTMLElement }
+type SectionSlot = MarkdownViewerSection & { pos: number; end: number; headingSize: number }
 
 /** Viewer-only decorations. Neither toolbar widgets, folds nor matches enter the document model. */
 export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor | null; options?: MarkdownViewerReadingOptions }) {
   const [slots, setSlots] = useState<CodeSlot[]>([])
   const [imageSlots, setImageSlots] = useState<{ index: number; alt: string }[]>([])
+  const [sectionSlots, setSectionSlots] = useState<SectionSlot[]>([])
   const latest = useRef(options)
   const refresh = useRef<(() => void) | null>(null)
   const enabled = Boolean(options)
@@ -51,19 +64,40 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
     let blocks: CodeSlot[] = []
     let matches: ReadingTextMatch[] = []
     let images: { index: number; alt: string }[] = []
+    let sections: SectionSlot[] = []
+    let hidden: { from: number; to: number }[] = []
+    let roots: { node: ProseMirrorNode; pos: number }[] = []
+    let presentationDoc: ProseMirrorNode | null = null
+    const opened = new Set<number>()
+    let previousCollapsed = latest.current?.collapsedSections
     let lastScroll = ''
     const hosts = new Map<number, HTMLElement>()
     const sync = () => {
       if (editor.isDestroyed) return
       const settings = latest.current
+      presentationDoc = editor.state.doc
+      if (previousCollapsed !== settings?.collapsedSections) { opened.clear(); previousCollapsed = settings?.collapsedSections }
+      roots = []; editor.state.doc.forEach((node, pos) => roots.push({ node, pos }))
+      sections = []
+      const stack: SectionSlot[] = []
+      for (const [index, { node, pos }] of roots.entries()) {
+        if (node.type.name !== 'heading') continue
+        const level = Number(node.attrs.level)
+        while (stack.length && stack[stack.length - 1]!.level >= level) stack.pop()!.end = pos
+        const section = { index, title: node.textContent, level, collapsed: Boolean(settings?.collapsedSections?.includes(index)) && !opened.has(index), pos, end: editor.state.doc.content.size, headingSize: node.nodeSize }
+        sections.push(section); stack.push(section)
+      }
+      sections = sections.filter(section => section.end > section.pos + section.headingSize)
       matches = []
       let limited = false
       const codeBlocks: CodeSlot[] = []
       images = []
       let imageIndex = 0
+      const imagePositions = new Map<number, number>()
       editor.state.doc.descendants((node, pos) => {
         if (node.type.name === 'image') {
           const index = imageIndex++
+          imagePositions.set(index, pos)
           if (!node.marks.some(mark => mark.type.name === 'link')) {
             images.push({ index, alt: String(node.attrs.alt || '') })
           }
@@ -89,10 +123,21 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
           codeBlocks.push({ index, pos, size: node.nodeSize, host, code: node.textContent, language: String(node.attrs.language || 'text'), collapsed: Boolean(collapsed) })
         }
       })
+      const activeMatch = matches[settings?.search?.current ?? 0]
+      const revealedSections = sections.filter(section => section.collapsed && activeMatch && activeMatch.from >= section.pos + section.headingSize && activeMatch.from < section.end)
+      for (const section of revealedSections) { section.collapsed = false; opened.add(section.index) }
+      if (revealedSections.length) settings?.onRevealSections?.(revealedSections.map(section => section.index))
+      hidden = sections.filter(section => section.collapsed).map(section => ({ from: section.pos + section.headingSize, to: section.end }))
+      const isHidden = (position: number) => hidden.some(range => position >= range.from && position < range.to)
+      for (const block of codeBlocks) {
+        block.searchMatch = Boolean(activeMatch && activeMatch.from > block.pos && activeMatch.to < block.pos + block.size)
+        if (block.searchMatch) block.collapsed = false
+      }
       blocks = codeBlocks
       for (const index of hosts.keys()) if (index >= blocks.length) hosts.delete(index)
-      setSlots(blocks)
-      setImageSlots(images)
+      setSlots(blocks.filter(block => !isHidden(block.pos)))
+      setImageSlots(images.filter(image => !isHidden(imagePositions.get(image.index) ?? -1)))
+      setSectionSlots(sections.filter(section => !isHidden(section.pos)))
       editor.view.updateState(editor.state)
       editor.view.dom.dispatchEvent(new Event('markdown-reading-presentation'))
       settings?.onSearchResults?.({ count: matches.length, limited })
@@ -105,9 +150,18 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
     }
     editor.registerPlugin(new Plugin({ key, props: {
       decorations(state) {
+        if (state.doc !== presentationDoc) return DecorationSet.empty
         const decorations: Decoration[] = []
         const settings = latest.current
+        const isHidden = (position: number) => hidden.some(range => position >= range.from && position < range.to)
+        for (const [index, root] of roots.entries()) {
+          const attributes: Record<string, string> = { 'data-reading-block-position': String(root.pos) }
+          if (isHidden(root.pos)) { attributes.hidden = ''; attributes['data-reading-section-hidden'] = 'true' }
+          if (root.node.type.name === 'heading') attributes['data-reading-section-index'] = String(index)
+          decorations.push(Decoration.node(root.pos, root.pos + root.node.nodeSize, attributes))
+        }
         for (const block of blocks) {
+          if (isHidden(block.pos)) continue
           if (block.pos + block.size > state.doc.content.size) continue
           if (settings?.renderCodeToolbar) decorations.push(Decoration.widget(block.pos, block.host, {
             key: `reading-code-${block.index}`, side: -1, ignoreSelection: true, stopEvent: () => true,
@@ -123,10 +177,38 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
       },
     } }))
     refresh.current = sync
-    editor.on('update', sync)
+    const reveal = (target: HTMLElement) => {
+      let position: number
+      const block = target.closest<HTMLElement>('[data-reading-block-position]')
+      try { position = block ? Number(block.dataset.readingBlockPosition) : editor.view.posAtDOM(target, 0) } catch { return }
+      const ancestors = sections.filter(section => section.collapsed && position >= section.pos + section.headingSize && position < section.end)
+      if (!ancestors.length) return
+      ancestors.forEach(section => opened.add(section.index))
+      latest.current?.onRevealSections?.(ancestors.map(section => section.index)); sync()
+    }
+    const onReveal = (event: Event) => { if (event.target instanceof HTMLElement) reveal(event.target) }
+    const findTarget = (hash: string) => {
+      let id: string
+      try { id = decodeURIComponent(hash.replace(/^#/, '')) } catch { return }
+      const target = [...editor.view.dom.querySelectorAll<HTMLElement>('[id]')].find(element => element.id === id)
+      if (target) reveal(target)
+    }
+    const onClick = (event: MouseEvent) => {
+      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.button) return
+      const href = event.target instanceof Element ? event.target.closest('a')?.getAttribute('href') : null
+      if (href?.startsWith('#')) findTarget(href)
+    }
+    const onHash = () => findTarget(window.location.hash)
+    editor.view.dom.addEventListener('markdown-reading-reveal', onReveal)
+    editor.view.dom.addEventListener('beforematch', onReveal)
+    editor.view.dom.addEventListener('click', onClick, true)
+    window.addEventListener('hashchange', onHash)
+    const onTransaction = ({ transaction }: { transaction: { docChanged: boolean } }) => { if (transaction.docChanged) sync() }
+    editor.on('transaction', onTransaction)
     sync()
-    return () => { refresh.current = null; editor.off('update', sync); editor.unregisterPlugin(key) }
+    const frame = requestAnimationFrame(onHash)
+    return () => { cancelAnimationFrame(frame); refresh.current = null; editor.off('transaction', onTransaction); editor.unregisterPlugin(key); editor.view.dom.removeEventListener('markdown-reading-reveal', onReveal); editor.view.dom.removeEventListener('beforematch', onReveal); editor.view.dom.removeEventListener('click', onClick, true); window.removeEventListener('hashchange', onHash) }
   }, [editor, enabled])
   useLayoutEffect(() => { refresh.current?.() }, [options])
-  return <>{slots.map(slot => createPortal(options?.renderCodeToolbar?.(slot), slot.host, `code-${slot.index}`))}{imageSlots.map(slot => <Fragment key={`image-${slot.index}`}>{options?.renderImageToolbar?.(slot)}</Fragment>)}</>
+  return <>{slots.map(slot => createPortal(options?.renderCodeToolbar?.(slot), slot.host, `code-${slot.index}`))}{sectionSlots.map(slot => <Fragment key={`section-${slot.index}`}>{options?.renderSectionToggle?.(slot)}</Fragment>)}{imageSlots.map(slot => <Fragment key={`image-${slot.index}`}>{options?.renderImageToolbar?.(slot)}</Fragment>)}</>
 }

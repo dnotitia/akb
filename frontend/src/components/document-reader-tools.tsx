@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject, type ReactNode } from "react";
 import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, Copy, Minus, Plus, RotateCcw, Search, SlidersHorizontal, X, ZoomIn, ZoomOut, Maximize } from "lucide-react";
 import { findReadingTextMatches, type MarkdownViewerCodeBlock } from "@akb/markdown-editor/react";
 import { useReaderTools } from "@/contexts/reader-tools-context";
@@ -6,25 +6,27 @@ import { DEFAULT_READER_PREFERENCES } from "@/lib/reader-preferences";
 import { DocumentIconButton } from "@/components/document-reading-controls";
 import { Popover, PopoverAnchor, PopoverTrigger, PopoverContent } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 
 export function DocumentReaderToolsActions({ anchorRef }: { anchorRef?: RefObject<HTMLButtonElement | null> }) {
   const tools = useReaderTools();
+  const findTrigger = useRef<HTMLButtonElement>(null);
   const virtualAnchor = useMemo(() => ({ current: { getBoundingClientRect: () => anchorRef?.current?.getBoundingClientRect() ?? new DOMRect() } }), [anchorRef]);
   const openFind = tools?.openFind;
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (!openFind || event.defaultPrevented || event.isComposing || event.altKey || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "f"
-        || document.querySelector('[role="dialog"][data-state="open"], [role="alertdialog"]')
+        || [...document.querySelectorAll('[role="dialog"][data-state="open"], [role="alertdialog"]')].some(dialog => !dialog.contains(anchorRef?.current ?? findTrigger.current))
         || event.target instanceof HTMLElement && event.target.isContentEditable) return;
-      event.preventDefault(); openFind(anchorRef?.current ?? undefined);
+      event.preventDefault(); openFind(findTrigger.current ?? anchorRef?.current ?? undefined);
     };
     window.addEventListener("keydown", keydown); return () => window.removeEventListener("keydown", keydown);
   }, [openFind, anchorRef]);
   if (!tools) return null;
   const { preferences: value, setPreferences } = tools;
   return <>
-    {!anchorRef && <DocumentIconButton label="Find in document" aria-expanded={tools.findOpen} onClick={event => tools.openFind(event.currentTarget)}><Search size={16} aria-hidden /></DocumentIconButton>}
+    <DocumentIconButton ref={findTrigger} label="Find in document" className="document-find-trigger" aria-expanded={tools.findOpen} onClick={event => tools.openFind(event.currentTarget)}><Search size={16} aria-hidden /></DocumentIconButton>
     <Popover open={tools.settingsOpen} onOpenChange={tools.setSettingsOpen}>{anchorRef ? <PopoverAnchor virtualRef={virtualAnchor} /> : <PopoverTrigger asChild><DocumentIconButton label="Reading settings"><SlidersHorizontal size={16} aria-hidden /></DocumentIconButton></PopoverTrigger>}
       <PopoverContent align="end" className="reader-settings" aria-label="Reading settings" onCloseAutoFocus={event => { if (anchorRef?.current) { event.preventDefault(); anchorRef.current.focus({ preventScroll: true }); } }}>
         <h2 className="text-sm font-semibold">Reading settings</h2>
@@ -55,7 +57,7 @@ export function DocumentFindBar() {
     if (event.key === "Escape") { event.preventDefault(); close(); }
     if (event.key === "Enter") { event.preventDefault(); tools.move(event.shiftKey ? -1 : 1); }
   }}>
-    <Search size={15} aria-hidden /><input ref={input} type="search" aria-label="Find text in document" placeholder="Find in this document…" maxLength={256} value={tools.query} onChange={event => tools.setQuery(event.target.value)} />
+    <Search size={15} aria-hidden /><Input ref={input} type="search" className="focus-visible:ring-offset-0" aria-label="Find text in document" placeholder="Find in this document…" maxLength={256} value={tools.query} onChange={event => tools.setQuery(event.target.value)} />
     <output aria-live="polite">{tools.query ? `${tools.result.count ? tools.current + 1 : 0}/${tools.result.count}${tools.result.limited ? "+" : ""}` : ""}</output>
     <Button variant="ghost" size="icon" aria-label="Previous match" disabled={!tools.result.count} onClick={() => tools.move(-1)}><ArrowUp size={14} aria-hidden /></Button>
     <Button variant="ghost" size="icon" aria-label="Next match" disabled={!tools.result.count} onClick={() => tools.move(1)}><ArrowDown size={14} aria-hidden /></Button>
@@ -63,13 +65,14 @@ export function DocumentFindBar() {
   </div>;
 }
 
-export function DocumentCodeToolbar({ block, onToggle }: { block: MarkdownViewerCodeBlock; onToggle: () => void }) {
+export function DocumentCodeToolbar({ block, onToggle, children }: { block: MarkdownViewerCodeBlock; onToggle: () => void; children?: ReactNode }) {
   const [copied, setCopied] = useState(false);
   const [failed, setFailed] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(timer.current), []);
   return <div className="reader-code-toolbar" role="group" aria-label={`${block.language} code tools`}>
     <span className="reader-code-language">{block.language}</span><span className="reader-code-lines">{block.code.split("\n").length} lines</span>
+    {children}
     <Button size="sm" variant="ghost" aria-label={`Copy code block ${block.index + 1}`} onClick={async () => {
       try { await navigator.clipboard.writeText(block.code); setCopied(true); setFailed(false); clearTimeout(timer.current); timer.current = setTimeout(() => setCopied(false), 1500); }
       catch { setFailed(true); }

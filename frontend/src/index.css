@@ -1438,6 +1438,7 @@ body::before {
 /* Reading Studio uses available workspace width, not the browser viewport:
    collection navigation, zoom and the reference pane all consume that width. */
 .reading-studio {
+  --reader-standard-measure: 42rem;
   display: flex; flex-direction: column; height: 100%; min-height: 0; min-width: 0;
   color: var(--color-foreground); background: var(--color-surface);
   container: reading-studio / inline-size;
@@ -1618,6 +1619,10 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
   .reading-studio-header [data-slot=resource-command-actions] { gap: .125rem; }
   .reading-reference-trigger { margin-right: 0; }
 }
+/* Copy remains in More on narrow readers, preserving room for Find and Contents. */
+@container reading-studio (max-width: 24rem) {
+  .reading-studio-header .document-copy-button { display: none; }
+}
 @media (pointer: coarse) { .reading-reference-trigger { min-width: 2.75rem; } }
 
 /* Controls follow reading → references → editing → secondary actions. Inset
@@ -1651,9 +1656,36 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 }
 
 /* Reader tools are presentation only; authored Markdown and editor layout stay intact. */
+.reader-render [data-reading-section-hidden=true] { display: none !important; }
+.reader-render [data-reading-section-index] { padding-inline-end: 2rem; }
+.reader-section-toggle { position: absolute; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; color: var(--color-foreground-muted); border-radius: var(--radius-sm); cursor: pointer; }
+.reader-section-toggle:hover { color: var(--color-link); background: var(--color-surface-hover); }
+.reader-section-toggle:focus-visible, .reader-render [data-footnote-link]:focus-visible, .reader-render [data-footnote-backlinks] a:focus-visible { outline: 2px solid var(--color-ring); outline-offset: 2px; }
+.reader-render [data-markdown-footnote-definition] { position: relative; width: 100%; max-width: var(--document-reading-measure, 52rem); padding: .75rem 1rem .75rem 2.5rem; margin: 1rem auto; border-top: 1px solid var(--color-border); font-size: .875em; }
+.reader-render [data-markdown-footnote-definition]::before { content: attr(data-footnote-number) "."; position: absolute; left: 1rem; color: var(--color-foreground-muted); }
+.reader-render [data-footnote-link] { color: var(--color-link); text-decoration: underline; text-underline-offset: 2px; padding-inline: .15rem; }
+.reader-render [data-footnote-backlinks] { display: flex; gap: .5rem; }
+.reader-render [data-footnote-backlinks] a { padding: .25rem; color: var(--color-link); }
+.reader-footnote-preview { display: grid; gap: .5rem; width: min(24rem, calc(100vw - 1rem)); padding: .875rem; }
+.reader-footnote-preview .reader-footnote-body { font-size: .875rem; }
+.reader-public-tools { display: flex; justify-content: flex-end; gap: .25rem; }
+.reader-mermaid-block { min-width: 0; }
+.reader-mermaid-block .reader-code-toolbar { border-radius: var(--radius-md) var(--radius-md) 0 0; }
+.reader-render [data-markdown-code-tools]:has([data-diagram-mode=diagram]) + pre { display: none; }
+.reader-mermaid-figure { margin: 0; padding: 1rem; border: 1px solid var(--color-border); border-top: 0; border-radius: 0 0 var(--radius-md) var(--radius-md); background: var(--color-surface); }
+.reader-mermaid-figure img { display: block; max-width: 100%; height: auto; margin-inline: auto; }
+.reader-mermaid-status { margin: 0; padding: .75rem; background: var(--color-surface-2); color: var(--color-foreground-muted); font-size: .75rem; }
+@media (pointer: coarse), (max-width: 40rem) {
+  .reader-section-toggle { width: 2.75rem; height: 2.75rem; }
+  .reader-render [data-reading-section-index] { padding-inline-end: 3rem; }
+  .reader-render [data-footnote-backlinks] a { min-width: 2.75rem; min-height: 2.75rem; }
+}
 .reading-primary { display: flex; flex-direction: column; min-height: 0; }
 .reading-primary-content { flex: 1; min-height: 0; }
 .reader-render { position: relative; }
+.reader-render > [data-markdown-surface] { font-size: var(--reader-font-size, 1rem); }
+.document-reading-container .document-reading-source { --document-reading-measure: var(--reader-measure, 42rem); }
+.document-reading-container pre.document-reading-source { font-size: calc(var(--reader-font-size, 1rem) * .8125); }
 .reader-render .document-reading-flow { font-size: var(--reader-font-size, 1rem); }
 .reading-studio .document-reading-source { --document-reading-measure: var(--reader-measure, 42rem); }
 .reader-render .ProseMirror > [data-markdown-code-tools] { width: 100%; max-width: var(--document-reading-measure, 52rem); margin: 1.25rem auto 0; }
@@ -1661,7 +1693,7 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 .reader-render pre[data-reading-folded=true] { display: none; }
 .reader-code-toolbar { display: flex; align-items: center; gap: .65rem; min-height: 2.25rem; padding: .15rem .5rem .15rem .8rem; border: 1px solid var(--color-border); border-radius: var(--radius-md) var(--radius-md) 0 0; background: var(--color-surface-2); font-family: var(--font-sans); font-size: .75rem; line-height: 1.5; }
 .reader-code-language { color: var(--color-foreground); }
-.reader-code-lines { margin-right: auto; color: var(--color-foreground-muted); }
+.reader-code-lines { margin-right: auto; color: var(--color-foreground-muted); white-space: nowrap; }
 .reader-code-toolbar button { height: 1.875rem; min-height: 1.875rem; padding: .25rem .5rem; font-size: .75rem; }
 .reader-code-toolbar button[aria-expanded] { width: 1.875rem; padding: 0; }
 .reader-code-toolbar:has([aria-expanded=false]) { border-radius: var(--radius-md); }
@@ -1685,8 +1717,8 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 .reader-setting-check { display: flex; align-items: center; gap: .6rem; font-size: .75rem; min-height: 2rem; }
 .reader-setting-check input { accent-color: var(--color-primary); }
 .reader-find-bar { flex: none; display: flex; align-items: center; gap: .35rem; min-width: 0; padding: .4rem .75rem; border-bottom: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-foreground-muted); }
-.reader-find-bar input { flex: 1; min-width: 0; height: 2rem; border: 0; background: transparent; color: var(--color-foreground); font-size: .8125rem; outline: none; }
-.reader-find-bar:focus-within { box-shadow: inset 0 -2px var(--color-ring); }
+.reader-find-bar input { flex: 1; min-width: 0; height: 2rem; border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); padding: .375rem .75rem; background: var(--color-surface); color: var(--color-foreground); font-size: .8125rem; }
+.reader-find-bar input:focus-visible { border-color: var(--color-ring); outline: none; }
 .reader-find-bar output { min-width: 2rem; text-align: right; font-size: .75rem; font-variant-numeric: tabular-nums; }
 .reader-find-bar button { width: 2rem; height: 2rem; flex: none; }
 .reader-outline { min-width: 0; font-size: .75rem; }

@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, Link2, Search } from "lucide-react";
 import { useDocOutline } from "@/hooks/use-doc-outline";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { Button } from "@/components/ui/button";
+import { revealMarkdownTarget } from "@akb/markdown-editor/react";
 
 export function DocumentOutline({ markdown, articleEl, documentHref }: { markdown: string; articleEl: HTMLElement | null; documentHref: string }) {
   const { headings, activeSlug } = useDocOutline(markdown, { root: articleEl });
@@ -41,7 +42,7 @@ export function DocumentOutline({ markdown, articleEl, documentHref }: { markdow
         {heading.children ? <button type="button" className="reader-outline-fold" aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${heading.text}`} aria-expanded={!isCollapsed} disabled={Boolean(normalized)} onClick={() => toggle(heading.slug)}>{isCollapsed ? <ChevronRight size={12} aria-hidden /> : <ChevronDown size={12} aria-hidden />}</button> : <span className="reader-outline-fold" />}
         <a href={`#${heading.slug}`} aria-current={activeSlug === heading.slug ? "location" : undefined} onClick={() => {
           const target = articleEl && Array.from(articleEl.querySelectorAll<HTMLElement>("[id]")).find(element => element.id === heading.slug);
-          target?.scrollIntoView?.({ block: "start" });
+          if (target) { revealMarkdownTarget(target); target.scrollIntoView?.({ block: "start" }); }
         }}><TooltipText className="truncate block">{heading.text}</TooltipText></a>
         <button type="button" className="reader-outline-copy" aria-label={`Copy link to ${heading.text}`} onClick={async () => {
           const url = new URL(documentHref, window.location.origin); url.hash = heading.slug;

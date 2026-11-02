@@ -9,7 +9,7 @@ otherwise the labelled reference icon opens a sheet. The panel starts closed on
 entry and document-tab navigation. The icon shows the confirmed relation count,
 including zero; loading/error never implies a zero. Its visible word label is omitted;
 its accessible name, count description, tooltip and expanded state remain. The primary toolbar follows
-Preview/Raw → references + count → saved side document (when present) → Copy → Edit → More. Edit is icon-only.
+Preview/Raw → Find → Contents → references + count → saved side document (when present) → Copy → Edit → More. Edit is icon-only.
 More has one Document details entry containing the outline and Properties,
 plus copy fallbacks and lifecycle actions; the document rail has no whole-graph exploration action.
 Author, update time and
@@ -26,10 +26,13 @@ title and is never part of copied Markdown.
 Full-page Preview and Raw share a centered 42rem reading measure; route-backed
 search previews retain their existing 52rem measure.
 
-The document More menu owns Find in document and Reading settings, keeping the
-primary command row compact. Reader preferences offer compact/standard/wide
+Find in document and Table of contents have direct icon buttons in the reader
+command row, with names, tooltips and expanded states. More owns Reading settings
+and less frequent document actions. Reader preferences offer compact/standard/wide
 measures, body text size, table fit and initially collapsed code. These
 non-content preferences persist locally; document search terms remain in memory.
+The find field has a persistent border and horizontal padding; its own focus
+ring identifies text entry without changing the surrounding row geometry.
 Rendered and Raw finding are separate text surfaces within the same
 document search, with bounded counts, next/previous navigation and focus return.
 Code language, line count, copy and fold controls live in a small block header;
@@ -38,6 +41,16 @@ keyboard-accessible enlargement action with Fit, original size and zoom controls
 The outline supports section-name filtering, ancestor context, hierarchy folding
 and section-link copying. Tab drag reordering has left/right move buttons in the
 open-document list; open and recently closed documents use separate list modes.
+Heading controls fold only their own section, keeping nested folds independent.
+Finding text or following an anchor opens the required ancestors before scrolling.
+Controls are measured outside authored prose; they never enter heading text or
+the serialized document. Preferences are shared across full readers, search and
+reference previews, Raw views, Guides and public documents.
+Footnote references have viewer-local identifiers, a keyboard/touch preview,
+definition navigation and individual return links. Definitions preserve their
+Markdown content through editing. Mermaid loads near the viewport, uses strict
+fixed configuration and AKB theme tokens, and retains copyable source on failure.
+Its diagram/source toggle and enlargement controls belong to the code-block bar.
 The tab manager is a labelled, anchored popover with a compact title, underline
 Open/Recently closed tabs and their counts, and one search field. Document rows
 prioritize title and path, with a check and Current label for the active document.

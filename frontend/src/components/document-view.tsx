@@ -1,6 +1,6 @@
 import { readWithAccessBoundary } from "@/lib/query-access-boundary";
 import { Button } from "@/components/ui/button";
-import { useState, type ReactNode } from "react";
+import { useState, type ReactNode, type CSSProperties } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getDocument } from "@/lib/api";
 import { MarkdownRender } from "@/components/markdown-render";
@@ -12,6 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import { RawDocumentText } from "@/components/document-reader-tools";
+import { useReaderPreferences } from "@/lib/reader-preferences";
 
 type ViewMode = "rendered" | "raw";
 
@@ -70,6 +71,7 @@ export function DocumentView({
   const user = useCurrentUser();
   const { checking, revision } = useAccessVerification();
   const [localView, setLocalView] = useState<ViewMode>("rendered");
+  const { preferences } = useReaderPreferences();
 
   // Controlled vs. uncontrolled view mode
   const view = viewProp ?? localView;
@@ -110,6 +112,7 @@ export function DocumentView({
   return (
     <section
       aria-label="Document content"
+      style={{ "--reader-font-size": `${preferences.fontSize / 16}rem`, "--reader-measure": preferences.width === "compact" ? "36rem" : preferences.width === "wide" ? "64rem" : "var(--reader-standard-measure, 52rem)" } as CSSProperties}
       className={cn(
         "document-reading-container",
         fileAppearance && !bodyOnly &&

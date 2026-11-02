@@ -2,12 +2,18 @@ import {
   MarkdownLocaleProvider,
   MarkdownViewer,
   type MarkdownViewerReadingOptions,
+  revealMarkdownTarget,
 } from "@akb/markdown-editor/react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type CSSProperties } from "react";
 import { useReaderTools } from "@/contexts/reader-tools-context";
-import { DEFAULT_READER_PREFERENCES } from "@/lib/reader-preferences";
+import { useReaderPreferences } from "@/lib/reader-preferences";
 import { DocumentCodeToolbar, DocumentImageOpenButton, ReaderImageZoom } from "@/components/document-reader-tools";
-import { parseMarkdown } from "@akb/markdown-editor";
+import { parseMarkdown, serializeMarkdown } from "@akb/markdown-editor";
+import { ChevronDown, ChevronRight } from "lucide-react";
+import { ReaderMermaid } from "@/components/reader-mermaid";
+import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
+import { Button } from "@/components/ui/button";
+import { useReaderSectionControls } from "@/hooks/use-reader-section-controls";
 import "katex/dist/katex.min.css";
 import {
   createAkbMarkdownAdapters,
@@ -64,15 +70,24 @@ export function MarkdownRender({
 }: MarkdownRenderProps) {
   const body = useMemo(() => stripFrontmatter(markdown || ""), [markdown]);
   const tools = useReaderTools();
-  const preferences = tools?.preferences ?? DEFAULT_READER_PREFERENCES;
+  const { preferences } = useReaderPreferences();
   const [codeState, setCodeState] = useState<{ body: string; overrides: Record<number, boolean> }>({ body, overrides: {} });
   const overrides = useMemo(() => codeState.body === body ? codeState.overrides : {}, [body, codeState]);
-  const renderCodeToolbar = useCallback((block: Parameters<NonNullable<MarkdownViewerReadingOptions["renderCodeToolbar"]>>[0]) =>
-    <DocumentCodeToolbar key={`${body}:${block.index}`} block={block} onToggle={() => setCodeState(previous => ({ body, overrides: { ...(previous.body === body ? previous.overrides : {}), [block.index]: !block.collapsed } }))} />, [body]);
+  const [sectionState, setSectionState] = useState<{ body: string; collapsed: number[] }>({ body, collapsed: [] });
+  const rootRef = useRef<HTMLDivElement>(null);
+  const sectionPositions = useReaderSectionControls(rootRef, body);
+  const collapsedSections = useMemo(() => sectionState.body === body ? sectionState.collapsed : [], [body, sectionState]);
+  const renderSectionToggle = useCallback((section: Parameters<NonNullable<MarkdownViewerReadingOptions["renderSectionToggle"]>>[0]) => <button type="button" className="reader-section-toggle" style={sectionPositions[section.index]} aria-label={`${section.collapsed ? "Expand" : "Collapse"} section: ${section.title}`} aria-expanded={!section.collapsed} title={section.collapsed ? "Expand section" : "Collapse section"} onClick={() => setSectionState(previous => {
+    const before = previous.body === body ? previous.collapsed : [];
+    return { body, collapsed: section.collapsed ? before.filter(index => index !== section.index) : [...before, section.index] };
+  })}>{section.collapsed ? <ChevronRight size={15} aria-hidden /> : <ChevronDown size={15} aria-hidden />}</button>, [body, sectionPositions]);
+  const onRevealSections = useCallback((indices: readonly number[]) => setSectionState(previous => {
+    if (previous.body !== body || !previous.collapsed.some(index => indices.includes(index))) return previous;
+    return { body, collapsed: previous.collapsed.filter(index => !indices.includes(index)) };
+  }), [body]);
   const report = tools?.report;
   const findQuery = searchable && tools?.findOpen ? tools.query : "";
   const current = tools?.current ?? 0;
-  const rootRef = useRef<HTMLDivElement>(null);
   const zoomOpener = useRef<HTMLElement | null>(null);
   const [zoom, setZoom] = useState<{ src: string; alt: string } | null>(null);
   useEffect(() => { setZoom(null); }, [body]);
@@ -82,16 +97,52 @@ export function MarkdownRender({
     if (!readingTools || !image || image.closest("a") || !image.complete || !image.naturalWidth) return;
     event.preventDefault(); event.stopPropagation();
     const index = Array.from(rootRef.current?.querySelectorAll("img[data-markdown-image], img[data-markdown-target]") ?? []).indexOf(image);
-    zoomOpener.current = rootRef.current?.querySelector<HTMLElement>(`button[data-reader-image-index="${index}"]`) ?? null;
+    zoomOpener.current = rootRef.current?.querySelector<HTMLElement>(`button[data-reader-image-index="${index}"]`) ?? image.closest('[data-diagram-mode]')?.querySelector<HTMLElement>('[data-reader-diagram-enlarge]') ?? null;
     setZoom({ src: image.currentSrc || image.src, alt: image.alt });
   };
   const enlarge = useCallback((image: { src: string; alt: string }, opener: HTMLElement) => { zoomOpener.current = opener; setZoom(image); }, []);
+  const renderCodeToolbar = useCallback((block: Parameters<NonNullable<MarkdownViewerReadingOptions["renderCodeToolbar"]>>[0]) => {
+    const onToggle = () => setCodeState(previous => ({ body, overrides: { ...(previous.body === body ? previous.overrides : {}), [block.index]: !block.collapsed } }));
+    return block.language.toLowerCase() === "mermaid" ? <ReaderMermaid key={`${body}:${block.index}`} block={block} onToggle={onToggle} onEnlarge={enlarge} /> : <DocumentCodeToolbar key={`${body}:${block.index}`} block={block} onToggle={onToggle} />;
+  }, [body, enlarge]);
   const renderImageToolbar = useCallback(({ index, alt }: { index: number; alt: string }) => <DocumentImageOpenButton index={index} alt={alt} rootRef={rootRef} onOpen={enlarge} />, [enlarge]);
-  const reading = useMemo<MarkdownViewerReadingOptions>(() => ({ renderCodeToolbar, renderImageToolbar, collapseCodeBlocks: preferences.foldCode,
+  const reading = useMemo<MarkdownViewerReadingOptions>(() => ({ renderCodeToolbar, renderImageToolbar, renderSectionToggle, collapsedSections, onRevealSections, collapseCodeBlocks: preferences.foldCode,
     collapsedCodeBlocks: Object.keys(overrides).filter(index => overrides[Number(index)]).map(Number),
     expandedCodeBlocks: Object.keys(overrides).filter(index => !overrides[Number(index)]).map(Number),
     search: { query: findQuery, current }, onSearchResults: searchable ? report : undefined,
-  }), [renderCodeToolbar, renderImageToolbar, preferences.foldCode, overrides, findQuery, current, searchable, report]);
+  }), [renderCodeToolbar, renderImageToolbar, renderSectionToggle, collapsedSections, onRevealSections, preferences.foldCode, overrides, findQuery, current, searchable, report]);
+  const definitions = useMemo(() => {
+    const result = new Map<string, string>();
+    if (readingTools && body.includes("[^")) for (const node of parseMarkdown(body).content ?? []) {
+      if (node.type === "footnoteDefinition") {
+        const label = String(node.attrs?.label ?? "").normalize("NFC").toLocaleLowerCase();
+        if (!result.has(label)) result.set(label, serializeMarkdown({ type: "doc", content: node.content }));
+      }
+    }
+    return result;
+  }, [body, readingTools]);
+  const [footnote, setFootnote] = useState<{ body: string; source: string; number: string; opener: HTMLAnchorElement; peek: boolean } | null>(null);
+  const note = footnote?.body === body ? footnote : null;
+  const footnoteContent = useRef<HTMLDivElement>(null);
+  const lastFootnote = useRef<typeof footnote>(null);
+  const skipFootnoteReturn = useRef(false);
+  const footnoteTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(footnoteTimer.current), []);
+  const noteAnchor = useMemo(() => ({ current: { getBoundingClientRect: () => note?.opener.getBoundingClientRect() ?? new DOMRect() } }), [note]);
+  const showFootnote = (target: EventTarget | null, peek: boolean) => {
+    const opener = target instanceof Element ? target.closest<HTMLAnchorElement>("a[data-footnote-link][href]") : null;
+    if (!opener || !rootRef.current?.contains(opener)) return false;
+    const source = definitions.get((opener.dataset.footnoteLink || "").normalize("NFC").toLocaleLowerCase());
+    if (source === undefined) return false;
+    clearTimeout(footnoteTimer.current); const next = { body, source, number: opener.dataset.footnoteNumber || "", opener, peek };
+    lastFootnote.current = next; skipFootnoteReturn.current = false; setFootnote(next);
+    if (!peek) requestAnimationFrame(() => footnoteContent.current?.focus({ preventScroll: true }));
+    return true;
+  };
+  const leaveFootnote = () => {
+    clearTimeout(footnoteTimer.current);
+    footnoteTimer.current = setTimeout(() => setFootnote(previous => previous?.peek && document.activeElement !== previous.opener && !footnoteContent.current?.contains(document.activeElement) ? null : previous), 180);
+  };
   const authenticated =
     assetContext?.mode === "authenticated" ? assetContext : undefined;
   const authenticatedVault = authenticated?.vault;
@@ -143,10 +194,12 @@ export function MarkdownRender({
   </> : undefined;
 
   return (
-    <MarkdownLocaleProvider locale="en"><div ref={rootRef} className="reader-render" data-table-fit={preferences.tableFit} onClickCapture={openImage} onKeyDownCapture={openImage}>
+    <MarkdownLocaleProvider locale="en"><div ref={rootRef} className="reader-render" data-table-fit={preferences.tableFit}
+      onClickCapture={event => { if (!event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !event.button && showFootnote(event.target, false)) { event.preventDefault(); event.stopPropagation(); } else openImage(event); }} onKeyDownCapture={openImage}
+      onPointerOverCapture={event => { if (event.pointerType === "mouse" && event.target instanceof Element && event.target.closest("a[data-footnote-link][href]")) { const target = event.target; clearTimeout(footnoteTimer.current); footnoteTimer.current = setTimeout(() => showFootnote(target, true), 250); } }} onPointerOutCapture={leaveFootnote}>
       <MarkdownViewer
         reading={readingTools ? reading : undefined}
-        style={{ "--document-reading-measure": preferences.width === "compact" ? "36rem" : preferences.width === "wide" ? "64rem" : className?.includes("document-reading-flow") && tools ? "42rem" : "52rem", "--reader-font-size": `${preferences.fontSize / 16}rem` } as CSSProperties}
+        style={{ "--document-reading-measure": preferences.width === "compact" ? "36rem" : preferences.width === "wide" ? "64rem" : "var(--reader-standard-measure, 52rem)", "--reader-font-size": `${preferences.fontSize / 16}rem` } as CSSProperties}
         markdown={body}
         afterLeadingHeading={adornment}
         className={cn(
@@ -166,7 +219,16 @@ export function MarkdownRender({
         image={AKB_MARKDOWN_VIEWER_IMAGE_OPTIONS}
         tableLayout={AKB_MARKDOWN_VIEWER_TABLE_LAYOUT}
       />
-    </div><ReaderImageZoom image={zoom} onClose={() => setZoom(null)} returnFocusRef={zoomOpener} /></MarkdownLocaleProvider>
+    </div><ReaderImageZoom image={zoom} onClose={() => setZoom(null)} returnFocusRef={zoomOpener} />
+    <Popover open={Boolean(note)} onOpenChange={open => { if (!open) setFootnote(null); }}><PopoverAnchor virtualRef={noteAnchor} /><PopoverContent ref={footnoteContent} tabIndex={-1} align="start" className="reader-footnote-preview" aria-label={`Footnote ${note?.number}`} onOpenAutoFocus={event => { if (note?.peek) event.preventDefault(); }} onCloseAutoFocus={event => { event.preventDefault(); if (!skipFootnoteReturn.current && lastFootnote.current?.opener.isConnected && !lastFootnote.current.peek) lastFootnote.current.opener.focus({ preventScroll: true }); }} onPointerEnter={() => clearTimeout(footnoteTimer.current)} onPointerLeave={leaveFootnote}>
+      <p className="text-xs font-medium text-foreground-muted">Footnote {note?.number}</p>
+      {note && <MarkdownRender markdown={note.source} readingTools={false} assetContext={assetContext} headingIdPrefix={`${headingIdPrefix}footnote-`} className="reader-footnote-body" />}
+      <Button variant="ghost" size="sm" onClick={() => {
+        const id = note?.opener.getAttribute("href")?.slice(1), target = [...(rootRef.current?.querySelectorAll<HTMLElement>("[id]") ?? [])].find(element => element.id === id);
+        skipFootnoteReturn.current = true; setFootnote(null); if (target) { revealMarkdownTarget(target); target.scrollIntoView({ block: "center" }); target.focus({ preventScroll: true }); }
+      }}>Go to footnote</Button>
+    </PopoverContent></Popover>
+    </MarkdownLocaleProvider>
   );
 }
 
