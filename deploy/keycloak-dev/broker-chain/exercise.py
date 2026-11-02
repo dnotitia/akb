@@ -2658,7 +2658,7 @@ async def _prove_enabled_credential_rotation(
                         "client_id": ROTATED_CLIENT_ID,
                         "client_secret": ROTATED_CLIENT_SECRET,
                         "expected_fingerprint": before_ownership["fingerprint"],
-                        "secret_revision": "fixture-rotation-1",
+                        "secret_revision": "fixture-rotation-1",  # pragma: allowlist secret
                     },
                 )
                 texts.append(changed.text)
@@ -2696,7 +2696,7 @@ async def _prove_enabled_credential_rotation(
                 after_ownership["owner_id"] is not None
                 or after_ownership["revision"] != before_ownership["revision"] + 1
                 or after_ownership["drifted"]
-                or after_ownership["provider_secret_revision"] != "fixture-rotation-1"
+                or after_ownership["provider_secret_revision"] != "fixture-rotation-1"  # pragma: allowlist secret
             ):
                 raise _fail("fixture_rotation_ownership_not_recorded")
 
@@ -2729,7 +2729,7 @@ async def _prove_enabled_credential_rotation(
                     "client_id": ROTATED_CLIENT_ID,
                     "client_secret": ROTATED_CLIENT_SECRET,
                     "expected_fingerprint": after_ownership["fingerprint"],
-                    "secret_revision": "fixture-rotation-1-restored",
+                    "secret_revision": "fixture-rotation-1-restored",  # pragma: allowlist secret
                 },
             )
             texts.append(repeated.text)
@@ -2738,7 +2738,7 @@ async def _prove_enabled_credential_rotation(
             texts.append(repr(restored))
             if (
                 repeated.status_code != 200 or raw_repeated != raw_after
-                or restored["provider_secret_revision"] != "fixture-rotation-1-restored"
+                or restored["provider_secret_revision"] != "fixture-rotation-1-restored"  # pragma: allowlist secret
                 or restored["fingerprint"] != after_ownership["fingerprint"]
             ):
                 raise _fail("fixture_rotation_repeat_not_idempotent")

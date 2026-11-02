@@ -117,7 +117,7 @@ async def standalone(monkeypatch):
 
 def _body(fingerprint: str, **changes: object) -> dict[str, object]:
     body: dict[str, object] = {"client_id": "akb-broker-next", "client_secret": _SECRET,
-                               "expected_fingerprint": fingerprint, "secret_revision": "secret-v2"}
+                               "expected_fingerprint": fingerprint, "secret_revision": "secret-v2"}  # pragma: allowlist secret
     body.update(changes)
     return {key: value for key, value in body.items() if value is not None}
 
@@ -154,7 +154,7 @@ async def test_enabled_unowned_provider_credentials_change_and_record_evidence_w
         assert after["owner_id"] is None and after["revision"] == 1
         assert after["fingerprint"] == ops.provider_fingerprint(control.providers[0]) != before["fingerprint"]
         assert not after["drifted"] and not after["emergency_disabled"]
-        assert after["provider_secret_revision"] == "secret-v2"
+        assert after["provider_secret_revision"] == "secret-v2"  # pragma: allowlist secret
 
         # The same pair again changes nothing in the provider and records the
         # label again: that is how a caller restores cleared evidence.
@@ -166,7 +166,7 @@ async def test_enabled_unowned_provider_credentials_change_and_record_evidence_w
         assert control.providers[0] == provider_before_repeat
         restored = await _ownership(client, lane)
         assert (restored["revision"], restored["fingerprint"]) == (2, after["fingerprint"])
-        assert restored["provider_secret_revision"] == "secret-v2-restored"
+        assert restored["provider_secret_revision"] == "secret-v2-restored"  # pragma: allowlist secret
 
         # A call without a label clears the stored one.
         unlabeled = await client.put(_PATH, headers=lane["pat"],
@@ -278,16 +278,16 @@ async def test_secret_revision_survives_emergency_disable_and_a_cleared_latch(st
         unowned = await _ownership(client, lane)
         await ops.set_ownership("workforce", owner_id="controller-instance", expected_revision=unowned["revision"],
                                 expected_fingerprint=unowned["fingerprint"], clear_emergency=False, actor_id=lane["human"])
-        assert (await _ownership(client, lane))["provider_secret_revision"] == "secret-v7"
+        assert (await _ownership(client, lane))["provider_secret_revision"] == "secret-v7"  # pragma: allowlist secret
         human = await review_human_cookies(client)
         assert (await client.post("/api/v1/admin/sso/providers/workforce/disable", headers=human)).status_code == 200
         latched = await _ownership(client, lane)
-        assert latched["emergency_disabled"] and latched["provider_secret_revision"] == "secret-v7"
+        assert latched["emergency_disabled"] and latched["provider_secret_revision"] == "secret-v7"  # pragma: allowlist secret
         await ops.set_ownership("workforce", owner_id="controller-instance", expected_revision=latched["revision"],
                                 expected_fingerprint=latched["fingerprint"], clear_emergency=True, actor_id=lane["human"])
         cleared = await _ownership(client, lane)
         assert not cleared["emergency_disabled"]
-        assert cleared["provider_secret_revision"] == "secret-v7"
+        assert cleared["provider_secret_revision"] == "secret-v7"  # pragma: allowlist secret
 
 
 async def test_secret_revision_survives_ordinary_toggles_and_configure_clears_it(standalone):
@@ -300,7 +300,7 @@ async def test_secret_revision_survives_ordinary_toggles_and_configure_clears_it
             toggled = await client.post(f"/api/v1/admin/sso/providers/workforce/{verb}", headers=lane["pat"])
             assert toggled.status_code == 200, toggled.text
             observed = await _ownership(client, lane)
-            assert not observed["drifted"] and observed["provider_secret_revision"] == "secret-v8"
+            assert not observed["drifted"] and observed["provider_secret_revision"] == "secret-v8"  # pragma: allowlist secret
         configured = await client.put("/api/v1/admin/sso/providers/workforce", headers=lane["pat"],
             json={"provider_type": "keycloak-oidc", "display_name": "Company SSO", "issuer": OLD,
                   "discovery_url": OLD + "/.well-known/openid-configuration", "client_id": "akb-broker-next"})

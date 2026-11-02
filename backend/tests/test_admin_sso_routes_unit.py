@@ -885,7 +885,7 @@ def _credentials(**changes: object) -> dict[str, object]:
         "client_id": "akb-broker-next",
         "client_secret": _SECRET,
         "expected_fingerprint": _FINGERPRINT,
-        "secret_revision": "secret-v2",
+        "secret_revision": "secret-v2",  # pragma: allowlist secret
     }
     body.update(changes)
     return {key: value for key, value in body.items() if value is not _OMIT}
