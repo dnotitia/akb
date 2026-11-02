@@ -146,10 +146,13 @@ provider_client_credentials_request_invalid`, without echoing the request), and
 a missing or non-string secret (`422 provider_client_secret_required` /
 `provider_client_secret_invalid`).
 
-At the moment of the swap, a sign-in that was already on the upstream login
-page fails once, because its authorization code was issued to the previous
-client; signing in again works. No other session is affected. Remove the old
-secret or client at the upstream only after the change has been read back.
+When the client ID changes, a sign-in that was already on the upstream login
+page at the moment of the swap can fail once, because its authorization code
+was issued to the previous client; signing in again works. A secret-only
+rotation keeps the client ID, so an in-flight sign-in is not bound to a
+different client; keep both secrets valid at the upstream until the change has
+been read back. No other session is affected. Remove the old secret or client
+at the upstream only after the change has been read back.
 
 Changing the issuer or discovery URL still requires disable, configure and
 enable. This endpoint does not rotate anything at the upstream; it only tells
