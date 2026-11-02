@@ -202,7 +202,7 @@ for (const scenario of [{ width: 1440, height: 900, dark: false }, { width: 2560
       expect(b.width).toBeLessThanOrEqual(320);
     } else {
       expect(b.y).toBeGreaterThanOrEqual(a.y + a.height - 1);
-      await preview.getByRole("button", { name: "Table of contents", exact: true }).click();
+      await preview.getByRole("button", { name: "Document details", exact: true }).click();
       await expect(preview.getByRole("textbox", { name: "Summary", exact: true })).toBeFocused();
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
