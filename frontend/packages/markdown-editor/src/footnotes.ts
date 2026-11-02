@@ -21,7 +21,8 @@ export const MarkdownFootnoteReference = Node.create({
   markdownTokenizer: {
     name: 'footnoteReference', level: 'inline', start: source => source.indexOf('[^'),
     tokenize(source) {
-      const match = /^\[\^([^\]\s]{1,200})\]/u.exec(source)
+      // Explicit and reference-style links keep their ordinary link labels.
+      const match = /^\[\^([^\]\s]{1,200})\](?!\(|\[)/u.exec(source)
       if (match) return { type: 'footnoteReference', raw: match[0], label: match[1] }
     },
   },

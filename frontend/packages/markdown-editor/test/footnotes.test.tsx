@@ -24,6 +24,18 @@ it('keeps code and escaped references literal', () => {
   expect(JSON.stringify(parsed)).not.toContain('footnoteDefinition')
 })
 
+it('preserves ordinary inline and reference links with footnote-shaped labels', async () => {
+  const markdown = '[^inline](https://example.org/inline) and [^reference][target]\n\n[target]: https://example.org/reference'
+  const parsed = parseMarkdown(markdown)
+  expect(JSON.stringify(parsed)).not.toContain('footnoteReference')
+  const serialized = serializeMarkdown(parsed)
+  const { container } = render(<MarkdownViewer markdown={serialized} />)
+  await waitFor(() => expect(container.querySelectorAll('a[href]')).toHaveLength(2))
+  expect([...container.querySelectorAll<HTMLAnchorElement>('a[href]')].map(link => [link.textContent, link.href])).toEqual([
+    ['^inline', 'https://example.org/inline'], ['^reference', 'https://example.org/reference'],
+  ])
+})
+
 it('isolates two viewers, numbers repeated references and supplies exact return links', async () => {
   const { container } = render(<><MarkdownViewer markdown={source} /><MarkdownViewer markdown={source} /></>)
   await waitFor(() => expect(container.querySelectorAll('[role="doc-endnote"]')).toHaveLength(2))
