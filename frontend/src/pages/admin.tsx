@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Panel, PanelHeader } from "@/components/ui/panel";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { Logo } from "@/components/logo";
+import { RealmAccountResidue } from "@/components/admin-realm-account-residue";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -143,6 +144,7 @@ export default function AdminPage() {
                 <p className="coord mt-3">{session.auth_mode.toUpperCase()} ADMIN SESSION</p>
               </div>
               {session.auth_mode === "sso" && <SsoProviderControl />}
+              {session.auth_mode === "sso" && <RealmAccountResidue />}
               {error && <Alert variant="destructive">{error}</Alert>}
               <Button type="button" variant="outline" className="w-full" loading={submitting} onClick={signOut}>
                 Sign out

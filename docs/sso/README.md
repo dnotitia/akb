@@ -113,6 +113,55 @@ control and read-only user/prelink verification. It has no `manage-users`;
 broker-user and federated-link mutations require a separate one-time Keycloak
 operator. It does not retain the bootstrap credential.
 
+## Realm account residue
+
+A brokered sign-in creates an account in the installation realm before AKB
+decides whether to admit the person. When AKB refuses the arrival (under
+`invite_only`, or before an administrator approves it), it records the
+arrival, but the realm account remains, and the management account cannot
+remove it. `/admin` therefore shows a read-only reconciliation:
+
+```text
+residue = realm accounts - (exact AKB bindings ∪ recorded arrivals)
+```
+
+```text
+GET /api/v1/admin/sso/realm-account-residue
+```
+
+The route exists only in `auth_mode: sso` and requires a signed-in product
+administrator; a platform service key is not accepted. It uses only the
+`query-users` and `view-users` roles the management account already holds:
+one token request and paged `GET` user listings. It never deletes, disables,
+or expires an account. Removing one stays a separate, one-time Keycloak
+operator action. An old account can belong to a person whose admission is only
+pending, so AKB does not expire accounts by age.
+
+- An **exact binding** is an AKB identity binding for this realm's issuer
+  whose subject is the realm account's id.
+- A **recorded arrival** is a pending admission for the same issuer and
+  subject that is still inside the retention window. An arrival past
+  retention no longer counts.
+
+The response is versioned (`schema_version: 1`). Its keys are the same in
+both states:
+
+| Field | Meaning |
+| --- | --- |
+| `state` | `available`, or `unavailable` when the realm could not be read |
+| `unavailable_code` | value-less reason, for example `realm_accounts_unavailable` or `keycloak_provider_control_delegated`; null when available |
+| `scan_limit` | the most realm accounts one read examines (1000) |
+| `truncated` | true when the realm holds more accounts than `scan_limit`; the counts then cover only the accounts read |
+| `realm_account_count` | accounts read; equals `bound_count + pending_arrival_count + residue_count` |
+| `pending_arrival_count` | unbound accounts with a recorded arrival |
+| `residue_count` | unbound accounts with no recorded arrival |
+| `accounts` | at most 200 unbound accounts, residue first, then oldest first: `realm_user_id`, `username`, `created_at` (null if the realm reports none) and `arrival` (`admission_id`, `last_seen_at`) or null |
+
+When the realm read fails, every count and `accounts` are null. An
+administrator never sees a zero for a read that did not happen. Service-account
+users are not part of the realm's user listing. The read reflects one point in
+time, so an account created during the read can be missed.
+
 ## Built-in providers
 
 - [Generic OIDC](providers/oidc.md) configures standards-based upstreams from

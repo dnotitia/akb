@@ -21,6 +21,7 @@ from app.models.admin_sso import (
     SsoIdentityMigrationResponse,
     SsoProviderCatalogResponse,
     SsoProviderMutationResponse,
+    SsoRealmAccountResidueResponse,
 )
 from app.services import audit_log
 from app.sso.keycloak_admin import (
@@ -40,6 +41,7 @@ from app.sso.models import (
     ProviderMutationReadback,
     ProviderReadback,
 )
+from app.sso.realm_residue import realm_account_residue
 from app.sso.registry import provider_types
 from app.sso.identity_operations import provider_mutation_guard
 from app.api.routes.admin_sso_operations import router as operations_router
@@ -662,6 +664,24 @@ async def rollback_sso_identity_migration(
         actor,
         operation="rollback",
     )
+
+
+@router.get(
+    "/admin/sso/realm-account-residue",
+    summary="Count realm accounts with neither an AKB binding nor a recorded arrival",
+    response_model=SsoRealmAccountResidueResponse,
+)
+async def read_realm_account_residue(
+    _actor: ProductAdminActor = Depends(get_current_product_admin),
+):
+    """Read-only reconciliation for a signed-in product administrator.
+
+    It uses only the management client's existing read access to realm users
+    and never deletes, disables, or expires an account. A failed realm read is
+    returned as ``state=unavailable`` with null counts, not as an error that a
+    caller might render as an empty list.
+    """
+    return await realm_account_residue(get_keycloak_provider_control())
 
 
 legacy_router = router
