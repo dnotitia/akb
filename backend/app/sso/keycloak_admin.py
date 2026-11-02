@@ -9,6 +9,7 @@ response bodies in an error.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -55,6 +56,10 @@ class ProviderControlError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+# RFC 6750 b64token: what may follow "Bearer " in an Authorization header.
+_BEARER_TOKEN_RE = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 
 
 def _fail(code: str) -> ProviderControlError:
@@ -294,6 +299,12 @@ class KeycloakProviderControl:
         )
         token = body.get("access_token")
         if not isinstance(token, str) or not token or len(token) > 16_384:
+            raise _fail("keycloak_provider_token_invalid")
+        # The token goes into an Authorization header. Anything outside the
+        # RFC 6750 token alphabet would otherwise fail while the request is
+        # built, outside every ProviderControlError path, and reach callers as
+        # an unexpected exception instead of a value-less control failure.
+        if _BEARER_TOKEN_RE.fullmatch(token) is None:
             raise _fail("keycloak_provider_token_invalid")
         return token
 

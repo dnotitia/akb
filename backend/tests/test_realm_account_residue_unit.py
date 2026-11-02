@@ -406,6 +406,23 @@ async def test_a_refused_listing_is_unavailable(status_code):
     assert failure.value.code == "realm_accounts_unavailable"
 
 
+@pytest.mark.parametrize("token", ["invalid-\u2603", "has space", "line\nbreak", "quote\""])
+@pytest.mark.asyncio
+async def test_a_malformed_management_token_is_a_control_failure(token):
+    """A token that cannot be a bearer value fails as ProviderControlError, so the
+    projection reports it as unavailable instead of raising while the request is built."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": token})
+        raise AssertionError("no listing request may be built with a malformed token")
+
+    control = KeycloakProviderControl(_config(), transport=httpx.MockTransport(respond))
+    with pytest.raises(ProviderControlError) as failure:
+        await control.list_realm_accounts(limit=10)
+    assert failure.value.code == "keycloak_provider_token_invalid"
+
+
 @pytest.mark.asyncio
 async def test_an_absent_creation_time_is_carried_as_unknown():
     body = [{"id": "federated", "username": "ldap-person"}]
