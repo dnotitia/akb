@@ -10,6 +10,7 @@ import { DocumentReadingWorkspace } from "@/components/document-reading-workspac
 import { ApiError, getDocument, getRelations, type CurrentUser } from "@/lib/api";
 import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { emptyReadingSession, writeReadingSession, READING_SESSION_PREFIX } from "@/lib/reading-session";
 import { useReadingChrome } from "@/contexts/reading-chrome-context";
 
 vi.mock("@/lib/api", async original => ({ ...await original<typeof import("@/lib/api")>(), getDocument: vi.fn(), getRelations: vi.fn() }));
@@ -35,8 +36,7 @@ function Primary({ blocked }: { blocked: boolean }) {
     <a href="/vault/alpha/doc/b.md?commit=older">Historical reference</a>
   </div></>;
 }
-function setup({ blocked = false, revision = 0 } = {}) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function setup({ blocked = false, revision = 0, client = new QueryClient({ defaultOptions: { queries: { retry: false } } }) } = {}) {
   const renderTree = (nextRevision: number) => <QueryClientProvider client={client}><MemoryRouter initialEntries={["/vault/alpha/doc/a.md"]}>
     <CurrentUserProvider user={{ user_id: "reader" } as CurrentUser} revision={nextRevision}>
       <ResourceNavigationProvider><ReadingWorkspaceProvider><Routes>
@@ -183,6 +183,7 @@ describe("Reading Studio", () => {
     await user.keyboard("{Delete}");
     expect(screen.queryByRole("tab", { name: "Document B" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Open document list" }));
+    await user.click(screen.getByRole("tab", { name: /^Recently closed/ }));
     await user.click(screen.getByRole("button", { name: /Document B.*b.md/ }));
     await screen.findByRole("tab", { name: "Document B" });
   });
@@ -225,4 +226,81 @@ describe("Reading Studio", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     await waitFor(() => expect(screen.getByRole("link", { name: "Reference B" })).toHaveFocus());
   });
+  it("reorders through the document list and closes with the middle button", async () => {
+    const user = userEvent.setup(); setup(); await screen.findByRole("tab", { name: "Document A" });
+    await user.click(screen.getByRole("link", { name: "Reference B" }));
+    await user.click(await screen.findByRole("button", { name: "Keep in tabs" }));
+    await user.click(screen.getByRole("button", { name: "Close reference preview" }));
+    await waitFor(() => expect(screen.getByRole("link", { name: "Reference B" })).toHaveFocus());
+    await user.click(screen.getByRole("button", { name: "Open document list" }));
+    await user.click(screen.getByRole("button", { name: "Tab actions for Document B" }));
+    await user.click(screen.getByRole("menuitem", { name: "Move Document B left" }));
+    expect(within(screen.getByRole("tablist", { name: "Open documents" })).getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Document B", "Document A"]);
+    await user.keyboard("{Escape}");
+    fireEvent(screen.getByRole("tab", { name: "Document B" }), new MouseEvent("auxclick", { bubbles: true, button: 1 }));
+    expect(screen.queryByRole("tab", { name: "Document B" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Document A" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("restores saved tabs and the side document only after their access proof succeeds", async () => {
+    const session = emptyReadingSession();
+    const saved = { vault: "alpha", path: "b.md", title: "Stale secret title", href: "/vault/alpha/doc/b.md" };
+    session.tabs = [saved]; session.companion = saved; writeReadingSession("reader", session);
+    let resolve!: (value: typeof docs["b.md"]) => void;
+    const pending = new Promise<typeof docs["b.md"]>(done => { resolve = done; });
+    vi.mocked(getDocument).mockImplementation(async (_vault, path) => path === "b.md" ? pending : docs[path]);
+    setup();
+    expect(screen.queryByText("Stale secret title")).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Document B" })).toBeNull();
+    await act(async () => resolve(docs["b.md"]));
+    expect(await screen.findByRole("tab", { name: "Document B" })).toBeInTheDocument();
+    expect(await screen.findByRole("complementary", { name: "Side document: Document B" })).toBeInTheDocument();
+    expect(localStorage.getItem(READING_SESSION_PREFIX + "reader")).not.toContain("Stale secret title");
+  });
+
+  it("keeps the side document while the primary tab changes and exposes an accessible splitter", async () => {
+    const user = userEvent.setup(); setup(); await screen.findByRole("tab", { name: "Document A" });
+    await user.click(screen.getByRole("link", { name: "Reference B" }));
+    await user.click(await screen.findByRole("button", { name: "Keep side by side" }));
+    const side = await screen.findByRole("complementary", { name: "Side document: Document B" });
+    const splitter = screen.getByRole("separator", { name: "Resize side document" });
+    const before = Number(splitter.getAttribute("aria-valuenow"));
+    fireEvent.keyDown(splitter, { key: "ArrowLeft" });
+    expect(Number(splitter.getAttribute("aria-valuenow"))).toBeGreaterThan(before);
+    await user.click(screen.getByRole("tab", { name: "Document B" }));
+    expect(await screen.findByRole("complementary", { name: "Side document: Document B" })).toBe(side);
+    expect(screen.getByTestId("location")).toHaveTextContent("/vault/alpha/doc/b.md");
+    await user.click(screen.getByRole("button", { name: "Close side document" }));
+    expect(screen.queryByRole("complementary", { name: "Side document: Document B" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Document B" })).toBeInTheDocument();
+  });
+
+  it("removes denied saved tabs without exposing their old labels", async () => {
+    const session = emptyReadingSession(); session.tabs = [{ vault: "alpha", path: "b.md", title: "Private saved title", href: "/vault/alpha/doc/b.md" }];
+    writeReadingSession("reader", session);
+    vi.mocked(getDocument).mockImplementation(async (_vault, path) => { if (path === "b.md") throw new ApiError("Denied", 403, {}); return docs[path]; });
+    setup(); await screen.findByRole("tab", { name: "Document A" });
+    await waitFor(() => expect(localStorage.getItem(READING_SESSION_PREFIX + "reader")).not.toContain("b.md"));
+    expect(screen.queryByText("Private saved title")).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Document B" })).toBeNull();
+  });
+
+  it("bounds restoration even when the foreground document is already cached at the end", async () => {
+    const session = emptyReadingSession();
+    const paths = Array.from({ length: 8 }, (_, index) => `saved-${index}.md`);
+    session.tabs = [...paths, "a.md"].map(path => ({ vault: "alpha", path, title: "", href: `/vault/alpha/doc/${path}` }));
+    writeReadingSession("reader", session);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["document", "alpha", "a.md", undefined, "reader", 0], docs["a.md"]);
+    const pending = new Map<string, (value: typeof docs["a.md"]) => void>();
+    vi.mocked(getDocument).mockImplementation((_vault, path) => path === "a.md" ? Promise.resolve(docs[path]) : new Promise(resolve => { pending.set(path, resolve); }));
+    setup({ client });
+    await screen.findByRole("tab", { name: "Document A" });
+    expect([...pending.keys()]).toEqual(paths.slice(0, 4));
+    await act(async () => pending.get(paths[1])!({ ...docs["a.md"], path: paths[1], title: "Saved second" }));
+    expect([...pending.keys()]).toEqual(paths.slice(0, 4));
+    await act(async () => pending.get(paths[0])!({ ...docs["a.md"], path: paths[0], title: "Saved first" }));
+    await waitFor(() => expect([...pending.keys()]).toEqual(paths.slice(0, 6)));
+  });
+
 });

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add optional viewer-only code/image toolbar slots, code folding and bounded
+  literal-text search decorations. Reading controls and matches never enter
+  authored Markdown, editor history or serialized output.
+- Export `findReadingTextMatches` for products with a separate raw-text view.
+
 ## 0.17.1
 
 - Decode escaped braced person identities for exact resolver lookup and preserve

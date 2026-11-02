@@ -3,6 +3,9 @@ import { createContext, useContext, type Dispatch, type SetStateAction, type Rea
 export interface ReadingChrome {
   toolbarHost: HTMLElement | null;
   referenceControl: ReactNode;
+  sideControl?: ReactNode;
+  panelControl?: ReactNode;
+  openSideBySide?: () => void;
   detailsHost: HTMLElement | null;
   contextHeaderHost: HTMLElement | null;
   narrow: boolean;

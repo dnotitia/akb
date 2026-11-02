@@ -49,4 +49,19 @@ describe("DocumentOutline", () => {
     expect(location.hash).toBe("#details");
     cleanup();
   });
+  it("keeps ancestors in search and restores the collapsed hierarchy afterwards", async () => {
+    const user = userEvent.setup(); render(<Harness md={md} />);
+    await user.click(screen.getByRole("button", { name: "Collapse Details" }));
+    expect(screen.queryByRole("link", { name: "기술 스택" })).toBeNull();
+    await user.type(screen.getByRole("searchbox", { name: "Find a section" }), "기술");
+    expect(screen.getByRole("link", { name: "Intro" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Details" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "기술 스택" })).toBeInTheDocument();
+    await user.clear(screen.getByRole("searchbox", { name: "Find a section" }));
+    expect(screen.queryByRole("link", { name: "기술 스택" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Expand all" }));
+    expect(screen.getByRole("link", { name: "기술 스택" })).toBeInTheDocument();
+    cleanup();
+  });
+
 });

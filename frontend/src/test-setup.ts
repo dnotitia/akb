@@ -1,12 +1,14 @@
 import "@testing-library/jest-dom/vitest";
 import { afterEach } from "vitest";
 import { cleanup } from "@testing-library/react";
+import { clearReadingSessions } from "@/lib/reading-session";
 
 // Auto-cleanup after each test. @testing-library/react only registers this
 // automatically when `afterEach` is a global (i.e. globals:true in vitest
 // config). Since this project uses globals:false, we wire it up here.
 afterEach(() => {
   cleanup();
+  clearReadingSessions();
 });
 
 // jsdom doesn't implement ResizeObserver — our useMeasuredHeight relies on it,

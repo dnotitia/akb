@@ -128,6 +128,7 @@ export function DocumentContextPanel({ id: suppliedId, open, onOpenChange, view,
   const rememberFocus: FocusEventHandler<HTMLElement> = event => { if (event.target instanceof HTMLElement && event.currentTarget.contains(event.target)) lastPanelFocus.current = event.target; };
   const heading = <div className="document-panel-heading">
       {docked ? <h2 id={`${id}-heading`}>Document details</h2> : <DialogTitle>Document details</DialogTitle>}
+      {docked && readingChrome?.panelControl}
       <Button ref={closeRef} type="button" variant="ghost" size="icon" aria-label="Close document panel" onClick={() => onOpenChange(false)}><X className="h-4 w-4" aria-hidden /></Button>
     </div>;
   const body = <>

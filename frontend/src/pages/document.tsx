@@ -1,5 +1,7 @@
 import { readWithAccessBoundary } from "@/lib/query-access-boundary";
 import { DocumentReadingWorkspace } from "@/components/document-reading-workspace";
+import { DocumentReaderToolsActions } from "@/components/document-reader-tools";
+import { useReaderTools } from "@/contexts/reader-tools-context";
 import { Suspense, lazy, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { createPortal, flushSync } from "react-dom";
@@ -28,6 +30,9 @@ import {
   History,
   Maximize2,
   Pencil,
+  Search,
+  SlidersHorizontal,
+  Columns2,
 } from "lucide-react";
 import {
   ApiError,
@@ -173,6 +178,7 @@ function DocumentPageContent({
   const { name, id } = useParams<{ name: string; id: string }>();
   const currentUser = useCurrentUser();
   const readingChrome = useReadingChrome();
+  const readerTools = useReaderTools();
   const { checking: accessChecking, revision: accessRevision } = useAccessVerification();
   const resourceScope = JSON.stringify([name, id, currentUser?.user_id, accessRevision]);
   const viewId = useId();
@@ -235,7 +241,7 @@ function DocumentPageContent({
   const publicationTriggerRef = useRef<HTMLButtonElement | null>(null);
   const copyActionRef = useRef<DocumentCopyHandle | null>(null);
   const linkCopyActionRef = useRef<DocumentCopyHandle | null>(null);
-  const menuHandoff = useRef<"copy" | "link" | "publication" | "history" | "details" | null>(null);
+  const menuHandoff = useRef<"copy" | "link" | "publication" | "history" | "details" | "find" | "reading" | "split" | null>(null);
   useEffect(() => {
     setDetailsOpen(false);
     setCopyNotice(null);
@@ -1568,6 +1574,8 @@ function DocumentPageContent({
               <DocumentReadModes view={view === "raw" ? "raw" : "rendered"} onChange={setView} idPrefix={viewId} contentId="document-reading-canvas" labelled={Boolean(readingChrome)} />
             </div>}
             {readingChrome?.referenceControl}
+            {readingChrome?.sideControl}
+            {!isDiffMode && readingChrome && <DocumentReaderToolsActions anchorRef={actionsTriggerRef} />}
             <DocumentCopyButton key={resourceScope} content={doc.content || ""} actionRef={copyActionRef} returnFocusRef={actionsTriggerRef} onCopied={label => setCopyNotice({ label })} />
             {canEdit && <DocumentIconButton ref={editButtonRef} label="Edit" className="document-reader-edit text-link" onClick={() => requestEdit()}>
               <Pencil className="h-4 w-4" aria-hidden />
@@ -1588,6 +1596,9 @@ function DocumentPageContent({
                 menuHandoff.current = null;
                 requestAnimationFrame(() => {
                   if (action === "publication") publicationTriggerRef.current?.click();
+                  else if (action === "find") readerTools?.openFind(actionsTriggerRef.current ?? undefined);
+                  else if (action === "reading") readerTools?.setSettingsOpen(true);
+                  else if (action === "split") readingChrome?.openSideBySide?.();
                   else if (action === "history" || action === "details") {
                     setHistoryReturnFocus(null);
                     setDetailsTab(action === "history" ? "history" : "outline"); setDetailsOpen(true);
@@ -1610,6 +1621,11 @@ function DocumentPageContent({
               readerControl
             >
               {readingChrome && <>
+                {!isDiffMode && <>
+                  <DropdownMenu.Item className="document-reader-menu-item" onSelect={() => { menuHandoff.current = "find"; }}><Search className="h-4 w-4" aria-hidden />Find in document</DropdownMenu.Item>
+                  <DropdownMenu.Item className="document-reader-menu-item" onSelect={() => { menuHandoff.current = "reading"; }}><SlidersHorizontal className="h-4 w-4" aria-hidden />Reading settings</DropdownMenu.Item>
+                  <DropdownMenu.Item className="document-reader-menu-item" onSelect={() => { menuHandoff.current = "split"; }}><Columns2 className="h-4 w-4" aria-hidden />Read side by side</DropdownMenu.Item>
+                </>}
                 <DropdownMenu.Item className="document-reader-menu-item" onSelect={() => { menuHandoff.current = "details"; }}><Info className="h-4 w-4" aria-hidden />Document details</DropdownMenu.Item>
                 <DropdownMenu.Separator className="my-1 h-px bg-border" />
               </>}
@@ -1962,6 +1978,7 @@ function DocumentPageContent({
                   onViewChange={(next) => setView(next)}
                   appearance="file"
                   bodyOnly
+                  searchable={Boolean(readingChrome)}
                   idPrefix={viewId}
                   leadingMetadata={readingChrome ? metadata : undefined}
                 />

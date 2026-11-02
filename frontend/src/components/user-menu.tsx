@@ -13,6 +13,7 @@ import { TooltipText } from "@/components/ui/tooltip-text";
 import { useSettingsDialog } from "@/contexts/settings-dialog-context";
 import { useResourceNavigation } from "@/contexts/resource-navigation-context";
 import { useCurrentUser, useAccessVerification } from "@/contexts/current-user-context";
+import { clearReadingSessions } from "@/lib/reading-session";
 import { UserAvatar } from "@/components/user-avatar";
 
 const THEME_LABELS: Record<Theme, string> = {
@@ -59,6 +60,7 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
     setSigningOut(true);
     try {
       const result = await logoutOrdinarySession();
+      clearReadingSessions();
       queryClient.clear();
       if (result.mode === "sso") {
         window.location.assign(result.logout_url);

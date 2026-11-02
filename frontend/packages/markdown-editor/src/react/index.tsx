@@ -12,6 +12,9 @@ import type { ComponentPropsWithoutRef, DragEventHandler, ReactNode } from 'reac
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { EditorContent, useEditor } from '@tiptap/react'
 import { createPortal } from 'react-dom'
+import { MarkdownViewerReadingTools, type MarkdownViewerReadingOptions } from './markdown-reading-tools.js'
+export { findReadingTextMatches } from './markdown-reading-tools.js'
+export type { MarkdownViewerReadingOptions, MarkdownViewerCodeBlock, ReadingTextMatch } from './markdown-reading-tools.js'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { Decoration, DecorationSet } from '@tiptap/pm/view'
 import type { Editor } from '@tiptap/core'
@@ -743,6 +746,7 @@ export function MarkdownSurface({
 
     const managed = new Map<HTMLElement, { tagName: string; id: string | null }>()
     const apply = () => {
+      for (const heading of managed.keys()) if (!heading.isConnected) managed.delete(heading)
       const offset = Math.trunc(headings.levelOffset ?? 0)
       markdownContentElements<HTMLElement>(root, 'h1, h2, h3, h4, h5, h6').forEach((heading, index) => {
         const original = managed.get(heading) ?? {
@@ -791,6 +795,7 @@ export function MarkdownSurface({
     }
 
     apply()
+    root.addEventListener('markdown-reading-presentation', apply)
     editor.on('transaction', apply)
     const observer = typeof MutationObserver === 'undefined'
       ? null
@@ -799,6 +804,7 @@ export function MarkdownSurface({
 
     return () => {
       editor.off('transaction', apply)
+      root.removeEventListener('markdown-reading-presentation', apply)
       observer?.disconnect()
       restore()
     }
@@ -1980,6 +1986,8 @@ export function MarkdownEditor({
 }
 
 export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor' | 'editable'> {
+  /** Optional presentation-only code controls, folding and literal text search. */
+  reading?: MarkdownViewerReadingOptions
   /** Read-only presentation after a leading heading, or before a headingless body. Never serialized. */
   afterLeadingHeading?: ReactNode
   markdown: string
@@ -1991,6 +1999,7 @@ export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor'
 
 export function MarkdownViewer({
   markdown,
+  reading,
   afterLeadingHeading,
   profile = 'preserve',
   adapters,
@@ -2063,6 +2072,7 @@ export function MarkdownViewer({
 
   return (
     <>
+      <MarkdownViewerReadingTools editor={rawEditor} options={reading} />
       <MarkdownSurface
         {...props}
         editor={editor}
