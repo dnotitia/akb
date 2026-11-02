@@ -1,7 +1,7 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
 import { useLocation } from "react-router-dom";
 
-import { READER_PREFERENCES_KEY as storageKey, readReaderPreferences, type ReaderPreferences } from "@/lib/reader-preferences";
+import { useReaderPreferences, type ReaderPreferences } from "@/lib/reader-preferences";
 
 interface ReaderTools {
   preferences: ReaderPreferences;
@@ -19,11 +19,7 @@ const ReaderToolsContext = createContext<ReaderTools | null>(null);
 export function ReaderToolsProvider({ children }: { children: ReactNode }) {
   const location = useLocation();
   const identity = location.pathname + (new URLSearchParams(location.search).get("commit") || "");
-  const [preferences, updatePreferences] = useState(readReaderPreferences);
-  const setPreferences = useCallback((next: ReaderPreferences) => {
-    updatePreferences(next);
-    try { localStorage.setItem(storageKey, JSON.stringify(next)); } catch { /* Reading remains available without storage. */ }
-  }, []);
+  const { preferences, setPreferences } = useReaderPreferences();
   const [search, setSearch] = useState({ identity, open: false, query: "", current: 0, count: 0, limited: false });
   const [settings, setSettings] = useState({ identity, open: false });
   const setSettingsOpen = useCallback((open: boolean) => setSettings({ identity, open }), [identity]);
@@ -44,10 +40,6 @@ export function ReaderToolsProvider({ children }: { children: ReactNode }) {
     if (previous.identity !== identity || (previous.count === result.count && previous.limited === result.limited)) return previous;
     return { ...previous, ...result, current: result.count ? Math.min(previous.current, result.count - 1) : 0 };
   }), [identity]);
-  useEffect(() => {
-    const sync = (event: StorageEvent) => { if (event.key === storageKey || event.key === null) updatePreferences(readReaderPreferences()); };
-    window.addEventListener("storage", sync); return () => window.removeEventListener("storage", sync);
-  }, []);
   const { open: findOpen, query, current: currentMatch, count, limited } = scoped;
   const value = useMemo(() => ({ preferences, setPreferences, findOpen, findRequest, query, current: currentMatch,
     settingsOpen: settings.identity === identity && settings.open, setSettingsOpen,

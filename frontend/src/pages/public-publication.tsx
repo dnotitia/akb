@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useParams } from "react-router-dom";
 import { ArrowLeft, FileQuestion } from "lucide-react";
 import { MarkdownRender } from "@/components/markdown-render";
+import { ReaderToolsProvider } from "@/contexts/reader-tools-context";
+import { DocumentFindBar, DocumentReaderToolsActions } from "@/components/document-reader-tools";
 import {
   getPublication,
   publicationCapabilities,
@@ -25,7 +27,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 export default function PublicationPage() {
   const { slug } = useParams<{ slug: string }>();
   const { search } = useLocation();
-  return <PublicationContent key={`${slug}:${search}`} slug={slug} search={search} />;
+  return <ReaderToolsProvider><PublicationContent key={`${slug}:${search}`} slug={slug} search={search} /></ReaderToolsProvider>;
 }
 
 function PublicationContent({ slug, search }: { slug?: string; search: string }) {
@@ -228,7 +230,10 @@ function DocumentBody({ slug, data }: { slug: string; data: PublicationResponse 
     <article className="flex min-w-0 flex-col gap-4">
       {/* Left rail — metadata */}
       <header className="min-w-0 border-b border-border pb-4">
-        <h1 className="font-display text-2xl sm:text-3xl font-semibold text-foreground leading-tight tracking-tight break-words">{data.title}</h1>
+        <div className="flex items-start justify-between gap-3">
+          <h1 className="min-w-0 font-display text-2xl sm:text-3xl font-semibold text-foreground leading-tight tracking-tight break-words">{data.title}</h1>
+          <div className="reader-public-tools shrink-0"><DocumentReaderToolsActions /></div>
+        </div>
         <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-foreground-muted">
           {/* Author attribution comes only from the resolved display name; the
               backend no longer sends the raw created_by identifier (F8). */}
@@ -259,6 +264,7 @@ function DocumentBody({ slug, data }: { slug: string; data: PublicationResponse 
 
       {/* Main column */}
       <div className="min-w-0">
+        <DocumentFindBar />
         <SummaryFold summary={data.summary} className="mb-4" />
 
         {data.content_unavailable && (
@@ -278,6 +284,7 @@ function DocumentBody({ slug, data }: { slug: string; data: PublicationResponse 
 
         <MarkdownRender
           markdown={data.content || ""}
+          searchable
           className="text-[15px]"
           assetContext={{ mode: "publication", slug }}
         />

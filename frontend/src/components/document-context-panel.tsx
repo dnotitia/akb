@@ -8,6 +8,7 @@ import { Dialog, DialogOverlay, DialogPortal, DialogTitle } from "@/components/u
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useModalCount } from "@/lib/modal-visibility";
+import { revealMarkdownTarget } from "@akb/markdown-editor/react";
 
 export type DocumentContextView = "info" | "outline" | "relations" | "history";
 const sections = [{ id: "info", label: "Properties" }, { id: "history", label: "Version history" }, { id: "relations", label: "Related documents" }] as const;
@@ -123,6 +124,7 @@ export function DocumentContextPanel({ id: suppliedId, open, onOpenChange, view,
     const heading = canvas?.querySelector<HTMLElement>(`[id="${CSS.escape(href.slice(1))}"]`);
     if (!canvas || !heading) return;
     event.preventDefault();
+    revealMarkdownTarget(heading);
     canvas.scrollTop += heading.getBoundingClientRect().top - canvas.getBoundingClientRect().top - canvas.clientTop;
   };
   const rememberFocus: FocusEventHandler<HTMLElement> = event => { if (event.target instanceof HTMLElement && event.currentTarget.contains(event.target)) lastPanelFocus.current = event.target; };

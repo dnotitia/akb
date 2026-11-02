@@ -25,12 +25,13 @@ import { Alert } from "@/components/ui/alert";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { revealMarkdownTarget } from "@akb/markdown-editor/react";
 
 /** Route-level previews retain their own dialog/guard. Only full reader pages
  * participate in the persistent document workspace. */
 export function DocumentReadingWorkspace({ children, enabled }: { children: ReactNode; enabled: boolean }) {
   const workspace = useReadingWorkspace();
-  return enabled && workspace ? <ReaderToolsProvider><ReadingWorkspace>{children}</ReadingWorkspace></ReaderToolsProvider> : children;
+  return <ReaderToolsProvider>{enabled && workspace ? <ReadingWorkspace>{children}</ReadingWorkspace> : children}</ReaderToolsProvider>;
 }
 
 function ReadingWorkspace({ children }: { children: ReactNode }) {
@@ -85,7 +86,7 @@ function ReadingWorkspace({ children }: { children: ReactNode }) {
     const restore = requestAnimationFrame(() => {
       if (location.hash) {
         const heading = primaryRef.current?.querySelector<HTMLElement>(`[id="${CSS.escape(readingFragment(location.hash))}"]`);
-        if (heading) { heading.scrollIntoView({ block: "start" }); return; }
+        if (heading) { revealMarkdownTarget(heading); heading.scrollIntoView({ block: "start" }); return; }
       }
       canvas.scrollTop = positions.get(positionKey) ?? 0;
     });
@@ -284,7 +285,7 @@ function ReferencePreview({ target, narrow, headerHost, panelControl, canGoBack,
     const frame = requestAnimationFrame(() => {
       const hash = new URL(target.href, window.location.origin).hash;
       const heading = hash ? scrollElement.querySelector<HTMLElement>(`[id="${CSS.escape(prefix + "-" + readingFragment(hash))}"]`) : null;
-      if (heading) heading.scrollIntoView({ block: "start" });
+      if (heading) { revealMarkdownTarget(heading); heading.scrollIntoView({ block: "start" }); }
       else scrollElement.scrollTop = positions.get(positionKey) ?? 0;
     });
     const record = () => { if (scrollElement.isConnected && !scrollElement.closest("[hidden]")) savePosition(positionKey, scrollElement.scrollTop); };
@@ -304,7 +305,7 @@ function ReferencePreview({ target, narrow, headerHost, panelControl, canGoBack,
     if (href.startsWith("#")) {
       const slug = readingFragment(href);
       const heading = scrollRef.current?.querySelector<HTMLElement>(`[id="${CSS.escape(slug.startsWith(prefix + "-") ? slug : prefix + "-" + slug)}"]`);
-      if (heading) { event.preventDefault(); event.stopPropagation(); heading.scrollIntoView({ block: "start" }); }
+      if (heading) { event.preventDefault(); event.stopPropagation(); revealMarkdownTarget(heading); heading.scrollIntoView({ block: "start" }); }
       return;
     }
     const next = readingReference(href, window.location.origin);

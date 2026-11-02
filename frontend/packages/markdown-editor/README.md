@@ -133,7 +133,20 @@ updates are applied by the package and never become serialized Markdown:
 `MarkdownViewer.reading` optionally provides `renderCodeToolbar(block)` and
 `renderImageToolbar(image)` React slots. Image controls render outside the
 editable document DOM, so hosts can position them over the displayed image
-without changing prose text or its layout. Code blocks expose their index, code,
+without adding text to prose. `renderSectionToggle(section)`, `collapsedSections`
+and `onRevealSections` provide the same presentation-only contract for sections.
+Use `revealMarkdownTarget(element)` before measuring or scrolling to an anchor
+from a separate outline. Text finding also reveals collapsed ancestors. Reading
+decorations are rebuilt for each document, including when replacing a long body
+with a shorter one.
+
+Footnote references (`[^label]`) and indented multiline definitions are shared
+schema nodes. Their Markdown survives editor serialization; viewers add local
+numbering, isolated anchors and per-reference return links. Products may provide
+a footnote preview while reusing the same target/asset resolver. Mermaid remains
+a code fence in the shared schema; diagram rendering is a product-owned, optional
+viewer control and does not replace or execute the authored source.
+Code blocks expose their index, code,
 language and effective collapsed state. Image slots identify the image index
 and alt text; products must use their already-resolved image surface rather
 than fetching canonical private targets independently. `collapseCodeBlocks`,

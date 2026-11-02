@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add footnote references and multiline definitions to the shared schema, with
+  isolated viewer numbering and return links that never enter serialization.
+- Add section-toggle slots and presentation-only section folding. Explicit target
+  reveal and bounded text finding open ancestors before navigation. Presentation
+  decorations are scoped to the current document during content replacement.
+
 - Add optional viewer-only code/image toolbar slots, code folding and bounded
   literal-text search decorations. Reading controls and matches never enter
   authored Markdown, editor history or serialized output.

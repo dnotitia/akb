@@ -13,7 +13,8 @@ import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { EditorContent, useEditor } from '@tiptap/react'
 import { createPortal } from 'react-dom'
 import { MarkdownViewerReadingTools, type MarkdownViewerReadingOptions } from './markdown-reading-tools.js'
-export { findReadingTextMatches } from './markdown-reading-tools.js'
+import { MarkdownViewerFootnotes } from './markdown-footnotes.js'
+export { findReadingTextMatches, revealMarkdownTarget } from './markdown-reading-tools.js'
 export type { MarkdownViewerReadingOptions, MarkdownViewerCodeBlock, ReadingTextMatch } from './markdown-reading-tools.js'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { Decoration, DecorationSet } from '@tiptap/pm/view'
@@ -2082,6 +2083,7 @@ export function MarkdownViewer({
         resolvingReferences={Boolean(referenceAdapter?.resolve)}
       />
       <MarkdownViewerReadingTools editor={rawEditor} options={reading} />
+      <MarkdownViewerFootnotes editor={rawEditor} />
       {hasAdornment && adornmentHost && createPortal(afterLeadingHeading, adornmentHost)}
     </>
   )

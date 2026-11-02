@@ -359,7 +359,12 @@ async function openDocumentDetails(user: ReturnType<typeof userEvent.setup>, sec
   let panel = findPanel();
   if (!panel) {
     const readingTools = await screen.findByRole("group", { name: "Document reading tools" });
-    await user.click(within(readingTools).getByRole("button", { name: "Document details" }));
+    const contents = within(readingTools).queryByRole("button", { name: "Table of contents" });
+    if (contents) await user.click(contents);
+    else {
+      await user.click(within(readingTools).getByRole("button", { name: /^Actions for / }));
+      await user.click(screen.getByRole("menuitem", { name: "Document details" }));
+    }
     panel = await waitFor(() => {
       const inspector = findPanel();
       if (!inspector) throw new Error("Document details inspector has not opened");
@@ -1202,7 +1207,7 @@ describe("DocumentPage view toggle", () => {
     expect(screen.queryByRole("button", { name: "Publish" })).not.toBeInTheDocument();
     expect(screen.queryByRole("navigation", { name: "Vault sections" })).not.toBeInTheDocument();
     expect(screen.queryByRole("group", { name: "Document context" })).not.toBeInTheDocument();
-    const trigger = screen.getByRole("button", { name: "Document details" });
+    const trigger = screen.getByRole("button", { name: "Table of contents" });
     expect(readingTools).toContainElement(trigger);
     expect(trigger).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -1231,7 +1236,7 @@ describe("DocumentPage view toggle", () => {
       .toHaveAttribute("open");
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    await waitFor(() => expect(trigger).toHaveFocus());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Actions for DocTitle" })).toHaveFocus());
   });
 
   it("offers secondary document actions in overflow without a reading-width preference", async () => {
@@ -1404,7 +1409,7 @@ describe("DocumentPage view toggle", () => {
     const bodyHeading = screen.getByRole("heading", { name: "BodyHeading", level: 2 });
     expect(bodyHeading.compareDocumentPosition(summary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(within(readingTools).queryByRole("button", { name: "Read document summary" })).not.toBeInTheDocument();
-    expect(readingTools).toContainElement(screen.getByRole("button", { name: "Document details" }));
+    expect(readingTools).toContainElement(screen.getByRole("button", { name: "Table of contents" }));
     expect(within(readingTools).queryByLabelText(/^Document statistics:/)).not.toBeInTheDocument();
     expect(document.querySelector('[data-slot="document-context-panel"]')).not.toBeInTheDocument();
     const details = await openDocumentDetails(user, "Properties");
