@@ -352,6 +352,7 @@ jobs:
             tests/test_sso_management_targets_postgres.py
             tests/test_sso_callback_evidence_postgres.py
             tests/test_sso_operation_attempts_postgres.py
+            tests/test_sso_operation_requests_postgres.py
             tests/test_pending_admission_postgres.py
             tests/test_edge_vault_boundary_postgres.py
             tests/test_workspace_external_identity.py
