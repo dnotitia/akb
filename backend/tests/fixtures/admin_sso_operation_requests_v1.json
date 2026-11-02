@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "requests": [
+    {
+      "schema_version": 1,
+      "request_id": "5c4b3a29-1807-4f6e-9d5c-4b3a29180706",
+      "request_sha256": "a9a66ad7ef4f7b10bf0516a8d3ae8b50b53b8be979d37597d17064727211e561",
+      "request": {
+        "schema_version": 1,
+        "request_id": "5c4b3a29-1807-4f6e-9d5c-4b3a29180706",
+        "kind": "ownership_claim",
+        "installation_id": "6f1c2a52-2a4e-4c55-9d1f-1d6a1f0b6a01",
+        "target_id": "0b7e1a33-58f1-4f2f-8f3e-2b9c6d7e8a02",
+        "provider_alias": "workforce",
+        "owner_id": "controller-instance",
+        "requested_by": "3d9a7c11-5b2e-4a6f-9c8d-7e6f5a4b3c03",
+        "requested_token_id": "9e8d7c6b-5a49-4f38-a7b6-c5d4e3f2a104",
+        "claim": {
+          "expected_revision": 0,
+          "expected_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "grant": null
+      },
+      "status": "pending",
+      "created_at": "2026-11-02T09:00:00+00:00",
+      "expires_at": "2026-11-02T10:00:00+00:00",
+      "requester_username": "platform-controller",
+      "decided_by": null,
+      "decider_username": null,
+      "decided_at": null,
+      "operation_expires_at": null,
+      "closed_at": null
+    },
+    {
+      "schema_version": 1,
+      "request_id": "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1907",
+      "request_sha256": "5efb89efc25d864baf0c6f318b4a09d6bfa12b1f7038621050ad90ba937fbdb0",
+      "request": {
+        "schema_version": 1,
+        "request_id": "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1907",
+        "kind": "provider_grant",
+        "installation_id": "6f1c2a52-2a4e-4c55-9d1f-1d6a1f0b6a01",
+        "target_id": "0b7e1a33-58f1-4f2f-8f3e-2b9c6d7e8a02",
+        "provider_alias": "workforce",
+        "owner_id": "controller-instance",
+        "requested_by": "3d9a7c11-5b2e-4a6f-9c8d-7e6f5a4b3c03",
+        "requested_token_id": "9e8d7c6b-5a49-4f38-a7b6-c5d4e3f2a104",
+        "claim": null,
+        "grant": {
+          "operation_id": "2f3e4d5c-6b7a-4891-8a0b-1c2d3e4f5a08",
+          "source": {
+            "auth_mode": "sso",
+            "issuer": "https://auth.akb.example.com/realms/akb",
+            "runtime_generation": 1,
+            "sso_session_epoch": "80af20c6-6f9e-452e-9693-98b6ae0ea213",
+            "source_revision": null
+          },
+          "expected_provider_revision": 1,
+          "verbs": [
+            "configure",
+            "enable"
+          ],
+          "provider_payload_sha256": {
+            "configure": "9da10ceb86da0042b57a69ae8c1986a298783c23f4f263b73e113390c0e77398",
+            "enable": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+          },
+          "configure_summary": {
+            "provider_type": "keycloak-oidc",
+            "display_name": "Company SSO",
+            "issuer": "https://accounts.example.com/realms/workforce",
+            "discovery_url": "https://accounts.example.com/realms/workforce/.well-known/openid-configuration",
+            "client_id": "akb-broker-next",
+            "client_secret_supplied": true
+          },
+          "ttl_seconds": 600,
+          "provider_secret_revision": "secret-v2",
+          "recipient_public_key": "q1Xo2F1bTqgRLh5Ue6hZcP8L1wJgS1qkRZ7mT3bVb0A"
+        }
+      },
+      "status": "pending",
+      "created_at": "2026-11-02T09:05:00+00:00",
+      "expires_at": "2026-11-02T10:05:00+00:00",
+      "requester_username": "platform-controller",
+      "decided_by": null,
+      "decider_username": null,
+      "decided_at": null,
+      "operation_expires_at": null,
+      "closed_at": null
+    },
+    {
+      "schema_version": 1,
+      "request_id": "8f7e6d5c-4b3a-4291-8f7e-6d5c4b3a2909",
+      "request_sha256": "61cfaf3f4eb6d12a18b31a0d0c98964da5982177a7a0ddc99da57fb3ee92cce6",
+      "request": {
+        "schema_version": 1,
+        "request_id": "8f7e6d5c-4b3a-4291-8f7e-6d5c4b3a2909",
+        "kind": "provider_grant",
+        "installation_id": "6f1c2a52-2a4e-4c55-9d1f-1d6a1f0b6a01",
+        "target_id": "0b7e1a33-58f1-4f2f-8f3e-2b9c6d7e8a02",
+        "provider_alias": "workforce",
+        "owner_id": "controller-instance",
+        "requested_by": "3d9a7c11-5b2e-4a6f-9c8d-7e6f5a4b3c03",
+        "requested_token_id": "9e8d7c6b-5a49-4f38-a7b6-c5d4e3f2a104",
+        "claim": null,
+        "grant": {
+          "operation_id": "4a5b6c7d-8e9f-4a0b-9c1d-2e3f4a5b6c10",
+          "source": {
+            "auth_mode": "sso",
+            "issuer": "https://auth.akb.example.com/realms/akb",
+            "runtime_generation": 1,
+            "sso_session_epoch": "80af20c6-6f9e-452e-9693-98b6ae0ea213",
+            "source_revision": null
+          },
+          "expected_provider_revision": 1,
+          "verbs": [
+            "disable"
+          ],
+          "provider_payload_sha256": {
+            "disable": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+          },
+          "configure_summary": null,
+          "ttl_seconds": 300,
+          "provider_secret_revision": null,
+          "recipient_public_key": "Zm9vYmFyYmF6cXV4cXV1eGZvb2JhcmJhenF1eHF1dXg"
+        }
+      },
+      "status": "approved",
+      "created_at": "2026-11-02T08:50:00+00:00",
+      "expires_at": "2026-11-02T09:50:00+00:00",
+      "requester_username": "platform-controller",
+      "decided_by": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c05",
+      "decider_username": "admin",
+      "decided_at": "2026-11-02T08:55:00+00:00",
+      "operation_expires_at": "2026-11-02T09:00:00+00:00",
+      "closed_at": null
+    }
+  ]
+}

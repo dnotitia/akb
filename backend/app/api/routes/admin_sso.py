@@ -50,6 +50,7 @@ from app.sso.identity_operations import (
     provider_mutation_guard,
 )
 from app.api.routes.admin_sso_operations import router as operations_router
+from app.api.routes.admin_sso_operation_requests import router as operation_requests_router
 
 
 class ConfigureProviderRequest(BaseModel):
@@ -777,3 +778,4 @@ router = APIRouter()
 router.include_router(legacy_router)
 router.include_router(credentials_router)
 router.include_router(operations_router)
+router.include_router(operation_requests_router)
