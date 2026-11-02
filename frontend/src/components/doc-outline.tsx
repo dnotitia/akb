@@ -4,7 +4,7 @@ import { useDocOutline } from "@/hooks/use-doc-outline";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { Button } from "@/components/ui/button";
 
-export function DocumentOutline({ markdown, articleEl }: { markdown: string; articleEl: HTMLElement | null }) {
+export function DocumentOutline({ markdown, articleEl, documentHref }: { markdown: string; articleEl: HTMLElement | null; documentHref: string }) {
   const { headings, activeSlug } = useDocOutline(markdown, { root: articleEl });
   const [query, setQuery] = useState("");
   const [foldState, setFoldState] = useState<{ markdown: string; ids: Set<string> }>({ markdown, ids: new Set() });
@@ -44,7 +44,7 @@ export function DocumentOutline({ markdown, articleEl }: { markdown: string; art
           target?.scrollIntoView?.({ block: "start" });
         }}><TooltipText className="truncate block">{heading.text}</TooltipText></a>
         <button type="button" className="reader-outline-copy" aria-label={`Copy link to ${heading.text}`} onClick={async () => {
-          const url = new URL(window.location.href); url.hash = heading.slug;
+          const url = new URL(documentHref, window.location.origin); url.hash = heading.slug;
           try { await navigator.clipboard.writeText(url.href); setNotice(`Link to ${heading.text} copied`); }
           catch { setNotice("Link could not be copied. Open the section and copy its address."); }
         }}><Link2 size={12} aria-hidden /></button>

@@ -142,7 +142,7 @@ function OutlineFixture() {
         <Panel>
           <PanelHeader label="Document outline" count={4} />
           <div className="p-3">
-            <DocumentOutline markdown={markdown} articleEl={articleEl} />
+            <DocumentOutline markdown={markdown} articleEl={articleEl} documentHref="/vault/storybook/doc/rollout.md" />
           </div>
         </Panel>
       </div>

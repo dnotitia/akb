@@ -1,10 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { render, screen, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { DocumentOutline } from "@/components/doc-outline";
 
-function Harness({ md }: { md: string }) {
+function Harness({ md, href = "/vault/fixture/doc/reading.md" }: { md: string; href?: string }) {
   const [el, setEl] = useState<HTMLElement | null>(null);
   return (
     <div>
@@ -13,7 +13,7 @@ function Harness({ md }: { md: string }) {
         <h2 id="details">Details</h2>
         <h3 id="기술-스택">기술 스택</h3>
       </article>
-      <DocumentOutline markdown={md} articleEl={el} />
+      <DocumentOutline markdown={md} articleEl={el} documentHref={href} />
     </div>
   );
 }
@@ -62,6 +62,23 @@ describe("DocumentOutline", () => {
     await user.click(screen.getByRole("button", { name: "Expand all" }));
     expect(screen.getByRole("link", { name: "기술 스택" })).toBeInTheDocument();
     cleanup();
+  });
+
+  it("copies the inspected document and version rather than the background route", async () => {
+    const user = userEvent.setup();
+    const write = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    const previous = location.href;
+    window.history.replaceState(null, "", "/search?q=background#unrelated");
+    try {
+      render(<Harness md={md} href="/vault/fixture/doc/folder%2Freading.md?commit=aaaaaaa" />);
+      await user.click(screen.getByRole("button", { name: "Copy link to 기술 스택" }));
+      const expected = new URL("/vault/fixture/doc/folder%2Freading.md?commit=aaaaaaa", location.origin);
+      expected.hash = "기술-스택";
+      expect(write).toHaveBeenCalledWith(expected.href);
+      expect(location.pathname).toBe("/search");
+    } finally {
+      cleanup(); write.mockRestore(); window.history.replaceState(null, "", previous);
+    }
   });
 
 });

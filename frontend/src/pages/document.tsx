@@ -56,6 +56,7 @@ import { sameCommitRef } from "@/lib/commit";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { vaultGuideEditHref, vaultGuideHref } from "@/lib/vault-guide-navigation";
 import { DocumentOutline } from "@/components/doc-outline";
+import { readingDocumentHref } from "@/lib/reading-workspace";
 import { DocumentView } from "@/components/document-view";
 import { DocumentCopyButton, DocumentIconButton, DocumentReadModes, DocumentStatistics, DocumentTimestamp, type DocumentCopyHandle } from "@/components/document-reading-controls";
 import { DocumentContextPanel } from "@/components/document-context-panel";
@@ -2059,7 +2060,8 @@ function DocumentPageContent({
                   </p> : view === "raw" ? <div className="space-y-3">
                     <p className="text-sm leading-relaxed text-foreground-muted">Headings are available in the rendered document.</p>
                     <Button type="button" variant="outline" size="sm" onClick={() => setView("rendered")}>Show rendered document</Button>
-                  </div> : <DocumentOutline markdown={doc.content || ""} articleEl={articleEl} />
+                  </div> : <DocumentOutline markdown={doc.content || ""} articleEl={articleEl}
+                    documentHref={readingDocumentHref(name!, doc.path || docId, commitHash ? `?commit=${encodeURIComponent(commitHash)}` : "")} />
                 }
               relations={<>
                   <RelationsPanel
