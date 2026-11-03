@@ -13,6 +13,9 @@ The advertised schema now allows file-only creation and applies the backend's
 whole-body preconditions to file updates. Original-read tokens are forwarded
 unchanged; the proxy never fetches a replacement token or retries a conflict.
 
+Opt-in usage records include document input validation and file-read failures,
+with one record per call and no document content or local paths in the log.
+
 ## Unreleased — the proxy's own refusals set `isError`
 
 The file tools the proxy answers itself (`akb_put_file`, `akb_get_file`,

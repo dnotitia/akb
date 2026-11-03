@@ -604,50 +604,52 @@ export class AKBProxy {
       return await this._toolsList(id, params);
     }
 
-    // Resolve `file` → `content` for akb_put / akb_update before forwarding
-    if (method === "tools/call" && FILE_CONTENT_TOOLS.has(params?.name)) {
-      const args = params.arguments ?? {};
-      const inputError = documentInputError(params.name, args);
-      if (inputError) {
-        return {
-          jsonrpc: "2.0", id,
-          result: this._clientResult({
-            content: [{ type: "text", text: JSON.stringify(inputError) }],
-            isError: true,
-          }),
-        };
-      }
-      if (Object.hasOwn(args, "file")) {
-        try {
-          msg = {
-            ...msg,
-            params: {
-              ...params,
-              arguments: this._resolveFileToContent(args),
-            },
-          };
-        } catch (err) {
-          return {
-            jsonrpc: "2.0",
-            id,
-            result: this._clientResult({
-              content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
-              isError: true,
-            }),
-          };
-        }
-      }
-    }
-
-    const callKey = method === "tools/call" ? this._vaultSkillCallKey(msg.params) : null;
-    if (callKey) msg = this._withVaultSkillAcknowledgement(msg, callKey);
-
     // Only measured calls read the clock.
     const measuring = method === "tools/call" && this._usageLogPath !== null;
     const startedAt = measuring ? Date.now() : 0;
     let response;
     let threw = false;
     try {
+      // Resolve `file` → `content` for akb_put / akb_update before forwarding
+      if (method === "tools/call" && FILE_CONTENT_TOOLS.has(params?.name)) {
+        const args = params.arguments ?? {};
+        const inputError = documentInputError(params.name, args);
+        if (inputError) {
+          response = {
+            jsonrpc: "2.0", id,
+            result: this._clientResult({
+              content: [{ type: "text", text: JSON.stringify(inputError) }],
+              isError: true,
+            }),
+          };
+          return response;
+        }
+        if (Object.hasOwn(args, "file")) {
+          try {
+            msg = {
+              ...msg,
+              params: {
+                ...params,
+                arguments: this._resolveFileToContent(args),
+              },
+            };
+          } catch (err) {
+            response = {
+              jsonrpc: "2.0",
+              id,
+              result: this._clientResult({
+                content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
+                isError: true,
+              }),
+            };
+            return response;
+          }
+        }
+      }
+
+      const callKey = method === "tools/call" ? this._vaultSkillCallKey(msg.params) : null;
+      if (callKey) msg = this._withVaultSkillAcknowledgement(msg, callKey);
+
       response =
         method === "tools/call" && FILE_TOOL_NAMES.has(msg.params?.name)
           ? await this._handleFileTool(id, msg.params)
