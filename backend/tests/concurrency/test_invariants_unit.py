@@ -23,7 +23,7 @@ Talks to a real Postgres via `AKB_TEST_DSN`; skips when unreachable so
 the suite runs unattended on machines without a dev DB. The audit
 Docker stack default is `postgresql://akb:akb@localhost:5433/akb`.
 
-This file is listed in the DB-backed job of `backend-pytest.yml`, which
+This file runs in the live-PG job of `backend-pytest.yml`, which
 sets `AKB_TEST_DSN` and `REQUIRE_REAL_PG=1` — under that flag an
 unreachable DB fails instead of skipping, so the gate cannot go quietly
 green. The `pool` fixture applies init.sql *and* the migrations, because

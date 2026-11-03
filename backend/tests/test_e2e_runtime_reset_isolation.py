@@ -16,6 +16,7 @@ import pytest
 from tests.test_e2e_runtime_unit import COMPOSE_FILE, REPO_ROOT, E2ERuntime, RuntimeConfig
 
 
+@pytest.mark.needs_resource("an isolated Docker runtime; the e2e workflow runs it with AKB_TEST_RESET_ISOLATION=1")
 @pytest.mark.skipif(os.environ.get("AKB_TEST_RESET_ISOLATION") != "1", reason="requires isolated Docker runtime")
 async def test_reset_waits_for_writers_and_reuses_dependencies_with_isolated_storage(tmp_path, monkeypatch):
     monkeypatch.setenv("AKB_E2E_USERNAME", "reset-test-" + secrets.token_hex(8))
