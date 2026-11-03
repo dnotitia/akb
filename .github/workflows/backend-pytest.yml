@@ -290,6 +290,9 @@ jobs:
             tests/test_boot_schema_writer_retry_pg.py
             tests/test_role_membership_delta_pg.py
             tests/test_role_sync.py
+            # Grant contributions are claims about surviving rows and real
+            # group membership; off this list the file skipped in both lanes.
+            tests/test_access_contributions_postgres.py
             tests/test_index_order_unit.py
             tests/concurrency/test_alter_unique_race_unit.py
             tests/test_native_revision_reconcile_pg.py
