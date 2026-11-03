@@ -159,6 +159,19 @@ def test_smoke_input_seal_survives_redaction_checkpoint_and_failure_export(tmp_p
     assert json.loads(path.read_text())["smoke_gate"]["primary:http"]["outcome"]["model_input_evidence"][0] == original
 
 
+def test_checkpoint_rejects_late_secret_in_sealed_input(tmp_path: Path) -> None:
+    from mcp_catalog.execution import _model_input_evidence_for
+
+    store, key = _store(tmp_path / "checkpoint.json", secrets=("late-discovered-name",))
+    outcome = _outcome(key, error="benchmark incomplete")
+    outcome.model_input_evidence = [_model_input_evidence_for(
+        [{"content": "server instructions"}, {"content": "late-discovered-name"}], "server instructions", 1,
+    )]
+    with pytest.raises(CheckpointError, match="integrity"):
+        store.record_smoke_cell("primary:http", outcome, status="incomplete")
+    assert not store.path.exists()
+
+
 def test_checkpoint_keeps_provider_setup_requests_separate(tmp_path: Path) -> None:
     store, _key = _store(tmp_path / "checkpoint.json")
 

@@ -1003,7 +1003,7 @@ class BenchmarkRunner:
                 incomplete_reasons.add("benchmark incomplete: checkpoint and artifact trial counts differ")
             if checkpoint_doc.reserved_cost_usd != 0:
                 incomplete_reasons.add("benchmark incomplete: checkpoint has an orphaned reservation")
-        if ledger.reserved_cost_usd != Decimal("0"):
+        if self.shared_ledger is None and ledger.reserved_cost_usd != Decimal("0"):
             incomplete_reasons.add("benchmark incomplete: artifact has an orphaned reservation")
         if checkpoint_doc is not None:
             budget_model_requests = checkpoint_doc.spent.model_requests
@@ -3157,6 +3157,41 @@ def _validate_shared_budget(
             aggregate_cost += max(outcome.cost_usd, outcome.provider_cost_usd or 0.0)
             aggregate_work += outcome.latency_seconds
 
+    resume_source = baseline.get("resume_source")
+    if resume_source != candidate.get("resume_source"):
+        raise ValueError("paired resume accounting sources do not match")
+    if resume_source is not None:
+        if not isinstance(resume_source, dict):
+            raise ValueError("paired resume accounting source is invalid")
+        source = resume_source.get("source_accounting")
+        if not isinstance(source, dict):
+            raise ValueError("paired resume accounting source is invalid")
+        parent = source.get("parent_paired_budget_used")
+        spent = source.get("parent_checkpoint_spent")
+        residual = source.get("residual")
+        if not isinstance(parent, dict) or not isinstance(spent, dict) or not isinstance(residual, dict):
+            raise ValueError("paired resume accounting source is invalid")
+        if set(spent) != {"baseline", "candidate"} or not all(isinstance(value, dict) for value in spent.values()):
+            raise ValueError("paired resume checkpoint accounting is invalid")
+        for key in ("model_requests", "provider_setup_requests", "input_tokens", "output_tokens"):
+            values = [parent.get(key), residual.get(key), *(spent[arm].get(key) for arm in ("baseline", "candidate"))]
+            if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values):
+                raise ValueError("paired resume accounting contains an invalid count")
+            if values[0] != sum(values[1:]):
+                raise ValueError("paired resume accounting does not match its parent receipts")
+            if key in aggregate:
+                aggregate[key] += values[1]
+        for key, residual_key in (("cost_usd", "conservative_cost_usd"), ("model_work_seconds", "model_work_seconds")):
+            try:
+                values_decimal = [Decimal(str(value)) for value in (parent.get(key), residual.get(residual_key), *(spent[arm].get(key) for arm in ("baseline", "candidate")))]
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError("paired resume accounting contains an invalid amount") from exc
+            if any(not value.is_finite() or value < 0 for value in values_decimal) or not math.isclose(float(values_decimal[0]), float(sum(values_decimal[1:])), rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError("paired resume accounting does not match its parent receipts")
+            if key == "cost_usd":
+                aggregate_cost += float(values_decimal[1])
+            else:
+                aggregate_work += float(values_decimal[1])
     for key, expected in aggregate.items():
         if budget.get(key) != expected:
             raise ValueError(f"shared budget {key} does not match the paired trial and smoke outcomes")
@@ -4055,6 +4090,11 @@ def _validate_paired_execution_evidence(baseline: dict[str, Any], candidate: dic
     if event_sequences != list(range(1, len(events) + 1)):
         raise ValueError("paired execution sequence is not contiguous")
     records: dict[tuple[str, str, int, str], tuple[str, int | None]] = {}
+    reused_identities: set[tuple[str, str, int, str]] = set()
+    last_event: dict[tuple[str, str, int, str], dict[str, Any]] = {}
+    unfinished = evidence.get("unfinished_starts", [])
+    if not isinstance(unfinished, list) or any(not isinstance(item, dict) or item not in events for item in unfinished):
+        raise ValueError("paired unfinished execution evidence is invalid")
     for status, items in (("executed", events), ("reused", reused)):
         for item in items:
             if not isinstance(item, dict):
@@ -4070,12 +4110,41 @@ def _validate_paired_execution_evidence(baseline: dict[str, Any], candidate: dic
                 and isinstance(identity[1], str)
                 and isinstance(identity[2], int)
                 and identity[3] in {"baseline", "candidate"}
-            ) or identity in records:
+            ):
                 raise ValueError("paired execution identity is invalid or duplicated")
+            typed_identity = cast(tuple[str, str, int, str], identity)
+            if status == "reused" and identity in records:
+                if (
+                    typed_identity in reused_identities
+                    or records[typed_identity][0] != "executed"
+                    or item.get("order_position")
+                    != planned_arm_order(identity[1], identity[2], manifest["paired_order_seed"]).index(identity[3])
+                ):
+                    raise ValueError("paired execution identity is invalid or duplicated")
+                reused_identities.add(typed_identity)
+                continue
+            if identity in records:
+                previous = last_event.get(typed_identity)
+                previous_attempt = previous.get("attempt", 1) if previous is not None else None
+                if (
+                    status != "executed"
+                    or previous is None
+                    or not isinstance(previous_attempt, int)
+                    or isinstance(previous_attempt, bool)
+                    or previous not in unfinished
+                    or item.get("retry_of_sequence") != previous.get("sequence")
+                    or item.get("attempt") != previous_attempt + 1
+                    or item.get("order_position") != previous.get("order_position")
+                ):
+                    raise ValueError("paired execution identity is invalid or duplicated")
             records[cast(tuple[str, str, int, str], identity)] = (
                 status,
                 item.get("sequence") if status == "executed" else None,
             )
+            if status == "executed":
+                last_event[typed_identity] = item
+    if any(event in unfinished for event in last_event.values()):
+        raise ValueError("paired execution has an unfinished terminal attempt")
     outcomes: dict[tuple[str, str, int, str], TrialOutcome] = {}
     for artifact in (baseline, candidate):
         for cell, run in artifact["runs"].items():

@@ -10,11 +10,12 @@ import signal
 import sys
 import time
 from collections import Counter
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from .contracts import BenchmarkRunManifest, load_json
-from .evidence import write_json
+from .evidence import quarantine_invalid_model_inputs, write_json
 from .execution import BudgetLedger
 from .runner import (
     BenchmarkRunFailure,
@@ -359,7 +360,7 @@ async def run_paired(args: argparse.Namespace) -> int:
         for task in pending:
             task.cancel()
     results = await asyncio.gather(*run_tasks.values(), return_exceptions=True)
-    await ledger.release_all_reservations()
+    orphaned_reservation = await ledger.release_all_reservations()
 
     artifacts: dict[str, dict[str, Any]] = {}
     failures: list[BaseException] = []
@@ -386,16 +387,33 @@ async def run_paired(args: argparse.Namespace) -> int:
         "max_cost_per_trial_usd": baseline_manifest.budget.max_cost_per_trial_usd,
         "final_reserved_cost_usd": str(ledger.reserved_cost_usd),
     }
+    if orphaned_reservation > Decimal("1e-12"):
+        reason = f"benchmark incomplete: paired finalization released orphaned reservation ${orphaned_reservation:.8f}"
+        paired_budget["released_orphaned_cost_usd"] = str(orphaned_reservation)
+        failures.append(RuntimeError(reason))
+        for artifact in artifacts.values():
+            artifact["status"] = "incomplete"
+            artifact["incomplete_reasons"] = sorted(set(artifact.get("incomplete_reasons", [])) | {reason})
+            artifact.setdefault("failure_stage", "budget_finalization")
+            artifact.setdefault("failure", {"stage": "budget_finalization", "error": reason, "cleanup_errors": []})
     _reconcile_paired_artifact_reservations(
         artifacts,
         paired_budget_used=paired_budget,
         paired_run_terminal=len(artifacts) == 2 and not failures,
     )
-    runners = {"baseline": baseline_runner, "candidate": candidate_runner}
     outputs = {"baseline": args.baseline_output, "candidate": args.candidate_output}
-    for arm, artifact in artifacts.items():
+    export_secrets = tuple(dict.fromkeys((*baseline_runner.secrets, *candidate_runner.secrets)))
+    for arm, artifact in list(artifacts.items()):
+        artifact, withheld = quarantine_invalid_model_inputs(artifact, export_secrets)
+        if withheld:
+            reason = "benchmark incomplete: model input evidence was withheld after integrity validation failed"
+            artifact["status"] = "incomplete"
+            artifact["incomplete_reasons"] = sorted(set(artifact.get("incomplete_reasons", [])) | {reason})
+            artifact.setdefault("failure_stage", "evidence_export")
+            artifact.setdefault("failure", {"stage": "evidence_export", "error": reason, "cleanup_errors": []})
         attach_paired_execution_evidence(artifact, evidence=evidence, budget_used=paired_budget)
-        write_json(outputs[arm], artifact, runners[arm].secrets)
+        artifacts[arm] = artifact
+        write_json(outputs[arm], artifact, export_secrets)
     comparison = compare_artifacts(
         artifacts.get("baseline", {}),
         artifacts.get("candidate", {}),

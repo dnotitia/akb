@@ -3514,9 +3514,10 @@ async def execute_smoke(
             if input_schemas is None:
                 recorder.set_input_schemas(await capture_tool_input_schemas(toolset))
             agent = Agent(model=model, system_prompt=SYSTEM_PROMPT, retries=0)
+            local_file_paths = fixture.local_file_paths(task.fixture.local_files) if task.fixture.local_files else {}
             result = await run_agent_with_timeout(
                 agent,
-                f"{task.prompt}\nAfter the server confirms the operation, provide a concise final response.",
+                f"{render_task_prompt(task, local_file_paths)}\nAfter the server confirms the operation, provide a concise final response.",
                 toolsets=cast(Any, [toolset]),
                 model_settings=model.settings,
                 usage_limits=UsageLimits(

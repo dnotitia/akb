@@ -14,7 +14,7 @@ from typing import Any, Literal
 from pydantic import Field
 
 from .contracts import ArmName, ContractModel, TaskLocale, TaskManifest, hash_json
-from .evidence import safe_json
+from .evidence import safe_json, validate_model_input_evidence
 from .execution import TrialOutcome, has_measured_evidence
 
 
@@ -674,9 +674,9 @@ class CheckpointStore:
 
     def _safe_outcome(self, outcome: TrialOutcome) -> TrialOutcome:
         try:
-            return TrialOutcome.model_validate(
-                safe_json(outcome.model_dump(mode="json"), self.secrets)
-            )
+            safe = safe_json(outcome.model_dump(mode="json"), self.secrets)
+            validate_model_input_evidence(safe, self.secrets)
+            return TrialOutcome.model_validate(safe)
         except Exception as exc:
             raise CheckpointError(f"trial outcome cannot be safely checkpointed: {exc}") from exc
 

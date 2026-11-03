@@ -4,18 +4,70 @@ import asyncio
 import json
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import mcp_catalog.runner as runner_module
+import mcp_catalog.execution as execution_module
 from mcp_catalog.contracts import load_run_manifest, load_task_corpus
 from mcp_catalog.execution import BudgetExceeded, BudgetLedger, ToolCallRecord, TrialOutcome
 from mcp_catalog.runner import BenchmarkRunner, RuntimeContractError
-from mcp_catalog.runtime import RuntimeDescriptor
+from mcp_catalog.runtime import RuntimeDescriptor, RuntimeFixture, StateObservation
 from paired_artifact_factory import provider_registry_snapshot
 from test_runtime_contract import descriptor_dict
 
 ROOT = Path(__file__).parents[1]
+
+
+@pytest.mark.asyncio
+async def test_smoke_passes_declared_local_paths_to_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = next(task for task in load_task_corpus(ROOT / "corpus" / "history-tasks.json") if task.id == "stdio-local-ko")
+    manifest = load_run_manifest(ROOT / "config" / "run.json")
+    descriptor = descriptor_dict()
+    descriptor["services"]["stdio"]["consumer_root"] = str(tmp_path)
+    fixture = RuntimeFixture(RuntimeDescriptor.from_dict(descriptor))
+    for name in task.fixture.local_files:
+        (tmp_path / name).write_text("fixture")
+
+    async def observe(*_args, **_kwargs):
+        return StateObservation(True, 200, {})
+
+    class Toolset:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_args):
+            return None
+
+    async def discover(_spec):
+        return SimpleNamespace(instructions="sealed instructions")
+
+    prompts = []
+    async def capture_prompt(_agent, prompt, **_kwargs):
+        prompts.append(prompt)
+        raise RuntimeError("offline provider stopped")
+
+    monkeypatch.setattr(fixture, "observe", observe)
+    monkeypatch.setattr(fixture, "stdio_command", lambda _token: ("node", [], {}))
+    monkeypatch.setattr(execution_module, "discover_server", discover)
+    monkeypatch.setattr(execution_module, "create_client", lambda *_args: object())
+    monkeypatch.setattr(execution_module, "create_toolset", lambda *_args: Toolset())
+    monkeypatch.setattr(execution_module, "Agent", lambda **_kwargs: object())
+    monkeypatch.setattr(execution_module, "run_agent_with_timeout", capture_prompt)
+    try:
+        await execution_module.execute_smoke(
+            task, manifest=manifest, arm="baseline", model_spec=manifest.models[0],
+            registered_model={}, model=SimpleNamespace(settings={}), transport="stdio", fixture=fixture,
+            token="fixture", secrets=(), secret_values=lambda: (), request_timeout_seconds=10,
+            input_schemas={}, expected_server_instructions="sealed instructions",
+        )
+    finally:
+        await fixture.close()
+    assert len(prompts) == 1
+    assert task.prompt in prompts[0]
+    for name in task.fixture.local_files:
+        assert str(tmp_path / name) in prompts[0]
+    assert prompts[0].endswith("After the server confirms the operation, provide a concise final response.")
 
 
 class _SmokeResolver:
