@@ -69,7 +69,10 @@ Keep the original read predicates. Fetching a newer revision solely to retry
 an old-derived draft defeats concurrency protection. A second write reporting
 `conflict` would not prove that the first one failed, either.
 
-The proxy does not expose an operation-status API or a public idempotency key.
+The proxy does not generate idempotency keys or expose an operation-status API.
+Native document callers can supply a key using the backend's
+[document idempotency contract](document-idempotency.md); this does not opt
+writes into automatic proxy replay.
 State inspection is not a durable receipt for the original request. Other
 clients, explicit caller retries and other infrastructure can still duplicate
 operations; this policy is not an exactly-once guarantee.

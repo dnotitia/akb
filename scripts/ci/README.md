@@ -117,6 +117,13 @@ This file-input boundary checks the served schema, metadata-only/null updates,
 empty-file replacement and both revision/hash conflict predicates. No Inspector
 or alternate MCP driver is involved.
 
+`test_document_idempotency_e2e.py` exercises the unsupported retry-key contract
+through authenticated HTTP MCP and REST in the same mandatory Bare Git runtime
+gate. It checks advertised lack of support, explicit rejection without writes,
+and unchanged keyless behavior. Native receipt interchange, concurrency and
+response-loss oracles run separately in the live-PG lane through
+`test_document_idempotency_postgres.py`.
+
 `test_table_schema_e2e.py` checks the real table and Vault schema HTTP responses
 against the same runtime's served OpenAPI contract after create, alter, and
 migration, including replay of the same migration key. These six cases run in

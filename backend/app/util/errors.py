@@ -89,6 +89,7 @@ UNKNOWN_TOOL = "unknown_tool"
 CONFLICT = "conflict"  # version / expected-state mismatch
 NATIVE_REVISION_SELECTOR_AMBIGUOUS = "native_revision_selector_ambiguous"
 NATIVE_REVISION_SURFACE_UNSUPPORTED = "native_revision_surface_unsupported"
+DOCUMENT_IDEMPOTENCY_UNSUPPORTED = "document_idempotency_unsupported"
 WRITE_BUSY = "write_busy"  # write-lane admission timed out — retry after backoff
 UNIQUE_VIOLATION = "unique_violation"  # PG 23505 — INSERT/UPDATE breaks a unique key
 EDIT_FAILED = "edit_failed"  # akb_edit: old_string match / uniqueness failure
@@ -220,6 +221,8 @@ def exception_envelope(e: Exception) -> dict:
         )
     if getattr(e, "code", None) == NATIVE_REVISION_SURFACE_UNSUPPORTED:
         return err(str(e), code=NATIVE_REVISION_SURFACE_UNSUPPORTED)
+    if getattr(e, "code", None) == DOCUMENT_IDEMPOTENCY_UNSUPPORTED:
+        return err(str(e), code=DOCUMENT_IDEMPOTENCY_UNSUPPORTED)
     if getattr(e, "code", None) == GIT_HISTORY_FAILED:
         return err(str(e), code=GIT_HISTORY_FAILED)
     if getattr(e, "code", None) == GIT_HISTORY_TIMEOUT:
