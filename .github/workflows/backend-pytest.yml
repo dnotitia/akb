@@ -338,6 +338,10 @@ jobs:
             tests/test_app_rollout_postgres.py
             tests/test_recovery_admin_provisioning_postgres.py
             tests/test_local_session_generation_postgres.py
+            # A delivered local credential has to be replaced before any other
+            # route answers; every test here needs a real database, so off
+            # this list the file skips in both lanes.
+            tests/test_local_forced_credential_change.py
             tests/test_account_self_lifecycle_postgres.py
             # Photo revision races, session revocation and cleanup are real
             # transaction guarantees; otherwise this file skips in both lanes.

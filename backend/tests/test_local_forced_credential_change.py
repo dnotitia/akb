@@ -106,26 +106,20 @@ class _RoleSync:
 @pytest.fixture
 async def pool(monkeypatch):
     async with _fresh_database() as pool:
+        from app.db import postgres
         from app.services import (
             access_service,
             account_service,
             auth_service,
-            password_service,
             recovery_admin_service,
         )
 
-        async def _get_pool():
-            return pool
-
+        # Every ``get_pool()`` returns this process-wide handle once it is set,
+        # whichever module imported it. Patching ``get_pool`` module by module
+        # missed each service a route later started reading through — and the
+        # miss fell through to the configured database host, not this one.
+        monkeypatch.setattr(postgres, "_pool", pool)
         role_sync = _RoleSync()
-        for module in (
-            access_service,
-            account_service,
-            auth_service,
-            password_service,
-            recovery_admin_service,
-        ):
-            monkeypatch.setattr(module, "get_pool", _get_pool)
         for module in (
             access_service,
             account_service,
