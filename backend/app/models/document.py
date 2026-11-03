@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -68,6 +69,9 @@ class DocumentPutRequest(NFCModel):
     # flows opt into `reject`, surface the existing document, then retry with
     # `allow` only after the user explicitly chooses to keep a duplicate title.
     title_conflict_policy: TitleConflictPolicy = "allow"
+    idempotency_key: UUID | None = Field(
+        default=None, description="Native only: reuse the same UUID and identical request to retrieve the original write receipt.",
+    )
 
 
 class DocumentUpdateRequest(VersionedDocumentRequest):
@@ -102,6 +106,9 @@ class DocumentUpdateRequest(VersionedDocumentRequest):
         default=None, description="Original-read body hash; protects body equality, not concurrent metadata changes.",
     )
     title_conflict_policy: TitleConflictPolicy = "allow"
+    idempotency_key: UUID | None = Field(
+        default=None, description="Native only: reuse the same UUID, request and original-read conditions after a lost response.",
+    )
 
 
 class DocumentMoveRequest(NFCModel):
