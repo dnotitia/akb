@@ -149,7 +149,7 @@ python -m pytest -q \
 
 The live-PostgreSQL job in
 [backend-pytest.yml](../../.github/workflows/backend-pytest.yml) supplies those
-servers and runs every backend test that does not declare
-`@pytest.mark.needs_resource`, failing on any skip, so these suites cannot skip
-in both CI jobs.
+servers and runs every backend test outside `backend/tests/mcp_e2e` that does
+not declare `@pytest.mark.needs_resource`, failing on any skip, so these suites
+cannot skip in both CI jobs.
 For UI and repository checks, follow [CONTRIBUTING.md](../../CONTRIBUTING.md).

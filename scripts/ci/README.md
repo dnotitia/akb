@@ -126,8 +126,8 @@ users in the disposable fixture and does not skip ACL checks for missing PATs.
 The selected runtime backend is exercised through HTTP; Native catalog paging,
 concurrent edits and stable endpoint identity are additionally checked by
 `test_graph_native_catalog_pg.py` and `test_native_graph_resource_identity_pg.py`
-in the live-PG lane, which runs every backend test that does not declare
-`@pytest.mark.needs_resource` and fails on any skip.
+in the live-PG lane, which runs every backend test outside `backend/tests/mcp_e2e`
+that does not declare `@pytest.mark.needs_resource` and fails on any skip.
 
 `test_adoption_vault_delete_e2e.py` requires planned, applied and blocked
 adoption deletion through HTTP, with a non-admin owner, Reader and system
