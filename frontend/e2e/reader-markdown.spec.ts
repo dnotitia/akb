@@ -82,3 +82,48 @@ test("reading settings carry into search previews and public documents", async (
   await page.keyboard.press("Escape");
   await expect.poll(() => publicBody.evaluate(element => getComputedStyle(element).fontSize)).toBe("16px");
 });
+
+for (const width of [1440, 390]) {
+  test(`Markdown blocks share the reading column at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    const markdown = [
+      "# Reading column", "A paragraph sets the reading column.",
+      "```text\n" + "long_code_token".repeat(120) + "\n```",
+      "| Heading | Value |\n| --- | --- |\n| Column | Value |",
+      "> An inset quotation.\n>\n> ```text\n> nested code\n> ```", "---",
+      "![Reading image](https://example.org/reading-image.svg)",
+      "A note[^note].\n\n[^note]: Note text.",
+    ].join("\n\n");
+    await readingFixture(page, false, { "reading.md": markdown });
+    await page.route("https://example.org/reading-image.svg", route => route.fulfill({
+      contentType: "image/svg+xml",
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="80"/>',
+    }));
+    await page.goto("/vault/fixture/doc/reading.md");
+    const prose = page.locator(".document-reading-flow .ProseMirror");
+    const paragraph = await prose.getByText("A paragraph sets the reading column.").boundingBox();
+    expect(paragraph).not.toBeNull();
+    for (const selector of [
+      "[data-markdown-code-tools]", "pre", ".akb-md-table",
+      "blockquote", "hr", "[data-markdown-footnote-definition]",
+    ]) {
+      const block = prose.locator(selector).first();
+      await expect(block).toBeAttached();
+      const box = await block.boundingBox();
+      expect(box?.x, selector).toBeCloseTo(paragraph!.x, 0);
+      expect(box?.width, selector).toBeCloseTo(paragraph!.width, 0);
+    }
+    const image = prose.getByRole("img", { name: "Reading image" });
+    await expect.poll(() => image.evaluate((element: HTMLImageElement) => element.naturalWidth)).toBe(1200);
+    const imageBox = (await image.boundingBox())!;
+    expect(imageBox.x).toBeCloseTo(paragraph!.x, 0);
+    expect(imageBox.width).toBeLessThanOrEqual(paragraph!.width);
+    const nestedTools = (await prose.locator("blockquote [data-markdown-code-tools]").boundingBox())!;
+    const nestedCode = (await prose.locator("blockquote pre").boundingBox())!;
+    expect(nestedCode.x).toBeCloseTo(nestedTools.x, 0);
+    expect(nestedCode.width).toBeCloseTo(nestedTools.width, 0);
+    expect(nestedCode.y).toBeCloseTo(nestedTools.y + nestedTools.height, 0);
+    expect(await prose.locator("pre").first().evaluate(block => block.scrollWidth > block.clientWidth)).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(width);
+  });
+}

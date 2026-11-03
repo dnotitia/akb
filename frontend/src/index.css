@@ -1065,7 +1065,7 @@ body::before {
 @media (prefers-reduced-motion: reduce) { .document-read-modes::before, .document-panel-sections summary svg { transition: none; } }
 
 /* Presentation-only metadata uses the same measure as the intact Markdown. */
-.document-reading-flow .ProseMirror > [data-markdown-leading-adornment] { width: 100%; max-width: var(--document-reading-measure); margin: 0 auto 1.25rem; }
+.document-reading-flow .ProseMirror > [data-markdown-leading-adornment] { margin: 0 0 1.25rem; }
 .document-reading-flow .ProseMirror > :is(h1,h2,h3,h4,h5,h6) + [data-markdown-leading-adornment] { margin-top: 0; }
 .document-summary-line { --summary-edge-clearance: 28px; display: flex; align-items: center; gap: .5rem; min-width: 0; min-height: 2.75rem; font-family: var(--font-sans); }
 .document-summary-viewport { flex: 1; min-width: 0; overflow: hidden; border-radius: var(--radius-sm); }
@@ -1133,16 +1133,15 @@ body::before {
 @media (max-width: 40rem) { .document-reading-flow .ProseMirror > :is(h1,h2) { font-size: 1.25rem; } }
 .document-reading-flow .ProseMirror > h3 { font-size: 1.125rem; }
 .document-reading-flow .ProseMirror > :is(h4,h5,h6) { font-size: 1rem; }
-.document-reading-flow .ProseMirror { min-width: 0; }
-/* Nested blocks stay within their parent; top-level blocks share the measure. */
-.document-reading-flow .ProseMirror :where(pre, .akb-md-table) { max-width: 100%; }
-/* Explicit pre specificity also overrides .prose pre[data-markdown-code]. */
-.document-reading-flow .ProseMirror > pre,
-.document-reading-flow .ProseMirror > :where(h1, h2, h3, h4, h5, h6, p, ul, ol, blockquote, .akb-md-table, .tableWrapper) {
-  width: 100%;
+/* One reading column also constrains blocks added by the Markdown renderer. */
+.document-reading-flow .ProseMirror {
+  min-width: 0;
   max-width: var(--document-reading-measure);
   margin-inline: auto;
+  /* Wrap long prose without shrinking the intrinsic width of table cells. */
+  overflow-wrap: break-word;
 }
+.document-reading-flow .ProseMirror :where(pre, .akb-md-table) { max-width: 100%; }
 .document-reading-flow .ProseMirror > :first-child { margin-top: 0; }
 /* Image frames live inside paragraphs: keep that paragraph on the same
    reading measure as prose, including loading and unavailable placeholders. */
@@ -1580,7 +1579,6 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 .document-byline-author > :last-child { min-width: 0; color: var(--color-foreground); overflow-wrap: anywhere; }
 .document-byline time { max-width: 100%; font-size: .75rem; white-space: normal; overflow: visible; text-overflow: clip; }
 .document-byline-saved { display: inline-flex; align-items: center; gap: .3rem; color: var(--color-success); }
-.reading-studio .document-reading-flow .ProseMirror > [data-markdown-leading-adornment] { width: 100%; max-width: var(--document-reading-measure); margin-inline: auto; }
 .reading-studio .document-reading-flow .ProseMirror > :is(h1,h2):first-child { margin-bottom: .5rem; }
 .document-fallback-title, .document-source-identity > h2 { margin: 0 0 .5rem; font-size: 1.65rem; font-weight: 550; line-height: 1.4; letter-spacing: -.025em; overflow-wrap: anywhere; }
 .document-source-identity { font-family: var(--font-sans); }
@@ -1688,8 +1686,8 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 .document-reading-container pre.document-reading-source { font-size: calc(var(--reader-font-size, 1rem) * .8125); }
 .reader-render .document-reading-flow { font-size: var(--reader-font-size, 1rem); }
 .reading-studio .document-reading-source { --document-reading-measure: var(--reader-measure, 42rem); }
-.reader-render .ProseMirror > [data-markdown-code-tools] { width: 100%; max-width: var(--document-reading-measure, 52rem); margin: 1.25rem auto 0; }
-.reader-render .ProseMirror > [data-markdown-code-tools] + pre { margin-top: 0; border-top-left-radius: 0; border-top-right-radius: 0; }
+.reader-render .ProseMirror [data-markdown-code-tools] { margin-block: 1.25rem 0; }
+.reader-render .ProseMirror [data-markdown-code-tools] + pre { margin-top: 0; border-top: 0; border-start-start-radius: 0; border-start-end-radius: 0; }
 .reader-render pre[data-reading-folded=true] { display: none; }
 .reader-code-toolbar { display: flex; align-items: center; gap: .65rem; min-height: 2.25rem; padding: .15rem .5rem .15rem .8rem; border: 1px solid var(--color-border); border-radius: var(--radius-md) var(--radius-md) 0 0; background: var(--color-surface-2); font-family: var(--font-sans); font-size: .75rem; line-height: 1.5; }
 .reader-code-language { color: var(--color-foreground); }
