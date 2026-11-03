@@ -9,11 +9,8 @@ import {
   ChevronDown,
   X,
   FileClock,
-  Files,
   FilePlus,
-  FileText,
   FolderInput,
-  FolderTree,
   GitCommit,
   Globe,
   HelpCircle,
@@ -45,16 +42,13 @@ import { Button } from "@/components/ui/button";
 import { Panel } from "@/components/ui/panel";
 import { Popover, PopoverTrigger, PopoverContent, PopoverClose } from "@/components/ui/popover";
 import { EmptyState } from "@/components/empty-state";
-import { RoleBadge, VaultStateBadge } from "@/components/status-badge";
+import { VaultStateBadge } from "@/components/status-badge";
 import { VaultProcessingDetails } from "@/components/vault-processing-details";
 import { VAULT_SKILL_PATH, isReservedCollection } from "@/lib/skill";
-import { TooltipText } from "@/components/ui/tooltip-text";
 import { cn } from "@/lib/utils";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { useOpenDocumentCreateDialog } from "@/contexts/document-create-dialog-context";
 import { useCollectionProof } from "@/hooks/use-vault-tree";
-import { WorkspacePageHeader } from "@/components/ui/workspace-page-header";
-import { VaultAddressAction } from "@/components/vault-address-action";
 import { VaultCreateMenu } from "@/components/vault-create-menu";
 import { VaultOverviewNavigation } from "@/components/vault-overview-navigation";
 import { VaultCollectionsWorkspace } from "@/components/vault-collections-workspace";
@@ -115,52 +109,6 @@ const fmt = (n: number) => n.toLocaleString();
 // Vault, an empty table, or an assertion about its access policy.
 function knownCount(value?: number): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
-}
-
-function OverviewCount({ value }: { value?: number }) {
-  return knownCount(value) ? (
-    <span className="tabular-nums">{fmt(value)}</span>
-  ) : (
-    <span><span aria-hidden>—</span><span className="sr-only">Not available</span></span>
-  );
-}
-
-/** Content inventory is passive text, separate from page navigation. */
-function VaultContentSummary({ info }: { info: VaultInfo | null }) {
-  const contents = [
-    { label: "Documents", value: info?.document_count, Icon: FileText },
-    { label: "Collections", value: info?.collection_count, Icon: FolderTree },
-    { label: "Tables", value: info?.table_count, Icon: TableIcon },
-    { label: "Files", value: info?.file_count, Icon: Files },
-  ];
-  return (
-    <section aria-label="Contents" aria-busy={!info} className="min-w-0 max-w-full">
-      <dl className="flex flex-wrap gap-2">
-        {contents.map(({ label, value, Icon }) => (
-          <div
-            key={label}
-            title={info && !knownCount(value) ? `${label} count is unavailable on this server` : undefined}
-            className="inline-flex min-h-8 items-center gap-2 text-xs"
-          >
-            <dt className="inline-flex items-center gap-1.5 whitespace-nowrap text-foreground-muted">
-              <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden />
-              {label}
-            </dt>
-            <dd className="font-semibold text-foreground">
-              {info ? <OverviewCount value={value} /> : (
-                <span className="block h-3 w-5 animate-pulse rounded bg-surface-muted" aria-hidden />
-              )}
-            </dd>
-          </div>
-        ))}
-      </dl>
-      {!info ? (
-        <span className="sr-only">Loading content counts</span>
-      ) : contents.some(({ value }) => !knownCount(value)) && (
-        <p className="mt-1.5 text-xs text-foreground-muted">Some counts aren't available on this server.</p>
-      )}
-    </section>
-  );
 }
 
 /** A git per-file change → a single-letter mark with a paired color (color is
@@ -384,7 +332,7 @@ function VaultWorkspace({ checking, scope }: { checking: boolean; scope: string 
     <div
       role="region"
       aria-label={`${name} Vault overview`}
-      className="@container/vault-overview mx-auto flex min-h-full w-full max-w-7xl flex-col gap-5 bg-background"
+      className="vault-page vault-overview @container/vault-overview"
     >
       {infoError && (
         <Alert variant="destructive">
@@ -406,40 +354,32 @@ function VaultWorkspace({ checking, scope }: { checking: boolean; scope: string 
         </Alert>
       )}
 
-      <section aria-label="Vault summary" className="flex min-w-0 flex-col gap-2 border-b border-border pb-3">
-        <WorkspacePageHeader
-          icon={Box}
-          iconTone="knowledge"
-          title={name}
-          context={
-            info?.description ? (
-              <span className="block break-words [overflow-wrap:anywhere]">{info.description}</span>
-            ) : undefined
-          }
-          meta={
-            <>
-              <VaultAddressAction name={name!} />
-              {info?.role && <RoleBadge role={info.role} />}
-              <VaultStateBadge
-                archived={info?.is_archived}
-                externalGit={info?.is_external_git}
-              />
+      <section aria-label="Vault summary" className="vault-overview-summary">
+        <header className="vault-overview-heading">
+          <div className="vault-overview-title">
+            <span className="vault-library-mark"><Box className="h-6 w-6" aria-hidden /></span>
+            <h1 className="min-w-0 break-words [overflow-wrap:anywhere]">{name}</h1>
+          </div>
+          <div className="vault-overview-actions">
+            {canCreateContent && <div role="group" aria-label="Create content">
+              <VaultCreateMenu label="New" triggerRef={createButtonRef} onDocument={() => openCreateDocument({ collection: creationCollection })}
+                onTable={() => setTableCreateOpen(true)} onUpload={() => setUploadOpen(true)} onCollection={() => setCollectionCreateOpen(true)} />
+            </div>}
+          </div>
+        </header>
+        {info?.description && <p className="vault-overview-description break-words [overflow-wrap:anywhere]">{info.description}</p>}
+        <div className="vault-overview-meta-row">
+          <div className="vault-overview-facts">
+            {info && <VaultOverviewMetadata name={name!} info={info} guideDefined={skillExists}
+              guideCustomized={skillCustomized} guideLoading={skillQuery.isLoading}
+              guideError={skillError} guideRetrying={skillQuery.isFetching}
+              onGuideRetry={() => { void skillQuery.refetch(); }} />}
+            <div className="vault-overview-state-row">
+              <VaultStateBadge archived={info?.is_archived} externalGit={info?.is_external_git} />
               <VaultProcessingDetails vaultName={name!} />
-            </>
-          }
-          actions={canCreateContent ? <div role="group" aria-label="Create content">
-            <VaultCreateMenu triggerRef={createButtonRef} onDocument={() => openCreateDocument({ collection: creationCollection })}
-              onTable={() => setTableCreateOpen(true)} onUpload={() => setUploadOpen(true)} onCollection={() => setCollectionCreateOpen(true)} />
-          </div> : undefined}
-          className="min-h-0 flex-nowrap items-start rounded-none border-0 bg-transparent p-0 shadow-none [&>div:first-child]:flex-1 [&>div:first-child]:max-w-full [&>div:first-child]:gap-2.5 [&>div:first-child>span]:h-7 [&>div:first-child>span]:w-7 [&_h1]:text-sm [&_h1]:whitespace-normal [&_h1]:break-words [&_h1]:[overflow-wrap:anywhere]"
-        />
-        {info && <VaultOverviewMetadata name={name!} info={info} guideDefined={skillExists}
-          guideCustomized={skillCustomized} guideLoading={skillQuery.isLoading}
-          guideError={skillError} guideRetrying={skillQuery.isFetching}
-          onGuideRetry={() => { void skillQuery.refetch(); }} />}
-        <div data-slot="vault-summary-links" className="flex min-w-0 flex-wrap items-center justify-between gap-x-5 gap-y-1">
-          {!infoError && <VaultContentSummary info={info} />}
-          {name && <VaultOverviewNavigation vault={name} memberCount={info?.member_count} />}
+            </div>
+          </div>
+
         </div>
       </section>
 
@@ -450,9 +390,10 @@ function VaultWorkspace({ checking, scope }: { checking: boolean; scope: string 
         </Alert>
       )}
 
-      <div className={cn("grid min-w-0 items-start gap-6", !isEmpty && "@[56rem]/vault-overview:grid-cols-[minmax(0,1fr)_16rem]")}>
-        <div className="flex min-w-0 flex-col gap-5">
-          {info && isEmpty ? (
+      <VaultCollectionsWorkspace key={scope} vault={name!} enabled={!checking && loadedScope === scope}
+        inventory={info ?? undefined}
+        navigation={<VaultOverviewNavigation vault={name!} memberCount={info?.member_count} />}
+        onboarding={info && isEmpty ? (
             <VaultEmptyOnboarding
               name={name!}
               canWrite={canCreateContent}
@@ -469,16 +410,13 @@ function VaultWorkspace({ checking, scope }: { checking: boolean; scope: string 
               }}
             />
           ) : null}
-          <VaultCollectionsWorkspace key={scope} vault={name!} enabled={!checking && loadedScope === scope} />
-        </div>
-
-        {info ? (
-          !isEmpty && <aside className="flex min-w-0 flex-col gap-4" aria-label="Vault overview details">
+        context={info ? (
+          !isEmpty && <aside className="vault-overview-context" aria-label="Vault overview details">
             <RecentActivityPanel name={name!} rows={recent} loading={recentLoading} loaded={recentLoaded} error={recentError} onRetry={() => name && loadRecent(name)} />
             <CommitHistoryPanel name={name!} rows={activity} loading={activityLoading} loaded={activityLoaded} error={activityError} onRetry={() => name && loadActivity(name)} />
           </aside>
         ) : infoError ? (
-          <aside aria-label="Vault overview details" className="flex min-w-0 flex-col gap-4">
+          <aside aria-label="Vault overview details" className="vault-overview-context">
             <RecentActivityPanel name={name!} rows={recent} loading={recentLoading} loaded={recentLoaded} error={recentError} onRetry={() => name && loadRecent(name)} />
             <CommitHistoryPanel name={name!} rows={activity} loading={activityLoading} loaded={activityLoaded} error={activityError} onRetry={() => name && loadActivity(name)} />
             <Panel variant="workspace" className="p-4 text-ui text-foreground-muted">
@@ -487,8 +425,7 @@ function VaultWorkspace({ checking, scope }: { checking: boolean; scope: string 
           </aside>
         ) : (
           <VaultContextSkeleton />
-        )}
-      </div>
+        )} />
 
     </div>
     </Activity>
@@ -571,20 +508,19 @@ function RecentActivityPanel({
       role="region"
       aria-labelledby="recent-heading"
       aria-busy={loading}
-      className="@container/recent min-w-0 rounded-[var(--radius-sm)]"
+      className="vault-recent-panel @container/recent min-w-0"
     >
-      <div className="flex min-h-10 flex-wrap items-center gap-2 border-b border-border bg-background px-3 py-1.5">
-        <FileClock className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
+      <div className="vault-section-heading flex flex-wrap items-center gap-2">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
           <h2
             id="recent-heading"
             className="text-sm font-semibold text-foreground"
           >
-            Recent activity
+            Recently updated
           </h2>
           {!loading && !error && (
             <span className="text-xs tabular-nums text-foreground-muted">
-              {rows.length} change{rows.length === 1 ? "" : "s"}
+              Documents
             </span>
           )}
         </div>
@@ -657,17 +593,14 @@ function RecentActivityPanel({
                   </span>
                   <span className="min-w-0">
                     <span
-                      className="line-clamp-2 break-words text-ui font-medium text-foreground transition-colors group-hover:text-link [overflow-wrap:anywhere]"
+                      className="break-words text-ui font-medium text-foreground transition-colors group-hover:text-link [overflow-wrap:anywhere]"
                       title={row.title}
                     >
                       {row.title}
                     </span>
-                    <span className="block truncate text-xs leading-4 text-foreground-muted" title={collection}>
-                      {collection}
-                    </span>
-                    <span className="mt-0.5 block">
-                    <span className="sr-only">Updated </span>
-                    <RelativeTime iso={row.changed_at} fallback="—" className="whitespace-nowrap text-xs" />
+                    <span className="vault-recent-metadata">
+                      <span className="min-w-0 truncate text-xs text-foreground-muted" title={collection}>{collection}</span>
+                      <span><span className="sr-only">Updated </span><RelativeTime iso={row.changed_at} fallback="—" className="whitespace-nowrap text-xs" /></span>
                     </span>
                   </span>
                 </Link>
@@ -699,7 +632,6 @@ function CommitHistoryPanel({
   const [expanded, setExpanded] = useState(false);
   const { requestNavigation } = useResourceNavigation();
   const activityHref = `/vault/${encodeURIComponent(name)}/activity`;
-  const expandable = loading || error || rows.length > 0;
 
   return (
     <Panel
@@ -708,63 +640,18 @@ function CommitHistoryPanel({
       role="region"
       aria-labelledby="commit-history-heading"
       aria-busy={loading}
-      className="w-full min-w-0 rounded-none border-0 border-t bg-transparent"
+      className="vault-commit-panel w-full min-w-0 rounded-none border-0 border-t bg-transparent"
     >
-      <div className="flex min-h-11 flex-wrap items-center gap-2 py-1.5">
-        <div className="flex flex-1 items-center gap-2">
-          <GitCommit className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
-          <h2
-            id="commit-history-heading"
-            className="whitespace-nowrap text-sm font-semibold text-foreground"
-          >
-            Commit history
-          </h2>
-          <span className="whitespace-nowrap text-xs tabular-nums text-foreground-muted">
-            {loading
-              ? "Loading commits…"
-              : error
-                ? "Unavailable"
-                : rows.length > 0
-                  ? `${fmt(rows.length)} recent`
-                  : "No commits yet"}
-          </span>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {expandable && (
-            <button
-              type="button"
-              aria-expanded={expanded}
-              aria-controls="commit-history-list"
-              onClick={() => setExpanded((current) => !current)}
-              className="inline-flex min-h-11 cursor-pointer items-center sm:[@media(pointer:fine)]:min-h-8 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              {expanded ? "Hide commits" : "Show commits"}
-              <ChevronRight
-                className={cn(
-                  "ml-1 h-3.5 w-3.5 transition-transform",
-                  expanded && "rotate-90",
-                )}
-                aria-hidden
-              />
-            </button>
-          )}
-          <Link
-            to={activityHref}
-            state={{ vaultPageNavigation: activityHref }}
-            onClick={event => {
-              if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-              if (!requestNavigation(activityHref, { state: { vaultPageNavigation: activityHref } })) event.preventDefault();
-            }}
-            className="inline-flex min-h-11 items-center sm:[@media(pointer:fine)]:min-h-8 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            Full commit log
-            <ChevronRight className="ml-1 h-3.5 w-3.5" aria-hidden />
-          </Link>
-        </div>
-      </div>
+      <h2 id="commit-history-heading" className="sr-only">Version history</h2>
+      <Button type="button" variant="ghost" className="vault-history-disclosure"
+        aria-label={expanded ? "Hide version history" : "Show version history"}
+        aria-expanded={expanded} aria-controls="commit-history-list" onClick={() => setExpanded(current => !current)}>
+        <GitCommit className="h-4 w-4 shrink-0" aria-hidden /><span>Version history</span>
+        <ChevronRight className={cn("ml-auto h-3.5 w-3.5 shrink-0 transition-transform", expanded && "rotate-90")} aria-hidden />
+      </Button>
 
-      {loaded && loading && <InlineLoadingState label="Updating commit history; previous commits shown" className="py-2" />}
-      {loaded && error && <Alert variant="destructive" className="my-2">Commit history could not be updated; previous commits shown.<Button variant="outline" size="sm" className="ml-2 max-sm:min-h-11 pointer-coarse:min-h-11" loading={loading} onClick={onRetry}>Retry</Button></Alert>}
+      {expanded && loaded && loading && <InlineLoadingState label="Updating commit history; previous commits shown" className="py-2" />}
+      {expanded && loaded && error && <Alert variant="destructive" className="my-2">Commit history could not be updated; previous commits shown.<Button variant="outline" size="sm" className="ml-2 max-sm:min-h-11 pointer-coarse:min-h-11" loading={loading} onClick={onRetry}>Retry</Button></Alert>}
       {expanded && (
         <div id="commit-history-list">
           {loading && !loaded ? (
@@ -811,54 +698,33 @@ function CommitHistoryPanel({
                   : `/vault/${name}`;
                 return (
                   <li key={`${row.hash ?? "commit"}:${index}`}>
-                    <Link
-                      to={link}
-                      className="group grid min-h-11 grid-cols-[62px_minmax(0,1fr)_auto] items-center gap-2.5 px-4 py-2 transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:grid-cols-[62px_120px_minmax(0,1fr)_auto]"
-                    >
-                      <span className="font-mono text-xs tabular-nums text-foreground-muted">
-                        {(row.hash || "").slice(0, 7)}
-                      </span>
-                      <TooltipText
-                        tip={author}
-                        className="hidden truncate text-xs text-foreground sm:block"
-                      >
-                        {author}
-                      </TooltipText>
+                    <Link to={link} className="vault-history-entry group">
                       <span className="min-w-0">
-                        <span className="flex min-w-0 items-center gap-2">
-                          {changeMark(row.files?.[0]?.change)}
-                          <TooltipText
-                            tip={
-                              row.subject ||
-                              primaryPath ||
-                              row.summary ||
-                              "Commit"
-                            }
-                            className="truncate text-ui text-foreground transition-colors group-hover:text-link"
-                          >
-                            {row.subject ||
-                              primaryPath ||
-                              row.summary ||
-                              "Commit"}
-                          </TooltipText>
+                        <span className="block break-words text-ui font-medium leading-5 group-hover:text-link [overflow-wrap:anywhere]">{row.subject || primaryPath || row.summary || "Commit"}</span>
+                        <span className="vault-history-entry-meta">
+                          <code>{(row.hash || "").slice(0, 7)}</code><span>{author}</span>{changeMark(row.files?.[0]?.change)}
                         </span>
-                        {primaryPath && (
-                          <span className="coord block truncate pl-6">
-                            {primaryPath}
-                            {filesCount > 1 && ` · +${filesCount - 1} files`}
-                          </span>
-                        )}
+                        {primaryPath && <span className="mt-1 block break-words text-xs text-foreground-muted [overflow-wrap:anywhere]">{primaryPath}{filesCount > 1 && ` · +${filesCount - 1} files`}</span>}
                       </span>
-                      <RelativeTime
-                        iso={row.timestamp || row.date}
-                        className="w-[60px] justify-end text-right"
-                      />
+                      <RelativeTime iso={row.timestamp || row.date} className="whitespace-nowrap text-xs" />
                     </Link>
                   </li>
                 );
               })}
             </ol>
           )}
+          <Link
+            to={activityHref}
+            state={{ vaultPageNavigation: activityHref }}
+            onClick={event => {
+              if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+              if (!requestNavigation(activityHref, { state: { vaultPageNavigation: activityHref } })) event.preventDefault();
+            }}
+            className="mt-2 inline-flex min-h-11 items-center sm:[@media(pointer:fine)]:min-h-8 rounded-[var(--radius-sm)] px-2 text-xs font-medium text-link transition-token hover:bg-surface-hover hover:text-link-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Full commit log
+            <ChevronRight className="ml-1 h-3.5 w-3.5" aria-hidden />
+          </Link>
         </div>
       )}
     </Panel>
@@ -886,6 +752,13 @@ function VaultOverviewMetadata({ name, info, guideDefined, guideCustomized, guid
     : info.public_access === "none" ? "Only people with access can open this vault." : "Visibility information is unavailable.";
   const VisibilityIcon = info.public_access === "none" ? LockKeyhole : info.public_access === "reader" || info.public_access === "writer" ? Globe : HelpCircle;
   const metaLink = "inline-flex min-h-9 min-w-0 items-center gap-1.5 rounded-[var(--radius-sm)] text-ui text-link hover:text-link-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-sm:min-h-11 pointer-coarse:min-h-11";
+  const guide = !info.is_external_git && <section aria-label="Vault guide" className="min-w-0">
+      {guideLoading ? <InlineLoadingState label="Checking vault guide" className="py-1 text-xs" />
+        : guideError ? <button type="button" className={metaLink} onClick={onGuideRetry} disabled={guideRetrying} aria-busy={guideRetrying} aria-label="Retry vault guide">{guideRetrying ? "Checking guide…" : "Guide unavailable · Retry"}</button>
+        : guideDefined ? <><span id="vault-guide-status" className="sr-only">{guideStatus}</span><Link id="vault-overview-guide" to={`/vault/${encodeURIComponent(name)}/doc/${encodeURIComponent(VAULT_SKILL_PATH)}`} state={documentPreviewState(location, "vault-overview-guide")} aria-label="Open vault guide" aria-describedby="vault-guide-status" className={metaLink}>Vault guide</Link></>
+        : canSetUp ? <Link id="vault-overview-guide" to={`/vault/${encodeURIComponent(name)}/settings#skill`} aria-label="Set up vault guide" className={metaLink}>Set up guide</Link>
+        : <span className="inline-flex min-h-9 items-center text-xs max-sm:min-h-11 pointer-coarse:min-h-11">Guide not configured</span>}
+    </section>;
   return <div data-slot="vault-overview-metadata" className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-0 text-ui text-foreground-muted">
     <section aria-label="Access and ownership" className="flex min-w-0 flex-wrap items-center gap-x-4">
       <Popover>
@@ -897,26 +770,21 @@ function VaultOverviewMetadata({ name, info, guideDefined, guideCustomized, guid
         <PopoverContent align="start" aria-label="Vault access" className="p-3 text-ui">
           <div className="flex items-center justify-between gap-3"><h2 className="text-sm font-semibold">Vault access</h2><PopoverClose asChild><Button variant="ghost" size="icon" className="h-9 w-9 max-sm:h-11 max-sm:w-11 pointer-coarse:h-11 pointer-coarse:w-11" aria-label="Close vault access"><X className="h-4 w-4" aria-hidden /></Button></PopoverClose></div>
           <p className="mt-1 leading-5">{policy}</p>
-          <p className="mt-2 text-xs leading-5 text-foreground-muted">Public links are managed separately and may allow access without signing in.</p>
+          <p className="mt-2 text-xs leading-5 text-foreground-muted">Publications are managed separately and may allow access without signing in.</p>
         </PopoverContent>
       </Popover>
-      <p className="min-w-0 break-words py-1.5 [overflow-wrap:anywhere]"><span>Owner</span><span className="ml-1.5 text-foreground">{info.owner_display_name || info.owner || "Not available"}</span></p>
+      <div className="vault-owner-guide"><p className="min-w-0 break-words py-1.5 [overflow-wrap:anywhere]"><span>Owner</span><span className="ml-1.5 text-foreground">{info.owner_display_name || info.owner || "Not available"}</span></p>{guide}</div>
     </section>
-    {!info.is_external_git && <section aria-label="Vault guide" className="min-w-0">
-      {guideLoading ? <InlineLoadingState label="Checking vault guide" className="py-1 text-xs" />
-        : guideError ? <button type="button" className={metaLink} onClick={onGuideRetry} disabled={guideRetrying} aria-busy={guideRetrying} aria-label="Retry vault guide"><BookText className="h-3.5 w-3.5" aria-hidden />{guideRetrying ? "Checking guide…" : "Guide unavailable · Retry"}</button>
-        : guideDefined ? <><span id="vault-guide-status" className="sr-only">{guideStatus}</span><Link id="vault-overview-guide" to={`/vault/${encodeURIComponent(name)}/doc/${encodeURIComponent(VAULT_SKILL_PATH)}`} state={documentPreviewState(location, "vault-overview-guide")} aria-label="Open vault guide" aria-describedby="vault-guide-status" className={metaLink}><BookText className="h-3.5 w-3.5" aria-hidden />Vault guide<ChevronRight className="h-3 w-3" aria-hidden /></Link></>
-        : canSetUp ? <Link id="vault-overview-guide" to={`/vault/${encodeURIComponent(name)}/settings#skill`} aria-label="Set up vault guide" className={metaLink}><BookText className="h-3.5 w-3.5" aria-hidden />Set up guide<ChevronRight className="h-3 w-3" aria-hidden /></Link>
-        : <span className="inline-flex min-h-9 items-center text-xs max-sm:min-h-11 pointer-coarse:min-h-11">Guide not configured</span>}
-    </section>}
+
+    {info.role && info.role !== "owner" && <span className="vault-my-access">Your access: {info.role}</span>}
   </div>;
 }
 
 function VaultContextSkeleton() {
   return (
-    <aside className="flex min-w-0 flex-col gap-4" aria-label="Loading vault details" aria-busy="true">
-      <Panel variant="workspace" flush className="rounded-[var(--radius-sm)]" aria-hidden>
-        <div className="flex h-10 items-center gap-2 border-b border-border bg-background px-3">
+    <aside className="vault-overview-context" aria-label="Loading vault details" aria-busy="true">
+      <Panel variant="workspace" flush className="vault-recent-panel" aria-hidden>
+        <div className="vault-section-heading flex items-center gap-2">
           <Skeleton className="h-4 w-4" /><Skeleton className="h-4 w-28" />
         </div>
         <div className="divide-y divide-border">
@@ -1185,16 +1053,18 @@ function OnboardStep({
 }
 
 function OverviewLoadingState({ checking }: { checking: boolean }) {
-  return <LoadingState label={checking ? "Verifying vault access…" : "Loading vault overview…"} className="@container/vault-overview-loading mx-auto w-full max-w-7xl space-y-5">
-    <section aria-hidden className="space-y-2 border-b border-border pb-3">
-      <div className="flex min-h-14 items-center gap-3"><Skeleton className="h-7 w-7" /><div className="flex-1 space-y-2"><Skeleton className="h-4 w-48" /><Skeleton className="h-3 w-3/5" /></div></div>
+  return <LoadingState label={checking ? "Verifying vault access…" : "Loading vault overview…"} className="vault-page vault-overview @container/vault-overview">
+    <section aria-hidden className="vault-overview-summary">
+      <div className="vault-overview-heading"><div className="vault-overview-title"><Skeleton className="h-8 w-8 shrink-0" /><Skeleton className="h-6 w-48 max-w-full" /></div><Skeleton className="h-9 w-9 shrink-0" /></div>
+      <Skeleton className="h-5 w-3/5" />
       <div className="flex min-h-9 flex-wrap items-center gap-4"><Skeleton className="h-3 w-16" /><Skeleton className="h-3 w-28" /><Skeleton className="h-3 w-20" /></div>
-      <div className="flex min-h-8 flex-wrap items-center gap-4">{[0, 1, 2, 3].map(index => <Skeleton key={index} className="h-3 w-20" />)}</div>
+
     </section>
-    <div className="grid items-start gap-6 @[56rem]/vault-overview-loading:grid-cols-[minmax(0,1fr)_16rem]">
-      <div className="@container/overview-main min-w-0" aria-hidden>
-        <div className="mb-4 flex min-h-12 items-start justify-between gap-3 border-b border-border pb-3"><Skeleton className="h-5 w-28" /><Skeleton className="h-9 w-2/5" /></div>
-        <div className="grid grid-cols-1 gap-3 @[28rem]/overview-main:grid-cols-2 @[44rem]/overview-main:grid-cols-3">{[0, 1, 2, 3].map(index => <Skeleton key={index} className="h-24 w-full" />)}</div>
+    <div className="vault-content-navigation" aria-hidden><div className="vault-content-tabs">{["Collections", "Documents", "Tables", "Files"].map(label => <Skeleton key={label} className="h-9 w-24" />)}</div></div>
+    <div className="vault-overview-body">
+      <div className="vault-overview-main" aria-hidden>
+        <div className="vault-collection-toolbar"><Skeleton className="h-6 w-28" /><Skeleton className="h-10 w-2/5" /></div>
+        <div className="vault-collection-grid">{[0, 1, 2, 3].map(index => <Skeleton key={index} className="h-15 w-full" />)}</div>
       </div>
       <VaultContextSkeleton />
     </div>

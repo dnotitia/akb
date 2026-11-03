@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode, type RefCallback } from "react";
 import { Check, Terminal } from "lucide-react";
 import { authSessionSnapshot, isCurrentAuthSession, type AuthSessionSnapshot } from "@/lib/api";
 import { type PatReceipt } from "@/lib/api-pat-issuance";
@@ -11,14 +11,17 @@ import { CodeSnippet } from "@/components/ui/code-snippet";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
+import { useSetupStepNavigation, type SetupStepNumber } from "@/hooks/use-setup-step-navigation";
 
-function SetupStep({ id, number, title, children }: { id: string; number: number; title: string; children: ReactNode }) {
-  return <section aria-labelledby={id} className="grid min-w-0 grid-cols-[1.75rem_minmax(0,1fr)] gap-x-3 py-4 sm:gap-x-4">
-    <span aria-hidden className="flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] bg-primary/10 text-xs font-semibold tabular-nums text-link">{number}</span>
-    <h3 id={id} aria-label={`${number}. ${title}`} className="pt-0.5 text-sm font-semibold leading-6 text-foreground"><span className="sr-only">{number}. </span>{title}</h3>
-    <div className="col-span-2 min-w-0 space-y-3 pt-3 sm:col-span-1 sm:col-start-2">
-      {children}
-    </div>
+function SetupStep({ id, number, title, description, current, sectionRef, onFocus, children }: {
+  id: string; number: SetupStepNumber; title: string; description: string; current: boolean;
+  sectionRef: RefCallback<HTMLElement>; onFocus: (step: SetupStepNumber) => void; children: ReactNode;
+}) {
+  return <section ref={sectionRef} id={`${id}-section`} aria-labelledby={id} className="connection-step" data-current={current} onFocusCapture={() => onFocus(number)}>
+    <header className="connection-step-heading"><span aria-hidden className="connection-step-number">{number}</span>
+      <div className="min-w-0"><h3 id={id} tabIndex={-1} aria-label={`${number}. ${title}`}><span className="sr-only">{number}. </span>{title}</h3><p>{description}</p></div>
+    </header>
+    <div className="connection-step-body space-y-3">{children}</div>
   </section>;
 }
 
@@ -27,12 +30,13 @@ function SetupChoice({ label, name, value, options, disabled, onChange, appearan
   label: string; name: string; value: string;
   options: { value: string; label: string; accessibleName?: string }[];
   disabled: boolean; onChange: (value: string) => void;
-  appearance?: "tabs" | "segmented";
+  appearance?: "tabs" | "segmented" | "compact";
 }) {
-  return <fieldset disabled={disabled} className="min-w-0">
+  const compact = appearance === "compact";
+  return <fieldset disabled={disabled} className={cn("min-w-0", compact && "connection-compact-choices")}>
     <legend className="mb-2 text-xs font-medium text-foreground-muted">{label}</legend>
-    <div className={cn("flex flex-wrap gap-1", appearance === "tabs" ? "border-b border-border" : "rounded-[var(--radius-md)] border border-border bg-surface-2 p-1")}>
-      {options.map(option => <label key={option.value} className={cn(
+    <div className={cn("flex flex-wrap gap-1", compact ? "connection-choice-row" : appearance === "tabs" ? "border-b border-border" : "rounded-[var(--radius-md)] border border-border bg-surface-2 p-1")}>
+      {options.map(option => <label key={option.value} data-selected={value === option.value} data-disabled={disabled} className={compact ? "connection-choice-option" : cn(
         "relative flex min-h-11 flex-[1_0_auto] cursor-pointer items-center justify-center gap-2 whitespace-nowrap px-3 text-sm transition-token has-[:focus-visible]:z-10 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring has-[:focus-visible]:ring-offset-2 has-[:focus-visible]:ring-offset-surface",
         appearance === "tabs" ? "rounded-t-[var(--radius-sm)] border-b-2" : "rounded-[var(--radius-sm)] border",
         disabled && "cursor-not-allowed opacity-50",
@@ -62,6 +66,7 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
   ownsOperation?: () => boolean;
 }) {
   const id = useId();
+  const { rootRef, navigationRef, stepsRef, currentStep, setCurrentStep, jumpToStep } = useSetupStepNavigation();
   const [agent, setAgent] = useState<McpAgent>("claude");
   const [auth, setAuth] = useState("oauth");
   const [credentialMode, setCredentialMode] = useState("create");
@@ -120,18 +125,23 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
 
   const accessMethod = useOauth ? "oauth" : freshToken ? "create" : credentialMode;
   const configVisible = useOauth || (usableToken && (!freshToken || showSecret));
-  return <div className="min-w-0 text-sm" data-layout={layout}>
-    <ol aria-label="Connection setup overview" className="mb-4 grid grid-cols-3 gap-2 border-b border-border pb-4 text-xs text-foreground-muted">
-      {["Prepare access", "Configure your tool", "Try the connection"].map((step, index) => <li key={step} className="min-w-0 leading-relaxed">
-        <span className="mb-1 block font-semibold tabular-nums text-link">Step {index + 1}</span>{step}
-      </li>)}
-    </ol>
-    <div>
-      <SetupChoice label="AI tool" appearance="tabs" name={`${id}-agent`} value={agent} disabled={creating} onChange={value => setAgent(value as McpAgent)} options={Object.entries(MCP_AGENT_LABELS).map(([value, label]) => ({ value, label }))} />
-    </div>
-    <div className="divide-y divide-border">
-    <SetupStep id={`${id}-choose`} number={1} title="Prepare access">
-      <SetupChoice label="Access method" name={`${id}-access`} value={accessMethod} disabled={creating} onChange={value => {
+  return <div ref={rootRef} className="connection-setup min-w-0" data-layout={layout}>
+    <nav ref={navigationRef} className="connection-progress" aria-label="Connection setup steps">
+      <ol aria-label="Connection setup overview">
+        {[
+          { number: 1, label: "Prepare access", short: "Access", target: `${id}-choose` },
+          { number: 2, label: `Configure ${MCP_AGENT_LABELS[agent]}`, short: "Configure", target: `${id}-configure` },
+          { number: 3, label: "Try the connection", short: "Try", target: `${id}-try` },
+        ].map(step => <li key={step.number}><button type="button" aria-label={`Go to step ${step.number}: ${step.label}`} aria-controls={`${step.target}-section`}
+          aria-current={currentStep === step.number ? "step" : undefined} onClick={() => jumpToStep(step.number as SetupStepNumber)}>
+          <span aria-hidden className="connection-progress-number">{step.number}</span><span aria-hidden className="connection-progress-label">{step.label}</span><span aria-hidden className="connection-progress-short">{step.short}</span>
+        </button></li>)}
+      </ol>
+    </nav>
+    <div className="connection-steps">
+    <SetupStep id={`${id}-choose`} number={1} title="Prepare access" description="Choose how your tool will sign in to AKB."
+      current={currentStep === 1} sectionRef={element => { stepsRef.current[0] = element; }} onFocus={setCurrentStep}>
+      <SetupChoice label="Access method" appearance={layout === "settings" ? "compact" : "segmented"} name={`${id}-access`} value={accessMethod} disabled={creating} onChange={value => {
         if (value === "oauth") setAuth("oauth");
         else { setAuth("pat"); setCredentialMode(value); }
       }} options={[
@@ -165,17 +175,21 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
       </div>}
     </SetupStep>
 
-    <SetupStep id={`${id}-configure`} number={2} title={`Configure ${MCP_AGENT_LABELS[agent]}`}>
+    <SetupStep id={`${id}-configure`} number={2} title={`Configure ${MCP_AGENT_LABELS[agent]}`} description="Select your tool, then copy its configuration."
+      current={currentStep === 2} sectionRef={element => { stepsRef.current[1] = element; }} onFocus={setCurrentStep}>
+      <SetupChoice label="AI tool" appearance={layout === "settings" ? "compact" : "tabs"} name={`${id}-agent`} value={agent} disabled={creating} onChange={value => setAgent(value as McpAgent)} options={Object.entries(MCP_AGENT_LABELS).map(([value, label]) => ({ value, label }))} />
       {configVisible ? <>
         <p className="text-foreground-muted">{MCP_AGENT_FILES[agent] === "terminal" ? "Run this in your terminal." : `Merge this configuration into your tool's ${MCP_AGENT_FILES[agent]}; keep any existing servers.`}</p>
         <CodeSnippet code={useOauth ? oauthSnippet! : mcpInstallSnippets(token)[agent]} filename={MCP_AGENT_FILES[agent]} />
-      </> : <div className="flex items-start gap-3 rounded-[var(--radius-md)] border border-dashed border-border bg-surface-2/50 p-4">
+      </> : <div className="flex items-start gap-3 rounded-[var(--radius-md)] bg-surface-2/50 p-3">
         <Terminal className="mt-0.5 h-4 w-4 shrink-0 text-foreground-muted" aria-hidden />
-        <div className="space-y-1"><p className="font-medium">Your configuration will appear here</p><p className="text-xs leading-relaxed text-foreground-muted">{freshToken && !showSecret ? "Show your token and configuration in step 1 to copy it." : "Create or enter a token in step 1. No placeholder credentials are included."}</p></div>
+        <div className="min-w-0 space-y-2"><p className="font-medium">Your configuration will appear here</p><p className="text-xs leading-relaxed text-foreground-muted">{freshToken && !showSecret ? "Show your token and configuration in step 1 to copy it." : mcpOauthEnabled && !oauthAvailable && auth === "oauth" ? `${MCP_AGENT_LABELS[agent]} needs token access. Create or enter a token in step 1.` : "Create or enter a token in step 1. No placeholder credentials are included."}</p>
+          <Button type="button" variant="outline" size="sm" onClick={() => jumpToStep(1)}>Return to Prepare access</Button></div>
       </div>}
     </SetupStep>
 
-    <SetupStep id={`${id}-try`} number={3} title="Try it in your agent">
+    <SetupStep id={`${id}-try`} number={3} title="Try it in your agent" description="Complete sign-in and check the response in your tool."
+      current={currentStep === 3} sectionRef={element => { stepsRef.current[2] = element; }} onFocus={setCurrentStep}>
       <p className="leading-relaxed text-foreground-muted">{useOauth ? agent === "claude" ? "Open Claude Code and use /mcp to sign in to AKB in your browser. Then send this read-only request:" : "Reload your tool, enable AKB and complete its browser sign-in. Then send this read-only request:" : "Reload your tool if needed, enable AKB, then send this read-only request:"}</p>
       <CodeSnippet code="Use akb_help to show me how AKB works, then list the vaults I can access. Do not create or change anything." filename="Prompt for your agent" />
       <p className="text-xs leading-relaxed text-foreground-muted">Expected response: AKB's usage guide and the vaults you can access. This browser cannot verify an external agent connection.</p>

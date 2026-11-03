@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LoadingState, InlineLoadingState } from "@/components/ui/loading-state";
+import { SettingsHeading } from "./settings-ui";
 
 export function NotificationsSection({ onBusyChange }: { onBusyChange?: (busy: boolean) => void }) {
   const user = useCurrentUser();
@@ -25,17 +26,15 @@ export function NotificationsSection({ onBusyChange }: { onBusyChange?: (busy: b
     finally { setBusy(null); }
   }
   return (
-    <section aria-labelledby="watched-documents-heading" className="max-w-5xl">
-      <div className="border-b border-border pb-4">
-        <h2 id="watched-documents-heading" className="text-base font-semibold text-foreground">Watched documents</h2>
-        <p className="mt-1 text-sm text-foreground-muted">Get notified when others update these documents. Choose Watch in a document to add it here.</p>
-      </div>
+    <section aria-labelledby="watched-documents-heading">
+      <SettingsHeading id="watched-documents-heading" title="Watched documents" description="Keep up with the documents that matter to your work." />
+      <p className="settings-supporting-note">Choose Watch in any document to receive updates and manage it here.</p>
       {query.isPending && <LoadingState label="Loading watched documents" className="space-y-3 py-5">{[0, 1, 2].map(row => <Skeleton key={row} className="h-14 w-full" />)}</LoadingState>}
       {query.isFetching && query.data && <InlineLoadingState label="Updating watched documents" className="py-3" />}
       {query.error && <Alert variant="info" className="mt-4">{query.error instanceof NotificationsUnavailable ? query.error.message : "Could not load watched documents."}<Button variant="ghost" size="sm" loading={query.isFetching} onClick={() => void query.refetch()}>Retry</Button></Alert>}
       {error && <Alert variant="destructive" className="mt-4">{error}<Button variant="ghost" size="sm" onClick={() => setError(null)}>Dismiss</Button></Alert>}
-      {query.data?.items.length === 0 && <p className="py-6 text-sm text-foreground-muted">You aren’t watching any documents yet.</p>}
-      <ul className="divide-y divide-border" aria-busy={query.isFetching || busy !== null}>
+      {query.data?.items.length === 0 && <div className="settings-empty"><FileText aria-hidden /><h3>No documents to follow yet</h3><p>You aren’t watching any documents yet.</p><p>Open a document and choose Watch to add it here.</p></div>}
+      <ul className={query.data?.items.length ? "settings-watch-list" : ""} aria-busy={query.isFetching || busy !== null}>
         {query.data?.items.map(item => {
           const parsed = parseDocUri(item.uri);
           const href = parsed && parsed.vault === item.vault ? `/vault/${encodeURIComponent(parsed.vault)}/doc/${encodeURIComponent(parsed.id)}` : null;

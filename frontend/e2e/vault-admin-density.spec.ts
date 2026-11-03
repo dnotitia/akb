@@ -17,11 +17,49 @@ async function fixture(page: Page, dark: boolean) {
     else if (path.endsWith("/vaults")) json = { vaults: [{ id: "density-vault", name: "fixture", role: "owner" }] };
     else if (path.endsWith("/info")) json = { name: "fixture", role: "owner", role_source: "member", public_access: "none", description: "Shared operating knowledge.", document_count: 9, collection_count: 1, table_count: 0, file_count: 0, member_count: 9 };
     else if (path.endsWith("/members")) json = { members: Array.from({ length: 9 }, (_, index) => ({ id: index ? `member-${index}` : "density-owner", username: index ? `member-${index}` : "owner", display_name: index ? `Member ${index}` : "Review owner", email: `member${index}@example.invalid`, role: index ? "reader" : "owner", account_kind: "human", account_status: "active", since: "2026-09-15T00:00:00Z" })) };
+    else if (path === "/api/v1/publications") json = { publications: [], total: 0, complete: true, next_cursor: null };
     else if (path.includes("/publications/")) json = { publications: Array.from({ length: 9 }, (_, index) => ({ slug: `density-link-${index}`, share_url: `https://example.invalid/p/density-link-${index}`, resource_type: "document", resource_uri: `akb://fixture/coll/guides/doc/document-${index}.md`, vault: "fixture", title: index ? `Operating guide ${index}` : "Architecture decisions and operating guidance for the platform team", mode: "live", view_count: index, expires_at: null, max_views: null, password_protected: false, created_at: "2026-09-15T00:00:00Z" })) };
     else if (path.includes("/documents/fixture/")) json = { id: "guide", path: "overview/vault-skill.md", title: "Vault guide", content: "# Vault guide\n\nKeep decisions with their context.", current_commit: "guide-head", metadata: {}, status: "active" };
     else if (path.endsWith("/help/skill-template")) return route.fulfill({ contentType: "text/plain", body: "# {vault} Guide\n\nStarter template." });
-    else if (path.includes("/browse/")) json = { items: [{ type: "collection", name: "guides", path: "guides", doc_count: 9 }] };
+    else if (path.includes("/browse/")) json = { path: "", complete: true, next_cursor: null, items: [{ type: "collection", name: "guides", path: "guides", doc_count: 9 }] };
     return route.fulfill({ json });
+  });
+}
+
+for (const width of [375, 1024, 1920, 2560]) for (const dark of [false, true]) {
+  test(`Directory, Overview and global Publications share page identity and gutters at ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 1000 });
+    await page.emulateMedia({ reducedMotion: "reduce", colorScheme: dark ? "dark" : "light" });
+    await fixture(page, dark);
+    for (const route of ["/vault", "/vault/fixture", "/publications"]) {
+      await page.goto(route);
+      const directory = route === "/vault";
+      const global = route === "/publications";
+      const frame = page.locator(global ? ".workspace-density-compact" : directory ? ".vault-directory" : ".vault-overview");
+      const heading = frame.getByRole("heading", { level: 1 });
+      await expect(heading).toBeVisible();
+      await expect(heading).toHaveCSS("font-size", "20px");
+      await expect(heading).toHaveCSS("line-height", "28px");
+      await expect(heading).toHaveCSS("font-weight", "600");
+      if (!directory) {
+        const mark = frame.locator(global ? ".workspace-route-mark" : ".vault-overview-title > .vault-library-mark");
+        await expect(mark).toHaveCSS("width", "36px");
+        await expect(mark).toHaveCSS("height", "36px");
+        await expect(mark.locator("svg")).toHaveCSS("width", "20px");
+        await expect(mark.locator("svg")).toHaveCSS("height", "20px");
+      }
+      const viewport = page.locator(global ? "#main" : '[data-slot="vault-route-viewport"]');
+      const box = (await frame.boundingBox())!;
+      const origin = (await viewport.boundingBox())!;
+      const available = await viewport.evaluate(element => element.clientWidth);
+      const gutter = width >= 1280 ? 32 : width >= 640 ? 24 : 16;
+      const expectedWidth = Math.min(1280, available - gutter * 2);
+      expect(box.width).toBe(expectedWidth);
+      expect(box.x - origin.x).toBe((available - expectedWidth) / 2);
+      expect(box.y - origin.y).toBe(20);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      await page.screenshot({ path: testInfo.outputPath(`${directory ? "directory" : global ? "publications" : "overview"}-identity.png`), animations: "disabled", fullPage: true });
+    }
   });
 }
 
@@ -30,13 +68,6 @@ for (const width of [375, 1024, 1920, 2560]) for (const dark of [false, true]) f
     await page.setViewportSize({ width, height: 1000 });
     await page.emulateMedia({ reducedMotion: "reduce", colorScheme: dark ? "dark" : "light" });
     await fixture(page, dark);
-    let overviewBox: { x: number; y: number; width: number; height: number } | null = null;
-    if (width >= 1920) {
-      await page.goto("/vault/fixture");
-      const overview = page.getByRole("region", { name: "fixture Vault overview", exact: true });
-      await expect(overview).toBeVisible();
-      overviewBox = await overview.boundingBox();
-    }
     await page.goto(`/vault/fixture/${route}`);
     const workspace = page.locator(".workspace-density-compact");
     await expect(workspace).toBeVisible();
@@ -44,30 +75,48 @@ for (const width of [375, 1024, 1920, 2560]) for (const dark of [false, true]) f
     const workspaceBox = (await workspace.boundingBox())!;
     const viewportBox = (await viewport.boundingBox())!;
     const viewportWidth = await viewport.evaluate(element => element.clientWidth);
-    const gutter = width >= 1280 ? 32 : width >= 640 ? 24 : 16;
-    const expectedWidth = Math.min(1280, viewportWidth - gutter * 2);
-    const expectedInset = (viewportWidth - expectedWidth) / 2;
-    expect(workspaceBox.width).toBe(expectedWidth);
-    expect(workspaceBox.x - viewportBox.x).toBe(expectedInset);
-    expect(viewportBox.x + viewportWidth - workspaceBox.x - workspaceBox.width).toBe(expectedInset);
-    expect(workspaceBox.y - viewportBox.y).toBe(20);
-    if (overviewBox) {
-      expect(workspaceBox.x).toBe(overviewBox.x);
-      expect(workspaceBox.width).toBe(overviewBox.width);
-      expect(workspaceBox.y).toBe(overviewBox.y);
+    if (route === "settings") {
+      expect(Math.abs(workspaceBox.width - viewportWidth)).toBeLessThanOrEqual(1);
+      expect(Math.abs(workspaceBox.x - viewportBox.x)).toBeLessThanOrEqual(1);
+      const header = page.getByTestId("vault-settings-header");
+      await expect(header).toBeVisible();
+      const headerBox = (await header.boundingBox())!;
+      expect(headerBox.x - workspaceBox.x).toBeGreaterThanOrEqual(16);
+      const leftInset = headerBox.x - workspaceBox.x;
+      const rightInset = workspaceBox.x + workspaceBox.width - headerBox.x - headerBox.width;
+      expect(Math.abs(leftInset - rightInset)).toBeLessThanOrEqual(1);
+      expect(headerBox.y - workspaceBox.y).toBeGreaterThanOrEqual(16);
+      const panel = page.getByRole("tabpanel");
+      const panelBox = (await panel.boundingBox())!;
+      expect(panelBox.width).toBeLessThanOrEqual(1280);
+      expect(Math.abs(panelBox.x - headerBox.x)).toBeLessThanOrEqual(1);
+      expect(Math.abs(panelBox.width - headerBox.width)).toBeLessThanOrEqual(1);
+      await expect(header.getByRole("heading")).toHaveCSS("font-size", "20px");
+    } else {
+      const gutter = width >= 1280 ? 32 : width >= 640 ? 24 : 16;
+      const expectedWidth = Math.min(1280, viewportWidth - gutter * 2);
+      const expectedInset = (viewportWidth - expectedWidth) / 2;
+      expect(workspaceBox.width).toBe(expectedWidth);
+      expect(workspaceBox.x - viewportBox.x).toBe(expectedInset);
+      expect(viewportBox.x + viewportWidth - workspaceBox.x - workspaceBox.width).toBe(expectedInset);
+      expect(workspaceBox.y - viewportBox.y).toBe(20);
+      const header = workspace.locator('[data-slot="workspace-page-header"]');
+      await expect(header).toBeVisible();
+      await expect(header.getByRole("heading", { level: 1 })).toHaveCSS("font-size", "20px");
+      await expect(header.getByRole("heading", { level: 1 })).toHaveCSS("line-height", "28px");
+      await expect(header.locator(".workspace-route-mark")).toHaveCSS("width", "36px");
+      await expect(header.locator(".workspace-route-mark > svg")).toHaveCSS("width", "20px");
     }
-    const header = workspace.locator('[data-slot="workspace-section-header"]');
-    await expect(header).toBeVisible();
 
     if (route === "publications") {
-      const list = page.getByRole("list", { name: "Public links", exact: true });
+      const list = page.getByRole("list", { name: "Publications", exact: true });
       await expect(list.getByRole("listitem")).toHaveCount(9);
       const row = list.getByRole("listitem").first();
       const content = (await row.locator(":scope > div").first().boundingBox())!;
       const actions = (await row.locator(":scope > div").last().boundingBox())!;
       if (workspaceBox.width < 672) expect(actions.y).toBeGreaterThanOrEqual(content.y + content.height);
       else expect(actions.x).toBeGreaterThanOrEqual(content.x + content.width);
-      await expect(page.getByRole("searchbox", { name: "Filter public links", exact: true })).toBeVisible();
+      await expect(page.getByRole("searchbox", { name: "Filter publications", exact: true })).toBeVisible();
       const copy = row.getByRole("button", { name: /Copy/ }).first();
       expect((await copy.boundingBox())!.height).toBeGreaterThanOrEqual(width < 640 ? 44 : 32);
     } else if (route === "members") {
@@ -81,7 +130,7 @@ for (const width of [375, 1024, 1920, 2560]) for (const dark of [false, true]) f
       const description = page.getByRole("textbox", { name: "Description", exact: true });
       await expect(description).toBeVisible();
       expect((await description.boundingBox())!.height).toBeGreaterThanOrEqual(80);
-      expect((await page.getByTestId("settings-access-editor").boundingBox())!.width).toBeLessThanOrEqual(1024);
+      expect((await page.getByTestId("settings-general-editor").boundingBox())!.width).toBeLessThanOrEqual(1024);
       await description.fill("Unsaved layout review");
       const save = page.getByRole("button", { name: "Save changes", exact: true });
       await expect(save).toBeEnabled();

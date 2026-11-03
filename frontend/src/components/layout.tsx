@@ -1,7 +1,7 @@
 import { Link, Outlet, Navigate, matchPath, useLocation } from "react-router-dom";
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Boxes, House, type LucideIcon } from "lucide-react";
+import { Boxes, Share2, type LucideIcon } from "lucide-react";
 import {
   ApiError,
   authSessionSnapshot,
@@ -198,6 +198,7 @@ export function Layout({ routeOverlay, protectBackgroundDrafts = false }: { rout
   const isSearchWorkspace = Boolean(matchPath("/search", location.pathname));
   const isSearchRoute = isSearchWorkspace || Boolean(matchPath("/vault/:name/search", location.pathname));
   const isSettingsWorkspace = Boolean(matchPath("/settings", location.pathname));
+  const isPublicLinksWorkspace = Boolean(matchPath("/publications", location.pathname));
   const overviewMatch = matchPath("/vault/:name", location.pathname);
   const isVaultOverview = !!overviewMatch && overviewMatch.params.name !== "new";
   const namedVault = wide && matchPath("/vault/:name/*", location.pathname)?.params.name;
@@ -307,7 +308,7 @@ export function Layout({ routeOverlay, protectBackgroundDrafts = false }: { rout
           <div className="flex h-full min-w-0 flex-1 items-center pr-3 lg:px-5">
             {namedVault && <VaultParentBackLink className="mr-2 hidden lg:inline-flex" />}
             <AppPageLocation isAdmin={session.user.is_admin} parentBack={Boolean(namedVault)} />
-            <div ref={searchControlsRef} className="ml-auto flex min-w-0 flex-1 items-center gap-2 lg:flex-none lg:pl-3">
+            <div ref={searchControlsRef} className="ml-auto flex min-w-0 shrink-0 items-center gap-2 lg:flex-none lg:pl-3">
               {!isVaultOverview && <HeaderIndexingStatus />}
               {/* Quick search stays available on every route. The full Search
                   page owns its separate, URL-backed query below this header. */}
@@ -323,17 +324,12 @@ export function Layout({ routeOverlay, protectBackgroundDrafts = false }: { rout
               className="ml-2 flex items-center gap-1 lg:hidden"
             >
               <MobileNavLink
-                to="/"
-                active={location.pathname === "/"}
-                name="Home"
-                icon={House}
-              />
-              <MobileNavLink
                 to="/vault"
                 active={location.pathname.startsWith("/vault")}
                 name="Vaults"
                 icon={Boxes}
               />
+              <MobileNavLink to="/publications" active={isPublicLinksWorkspace} name="Publications" icon={Share2} />
             </nav>
 
             <div ref={accountControlsRef} className="ml-2 flex shrink-0 items-center justify-end gap-2 border-l border-border pl-2 lg:min-w-28">
@@ -381,7 +377,7 @@ export function Layout({ routeOverlay, protectBackgroundDrafts = false }: { rout
                 </ErrorBoundary>
               </CurrentUserProvider>
             ) : (
-              <div className="w-full px-[var(--workspace-gutter)] py-8">
+              <div className={isPublicLinksWorkspace ? "w-full px-4 py-5 sm:px-6 xl:px-8" : "w-full px-[var(--workspace-gutter)] py-8"}>
                 <CurrentUserProvider user={session.user} checking={revalidating} revision={accessRevision}>
                   <ErrorBoundary
                     resetKeys={[location.pathname, location.search]}

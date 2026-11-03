@@ -248,7 +248,7 @@ for (const width of [375, 1440]) for (const dark of [false, true]) test(`profile
   await expect(confirm).toBeVisible(); await confirm.getByRole("button", { name: "Keep editing" }).click();
   await dialog.getByRole("button", { name: "Save photo" }).click();
   await expect(dialog.getByText("Photo saved", { exact: true })).toBeVisible();
-  await expect(dialog.locator('[data-slot="user-avatar"] img')).toHaveCount(1);
+  await expect(dialog.getByTestId("profile-photo-editor").locator('[data-slot="user-avatar"] img')).toHaveCount(1);
   expect(fixture.writes).toBe(1);
   await page.screenshot({ path: info.outputPath("profile-photo-saved.png") });
   expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
@@ -265,7 +265,7 @@ for (const width of [375, 1440]) for (const dark of [false, true]) test(`profile
   await dialog.getByRole("button", { name: "Remove photo", exact: true }).click();
   await dialog.getByRole("group", { name: "Remove profile photo?" }).getByRole("button", { name: "Remove photo", exact: true }).click();
   await expect(dialog.getByText("Photo removed", { exact: true })).toBeVisible();
-  await expect(dialog.locator('[data-slot="user-avatar"] img')).toHaveCount(0);
+  await expect(dialog.getByTestId("profile-photo-editor").locator('[data-slot="user-avatar"] img')).toHaveCount(0);
   expect(fixture.revision).not.toBeNull();
   // A replacement after removal must use its retained revision, not first-write none.
   await choose(page); await dialog.getByRole("button", { name: "Save photo" }).click();

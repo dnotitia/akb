@@ -53,7 +53,11 @@ beforeEach(() => {
   createPublicationMock.mockResolvedValue(FILE_PUBLICATION);
 });
 
-afterEach(cleanup);
+afterEach(async () => {
+  cleanup();
+  // Radix restores focus on a timer after its scope unmounts.
+  await new Promise<void>(resolve => setTimeout(resolve, 0));
+});
 
 describe("PublishOptionsDialog file flow", () => {
   it("publishes a canonical file URI with the shared access controls", async () => {

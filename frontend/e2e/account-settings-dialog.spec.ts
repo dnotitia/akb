@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import axe from "axe-core";
 
 test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Owns isolated HTTP responses.");
 
@@ -35,6 +36,41 @@ test("settings opens over the current workspace and restores it on close", async
   await expect(dialog).toHaveCount(0);
   await expect(query).toHaveValue("retained");
   await expect(trigger).toBeFocused();
+});
+
+for (const dark of [false, true]) test(`Settings Studio preserves contrast and keyboard navigation (${dark ? "dark" : "light"})`, async ({ page }, testInfo) => {
+  await setup(page, { dark, admin: true });
+  await page.setViewportSize({ width: 1440, height: 960 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/settings");
+  const dialog = page.getByRole("dialog", { name: "Settings", exact: true });
+  await expect(dialog.getByLabel("Display name")).toBeVisible();
+  const palette = await dialog.evaluate(element => ({
+    local: getComputedStyle(element).getPropertyValue("--color-primary").trim(),
+    global: getComputedStyle(document.documentElement).getPropertyValue("--color-primary").trim(),
+    localFont: getComputedStyle(element).fontFamily,
+    globalFont: getComputedStyle(document.body).fontFamily,
+  }));
+  expect(palette.local).toBe(palette.global);
+  expect(palette.localFont).toBe(palette.globalFont);
+  const profile = dialog.getByRole("tab", { name: "Profile", exact: true });
+  await profile.focus();
+  await page.keyboard.press("ArrowDown");
+  await expect(dialog.getByRole("tab", { name: "Appearance", exact: true })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(dialog.getByRole("radio", { name: dark ? "Dark" : "Light", exact: true })).toBeChecked();
+  await page.addScriptTag({ content: axe.source });
+  for (const section of ["Profile", "Appearance", "Watched documents", "Security", "Administration", "Agent connections"]) {
+    await dialog.getByRole("tab", { name: section, exact: true }).click();
+    const violations = await page.evaluate(async () => {
+      const report = await (window as unknown as { axe: typeof axe }).axe.run(document.querySelector('[data-testid="account-settings-dialog"]')!, {
+        runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"] },
+      });
+      return report.violations.map(issue => ({ id: issue.id, nodes: issue.nodes.map(node => node.html) }));
+    });
+    expect(violations, `${section} accessibility`).toEqual([]);
+    await page.screenshot({ path: testInfo.outputPath(`${section.toLowerCase().replaceAll(" ", "-")}.png`) });
+  }
 });
 
 test("unsaved profile changes protect Escape, dismissal and section changes", async ({ page }) => {
@@ -101,6 +137,7 @@ for (const width of [375, 1440]) for (const dark of [false, true]) test(`setting
   const bounds = (await dialog.boundingBox())!;
   expect(bounds.x).toBeGreaterThanOrEqual(0);
   expect(bounds.x + bounds.width).toBeLessThanOrEqual(width);
+  if (width < 768) expect(bounds.width).toBe(width);
   expect(bounds.y + bounds.height).toBeLessThanOrEqual(800);
   await page.screenshot({ path: testInfo.outputPath("settings-appearance.png") });
 });
@@ -122,6 +159,43 @@ test("agent connection deep links preserve all three setup phases", async ({ pag
   await expect(dialog.getByRole("heading", { name: /2. Configure/ })).toBeVisible();
   await expect(dialog.getByRole("heading", { name: "3. Try it in your agent" })).toBeVisible();
   await expect(dialog.getByText("No tokens yet", { exact: true })).toBeVisible();
+});
+
+for (const width of [375, 1440]) for (const dark of [false, true]) test(`connection steps follow reading and preserve drafts at ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
+  await setup(page, { dark });
+  await page.setViewportSize({ width, height: 760 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/settings?tab=tokens");
+  const dialog = page.getByRole("dialog", { name: "Settings", exact: true });
+  const navigation = dialog.getByRole("navigation", { name: "Connection setup steps", exact: true });
+  const draft = dialog.getByLabel("Token name", { exact: true });
+  await draft.fill("Preserved setup draft");
+  await navigation.getByRole("button", { name: /Go to step 2:/ }).focus();
+  await page.keyboard.press("Enter");
+  const configuration = dialog.getByRole("region", { name: "2. Configure Claude Code", exact: true });
+  await expect(configuration.getByRole("heading")).toBeFocused();
+  const navBox = (await navigation.boundingBox())!;
+  expect((await configuration.boundingBox())!.y).toBeGreaterThanOrEqual(navBox.y + navBox.height + 11);
+  await configuration.getByRole("radio", { name: "Codex", exact: true }).locator("..").click();
+  await expect(navigation.getByRole("button", { name: "Go to step 2: Configure Codex", exact: true })).toHaveAttribute("aria-current", "step");
+  await dialog.getByRole("button", { name: "Return to Prepare access", exact: true }).click();
+  await expect(dialog.getByRole("heading", { name: "1. Prepare access", exact: true })).toBeFocused();
+  await expect(draft).toHaveValue("Preserved setup draft");
+  await navigation.getByRole("button", { name: /Go to step 3:/ }).click();
+  await expect(dialog.getByRole("heading", { name: "3. Try it in your agent", exact: true })).toBeFocused();
+  const lastStep = navigation.getByRole("button", { name: /Go to step 3:/ });
+  await expect(lastStep).toHaveAttribute("aria-current", "step");
+  await lastStep.focus();
+  const content = dialog.locator('[data-slot="settings-content"]');
+  await content.evaluate(node => { node.scrollTop = 0; });
+  await expect(navigation.getByRole("button", { name: /Go to step 1:/ })).toHaveAttribute("aria-current", "step");
+  await content.evaluate(node => { node.scrollTop = node.scrollHeight; });
+  await expect(lastStep).toHaveAttribute("aria-current", "step");
+  await expect(draft).toHaveValue("Preserved setup draft");
+  await expect(page.getByRole("dialog", { name: "Discard unsaved changes?", exact: true })).toHaveCount(0);
+  expect(await dialog.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+  await navigation.getByRole("button", { name: /Go to step 2:/ }).click();
+  await page.screenshot({ path: testInfo.outputPath("connection-steps.png"), animations: "disabled" });
 });
 
 test("account menu opens settings in place and outside dismissal restores focus without layout shift", async ({ page }) => {

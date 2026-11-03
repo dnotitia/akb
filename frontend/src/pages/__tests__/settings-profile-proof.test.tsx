@@ -64,7 +64,7 @@ it.each(["success", "failure"])("retains a hidden profile %s without abandoning 
     await waitFor(() => expect(screen.getByLabelText("Display name")).toBeVisible());
     expect(screen.getByLabelText("Display name")).toHaveValue("");
     expect(screen.getByRole("button", { name: "Save profile" })).toBeDisabled();
-    expect(screen.getByText("@alice")).toBeVisible();
+    expect(screen.getByRole("region", { name: "Profile" })).toHaveTextContent("@alice");
   } else {
     await waitFor(() => expect(screen.getByText("Profile save unavailable")).toBeVisible());
     expect(screen.getByLabelText("Display name")).toHaveValue("  ");

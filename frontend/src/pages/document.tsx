@@ -53,7 +53,7 @@ import { DocumentWatch } from "@/components/document-watch";
 import { WorkspacePin } from "@/components/workspace-pin";
 import { sameCommitRef } from "@/lib/commit";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
-import { vaultGuideEditHref, vaultGuideHref } from "@/lib/vault-guide-navigation";
+import { vaultGuideHref } from "@/lib/vault-guide-navigation";
 import { DocumentOutline } from "@/components/doc-outline";
 import { readingDocumentHref } from "@/lib/reading-workspace";
 import { DocumentView } from "@/components/document-view";
@@ -253,8 +253,8 @@ function DocumentPageContent({
   const actionsTriggerRef = useRef<HTMLButtonElement | null>(null);
   const editButtonRef = useRef<HTMLButtonElement | null>(null);
   const cancelEditButtonRef = useRef<HTMLButtonElement | null>(null);
-  const editTitleRef = useRef<HTMLInputElement | null>(null);
-  const mountEditTitle = useCallback((input: HTMLInputElement | null) => {
+  const editTitleRef = useRef<HTMLInputElement | HTMLHeadingElement | null>(null);
+  const mountEditTitle = useCallback((input: HTMLInputElement | HTMLHeadingElement | null) => {
     editTitleRef.current = input;
     if (!input) return;
     // Start the document form at its title. Body autofocus can scroll this
@@ -685,22 +685,20 @@ function DocumentPageContent({
   // short hashes; current_commit is the full SHA) and returns false while HEAD
   // is still loading — so a real older version is never briefly editable.
   const isHistorical = !!commitHash && !sameCommitRef(commitHash, headCommit);
+  const isGuideDocument = doc?.path === VAULT_SKILL_PATH;
   const canEdit =
     !vaultReadOnly &&
-    doc?.path !== VAULT_SKILL_PATH &&
     !isHistorical &&
     !isDiffMode &&
-    (vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner");
-  const canManageGuide = doc?.path === VAULT_SKILL_PATH && !vaultReadOnly &&
-    vaultRole === "owner" && !isHistorical && !isDiffMode;
+    (isGuideDocument ? vaultRole === "owner" : vaultRole === "writer" || vaultRole === "admin" || vaultRole === "owner");
 
   // Publishing has its own policy: the guide's owner-only editing restriction
-  // does not apply to public links, but historical/diff views must not publish HEAD.
+  // does not apply to publications, but historical/diff views must not publish HEAD.
   const publishDisabledReason = accessChecking || vaultInfoQuery.isPending
     ? "Checking publishing access…"
     : !verifiedVault ? "Publishing access could not be verified."
-    : isHistorical || isDiffMode ? "Open the latest document to manage public links."
-    : verifiedVault.is_archived ? "Restore this Vault before managing public links."
+    : isHistorical || isDiffMode ? "Open the latest document to manage publications."
+    : verifiedVault.is_archived ? "Restore this Vault before managing publications."
     : verifiedVault.is_external_git ? "External Git vaults are read-only."
     : !["writer", "admin", "owner"].includes(vaultRole ?? "") ? "Writer access or higher is required to publish."
     : undefined;
@@ -1151,21 +1149,21 @@ function DocumentPageContent({
       return;
     }
     setTitleTouched(true);
-    if (!normalizedEditingTitle) {
+    if (!isGuideDocument && !normalizedEditingTitle) {
       window.requestAnimationFrame(() => editTitleRef.current?.focus());
       return;
     }
     const activeConflict = serverTitleConflict ?? detectedTitleConflict;
-    if (titleConflictPolicy === "reject" && activeConflict) {
+    if (!isGuideDocument && titleConflictPolicy === "reject" && activeConflict) {
       await showTitleConflict(activeConflict);
       return;
     }
 
     const contentToSave = editingContent;
     const assetIdsToClaim = editingAssetIds;
-    const payload: DocumentUpdateInput = changedDocumentDetails(editingDetails, originalDetails);
+    const payload: DocumentUpdateInput = isGuideDocument ? {} : changedDocumentDetails(editingDetails, originalDetails);
     if (contentChanged) payload.content = contentToSave;
-    if (titleChanged) {
+    if (!isGuideDocument && titleChanged) {
       payload.title = normalizedEditingTitle;
       payload.title_conflict_policy = titleConflictPolicy;
     }
@@ -1187,7 +1185,7 @@ function DocumentPageContent({
       if (!validRevision(savedCommit)) {
         throw new Error("The server did not return a document revision after saving.");
       }
-      const titleToSave = titleChanged ? normalizedEditingTitle : originalTitle;
+      const titleToSave = !isGuideDocument && titleChanged ? normalizedEditingTitle : originalTitle;
       const hasFollowupEdits = draftRevisionRef.current !== saveRevision;
       const followup = editingSnapshotRef.current;
       // Advance the body immediately, but don't fabricate an exact server
@@ -1195,7 +1193,7 @@ function DocumentPageContent({
       // DocumentView consumes this same query key independently.
       const nextDoc = {
         ...(doc || {}),
-        ...changedDocumentDetails(editingDetails, originalDetails),
+        ...(!isGuideDocument ? changedDocumentDetails(editingDetails, originalDetails) : {}),
         content: contentToSave,
         title: titleToSave,
         updated_at: typeof saved.updated_at === "string" ? saved.updated_at : undefined,
@@ -1273,6 +1271,7 @@ function DocumentPageContent({
       continueNavigation(() => updateRouteParams(p, { replace: true }));
       void queryClient.invalidateQueries({ queryKey: ["document", name, docId] });
       void queryClient.invalidateQueries({ queryKey: ["document-history", name] });
+      if (isGuideDocument) void queryClient.invalidateQueries({ queryKey: ["vault-skill-preview", name] });
     } catch (e: unknown) {
       const conflict = documentTitleConflictFromError(e);
       if (conflict) {
@@ -1450,10 +1449,9 @@ function DocumentPageContent({
 
   if (accessChecking) return <><DocumentPageLoading presentation={presentation} />{navigationDialog}</>;
 
-  // Guides use the ordinary reader in every presentation, but only Settings
-  // owns their body editor. Old generic-edit URLs must never mount that form,
-  // including references resolved by UUID rather than the reserved path.
-  if (doc?.path === VAULT_SKILL_PATH && view === "edit") {
+  // Guide editing is owner-only, including references resolved by UUID. Its
+  // shared editor saves body text and the revision pin, never managed metadata.
+  if (isGuideDocument && view === "edit" && !vaultInfoQuery.isPending && !canEdit) {
     const params = new URLSearchParams(searchParams);
     params.delete("view");
     const search = params.toString();
@@ -1581,11 +1579,8 @@ function DocumentPageContent({
             {readingChrome?.referenceControl}
             {readingChrome?.sideControl}
             <DocumentCopyButton key={resourceScope} content={doc.content || ""} actionRef={copyActionRef} returnFocusRef={actionsTriggerRef} onCopied={label => setCopyNotice({ label })} />
-            {canEdit && <DocumentIconButton ref={editButtonRef} label="Edit" className="document-reader-edit text-link" onClick={() => requestEdit()}>
+            {canEdit && <DocumentIconButton ref={editButtonRef} label={isGuideDocument ? "Edit guide" : "Edit"} className="document-reader-edit text-link" onClick={() => requestEdit()}>
               <Pencil className="h-4 w-4" aria-hidden />
-            </DocumentIconButton>}
-            {canManageGuide && <DocumentIconButton asChild label="Edit guide" className="document-reader-edit text-link">
-              <Link to={vaultGuideEditHref(name!)}><Pencil className="h-4 w-4" aria-hidden /></Link>
             </DocumentIconButton>}
             <ResourceActionsMenu
               triggerRef={actionsTriggerRef}
@@ -1631,14 +1626,14 @@ function DocumentPageContent({
               </>}
               <DropdownMenu.Item className="document-reader-menu-item" onSelect={() => { menuHandoff.current = "link"; }}><Link2 className="h-4 w-4" aria-hidden />Copy document link</DropdownMenu.Item>
               <DropdownMenu.Item className="document-reader-menu-item" onSelect={() => { menuHandoff.current = "copy"; }}><Copy className="h-4 w-4" aria-hidden />Copy markdown</DropdownMenu.Item>
-              <DropdownMenu.Item className="document-reader-menu-item" aria-label={doc.is_public && !isHistorical && !isDiffMode ? "Public link" : "Publish"}
+              <DropdownMenu.Item className="document-reader-menu-item" aria-label={doc.is_public && !isHistorical && !isDiffMode ? "Publication" : "Publish"}
                 aria-describedby={(!doc.is_public || isHistorical || isDiffMode) && publishDisabledReason ? `${viewId}-publish-disabled` : undefined}
                 aria-disabled={(!doc.is_public || isHistorical || isDiffMode) && !!publishDisabledReason || undefined}
                 onSelect={event => {
                   if ((!doc.is_public || isHistorical || isDiffMode) && publishDisabledReason) { event.preventDefault(); return; }
                   menuHandoff.current = "publication";
                 }}>
-                <Globe2 className="h-4 w-4 shrink-0" aria-hidden /><span>{doc.is_public && !isHistorical && !isDiffMode ? "Public link" : "Publish"}
+                <Globe2 className="h-4 w-4 shrink-0" aria-hidden /><span>{doc.is_public && !isHistorical && !isDiffMode ? "Publication" : "Publish"}
                   {(!doc.is_public || isHistorical || isDiffMode) && publishDisabledReason && <span id={`${viewId}-publish-disabled`} className="mt-0.5 block max-w-64 text-xs leading-snug text-foreground-muted">{publishDisabledReason}</span>}
                 </span>
               </DropdownMenu.Item>
@@ -1773,7 +1768,8 @@ function DocumentPageContent({
                 <DocumentAuthoringLayout
                   detailsId="document-edit-details"
                   detailsHeadingId="document-edit-details-heading"
-                  details={<div className="space-y-5 p-4 sm:p-5">
+                  writingProps={isGuideDocument ? { className: "mx-auto w-full max-w-5xl" } : undefined}
+                  details={!isGuideDocument && <div className="space-y-5 p-4 sm:p-5">
                     <h2 id="document-edit-details-heading" className="text-sm font-semibold">Document details</h2>
                     <div className="space-y-1.5 text-sm">
                       <p className="text-xs font-medium text-foreground-muted">Collection</p>
@@ -1799,6 +1795,7 @@ function DocumentPageContent({
                   <div>
                     <div className="border-b border-border">
                       <div className="space-y-1.5 px-4 py-4 sm:px-6">
+                        {isGuideDocument ? <h2 ref={mountEditTitle} tabIndex={-1} className="font-display text-xl font-semibold outline-none">{doc.title || "Vault guide"}</h2> : <>
                         <Button type="button" variant="ghost" size="sm" className="float-right @[52rem]/authoring:hidden" onClick={() => summaryFieldRef.current?.focus()}>Document details</Button>
                         <Label htmlFor="document-edit-title" className="text-xs text-foreground-muted">Document title</Label>
                         <Input
@@ -1846,6 +1843,7 @@ function DocumentPageContent({
                             />
                           </div>
                         )}
+                        </>}
                       </div>
                     </div>
                     <Suspense fallback={<MarkdownEditorFallback />}>
@@ -1880,7 +1878,7 @@ function DocumentPageContent({
                           setEditingAssetExpirations(expirations);
                         }}
                         onUnclaimedAssetIdsChange={setUnclaimedAssetIds}
-                        ariaLabel="Document body (markdown)"
+                        ariaLabel={isGuideDocument ? "Vault guide body" : "Document body (markdown)"}
                         readOnly={savingBody || !canEdit}
                         vault={name!}
                         document={doc?.path}
@@ -1996,7 +1994,7 @@ function DocumentPageContent({
               info={<>
               <section aria-labelledby="document-properties-heading">
                 <h3 id="document-properties-heading" className="sr-only">Document properties</h3>
-                  {canEdit && (
+                  {canEdit && !isGuideDocument && (
                     <Button type="button" variant="ghost" size="sm" className="mb-3" onClick={() => requestEdit(true)}>
                       <Pencil className="h-3.5 w-3.5" aria-hidden />
                       Edit properties
@@ -2072,7 +2070,7 @@ function DocumentPageContent({
                     initialLoading={relationsQuery.isPending}
                     refreshing={relationsQuery.isFetching}
                     hasSnapshot={Boolean(relationsQuery.data) && !relationsDenied}
-                    canWrite={canEdit}
+                    canWrite={canEdit && !isGuideDocument}
                     graphHref={`/vault/${name}/graph${doc.path ? `?entry=${encodeURIComponent(doc.path)}` : ""}`}
                     onReload={reloadRelations}
                   />

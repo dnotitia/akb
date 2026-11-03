@@ -45,11 +45,11 @@ for (const width of [320, 768, 874, 1440]) for (const dark of [false, true]) tes
   const cards = list.locator('[data-slot="vault-directory-card"]');
   await expect(cards).toHaveCount(6);
   const columns = await list.evaluate(element => getComputedStyle(element).gridTemplateColumns.split(" ").length);
-  expect(columns).toBe(width === 320 ? 1 : width === 768 ? 2 : width === 874 ? 3 : 4);
+  expect(columns).toBe(width === 320 ? 1 : width < 1000 ? 3 : 5);
   await expect(list.getByRole("link")).toHaveText(vaults.map(vault => new RegExp(vault.name)));
   const heights = await cards.evaluateAll(elements => elements.map(element => element.getBoundingClientRect().height));
   expect(Math.max(...heights) - Math.min(...heights)).toBeLessThan(2);
-  expect(Math.max(...heights)).toBeLessThan(160);
+  expect(Math.max(...heights)).toBeLessThan(132);
   await expect(list.getByText("Open vault", { exact: true })).toHaveCount(0);
   await expect(list.getByText("Owner", { exact: true })).toHaveCount(0);
   await expect(list.getByText("Read only", { exact: true })).toBeVisible();
@@ -103,6 +103,48 @@ for (const width of [320, 768, 874, 1440]) for (const dark of [false, true]) tes
   await first.click({ position: { x: restoredBox.width - 6, y: restoredBox.height / 2 } });
   await expect(page).toHaveURL(/\/vault\/alpha-engineering$/);
   await page.screenshot({ path: testInfo.outputPath("vault-card-directory.png"), animations: "disabled", fullPage: true });
+});
+
+for (const dark of [false, true]) test(`Directory reflows during resize without losing a search or keyboard focus ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
+  await fixture(page, dark);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/vault");
+  const search = page.getByRole("textbox", { name: "Find a vault", exact: true });
+  await search.fill("architecture");
+  const directory = page.getByRole("region", { name: "Your vaults", exact: true });
+  const list = directory.getByRole("list", { name: "Available vaults", exact: true });
+  const columns = new Map<number, number>();
+  for (const [width, height] of [[375, 812], [768, 1024], [1024, 768], [1920, 900], [812, 375]]) {
+    await search.focus();
+    await page.setViewportSize({ width, height });
+    await expect(search).toBeFocused();
+    await expect(search).toHaveValue("architecture");
+    await expect(list.getByRole("link")).toHaveCount(2);
+    // The directory shares the other Vault pages' gutters and centered frame
+    // while its search fills that frame through navigator and viewport changes.
+    const fit = await directory.evaluate(element => {
+      const pane = element.closest('[data-slot="vault-route-viewport"]')!;
+      const field = element.querySelector("input")!;
+      const style = getComputedStyle(element);
+      return { pane: pane.clientWidth, page: element.getBoundingClientRect().width,
+        field: field.getBoundingClientRect().width,
+        content: element.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+        overflows: element.scrollWidth > element.clientWidth + 1 };
+    });
+    const gutter = width >= 1280 ? 32 : width >= 640 ? 24 : 16;
+    expect(Math.abs(fit.page - Math.min(1280, fit.pane - gutter * 2))).toBeLessThanOrEqual(1);
+    expect(Math.abs(fit.field - fit.content)).toBeLessThanOrEqual(1);
+    expect(fit.overflows).toBe(false);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    columns.set(width, await list.evaluate(element => getComputedStyle(element).gridTemplateColumns.split(" ").length));
+  }
+  expect(columns.get(1920)!).toBeGreaterThan(columns.get(375)!);
+  await page.getByRole("button", { name: "List view", exact: true }).click();
+  await page.setViewportSize({ width: 375, height: 812 });
+  await expect(list).toHaveAttribute("data-view", "list");
+  await expect(search).toHaveValue("architecture");
+  await expect(list.getByRole("link")).toHaveCount(2);
+  await page.screenshot({ path: testInfo.outputPath("directory-resized.png"), fullPage: true });
 });
 
 async function openExplorer(page: Page, dark = false, mobile = false) {

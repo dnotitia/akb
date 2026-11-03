@@ -9,10 +9,11 @@ import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { cn } from "@/lib/utils";
 
 /** Keep complete Markdown blocks readable and focusable, without clipping links. */
-export default function GuidePreview({ vault, content, onNavigate }: {
+export default function GuidePreview({ vault, content, onNavigate, headingLevelOffset = 3 }: {
   vault: string;
   content: string;
   onNavigate?: (event: MouseEvent<HTMLDivElement>, url: URL) => void;
+  headingLevelOffset?: number;
 }) {
   const id = useId();
   const previewRef = useRef<HTMLDivElement>(null);
@@ -70,12 +71,13 @@ export default function GuidePreview({ vault, content, onNavigate }: {
   }
 
   return (
-    <div className="mt-4 border-t border-border pt-4" onClick={followLink}>
+    <div className="guide-preview mt-4 border-t border-border pt-4" onClick={followLink}>
       <div ref={previewRef} id={id} role="region" aria-label="Vault guide preview"
         className={cn("max-w-prose", !showAll && "[&_.ProseMirror>:nth-child(n+5)]:hidden")}>
-        <MarkdownRender markdown={markdown} readingTools={false}
+        {/* A new body gets a fresh viewer, including its presentation-only headings. */}
+        <MarkdownRender key={markdown} markdown={markdown} readingTools={false}
           assetContext={{ mode: "authenticated", vault, document: VAULT_SKILL_PATH }}
-          headingIdPrefix={headingPrefix} headingLevelOffset={3}
+          headingIdPrefix={headingPrefix} headingLevelOffset={headingLevelOffset} contentLabel="Vault guide content"
           className="text-ui leading-relaxed prose-headings:mb-1.5 prose-headings:mt-3 prose-headings:text-ui prose-headings:font-semibold prose-p:my-1.5 prose-li:my-0.5 prose-pre:my-3 [&_.ProseMirror>:first-child]:mt-0 [&_.ProseMirror>:last-child]:mb-0 [&_img]:max-h-40 [&_img]:object-contain" />
       </div>
       {hasMore && <Button ref={toggleRef} variant="ghost" size="sm"

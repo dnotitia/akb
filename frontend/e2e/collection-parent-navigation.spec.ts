@@ -57,8 +57,12 @@ for (const width of [375, 1440]) for (const dark of [false, true]) {
     await workspace.getByRole("link", { name: "Open collection guides", exact: true }).click();
     await expect(workspace.getByRole("heading", { name: "guides", exact: true })).toBeVisible();
     await trail.getByRole("link", { name: "All collections", exact: true }).click();
+    await expect(page).toHaveURL("/vault/fixture");
+    await expect(workspace.getByRole("list", { name: "Collections", exact: true })).toBeVisible();
     await workspace.getByRole("textbox", { name: "Search collections and content", exact: true }).fill("child?");
-    await workspace.getByRole("link", { name: `Open collection ${selectedPath}`, exact: true }).click();
+    const matches = workspace.getByRole("list", { name: "Matching collections", exact: true });
+    await expect(workspace).toHaveAttribute("aria-busy", "false");
+    await matches.getByRole("link", { name: `Open collection ${selectedPath}`, exact: true }).click();
     await expect(parent).toBeVisible();
     await expect(workspace.getByRole("textbox", { name: "Search collections and content", exact: true })).toHaveValue("");
     await parent.click();

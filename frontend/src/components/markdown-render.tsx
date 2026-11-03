@@ -52,6 +52,8 @@ export interface MarkdownRenderProps {
   headingLevelOffset?: number;
   leadingMetadata?: ReactNode;
   fallbackTitle?: string;
+  /** Named read-only document surface for embedded previews. */
+  contentLabel?: string;
   searchable?: boolean;
   readingTools?: boolean;
 }
@@ -65,6 +67,7 @@ export function MarkdownRender({
   headingLevelOffset = 1,
   leadingMetadata,
   fallbackTitle,
+  contentLabel,
   searchable = false,
   readingTools = true,
 }: MarkdownRenderProps) {
@@ -201,6 +204,7 @@ export function MarkdownRender({
         reading={readingTools ? reading : undefined}
         style={{ "--document-reading-measure": preferences.width === "compact" ? "36rem" : preferences.width === "wide" ? "64rem" : "var(--reader-standard-measure, 52rem)", "--reader-font-size": `${preferences.fontSize / 16}rem` } as CSSProperties}
         markdown={body}
+        contentAttributes={contentLabel ? { role: "document", "aria-label": contentLabel } : undefined}
         afterLeadingHeading={adornment}
         className={cn(
           "akb-md min-w-0 text-[15px] text-foreground prose dark:prose-invert !max-w-none",

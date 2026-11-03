@@ -24,25 +24,26 @@ describe("Overview page navigation", () => {
     await userEvent.click(screen.getByRole("link", { name: "Open guides" }));
     await waitFor(() => expect(screen.getByRole("main")).toHaveFocus());
   });
-  it("offers four direct destinations without a redundant Overview or Search link", () => {
+  it("exposes four native destinations without a disclosure or redundant Overview/Search", async () => {
     renderNavigation();
+    expect(screen.queryByRole("menuitem")).not.toBeInTheDocument();
     const nav = screen.getByRole("navigation", { name: "Vault pages" });
     const links = within(nav).getAllByRole("link");
     expect(links.map(link => [link.textContent, link.getAttribute("href")])).toEqual([
-      ["Graph", "/vault/team/graph"], ["Public links", "/vault/team/publications"],
+      ["Graph", "/vault/team/graph"], ["Publications", "/vault/team/publications"],
       ["Members", "/vault/team/members"], ["Settings", "/vault/team/settings"],
     ]);
-    expect(within(nav).queryByRole("button")).not.toBeInTheDocument();
+    expect(within(nav).queryByRole("link", { name: "Overview" })).not.toBeInTheDocument();
     expect(nav.querySelector("[aria-current]")).toBeNull();
-    for (const link of links) expect(link.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("encodes the Vault boundary in every native link", () => {
+  it("encodes the Vault boundary in every native link", async () => {
     render(<MemoryRouter><VaultOverviewNavigation vault="팀 /#? Vault" /></MemoryRouter>);
     for (const link of screen.getAllByRole("link")) expect(link.getAttribute("href")).toMatch(/^\/vault\/%ED%8C%80%20%2F%23%3F%20Vault\//);
   });
 
-  it("keeps the member count on the existing native Members destination", () => {
+  it("keeps the member count on the existing native Members destination", async () => {
     render(<MemoryRouter><VaultOverviewNavigation vault="team" memberCount={5} /></MemoryRouter>);
     const members = screen.getByRole("link", { name: "Members" });
     expect(members).toHaveAttribute("href", "/vault/team/members");
@@ -50,17 +51,17 @@ describe("Overview page navigation", () => {
     expect(members).toHaveAccessibleDescription("5 members");
     expect(within(members).getByText("5")).toHaveAttribute("aria-hidden", "true");
     expect(screen.getAllByRole("link")).toHaveLength(4);
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Manage" })).not.toBeInTheDocument();
   });
 
-  it.each([undefined, -1, Number.NaN, Number.POSITIVE_INFINITY])("omits an unavailable member count instead of inventing zero: %s", memberCount => {
+  it.each([undefined, -1, Number.NaN, Number.POSITIVE_INFINITY])("omits an unavailable member count instead of inventing zero: %s", async memberCount => {
     render(<MemoryRouter><VaultOverviewNavigation vault="team" memberCount={memberCount} /></MemoryRouter>);
     const members = screen.getByRole("link", { name: "Members" });
     expect(members).toHaveTextContent(/^Members$/);
     expect(members).not.toHaveAccessibleDescription();
   });
 
-  it("retains an authoritative zero member count", () => {
+  it("retains an authoritative zero member count", async () => {
     render(<MemoryRouter><VaultOverviewNavigation vault="team" memberCount={0} /></MemoryRouter>);
     expect(screen.getByRole("link", { name: "Members" })).toHaveAccessibleDescription("0 members");
   });
@@ -68,7 +69,7 @@ describe("Overview page navigation", () => {
   it("uses normal Tab order and focuses the destination when an accepted link unmounts", async () => {
     const user = userEvent.setup();
     renderNavigation();
-    for (const name of ["Graph", "Public links", "Members", "Settings"]) {
+    for (const name of ["Graph", "Publications", "Members", "Settings"]) {
       await user.tab();
       expect(screen.getByRole("link", { name })).toHaveFocus();
     }
@@ -78,7 +79,7 @@ describe("Overview page navigation", () => {
     await waitFor(() => expect(screen.getByRole("main")).toHaveFocus());
   });
 
-  it("retains the source and focus when a workspace blocks departure", async () => {
+  it("retains source focus when a workspace blocks departure", async () => {
     const user = userEvent.setup();
     const guard = vi.fn(() => false);
     renderNavigation(guard);
@@ -90,7 +91,7 @@ describe("Overview page navigation", () => {
     expect(members).toHaveFocus();
   });
 
-  it.each([{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { button: 1 }])("leaves modified/native clicks alone: %j", modifiers => {
+  it.each([{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { button: 1 }])("leaves modified/native clicks alone: %j", async modifiers => {
     const guard = vi.fn(() => false);
     renderNavigation(guard);
     fireEvent.click(screen.getByRole("link", { name: "Members" }), modifiers);

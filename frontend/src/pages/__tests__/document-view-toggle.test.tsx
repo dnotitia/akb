@@ -678,9 +678,9 @@ describe("DocumentPage view toggle", () => {
 
   it.each([
     [{ role: "reader" }, "", "Writer access or higher is required to publish."],
-    [{ role: "owner", is_archived: true }, "", "Restore this Vault before managing public links."],
+    [{ role: "owner", is_archived: true }, "", "Restore this Vault before managing publications."],
     [{ role: "writer", is_external_git: true }, "", "External Git vaults are read-only."],
-    [{ role: "owner" }, "?view=diff&commit=abcdef1234567", "Open the latest document to manage public links."],
+    [{ role: "owner" }, "?view=diff&commit=abcdef1234567", "Open the latest document to manage publications."],
   ])("keeps publishing restrictions visible for %j %s", async (vault, query, reason) => {
     const user = userEvent.setup();
     getVaultInfoMock.mockResolvedValue(vault);

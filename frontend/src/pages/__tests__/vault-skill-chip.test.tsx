@@ -347,24 +347,25 @@ describe("vault page guide metadata", () => {
     renderVault();
 
     expect(
-      await screen.findByRole("region", { name: "Recent activity" }),
+      await screen.findByRole("region", { name: "Recently updated" }),
     ).toBeInTheDocument();
     expect(
-      await screen.findByRole("region", { name: "Commit history" }),
+      await screen.findByRole("region", { name: "Version history" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "Full activity" })).toBeNull();
     expect(screen.queryByText("Update incident runbook")).toBeNull();
-    expect(
-      screen.getByRole("link", { name: "Full commit log" }),
-    ).toHaveAttribute("href", "/vault/my-v/activity");
+    expect(screen.queryByRole("link", { name: "Full commit log" })).not.toBeInTheDocument();
     const disclosure = await screen.findByRole("button", {
-      name: "Show commits",
+      name: "Show version history",
     });
     expect(disclosure).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(disclosure);
     expect(
-      screen.getByRole("button", { name: "Hide commits" }),
+      screen.getByRole("button", { name: "Hide version history" }),
     ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("link", { name: "Full commit log" }),
+    ).toHaveAttribute("href", "/vault/my-v/activity");
     expect(screen.getByText("Update incident runbook")).toBeInTheDocument();
     expect(screen.getByText("Vault Owner")).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Contents" })).toBeInTheDocument();
@@ -459,7 +460,7 @@ describe("vault page guide metadata", () => {
     const summary = screen.getByRole("region", { name: "Vault summary" });
     expect(summary).toHaveTextContent("Vault Owner");
     expect(within(summary).getByRole("button", { name: "Vault access: Private" })).toBeVisible();
-    expect(within(summary).getByRole("link", { name: "Members" })).toHaveAccessibleDescription("1 members");
+    expect(screen.getByRole("link", { name: "Members" })).toHaveAccessibleDescription("1 members");
     expect(screen.queryByRole("complementary", { name: "Vault overview details" })).not.toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "About this vault" }),
@@ -492,10 +493,10 @@ describe("vault page guide metadata", () => {
     expect(screen.getByText(/2 documents created/i)).toBeInTheDocument();
   });
 
-  it("keeps the icon-only creation menu available while inline Vault navigation is open", async () => {
+  it("keeps the compact creation menu available while Vault navigation is open", async () => {
     renderVault({ vaultNavigationOpen: true });
     const trigger = await screen.findByRole("button", { name: "New content" });
-    expect(trigger.textContent).toBe("");
+    expect(trigger.textContent).toBe("New");
     expect(trigger.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
     const user = userEvent.setup();
     trigger.focus();
@@ -606,8 +607,7 @@ describe("vault overview content hierarchy", () => {
     renderVault();
     const link = await findChip();
     await waitFor(() => expect(link).toHaveAccessibleDescription("Guide customized"));
-    const summary = screen.getByRole("region", { name: "Vault summary" });
-    const guide = within(summary).getByRole("region", { name: "Vault guide" });
+    const guide = screen.getByRole("region", { name: "Vault guide" });
     expect(guide).toContainElement(link);
     expect(within(guide).getAllByRole("link")).toHaveLength(1);
     expect(within(guide).queryByRole("heading")).not.toBeInTheDocument();
@@ -638,7 +638,7 @@ describe("vault overview content hierarchy", () => {
     const trigger = within(access).getByRole("button", { name: `Vault access: ${label}` });
     expect(access).toHaveTextContent("OwnerVault Owner");
     expect(access).not.toHaveTextContent(explanation!);
-    expect(within(access).queryByRole("link")).not.toBeInTheDocument();
+    expect(within(access).queryByRole("link", { name: "Members" })).not.toBeInTheDocument();
     const members = within(screen.getByRole("navigation", { name: "Vault pages" })).getByRole("link", { name: "Members" });
     expect(members).toHaveAttribute("href", "/vault/my-v/members");
     expect(members).toHaveAccessibleDescription("5 members");
@@ -646,7 +646,7 @@ describe("vault overview content hierarchy", () => {
     await user.click(trigger);
     const policy = screen.getByRole("dialog", { name: "Vault access" });
     expect(policy).toHaveTextContent(explanation!);
-    expect(policy).toHaveTextContent("Public links are managed separately and may allow access without signing in.");
+    expect(policy).toHaveTextContent("Publications are managed separately and may allow access without signing in.");
     await user.click(within(policy).getByRole("button", { name: "Close vault access" }));
     expect(screen.queryByRole("dialog", { name: "Vault access" })).not.toBeInTheDocument();
     await waitFor(() => expect(trigger).toHaveFocus());
@@ -676,25 +676,26 @@ describe("vault overview content hierarchy", () => {
     const contents = await screen.findByRole("region", { name: "Contents" });
     const summary = screen.getByRole("region", { name: "Vault summary" });
     const details = screen.getByRole("complementary", { name: "Vault overview details" });
-    expect(summary).toContainElement(contents);
-    const pages = within(summary).getByRole("navigation", { name: "Vault pages" });
-    expect(within(pages).getAllByRole("link").map(link => link.getAttribute("href"))).toEqual(["/vault/my-v/graph", "/vault/my-v/publications", "/vault/my-v/members", "/vault/my-v/settings"]);
+    expect(summary).not.toContainElement(contents);
+    const pages = within(contents).getByRole("navigation", { name: "Vault pages" });
+    expect(within(pages).getAllByRole("link")).toHaveLength(4);
+    expect(within(pages).queryByRole("button", { name: "Manage" })).not.toBeInTheDocument();
     expect(within(pages).queryByRole("link", { name: "Overview" })).not.toBeInTheDocument();
     expect(details).not.toContainElement(contents);
-    expect(within(summary).getByText("writer", { exact: true })).toBeInTheDocument();
+    expect(within(summary).getByText("Your access: writer", { exact: true })).toBeInTheDocument();
     expect(within(summary).getByRole("button", { name: "Vault access: Public read" })).toBeVisible();
     expect(within(summary).queryByText("public:reader")).not.toBeInTheDocument();
-    expect(within(summary).getByRole("button", { name: "Copy akb://my-v" })).toBeEnabled();
+    expect(within(summary).queryByRole("button", { name: "Copy akb://my-v" })).not.toBeInTheDocument();
     expect(within(details).queryByRole("button", { name: "Copy akb://my-v" })).toBeNull();
-    expect(within(contents).queryByRole("button")).toBeNull();
+    expect(within(contents).getAllByRole("tab")).toHaveLength(4);
     for (const [label, value] of [["Documents", "36"], ["Collections", "8"], ["Tables", "2"], ["Files", "7"]]) {
-      expect(within(contents).getByText(label).closest("div")).toHaveTextContent(value);
+      expect(within(contents).getByText(label).closest("button")).toHaveTextContent(value);
     }
-    expect(within(contents).queryByText("Members")).toBeNull();
+    expect(within(summary).queryByRole("link", { name: "Members" })).not.toBeInTheDocument();
     const access = screen.getByRole("region", { name: "Access and ownership" });
     expect(summary).toContainElement(access);
     expect(within(access).queryByText("Members")).not.toBeInTheDocument();
-    const members = within(pages).getByRole("link", { name: "Members" });
+    const members = screen.getByRole("link", { name: "Members" });
     expect(members).toHaveAttribute("href", "/vault/my-v/members");
     expect(members).toHaveTextContent("Members5");
     expect(members).toHaveAccessibleDescription("5 members");
@@ -711,11 +712,11 @@ describe("vault overview content hierarchy", () => {
     getVaultInfoMock.mockResolvedValue({ name: "my-v", role: "reader", file_count: 0 });
     renderVault();
     const contents = await screen.findByRole("region", { name: "Contents" });
-    expect(within(contents).getByText("Documents").closest("div")).toHaveTextContent("—");
-    expect(within(contents).getByText("Files").closest("div")).toHaveTextContent("0");
+    expect(within(contents).getByText("Documents").closest("button")).toHaveTextContent("—");
+    expect(within(contents).getByText("Files").closest("button")).toHaveTextContent("0");
     expect(screen.getByRole("region", { name: "Access and ownership" })).not.toHaveTextContent("Private");
     expect(screen.queryByRole("region", { name: "Set up this Vault" })).toBeNull();
-    expect(screen.getByRole("region", { name: "Recent activity" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Recently updated" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "New table" })).toBeNull();
   });
 
@@ -725,7 +726,7 @@ describe("vault overview content hierarchy", () => {
       { doc_id: "d-root", title: "Welcome", path: "welcome.md" },
     ] });
     renderVault();
-    const recent = await screen.findByRole("region", { name: "Recent activity" });
+    const recent = await screen.findByRole("region", { name: "Recently updated" });
     const runbook = await within(recent).findByRole("link", { name: /Runbook/ });
     expect(runbook).toHaveAttribute("href", "/vault/my-v/doc/team%2Fops%2Frunbook.md");
     expect(runbook).toHaveTextContent("team / ops");
@@ -741,8 +742,8 @@ describe("vault overview content hierarchy", () => {
     });
     renderVault();
     const details = await screen.findByRole("complementary", { name: "Vault overview details" });
-    expect(within(details).getByRole("region", { name: "Recent activity" })).toBeInTheDocument();
-    expect(within(details).getByRole("region", { name: "Commit history" })).toBeInTheDocument();
+    expect(within(details).getByRole("region", { name: "Recently updated" })).toBeInTheDocument();
+    expect(within(details).getByRole("region", { name: "Version history" })).toBeInTheDocument();
     expect(details).not.toContainElement(screen.getByRole("region", { name: "Collection workspace" }));
     expect(within(details).getAllByRole("region")).toHaveLength(2);
     expect(within(details).queryByRole("region", { name: "Vault guide" })).not.toBeInTheDocument();
@@ -751,13 +752,13 @@ describe("vault overview content hierarchy", () => {
     expect(summary).toContainElement(screen.getByRole("region", { name: "Vault guide" }));
     expect(summary).toContainElement(screen.getByRole("region", { name: "Access and ownership" }));
     expect(summary.compareDocumentPosition(screen.getByRole("region", { name: "Collection workspace" })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByRole("region", { name: "Collection workspace" }).compareDocumentPosition(details) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Collection workspace" })).toContainElement(details);
     expect(within(details).queryByRole("region", { name: "Tables" })).toBeNull();
     expect(screen.queryByRole("link", { name: /catalog|inventory/ })).toBeNull();
     const contents = screen.getByRole("region", { name: "Contents" });
-    expect(within(contents).getByText("Tables").closest("div")).toHaveTextContent("4");
-    expect(within(contents).getByText("Files").closest("div")).toHaveTextContent("2");
-    const recent = screen.getByRole("region", { name: "Recent activity" });
+    expect(within(contents).getByText("Tables").closest("button")).toHaveTextContent("4");
+    expect(within(contents).getByText("Files").closest("button")).toHaveTextContent("2");
+    const recent = screen.getByRole("region", { name: "Recently updated" });
     expect(await within(recent).findByText("Nothing written yet")).toBeInTheDocument();
     expect(within(recent).queryByRole("link")).toBeNull();
   });
@@ -768,7 +769,7 @@ describe("vault overview content hierarchy", () => {
     renderVault();
     expect(await screen.findByText("Vault details are unavailable.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Try again" })).toBeEnabled();
-    expect(screen.queryByRole("region", { name: "Contents" })).toBeNull();
+    expect(screen.getByRole("region", { name: "Contents" })).toHaveTextContent("—");
     expect(screen.queryByRole("button", { name: "New content" })).not.toBeInTheDocument();
     const details = screen.getByRole("complementary", { name: "Vault overview details" });
     expect(await within(details).findByRole("link", { name: /Available recent update/ })).toHaveAttribute("href", "/vault/my-v/doc/guides%2Frunbook.md");

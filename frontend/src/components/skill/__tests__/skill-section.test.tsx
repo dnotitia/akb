@@ -187,13 +187,11 @@ describe("SkillSection", () => {
     render(wrap(<SkillSection vault="my-v" doc={DOC} canManage />));
 
     // Anchor for the canonical guide-management section.
-    expect(document.getElementById("skill")).toBeTruthy();
-    const sectionHeader = screen.getByRole("heading", { name: "Vault guide" });
-    expect(sectionHeader).toHaveClass("text-ui", "font-semibold");
-    expect(sectionHeader.nextElementSibling).toHaveAttribute("data-slot", "settings-group");
-    expect(sectionHeader.nextElementSibling).not.toHaveClass("border-border-strong");
-    expect(sectionHeader).not.toHaveClass("bg-surface-2/55");
-    expect(await screen.findByText(/Stored body/)).toBeTruthy();
+    const section = screen.getByRole("region", { name: "Vault guide" });
+    expect(section).toHaveAttribute("id", "skill");
+    const sectionHeader = within(section).getByRole("heading", { name: "Vault guide" });
+    expect(section).toHaveAttribute("aria-labelledby", sectionHeader.id);
+    expect(await within(section).findByRole("document", { name: "Vault guide content" })).toHaveTextContent("Stored body");
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
 
     // History points at the canonical reader pinned to its commit.
