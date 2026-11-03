@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib.util
 import json
 import math
 import sys
@@ -29,6 +28,7 @@ for entry in (BACKEND, SCRIPT_DIR):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
+from app.db import postgres
 from app.exceptions import NotFoundError
 from app.services.index_service import chunk_markdown
 from app.services.m1_native_grep_service import M1NativeGrepService
@@ -296,18 +296,11 @@ async def _setup(dsn: str, *, pool_max_size: int = 24) -> tuple[asyncpg.Pool, st
     try:
         database = str(await conn.fetchval("SELECT current_database()"))
         validate_measurement_database(database)
-        await conn.execute((BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8"))
-        for filename in (
-            "048_native_revision_core.py",
-            "053_native_revision_m1_pg_body.py",
-            "057_native_revision_m1_payload_placement.py",
-        ):
-            path = BACKEND / "app" / "db" / "migrations" / filename
-            spec = importlib.util.spec_from_file_location("m1_capacity_" + filename.replace(".", "_"), path)
-            if spec is None or spec.loader is None:
-                raise AdapterError(f"cannot load measurement migration {filename}")
-            module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-            await module.migrate(conn=conn)
+        # The server's own boot path: init.sql, then every registered migration
+        # in its order (048, 053 and 057 among them). The native writer this
+        # adapter drives reaches tables later migrations add, so a hand-kept
+        # subset stops being able to run it at the next such migration.
+        await postgres._run_boot_schema(conn, init_sql=(BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8"))
         await conn.execute(f"""
             CREATE TABLE IF NOT EXISTS {MEASUREMENT_TABLE} (
                 namespace_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
