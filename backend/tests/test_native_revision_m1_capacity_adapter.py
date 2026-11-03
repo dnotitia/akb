@@ -409,6 +409,8 @@ async def _reachable() -> bool:
 @pytest.mark.asyncio
 async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
     if not await _reachable():
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail("REQUIRE_REAL_PG=1 but Postgres is not reachable for focused M1 capacity test")
         pytest.skip("Postgres is not reachable for focused M1 capacity test")
     base, _ = DSN.rsplit("/", 1)
     name = f"akb_revision_m1_measurement_test_{uuid.uuid4().hex[:10]}"
@@ -524,6 +526,8 @@ async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
 @pytest.mark.parametrize("failure", ["read_error", "timeout", "cancel"])
 async def test_derived_probe_joins_delayed_delivery_before_leaving(monkeypatch, failure):
     if not await _reachable():
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail("REQUIRE_REAL_PG=1 but Postgres is not reachable for focused M1 capacity test")
         pytest.skip("Postgres is not reachable for focused M1 capacity test")
     base, _ = DSN.rsplit("/", 1)
     name = f"akb_revision_m1_measurement_cleanup_{uuid.uuid4().hex[:10]}"

@@ -296,6 +296,13 @@ jobs:
             tests/test_index_order_unit.py
             tests/concurrency/test_alter_unique_race_unit.py
             tests/test_native_revision_reconcile_pg.py
+            # Native write-path contracts on a database the server's own boot
+            # path builds; off this list they skipped in both lanes.
+            tests/test_document_counters_pg.py
+            tests/test_migration_060_native_revision_bridge_unit.py
+            tests/test_native_revision_m1_capacity_adapter.py
+            tests/test_native_revision_public_selector_pg.py
+            tests/test_native_revision_reference_ambiguity_pg.py
             # The bridged-body migration is a claim about two stores:
             # a body moves out of the git working volume into the
             # payload table and the same bytes come back. Both halves

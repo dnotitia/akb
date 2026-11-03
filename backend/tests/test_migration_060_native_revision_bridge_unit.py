@@ -11,6 +11,7 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from app.db import postgres
 from app.services.native_revision_service import NativeRevisionService
 
 
@@ -49,7 +50,22 @@ def _load(filename: str):
 
 @asynccontextmanager
 async def _fresh_schema():
+    """A fresh database with migration 060 applied, then applied again.
+
+    The boot path applies 060 at its registered position, after 048 and
+    everything between; the second `migrate()` is the reapplication this file
+    pins. The upgrade base is the server's current schema rather than 048
+    alone because the test publishes real native revisions through
+    `NativeRevisionService.create_text`, and that write path reaches tables
+    later migrations change (`document_asset_refs.native_document_id`, added
+    by 107). A base frozen at 048 cannot run today's writer, and a hand-kept
+    list goes stale with the next migration. Later migrations amend 060's own
+    tables too (092, 094, 105), so the keys, foreign keys and cascades below
+    are checked as they stand on a current installation.
+    """
     if not await _reachable():
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
         pytest.skip(f"Postgres not reachable at {_DSN}")
 
     name = f"akb_native_revision_bridge_{uuid.uuid4().hex[:12]}"
@@ -60,11 +76,8 @@ async def _fresh_schema():
         await admin.execute(f'CREATE DATABASE "{name}"')
         dsn = _database_dsn(name)
         conn = await asyncpg.connect(dsn)
-        await conn.execute(_INIT_SQL)
-        await _load("048_native_revision_core.py").migrate(conn=conn)
-        migration = _load("060_native_revision_migration_bridge.py")
-        await migration.migrate(conn=conn)
-        await migration.migrate(conn=conn)
+        await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
+        await _load("060_native_revision_migration_bridge.py").migrate(conn=conn)
         await conn.close()
         conn = None
         pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
