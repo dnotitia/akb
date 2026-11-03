@@ -454,7 +454,7 @@ describe("collection shortcut navigation", () => {
     expect(screen.queryByRole("treeitem", { name: /Shared outside/ })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Clear collection scope" }));
     expect(screen.getByRole("searchbox", { name: "Filter resources" })).toHaveValue("shared");
-    expect(screen.getByRole("treeitem", { name: /Shared outside/ })).toBeInTheDocument();
+    expect(await screen.findByRole("treeitem", { name: /Shared outside/ })).toBeInTheDocument();
   });
 
   it("does not restore a previous account or Vault's Collection scope", async () => {
