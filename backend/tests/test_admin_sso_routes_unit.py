@@ -138,12 +138,12 @@ def _client(monkeypatch, control: Control, *, admin=None, guard_calls=None) -> T
         yield complete
 
     @asynccontextmanager
-    async def unowned_credentials_guard(alias, _actor, *, expected_fingerprint, secret_revision):
+    async def unowned_credentials_guard(alias, _actor, *, expected_fingerprint, secret_revision, expected_target_id=None):
         guard_calls.append((alias, expected_fingerprint, secret_revision))
 
         async def complete(_mutation):
             pass
-        yield SimpleNamespace(check=lambda _provider: None, complete=complete)
+        yield SimpleNamespace(control=control, check=lambda _provider: None, complete=complete)
 
     monkeypatch.setattr(admin_sso, "provider_mutation_guard", unowned_provider_guard)
     monkeypatch.setattr(admin_sso, "provider_credentials_guard", unowned_credentials_guard)

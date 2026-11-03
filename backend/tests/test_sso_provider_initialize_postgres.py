@@ -68,7 +68,7 @@ async def test_initialize_creates_once_and_records_redacted_atomic_evidence(empt
     caplog.set_level(logging.DEBUG)
     async with review_http_client() as client:
         caps = (await client.get("/api/v1/admin/sso/operation-capabilities", headers=lane["pat"])).json()
-        for name in ("sso.provider-initialize.v1", "sso.operation-request-service-key.v1"):
+        for name in ("sso.provider-initialize.v1", "sso.operation-request-service-key.v1", "sso.provider-target-cas.v1"):
             assert name in caps["capabilities"] and name in BASE_CAPABILITIES
         before = await ownership(client, lane)
         assert before["revision"] == 0 and before["fingerprint"] == body()["expected_fingerprint"]
@@ -244,3 +244,23 @@ async def test_real_adapter_and_mock_keycloak_transport_with_postgres(standalone
         event = await lane["pool"].fetchval("SELECT payload FROM events WHERE kind='auth.sso_provider_initialized'")
         assert json.loads(event)["before"] is None
         assert _SECRET not in created.text + repr(lane["audit"]) + event + caplog.text
+
+
+async def test_initialize_refuses_active_target_switch_before_effect(empty, monkeypatch):
+    from app.sso import management_targets
+
+    lane = empty
+    async with review_http_client() as client:
+        before = await ownership(client, lane)
+        original = management_targets.resolve
+        async def switched(conn, target_id=None):
+            target = await original(conn, target_id)
+            return replace(target, target_id=uuid.uuid4()) if target_id is None else target
+        monkeypatch.setattr(management_targets, "resolve", switched)
+        rejected = await client.put(_PATH, headers=lane["pat"], json=body(expected_target_id=before["target_id"]))
+        assert (rejected.status_code, rejected.json()["code"]) == (409, "sso_management_target_conflict")
+        assert _SECRET not in rejected.text and lane["writes"] == []
+        assert await lane["pool"].fetchval("SELECT count(*) FROM sso_provider_ownership") == 0
+        monkeypatch.setattr(management_targets, "resolve", original)
+        accepted = await client.put(_PATH, headers=lane["pat"], json=body(expected_target_id=before["target_id"]))
+        assert accepted.status_code == 200 and lane["writes"] == ["workforce"]

@@ -36,6 +36,7 @@ CAPABILITIES = [
     "sso.operation-attempts.v1",
     "sso.provider-client-credentials.v1",
     "sso.provider-initialize.v1",
+    "sso.provider-target-cas.v1",
     "sso.operation-requests.v1",
     "sso.operation-request-service-key.v1",
 ]
@@ -217,6 +218,7 @@ async def provider_mutation_guard(alias: str, actor, *, enabled: bool | None = N
 
 @dataclass(frozen=True, slots=True)
 class ProviderCredentialsGuard:
+    control: Any
     check: Callable[[Any], None]
     complete: Callable[[Any], Awaitable[None]]
 
@@ -232,7 +234,8 @@ def _secret_revision_label(value: str | None) -> str | None:
 
 @asynccontextmanager
 async def provider_credentials_guard(alias: str, actor, *, expected_fingerprint: str,
-                                     secret_revision: str | None):
+                                     secret_revision: str | None,
+                                     expected_target_id: uuid.UUID | None = None):
     """Serialize one client-credential change of an unowned provider.
 
     Only an unowned provider without an emergency latch qualifies; an owned
@@ -250,6 +253,8 @@ async def provider_credentials_guard(alias: str, actor, *, expected_fingerprint:
     async with pool.acquire() as conn, conn.transaction():
         target = await management_targets.resolve(conn)
         await _alias_lock(conn, alias, target)
+        if expected_target_id is not None and target.target_id != expected_target_id:
+            raise _error("sso_management_target_conflict")
         row = await conn.fetchrow("SELECT * FROM sso_provider_ownership WHERE alias=$1 AND target_id=$2 FOR UPDATE", alias, target.target_id)
         if row and row["owner_id"] is not None:
             raise _error("sso_provider_owned_mutation_forbidden", 403)
@@ -270,7 +275,7 @@ async def provider_credentials_guard(alias: str, actor, *, expected_fingerprint:
                 alias, provider_fingerprint(mutation.after), actor_id, target.target_id, label)
             await emit_event(conn, "auth.sso_provider_client_credentials_changed", actor_id=str(actor_id),
                              payload={"provider_alias": alias, "provider_revision": revision, **mutation.audit_view()})
-        yield ProviderCredentialsGuard(check=check, complete=complete)
+        yield ProviderCredentialsGuard(control=target.control, check=check, complete=complete)
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,7 +286,8 @@ class ProviderInitializationGuard:
 
 @asynccontextmanager
 async def provider_initialization_guard(alias: str, actor, *, expected_fingerprint: str,
-                                        secret_revision: str):
+                                        secret_revision: str,
+                                        expected_target_id: uuid.UUID | None = None):
     """Serialize absent-only initialization against AKB ownership changes."""
     alias = _canonical_alias(alias)
     label = _secret_revision_label(secret_revision)
@@ -292,6 +298,8 @@ async def provider_initialization_guard(alias: str, actor, *, expected_fingerpri
     async with pool.acquire() as conn, conn.transaction():
         target = await management_targets.resolve(conn)
         await _alias_lock(conn, alias, target)
+        if expected_target_id is not None and target.target_id != expected_target_id:
+            raise _error("sso_management_target_conflict")
         row = await conn.fetchrow(
             "SELECT * FROM sso_provider_ownership WHERE alias=$1 AND target_id=$2 FOR UPDATE",
             alias, target.target_id,
