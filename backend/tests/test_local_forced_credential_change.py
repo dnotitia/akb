@@ -60,6 +60,9 @@ async def _fresh_database():
             pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
         pytest.skip(f"Postgres not reachable at {_DSN}")
 
+    from app.db import postgres
+
+    handle_before = postgres._pool
     database = f"akb_forced_change_{uuid.uuid4().hex[:12]}"
     admin = await asyncpg.connect(_DSN)
     await admin.execute(f'CREATE DATABASE "{database}"')
@@ -86,8 +89,15 @@ async def _fresh_database():
             " WHERE datname = $1 AND pid <> pg_backend_pid()",
             database,
         )
+        handle_at_drop = postgres._pool
         await admin.execute(f'DROP DATABASE "{database}"')
         await admin.close()
+    # Whatever routed the process to this database had to hand the handle back
+    # before the database went; a handle left behind points every later
+    # ``get_pool()`` at a closed pool on a dropped database.
+    assert handle_at_drop is handle_before, (
+        "the process-wide pool still pointed at this database when it was dropped"
+    )
 
 
 class _RoleSync:
@@ -106,26 +116,15 @@ class _RoleSync:
 @pytest.fixture
 async def pool(monkeypatch):
     async with _fresh_database() as pool:
+        from app.db import postgres
         from app.services import (
             access_service,
             account_service,
             auth_service,
-            password_service,
             recovery_admin_service,
         )
 
-        async def _get_pool():
-            return pool
-
         role_sync = _RoleSync()
-        for module in (
-            access_service,
-            account_service,
-            auth_service,
-            password_service,
-            recovery_admin_service,
-        ):
-            monkeypatch.setattr(module, "get_pool", _get_pool)
         for module in (
             access_service,
             account_service,
@@ -134,7 +133,19 @@ async def pool(monkeypatch):
         ):
             monkeypatch.setattr(module, "get_role_sync", lambda: role_sync)
         monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
-        yield pool
+        # Every ``get_pool()`` returns this process-wide handle once it is set,
+        # whichever module imported it. Patching ``get_pool`` module by module
+        # missed each service a route later started reading through — and the
+        # miss fell through to the configured database host, not this one.
+        # The handle is handed back here, not by ``monkeypatch``: that undoes
+        # only after this fixture has finished, and by then the pool is closed
+        # and its database dropped.
+        previous = postgres._pool
+        postgres._pool = pool
+        try:
+            yield pool
+        finally:
+            postgres._pool = previous
 
 
 async def _credential_change_required(pool, user_id) -> bool:

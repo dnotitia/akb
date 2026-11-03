@@ -27,7 +27,6 @@ unreachable — the same convention as the neighbouring `*_pg.py` files.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -37,6 +36,7 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from app.db import postgres
 from app.services import access_service
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
@@ -46,7 +46,6 @@ pytestmark = pytest.mark.asyncio
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8")
-_MIGRATIONS = _BACKEND / "app" / "db" / "migrations"
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
@@ -71,19 +70,20 @@ def _database_dsn(name: str) -> str:
     return f"{_DSN.rsplit('/', 1)[0]}/{name}"
 
 
-def _load(filename: str):
-    path = _MIGRATIONS / filename
-    spec = importlib.util.spec_from_file_location(f"counters_migration_{filename}", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 @asynccontextmanager
 async def _fresh_database(monkeypatch):
-    """A vault with an owner, on a database carrying the native core."""
+    """A vault with an owner, on a database built the way a booting server builds one.
+
+    `_run_boot_schema` applies `init.sql` and then every registered migration
+    in the server's order. The native write path these tests drive reaches
+    tables that later migrations change (`create_text` records inline-image
+    references in `document_asset_refs.native_document_id`, added by 107), so a
+    hand-kept migration list here goes stale with the next migration and turns
+    every test in this file into a setup error.
+    """
     if not await _reachable():
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
         pytest.skip(f"Postgres not reachable at {_DSN}")
 
     name = f"akb_document_counters_{uuid.uuid4().hex[:12]}"
@@ -93,15 +93,7 @@ async def _fresh_database(monkeypatch):
     try:
         await admin.execute(f'CREATE DATABASE "{name}"')
         conn = await asyncpg.connect(_database_dsn(name))
-        await conn.execute(_INIT_SQL)
-        for filename in (
-            "010_external_git_mirror.py",
-            "015_events_outbox.py",
-            "044_vault_write_policy.py",
-            "045_vault_write_grant_actions.py",
-            "048_native_revision_core.py",
-        ):
-            await _load(filename).migrate(conn=conn)
+        await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
         await conn.close()
         conn = None
         pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=4)

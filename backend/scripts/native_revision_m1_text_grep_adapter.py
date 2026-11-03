@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import sys
 import time
 import uuid
@@ -20,6 +19,7 @@ if str(BACKEND) not in sys.path:
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from app.db import postgres  # noqa: E402
 from app.exceptions import ForbiddenError  # noqa: E402
 from app.services.m1_native_grep_service import M1NativeGrepService  # noqa: E402
 from app.services.m1_pg_body_store import M1PgBodyStore  # noqa: E402
@@ -84,16 +84,6 @@ def _safe_cases(cases: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _load_migration(conn: asyncpg.Connection, filename: str) -> None:
-    path = BACKEND / "app" / "db" / "migrations" / filename
-    spec = importlib.util.spec_from_file_location(f"akb_{filename.replace('.', '_')}", path)
-    if spec is None or spec.loader is None:
-        raise AdapterError(f"cannot load migration {filename}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    await module.migrate(conn=conn)
-
-
 async def initialise(
     dsn: str,
 ) -> tuple[asyncpg.Pool, str, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
@@ -101,10 +91,11 @@ async def initialise(
     try:
         database = str(await conn.fetchval("SELECT current_database()"))
         validate_measurement_database(database)
-        await conn.execute((BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8"))
-        await _load_migration(conn, "048_native_revision_core.py")
-        await _load_migration(conn, "053_native_revision_m1_pg_body.py")
-        await _load_migration(conn, "057_native_revision_m1_payload_placement.py")
+        # The server's own boot path: init.sql, then every registered migration
+        # in its order (048, 053 and 057 among them). The native writer this
+        # adapter drives reaches tables later migrations add, so a hand-kept
+        # subset stops being able to run it at the next such migration.
+        await postgres._run_boot_schema(conn, init_sql=(BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8"))
         suffix = uuid.uuid4().hex
         owner_id = await conn.fetchval(
             """
