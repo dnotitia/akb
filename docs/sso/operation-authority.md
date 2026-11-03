@@ -31,7 +31,9 @@ Capabilities return `schema_version: 1`, the database-owned `installation_id`,
 - `auth.callback-login-evidence.v1`
 - `sso.operation-attempts.v1`
 - `sso.provider-client-credentials.v1`
+- `sso.provider-initialize.v1`
 - `sso.operation-requests.v1`
+- `sso.operation-request-service-key.v1`
 
 `realm_identity` is `{realm_id, realm_name, issuer}` from an actual Admin REST
 read of the configured realm. Missing permission, delegated management and
@@ -81,6 +83,36 @@ Enabling and disabling, a human emergency disable included, keep the label,
 because neither changes the secret, so after the latch is cleared the ownership
 read still names the configured secret version. An ordinary configure and a
 release of ownership clear it.
+
+## Initialize an absent provider
+
+When a provider alias is absent, an authorized provider-control actor may use
+`PUT /admin/sso/providers/{alias}/initialize`. Supply the ordinary
+configuration fields `provider_type`, `display_name`, `issuer`,
+`discovery_url`, `client_id` and `client_secret`, plus the
+`expected_fingerprint` from the absent-provider ownership read and a
+nonempty `secret_revision` label. The label is an opaque revision of the
+secret in the caller's secret store, never the secret itself.
+
+Initialization requires an unowned alias without an emergency latch and creates
+the provider disabled. It does not enable the provider. The operation checks
+the absent fingerprint under the ownership lock and checks Keycloak again after
+discovery; creation uses only Keycloak's create operation. A concurrent
+creation causes a conflict and is never overwritten. The normal provider
+response is secret-free; ownership readback shows the resulting fingerprint,
+revision and secret-revision label.
+
+Keycloak and the AKB database are separate authorities. If a response is lost
+or the database or audit write fails after Keycloak accepted creation, the
+provider can exist without the corresponding AKB evidence. Do not automatically
+retry initialization after an ambiguous result: inspect the provider and
+ownership readback, then reconcile explicitly. Existing providers require the
+ordinary configuration or client-credential paths.
+
+The `sso.provider-initialize.v1` capability advertises this endpoint.
+The independent `sso.operation-request-service-key.v1` capability advertises
+Native issuance of the dedicated request key; the older
+`sso.operation-requests.v1` capability alone does not establish that support.
 
 ## Operation requests
 

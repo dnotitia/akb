@@ -495,6 +495,7 @@ def test_only_provider_catalog_configuration_credentials_and_toggle_use_machine_
         ("/admin/sso/providers", "GET"),
         ("/admin/sso/providers/{alias}", "PUT"),
         ("/admin/sso/providers/{alias}/client-credentials", "PUT"),
+        ("/admin/sso/providers/{alias}/initialize", "PUT"),
         ("/admin/sso/providers/{alias}/enable", "POST"),
         ("/admin/sso/providers/{alias}/disable", "POST"),
     }

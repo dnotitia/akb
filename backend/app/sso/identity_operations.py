@@ -35,7 +35,9 @@ CAPABILITIES = [
     "auth.callback-login-evidence.v1",
     "sso.operation-attempts.v1",
     "sso.provider-client-credentials.v1",
+    "sso.provider-initialize.v1",
     "sso.operation-requests.v1",
+    "sso.operation-request-service-key.v1",
 ]
 IDENTITY_VERBS = frozenset({"preflight", "postcheck", "apply", "rollback", "admit"})
 EVIDENCE_VERBS = frozenset({"login-evidence"})
@@ -269,6 +271,55 @@ async def provider_credentials_guard(alias: str, actor, *, expected_fingerprint:
             await emit_event(conn, "auth.sso_provider_client_credentials_changed", actor_id=str(actor_id),
                              payload={"provider_alias": alias, "provider_revision": revision, **mutation.audit_view()})
         yield ProviderCredentialsGuard(check=check, complete=complete)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderInitializationGuard:
+    control: Any
+    complete: Callable[[Any], Awaitable[None]]
+
+
+@asynccontextmanager
+async def provider_initialization_guard(alias: str, actor, *, expected_fingerprint: str,
+                                        secret_revision: str):
+    """Serialize absent-only initialization against AKB ownership changes."""
+    alias = _canonical_alias(alias)
+    label = _secret_revision_label(secret_revision)
+    if label is None:
+        raise _error("sso_provider_secret_revision_invalid", 422)
+    actor_id = uuid.UUID(str(actor.user_id))
+    pool = await get_pool()
+    async with pool.acquire() as conn, conn.transaction():
+        target = await management_targets.resolve(conn)
+        await _alias_lock(conn, alias, target)
+        row = await conn.fetchrow(
+            "SELECT * FROM sso_provider_ownership WHERE alias=$1 AND target_id=$2 FOR UPDATE",
+            alias, target.target_id,
+        )
+        if row and row["owner_id"] is not None:
+            raise _error("sso_provider_owned_mutation_forbidden", 403)
+        if row and row["emergency_disabled"]:
+            raise _error("sso_provider_emergency_disabled")
+        if expected_fingerprint != provider_fingerprint(None, alias=alias):
+            raise _error("sso_provider_fingerprint_conflict")
+        existing = await _provider(alias, allow_missing=True, allow_configuration_error=True, target=target)
+        if existing is not None:
+            raise _error("sso_provider_fingerprint_conflict")
+
+        async def complete(mutation) -> None:
+            after = mutation.after
+            if (mutation.before is not None or after.alias != alias or after.enabled
+                    or after.state != "configured_disabled" or not after.client_secret_configured):
+                raise _error("sso_provider_initialization_invalid")
+            revision = await conn.fetchval("""INSERT INTO sso_provider_ownership
+                (alias,owner_id,revision,fingerprint,emergency_disabled,updated_by,target_id,secret_revision)
+                VALUES($1,NULL,1,$2,FALSE,$3,$4,$5) ON CONFLICT(target_id,alias) DO UPDATE SET
+                revision=sso_provider_ownership.revision+1,fingerprint=EXCLUDED.fingerprint,
+                updated_by=EXCLUDED.updated_by,updated_at=NOW(),secret_revision=EXCLUDED.secret_revision
+                RETURNING revision""", alias, provider_fingerprint(after), actor_id, target.target_id, label)
+            await emit_event(conn, "auth.sso_provider_initialized", actor_id=str(actor_id),
+                             payload={"provider_alias": alias, "provider_revision": revision, **mutation.audit_view()})
+        yield ProviderInitializationGuard(control=target.control, complete=complete)
 
 
 async def _live_actor(conn, row, *, approval_request_id=None):

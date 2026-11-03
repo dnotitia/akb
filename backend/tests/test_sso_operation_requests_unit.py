@@ -103,7 +103,11 @@ def test_configure_summary_keeps_every_field_but_the_secret():
 
 
 def test_capability_is_advertised():
+    from app.sso.runtime_identity import BASE_CAPABILITIES
+
     assert "sso.operation-requests.v1" in ops.CAPABILITIES
+    for capability in ("sso.provider-initialize.v1", "sso.operation-request-service-key.v1"):
+        assert capability in ops.CAPABILITIES and capability in BASE_CAPABILITIES
 
 
 def _reader_request(authorization):
