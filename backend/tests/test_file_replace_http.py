@@ -16,6 +16,8 @@ import uuid
 import httpx
 import pytest
 
+pytestmark = pytest.mark.needs_resource("a running AKB with real object storage at AKB_FILE_REPLACE_TEST_URL")
+
 
 def _hash(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()

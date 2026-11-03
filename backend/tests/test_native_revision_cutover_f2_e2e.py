@@ -27,6 +27,7 @@ from e2e_runtime import CredentialNames, E2ERuntime, RuntimeConfig  # noqa: E402
 
 pytestmark = [
     pytest.mark.asyncio,
+    pytest.mark.needs_resource("a disposable legacy runtime fixture, enabled by AKB_RUN_NATIVE_CUTOVER_F2=1"),
     pytest.mark.skipif(
         os.environ.get("AKB_RUN_NATIVE_CUTOVER_F2") != "1",
         reason="set AKB_RUN_NATIVE_CUTOVER_F2=1 for the disposable live fixture",

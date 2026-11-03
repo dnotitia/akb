@@ -35,7 +35,9 @@ from tests.test_prepared_sso_target_unit import preparation
 IMAGE = "quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13"
 REMOTE_HOST = os.environ.get("AKB_PREPARED_TARGET_DOCKER_HOST", "")
 PG_PORT = int(os.environ.get("AKB_PREPARED_TARGET_PG_PORT", "55476"))
-pytestmark = [pytest.mark.asyncio, pytest.mark.skipif(os.environ.get("AKB_PREPARED_TARGET_REMOTE") != "1",
+pytestmark = [pytest.mark.asyncio,
+              pytest.mark.needs_resource("an owned private Docker host for Keycloak, enabled by AKB_PREPARED_TARGET_REMOTE=1"),
+              pytest.mark.skipif(os.environ.get("AKB_PREPARED_TARGET_REMOTE") != "1",
                                                    reason="requires explicit owned private Docker fixture")]
 
 

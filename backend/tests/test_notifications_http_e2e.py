@@ -50,6 +50,7 @@ def _until(fetch, predicate, description, timeout=30):
     pytest.fail(f"Notification worker did not reach {description} within {timeout}s")
 
 
+@pytest.mark.needs_resource("an isolated loopback AKB runtime with its workers at AKB_NOTIFICATION_E2E_URL")
 def test_personal_inbox_http_and_background_worker():
     origin = _target()
     suffix = uuid.uuid4().hex[:12]

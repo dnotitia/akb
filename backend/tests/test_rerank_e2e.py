@@ -38,9 +38,10 @@ import pytest
 # helpers for the standalone runner (see module docstring), not pytest
 # test cases — they need a live corpus and break under pytest's plain
 # import context.
-pytestmark = pytest.mark.skip(
-    reason="Standalone in-pod E2E script; see module docstring for run command."
-)
+pytestmark = [
+    pytest.mark.needs_resource("a deployed backend pod and its live corpus; it runs as a standalone script"),
+    pytest.mark.skip(reason="Standalone in-pod E2E script; see module docstring for run command."),
+]
 
 sys.path.insert(0, "/app")
 
