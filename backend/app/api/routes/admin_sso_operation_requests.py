@@ -12,6 +12,7 @@ import uuid
 from fastapi import APIRouter, Body, Depends, Header, Request, Response
 from pydantic import Field
 
+from app.api.deps import get_sso_operation_request_service_key
 from app.api.routes.admin_auth import ProductAdminActor, get_current_product_admin, get_product_admin_mutation
 from app.api.routes.admin_sso_operations import RequestModel, SourceTuple, ValueLessRoute
 from app.config import settings
@@ -25,22 +26,17 @@ _SHA256 = r"^[a-f0-9]{64}$"
 
 
 async def get_requesting_service_key(request: Request, authorization: str | None = Header(default=None)):
-    """The administrator service key, and nothing else: no session, no cookie."""
-    from app.api.routes.admin_sso import get_sso_provider_control_actor
-
-    if not authorization:
-        raise ForbiddenError("SSO operation requests require an administrator service key",
-                             code="sso_operation_request_service_key_required")
-    return await get_sso_provider_control_actor(request, authorization=authorization, csrf_header=None)
+    """The dedicated request key, and nothing else: no session or cookie."""
+    return await get_sso_operation_request_service_key(authorization=authorization)
 
 
 async def get_request_reader(request: Request, authorization: str | None = Header(default=None)):
-    """A human administrator, or the administrator service key.
+    """A human administrator, or the dedicated request key.
 
     The human is the product-admin session in SSO mode and the local
     product-admin bearer in local mode, resolved the way the existing
     operation metadata reader does it: a local human bearer first, then the
-    service key. A bearer that is neither is refused by the service-key path.
+    dedicated request key. A bearer that is neither is refused.
     """
     if authorization:
         if settings.require_auth_mode() == "local":

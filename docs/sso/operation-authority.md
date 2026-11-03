@@ -16,8 +16,8 @@ becomes a second verifier, a public login choice or an OIDC credential issuer.
 All paths below are relative to `/api/v1`. The existing administrator service
 PAT can read `/admin/sso/operation-capabilities` and
 `/admin/sso/providers/{alias}/ownership`. It cannot grant or retire operations or
-assign ownership itself; it can ask a human to, through an
-[operation request](#operation-requests). Human calls use the product-admin
+assign ownership itself. A separate dedicated service key can ask a human
+through an [operation request](#operation-requests). Human calls use the product-admin
 session; mutations also require the matching `X-AKB-Admin-CSRF` cookie/header
 proof.
 
@@ -92,10 +92,12 @@ only the token that asked collects the credential, once, sealed to a key it
 generated for that request. No response returned to a human contains a
 credential.
 
-`POST /admin/sso/operation-requests` accepts only an administrator service key
-(the same `read`, `write`, `admin` service PAT conjunction an operation actor
-must hold). The requesting user and token are taken from the calling token; the
-body cannot name them. Two kinds exist:
+`POST /admin/sso/operation-requests` accepts only a service key with exactly
+the `sso_operation_requests` scope and no vault scope, belonging to an active
+non-admin service account. Provision it using the
+[Native bootstrap](#provision-the-requester-key). Broad read, write and admin
+keys do not acquire this authority. The requesting user and token are taken
+from the calling token; the body cannot name them. Two kinds exist:
 
 ```json
 {
@@ -157,7 +159,7 @@ product-admin session and the CSRF header, and the body
 `{"expected_request_sha256": "<digest the screen showed>"}`. A different digest,
 or a request that is no longer pending, is a `409` conflict, so a stale screen
 cannot decide anything it did not show. Approval also requires the requesting
-token to still be a live administrator service key.
+token to still be the live dedicated service key.
 
 - Approving a claim runs the ownership compare-and-set above with the approving
   human as the actor and `updated_by`, in the transaction that records the
@@ -319,8 +321,40 @@ and adopt the live fingerprint before issuing another operation.
 Human administrators inspect a secret-free operation with
 `GET /admin/sso/identity-operations/{id}` and retire it with
 `POST /admin/sso/identity-operations/{id}/retire`. Those paths also accept the
-bounded operation carrier while valid. Retirement retains the journal. No
-automatic Keycloak user/link deletion is performed.
+bounded operation carrier while valid. The dedicated requester key can inspect
+and retire only operations originating from its own collected requests and
+their human-reauthorized attempts, bound to the same user and token.
+Retirement retains the journal. No automatic Keycloak user/link deletion is performed.
+
+## Provision the requester key
+
+This command is a trusted Native operator action with database authority. It is
+the only issuance path for this scope; generic HTTP token minting cannot issue
+it. Before running it, create and durably retain a fresh credential in the
+operator's secret store. It must be `akb_secret_` followed by the unpadded
+base64url encoding of 32 cryptographically random bytes. Choose a fresh UUID
+for the token ID and retain both values across retries.
+
+Pipe the retained credential directly to standard input, and write the
+secret-free receipt to a protected path:
+
+```sh
+cat /protected/requester-key | python -m app.cli provision-approval-service-credential \
+  --token-id "$REQUESTER_TOKEN_ID" --receipt-file /protected/requester-receipt.json
+```
+
+Standard input must be a pipe; the value never appears in command arguments,
+stdout, stderr, the receipt or audit events. The receipt includes
+`requester_user_id`, `requester_token_id`, `installation_id`, `key_class`,
+`scopes`, `vault_scope` and `status` (`issued` or `replayed`). Store the
+identity metadata with the secret. Retrying the same UUID and value returns
+the same identity; a changed value, a deleted key, or an altered account is
+refused. The ledger retains a tombstone even when an account or token is deleted.
+
+For rotation, retain a new credential under a new token UUID and run the same
+command. It adds a key to the same non-admin requester without revoking the
+prior key. Existing requests and operations stay bound to their original user
+and token; revoke an old key only when its outstanding work no longer needs it.
 
 ## Installed management targets
 

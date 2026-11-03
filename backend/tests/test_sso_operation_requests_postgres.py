@@ -62,7 +62,8 @@ class MutableControl(Control):
 async def _service_token(pool, username: str, scopes: list[str]) -> tuple[uuid.UUID, uuid.UUID, dict[str, str]]:
     user_id, token_id = uuid.uuid4(), uuid.uuid4()
     await pool.execute("""INSERT INTO users(id,username,email,password_hash,is_admin,account_kind,auth_provider)
-        VALUES($1,$2,$2||'@example.test','!fixture!',TRUE,'service','keycloak')""", user_id, username)
+        VALUES($1,$2,$2||'@example.test','!fixture!',$3,'service','keycloak')""",
+                       user_id, username, scopes != ["sso_operation_requests"])
     raw, digest, prefix = auth_service.generate_pat("service")
     await pool.execute("""INSERT INTO tokens(id,user_id,name,token_hash,token_prefix,key_class,scopes)
         VALUES($1,$2,$3,$4,$5,'service',$6::text[])""", token_id, user_id, username, digest, prefix, scopes)
@@ -102,11 +103,13 @@ async def lane(monkeypatch):
         await pool.execute("""INSERT INTO users(id,username,email,password_hash,is_admin,account_kind,auth_provider)
             VALUES($1,'admin','admin@example.test','!fixture!',TRUE,'human','keycloak')""", human)
         await pool.execute("INSERT INTO external_identities(user_id,issuer,subject) VALUES($1,$2,'admin-subject')", human, NEW)
-        machine, tid, pat = await _service_token(pool, "machine", ["read", "write", "admin"])
-        _, other_tid, other_pat = await _service_token(pool, "other-machine", ["read", "write", "admin"])
+        machine, tid, pat = await _service_token(pool, "machine", ["sso_operation_requests"])
+        _, other_tid, other_pat = await _service_token(pool, "other-machine", ["sso_operation_requests"])
         _, _, reader_pat = await _service_token(pool, "reader-machine", ["read"])
+        _, _, broad_pat = await _service_token(pool, "broad-machine", ["read", "write", "admin"])
         yield {"pool": pool, "control": control, "human": human, "machine": machine, "tid": tid,
-               "pat": pat, "other_pat": other_pat, "other_tid": other_tid, "reader_pat": reader_pat}
+               "pat": pat, "other_pat": other_pat, "other_tid": other_tid, "reader_pat": reader_pat,
+               "broad_pat": broad_pat}
 
 
 def keypair() -> tuple[X25519PrivateKey, str]:
@@ -164,7 +167,7 @@ async def events(lane, prefix="auth.sso_operation_request_") -> list[tuple[str, 
 
 async def test_claim_is_proposed_by_a_service_key_and_approved_by_the_exact_human_digest(lane):
     async with review_http_client() as client:
-        capabilities = await client.get("/api/v1/admin/sso/operation-capabilities", headers=lane["pat"])
+        capabilities = await client.get("/api/v1/admin/sso/operation-capabilities", headers=lane["broad_pat"])
         assert "sso.operation-requests.v1" in capabilities.json()["capabilities"]
         before = await ops.ownership("workforce")
         claim = {"kind": "ownership_claim", "provider_alias": "workforce", "owner_id": OWNER,
@@ -176,6 +179,7 @@ async def test_claim_is_proposed_by_a_service_key_and_approved_by_the_exact_huma
         as_human = await client.post(BASE, json=claim, headers=csrf)
         assert (as_human.status_code, as_human.json()["code"]) == (403, "sso_operation_request_service_key_required")
         assert (await client.post(BASE, json=claim, headers=lane["reader_pat"])).status_code == 403
+        assert (await client.post(BASE, json=claim, headers=lane["broad_pat"])).status_code == 403
         # The requester comes from the calling token; the body cannot name it.
         named = await client.post(BASE, json={**claim, "requested_by": str(lane["human"])}, headers=lane["pat"])
         assert (named.status_code, named.json()["detail"]["code"]) == (422, "sso_operation_request_invalid")
@@ -297,7 +301,8 @@ async def test_an_approved_grant_is_collected_once_sealed_to_the_requesters_key(
         assert enabled.status_code == 200 and enabled.json()["provider"]["enabled"]
         assert lane["control"].configured_secret == SECRET
 
-        after = await client.get("/api/v1/admin/sso/providers/workforce/ownership", headers=lane["pat"])
+        assert (await client.get("/api/v1/admin/sso/providers/workforce/ownership", headers=lane["pat"])).status_code == 403
+        after = await client.get("/api/v1/admin/sso/providers/workforce/ownership")
         assert after.json()["provider_secret_revision"] == "secret-v2"  # pragma: allowlist secret
         human_texts.append((await client.get(BASE)).text)
         human_texts.append((await client.get(f"{BASE}/{request['request_id']}")).text)
@@ -536,8 +541,198 @@ async def test_a_human_reauthorization_keeps_the_approved_summary(lane):
     parent = await lane["pool"].fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1",
                                          uuid.UUID(sealed["operation_id"]))
     child_id = uuid.uuid4()
-    await operation_attempts.reauthorize(parent["operation_id"], operation_id=child_id,
+    reauthorized = await operation_attempts.reauthorize(parent["operation_id"], operation_id=child_id,
                                          expected_intent_sha256=operation_attempts.intent_hash(parent),
                                          ttl_seconds=600, granted_by=lane["human"])
     child = await lane["pool"].fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1", child_id)
     assert json.loads(child["provider_configure_summary"]) == SUMMARY
+    # A human reauthorization remains in the request-origin lineage.
+    async with review_http_client() as client:
+        path = f"/api/v1/admin/sso/identity-operations/{child_id}"
+        assert (await client.get(path, headers=lane["pat"])).status_code == 200
+        carrier = {"Authorization": "AKB-Operation " + reauthorized["credential"]}
+        assert (await client.get(path, headers=carrier)).status_code == 200
+        assert (await client.post(path + "/retire", headers=lane["pat"])).status_code == 200
+
+
+async def test_requester_can_only_read_and_retire_its_own_collected_operation(lane):
+    from app.exceptions import AKBError
+
+    owned = await own(lane)
+    _, public = keypair()
+    body = grant_body(public, owned["revision"])
+    async with review_http_client() as client:
+        csrf = await review_human_cookies(client)
+        request = await propose_and_approve(client, lane, csrf, body)
+
+        # Approval cannot be harvested through the legacy direct human grant.
+        doc = request["request"]
+        terms = doc["grant"]
+        spec = {"operation_id": uuid.UUID(terms["operation_id"]), "installation_id": uuid.UUID(doc["installation_id"]),
+                "actor_id": lane["machine"], "actor_token_id": lane["tid"], "provider_alias": doc["provider_alias"],
+                "owner_id": doc["owner_id"], "expected_provider_revision": terms["expected_provider_revision"],
+                "expected_source": terms["source"], "ttl_seconds": terms["ttl_seconds"], "verbs": terms["verbs"],
+                "cohort": [], "provider_payload_sha256": terms["provider_payload_sha256"],
+                "provider_secret_revision": terms["provider_secret_revision"]}
+        with pytest.raises(AKBError) as direct:
+            await ops.grant(spec, granted_by=lane["human"])
+        assert direct.value.code == "sso_operation_actor_retired"
+
+        path = f"{BASE}/{request['request_id']}"
+        # Same account with a different token is still a foreign requester.
+        sibling_raw, sibling_hash, sibling_prefix = auth_service.generate_pat("service")
+        sibling_id = uuid.uuid4()
+        await lane["pool"].execute("""INSERT INTO tokens(id,user_id,name,token_hash,token_prefix,key_class,scopes)
+            VALUES($1,$2,'sibling',$3,$4,'service',ARRAY['sso_operation_requests'])""",
+            sibling_id, lane["machine"], sibling_hash, sibling_prefix)
+        sibling = {"Authorization": f"Bearer {sibling_raw}"}
+        assert (await client.get(path, headers=sibling)).status_code == 403
+        assert (await client.post(path + "/credential", headers=sibling)).status_code == 403
+        assert (await client.post(path + "/cancel", headers=sibling)).status_code == 403
+        assert (await client.post(path + "/credential", headers=lane["broad_pat"])).status_code == 403
+        assert (await client.post(path + "/cancel", headers=lane["broad_pat"])).status_code == 403
+        assert (await client.get(path, headers=lane["broad_pat"])).status_code == 403
+        collected = await client.post(path + "/credential", headers=lane["pat"])
+        assert collected.status_code == 200, collected.text
+
+        operation = f"/api/v1/admin/sso/identity-operations/{terms['operation_id']}"
+        assert (await client.get(operation, headers=sibling)).status_code == 403
+        assert (await client.post(operation + "/retire", headers=sibling)).status_code == 403
+        assert (await client.get(operation, headers=lane["other_pat"])).status_code == 403
+        assert (await client.post(operation + "/retire", headers=lane["other_pat"])).status_code == 403
+        own_status = await client.get(operation, headers=lane["pat"])
+        assert own_status.status_code == 200, own_status.text
+        retired = await client.post(operation + "/retire", headers=lane["pat"])
+        assert retired.status_code == 200 and retired.json()["phase"] == "retired"
+
+
+@pytest.mark.parametrize("mutation", [
+    "UPDATE users SET is_admin=TRUE WHERE id=$1",
+    "UPDATE users SET account_kind='human' WHERE id=$1",
+    "UPDATE users SET account_status='suspended' WHERE id=$1",
+    "UPDATE tokens SET scopes=ARRAY['sso_operation_requests','read'] WHERE id=$2",
+    "UPDATE tokens SET vault_scope='{}' WHERE id=$2",
+    "UPDATE tokens SET key_class='pat' WHERE id=$2",
+    "UPDATE tokens SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE id=$2",
+])
+async def test_changed_requester_authority_cannot_propose(lane, mutation):
+    before = await ops.ownership("workforce")
+    body = {"kind": "ownership_claim", "provider_alias": "workforce", "owner_id": OWNER,
+            "expected_revision": before["revision"], "expected_fingerprint": before["fingerprint"]}
+    # asyncpg requires the parameters actually referenced by each statement.
+    if "$2" in mutation:
+        await lane["pool"].execute(mutation.replace("$2", "$1"), lane["tid"])
+    else:
+        await lane["pool"].execute(mutation, lane["machine"])
+    async with review_http_client() as client:
+        response = await client.post(BASE, headers=lane["pat"], json=body)
+        assert response.status_code in (401, 403)
+    assert await lane["pool"].fetchval("SELECT COUNT(*) FROM sso_operation_requests") == 0
+
+
+async def test_sealing_failure_rolls_back_then_collection_can_retry(lane, monkeypatch):
+    owned = await own(lane)
+    _, public = keypair()
+    async with review_http_client() as client:
+        csrf = await review_human_cookies(client)
+        request = await propose_and_approve(client, lane, csrf, grant_body(public, owned["revision"]))
+        path = f"{BASE}/{request['request_id']}/credential"
+        original = sealing.seal
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("simulated sealing failure")
+
+        monkeypatch.setattr(sealing, "seal", fail)
+        with pytest.raises(RuntimeError, match="simulated sealing failure"):
+            await client.post(path, headers=lane["pat"])
+        assert await lane["pool"].fetchval("SELECT COUNT(*) FROM sso_identity_operations") == 0
+        assert await lane["pool"].fetchval("SELECT status FROM sso_operation_requests") == "approved"
+        assert len(await events(lane)) == 2
+        monkeypatch.setattr(sealing, "seal", original)
+        assert (await client.post(path, headers=lane["pat"])).status_code == 200
+        assert (await client.post(path, headers=lane["pat"])).status_code == 409
+        assert await lane["pool"].fetchval("SELECT COUNT(*) FROM sso_identity_operations") == 1
+
+
+async def test_concurrent_collection_has_exactly_one_winner(lane):
+    import asyncio
+
+    owned = await own(lane)
+    _, public = keypair()
+    async with review_http_client() as client:
+        csrf = await review_human_cookies(client)
+        request = await propose_and_approve(client, lane, csrf, grant_body(public, owned["revision"]))
+        path = f"{BASE}/{request['request_id']}/credential"
+        responses = await asyncio.gather(client.post(path, headers=lane["pat"]), client.post(path, headers=lane["pat"]))
+        assert sorted(response.status_code for response in responses) == [200, 409]
+        assert await lane["pool"].fetchval("SELECT COUNT(*) FROM sso_identity_operations") == 1
+        assert [kind for kind, _ in await events(lane)].count("auth.sso_operation_request_credential_issued") == 1
+
+
+async def test_new_request_cannot_turn_into_legacy_authority_but_old_operations_remain_valid(lane):
+    owned = await own(lane)
+    private, public = keypair()
+    async with review_http_client() as client:
+        csrf = await review_human_cookies(client)
+        request = await propose_and_approve(client, lane, csrf, grant_body(public, owned["revision"]))
+        result = (await client.post(f"{BASE}/{request['request_id']}/credential", headers=lane["pat"])).json()
+        credential = unseal(result["sealed_credential"], private, result["seal"]["info"])
+        path = f"/api/v1/admin/sso/identity-operations/{result['operation_id']}"
+        carrier = {"Authorization": "AKB-Operation " + credential}
+        assert (await client.get(path, headers=carrier)).status_code == 200
+        await lane["pool"].execute("UPDATE users SET is_admin=TRUE WHERE id=$1", lane["machine"])
+        await lane["pool"].execute("UPDATE tokens SET scopes=ARRAY['read','write','admin'] WHERE id=$1", lane["tid"])
+        denied = await client.get(path, headers=carrier)
+        assert (denied.status_code, denied.json()["code"]) == (403, "sso_operation_actor_retired")
+        # NULL is the upgrade state of an operation request issued before this migration.
+        await lane["pool"].execute("UPDATE sso_operation_requests SET requester_scope=NULL WHERE request_id=$1",
+                                   uuid.UUID(request["request_id"]))
+        legacy = await client.get(path, headers=carrier)
+        assert legacy.status_code == 200, legacy.text
+
+
+async def test_dedicated_key_has_no_generic_vault_or_admin_access(lane):
+    from app.api.routes import access, documents
+    from app.exceptions import AKBError
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+    import httpx
+
+    app = FastAPI()
+    app.include_router(access.router, prefix="/api/v1")
+    app.include_router(documents.router, prefix="/api/v1")
+
+    @app.exception_handler(AKBError)
+    async def error(_request, exc):
+        return JSONResponse({"code": exc.code}, status_code=exc.status_code)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://test") as client:
+        assert (await client.get("/api/v1/vaults", headers=lane["pat"])).status_code == 403
+        assert (await client.post(f"/api/v1/admin/users/{lane['machine']}/tokens", headers=lane["pat"],
+                                  json={"name": "denied"})).status_code == 403
+
+
+async def test_requester_expiring_during_token_lock_wait_is_refused(lane):
+    import asyncio
+
+    from app.exceptions import AKBError
+
+    pool = lane["pool"]
+    async with pool.acquire() as holder:
+        async with holder.transaction():
+            await holder.execute("SELECT id FROM tokens WHERE id=$1 FOR UPDATE", lane["tid"])
+            await holder.execute("UPDATE tokens SET expires_at=clock_timestamp()+INTERVAL '100 milliseconds' WHERE id=$1",
+                                 lane["tid"])
+
+        async with holder.transaction():
+            await holder.execute("SELECT id FROM tokens WHERE id=$1 FOR UPDATE", lane["tid"])
+
+            async def check():
+                async with pool.acquire() as conn, conn.transaction():
+                    await operation_requests._live_requester(conn, lane["machine"], lane["tid"])
+
+            pending = asyncio.create_task(check())
+            await asyncio.sleep(0.2)
+        with pytest.raises(AKBError) as expired:
+            await pending
+    assert expired.value.code == "sso_operation_actor_retired"

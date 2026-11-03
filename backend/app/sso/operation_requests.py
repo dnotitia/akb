@@ -1,6 +1,6 @@
 """Operation requests: a service key proposes, a human approves the exact digest.
 
-An administrator service key proposes an ownership claim or a provider grant.
+A dedicated service key proposes an ownership claim or a provider grant.
 A human administrator approves or denies the exact request, identified by the
 SHA-256 of its canonical document, so a stale screen cannot approve anything it
 did not show. Approving a claim runs the existing ownership compare-and-set
@@ -72,13 +72,14 @@ async def _expire_due(pool) -> None:
 
 async def _live_requester(conn, user_id, token_id) -> None:
     # The same conjunction the issued operation's actor must satisfy.
-    live = await conn.fetchval("""SELECT TRUE FROM tokens t JOIN users u ON u.id=t.user_id
+    live = await conn.fetchrow("""SELECT t.expires_at FROM tokens t JOIN users u ON u.id=t.user_id
         WHERE t.id=$1 AND t.user_id=$2 AND t.key_class='service'
-        AND t.scopes @> ARRAY['read','write','admin']::text[]
+        AND t.scopes = ARRAY['sso_operation_requests']::text[] AND t.vault_scope IS NULL
         AND (t.expires_at IS NULL OR t.expires_at>clock_timestamp())
-        AND u.account_status='active' AND u.account_kind='service' AND u.is_admin
+        AND u.account_status='active' AND u.account_kind='service' AND NOT u.is_admin
         FOR SHARE OF t,u""", token_id, user_id)
-    if live is not True:
+    now = await conn.fetchval("SELECT clock_timestamp()")
+    if live is None or (live["expires_at"] is not None and live["expires_at"] <= now):
         raise _error("sso_operation_actor_retired", 403)
 
 
@@ -167,11 +168,12 @@ async def propose(spec: dict[str, Any], *, actor) -> dict[str, Any]:
                     "requested_by": str(user_id), "requested_token_id": str(token_id),
                     "claim": claim, "grant": grant}
         digest = ops._digest(document)
+        await _live_requester(conn, user_id, token_id)
         now = await conn.fetchval("SELECT clock_timestamp()")
         await conn.execute("""INSERT INTO sso_operation_requests
             (request_id,kind,request,request_sha256,target_id,provider_alias,requested_by,requested_token_id,
-             operation_id,ttl_seconds,created_at,expires_at)
-            VALUES($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10,$11,$12)""",
+             operation_id,ttl_seconds,created_at,expires_at,requester_scope)
+            VALUES($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10,$11,$12,'sso_operation_requests')""",
             request_id, kind, ops._json(document), digest, target.target_id, alias, user_id, token_id,
             uuid.UUID(grant["operation_id"]) if grant else None, grant["ttl_seconds"] if grant else None,
             now, now + timedelta(seconds=PENDING_SECONDS))
@@ -190,8 +192,11 @@ async def list_requests(*, actor) -> dict[str, Any]:
     order = (" ORDER BY CASE r.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,"
              " r.created_at DESC, r.request_id LIMIT $1")
     if getattr(actor, "account_kind", "human") == "service":
-        rows = await pool.fetch(_SELECT + " WHERE r.requested_token_id=$2 AND r.requested_by=$3" + order,
-                                LIST_LIMIT, uuid.UUID(str(actor.token_id)), uuid.UUID(str(actor.user_id)))
+        user_id, token_id = _service_identity(actor)
+        async with pool.acquire() as conn, conn.transaction():
+            await _live_requester(conn, user_id, token_id)
+            rows = await conn.fetch(_SELECT + " WHERE r.requested_token_id=$2 AND r.requested_by=$3" + order,
+                                    LIST_LIMIT, token_id, user_id)
     else:
         rows = await pool.fetch(_SELECT + order, LIST_LIMIT)
     return {"schema_version": 1, "requests": [view(row) for row in rows]}
@@ -200,12 +205,16 @@ async def list_requests(*, actor) -> dict[str, Any]:
 async def read(request_id: uuid.UUID, *, actor) -> dict[str, Any]:
     pool = await get_pool()
     await _expire_due(pool)
-    row = await pool.fetchrow(_SELECT + " WHERE r.request_id=$1", request_id)
-    if row is None:
-        raise _error("sso_operation_request_not_found", 404)
-    if getattr(actor, "account_kind", "human") == "service" and not _is_requester(row, actor):
-        raise _error("sso_operation_request_scope_forbidden", 403)
-    return view(row)
+    async with pool.acquire() as conn, conn.transaction():
+        if getattr(actor, "account_kind", "human") == "service":
+            user_id, token_id = _service_identity(actor)
+            await _live_requester(conn, user_id, token_id)
+        row = await conn.fetchrow(_SELECT + " WHERE r.request_id=$1", request_id)
+        if row is None:
+            raise _error("sso_operation_request_not_found", 404)
+        if getattr(actor, "account_kind", "human") == "service" and not _is_requester(row, actor):
+            raise _error("sso_operation_request_scope_forbidden", 403)
+        return view(row)
 
 
 async def _locked(conn, request_id: uuid.UUID):
@@ -234,6 +243,8 @@ async def _decide(request_id: uuid.UUID, *, expected_request_sha256: str, human_
                                           expected_revision=claim["expected_revision"],
                                           expected_fingerprint=claim["expected_fingerprint"],
                                           clear_emergency=False, actor_id=human_id, target_id=row["target_id"])
+        if approve:
+            await _live_requester(conn, row["requested_by"], row["requested_token_id"])
         now = await conn.fetchval("SELECT clock_timestamp()")
         grant = approve and row["kind"] == "provider_grant"
         await conn.execute("""UPDATE sso_operation_requests SET status=$2,decided_by=$3,decided_at=$4::timestamptz,
@@ -266,6 +277,7 @@ async def cancel(request_id: uuid.UUID, *, actor) -> dict[str, Any]:
     await _expire_due(pool)
     async with pool.acquire() as conn, conn.transaction():
         row = await _locked(conn, request_id)
+        await _live_requester(conn, uuid.UUID(str(actor.user_id)), uuid.UUID(str(actor.token_id)))
         if not _is_requester(row, actor):
             raise _error("sso_operation_request_scope_forbidden", 403)
         if row["status"] not in {"pending", "approved"} or (row["status"] == "approved" and row["kind"] != "provider_grant"):
@@ -284,6 +296,7 @@ async def collect(request_id: uuid.UUID, *, actor) -> dict[str, Any]:
     await _expire_due(pool)
     async with pool.acquire() as conn, conn.transaction():
         row = await _locked(conn, request_id)
+        await _live_requester(conn, uuid.UUID(str(actor.user_id)), uuid.UUID(str(actor.token_id)))
         if not _is_requester(row, actor):
             raise _error("sso_operation_request_scope_forbidden", 403)
         if row["kind"] != "provider_grant":
@@ -306,9 +319,11 @@ async def collect(request_id: uuid.UUID, *, actor) -> dict[str, Any]:
                 "verbs": terms["verbs"], "cohort": [], "provider_payload_sha256": terms["provider_payload_sha256"],
                 "provider_secret_revision": terms["provider_secret_revision"]}
         issued = await ops.grant_in(conn, spec, granted_by=row["decided_by"], expires_at=row["operation_expires_at"],
-                                    expected_target_id=row["target_id"], configure_summary=terms["configure_summary"])
+                                    expected_target_id=row["target_id"], configure_summary=terms["configure_summary"],
+                                    approval_request_id=row["request_id"])
         sealed = sealing.seal(issued.pop("credential"), terms["recipient_public_key"],
                               request_id=str(request_id), request_sha256=row["request_sha256"])
+        await _live_requester(conn, row["requested_by"], row["requested_token_id"])
         await conn.execute("UPDATE sso_operation_requests SET status='collected',closed_at=clock_timestamp() WHERE request_id=$1",
                            request_id)
         await emit_event(conn, "auth.sso_operation_request_credential_issued", actor_id=str(row["requested_by"]),

@@ -1297,3 +1297,15 @@ CREATE INDEX IF NOT EXISTS sso_operation_requests_token
 -- configure verb requires every non-secret payload field to equal it. Direct
 -- grants leave it null and keep their existing behavior.
 ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS provider_configure_summary JSONB;
+
+-- Permanent, non-secret lineage survives account or token deletion.
+CREATE TABLE IF NOT EXISTS approval_service_bootstrap (
+    token_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL,
+    installation_id UUID NOT NULL,
+    credential_sha256 TEXT NOT NULL CHECK (credential_sha256 ~ '^[a-f0-9]{64}$'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+-- NULL identifies requests written before dedicated requester keys existed.
+ALTER TABLE sso_operation_requests ADD COLUMN IF NOT EXISTS requester_scope TEXT;

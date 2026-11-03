@@ -271,14 +271,25 @@ async def provider_credentials_guard(alias: str, actor, *, expected_fingerprint:
         yield ProviderCredentialsGuard(check=check, complete=complete)
 
 
-async def _live_actor(conn, row):
+async def _live_actor(conn, row, *, approval_request_id=None):
     # Locks serialize token revocation and human demotion with the mutation.
     machine = await conn.fetchrow("""SELECT t.id,t.expires_at FROM tokens t JOIN users u ON u.id=t.user_id
         WHERE t.id=$1 AND t.user_id=$2 AND t.key_class='service'
-        AND t.scopes @> ARRAY['read','write','admin']::text[]
         AND (t.expires_at IS NULL OR t.expires_at>clock_timestamp())
-        AND u.account_status='active' AND u.account_kind='service' AND u.is_admin
-        FOR SHARE OF t,u""", row["actor_token_id"], row["actor_id"])
+        AND u.account_status='active' AND u.account_kind='service'
+        AND (
+            (u.is_admin AND t.scopes @> ARRAY['read','write','admin']::text[]
+                AND NOT EXISTS (SELECT 1 FROM sso_operation_requests r
+                    WHERE r.operation_id=$3 AND r.requester_scope='sso_operation_requests'))
+            OR (NOT u.is_admin AND t.vault_scope IS NULL
+                AND t.scopes = ARRAY['sso_operation_requests']::text[]
+                AND EXISTS (SELECT 1 FROM sso_operation_requests r
+                    WHERE r.operation_id=$3 AND r.requested_by=u.id AND r.requested_token_id=t.id
+                      AND r.requester_scope='sso_operation_requests'
+                      AND (r.status='collected' OR (r.status='approved' AND r.request_id=$4))))
+        )
+        FOR SHARE OF t,u""", row["actor_token_id"], row["actor_id"],
+        row.get("parent_operation_id") or row["operation_id"], approval_request_id)
     human = await conn.fetchrow("""SELECT id FROM users WHERE id=$1 AND is_admin
         AND account_status='active' AND account_kind='human' FOR SHARE""",
         row["granted_by"])
@@ -320,7 +331,8 @@ def _validate_scope(spec: dict[str, Any]) -> None:
 
 async def grant_in(conn, spec: dict[str, Any], *, granted_by: uuid.UUID, expires_at: datetime | None = None,
                    expected_target_id: uuid.UUID | None = None,
-                   configure_summary: dict[str, Any] | None = None) -> dict[str, Any]:
+                   configure_summary: dict[str, Any] | None = None,
+                   approval_request_id: uuid.UUID | None = None) -> dict[str, Any]:
     """Every grant check and the operation row, on the caller's transaction.
 
     The direct human grant calls it with no keyword. A collected operation
@@ -379,8 +391,9 @@ async def grant_in(conn, spec: dict[str, Any], *, granted_by: uuid.UUID, expires
     installation = await conn.fetchval("SELECT installation_id FROM sso_operation_installation WHERE singleton")
     if spec["installation_id"] != installation:
         raise _error("sso_operation_installation_conflict")
-    row = {"actor_id": spec["actor_id"], "actor_token_id": spec["actor_token_id"], "granted_by": granted_by}
-    await _live_actor(conn, row)
+    row = {"operation_id": spec["operation_id"], "actor_id": spec["actor_id"],
+           "actor_token_id": spec["actor_token_id"], "granted_by": granted_by}
+    await _live_actor(conn, row, approval_request_id=approval_request_id)
     # Grant only cohorts that already possess the exact upstream binding.
     # No email lookup, no local-account conversion, no new user creation.
     for item in cohort:
@@ -667,6 +680,21 @@ async def _postcheck(conn, row, target):
         _digest(sorted(linked)) if prepared else None, row["parent_operation_id"])
 
 
+async def _require_request_origin(conn, row, actor):
+    """Bind the dedicated requester to a collected request for this operation."""
+    if (str(actor.user_id) != str(row["actor_id"]) or str(actor.token_id) != str(row["actor_token_id"])
+            or actor.account_kind != "service"):
+        raise _error("sso_operation_scope_forbidden", 403)
+    from app.sso.operation_requests import _live_requester
+    await _live_requester(conn, row["actor_id"], row["actor_token_id"])
+    exists = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM sso_operation_requests
+        WHERE operation_id=$1 AND requested_by=$2 AND requested_token_id=$3
+          AND requester_scope='sso_operation_requests' AND status='collected')""",
+        row["parent_operation_id"] or row["operation_id"], row["actor_id"], row["actor_token_id"])
+    if not exists:
+        raise _error("sso_operation_scope_forbidden", 403)
+
+
 async def status(operation_id: uuid.UUID, *, credential: str | None = None, actor=None) -> dict[str, Any]:
     pool = await get_pool()
     async with pool.acquire() as conn, conn.transaction():
@@ -676,8 +704,13 @@ async def status(operation_id: uuid.UUID, *, credential: str | None = None, acto
             row = await conn.fetchrow("SELECT * FROM sso_identity_operations WHERE operation_id=$1", operation_id)
             if row is None:
                 raise _error("sso_operation_not_found", 404)
-        if actor is not None and (str(actor.user_id) != str(row["actor_id"]) or str(actor.token_id) != str(row["actor_token_id"]) or actor.account_kind != "service"):
-            raise _error("sso_operation_scope_forbidden", 403)
+        if actor is not None:
+            from app.sso.operation_request_scope import SSO_OPERATION_REQUEST_SCOPES
+            if getattr(actor, "token_scopes", None) == SSO_OPERATION_REQUEST_SCOPES:
+                await _require_request_origin(conn, row, actor)
+            elif (str(actor.user_id) != str(row["actor_id"]) or str(actor.token_id) != str(row["actor_token_id"])
+                  or actor.account_kind != "service"):
+                raise _error("sso_operation_scope_forbidden", 403)
         values = {key: row[key] for key in ("operation_id", "provider_alias", "cohort_sha256", "expires_at", "retired_at", "verbs",
                   "target_id", "phase", "prepared_identity_ids_hash", "existing_identity_ids_hash", "parent_operation_id", "authority_attempt")}
         from app.sso.operation_attempts import intent_hash
@@ -712,7 +745,8 @@ async def status(operation_id: uuid.UUID, *, credential: str | None = None, acto
                 if isinstance(value, uuid.UUID) else value) for key, value in values.items()}}
 
 
-async def retire(operation_id: uuid.UUID, *, actor_id: uuid.UUID | None = None, credential: str | None = None) -> dict[str, Any]:
+async def retire(operation_id: uuid.UUID, *, actor_id: uuid.UUID | None = None,
+                 credential: str | None = None, actor=None) -> dict[str, Any]:
     pool = await get_pool()
     async with pool.acquire() as conn, conn.transaction():
         if credential is not None:
@@ -722,6 +756,9 @@ async def retire(operation_id: uuid.UUID, *, actor_id: uuid.UUID | None = None, 
             row = await _lock_operation(conn, operation_id)
             if row is None:
                 raise _error("sso_operation_not_found", 404)
+            if actor is not None:
+                await _require_request_origin(conn, row, actor)
+                actor_id = row["actor_id"]
         root_id = row["parent_operation_id"] or row["operation_id"]
         await conn.execute("""UPDATE sso_identity_operations SET retired_at=COALESCE(retired_at,NOW()),phase='retired',lineage_closed_at=COALESCE(lineage_closed_at,NOW())
             WHERE operation_id=$1 OR parent_operation_id=$1""", root_id)
