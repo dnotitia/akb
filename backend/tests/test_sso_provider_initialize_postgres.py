@@ -18,9 +18,10 @@ from app.sso.models import ProviderMutationReadback
 from app.sso.runtime_identity import BASE_CAPABILITIES
 from tests.test_admin_sso_routes_unit import _provider
 from tests.test_sso_identity_operations_postgres import OLD, review_http_client, review_human_cookies
+from tests.test_sso_provider_client_credentials_postgres import standalone as standalone_fixture
 
 
-pytest_plugins = ("tests.test_sso_provider_client_credentials_postgres",)
+standalone = standalone_fixture
 pytestmark = pytest.mark.asyncio
 _PATH = "/api/v1/admin/sso/providers/workforce/initialize"
 _SECRET = "initial-fixture-secret-never-returned"  # pragma: allowlist secret
