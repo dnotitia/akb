@@ -68,8 +68,18 @@ for (const width of [375, 1920]) for (const dark of [false, true]) for (const [r
     await expect(page.getByRole("navigation", { name: "Vault sections", exact: true })).toHaveCount(0);
     await expect(page.getByRole("separator", { name: "Resize tree panel", exact: true })).toHaveCount(0);
     if (route === "settings") {
-      for (const region of ["Vault details", "Access permissions", "Vault guide", "Danger zone"]) await expect(page.getByRole("region", { name: region, exact: true })).toBeVisible();
-      await expect(page.getByRole("tablist")).toHaveCount(0);
+      const settingsTabs = page.getByRole("tablist", { name: "Vault settings sections", exact: true });
+      for (const [tab, region] of [
+        ["Vault details", "Vault details"],
+        ["Access permissions", "Access permissions"],
+        ["Vault guide", "Vault guide"],
+        ["Lifecycle actions", "Danger zone"],
+      ]) {
+        await settingsTabs.getByRole("tab", { name: tab, exact: true }).click();
+        const panel = page.getByRole("tabpanel", { name: tab, exact: true });
+        await expect(panel.getByRole("region", { name: region, exact: true })).toBeVisible();
+        await expect(page.getByRole("tabpanel")).toHaveCount(1);
+      }
       await expect(page.getByRole("complementary", { name: "Vault details" })).toHaveCount(0);
     } else if (route === "members") await expect(page.getByRole("table", { name: "Vault members" })).toBeVisible();
     else if (route === "publications") await expect(page.getByText("Nothing published yet", { exact: true })).toBeVisible();
@@ -132,6 +142,9 @@ for (const width of [375, 1920]) for (const dark of [false, true]) for (const [r
     await expect(page).toHaveURL(/\/vault\/fixture$/);
     await expect(trail.locator('[aria-current="page"]')).toHaveText("fixture");
     // Overview owns scoped task discovery after removing the duplicate menu.
+    if (route === "activity") {
+      await page.getByRole("button", { name: "Show version history", exact: true }).click();
+    }
     const destination = route === "activity"
       ? page.getByRole("link", { name: "Full commit log", exact: true })
       : page.getByRole("navigation", { name: "Vault pages", exact: true }).getByRole("link", { name: label, exact: true });
@@ -196,7 +209,7 @@ for (const width of [375, 1920]) test(`Vault directory keeps a populated navigat
   await page.setViewportSize({ width, height: 1000 });
   await fixture(page);
   await page.goto("/vault");
-  await expect(page.getByRole("heading", { name: "Vaults", exact: true, level: 1 })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Your vaults", exact: true, level: 1 })).toBeVisible();
   const directory = page.getByRole("list", { name: "Available vaults", exact: true });
   await expect(directory.getByRole("link")).toHaveAttribute("href", "/vault/fixture");
   const panel = page.locator("#vault-workspace-navigation");

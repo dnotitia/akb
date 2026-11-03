@@ -30,7 +30,7 @@ Expiry = Literal["any", "none", "soon", "long-running"]
 
 def _pack(payload: dict) -> str:
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-    signature = hmac.new(settings.system_hmac_secret_effective.encode(), raw, hashlib.sha256).digest()
+    signature = hmac.new(settings.system_hmac_secret.encode(), raw, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(raw + signature).decode().rstrip("=")
 
 
@@ -40,7 +40,7 @@ def _unpack(cursor: str, binding: str) -> dict:
             raise ValueError
         data = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
         raw, supplied = data[:-32], data[-32:]
-        expected = hmac.new(settings.system_hmac_secret_effective.encode(), raw, hashlib.sha256).digest()
+        expected = hmac.new(settings.system_hmac_secret.encode(), raw, hashlib.sha256).digest()
         if not hmac.compare_digest(expected, supplied):
             raise ValueError
         value = json.loads(raw)
