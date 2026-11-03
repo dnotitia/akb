@@ -147,6 +147,27 @@ itAsync("records concurrent calls as whole lines, one per call", async () => {
 
 // ── failures are measured too ────────────────────────────────────
 
+itAsync("records one unknown write outcome without logging its arguments", async () => {
+  await withLogPath(async (path) => {
+    const proxy = backedBy("unused");
+    let dispatches = 0;
+    proxy._backendReady = true;
+    proxy._startBackendMonitor = () => {};
+    proxy._rpc = async () => { dispatches += 1; throw new Error("ECONNRESET"); };
+    const response = await proxy._handle({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "akb_put", arguments: { content: "private-write-body" } },
+    });
+    assert.equal(dispatches, 1);
+    const records = await readLines(path);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].error, true);
+    assert.equal(records[0].result_bytes, Buffer.byteLength(JSON.stringify(response.result), "utf8"));
+    assert.equal(JSON.parse(response.result.content[0].text).details.operation_outcome, "unknown");
+    assert.ok(!(await readFile(path, "utf8")).includes("private-write-body"));
+  });
+});
+
 itAsync("records document validation and file read failures once without arguments", async () => {
   await withLogPath(async (path) => {
     const canary = "private-document-input";
