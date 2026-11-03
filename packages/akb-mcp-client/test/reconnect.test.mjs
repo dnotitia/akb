@@ -313,7 +313,7 @@ itAsync("vault-guide acknowledgement never authorizes an unrelated queued write"
 
 // ── _forward never kills the process; it recovers or surfaces an error ─
 
-itAsync("_forward retries a connection error then surfaces it (process survives)", async () => {
+itAsync("_forward retries a read then reports the unknown result (process survives)", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {}; // observe restart without spinning a loop
   let restarts = 0;
@@ -323,16 +323,22 @@ itAsync("_forward retries a connection error then surfaces it (process survives)
     origNoop();
   };
   proxy._backendReady = true;
+  proxy._ensureBackend = async () => {
+    proxy._backendReady = true;
+    return true;
+  };
   let calls = 0;
   proxy._rpc = async () => {
     calls++;
     throw new Error("ECONNRESET");
   };
 
-  await assert.rejects(() => proxy._forward({ method: "tools/call", id: 5, params: {} }));
+  const response = await proxy._forward({ method: "tools/call", id: 5, params: { name: "akb_search" } });
+  assert.equal(response.result.isError, true);
+  assert.equal(JSON.parse(response.result.content[0].text).details.operation_outcome, "unknown");
   assert.equal(proxy._backendReady, false, "marks backend not-ready");
   assert.ok(restarts >= 1, "kicks the reconnect monitor");
-  assert.ok(calls >= 3, "attempted the initial call plus retries");
+  assert.equal(calls, 3, "attempted the initial read plus two retries");
 });
 
 itAsync("_forward recovers on a later attempt once the backend returns", async () => {
@@ -350,7 +356,7 @@ itAsync("_forward recovers on a later attempt once the backend returns", async (
     return true;
   };
 
-  const res = await proxy._forward({ method: "tools/call", id: 7, params: {} });
+  const res = await proxy._forward({ method: "tools/call", id: 7, params: { name: "akb_search" } });
   assert.equal(res.result.ok, true, "second attempt succeeds");
   assert.equal(calls, 2);
 });
