@@ -5,9 +5,11 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import importlib.util
 import json
+import os
 from pathlib import Path
 import uuid
 
+import asyncpg
 import pytest
 
 
@@ -194,3 +196,72 @@ def test_receipt_provenance_requires_explicit_runtime_identity(monkeypatch):
     }
     assert environment["tier"] == "E0"
     assert environment["storage_profile"]["authority"] == "postgresql-native-ledger"
+
+
+DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")  # pragma: allowlist secret
+
+
+@asynccontextmanager
+async def _fresh_measurement_database(label: str):
+    """Yield the DSN of a new, empty database the measurement-name gate admits."""
+    try:
+        admin = await asyncpg.connect(DSN, timeout=2)
+    except (OSError, asyncpg.PostgresError):
+        if os.environ.get("REQUIRE_REAL_PG") == "1":
+            pytest.fail("REQUIRE_REAL_PG=1 but Postgres is not reachable for the M1 adapter schema test")
+        pytest.skip("Postgres is not reachable for the M1 adapter schema test")
+    base, _ = DSN.rsplit("/", 1)
+    name = f"akb_revision_m1_measurement_{label}_{uuid.uuid4().hex[:10]}"
+    try:
+        await admin.execute(f'CREATE DATABASE "{name}"')
+        try:
+            yield f"{base}/{name}"
+        finally:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    finally:
+        await admin.close()
+
+
+# The native writer these adapters drive reaches tables that migrations after
+# the adapters were written add: creating a document syncs its inline-image
+# references into ``document_asset_refs.native_document_id``. Each test builds
+# a fresh database with the adapter's own setup and runs one real workload, so
+# a setup that cannot carry the writer fails here rather than on a measurement.
+
+
+@pytest.mark.asyncio
+async def test_adapter_setup_carries_its_native_write_workload():
+    adapter = _load_adapter()
+    async with _fresh_measurement_database("adapter") as dsn:
+        pool, namespace_id, database = await adapter.initialise_measurement_database(dsn)
+        try:
+            assert dsn.endswith(f"/{database}")
+            cases = await adapter.workload_independent(adapter.NativeRevisionService(pool), namespace_id, [])
+        finally:
+            await pool.close()
+
+    assert cases["C4"]["independent"]["published"] == ["independent-a", "independent-b"]
+    assert cases["C4"]["independent"]["overlap_observed"] is True
+
+
+@pytest.mark.asyncio
+async def test_text_grep_adapter_setup_carries_its_document_grep_workload():
+    adapter = _load_script("native_revision_m1_text_grep_adapter", _TEXT_GREP_SCRIPT)
+    async with _fresh_measurement_database("text_grep") as dsn:
+        pool, database, owner_id, _denied_id, reader_id, allowed_vault, denied_vault = await adapter.initialise(dsn)
+        try:
+            assert dsn.endswith(f"/{database}")
+            store = adapter.M1PgBodyStore(pool)
+            cases, requests, _latencies = await adapter._document_workload(
+                adapter.NativeRevisionService(pool, payload_store=store),
+                adapter.M1NativeGrepService(pool, body_store=store),
+                owner_id,
+                reader_id,
+                allowed_vault,
+                denied_vault,
+            )
+        finally:
+            await pool.close()
+
+    assert len(requests) == 4
+    assert [name for name, passed in cases["assertions"].items() if not passed] == []

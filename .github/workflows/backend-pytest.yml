@@ -288,6 +288,7 @@ jobs:
             tests/test_migration_107_native_asset_refs_pg.py
             tests/test_boot_schema_serialization_pg.py
             tests/test_boot_schema_writer_retry_pg.py
+            tests/test_native_revision_m1_adapter_unit.py
             tests/test_role_membership_delta_pg.py
             tests/test_role_sync.py
             # Grant contributions are claims about surviving rows and real
