@@ -502,5 +502,96 @@ async def test_shared_tool_core_audits_generation_revision_and_auth_method(monke
     ]
 
 
+@pytest.mark.asyncio
+async def test_a_modern_listen_request_is_answered_as_an_unserved_method(monkeypatch, tmp_path):
+    """`subscriptions/listen` gets the SDK's explicit refusal, never an empty 500.
+
+    The SDK answers listen on its streaming branch even in JSON-response mode,
+    and that branch watches the request's receive channel for the client
+    leaving. The adapter used to report a disconnect as soon as it had replayed
+    the body, so the SDK cancelled the request before answering and the ASGI
+    server substituted a bare 500. AKB serves no listen stream and advertises
+    `tools.listChanged: false`, so method-not-found is the protocol's answer.
+    """
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    alice = _user("alice")
+    monkeypatch.setattr(http_app, "resolve_mcp_authorization", lambda _header: _resolved(alice))
+
+    app = MCPApp()
+
+    async def must_answer(scope, receive, send):
+        started = False
+
+        async def tracking_send(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        await app(scope, receive, tracking_send)
+        assert started, "MCPApp returned without starting a response"
+
+    async with app.run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=must_answer), base_url="http://test"
+        ) as client:
+            meta = _modern_meta()
+            discover = await _post(
+                client,
+                {"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": meta}},
+                **{"mcp-protocol-version": "2026-07-28", "mcp-method": "server/discover"},
+            )
+            assert discover.status_code == 200
+            assert discover.json()["result"]["capabilities"]["tools"] == {"listChanged": False}
+
+            listen = await _post(
+                client,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "subscriptions/listen",
+                    "params": {"_meta": meta, "notifications": {"toolsListChanged": True}},
+                },
+                # A listen response is a stream, so the SDK requires the SSE
+                # accept for this method even in JSON-response mode.
+                accept="application/json, text/event-stream",
+                **{"mcp-protocol-version": "2026-07-28", "mcp-method": "subscriptions/listen"},
+            )
+
+    assert listen.status_code == 404
+    assert listen.headers["content-type"] == "application/json"
+    payload = listen.json()
+    assert payload["id"] == 3
+    assert "result" not in payload
+    assert payload["error"]["code"] == -32601
+    assert payload["error"]["data"] == "subscriptions/listen"
+
+
+@pytest.mark.asyncio
+async def test_replayed_body_leaves_every_later_read_to_the_client_connection():
+    """After the one replayed body, receive answers what the connection answers.
+
+    A connected client's receive blocks until something happens; only a client
+    that has really gone reports `http.disconnect`. The replay must not decide
+    that on the connection's behalf.
+    """
+    body = b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+    connection_answer = {"type": "http.disconnect"}
+    reads = 0
+
+    async def client_receive():
+        nonlocal reads
+        reads += 1
+        return connection_answer
+
+    receive = http_app._replay_body(body, client_receive)
+
+    assert await receive() == {"type": "http.request", "body": body, "more_body": False}
+    assert reads == 0
+    assert await receive() is connection_answer
+    assert await receive() is connection_answer
+    assert reads == 2
+
+
 async def _resolved(user: AuthenticatedUser) -> AuthenticatedUser:
     return user

@@ -123,6 +123,14 @@ specifically; the proxy has its own log in
   OpenAPI response contract. Declared enum values, table data, constraints,
   and drift reporting are unchanged.
 
+- A 2026-07-28 MCP client that sends `subscriptions/listen` now gets JSON-RPC
+  `-32601 Method not found` with HTTP 404 instead of an empty HTTP 500. The
+  MCP endpoint replays the request body it has already read, and used to
+  report a client disconnect on the next read; the SDK's listen path watches
+  for that and cancelled the request before answering. Later reads now go to
+  the client's connection. AKB still serves no notification stream, and
+  `server/discover` still advertises `tools.listChanged: false`.
+
 ### Documents
 
 - **Breaking:** whole-body document updates, including empty bodies and proxy
