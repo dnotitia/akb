@@ -16,8 +16,10 @@ becomes a second verifier, a public login choice or an OIDC credential issuer.
 All paths below are relative to `/api/v1`. The existing administrator service
 PAT can read `/admin/sso/operation-capabilities` and
 `/admin/sso/providers/{alias}/ownership`. It cannot grant or retire operations or
-assign ownership. Human calls use the product-admin session; mutations also
-require the matching `X-AKB-Admin-CSRF` cookie/header proof.
+assign ownership itself; it can ask a human to, through an
+[operation request](#operation-requests). Human calls use the product-admin
+session; mutations also require the matching `X-AKB-Admin-CSRF` cookie/header
+proof.
 
 Capabilities return `schema_version: 1`, the database-owned `installation_id`,
 `max_ttl_seconds: 600`, `max_nonce_age_seconds: 300` and these behavior names:
@@ -28,6 +30,8 @@ Capabilities return `schema_version: 1`, the database-owned `installation_id`,
 - `sso.preparation-target.v1`
 - `auth.callback-login-evidence.v1`
 - `sso.operation-attempts.v1`
+- `sso.provider-client-credentials.v1`
+- `sso.operation-requests.v1`
 
 `realm_identity` is `{realm_id, realm_name, issuer}` from an actual Admin REST
 read of the configured realm. Missing permission, delegated management and
@@ -51,8 +55,9 @@ an alias with:
 }
 ```
 
-Send this to `PUT /admin/sso/providers/{alias}/ownership`. Every successful
-change advances the revision. `owner_id: null` explicitly releases ownership.
+Send this to `PUT /admin/sso/providers/{alias}/ownership`, or let a controller
+propose it as an `ownership_claim` request. Every successful change advances
+the revision. `owner_id: null` explicitly releases ownership.
 Fingerprint and revision mismatches fail rather than adopting a stale read.
 Alias spelling must already be canonical: whitespace or other normalization
 changes are rejected before ownership lookup, locking or provider control.
@@ -61,11 +66,168 @@ A human can release its ownership with the live CAS values and repair it through
 the ordinary configuration API; new grants and execution remain blocked until
 the provider is valid.
 
-Ordinary configure and enable requests for an owned alias are forbidden. A
-human administrator may still disable it through the existing API. This records
-`emergency_disabled`, advances the revision and fences earlier grants. Clearing
-the emergency intent requires another explicit human CAS ownership request with
-`clear_emergency: true`; a controller cannot clear it.
+Ordinary configure, enable and client-credential requests for an owned alias
+are forbidden. A human administrator may still disable it through the existing
+API. This records `emergency_disabled`, advances the revision and fences earlier
+grants. Clearing the emergency intent requires another explicit human CAS
+ownership request with `clear_emergency: true`; a controller cannot clear it.
+
+`provider_secret_revision` is an opaque label for the configured client secret.
+A client-credential change of an unowned provider
+(`PUT /admin/sso/providers/{alias}/client-credentials`, see the SSO README)
+records it together with the new fingerprint and revision, creating an unowned
+row if none exists; that request is refused while the emergency latch is set.
+Enabling and disabling, a human emergency disable included, keep the label,
+because neither changes the secret, so after the latch is cleared the ownership
+read still names the configured secret version. An ordinary configure and a
+release of ownership clear it.
+
+## Operation requests
+
+A direct grant (next section) returns the raw operation credential to the
+administrator's browser, so an automation could only obtain a human's approval
+if the human copied a credential to it. An operation request removes that step:
+the automation proposes, a human approves the exact request in `/admin`, and
+only the token that asked collects the credential, once, sealed to a key it
+generated for that request. No response returned to a human contains a
+credential.
+
+`POST /admin/sso/operation-requests` accepts only an administrator service key
+(the same `read`, `write`, `admin` service PAT conjunction an operation actor
+must hold). The requesting user and token are taken from the calling token; the
+body cannot name them. Two kinds exist:
+
+```json
+{
+  "kind": "ownership_claim",
+  "provider_alias": "workforce",
+  "owner_id": "controller-installation-id",
+  "expected_revision": 0,
+  "expected_fingerprint": "<fingerprint from live ownership GET>"
+}
+```
+
+```json
+{
+  "kind": "provider_grant",
+  "operation_id": "<fresh UUID>",
+  "provider_alias": "workforce",
+  "owner_id": "controller-installation-id",
+  "expected_provider_revision": 1,
+  "verbs": ["configure", "enable"],
+  "provider_payload_sha256": {"configure": "<digest>", "enable": "<digest of {}>"},
+  "configure_summary": {
+    "provider_type": "keycloak-oidc",
+    "display_name": "Company SSO",
+    "issuer": "https://id.example.com/realms/workforce",
+    "discovery_url": "https://id.example.com/realms/workforce/.well-known/openid-configuration",
+    "client_id": "akb-broker",
+    "client_secret_supplied": true
+  },
+  "ttl_seconds": 600,
+  "provider_secret_revision": "<optional opaque label for this secret version>",
+  "recipient_public_key": "<raw 32-byte X25519 public key, unpadded base64url>"
+}
+```
+
+A claim always names an owner; releasing ownership stays a human decision. A
+grant carries only `configure`, `enable` and `disable`: no identity, cohort or
+login-evidence verb can be requested. `configure_summary` is required exactly
+when `configure` is requested and holds every configure field except the
+secret, plus whether a secret is supplied. Payload digests follow the direct
+grant's canonical JSON rule. An `operation_id` can be requested once.
+
+The response (`201`) is the request view: `request_id`, `request_sha256`,
+`request`, `status`, `created_at`, `expires_at`, `requester_username`,
+`decided_by`, `decider_username`, `decided_at`, `operation_expires_at` and
+`closed_at`. `request` is the complete immutable request document: the fields
+above, the database `installation_id`, the active `target_id`, the requesting
+`requested_by` and `requested_token_id`, and for a grant the active `source`
+tuple. `request_sha256` is the SHA-256 of that document's canonical JSON, so
+anyone can recompute it. A request nobody decides expires 3600 seconds after it
+was proposed.
+
+`GET /admin/sso/operation-requests` and `GET .../{request_id}` accept a human
+product-admin session, which sees every request, or the requesting service
+token, which sees only its own. Undecided requests are listed first, at most
+100 in all.
+
+`POST .../{request_id}/approve` and `POST .../{request_id}/deny` require a human
+product-admin session and the CSRF header, and the body
+`{"expected_request_sha256": "<digest the screen showed>"}`. A different digest,
+or a request that is no longer pending, is a `409` conflict, so a stale screen
+cannot decide anything it did not show. Approval also requires the requesting
+token to still be a live administrator service key.
+
+- Approving a claim runs the ownership compare-and-set above with the approving
+  human as the actor and `updated_by`, in the transaction that records the
+  approval. A revision or fingerprint that moved since the proposal is a `409`
+  and the request stays pending.
+- Approving a grant records the approval only and fixes
+  `operation_expires_at = decided_at + ttl_seconds`.
+
+`POST .../{request_id}/cancel` withdraws a pending request, or an approved grant
+not yet collected; only the requesting token can call it.
+
+`POST .../{request_id}/credential` collects an approved grant. Only the exact
+requesting token can call it, only once (a second call is `409`
+`sso_operation_request_already_collected`) and only before
+`operation_expires_at`; the response carries `Cache-Control: no-store`. At that
+moment every check of a direct grant runs again against the current state: the
+exact source tuple, the same target, owner, provider revision and fingerprint,
+no emergency latch, the installation, the live requesting token, and that the
+approving human is still an active administrator. Then AKB creates the
+operation row and its credential, exactly as a direct grant does, with
+`granted_by` set to the approving human and `expires_at` set to
+`operation_expires_at`, so the operation never outlives the human approval by
+more than its TTL. Only the credential hash is stored, and the request row keeps
+only the public key. The response:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "<UUID>",
+  "request_sha256": "<digest>",
+  "operation_id": "<UUID>",
+  "expires_at": "<operation expiry>",
+  "provider_revision": 1,
+  "sealed_credential": "<unpadded base64url>",
+  "seal": {
+    "mode": "base",
+    "suite": "DHKEM(X25519, HKDF-SHA256)/HKDF-SHA256/ChaCha20-Poly1305",
+    "info": "akb.sso.operation-request.credential.v1:<request_id>:<request_sha256>"
+  }
+}
+```
+
+The seal is HPKE (RFC 9180) base mode, single shot, with KEM `0x0020`, KDF
+`0x0001` and AEAD `0x0003`. `sealed_credential` is the 32-byte encapsulated key
+followed by the ciphertext, and `info` binds it to this request. Open it with
+the private key generated for this request, then use the credential exactly as
+a direct grant's credential. A stolen service key alone can at most collect a
+sealed credential it cannot open; the rightful requester then receives the
+`409` and can raise an alarm. A lost collection response requires a new
+request.
+
+For a `configure` verb from a request, execution additionally requires every
+payload field other than the secret, and whether a secret is supplied, to equal
+the approved `configure_summary` (`403 sso_operation_summary_conflict`). Direct
+grants carry no summary and are unchanged.
+
+Events, each without a credential, a sealed value or a secret:
+`auth.sso_operation_request_proposed`, `_approved`, `_denied`, `_cancelled`,
+`_expired` (once per request, recorded by the next request API call after its
+window passed) and `_credential_issued`.
+
+`/admin` shows, per provider, the owner, revision, emergency latch, drift and
+whether a secret revision is recorded; lists pending requests with the
+requesting service account, kind, alias, owner, verbs, summary, TTL and "secret
+held by the requester, not shown"; and binds approve and deny to the digest it
+displayed. It also releases ownership and clears the emergency latch, each a
+confirmed compare-and-set on the revision and fingerprint shown; the release
+confirmation states that releasing clears the recorded secret revision. An
+owned provider shows "Managed by an external owner" instead of the configure and
+enable controls; disable stays available.
 
 ## Issue an operation
 

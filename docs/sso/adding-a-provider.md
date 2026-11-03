@@ -32,9 +32,13 @@ Keycloak provider ID it renders, and these bounded operations:
    Never pass through an imported discovery response wholesale.
 3. Mark the representation with AKB's provider type and schema version.
 4. Toggle only `enabled` and `hideOnLogin` for activation changes.
-5. Read the representation back into `configured_disabled`, `enabled`, or
+5. Validate a replacement client ID and secret, and replace only `clientId`
+   and `clientSecret` in a stored representation, for an in-place credential
+   change of a possibly enabled provider. The masked-secret sentinel is never a
+   replacement secret.
+6. Read the representation back into `configured_disabled`, `enabled`, or
    `configuration_error` using an exact security profile.
-6. Produce separate admin, public, and audit views. None may contain a client
+7. Produce separate admin, public, and audit views. None may contain a client
    secret or Keycloak's masked-secret sentinel.
 
 Provider errors must use stable value-less codes. Do not include request
@@ -65,7 +69,8 @@ Contributions must cover:
 
 - accepted and rejected configuration boundaries;
 - exact rendered representation and ignored discovery fields;
-- secret creation, preservation, rotation, and redaction;
+- secret creation, preservation, rotation, and redaction, including an
+  in-place credential change that leaves every other field as read;
 - unmanaged alias collision;
 - disabled-before-reconfigure enforcement;
 - enable, disable, idempotency, and read-back drift;

@@ -53,20 +53,25 @@ test("Settings protects indexed browser Back and Forward, then replays each appr
   await expect(settings(page)).toHaveCount(0);
 });
 
-test("Guide draft protects a global sidebar link and approved leave does not ask twice", async ({ page }) => {
+test("Guide draft guards modal dismissal and approved leave does not ask twice", async ({ page }) => {
   await fixture(page);
   await page.goto("/vault/fixture/settings#skill");
   await page.getByRole("button", { name: "Edit guide", exact: true }).click();
-  await page.getByRole("textbox", { name: "Vault guide body" }).fill("Keep this guide draft");
-  await page.getByRole("link", { name: "AKB home — Agent Knowledgebase" }).click();
-  const prompt = page.getByRole("dialog", { name: "Discard unsaved settings changes?" });
+  const guide = page.getByRole("dialog", { name: "Document preview", exact: true });
+  const body = guide.getByRole("textbox", { name: "Vault guide body" });
+  const close = guide.getByRole("button", { name: "Close dialog", exact: true });
+  await body.fill("Keep this guide draft");
+  await close.click();
+  const prompt = page.getByRole("dialog", { name: "Leave this document?" });
   await expect(prompt).toBeVisible();
   await prompt.getByRole("button", { name: "Keep editing" }).click();
-  await expect(page.getByRole("textbox", { name: "Vault guide body" })).toHaveValue("Keep this guide draft");
-  await page.getByRole("link", { name: "AKB home — Agent Knowledgebase" }).click();
-  await prompt.getByRole("button", { name: "Discard changes and leave" }).click();
-  await expect(page).toHaveURL(/\/$/);
+  await expect(body).toContainText("Keep this guide draft");
+  await close.click();
+  await prompt.getByRole("button", { name: "Leave document" }).click();
+  await expect(page).toHaveURL(/\/vault\/fixture\/settings#skill$/);
   await expect(prompt).toHaveCount(0);
+  await page.getByRole("link", { name: "AKB home — Agent Knowledgebase" }).click();
+  await expect(page).toHaveURL(/\/$/);
 });
 
 test("Password form errors preserve the session and success explains its real revocation", async ({ page }) => {

@@ -20,6 +20,8 @@ the projection the handlers actually build.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict
 
 from app.sso.identity_migration import IdentityMigrationState
@@ -100,3 +102,42 @@ class SsoIdentityMigrationResponse(_AdminSsoModel):
     schema_version: int
     prelink: SsoIdentityPrelinkView
     migration: SsoIdentityMigrationView
+
+
+class SsoRealmArrivalView(_AdminSsoModel):
+    """A reference to a recorded arrival; the arrival itself is read from the
+    pending-admissions surface by this id."""
+
+    admission_id: str
+    last_seen_at: str
+
+
+class SsoRealmResidueAccountView(_AdminSsoModel):
+    """One realm account with no AKB binding. `arrival` is null for residue:
+    an account nothing in AKB refers to."""
+
+    realm_user_id: str
+    username: str
+    created_at: str | None
+    arrival: SsoRealmArrivalView | None
+
+
+class SsoRealmAccountResidueResponse(_AdminSsoModel):
+    """Realm accounts minus (exact bindings and recorded arrivals), read-only.
+
+    `state` is `unavailable` when the realm could not be read; every count and
+    the list are then null, never zero. When `truncated` is true the realm
+    holds more than `scan_limit` accounts and the counts describe only those
+    read. `accounts` is bounded and lists residue ahead of pending arrivals.
+    """
+
+    schema_version: int
+    state: Literal["available", "unavailable"]
+    unavailable_code: str | None
+    scan_limit: int
+    truncated: bool | None
+    realm_account_count: int | None
+    bound_count: int | None
+    pending_arrival_count: int | None
+    residue_count: int | None
+    accounts: list[SsoRealmResidueAccountView] | None

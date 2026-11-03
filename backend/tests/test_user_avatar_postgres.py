@@ -261,6 +261,7 @@ async def test_migration_is_idempotent_and_rejects_partial_or_nonreserved_storag
                                    uuid.UUID(user.user_id), uuid.uuid4(), key)
 
 
+@pytest.mark.needs_resource("an isolated S3-compatible store at AKB_TEST_AVATAR_S3_ENDPOINT")
 async def test_real_object_store_roundtrip_when_enabled(runtime, monkeypatch):
     endpoint = os.environ.get("AKB_TEST_AVATAR_S3_ENDPOINT")
     if not endpoint:

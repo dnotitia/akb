@@ -23,7 +23,7 @@ import bcrypt
 import jwt
 
 from app.services.role_authority import role_authority_transaction
-from app.config import AuthModeConfigurationError, settings
+from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import (
     AKBError,
@@ -742,12 +742,6 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
     its fresh-account JIT, whose collision branch adopts on authority
     instead of refusing when the domain is declared.
     """
-    if settings.keycloak_link_by_email:
-        # Keep the field readable for migration tooling, but make direct
-        # Settings construction as fail-closed as the canonical YAML loader.
-        raise AuthModeConfigurationError(
-            "keycloak_link_by_email=true is not a canonical runtime mode; email-based account adoption is disabled"
-        )
     issuer, subject = _external_identity_key(claims)
     if settings.keycloak_enrollment_mode == "disabled":
         raise ExternalAuthDisabledError()

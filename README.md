@@ -289,6 +289,18 @@ OKF and AKB are complementary — OKF standardizes *how knowledge is written
 down*; AKB stores, versions, searches, governs, and serves it to agents. See
 [`okf/`](okf/) for the mapping and a sample bundle.
 
+## Guides
+
+Task-oriented guides for teams evaluating or adopting an agent knowledge layer:
+
+- [Sharing one agent memory across Claude Code, Cursor, and other MCP clients](docs/guides/shared-agent-memory-across-mcp-clients.md)
+- [Evaluating retrieval claims for an agent knowledge layer](docs/guides/evaluating-retrieval-claims.md)
+- [Keeping document structure in retrieval: heading-aware chunks and section reads](docs/guides/structure-aware-chunking-and-section-reads.md)
+- [Self-hosting AKB: license terms, seat counting, and checks before you commit](docs/guides/self-hosting-license-and-seats.md)
+- [Applying permissions at query time when agents search shared knowledge](docs/guides/query-time-permissions-for-agent-search.md)
+- [Keeping a record of what coding agents decided](docs/guides/recording-coding-agent-decisions.md)
+- [Keeping search current when documents and embedding models change](docs/guides/keeping-embeddings-current.md)
+
 ## Quick Start
 
 New installations use **PostgreSQL Native** with a persisted installation identity
@@ -487,9 +499,12 @@ deployment issuer/audience, `jti`, and a public-only JWKS at
 boundary: generate and persist the v2 keyset before rollout, set
 `jwt_algorithm: RS256`, and restart all backends together. Existing HS256 user
 sessions then receive 401 and must sign in again; PATs and service keys are not
-revoked. The old `jwt_secret` may be retained for one release only as migration
-input for short-lived internal HMAC capabilities, or renamed unchanged to
-`system_hmac_secret`; it is never accepted as human-session signing material.
+revoked. Internal HMAC capabilities use `system_hmac_secret`. An old
+`jwt_secret` key now fails startup. If `system_hmac_secret` is already set,
+delete `jwt_secret` and keep `system_hmac_secret` as it is; otherwise rename
+`jwt_secret` to `system_hmac_secret` with the value unchanged. Either way the
+secret in effect stays the same, so links and cursors signed with it keep
+working.
 
 For routine v2 key rotation, generate a new directory while retaining the
 current public JWKS, publish the new immutable Secret/config revision, and

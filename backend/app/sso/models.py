@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal
 
 
@@ -106,3 +107,32 @@ class IdentityPrelinkReadback:
     broker_subject: str = field(repr=False)
     upstream_subject: str = field(repr=False)
     broker_username: str
+
+
+@dataclass(frozen=True, slots=True)
+class RealmAccount:
+    """One installation-realm account, as the read-only user listing returns it.
+
+    ``user_id`` is the realm's own identifier for the account, which is also
+    the ``sub`` this realm issues for it, so it is the subject half of an AKB
+    exact binding. ``created_at`` is ``None`` when the realm does not report a
+    creation time (a federated account can lack one); that is "unknown",
+    never "new".
+    """
+
+    user_id: str
+    username: str
+    created_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class RealmAccountListing:
+    """A bounded, point-in-time read of the realm's accounts.
+
+    ``truncated`` is true when the realm holds more accounts than the bound
+    allowed AKB to read; every count derived from the listing then describes
+    only the accounts that were read.
+    """
+
+    accounts: tuple[RealmAccount, ...]
+    truncated: bool

@@ -147,8 +147,9 @@ for (const width of [375, 1440]) for (const [suffix, label] of [
 });
 
 for (const width of [375, 1440]) for (const dark of [false, true]) {
-  test(`document header keeps reading tools and returns to Vault discovery at ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
+  test(`document header keeps reading tools and returns to Vault discovery at ${width}px ${dark ? "dark" : "light"}`, async ({ page, context }, testInfo) => {
     await page.setViewportSize({ width, height: 900 });
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
     await fixture(page, dark);
     await page.goto(documentUrl);
     const location = page.getByRole("navigation", { name: "Resource location", exact: true });
@@ -162,8 +163,10 @@ for (const width of [375, 1440]) for (const dark of [false, true]) {
     const controls = [
       tools.getByRole("radio", { name: "Preview", exact: true }),
       tools.getByRole("radio", { name: "Raw markdown", exact: true }),
+      tools.getByRole("button", { name: "Find in document", exact: true }),
+      tools.getByRole("button", { name: "Table of contents", exact: true }),
       tools.getByRole("button", { name: /^Show document references/ }),
-      tools.getByRole("button", { name: "Copy markdown", exact: true }),
+      ...(width >= 640 ? [tools.getByRole("button", { name: "Copy markdown", exact: true })] : []),
       tools.getByRole("button", { name: "Edit", exact: true }),
       tools.getByRole("button", { name: `Actions for ${title}`, exact: true }),
     ];
@@ -175,6 +178,10 @@ for (const width of [375, 1440]) for (const dark of [false, true]) {
       previousRight = box.x + box.width;
     }
     const detailsActions = tools.getByRole("button", { name: `Actions for ${title}`, exact: true });
+    await detailsActions.click();
+    await page.getByRole("menuitem", { name: "Copy markdown", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("# Reading context\n\nKeep decisions close to their source.");
+    await expect(detailsActions).toBeFocused();
     await detailsActions.click();
     await page.getByRole("menuitem", { name: "Document details", exact: true }).click();
     await expect(page.locator('[data-slot="document-context-panel"]')).toBeVisible();

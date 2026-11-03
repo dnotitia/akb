@@ -114,7 +114,7 @@ otherwise the labelled reference icon opens a sheet. The panel starts closed on
 entry and document-tab navigation. The icon shows the confirmed relation count,
 including zero; loading/error never implies a zero. Its visible word label is omitted;
 its accessible name, count description, tooltip and expanded state remain. The primary toolbar follows
-Preview/Raw → references + count → Copy → Edit → More. Edit is icon-only.
+Preview/Raw → Find → Contents → references + count → saved side document (when present) → Copy → Edit → More. Edit is icon-only.
 More has one Document details entry containing the outline and Properties,
 plus copy fallbacks and lifecycle actions; the document rail has no whole-graph exploration action.
 Author, update time and
@@ -130,6 +130,67 @@ insets; tab separators stop short of the bar edges. Metadata remains below the
 title and is never part of copied Markdown.
 Full-page Preview and Raw share a centered 42rem reading measure; route-backed
 search previews retain their existing 52rem measure.
+
+Find in document and Table of contents have direct icon buttons in the reader
+command row, with names, tooltips and expanded states. More owns Reading settings
+and less frequent document actions. Reader preferences offer compact/standard/wide
+measures, body text size, table fit and initially collapsed code. These
+non-content preferences persist locally; document search terms remain in memory.
+The find field has a persistent border and horizontal padding; its own focus
+ring identifies text entry without changing the surrounding row geometry.
+Rendered and Raw finding are separate text surfaces within the same
+document search, with bounded counts, next/previous navigation and focus return.
+Code language, line count, copy and fold controls live in a small block header;
+widgets and search highlights never become authored Markdown. Images offer a
+keyboard-accessible enlargement action with Fit, original size and zoom controls.
+The outline supports section-name filtering, ancestor context, hierarchy folding
+and section-link copying. Tab drag reordering has left/right move buttons in the
+open-document list; open and recently closed documents use separate list modes.
+Heading controls fold only their own section, keeping nested folds independent.
+Finding text or following an anchor opens the required ancestors before scrolling.
+Controls are measured outside authored prose; they never enter heading text or
+the serialized document. Preferences are shared across full readers, search and
+reference previews, Raw views, Guides and public documents.
+Footnote references have viewer-local identifiers, a keyboard/touch preview,
+definition navigation and individual return links. Definitions preserve their
+Markdown content through editing. Mermaid loads near the viewport, uses strict
+fixed configuration and AKB theme tokens, and retains copyable source on failure.
+Its diagram/source toggle and enlargement controls belong to the code-block bar.
+The tab manager is a labelled, anchored popover with a compact title, underline
+Open/Recently closed tabs and their counts, and one search field. Document rows
+prioritize title and path, with a check and Current label for the active document.
+Keep quick close visible; group side reading and order changes in a labelled
+row action menu. The footer offers reopening the last closed tab when available.
+Focus search on entry, support Up/Down between document targets, and return
+focus after dismissal or row removal. The list alone scrolls within available
+height; search and controls stay visible at narrow and short viewport sizes.
+The tab close glyph retains its background-free hover treatment and visible
+keyboard focus. Narrow/coarse-pointer targets retain the existing 44px treatment.
+
+Reading sessions persist per account on this browser: up to 30 open tabs, 20
+recently closed tabs, their order, version, Preview/Raw selection, independent
+reading positions and one side document. Store canonical document URIs and
+numeric view state, never titles, bodies or credentials. Revalidate identifiers
+against the current access proof before showing restored titles or content;
+background restoration uses at most four concurrent requests. Remove denied or
+missing documents and offer Retry for temporary failures. Logout clears saved
+reading sessions. Storage failure must leave ordinary reading usable.
+
+More → Read side by side, a preview's Keep side by side action, and the
+open-document list's side action share one persistent read-only companion pane.
+It survives primary-tab navigation; references and details temporarily cover it.
+At least 56rem of available workspace and 20rem of height are needed for two
+inline documents; otherwise the saved-side icon opens an explicit modal sheet.
+Restoring a session or shrinking the viewport never opens that sheet automatically.
+Each document keeps its own scroll position. The primary reading canvas stays
+mounted while the companion or its width changes.
+
+The context separator supports pointer drag, arrows (Shift accelerates),
+Home/End, Enter and double-click reset. Escape, pointer cancellation or blur
+rolls back an unfinished drag. The panel header's width menu provides a
+single-pointer alternative with compact presets or split proportions. Persist
+context width and split ratio as numeric preferences, clamped to actual space,
+with a 26rem primary and 22rem companion minimum for inline split reading.
 
 Unified with the **akb-platform family** (akb-platform + seahorse-mcp-agent-server):
 the Dnotitia palette, Pretendard typography, soft cool-gray surfaces, rounded

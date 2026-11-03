@@ -145,7 +145,10 @@ Ubuntu host bootstrap are documented in
   unreachable from `akb_user_*` roles by default.
   - Lifecycle (signup, vault create/delete, grant/revoke) emits the
     corresponding PG role DDL via `RoleSync`
-    (`backend/app/services/role_sync.py`). Hooks are best-effort;
+    (`backend/app/services/role_sync.py`). Grant, revoke and
+    ownership transfer apply it on the caller's connection inside
+    `role_authority_transaction`, so a failed projection rolls back
+    the catalog change. Post-commit hooks are best-effort, and
     the reconciler in `lifecycle.init_storage` rebuilds full role
     state from the catalog at startup (and on
     `POST /admin/reconcile-roles`).

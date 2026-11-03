@@ -9,9 +9,11 @@ response bodies in an error.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import time
 from typing import Any
 from urllib.parse import quote
@@ -29,6 +31,8 @@ from app.sso.models import (
     ProviderConfigureSpec,
     ProviderMutationReadback,
     ProviderReadback,
+    RealmAccount,
+    RealmAccountListing,
 )
 from app.sso.providers import keycloak_oidc
 from app.sso.providers.keycloak_oidc import ProviderDefinitionError
@@ -41,6 +45,9 @@ _CACHE_STALE_SECONDS = 60.0
 _FAILURE_BACKOFF_SECONDS = 5.0
 _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_SUBJECT_LENGTH = 1024
+_MAX_USERNAME_LENGTH = 255
+_REALM_ACCOUNT_PAGE_SIZE = 100
+_REALM_ACCOUNT_LIMIT_MAX = 10_000
 
 
 class ProviderControlError(RuntimeError):
@@ -49,6 +56,10 @@ class ProviderControlError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+# RFC 6750 b64token: what may follow "Bearer " in an Authorization header.
+_BEARER_TOKEN_RE = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 
 
 def _fail(code: str) -> ProviderControlError:
@@ -88,6 +99,41 @@ def _objects(value: object, *, code: str) -> list[dict[str, Any]]:
     return value
 
 
+def _bounded_text(value: object, *, max_length: int) -> str | None:
+    """Return ``value`` when it is a non-empty, printable, UTF-8 string."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > max_length
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value
+
+
+def _realm_account(value: dict[str, Any]) -> RealmAccount:
+    """Validate one brief user representation; refuse rather than repair it."""
+    user_id = _bounded_text(value.get("id"), max_length=_MAX_SUBJECT_LENGTH)
+    username = _bounded_text(value.get("username"), max_length=_MAX_USERNAME_LENGTH)
+    if user_id is None or username is None:
+        raise _fail("realm_accounts_invalid")
+    created = value.get("createdTimestamp")
+    if created is None:
+        return RealmAccount(user_id=user_id, username=username, created_at=None)
+    # Epoch milliseconds. ``bool`` is an ``int`` subclass and is refused too.
+    if type(created) is not int or created < 0:
+        raise _fail("realm_accounts_invalid")
+    try:
+        created_at = datetime.fromtimestamp(created / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        raise _fail("realm_accounts_invalid") from None
+    return RealmAccount(user_id=user_id, username=username, created_at=created_at)
+
+
 def _same_provider_configuration(
     before: ProviderReadback,
     after: ProviderReadback,
@@ -116,6 +162,19 @@ def _same_provider_configuration(
         after.supports_logout,
         after.supports_identity_migration,
     )
+
+
+def _without_client_credentials(representation: Mapping[str, object]) -> dict[str, object]:
+    """Return the raw representation minus the two fields a rotation changes."""
+    result = dict(representation)
+    config = result.get("config")
+    if isinstance(config, dict):
+        result["config"] = {
+            key: value
+            for key, value in config.items()
+            if key not in {"clientId", "clientSecret"}
+        }
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +312,12 @@ class KeycloakProviderControl:
         )
         token = body.get("access_token")
         if not isinstance(token, str) or not token or len(token) > 16_384:
+            raise _fail("keycloak_provider_token_invalid")
+        # The token goes into an Authorization header. Anything outside the
+        # RFC 6750 token alphabet would otherwise fail while the request is
+        # built, outside every ProviderControlError path, and reach callers as
+        # an unexpected exception instead of a value-less control failure.
+        if _BEARER_TOKEN_RE.fullmatch(token) is None:
             raise _fail("keycloak_provider_token_invalid")
         return token
 
@@ -702,6 +767,87 @@ class KeycloakProviderControl:
         self._catalog_error_at = 0.0
         return ProviderMutationReadback(before=current, after=readback)
 
+    async def set_client_credentials(
+        self,
+        alias: str,
+        *,
+        client_id: str,
+        client_secret: str,
+        precondition: Callable[[ProviderReadback], None] | None = None,
+    ) -> ProviderMutationReadback:
+        """Change only ``clientId`` and ``clientSecret`` of a managed provider.
+
+        The provider may be enabled: the stored representation is read, the
+        two credential fields are replaced and everything else is written back
+        as read. Discovery is not re-imported, so issuer, endpoints, enabled
+        and hidden state, mappers and flows stay as they are. ``precondition``
+        sees the exact current readback before any write and may refuse it.
+
+        A readback that differs anywhere but in the two credential fields, or
+        that no longer reports a configured secret, is an error. Nothing is
+        rolled back automatically: a person inspects the provider instead.
+        """
+        self._require_direct()
+        try:
+            validated_alias = keycloak_oidc.validate_alias(alias)
+            validated_id, validated_secret = keycloak_oidc.validate_client_credentials(
+                client_id,
+                client_secret,
+            )
+        except ProviderDefinitionError as exc:
+            raise _fail(exc.code) from exc
+        async with self._client() as client:
+            token = await self._token(client)
+            representation = await self._get_exact(client, token, validated_alias)
+            if representation is None:
+                raise _fail("provider_not_found")
+            definition = self._definition_for_representation(representation)
+            if definition is None:
+                raise _fail("provider_alias_conflict")
+            current = self._readback(definition, representation)
+            if current.state == "configuration_error":
+                raise _fail("provider_configuration_invalid")
+            if precondition is not None:
+                precondition(current)
+            # The provider may be enabled, so people can arrive through it the
+            # moment the new client works. Check the mark first, as enabling does.
+            await self._ensure_brokered_account_mark(client, token, validated_alias)
+            try:
+                desired = definition.module.with_client_credentials(
+                    representation,
+                    client_id=validated_id,
+                    client_secret=validated_secret,
+                )
+            except ProviderDefinitionError as exc:
+                raise _fail(exc.code) from exc
+            await self._request(
+                client,
+                "PUT",
+                f"{self._instances_path()}/{_path(validated_alias)}",
+                token=token,
+                json_body=desired,
+                expected=frozenset({204}),
+                code="keycloak_provider_credentials_update_failed",
+            )
+            stored = await self._get_exact(client, token, validated_alias)
+        if stored is None:
+            raise _fail("keycloak_provider_readback_failed")
+        readback = self._readback(definition, stored)
+        if (
+            _without_client_credentials(stored)
+            != _without_client_credentials(representation)
+            or readback.alias != validated_alias
+            or readback.client_id != validated_id
+            or not readback.client_secret_configured
+            or readback.state != current.state
+        ):
+            raise _fail("keycloak_provider_readback_failed")
+        self._catalog = None
+        self._catalog_at = 0.0
+        self._catalog_error_code = None
+        self._catalog_error_at = 0.0
+        return ProviderMutationReadback(before=current, after=readback)
+
     async def verify_identity_prelink(
         self,
         alias: str,
@@ -894,6 +1040,67 @@ class KeycloakProviderControl:
                     raise _fail("account_sync_user_invalid")
                 states[subject] = "active" if user["enabled"] else "disabled"
             return states
+
+    async def list_realm_accounts(self, *, limit: int) -> RealmAccountListing:
+        """Read at most ``limit`` accounts of this realm and say whether more exist.
+
+        This needs only the ``query-users``/``view-users`` roles the permanent
+        management client already holds: one client-credentials token, then
+        ``GET`` user listings in pages of brief representations. Nothing is
+        created, changed, or deleted, and no other user field leaves this
+        method. The realm's listing excludes service-account users.
+
+        The read is point-in-time. An account created or removed between two
+        pages can shift the next page, so an id seen twice is kept once, and a
+        read that runs out of its page budget reports itself truncated rather
+        than complete. A failed page returns no partial result.
+        """
+        self._require_direct()
+        if type(limit) is not int or not 1 <= limit <= _REALM_ACCOUNT_LIMIT_MAX:
+            raise _fail("realm_accounts_limit_invalid")
+        # One account past the bound proves truncation without reading on.
+        wanted = limit + 1
+        page_budget = wanted // _REALM_ACCOUNT_PAGE_SIZE + 3
+        accounts: dict[str, RealmAccount] = {}
+        exhausted = False
+        try:
+            async with asyncio.timeout(60), self._client() as client:
+                token = await self._token(client)
+                path = f"/admin/realms/{_path(self.config.realm)}/users"
+                first = 0
+                for _ in range(page_budget):
+                    size = min(_REALM_ACCOUNT_PAGE_SIZE, wanted - len(accounts))
+                    if size <= 0:
+                        break
+                    response = await self._request(
+                        client,
+                        "GET",
+                        path,
+                        token=token,
+                        expected=frozenset({200}),
+                        code="realm_accounts_unavailable",
+                        params={"briefRepresentation": "true", "first": first, "max": size},
+                    )
+                    page = _objects(
+                        self._json(response, code="realm_accounts_invalid"),
+                        code="realm_accounts_invalid",
+                    )
+                    if len(page) > size:
+                        raise _fail("realm_accounts_invalid")
+                    for item in page:
+                        account = _realm_account(item)
+                        accounts.setdefault(account.user_id, account)
+                    if len(page) < size:
+                        exhausted = True
+                        break
+                    first += len(page)
+        except TimeoutError:
+            raise _fail("realm_accounts_unavailable") from None
+        read = tuple(accounts.values())
+        return RealmAccountListing(
+            accounts=read[:limit],
+            truncated=len(read) > limit or (not exhausted and len(read) < wanted),
+        )
 
 
 def _runtime_config() -> KeycloakAdminConfig:

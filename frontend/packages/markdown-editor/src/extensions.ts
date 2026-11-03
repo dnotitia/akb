@@ -20,6 +20,7 @@ import TaskItem from '@tiptap/extension-task-item'
 import TaskList from '@tiptap/extension-task-list'
 import { common, createLowlight } from 'lowlight'
 import { createMarkdownParser } from './markdown-parser.js'
+import { MarkdownFootnoteDefinition, MarkdownFootnoteReference } from './footnotes.js'
 
 import type {
   MarkdownImageOptions,
@@ -844,6 +845,8 @@ export function createMarkdownExtensions({
     MarkdownLink.configure({ protocols: ['akb'] }),
     MarkdownReference,
     MarkdownImage.configure({ referrerPolicy: image?.referrerPolicy }),
+    MarkdownFootnoteDefinition,
+    MarkdownFootnoteReference,
     Table.configure({ resizable: false }),
     TableRow,
     TableHeader,

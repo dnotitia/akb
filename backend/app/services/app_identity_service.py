@@ -74,7 +74,7 @@ def _configured_app_secret() -> str:
             status_code=503,
             code="app_identity_unavailable",
         )
-    if secret == settings.system_hmac_secret_effective:
+    if secret == settings.system_hmac_secret:
         raise AKBError(
             "App token signing is not safely configured",
             status_code=503,

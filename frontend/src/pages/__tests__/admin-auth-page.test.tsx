@@ -8,8 +8,11 @@ import {
   adminLocalLogin,
   configureAdminSsoProvider,
   getAdminAuthConfig,
+  getAdminRealmAccountResidue,
   getAdminSession,
   getAdminSsoCatalog,
+  getAdminSsoOperationRequests,
+  getAdminSsoOwnership,
   setAdminSsoProviderEnabled,
   setToken,
 } from "@/lib/api";
@@ -25,6 +28,9 @@ vi.mock("@/lib/api", async () => {
     adminLocalLogin: vi.fn(),
     adminLogout: vi.fn(),
     getAdminSsoCatalog: vi.fn(),
+    getAdminRealmAccountResidue: vi.fn(),
+    getAdminSsoOwnership: vi.fn(),
+    getAdminSsoOperationRequests: vi.fn(),
     configureAdminSsoProvider: vi.fn(),
     setAdminSsoProviderEnabled: vi.fn(),
     setToken: vi.fn(),
@@ -98,7 +104,32 @@ function renderPage(initialEntry = "/admin") {
 
 beforeEach(() => {
   vi.mocked(getAdminSession).mockResolvedValue(null);
+  // An unowned provider and no operation request: the standalone defaults.
+  vi.mocked(getAdminSsoOwnership).mockImplementation(async (alias) => ({
+    schema_version: 1,
+    target_id: "00000000-0000-4000-8000-000000000001",
+    provider_alias: alias,
+    owner_id: null,
+    revision: 0,
+    fingerprint: "0".repeat(64),
+    provider_secret_revision: null,
+    drifted: false,
+    emergency_disabled: false,
+  }));
+  vi.mocked(getAdminSsoOperationRequests).mockResolvedValue([]);
   vi.mocked(getAdminSsoCatalog).mockResolvedValue(directCatalog);
+  vi.mocked(getAdminRealmAccountResidue).mockResolvedValue({
+    schema_version: 1,
+    state: "available",
+    unavailable_code: null,
+    scan_limit: 1000,
+    truncated: false,
+    realm_account_count: 3,
+    bound_count: 2,
+    pending_arrival_count: 0,
+    residue_count: 1,
+    accounts: [{ realm_user_id: "realm-user-1", username: "leftover", created_at: null, arrival: null }],
+  });
   vi.mocked(configureAdminSsoProvider).mockResolvedValue({
     ...provider,
     state: "configured_disabled",
@@ -159,6 +190,20 @@ describe("AdminPage mode boundary", () => {
     expect(await screen.findByLabelText("Username")).toBeInTheDocument();
     expect(screen.getByLabelText("Password")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /keycloak/i })).toBeNull();
+  });
+
+  it("does not read realm residue for a local product-admin session", async () => {
+    vi.mocked(getAdminAuthConfig).mockResolvedValue(localConfig);
+    vi.mocked(getAdminSession).mockResolvedValue({
+      schema_version: 1,
+      auth_mode: "local",
+      user: { id: "admin-local", username: "admin", email: "admin@example.com", display_name: "Admin", is_admin: true },
+    });
+    renderPage();
+
+    expect(await screen.findByRole("button", { name: /sign out/i })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /Realm account residue/i })).toBeNull();
+    expect(getAdminRealmAccountResidue).not.toHaveBeenCalled();
   });
 
   it("shows only the dedicated Keycloak entry in SSO mode", async () => {
@@ -225,6 +270,10 @@ describe("AdminPage mode boundary", () => {
     expect(screen.getByRole("button", { name: /sign out/i })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: /SSO providers/i })).toBeInTheDocument();
     expect(screen.getByText("Company SSO")).toBeInTheDocument();
+    // The read-only realm reconciliation sits on the same product-admin surface.
+    expect(await screen.findByRole("heading", { name: /Realm account residue/i })).toBeInTheDocument();
+    expect(await screen.findByText("leftover")).toBeInTheDocument();
+    expect(getAdminRealmAccountResidue).toHaveBeenCalledTimes(1);
   });
 
   it("toggles a configured provider without redeploying", async () => {

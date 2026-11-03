@@ -125,8 +125,8 @@ converges on one binding.
 External JIT users are always non-admin, including the first user in an empty
 database. OIDC realm/client roles never become AKB admin status or Vault
 grants. Phase 2 owns explicit product-admin seeding for an exact identity.
-`keycloak_link_by_email` remains readable only as a deprecated Phase 3
-migration/readiness input; canonical runtime rejects `true`.
+The former `keycloak_link_by_email` input has been removed; a config that still
+sets it fails to load.
 
 ## Dedicated product-admin browser boundary
 

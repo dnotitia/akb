@@ -22,7 +22,7 @@ import jwt
 from app.config import settings
 from app.db import postgres
 from app.exceptions import AKBError
-from app.services import auth_service, keycloak_oidc
+from app.services import auth_service, keycloak_oidc, platform_service_bootstrap
 from app.services.access_service import check_vault_access
 from app.services.auth_verifier_profiles import verify_keycloak_access_v1
 from app.services.local_session_keys import generate_local_session_keyset
@@ -2369,6 +2369,7 @@ class _ProviderLinkParser(HTMLParser):
 async def _prove_browser_route(
     *, entry_alias: str, actual_alias: str, username: str, password: str,
     expected_user_id: str, broker_subject: str, select_upstream: bool = False,
+    expected_upstream_client_id: str | None = None,
 ) -> dict[str, object]:
     """Navigate production login/callback routes and real Keycloak HTML forms.
 
@@ -2392,6 +2393,7 @@ async def _prove_browser_route(
     selected_link = False
     submitted = False
     callback_url = None
+    upstream_client_ids: list[str] = []
     async with (
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BROKER,
                           follow_redirects=False) as akb,
@@ -2409,6 +2411,12 @@ async def _prove_browser_route(
                     break
                 if urlsplit(target).netloc not in {urlsplit(BROKER).netloc, urlsplit(UPSTREAM).netloc}:
                     raise _fail("fixture_browser_route_unexpected_redirect")
+                parsed_target = urlsplit(target)
+                if (
+                    parsed_target.netloc == urlsplit(UPSTREAM).netloc
+                    and parsed_target.path.endswith("/protocol/openid-connect/auth")
+                ):
+                    upstream_client_ids.extend(parse_qs(parsed_target.query).get("client_id", []))
                 response = await browser.get(target)
                 continue
             if response.status_code != 200:
@@ -2436,6 +2444,8 @@ async def _prove_browser_route(
             submitted = True
         if callback_url is None or not submitted:
             raise _fail("fixture_browser_route_callback_missing")
+        if expected_upstream_client_id is not None and upstream_client_ids != [expected_upstream_client_id]:
+            raise _fail("fixture_browser_route_upstream_client_unexpected")
         callback = await akb.get(callback_url)
         if (
             callback.status_code != 303 or callback.headers.get("location") != intended
@@ -2486,6 +2496,276 @@ async def _prove_browser_route(
         "same_akb_user": True, "signed_access_and_id_tokens": True,
         "relative_redirect": True, "opaque_secure_session_cookies": True,
         "callback_json": False, "single_use_state": True,
+    }
+
+
+ROTATED_CLIENT_ID = "akb-broker-rotated"
+ROTATED_CLIENT_SECRET = "fixture-only-rotated-upstream-client-secret"  # pragma: allowlist secret
+ORIGINAL_CLIENT_SECRET = "fixture-only-upstream-client-secret"  # pragma: allowlist secret
+_ROTATION_SAMPLE_SECONDS = 1.0
+
+
+async def _raw_provider(client: httpx.AsyncClient, admin_token: str) -> dict[str, Any]:
+    response = await client.get(
+        f"{BROKER}/admin/realms/akb/identity-provider/instances/workforce",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    if response.status_code != 200:
+        raise _fail("fixture_rotation_provider_read_failed")
+    return _require_object(response.json(), "fixture_rotation_provider_read_failed")
+
+
+def _without_client_credentials(representation: dict[str, Any]) -> dict[str, Any]:
+    config = dict(_require_object(representation.get("config"), "fixture_rotation_provider_read_failed"))
+    config.pop("clientId", None)
+    config.pop("clientSecret", None)
+    return {**representation, "config": config}
+
+
+async def _federated_links(client: httpx.AsyncClient, admin_token: str, broker_subject: str) -> list[dict[str, Any]]:
+    response = await client.get(
+        f"{BROKER}/admin/realms/akb/users/{broker_subject}/federated-identity",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    if response.status_code != 200:
+        raise _fail("fixture_rotation_link_read_failed")
+    return _require_objects(response.json(), "fixture_rotation_link_read_failed")
+
+
+async def _set_upstream_client_enabled(client_id: str, *, enabled: bool) -> None:
+    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
+        admin_token = await _admin_token(client, UPSTREAM)
+        headers = {"Authorization": f"Bearer {admin_token}"}
+        response = await client.get(
+            f"{UPSTREAM}/admin/realms/workforce/clients",
+            params={"clientId": client_id}, headers=headers,
+        )
+        matches = [
+            item for item in _require_objects(response.json(), "fixture_upstream_client_read_failed")
+            if item.get("clientId") == client_id
+        ] if response.status_code == 200 else []
+        if len(matches) != 1:
+            raise _fail("fixture_upstream_client_not_exact")
+        updated = {**matches[0], "enabled": enabled}
+        written = await client.put(
+            f"{UPSTREAM}/admin/realms/workforce/clients/{matches[0]['id']}",
+            headers=headers, json=updated,
+        )
+        if written.status_code != 204:
+            raise _fail("fixture_upstream_client_write_failed")
+
+
+async def _service_administrator_key(pool) -> str:
+    """Stand in for the platform's administrator service key in this run."""
+    user_id, token_id = uuid.uuid4(), uuid.uuid4()
+    raw, digest, prefix = auth_service.generate_pat("service")
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """INSERT INTO users (id, username, email, password_hash, display_name, is_admin,
+                   auth_provider, account_status, account_kind)
+               VALUES ($1, 'fixture-platform', 'fixture-platform@invalid.local', $2,
+                       'Fixture platform', true, 'service', 'active', 'service')""",
+            user_id, platform_service_bootstrap.SENTINEL,
+        )
+        await conn.execute(
+            """INSERT INTO tokens (id, user_id, name, token_hash, token_prefix, key_class, scopes)
+               VALUES ($1, $2, 'fixture-platform', $3, $4, 'service', ARRAY['read','write','admin'])""",
+            token_id, user_id, digest, prefix,
+        )
+    return raw
+
+
+async def _prove_enabled_credential_rotation(
+    state: dict[str, object], *, broker_subject: str, upstream_subject: str,
+) -> dict[str, object]:
+    """Change an enabled provider's upstream client while people sign in through it.
+
+    A sampler reads the raw broker representation once a second for the whole
+    change and must see the provider enabled and visible in every sample, and
+    the client switch exactly once. The previous upstream client is then
+    disabled, so the real sign-in that follows can only succeed through the
+    new one, and it must reach the same AKB account through the same
+    federated link. Repeating the same pair must leave Keycloak unchanged.
+    """
+    from app.api.routes import admin_sso
+    from app.main import app
+    from app.services import audit_log
+
+    pool = state["pool"]
+    key = await _service_administrator_key(pool)
+    service = {"Authorization": f"Bearer {key}"}
+    audit_records: list[dict[str, object]] = []
+    original_record = audit_log.record
+
+    def capture(**values: object) -> None:
+        audit_records.append(values)
+        original_record(**values)
+
+    class _Collect(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(level=logging.DEBUG)
+            self.lines: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.lines.append(f"{record.name} {record.getMessage()} {record.exc_text or ''}")
+
+    collected = _Collect()
+    logging.getLogger().addHandler(collected)
+    admin_sso.audit_log.record = capture  # type: ignore[assignment]
+    texts: list[str] = []
+    samples: list[tuple[bool, bool, str]] = []
+    try:
+        async with (
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BROKER) as akb,
+            httpx.AsyncClient(verify=False, timeout=20.0) as keycloak,
+        ):
+            admin_token = await _admin_token(keycloak, BROKER)
+            links_before = await _federated_links(keycloak, admin_token, broker_subject)
+            identity_before = await pool.fetchval(
+                "SELECT id FROM external_identities WHERE issuer=$1 AND subject=$2", BROKER_ISSUER, broker_subject,
+            )
+            raw_before = await _raw_provider(keycloak, admin_token)
+            if raw_before.get("config", {}).get("clientId") != "akb-broker" or raw_before.get("enabled") is not True:
+                raise _fail("fixture_rotation_start_state_unexpected")
+            ownership = await akb.get("/api/v1/admin/sso/providers/workforce/ownership", headers=service)
+            texts.append(ownership.text)
+            if ownership.status_code != 200:
+                raise _evidence("fixture_rotation_ownership_read_failed", {"status": ownership.status_code})
+            before_ownership = ownership.json()
+
+            stop = asyncio.Event()
+
+            async def sample() -> None:
+                async with httpx.AsyncClient(verify=False, timeout=20.0) as sampler:
+                    token = await _admin_token(sampler, BROKER)
+                    while not stop.is_set():
+                        raw = await _raw_provider(sampler, token)
+                        samples.append((raw.get("enabled") is True, raw.get("hideOnLogin") is False,
+                                        str(raw.get("config", {}).get("clientId"))))
+                        try:
+                            await asyncio.wait_for(stop.wait(), timeout=_ROTATION_SAMPLE_SECONDS)
+                        except TimeoutError:
+                            pass
+
+            sampler_task = asyncio.create_task(sample())
+            try:
+                while len(samples) < 3:
+                    await asyncio.sleep(0.1)
+                changed = await akb.put(
+                    "/api/v1/admin/sso/providers/workforce/client-credentials",
+                    headers=service,
+                    json={
+                        "client_id": ROTATED_CLIENT_ID,
+                        "client_secret": ROTATED_CLIENT_SECRET,
+                        "expected_fingerprint": before_ownership["fingerprint"],
+                        "secret_revision": "fixture-rotation-1",  # pragma: allowlist secret
+                    },
+                )
+                texts.append(changed.text)
+                if changed.status_code != 200:
+                    raise _evidence("fixture_rotation_request_failed", {
+                        "status": changed.status_code,
+                        "code": (changed.json().get("detail") or {}).get("code")
+                        if "json" in changed.headers.get("content-type", "") else None,
+                    })
+                switched_at = len(samples)
+                while len(samples) < switched_at + 3:
+                    await asyncio.sleep(0.1)
+            finally:
+                stop.set()
+                await sampler_task
+            provider = changed.json()["provider"]
+            if (provider["state"], provider["client_id"], provider["enabled"]) != ("enabled", ROTATED_CLIENT_ID, True):
+                raise _fail("fixture_rotation_response_unexpected")
+            if not all(enabled and visible for enabled, visible, _ in samples):
+                raise _evidence("fixture_rotation_provider_disabled_during_change", {"samples": samples})
+            client_ids = [client_id for _, _, client_id in samples]
+            switch = client_ids.index(ROTATED_CLIENT_ID) if ROTATED_CLIENT_ID in client_ids else -1
+            if (
+                switch < 3 or set(client_ids[:switch]) != {"akb-broker"}
+                or set(client_ids[switch:]) != {ROTATED_CLIENT_ID} or len(client_ids) - switch < 3
+            ):
+                raise _evidence("fixture_rotation_switch_not_observed_once", {"client_ids": client_ids})
+
+            raw_after = await _raw_provider(keycloak, admin_token)
+            if _without_client_credentials(raw_after) != _without_client_credentials(raw_before):
+                raise _fail("fixture_rotation_changed_more_than_credentials")
+            after_ownership = (await akb.get("/api/v1/admin/sso/providers/workforce/ownership", headers=service)).json()
+            texts.append(repr(after_ownership))
+            if (
+                after_ownership["owner_id"] is not None
+                or after_ownership["revision"] != before_ownership["revision"] + 1
+                or after_ownership["drifted"]
+                or after_ownership["provider_secret_revision"] != "fixture-rotation-1"  # pragma: allowlist secret
+            ):
+                raise _fail("fixture_rotation_ownership_not_recorded")
+
+            # The old client stops working upstream, so only the new one can
+            # carry the sign-in below.
+            await _set_upstream_client_enabled("akb-broker", enabled=False)
+            sign_in = await _prove_browser_route(
+                entry_alias="workforce", actual_alias="workforce", username="alice",
+                password="fixture-only-alice-password",  # pragma: allowlist secret
+                expected_user_id=str(state["user_id"]), broker_subject=broker_subject,
+                expected_upstream_client_id=ROTATED_CLIENT_ID,
+            )
+            links_after = await _federated_links(keycloak, admin_token, broker_subject)
+            if links_after != links_before or [
+                (item.get("identityProvider"), item.get("userId")) for item in links_after
+            ] != [("workforce", upstream_subject)]:
+                raise _fail("fixture_rotation_federated_link_changed")
+            identity_after = await pool.fetchval(
+                "SELECT id FROM external_identities WHERE issuer=$1 AND subject=$2", BROKER_ISSUER, broker_subject,
+            )
+            if identity_before is None or identity_after != identity_before:
+                raise _fail("fixture_rotation_akb_binding_changed")
+
+            # Same pair again: Keycloak's representation stays as it was and
+            # only the label is recorded again.
+            repeated = await akb.put(
+                "/api/v1/admin/sso/providers/workforce/client-credentials",
+                headers=service,
+                json={
+                    "client_id": ROTATED_CLIENT_ID,
+                    "client_secret": ROTATED_CLIENT_SECRET,
+                    "expected_fingerprint": after_ownership["fingerprint"],
+                    "secret_revision": "fixture-rotation-1-restored",  # pragma: allowlist secret
+                },
+            )
+            texts.append(repeated.text)
+            raw_repeated = await _raw_provider(keycloak, admin_token)
+            restored = (await akb.get("/api/v1/admin/sso/providers/workforce/ownership", headers=service)).json()
+            texts.append(repr(restored))
+            if (
+                repeated.status_code != 200 or raw_repeated != raw_after
+                or restored["provider_secret_revision"] != "fixture-rotation-1-restored"  # pragma: allowlist secret
+                or restored["fingerprint"] != after_ownership["fingerprint"]
+            ):
+                raise _fail("fixture_rotation_repeat_not_idempotent")
+            events = await pool.fetch(
+                "SELECT payload::text AS payload FROM events WHERE kind='auth.sso_provider_client_credentials_changed'",
+            )
+            if len(events) != 2:
+                raise _fail("fixture_rotation_events_unexpected")
+    finally:
+        admin_sso.audit_log.record = original_record  # type: ignore[assignment]
+        logging.getLogger().removeHandler(collected)
+    scanned = [*texts, repr(audit_records), *(row["payload"] for row in events), *collected.lines]
+    if any(secret in text for text in scanned for secret in (ROTATED_CLIENT_SECRET, ORIGINAL_CLIENT_SECRET)):
+        raise _fail("fixture_rotation_secret_exposed")
+    if [record["action"] for record in audit_records].count("admin.sso.provider.client_credentials") != 2:
+        raise _fail("fixture_rotation_audit_unexpected")
+    return {
+        "readback_samples": len(samples),
+        "provider_never_disabled": True,
+        "client_switch_observed_once": True,
+        "only_client_credentials_changed": True,
+        "sign_in_through_new_client": sign_in["same_akb_user"],
+        "same_akb_user": sign_in["same_akb_user"],
+        "same_federated_link": True,
+        "repeat_left_keycloak_unchanged": True,
+        "secret_revision_recorded": True,
+        "secret_exposed": False,
     }
 
 
@@ -2672,6 +2952,10 @@ async def main() -> None:
     ):
         raise _fail("fixture_upstream_token_accepted")
 
+    client_credential_rotation = await _prove_enabled_credential_rotation(
+        state, broker_subject=broker_subject, upstream_subject=upstream_subject,
+    )
+
     disabled = (await control.set_enabled("workforce", enabled=False)).after
     if disabled.state != "configured_disabled":
         raise _fail("fixture_disable_readback_failed")
@@ -2712,7 +2996,7 @@ async def main() -> None:
     print(
         json.dumps(
             {
-                "schema_version": 7,
+                "schema_version": 8,
                 "provider_type": enabled.provider_type,
                 "alias": enabled.alias,
                 "configure_state": configured.state,
@@ -2733,6 +3017,7 @@ async def main() -> None:
                 "local_realm_migration": local_realm_migration,
                 "brokered_account_guard": brokered_account_guard,
                 "brokered_local_password": brokered_local_password,
+                "client_credential_rotation": client_credential_rotation,
                 "client_secret_exposed": False,
             },
             sort_keys=True,

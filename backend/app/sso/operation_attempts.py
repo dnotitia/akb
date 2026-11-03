@@ -74,13 +74,15 @@ async def reauthorize(parent_id, *, operation_id, expected_intent_sha256, ttl_se
              provider_revision,provider_fingerprint,current_provider_revision,current_provider_fingerprint,
              provider_payload_sha256,runtime_generation,session_epoch,cohort,cohort_sha256,verbs,expires_at,created_at,
              target_id,target_fingerprint,target_realm_id,source_tuple,target_tuple,provider_secret_revision,
-             parent_operation_id,intent_sha256,authority_attempt,phase,existing_identity_ids_hash,prepared_identity_ids_hash)
+             parent_operation_id,intent_sha256,authority_attempt,phase,existing_identity_ids_hash,prepared_identity_ids_hash,
+             provider_configure_summary)
             SELECT $2,installation_id,$3,$4,actor_id,actor_token_id,provider_alias,owner_id,
              provider_revision,provider_fingerprint,current_provider_revision,current_provider_fingerprint,
              provider_payload_sha256,runtime_generation,session_epoch,cohort,cohort_sha256,$5, $6,$7,
              target_id,target_fingerprint,target_realm_id,source_tuple,target_tuple,provider_secret_revision,
              $1,$8,$9,CASE WHEN prepared_identity_ids_hash IS NULL THEN 'granted' ELSE 'prepared' END,
-             existing_identity_ids_hash,prepared_identity_ids_hash
+             existing_identity_ids_hash,prepared_identity_ids_hash,
+             provider_configure_summary
              FROM sso_identity_operations WHERE operation_id=$1""",
             parent_id, operation_id, hashlib.sha256(raw.encode()).hexdigest(), granted_by, verbs, expires, now, intent, attempt)
         from app.repositories.events_repo import emit_event

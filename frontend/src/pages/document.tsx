@@ -1,5 +1,7 @@
 import { readWithAccessBoundary } from "@/lib/query-access-boundary";
 import { DocumentReadingWorkspace } from "@/components/document-reading-workspace";
+import { DocumentFindBar, DocumentReaderToolsActions } from "@/components/document-reader-tools";
+import { useReaderTools } from "@/contexts/reader-tools-context";
 import { Suspense, lazy, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { createPortal, flushSync } from "react-dom";
@@ -22,12 +24,14 @@ import {
   Copy,
   Globe2,
   Link2,
-  PanelRight,
   Info,
   GitCompareArrows,
   History,
   Maximize2,
   Pencil,
+  SlidersHorizontal,
+  Columns2,
+  ListTree,
 } from "lucide-react";
 import {
   ApiError,
@@ -51,6 +55,7 @@ import { sameCommitRef } from "@/lib/commit";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { vaultGuideHref } from "@/lib/vault-guide-navigation";
 import { DocumentOutline } from "@/components/doc-outline";
+import { readingDocumentHref } from "@/lib/reading-workspace";
 import { DocumentView } from "@/components/document-view";
 import { DocumentCopyButton, DocumentIconButton, DocumentReadModes, DocumentStatistics, DocumentTimestamp, type DocumentCopyHandle } from "@/components/document-reading-controls";
 import { DocumentContextPanel } from "@/components/document-context-panel";
@@ -173,6 +178,7 @@ function DocumentPageContent({
   const { name, id } = useParams<{ name: string; id: string }>();
   const currentUser = useCurrentUser();
   const readingChrome = useReadingChrome();
+  const readerTools = useReaderTools();
   const { checking: accessChecking, revision: accessRevision } = useAccessVerification();
   const resourceScope = JSON.stringify([name, id, currentUser?.user_id, accessRevision]);
   const viewId = useId();
@@ -222,6 +228,7 @@ function DocumentPageContent({
   const setDetailsOpen = readingChrome?.setDetailsOpen ?? setLocalDetailsOpen;
   const [detailsTab, setDetailsTab] = useState<"info" | "outline" | "relations" | "history">("outline");
   const [contextFocusRequest, setContextFocusRequest] = useState(0);
+  const [contentsEntry, setContentsEntry] = useState(false);
   const [historyReturnFocus, setHistoryReturnFocus] = useState<string | null>(null);
   const historyReturnFocusRef = useRef<HTMLButtonElement | null>(null);
   const finishHistoryReturnFocus = useCallback(() => setHistoryReturnFocus(null), []);
@@ -235,7 +242,7 @@ function DocumentPageContent({
   const publicationTriggerRef = useRef<HTMLButtonElement | null>(null);
   const copyActionRef = useRef<DocumentCopyHandle | null>(null);
   const linkCopyActionRef = useRef<DocumentCopyHandle | null>(null);
-  const menuHandoff = useRef<"copy" | "link" | "publication" | "history" | "details" | null>(null);
+  const menuHandoff = useRef<"copy" | "link" | "publication" | "history" | "details" | "find" | "reading" | "split" | null>(null);
   useEffect(() => {
     setDetailsOpen(false);
     setCopyNotice(null);
@@ -1565,14 +1572,15 @@ function DocumentPageContent({
             {!isDiffMode && <div role="group" aria-label="Reading controls" className="document-reader-controls">
               <DocumentReadModes view={view === "raw" ? "raw" : "rendered"} onChange={setView} idPrefix={viewId} contentId="document-reading-canvas" labelled={Boolean(readingChrome)} />
             </div>}
+            {!isDiffMode && <DocumentReaderToolsActions anchorRef={actionsTriggerRef} />}
+            {!isDiffMode && <DocumentIconButton ref={detailsTriggerRef} label="Table of contents" aria-expanded={detailsOpen && detailsTab === "outline"} aria-controls={`${viewId}-details`} onClick={() => {
+              setContentsEntry(true); setHistoryReturnFocus(null); setDetailsTab("outline"); setDetailsOpen(detailsOpen && detailsTab === "outline" ? false : true); setContextFocusRequest(value => value + 1);
+            }}><ListTree size={16} aria-hidden /></DocumentIconButton>}
             {readingChrome?.referenceControl}
+            {readingChrome?.sideControl}
             <DocumentCopyButton key={resourceScope} content={doc.content || ""} actionRef={copyActionRef} returnFocusRef={actionsTriggerRef} onCopied={label => setCopyNotice({ label })} />
             {canEdit && <DocumentIconButton ref={editButtonRef} label={isGuideDocument ? "Edit guide" : "Edit"} className="document-reader-edit text-link" onClick={() => requestEdit()}>
               <Pencil className="h-4 w-4" aria-hidden />
-            </DocumentIconButton>}
-            {!readingChrome && <DocumentIconButton ref={detailsTriggerRef} label="Document details" aria-expanded={detailsOpen} aria-controls={`${viewId}-details`}
-              onClick={() => { setHistoryReturnFocus(null); setDetailsOpen(open => !open); }}>
-              <PanelRight className="h-4 w-4" aria-hidden />
             </DocumentIconButton>}
             <ResourceActionsMenu
               triggerRef={actionsTriggerRef}
@@ -1583,7 +1591,11 @@ function DocumentPageContent({
                 menuHandoff.current = null;
                 requestAnimationFrame(() => {
                   if (action === "publication") publicationTriggerRef.current?.click();
+                  else if (action === "find") readerTools?.openFind(actionsTriggerRef.current ?? undefined);
+                  else if (action === "reading") readerTools?.setSettingsOpen(true);
+                  else if (action === "split") readingChrome?.openSideBySide?.();
                   else if (action === "history" || action === "details") {
+                    setContentsEntry(false);
                     setHistoryReturnFocus(null);
                     setDetailsTab(action === "history" ? "history" : "outline"); setDetailsOpen(true);
                     setContextFocusRequest(value => value + 1);
@@ -1604,7 +1616,11 @@ function DocumentPageContent({
               onDelete={canDelete ? () => setDeleteOpen(true) : undefined}
               readerControl
             >
-              {readingChrome && <>
+              {readerTools && <>
+                {!isDiffMode && <>
+                  <DropdownMenu.Item className="document-reader-menu-item" onSelect={() => { menuHandoff.current = "reading"; }}><SlidersHorizontal className="h-4 w-4" aria-hidden />Reading settings</DropdownMenu.Item>
+                  {readingChrome && <DropdownMenu.Item className="document-reader-menu-item" onSelect={() => { menuHandoff.current = "split"; }}><Columns2 className="h-4 w-4" aria-hidden />Read side by side</DropdownMenu.Item>}
+                </>}
                 <DropdownMenu.Item className="document-reader-menu-item" onSelect={() => { menuHandoff.current = "details"; }}><Info className="h-4 w-4" aria-hidden />Document details</DropdownMenu.Item>
                 <DropdownMenu.Separator className="my-1 h-px bg-border" />
               </>}
@@ -1722,6 +1738,7 @@ function DocumentPageContent({
           </div>
         )}
 
+        {!readingChrome && !inEditMode && !isDiffMode && <DocumentFindBar />}
         <div className="relative flex min-h-0 flex-1 overflow-hidden">
           {/* The app shell's <main id="main"> is the page's only main landmark;
               this scrolling canvas stays a focusable region inside it. */}
@@ -1960,6 +1977,7 @@ function DocumentPageContent({
                   onViewChange={(next) => setView(next)}
                   appearance="file"
                   bodyOnly
+                  searchable
                   idPrefix={viewId}
                   leadingMetadata={readingChrome ? metadata : undefined}
                 />
@@ -1971,7 +1989,7 @@ function DocumentPageContent({
             <DocumentContextPanel id={`${viewId}-details`} open={detailsOpen}
               onOpenChange={open => { setDetailsOpen(open); if (!open) setHistoryReturnFocus(null); }}
               view={detailsTab} onViewChange={next => { setDetailsTab(next); setHistoryReturnFocus(null); }}
-              triggerRef={readingChrome ? actionsTriggerRef : detailsTriggerRef} focusRequest={contextFocusRequest}
+              triggerRef={contentsEntry ? detailsTriggerRef : actionsTriggerRef} focusRequest={contextFocusRequest}
               focusTargetRef={historyReturnFocus ? historyReturnFocusRef : undefined} onFocusTarget={finishHistoryReturnFocus}
               info={<>
               <section aria-labelledby="document-properties-heading">
@@ -2040,7 +2058,8 @@ function DocumentPageContent({
                   </p> : view === "raw" ? <div className="space-y-3">
                     <p className="text-sm leading-relaxed text-foreground-muted">Headings are available in the rendered document.</p>
                     <Button type="button" variant="outline" size="sm" onClick={() => setView("rendered")}>Show rendered document</Button>
-                  </div> : <DocumentOutline markdown={doc.content || ""} articleEl={articleEl} />
+                  </div> : <DocumentOutline markdown={doc.content || ""} articleEl={articleEl}
+                    documentHref={readingDocumentHref(name!, doc.path || docId, commitHash ? `?commit=${encodeURIComponent(commitHash)}` : "")} />
                 }
               relations={<>
                   <RelationsPanel

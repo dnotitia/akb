@@ -25,6 +25,12 @@ from app.sso.providers.keycloak_oidc import (
     _secret_configured,
     validate_alias,
 )
+# Both provider types keep the upstream credentials in the same two config
+# keys, so the credential-only change is one shared, explicit re-export.
+from app.sso.providers.keycloak_oidc import (
+    validate_client_credentials as validate_client_credentials,
+    with_client_credentials as with_client_credentials,
+)
 
 
 PROVIDER_TYPE = "oidc"

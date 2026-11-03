@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 
+@pytest.mark.needs_resource("an isolated local AKB at AKB_SEARCH_TEST_URL")
 async def test_live_login_search_filters_and_vault_isolation():
     origin = os.getenv("AKB_SEARCH_TEST_URL")
     if not origin:

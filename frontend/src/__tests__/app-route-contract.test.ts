@@ -7,7 +7,6 @@ describe("application route contract", () => {
       { path: "/admin", component: "AdminPage", boundary: "admin" },
       { path: "/auth", component: "AuthPage", boundary: "auth" },
       { path: "/auth/forgot", component: "AuthForgotPage", boundary: "auth" },
-      { path: "/auth/callback", component: "AuthCallbackPage", boundary: "auth" },
       { path: "/p/:slug", component: "PublicationPage", boundary: "public" },
       { path: "/", component: "HomePage", boundary: "app-layout" },
       { path: "/vault/new", component: "VaultNewPage", boundary: "app-layout" },

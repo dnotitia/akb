@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +20,7 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from app.db import postgres
 from app.exceptions import ForbiddenError, ValidationError
 from app.services import access_service
 from app.services import access_contributions as contrib
@@ -32,36 +32,6 @@ _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
 _MIGRATION_085 = (
     _BACKEND / "app" / "db" / "migrations" / "085_vault_access_contributions.py"
 )
-_MIGRATION_HEAD = (
-    _BACKEND / "app" / "db" / "migrations" / "113_bm25_vocab_epoch.py"
-)
-_MIGRATIONS_DIR = _BACKEND / "app" / "db" / "migrations"
-
-
-def _registered_migrations() -> list[Path]:
-    """Every migration, in the order `postgres.py` registers them.
-
-    Reading the registry rather than listing the directory keeps this database
-    the same shape as a real one: `check_vault_access` reads the vault write
-    policy and `emit_event` writes the outbox, and neither table is in
-    `init.sql`. Picking migrations by hand is how a test database quietly stops
-    resembling the thing under test.
-    """
-    registry = (_BACKEND / "app" / "db" / "postgres.py").read_text()
-    names = re.findall(r'"(\d{3}_[a-z0-9_]+\.py)"', registry)
-    seen: set[str] = set()
-    ordered: list[Path] = []
-    for name in names:
-        if name in seen:
-            continue
-        seen.add(name)
-        ordered.append(_MIGRATIONS_DIR / name)
-    assert ordered, "no migrations found in the registry"
-    assert ordered[-1].name == _MIGRATION_HEAD.name, (
-        "the expected migration must be last for this test to be measuring "
-        f"the current head; registry ends at {ordered[-1].name}"
-    )
-    return ordered
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
@@ -92,6 +62,15 @@ async def _can_connect() -> bool:
 
 @asynccontextmanager
 async def _fresh_database():
+    """A new database built the way a booting server builds one.
+
+    `_run_boot_schema` applies `init.sql` and then every migration the server
+    registers, in its order, so this database has the shape of a real one:
+    `check_vault_access` reads the vault write policy and `emit_event` writes
+    the outbox, and neither table is in `init.sql`. A hand-kept copy of that
+    list here, or a pin to its last entry, goes stale with the next migration
+    and turns every test in this file into a setup error.
+    """
     if not await _can_connect():
         if os.environ.get("REQUIRE_REAL_PG") == "1":
             pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
@@ -102,9 +81,7 @@ async def _fresh_database():
     pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=8)
     try:
         async with pool.acquire() as conn:
-            await conn.execute(_INIT_SQL)
-            for path in _registered_migrations():
-                await _load_migration(path).migrate(conn=conn)
+            await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
         yield pool
     finally:
         await pool.close()
@@ -758,13 +735,30 @@ class _LiveEnv(_Env):
 
 @pytest.fixture
 async def live_role_sync(monkeypatch):
-    from app.services.role_sync import RoleSync
+    from app.services.role_sync import RoleSync, user_role_name, vault_group_role_name
 
     async with _fresh_database() as pool:
         role_sync = RoleSync(pool)
         monkeypatch.setattr(access_service, "get_pool", lambda: pool)
         monkeypatch.setattr(access_service, "get_role_sync", lambda: role_sync)
         yield _LiveEnv(pool, role_sync)
+        # Roles are cluster-global, so dropping the database leaves behind
+        # every one the real RoleSync created for it. Name them from the
+        # identities this database holds before it goes.
+        async with pool.acquire() as conn:
+            users = [r["id"] for r in await conn.fetch("SELECT id FROM users")]
+            vaults = [r["id"] for r in await conn.fetch("SELECT id FROM vaults")]
+        roles = [user_role_name(u) for u in users] + [
+            vault_group_role_name(v, scope)
+            for v in vaults
+            for scope in ("reader", "writer", "admin")
+        ]
+    admin = await asyncpg.connect(_DSN)
+    try:
+        for role in roles:
+            await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
+    finally:
+        await admin.close()
 
 
 async def _pg_membership(env, vault_id, user_id) -> set[str]:

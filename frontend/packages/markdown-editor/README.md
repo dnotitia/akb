@@ -112,7 +112,7 @@ typing. Metadata caches are bounded or weakly keyed, not a retained draft histor
 `MarkdownSurface` owns the editor content element and accepts
 `contentClassName` / `contentAttributes` for product styling and accessible
 semantics. `MarkdownViewer` additionally accepts presentation-only
-`headings`, `tableLayout`, and `image.referrerPolicy` options. Heading offsets
+`headings`, `tableLayout`, `reading`, and `image.referrerPolicy` options. Heading offsets
 and ids, table scroll wrappers, runtime image attributes, and content DOM
 updates are applied by the package and never become serialized Markdown:
 
@@ -129,6 +129,35 @@ updates are applied by the package and never become serialized Markdown:
   }}
 />
 ```
+
+`MarkdownViewer.reading` optionally provides `renderCodeToolbar(block)` and
+`renderImageToolbar(image)` React slots. Image controls render outside the
+editable document DOM, so hosts can position them over the displayed image
+without adding text to prose. `renderSectionToggle(section)`, `collapsedSections`
+and `onRevealSections` provide the same presentation-only contract for sections.
+Use `revealMarkdownTarget(element)` before measuring or scrolling to an anchor
+from a separate outline. Text finding also reveals collapsed ancestors. Reading
+decorations are rebuilt for each document, including when replacing a long body
+with a shorter one.
+
+Footnote references (`[^label]`) and indented multiline definitions are shared
+schema nodes. Their Markdown survives editor serialization; viewers add local
+numbering, isolated anchors and per-reference return links. Products may provide
+a footnote preview while reusing the same target/asset resolver. Mermaid remains
+a code fence in the shared schema; diagram rendering is a product-owned, optional
+viewer control and does not replace or execute the authored source.
+Code blocks expose their index, code,
+language and effective collapsed state. Image slots identify the image index
+and alt text; products must use their already-resolved image surface rather
+than fetching canonical private targets independently. `collapseCodeBlocks`,
+`collapsedCodeBlocks` and `expandedCodeBlocks` control presentation without
+editing source. `search: { query, current }` highlights literal text in the
+document model (excluding UI widgets), and `onSearchResults({ count, limited })`
+reports up to 1,000 matches. The active code match is revealed automatically.
+`findReadingTextMatches(text, query, limit?)`, exported from the React entry,
+uses the same UTF-16 literal-match contract for raw-text integrations. Products
+own the toolbar labels, styling, clipboard feedback and search controls. These
+options apply only to the viewer, never the editable document schema.
 
 `MarkdownViewer.afterLeadingHeading` accepts a React node for read-only
 metadata or controls after the first block when it is a heading, or before a

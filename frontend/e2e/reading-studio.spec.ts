@@ -50,7 +50,10 @@ for (const scenario of [{ width: 1920, dark: false }, { width: 1440, dark: true 
     await expect(references.locator(".reading-reference-count")).toContainText("2");
     await expect(references).toHaveAttribute("aria-expanded", "false");
     await expect(page.getByRole("complementary", { name: "Document references", exact: true })).toHaveCount(0);
-    await expect(tools.getByRole("button", { name: "Copy markdown", exact: true })).toBeVisible();
+    if (scenario.width < 640) await expect(tools.locator(".document-copy-button")).not.toBeVisible();
+    else await expect(tools.getByRole("button", { name: "Copy markdown", exact: true })).toBeVisible();
+    await expect(tools.getByRole("button", { name: "Find in document", exact: true })).toBeInViewport({ ratio: 1 });
+    await expect(tools.getByRole("button", { name: "Table of contents", exact: true })).toBeInViewport({ ratio: 1 });
     await expect(tools.getByRole("button", { name: "Edit", exact: true })).toHaveText("");
     await expect(tools.getByRole("button", { name: "Document details", exact: true })).toHaveCount(0);
     await expect(page.getByRole("link", { name: "Explore all connections", exact: true })).toHaveCount(0);
@@ -66,6 +69,7 @@ for (const scenario of [{ width: 1920, dark: false }, { width: 1440, dark: true 
       expect(insets).toEqual([12, 12]);
     }
     await more.click();
+    await expect(page.getByRole("menuitem", { name: "Copy markdown", exact: true })).toBeEnabled();
     await expect(page.getByRole("menuitem", { name: "On this page", exact: true })).toHaveCount(0);
     await page.getByRole("menuitem", { name: "Document details", exact: true }).click();
     await expect(page.getByRole("navigation", { name: "Document outline", exact: true })).toBeVisible();

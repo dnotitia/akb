@@ -800,3 +800,209 @@ async def test_duplicate_marks_are_refused_rather_than_guessed_between():
 
     assert captured.value.code == "keycloak_provider_guard_mapper_duplicate"
 
+
+
+def _admin_writes(fixture: KeycloakFixture) -> list[tuple[str, str]]:
+    return [
+        (method, path)
+        for method, path in fixture.requests
+        if method in {"POST", "PUT", "DELETE"} and not path.endswith("/protocol/openid-connect/token")
+    ]
+
+
+def _without_credentials(representation: dict[str, object]) -> dict[str, object]:
+    result = deepcopy(representation)
+    config = result["config"]
+    assert isinstance(config, dict)
+    config.pop("clientId")
+    config.pop("clientSecret")
+    return result
+
+
+@pytest.mark.parametrize("spec_factory", [_spec, _generic_spec])
+async def test_enabled_provider_client_credentials_change_without_disabling(spec_factory):
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    spec = spec_factory()
+    await control.configure(spec)
+    await control.set_enabled(spec.alias, enabled=True)
+    before = deepcopy(fixture.providers[spec.alias])
+    fixture.requests.clear()
+
+    mutation = await control.set_client_credentials(
+        spec.alias,
+        client_id="akb-broker-next",
+        client_secret=_NEW_SECRET,
+    )
+
+    stored = fixture.providers[spec.alias]
+    config = stored["config"]
+    assert isinstance(config, dict)
+    assert config["clientId"] == "akb-broker-next"
+    assert config["clientSecret"] == _NEW_SECRET
+    assert stored["enabled"] is True and stored["hideOnLogin"] is False
+    assert _without_credentials(stored) == _without_credentials(before)
+    assert mutation.before is not None
+    assert (mutation.before.client_id, mutation.before.state) == (spec.client_id, "enabled")
+    assert (mutation.after.client_id, mutation.after.state) == ("akb-broker-next", "enabled")
+    assert mutation.after.client_secret_configured is True
+    # No discovery re-import, no create, and exactly one provider write.
+    assert all("import-config" not in path for _, path in fixture.requests)
+    writes = _admin_writes(fixture)
+    assert writes == [("PUT", f"/auth/admin/realms/akb/identity-provider/instances/{spec.alias}")]
+    assert _NEW_SECRET not in repr(mutation)
+
+
+async def test_client_credentials_keep_a_disabled_provider_disabled():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    await control.configure(_spec())
+
+    mutation = await control.set_client_credentials(
+        "workforce",
+        client_id="akb-broker",
+        client_secret=_NEW_SECRET,
+    )
+
+    assert mutation.after.state == "configured_disabled"
+    assert fixture.providers["workforce"]["enabled"] is False
+    assert fixture.providers["workforce"]["hideOnLogin"] is True
+
+
+async def test_repeating_the_same_client_credentials_leaves_the_representation_unchanged():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    await control.configure(_spec())
+    await control.set_enabled("workforce", enabled=True)
+    await control.set_client_credentials("workforce", client_id="akb-broker-next", client_secret=_NEW_SECRET)
+    first = deepcopy(fixture.providers["workforce"])
+
+    again = await control.set_client_credentials("workforce", client_id="akb-broker-next", client_secret=_NEW_SECRET)
+
+    assert fixture.providers["workforce"] == first
+    assert again.before == again.after
+
+
+async def test_client_credentials_readback_drift_is_an_error_without_rollback():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    await control.configure(_spec())
+    await control.set_enabled("workforce", enabled=True)
+    fixture.drift_readback_after_write = True
+    fixture.requests.clear()
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.set_client_credentials("workforce", client_id="akb-broker-next", client_secret=_NEW_SECRET)
+
+    assert captured.value.code == "keycloak_provider_readback_failed"
+    writes = _admin_writes(fixture)
+    assert writes == [("PUT", "/auth/admin/realms/akb/identity-provider/instances/workforce")]
+    assert _NEW_SECRET not in f"{captured.value!s} {captured.value!r}"
+
+
+async def test_client_credentials_precondition_sees_the_exact_current_readback_before_any_write():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    await control.configure(_spec())
+    await control.set_enabled("workforce", enabled=True)
+    fixture.requests.clear()
+    seen = []
+
+    def refuse(provider):
+        seen.append(provider)
+        raise ProviderControlError("fixture_precondition_refused")
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.set_client_credentials(
+            "workforce", client_id="akb-broker-next", client_secret=_NEW_SECRET, precondition=refuse,
+        )
+
+    assert captured.value.code == "fixture_precondition_refused"
+    assert [(provider.client_id, provider.state) for provider in seen] == [("akb-broker", "enabled")]
+    assert all(method == "GET" or path.endswith("/token") for method, path in fixture.requests)
+
+
+async def test_client_credentials_restore_the_mark_before_the_write():
+    from app.sso.brokered_account_guard import BROKERED_ACCOUNT_ROLE
+
+    fixture = KeycloakFixture()
+    fixture.roles.add(BROKERED_ACCOUNT_ROLE)
+    control = _control(fixture)
+    await control.configure(_spec())
+    await control.set_enabled("workforce", enabled=True)
+    fixture.mappers["workforce"].clear()
+    fixture.requests.clear()
+
+    await control.set_client_credentials("workforce", client_id="akb-broker-next", client_secret=_NEW_SECRET)
+
+    assert len(_marks(fixture, "workforce")) == 1
+    writes = [(method, path) for method, path in fixture.requests if method in {"POST", "PUT"}]
+    assert writes[-1] == ("PUT", "/auth/admin/realms/akb/identity-provider/instances/workforce")
+    assert any(path.endswith("/mappers") for _, path in writes[:-1])
+
+
+async def test_client_credentials_fail_closed_when_the_mark_cannot_be_checked():
+    from app.sso.brokered_account_guard import BROKERED_ACCOUNT_ROLE
+
+    fixture = KeycloakFixture()
+    fixture.roles.add(BROKERED_ACCOUNT_ROLE)
+    control = _control(fixture)
+    await control.configure(_spec())
+    await control.set_enabled("workforce", enabled=True)
+    fixture.fail_mappers = True
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.set_client_credentials("workforce", client_id="akb-broker-next", client_secret=_NEW_SECRET)
+
+    assert captured.value.code == "keycloak_provider_guard_read_failed"
+    config = fixture.providers["workforce"]["config"]
+    assert isinstance(config, dict)
+    assert (config["clientId"], config["clientSecret"]) == ("akb-broker", _SECRET)
+
+
+@pytest.mark.parametrize(
+    ("client_id", "client_secret", "code"),
+    [
+        ("", _NEW_SECRET, "provider_client_id_invalid"),
+        ("bad client id", _NEW_SECRET, "provider_client_id_invalid"),
+        ("x" * 256, _NEW_SECRET, "provider_client_id_invalid"),
+        ("akb-broker-next", "", "provider_client_secret_invalid"),
+        ("akb-broker-next", "line\nbreak", "provider_client_secret_invalid"),
+        ("akb-broker-next", "x" * 4097, "provider_client_secret_invalid"),
+        ("akb-broker-next", MASKED_SECRET, "provider_client_secret_invalid"),
+    ],
+)
+async def test_client_credentials_are_validated_before_any_request(client_id, client_secret, code):
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+
+    with pytest.raises(ProviderControlError) as captured:
+        await control.set_client_credentials("workforce", client_id=client_id, client_secret=client_secret)
+
+    assert captured.value.code == code
+    assert fixture.requests == []
+
+
+async def test_client_credentials_refuse_absent_unmanaged_and_invalid_providers():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    with pytest.raises(ProviderControlError) as absent:
+        await control.set_client_credentials("workforce", client_id="akb-broker", client_secret=_NEW_SECRET)
+    assert absent.value.code == "provider_not_found"
+
+    fixture.providers["foreign"] = {
+        "alias": "foreign", "providerId": "oidc", "enabled": True,
+        "config": {"clientSecret": "pre-existing"},  # pragma: allowlist secret
+    }
+    with pytest.raises(ProviderControlError) as unmanaged:
+        await control.set_client_credentials("foreign", client_id="akb-broker", client_secret=_NEW_SECRET)
+    assert unmanaged.value.code == "provider_alias_conflict"
+
+    await control.configure(_spec())
+    config = fixture.providers["workforce"]["config"]
+    assert isinstance(config, dict)
+    config["validateSignature"] = "false"
+    with pytest.raises(ProviderControlError) as invalid:
+        await control.set_client_credentials("workforce", client_id="akb-broker", client_secret=_NEW_SECRET)
+    assert invalid.value.code == "provider_configuration_invalid"
+    assert config["clientSecret"] == _SECRET

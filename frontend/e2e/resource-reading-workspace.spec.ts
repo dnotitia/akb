@@ -554,8 +554,8 @@ async function openDocumentDetails(page: Page, section?: "Properties" | "Version
   const panel = page.locator('[data-slot="document-context-panel"]');
   if (!await panel.count()) {
     await expect(page.getByRole("group", { name: "Document reading tools", exact: true })).toBeVisible();
-    const direct = page.getByRole("button", { name: "Document details", exact: true });
-    if (await direct.count()) await direct.click();
+    const direct = page.getByRole("button", { name: "Table of contents", exact: true });
+    if (await page.getByTestId("document-preview-dialog").count() && await direct.count()) await direct.click();
     else {
       await documentActions(page).click();
       await page.getByRole("menuitem", { name: "Document details", exact: true }).click();
@@ -709,7 +709,8 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     await expect(page.locator('[data-slot="resource-command-row"]')).toHaveCount(1);
     const readingTools = page.getByRole("group", { name: "Document reading tools", exact: true });
     await expect(readingTools.getByRole("radio", { name: "Preview", exact: true })).toBeVisible();
-    await expect(readingTools.getByRole("button", { name: "Copy markdown", exact: true })).toBeVisible();
+    if (width < 640) await expect(readingTools.locator(".document-copy-button")).not.toBeVisible();
+    else await expect(readingTools.getByRole("button", { name: "Copy markdown", exact: true })).toBeVisible();
     const contextBounds = (await page.locator('[data-slot="resource-command-row"]').boundingBox())!;
     const toolBounds = (await readingTools.boundingBox())!;
     expect(toolBounds.y).toBe(contextBounds.y);
@@ -727,9 +728,9 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       expect(toolBounds.height).toBeLessThanOrEqual(49);
     }
     const modeBounds = (await readingTools.getByRole("radiogroup", { name: "Document view mode", exact: true }).boundingBox())!;
-    const actionBounds = (await readingTools.getByRole("button", { name: "Copy markdown", exact: true }).boundingBox())!;
+    const actionBounds = (await readingTools.getByRole("button", { name: "Find in document", exact: true }).boundingBox())!;
     expect(modeBounds.x + modeBounds.width).toBeLessThan(actionBounds.x);
-    const commandMetrics = await page.locator('[data-slot="resource-command-row"] [data-reader-control]').evaluateAll(elements => elements.map(element => ({
+    const commandMetrics = await page.locator('[data-slot="resource-command-row"] [data-reader-control]:visible').evaluateAll(elements => elements.map(element => ({
       height: element.getBoundingClientRect().height,
       font: getComputedStyle(element).fontSize,
     })));
@@ -742,7 +743,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     }), lastEdited);
     await expect(editTime.locator(".sr-only")).toHaveText(`Last edited: ${exactEditTime}`);
     await expect(editTime).toBeVisible();
-    await expect(readingTools.getByRole("button", { name: "Document details", exact: true })).toHaveCount(0);
+    await expect(readingTools.getByRole("button", { name: "Table of contents", exact: true })).toHaveCount(1);
     await expect(documentActions(page)).toBeVisible();
     await expect(page.getByRole("button", { name: "Open document info", exact: true })).toHaveCount(0);
     const collections = page.locator('[data-slot="vault-collections-sidebar"]');
@@ -788,7 +789,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       await expect(page.getByRole("button", { name: "Open vault navigation", exact: true })).toBeFocused();
     }
     if (width === 2560) await page.getByRole("button", { name: "Close vault navigation", exact: true }).click();
-    for (const name of ["Edit", "Copy markdown", `Actions for ${title}`]) {
+    for (const name of ["Edit", "Find in document", "Table of contents", ...(width >= 640 ? ["Copy markdown"] : []), `Actions for ${title}`]) {
       await expect(readingTools.getByRole("button", { name, exact: true })).toBeInViewport();
     }
     await expect(readingTools.getByRole("button", { name: "Publish", exact: true })).toHaveCount(0);
@@ -874,10 +875,12 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
     if (docked) {
       const panelBox = (await panel.boundingBox())!;
       const contextBox = (await page.locator(".reading-details-host").boundingBox())!;
+      const divider = (await page.getByRole("separator", { name: "Resize context panel", exact: true }).boundingBox())!;
       expect(contextBox.width).toBe(288);
-      expect(panelBox.width).toBe(contextBox.width - 1);
-      expect(contextBox.x).toBeCloseTo(afterDetails.x + afterDetails.width, 0);
-      expect(afterDetails.width + contextBox.width).toBeCloseTo(beforeDetails.width, 0);
+      expect(panelBox.width).toBe(contextBox.width);
+      expect(divider.width).toBeGreaterThan(0);
+      expect(contextBox.x).toBeCloseTo(afterDetails.x + afterDetails.width + divider.width, 0);
+      expect(afterDetails.width + contextBox.width + divider.width).toBeCloseTo(beforeDetails.width, 0);
       expect(afterDetails.x).toBe(beforeDetails.x);
       expect(afterDetails.height).toBe(beforeDetails.height);
     } else {
@@ -1754,7 +1757,8 @@ test("docked details preserve article scroll and remain open during reading", as
   await expect(panel).toHaveAttribute("data-mode", "docked");
   expect(await canvas.evaluate(element => element.scrollTop)).toBe(240);
   const after = (await canvas.boundingBox())!;
-  expect(after.width + (await page.locator(".reading-details-host").boundingBox())!.width).toBeCloseTo(before.width, 0);
+  const divider = (await page.getByRole("separator", { name: "Resize context panel", exact: true }).boundingBox())!;
+  expect(after.width + (await page.locator(".reading-details-host").boundingBox())!.width + divider.width).toBeCloseTo(before.width, 0);
   await panel.getByText(title, { exact: true }).click({ clickCount: 3 });
   await expect(panel).toBeVisible();
   await canvas.hover({ position: { x: 40, y: 80 } });
@@ -1811,7 +1815,7 @@ test("docked details close inside a preview and outline navigation preserves its
   await page.goto("/search?q=reading&source=document");
   await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
   const preview = page.getByTestId("document-preview-dialog");
-  const trigger = preview.getByRole("button", { name: "Document details", exact: true });
+  const trigger = preview.getByRole("button", { name: "Table of contents", exact: true });
   const panel = await openDocumentDetails(page);
   await expect(panel).toHaveAttribute("data-mode", "docked");
   await page.keyboard.press("Escape");
@@ -1933,7 +1937,7 @@ for (const scenario of ["desktop", "mobile", "preview"] as const) {
     expect(await workspaceMetrics()).toEqual(before);
     await page.getByRole("button", { name: "Close document panel", exact: true }).click();
     await expect(panel).toHaveCount(0);
-    await expect(scenario === "preview" ? rail.getByRole("button", { name: "Document details", exact: true }) : documentActions(page)).toBeFocused();
+    await expect(scenario === "preview" ? rail.getByRole("button", { name: "Table of contents", exact: true }) : documentActions(page)).toBeFocused();
   });
 }
 
@@ -2194,7 +2198,7 @@ test("Escape closes only the nested context overlay inside a document preview", 
   await page.getByRole("link", { name: /문서 읽기 작업공간/ }).first().click();
   const preview = page.getByTestId("document-preview-dialog");
   await expect(preview).toBeVisible();
-  const info = preview.getByRole("button", { name: "Document details", exact: true });
+  const info = preview.getByRole("button", { name: "Table of contents", exact: true });
   await info.click();
   const context = page.getByRole("dialog", { name: "Document details", exact: true });
   await expect(context).toHaveAttribute("data-mode", "overlay");
@@ -2206,7 +2210,7 @@ test("Escape closes only the nested context overlay inside a document preview", 
   await expect(page).toHaveURL(new RegExp(`/doc/${encodeURIComponent(path)}$`));
   const previewUrl = page.url();
   const previewHistory = await page.evaluate(() => history.state);
-  await preview.getByRole("button", { name: "Document details", exact: true }).click();
+  await preview.getByRole("button", { name: "Table of contents", exact: true }).click();
   const outline = page.getByRole("dialog", { name: "Document details", exact: true });
   const headingLink = outline.getByRole("link", { name: "Authored heading", exact: true });
   await headingLink.click();
@@ -2218,7 +2222,7 @@ test("Escape closes only the nested context overlay inside a document preview", 
   await page.keyboard.press("Escape");
   await expect(outline).toHaveCount(0);
   await expect(preview).toBeVisible();
-  await expect(preview.getByRole("button", { name: "Document details", exact: true })).toBeFocused();
+  await expect(preview.getByRole("button", { name: "Table of contents", exact: true })).toBeFocused();
 });
 
 test("foreground access verification preserves the live editor draft", async ({ page }) => {
@@ -2555,7 +2559,7 @@ for (const scenario of [
   const timestamp = byline.locator("time");
   await expect(timestamp).toHaveAttribute("datetime", new Date(lastEdited).toISOString());
   await expect(tools.getByRole("button", { name: "Edit", exact: true })).toBeInViewport({ ratio: 1 });
-  await expect(scenario.preview ? tools.getByRole("button", { name: "Document details", exact: true }) : documentActions(page)).toBeInViewport({ ratio: 1 });
+  await expect(scenario.preview ? tools.getByRole("button", { name: "Table of contents", exact: true }) : documentActions(page)).toBeInViewport({ ratio: 1 });
   await expect(page.getByRole("region", { name: "Document preview", exact: true })).toContainText("Authored heading");
   expect(await byline.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
   expect(await name.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);

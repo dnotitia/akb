@@ -52,6 +52,8 @@ def _configure_old_backend(backend: Path, dsn: str):
     settings.db_name = parsed.path.lstrip("/")
     settings.db_user = unquote(parsed.username or "")
     settings.db_password = unquote(parsed.password or "")
+    # The archived backend's Settings predates system_hmac_secret; it only knows
+    # jwt_secret. This helper follows that old model, not the current schema.
     settings.jwt_secret = (  # pragma: allowlist secret
         "old-image-compatibility-secret-32-bytes"
     )

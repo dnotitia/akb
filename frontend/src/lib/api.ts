@@ -3,7 +3,6 @@ import { changesInventory, notifyInventoryChanged } from "./inventory-refresh";
 const API_BASE = "/api/v1";
 
 export type AuthMode = "local" | "sso";
-export type PublicAuthMode = AuthMode | "hybrid";
 
 let _token: string | null = null;
 let _authMode: AuthMode | null = null;
@@ -11,8 +10,6 @@ let _authSessionGeneration = 0;
 let _ssoCsrfToken: string | null = null;
 const SAFE_AUTH_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const LOCAL_TOKEN_STORAGE_KEY = "akb_token";
-const LEGACY_SSO_SESSION_KEY = "akb_legacy_sso";
-const LEGACY_SSO_ID_TOKEN_KEY = "akb_legacy_kc_id_token";
 
 const PRIVATE_ASSET_CACHE_MAX_ENTRIES = 32;
 const PRIVATE_ASSET_CACHE_MAX_BYTES = 64 * 1024 * 1024;
@@ -73,54 +70,6 @@ export function setToken(t: string | null) {
   }
   _token = t;
   writeStoredToken(t);
-}
-
-/**
- * Temporary compatibility marker for the pre-browser-session Keycloak flow.
- * The legacy backend exchanges a one-time callback code for the same Bearer
- * JWT used by local login, so transport remains `local`; this marker exists
- * only to choose the matching RP-initiated logout route. Session storage keeps
- * the optional Keycloak hint scoped to the tab that completed the redirect.
- */
-export function markLegacySsoSession(idToken?: unknown) {
-  try {
-    sessionStorage.setItem(LEGACY_SSO_SESSION_KEY, "1");
-    if (
-      typeof idToken === "string" &&
-      idToken.length > 0 &&
-      idToken.length <= 16_384 &&
-      !hasControlCharacters(idToken)
-    ) {
-      sessionStorage.setItem(LEGACY_SSO_ID_TOKEN_KEY, idToken);
-    } else {
-      sessionStorage.removeItem(LEGACY_SSO_ID_TOKEN_KEY);
-    }
-  } catch {
-    // The Bearer session remains usable when storage is blocked; only the
-    // seamless Keycloak logout hint is lost.
-  }
-}
-
-export function clearLegacySsoSession() {
-  try {
-    sessionStorage.removeItem(LEGACY_SSO_SESSION_KEY);
-    sessionStorage.removeItem(LEGACY_SSO_ID_TOKEN_KEY);
-  } catch {
-    // Best effort; the AKB Bearer token is cleared independently.
-  }
-}
-
-function legacySsoLogoutUrl(): string | null {
-  try {
-    if (sessionStorage.getItem(LEGACY_SSO_SESSION_KEY) !== "1") return null;
-    const hint = sessionStorage.getItem(LEGACY_SSO_ID_TOKEN_KEY);
-    const search = new URLSearchParams();
-    if (hint) search.set("id_token_hint", hint);
-    const query = search.toString();
-    return `${API_BASE}/auth/keycloak/logout${query ? `?${query}` : ""}`;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -232,7 +181,6 @@ export function beginAccountLifecycle(snapshot: AuthSessionSnapshot): () => void
 export function clearCompletedAccountSession(snapshot: AuthSessionSnapshot): boolean {
   if (!isCurrentAuthSession(snapshot)) return false;
   clearPrivateAssetCache();
-  clearLegacySsoSession();
   setToken(null);
   // SSO credentials are already revoked server-side. Leave the inert cookies
   // alone so a late response cannot erase a newer login, and invalidate old work.
@@ -294,7 +242,6 @@ function withAuthCarrier(headers: HeadersInit | undefined, method: string): Head
 function expireUnauthorizedSession(redirect: boolean) {
   if (_authMode === "local" || getToken() !== null) {
     setToken(null);
-    clearLegacySsoSession();
   } else {
     _authSessionGeneration += 1;
     clearPrivateAssetCache();
@@ -440,8 +387,8 @@ export interface AuthProviderOption {
 
 export interface AuthConfig {
   available: boolean;
-  schema_version: 1 | 2 | null;
-  auth_mode: PublicAuthMode | null;
+  schema_version: 2 | null;
+  auth_mode: AuthMode | null;
   local_auth: { enabled: boolean };
   keycloak: {
     enabled: boolean;
@@ -563,71 +510,8 @@ function parseV2AuthConfig(value: unknown): AuthConfig | null {
   };
 }
 
-/**
- * Exact adapter for the last unversioned hybrid contract shipped before the
- * server-custodied SSO transition. Do not broaden this parser: unknown legacy
- * shapes must continue to fail closed instead of being guessed into policy.
- */
-function parseLegacyHybridAuthConfig(value: unknown): AuthConfig | null {
-  const root = record(value);
-  const localAuth = record(root?.local_auth);
-  const keycloak = record(root?.keycloak);
-  const mcpOauth = record(root?.mcp_oauth);
-  const keycloakEnabled = keycloak?.enabled;
-  const loginUrl = keycloak?.login_url;
-  const ssoOnly = keycloak?.sso_only;
-  const enrollmentMode = keycloak?.enrollment_mode;
-  if (
-    !hasExactKeys(root, ["local_auth", "keycloak", "mcp_oauth"]) ||
-    !hasExactKeys(localAuth, ["enabled"]) ||
-    !hasExactKeys(keycloak, ["enabled", "enrollment_mode", "login_url", "sso_only"]) ||
-    !hasExactKeys(mcpOauth, ["enabled"]) ||
-    typeof localAuth.enabled !== "boolean" ||
-    typeof keycloakEnabled !== "boolean" ||
-    typeof ssoOnly !== "boolean" ||
-    !["open", "invite_only", "disabled"].includes(String(enrollmentMode)) ||
-    typeof mcpOauth.enabled !== "boolean" ||
-    loginUrl !== (keycloakEnabled ? "/api/v1/auth/keycloak/login" : null) ||
-    (ssoOnly && !keycloakEnabled)
-  ) {
-    return null;
-  }
-
-  // `sso_only` was a server-owned presentation policy. Its recovery escape is
-  // intentionally not revived: when set, the compatibility client exposes no
-  // local form even if the old payload also reports local_auth.enabled=true.
-  const localEnabled = localAuth.enabled && !ssoOnly;
-  if (!localEnabled && !keycloakEnabled) return null;
-
-  return {
-    available: true,
-    schema_version: 1,
-    auth_mode: keycloakEnabled ? "hybrid" : "local",
-    local_auth: { enabled: localEnabled },
-    keycloak: {
-      enabled: keycloakEnabled,
-      // Legacy Keycloak exchanges into a Bearer JWT. It is intentionally not
-      // represented as the v2 HttpOnly browser-session transport.
-      browser_session_ready: false,
-    },
-    providers: keycloakEnabled
-      ? [{
-          provider_type: "legacy-keycloak-oidc",
-          alias: "legacy-keycloak",
-          display_name: "SSO",
-          login_url: "/api/v1/auth/keycloak/login",
-        }]
-      : [],
-    mcp_oauth: { enabled: mcpOauth.enabled },
-  };
-}
-
 export function parseAuthConfig(value: unknown): AuthConfig {
-  return (
-    parseV2AuthConfig(value) ??
-    parseLegacyHybridAuthConfig(value) ??
-    AUTH_CONFIG_UNAVAILABLE
-  );
+  return parseV2AuthConfig(value) ?? AUTH_CONFIG_UNAVAILABLE;
 }
 
 /** Versioned public capabilities. Any transport/schema error is deny-all. */
@@ -637,7 +521,7 @@ export async function getAuthConfig(): Promise<AuthConfig> {
     if (!response.ok) return AUTH_CONFIG_UNAVAILABLE;
     const config = parseAuthConfig(await response.json());
     if (config.available && config.auth_mode !== null) {
-      configureAuthTransport(config.auth_mode === "hybrid" ? "local" : config.auth_mode);
+      configureAuthTransport(config.auth_mode);
     }
     return config;
   } catch {
@@ -1048,6 +932,568 @@ export function setAdminSsoProviderEnabled(
   ).then(parseAdminSsoMutation);
 }
 
+export interface AdminRealmResidueAccount {
+  realm_user_id: string;
+  username: string;
+  created_at: string | null;
+  /** Null for residue: nothing in AKB refers to this realm account. */
+  arrival: { admission_id: string; last_seen_at: string } | null;
+}
+
+interface AdminRealmAccountResidueBase {
+  schema_version: 1;
+  scan_limit: number;
+}
+
+/**
+ * Realm accounts minus (exact AKB bindings and recorded arrivals). An
+ * unavailable read carries no counts at all, so it can never render as zero.
+ */
+export type AdminRealmAccountResidue =
+  | (AdminRealmAccountResidueBase & {
+      state: "available";
+      unavailable_code: null;
+      truncated: boolean;
+      realm_account_count: number;
+      bound_count: number;
+      pending_arrival_count: number;
+      residue_count: number;
+      accounts: AdminRealmResidueAccount[];
+    })
+  | (AdminRealmAccountResidueBase & {
+      state: "unavailable";
+      unavailable_code: string;
+      truncated: null;
+      realm_account_count: null;
+      bound_count: null;
+      pending_arrival_count: null;
+      residue_count: null;
+      accounts: null;
+    });
+
+const REALM_RESIDUE_KEYS = [
+  "schema_version", "state", "unavailable_code", "scan_limit", "truncated",
+  "realm_account_count", "bound_count", "pending_arrival_count",
+  "residue_count", "accounts",
+] as const;
+const REALM_RESIDUE_SCAN_LIMIT_MAX = 10_000;
+const REALM_RESIDUE_LIST_MAX = 1_000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function isCount(value: unknown, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= max;
+}
+
+function isBoundedText(value: unknown, max: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= max && !hasControlCharacters(value);
+}
+
+function isTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 64 && /^\d{4}-\d{2}-\d{2}T/.test(value) && !Number.isNaN(Date.parse(value));
+}
+
+function parseRealmResidueAccount(value: unknown): AdminRealmResidueAccount {
+  const account = record(value);
+  if (!hasExactKeys(account, ["realm_user_id", "username", "created_at", "arrival"])) {
+    throw new Error("Invalid realm account residue response");
+  }
+  const arrival = account.arrival === null ? null : record(account.arrival);
+  if (
+    !isBoundedText(account.realm_user_id, 1024) ||
+    !isBoundedText(account.username, 255) ||
+    (account.created_at !== null && !isTimestamp(account.created_at)) ||
+    (account.arrival !== null && (
+      !hasExactKeys(arrival, ["admission_id", "last_seen_at"]) ||
+      typeof arrival.admission_id !== "string" ||
+      !UUID_PATTERN.test(arrival.admission_id) ||
+      !isTimestamp(arrival.last_seen_at)
+    ))
+  ) {
+    throw new Error("Invalid realm account residue response");
+  }
+  return {
+    realm_user_id: account.realm_user_id,
+    username: account.username,
+    created_at: account.created_at as string | null,
+    arrival: arrival === null
+      ? null
+      : { admission_id: arrival.admission_id as string, last_seen_at: arrival.last_seen_at as string },
+  };
+}
+
+export function parseAdminRealmAccountResidue(value: unknown): AdminRealmAccountResidue {
+  const root = record(value);
+  if (
+    !hasExactKeys(root, REALM_RESIDUE_KEYS) ||
+    root.schema_version !== 1 ||
+    !isCount(root.scan_limit, REALM_RESIDUE_SCAN_LIMIT_MAX) ||
+    root.scan_limit < 1
+  ) {
+    throw new Error("Invalid realm account residue response");
+  }
+  const scanLimit = root.scan_limit;
+  if (root.state === "unavailable") {
+    if (
+      typeof root.unavailable_code !== "string" ||
+      !/^[a-z0-9_]{1,80}$/.test(root.unavailable_code) ||
+      root.truncated !== null ||
+      root.realm_account_count !== null ||
+      root.bound_count !== null ||
+      root.pending_arrival_count !== null ||
+      root.residue_count !== null ||
+      root.accounts !== null
+    ) {
+      throw new Error("Invalid realm account residue response");
+    }
+    return {
+      schema_version: 1,
+      state: "unavailable",
+      unavailable_code: root.unavailable_code,
+      scan_limit: scanLimit,
+      truncated: null,
+      realm_account_count: null,
+      bound_count: null,
+      pending_arrival_count: null,
+      residue_count: null,
+      accounts: null,
+    };
+  }
+  const values = root.accounts;
+  if (
+    root.state !== "available" ||
+    root.unavailable_code !== null ||
+    typeof root.truncated !== "boolean" ||
+    !isCount(root.realm_account_count, scanLimit) ||
+    !isCount(root.bound_count, scanLimit) ||
+    !isCount(root.pending_arrival_count, scanLimit) ||
+    !isCount(root.residue_count, scanLimit) ||
+    // Every account read lands in exactly one partition.
+    root.realm_account_count !== root.bound_count + root.pending_arrival_count + root.residue_count ||
+    !Array.isArray(values) ||
+    values.length > REALM_RESIDUE_LIST_MAX ||
+    values.length > root.pending_arrival_count + root.residue_count
+  ) {
+    throw new Error("Invalid realm account residue response");
+  }
+  const accounts = values.map(parseRealmResidueAccount);
+  const listedResidue = accounts.filter((account) => account.arrival === null).length;
+  if (
+    new Set(accounts.map((account) => account.realm_user_id)).size !== accounts.length ||
+    listedResidue > root.residue_count ||
+    accounts.length - listedResidue > root.pending_arrival_count
+  ) {
+    throw new Error("Invalid realm account residue response");
+  }
+  return {
+    schema_version: 1,
+    state: "available",
+    unavailable_code: null,
+    scan_limit: scanLimit,
+    truncated: root.truncated,
+    realm_account_count: root.realm_account_count,
+    bound_count: root.bound_count,
+    pending_arrival_count: root.pending_arrival_count,
+    residue_count: root.residue_count,
+    accounts,
+  };
+}
+
+export async function getAdminRealmAccountResidue(): Promise<AdminRealmAccountResidue> {
+  const response = await fetch(`${API_BASE}/admin/sso/realm-account-residue`, {
+    credentials: "same-origin",
+    headers: adminSsoHeaders(),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminRealmAccountResidue(await response.json());
+}
+
+// ── Provider ownership and operation requests (product admin) ──
+
+/** Who owns a provider alias, and what the screen must echo to change it. */
+export interface AdminSsoOwnership {
+  schema_version: 1;
+  target_id: string;
+  provider_alias: string;
+  owner_id: string | null;
+  revision: number;
+  fingerprint: string;
+  provider_secret_revision: string | null;
+  drifted: boolean;
+  emergency_disabled: boolean;
+}
+
+const OWNERSHIP_KEYS = [
+  "schema_version", "target_id", "provider_alias", "owner_id", "revision", "fingerprint",
+  "provider_secret_revision", "drifted", "emergency_disabled",
+] as const;
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const PROVIDER_ALIAS_PATTERN = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+
+function isNullableText(value: unknown, max: number): value is string | null {
+  return value === null || isBoundedText(value, max);
+}
+
+export function parseAdminSsoOwnership(value: unknown): AdminSsoOwnership {
+  const root = record(value);
+  if (
+    !hasExactKeys(root, OWNERSHIP_KEYS) ||
+    root.schema_version !== 1 ||
+    typeof root.target_id !== "string" || !UUID_PATTERN.test(root.target_id) ||
+    typeof root.provider_alias !== "string" || !PROVIDER_ALIAS_PATTERN.test(root.provider_alias) ||
+    !isNullableText(root.owner_id, 255) ||
+    !isCount(root.revision, Number.MAX_SAFE_INTEGER) ||
+    typeof root.fingerprint !== "string" || !SHA256_PATTERN.test(root.fingerprint) ||
+    !isNullableText(root.provider_secret_revision, 255) ||
+    typeof root.drifted !== "boolean" ||
+    typeof root.emergency_disabled !== "boolean"
+  ) {
+    throw new Error("Invalid SSO provider ownership response");
+  }
+  return {
+    schema_version: 1,
+    target_id: root.target_id,
+    provider_alias: root.provider_alias,
+    owner_id: root.owner_id,
+    revision: root.revision,
+    fingerprint: root.fingerprint,
+    provider_secret_revision: root.provider_secret_revision,
+    drifted: root.drifted,
+    emergency_disabled: root.emergency_disabled,
+  };
+}
+
+export async function getAdminSsoOwnership(alias: string): Promise<AdminSsoOwnership> {
+  const response = await fetch(`${API_BASE}/admin/sso/providers/${encodeURIComponent(alias)}/ownership`, {
+    credentials: "same-origin",
+    headers: adminSsoHeaders(),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSsoOwnership(await response.json());
+}
+
+/** A compare-and-set on exactly the revision and fingerprint the screen showed. */
+export interface AdminSsoOwnershipChange {
+  owner_id: string | null;
+  expected_revision: number;
+  expected_fingerprint: string;
+  clear_emergency: boolean;
+}
+
+export async function setAdminSsoOwnership(
+  alias: string,
+  input: AdminSsoOwnershipChange,
+): Promise<AdminSsoOwnership> {
+  const response = await fetch(`${API_BASE}/admin/sso/providers/${encodeURIComponent(alias)}/ownership`, {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: adminSsoHeaders({ mutation: true }),
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSsoOwnership(await response.json());
+}
+
+export type AdminSsoOperationRequestStatus =
+  | "pending" | "approved" | "denied" | "cancelled" | "expired" | "collected";
+export type AdminSsoProviderVerb = "configure" | "enable" | "disable";
+
+export interface AdminSsoConfigureSummary {
+  provider_type: string;
+  display_name: string;
+  issuer: string;
+  discovery_url: string;
+  client_id: string;
+  client_secret_supplied: boolean;
+}
+
+export interface AdminSsoOperationRequestDocument {
+  schema_version: 1;
+  request_id: string;
+  kind: "ownership_claim" | "provider_grant";
+  installation_id: string;
+  target_id: string;
+  provider_alias: string;
+  owner_id: string;
+  requested_by: string;
+  requested_token_id: string;
+  claim: { expected_revision: number; expected_fingerprint: string } | null;
+  grant: {
+    operation_id: string;
+    source: {
+      auth_mode: "local" | "sso";
+      issuer: string | null;
+      runtime_generation: number;
+      sso_session_epoch: string | null;
+      source_revision: string | null;
+    };
+    expected_provider_revision: number;
+    verbs: AdminSsoProviderVerb[];
+    provider_payload_sha256: Partial<Record<AdminSsoProviderVerb, string>>;
+    configure_summary: AdminSsoConfigureSummary | null;
+    ttl_seconds: number;
+    provider_secret_revision: string | null;
+    recipient_public_key: string;
+  } | null;
+}
+
+/**
+ * A secret-free operation request. The parser accepts exactly these keys, so a
+ * response that ever carried a credential would be refused, not rendered.
+ */
+export interface AdminSsoOperationRequest {
+  schema_version: 1;
+  request_id: string;
+  request_sha256: string;
+  request: AdminSsoOperationRequestDocument;
+  status: AdminSsoOperationRequestStatus;
+  created_at: string;
+  expires_at: string;
+  requester_username: string | null;
+  decided_by: string | null;
+  decider_username: string | null;
+  decided_at: string | null;
+  operation_expires_at: string | null;
+  closed_at: string | null;
+}
+
+const OPERATION_REQUEST_KEYS = [
+  "schema_version", "request_id", "request_sha256", "request", "status", "created_at", "expires_at",
+  "requester_username", "decided_by", "decider_username", "decided_at", "operation_expires_at", "closed_at",
+] as const;
+const OPERATION_REQUEST_DOCUMENT_KEYS = [
+  "schema_version", "request_id", "kind", "installation_id", "target_id", "provider_alias", "owner_id",
+  "requested_by", "requested_token_id", "claim", "grant",
+] as const;
+const OPERATION_GRANT_KEYS = [
+  "operation_id", "source", "expected_provider_revision", "verbs", "provider_payload_sha256",
+  "configure_summary", "ttl_seconds", "provider_secret_revision", "recipient_public_key",
+] as const;
+const CONFIGURE_SUMMARY_KEYS = [
+  "provider_type", "display_name", "issuer", "discovery_url", "client_id", "client_secret_supplied",
+] as const;
+const OPERATION_REQUEST_STATUSES: readonly AdminSsoOperationRequestStatus[] = [
+  "pending", "approved", "denied", "cancelled", "expired", "collected",
+];
+const PROVIDER_VERBS: readonly AdminSsoProviderVerb[] = ["configure", "enable", "disable"];
+const OPERATION_REQUEST_LIST_MAX = 100;
+
+function isUuid(value: unknown): value is string {
+  return typeof value === "string" && UUID_PATTERN.test(value);
+}
+
+function isNullableTimestamp(value: unknown): value is string | null {
+  return value === null || isTimestamp(value);
+}
+
+function parseConfigureSummary(value: unknown): AdminSsoConfigureSummary {
+  const summary = record(value);
+  if (
+    !hasExactKeys(summary, CONFIGURE_SUMMARY_KEYS) ||
+    !isBoundedText(summary.provider_type, 80) ||
+    !isBoundedText(summary.display_name, 80) ||
+    !isBoundedText(summary.issuer, 2048) ||
+    !isBoundedText(summary.discovery_url, 2048) ||
+    !isBoundedText(summary.client_id, 255) ||
+    typeof summary.client_secret_supplied !== "boolean" // pragma: allowlist secret
+  ) {
+    throw new Error("Invalid SSO operation request response");
+  }
+  return {
+    provider_type: summary.provider_type,
+    display_name: summary.display_name,
+    issuer: summary.issuer,
+    discovery_url: summary.discovery_url,
+    client_id: summary.client_id,
+    client_secret_supplied: summary.client_secret_supplied,
+  };
+}
+
+function parseOperationGrant(value: unknown): NonNullable<AdminSsoOperationRequestDocument["grant"]> {
+  const grant = record(value);
+  const source = record(grant?.source);
+  const hashes = record(grant?.provider_payload_sha256);
+  const verbs = grant?.verbs;
+  if (
+    !hasExactKeys(grant, OPERATION_GRANT_KEYS) ||
+    !hasExactKeys(source, ["auth_mode", "issuer", "runtime_generation", "sso_session_epoch", "source_revision"]) ||
+    (source.auth_mode !== "local" && source.auth_mode !== "sso") ||
+    !isNullableText(source.issuer, 2048) ||
+    !isCount(source.runtime_generation, Number.MAX_SAFE_INTEGER) ||
+    (source.sso_session_epoch !== null && !isUuid(source.sso_session_epoch)) ||
+    (source.source_revision !== null && (typeof source.source_revision !== "string" || !/^[a-f0-9]{40}$/.test(source.source_revision))) ||
+    !isUuid(grant.operation_id) ||
+    !isCount(grant.expected_provider_revision, Number.MAX_SAFE_INTEGER) ||
+    !Array.isArray(verbs) ||
+    verbs.length === 0 ||
+    verbs.some((verb) => !PROVIDER_VERBS.includes(verb as AdminSsoProviderVerb)) ||
+    new Set(verbs).size !== verbs.length ||
+    !hashes ||
+    Object.keys(hashes).sort().join() !== [...verbs].sort().join() ||
+    Object.values(hashes).some((hash) => typeof hash !== "string" || !SHA256_PATTERN.test(hash)) ||
+    !isCount(grant.ttl_seconds, 600) ||
+    grant.ttl_seconds < 1 ||
+    !isNullableText(grant.provider_secret_revision, 255) ||
+    typeof grant.recipient_public_key !== "string" ||
+    !/^[A-Za-z0-9_-]{43}$/.test(grant.recipient_public_key) ||
+    (verbs.includes("configure") !== (grant.configure_summary !== null))
+  ) {
+    throw new Error("Invalid SSO operation request response");
+  }
+  return {
+    operation_id: grant.operation_id,
+    source: {
+      auth_mode: source.auth_mode,
+      issuer: source.issuer,
+      runtime_generation: source.runtime_generation,
+      sso_session_epoch: source.sso_session_epoch as string | null,
+      source_revision: source.source_revision as string | null,
+    },
+    expected_provider_revision: grant.expected_provider_revision,
+    verbs: verbs as AdminSsoProviderVerb[],
+    provider_payload_sha256: hashes as Partial<Record<AdminSsoProviderVerb, string>>,
+    configure_summary: grant.configure_summary === null ? null : parseConfigureSummary(grant.configure_summary),
+    ttl_seconds: grant.ttl_seconds,
+    provider_secret_revision: grant.provider_secret_revision,
+    recipient_public_key: grant.recipient_public_key,
+  };
+}
+
+function parseOperationRequestDocument(value: unknown): AdminSsoOperationRequestDocument {
+  const document = record(value);
+  const claim = document?.claim === null ? null : record(document?.claim);
+  if (
+    !hasExactKeys(document, OPERATION_REQUEST_DOCUMENT_KEYS) ||
+    document.schema_version !== 1 ||
+    !isUuid(document.request_id) ||
+    (document.kind !== "ownership_claim" && document.kind !== "provider_grant") ||
+    !isUuid(document.installation_id) ||
+    !isUuid(document.target_id) ||
+    typeof document.provider_alias !== "string" || !PROVIDER_ALIAS_PATTERN.test(document.provider_alias) ||
+    !isBoundedText(document.owner_id, 255) ||
+    !isUuid(document.requested_by) ||
+    !isUuid(document.requested_token_id) ||
+    (document.kind === "ownership_claim") !== (claim !== null && document.grant === null) ||
+    (claim !== null && (
+      !hasExactKeys(claim, ["expected_revision", "expected_fingerprint"]) ||
+      !isCount(claim.expected_revision, Number.MAX_SAFE_INTEGER) ||
+      typeof claim.expected_fingerprint !== "string" || !SHA256_PATTERN.test(claim.expected_fingerprint)
+    ))
+  ) {
+    throw new Error("Invalid SSO operation request response");
+  }
+  return {
+    schema_version: 1,
+    request_id: document.request_id,
+    kind: document.kind,
+    installation_id: document.installation_id,
+    target_id: document.target_id,
+    provider_alias: document.provider_alias,
+    owner_id: document.owner_id,
+    requested_by: document.requested_by,
+    requested_token_id: document.requested_token_id,
+    claim: claim === null ? null : {
+      expected_revision: claim.expected_revision as number,
+      expected_fingerprint: claim.expected_fingerprint as string,
+    },
+    grant: document.kind === "provider_grant" ? parseOperationGrant(document.grant) : null,
+  };
+}
+
+export function parseAdminSsoOperationRequest(value: unknown): AdminSsoOperationRequest {
+  const root = record(value);
+  if (
+    !hasExactKeys(root, OPERATION_REQUEST_KEYS) ||
+    root.schema_version !== 1 ||
+    !isUuid(root.request_id) ||
+    typeof root.request_sha256 !== "string" || !SHA256_PATTERN.test(root.request_sha256) ||
+    !OPERATION_REQUEST_STATUSES.includes(root.status as AdminSsoOperationRequestStatus) ||
+    !isTimestamp(root.created_at) ||
+    !isTimestamp(root.expires_at) ||
+    !isNullableText(root.requester_username, 255) ||
+    (root.decided_by !== null && !isUuid(root.decided_by)) ||
+    !isNullableText(root.decider_username, 255) ||
+    !isNullableTimestamp(root.decided_at) ||
+    !isNullableTimestamp(root.operation_expires_at) ||
+    !isNullableTimestamp(root.closed_at) ||
+    ((root.status === "approved" || root.status === "denied" || root.status === "collected") &&
+      (root.decided_by === null || root.decided_at === null))
+  ) {
+    throw new Error("Invalid SSO operation request response");
+  }
+  const request = parseOperationRequestDocument(root.request);
+  if (request.request_id !== root.request_id) {
+    throw new Error("Invalid SSO operation request response");
+  }
+  return {
+    schema_version: 1,
+    request_id: root.request_id,
+    request_sha256: root.request_sha256,
+    request,
+    status: root.status as AdminSsoOperationRequestStatus,
+    created_at: root.created_at,
+    expires_at: root.expires_at,
+    requester_username: root.requester_username,
+    decided_by: root.decided_by as string | null,
+    decider_username: root.decider_username,
+    decided_at: root.decided_at,
+    operation_expires_at: root.operation_expires_at,
+    closed_at: root.closed_at,
+  };
+}
+
+export function parseAdminSsoOperationRequests(value: unknown): AdminSsoOperationRequest[] {
+  const root = record(value);
+  const values = root?.requests;
+  if (
+    !hasExactKeys(root, ["schema_version", "requests"]) ||
+    root.schema_version !== 1 ||
+    !Array.isArray(values) ||
+    values.length > OPERATION_REQUEST_LIST_MAX
+  ) {
+    throw new Error("Invalid SSO operation request list response");
+  }
+  const requests = values.map(parseAdminSsoOperationRequest);
+  if (new Set(requests.map((request) => request.request_id)).size !== requests.length) {
+    throw new Error("Invalid SSO operation request list response");
+  }
+  return requests;
+}
+
+export async function getAdminSsoOperationRequests(): Promise<AdminSsoOperationRequest[]> {
+  const response = await fetch(`${API_BASE}/admin/sso/operation-requests`, {
+    credentials: "same-origin",
+    headers: adminSsoHeaders(),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSsoOperationRequests(await response.json());
+}
+
+async function decideAdminSsoOperationRequest(
+  requestId: string,
+  decision: "approve" | "deny",
+  requestSha256: string,
+): Promise<AdminSsoOperationRequest> {
+  const response = await fetch(
+    `${API_BASE}/admin/sso/operation-requests/${encodeURIComponent(requestId)}/${decision}`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: adminSsoHeaders({ mutation: true }),
+      body: JSON.stringify({ expected_request_sha256: requestSha256 }),
+    },
+  );
+  if (!response.ok) await throwJsonApiError(response);
+  return parseAdminSsoOperationRequest(await response.json());
+}
+
+/** Approve exactly the request digest the screen showed. */
+export const approveAdminSsoOperationRequest = (requestId: string, requestSha256: string) =>
+  decideAdminSsoOperationRequest(requestId, "approve", requestSha256);
+
+/** Deny exactly the request digest the screen showed. */
+export const denyAdminSsoOperationRequest = (requestId: string, requestSha256: string) =>
+  decideAdminSsoOperationRequest(requestId, "deny", requestSha256);
+
 // ── Auth (ordinary browser session) ──
 export interface AvatarState {
   revision: string | null;
@@ -1096,12 +1542,8 @@ export interface OrdinaryLogoutResult {
 export async function logoutOrdinarySession(): Promise<OrdinaryLogoutResult> {
   const mode = _authMode === "sso" ? "sso" : "local";
   if (mode === "local") {
-    const legacyLogout = legacySsoLogoutUrl();
     setToken(null);
-    clearLegacySsoSession();
-    return legacyLogout
-      ? { mode: "sso", logout_url: legacyLogout }
-      : { mode, logout_url: "/auth" };
+    return { mode, logout_url: "/auth" };
   }
   const response = await authenticatedFetch(
     `${API_BASE}/auth/logout`,
@@ -1137,14 +1579,6 @@ export async function logoutOrdinarySession(): Promise<OrdinaryLogoutResult> {
   clearPrivateAssetCache();
   return { mode, logout_url: navigation.href };
 }
-
-/** Redeem the legacy one-time Keycloak callback code for an AKB Bearer JWT. */
-export const keycloakExchange = (code: string) =>
-  fetch(`${API_BASE}/auth/keycloak/exchange`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code }),
-  }).then(parseAuthResponse);
 
 export const createPAT = (name: string, scopes?: string[], expires_days?: number) =>
   api<any>("/auth/tokens", { method: "POST", body: JSON.stringify({ name, scopes, expires_days }) });

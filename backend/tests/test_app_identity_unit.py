@@ -70,7 +70,6 @@ def test_app_token_contains_identity_not_registry_authority(monkeypatch):
 
 def test_matching_system_hmac_and_app_signing_secrets_fail_closed(monkeypatch):
     monkeypatch.setattr(settings, "system_hmac_secret", "same-signing-material", raising=False)
-    monkeypatch.setattr(settings, "jwt_secret", "irrelevant-migration-input", raising=False)
     monkeypatch.setattr(settings, "app_token_secret", "same-signing-material", raising=False)
 
     with pytest.raises(AKBError) as exc:
@@ -92,7 +91,7 @@ async def test_explicit_app_token_type_never_reaches_user_lookup(monkeypatch):
             "iat": now,
             "exp": now + timedelta(minutes=5),
         },
-        settings.system_hmac_secret_effective,
+        settings.system_hmac_secret,
         algorithm="HS256",
         headers={"typ": app_identity_service.APP_TOKEN_TYPE},
     )

@@ -1,6 +1,6 @@
 import { readWithAccessBoundary } from "@/lib/query-access-boundary";
 import { Button } from "@/components/ui/button";
-import { useState, type ReactNode } from "react";
+import { useState, type ReactNode, type CSSProperties } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getDocument } from "@/lib/api";
 import { MarkdownRender } from "@/components/markdown-render";
@@ -11,6 +11,8 @@ import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
+import { RawDocumentText } from "@/components/document-reader-tools";
+import { useReaderPreferences } from "@/lib/reader-preferences";
 
 type ViewMode = "rendered" | "raw";
 
@@ -34,6 +36,7 @@ interface DocumentViewProps {
   bodyOnly?: boolean;
   idPrefix?: string;
   leadingMetadata?: ReactNode;
+  searchable?: boolean;
 }
 
 /**
@@ -62,11 +65,13 @@ export function DocumentView({
   bodyOnly = false,
   idPrefix = "docview",
   leadingMetadata,
+  searchable = false,
 }: DocumentViewProps) {
   const queryClient = useQueryClient();
   const user = useCurrentUser();
   const { checking, revision } = useAccessVerification();
   const [localView, setLocalView] = useState<ViewMode>("rendered");
+  const { preferences } = useReaderPreferences();
 
   // Controlled vs. uncontrolled view mode
   const view = viewProp ?? localView;
@@ -107,6 +112,7 @@ export function DocumentView({
   return (
     <section
       aria-label="Document content"
+      style={{ "--reader-font-size": `${preferences.fontSize / 16}rem`, "--reader-measure": preferences.width === "compact" ? "36rem" : preferences.width === "wide" ? "64rem" : "var(--reader-standard-measure, 52rem)" } as CSSProperties}
       className={cn(
         "document-reading-container",
         fileAppearance && !bodyOnly &&
@@ -134,6 +140,7 @@ export function DocumentView({
           style={{ maxWidth: "100%" }}
         >
           <MarkdownRender
+            searchable={searchable}
             markdown={doc.content || ""}
             summary={doc.summary}
             leadingMetadata={leadingMetadata}
@@ -159,7 +166,7 @@ export function DocumentView({
             data-testid="doc-raw"
             className="document-reading-source m-0 wrap-anywhere overflow-x-auto whitespace-pre-wrap font-mono text-[13px] leading-[1.65] text-foreground"
           >
-            {doc.content || ""}
+            <RawDocumentText text={doc.content || ""} searchable={searchable} />
           </pre>
         </div>
       )}

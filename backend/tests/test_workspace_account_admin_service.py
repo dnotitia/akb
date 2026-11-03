@@ -521,7 +521,7 @@ async def test_ensure_service_user_is_noninteractive_idempotent_and_non_admin(
         scopes=["read", "write"],
     )
 
-    monkeypatch.setattr(settings, "local_auth_enabled", False, raising=False)
+    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
     resolved = await resolve_token(f"Bearer {credential['token']}")
     assert resolved is not None
     assert resolved.user_id == first["user_id"]

@@ -90,8 +90,7 @@ export function Layout({ routeOverlay, protectBackgroundDrafts = false }: { rout
       if (
         config.available !== true ||
         config.auth_mode === null ||
-        ((config.auth_mode === "local" || config.auth_mode === "hybrid") &&
-          !getToken())
+        (config.auth_mode === "local" && !getToken())
       ) {
         if (!cancelled) setSession({ status: "unauthenticated", user: null });
         return;

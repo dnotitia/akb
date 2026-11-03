@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import difflib
 import hashlib
-import importlib.util
 import json
 import os
 import subprocess
@@ -33,6 +32,7 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+from app.db import postgres  # noqa: E402
 from app.exceptions import ConflictError, NotFoundError  # noqa: E402
 from app.services.m1_native_grep_service import M1NativeGrepService  # noqa: E402
 from app.services.m1_pg_body_store import M1PgBodyStore  # noqa: E402
@@ -271,22 +271,11 @@ async def initialise_measurement_database(dsn: str) -> tuple[asyncpg.Pool, uuid.
     try:
         database = await conn.fetchval("SELECT current_database()")
         validate_measurement_database(str(database))
-        init_sql = (BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8")
-        await conn.execute(init_sql)
-        for filename in (
-            "048_native_revision_core.py",
-            "053_native_revision_m1_pg_body.py",
-            "057_native_revision_m1_payload_placement.py",
-        ):
-            migration_path = BACKEND / "app" / "db" / "migrations" / filename
-            spec = importlib.util.spec_from_file_location(
-                f"akb_native_revision_m1_{filename.replace('.', '_')}", migration_path
-            )
-            if spec is None or spec.loader is None:
-                raise AdapterError(f"cannot load native revision migration: {filename}")
-            migration = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(migration)
-            await migration.migrate(conn=conn)
+        # The server's own boot path: init.sql, then every registered migration
+        # in its order (048, 053 and 057 among them). The native writer this
+        # adapter drives reaches tables later migrations add, so a hand-kept
+        # subset stops being able to run it at the next such migration.
+        await postgres._run_boot_schema(conn, init_sql=(BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8"))
         namespace = await conn.fetchval(
             "INSERT INTO vaults (name, git_path) VALUES ($1, $2) RETURNING id",
             f"m1-native-{uuid.uuid4().hex}",

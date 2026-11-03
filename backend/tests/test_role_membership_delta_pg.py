@@ -231,6 +231,10 @@ async def test_foreign_token_membership_prevents_false_success_and_rolls_back():
             await conn.execute(f'DROP OWNED BY "{token}"; DROP ROLE "{token}"')
 
 
+@pytest.mark.needs_resource(
+    "an exclusively owned PostgreSQL cluster (AKB_ROLE_CLUSTER_EXCLUSIVE=1); "
+    "the live-PG job runs it in its own step before any other DB fixture"
+)
 async def test_full_reconcile_preserves_similarly_prefixed_operator_roles():
     # PostgreSQL roles are cluster-global. This full prune oracle must run
     # separately before other fixtures allocate UUID roles in another DB.

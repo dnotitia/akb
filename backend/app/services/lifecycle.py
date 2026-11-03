@@ -92,7 +92,7 @@ def _validate_required_settings() -> None:
     if settings.mcp_oauth_enabled and settings.api_oauth_audience_effective == settings.mcp_oauth_audience_effective:
         raise RuntimeError("API and MCP OAuth audiences must be distinct resource identifiers")
     missing: list[str] = []
-    if not settings.system_hmac_secret_effective:
+    if not settings.system_hmac_secret:
         missing.append("system_hmac_secret (internal non-session HMAC material — use a strong random string)")
     if auth_mode == "local":
         if not settings.local_session_private_key_path.strip():
