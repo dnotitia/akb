@@ -1138,7 +1138,8 @@ body::before {
   min-width: 0;
   max-width: var(--document-reading-measure);
   margin-inline: auto;
-  overflow-wrap: anywhere;
+  /* Wrap long prose without shrinking the intrinsic width of table cells. */
+  overflow-wrap: break-word;
 }
 .document-reading-flow .ProseMirror :where(pre, .akb-md-table) { max-width: 100%; }
 .document-reading-flow .ProseMirror > :first-child { margin-top: 0; }
