@@ -16,6 +16,45 @@ from mcp_catalog.state import evaluate_checkpoint_contract, evaluate_state_contr
 ROOT = Path(__file__).parents[1]
 
 
+def test_state_reasons_survive_task_json_key_reordering() -> None:
+    from mcp_catalog.contracts import TaskManifest
+
+    task = next(task for task in load_task_corpus(ROOT / "corpus/tasks.json") if task.id == "knowledge-workflow-ko")
+    reloaded = TaskManifest.model_validate(json.loads(json.dumps(task.model_dump(mode="json"), sort_keys=True)))
+    before = StateObservation(True, 404, {})
+    after = StateObservation(True, 200, {"items": []})
+    original = evaluate_state_contract(task.expected_final_state, before, after)
+    assert original == evaluate_state_contract(reloaded.expected_final_state, before, after)
+    changed = reloaded.model_copy(deep=True)
+    changed.expected_final_state.observation_sets[0].must[0].value["name"] = "different"
+    assert original != evaluate_state_contract(changed.expected_final_state, before, after)
+
+
+def test_skipped_before_observation_requires_the_exact_sentinel() -> None:
+    from mcp_catalog.runner import _state_observations
+
+    task = next(task for task in load_task_corpus(ROOT / "corpus/tasks.json") if task.id == "stdio-image-files-en")
+    records = [
+        {"available": True, "status_code": item.resolved_before_expected_status, "payload": {}, "error": None}
+        if item.check_before else {"available": True, "status_code": None, "payload": None, "error": None}
+        for item in task.expected_final_state.observation_sets
+    ]
+    outcome = TrialOutcome(
+        task_id=task.id, category=task.category, arm="baseline", model_class="primary",
+        model_id="fixture-model", transport="stdio", state_observations_before=records,
+    )
+    assert len(_state_observations(outcome, task, before=True)) == len(records)
+    skipped = next(i for i, item in enumerate(task.expected_final_state.observation_sets) if not item.check_before)
+    outcome.state_observations_before[skipped]["payload"] = {"fabricated": True}
+    with pytest.raises(ValueError, match="registered HTTP status"):
+        _state_observations(outcome, task, before=True)
+    outcome.state_observations_before[skipped]["payload"] = None
+    checked = next(i for i, item in enumerate(task.expected_final_state.observation_sets) if item.check_before)
+    outcome.state_observations_before[checked]["status_code"] = 500
+    with pytest.raises(ValueError, match="registered HTTP status"):
+        _state_observations(outcome, task, before=True)
+
+
 def _contract(
     *,
     must=(),

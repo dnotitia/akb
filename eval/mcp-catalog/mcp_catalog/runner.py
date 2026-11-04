@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.metadata
+import json
 import math
 import os
 import platform
@@ -31,6 +32,7 @@ from .checkpoint import (
     SmokeTransport,
     valid_completed_outcome,
     valid_smoke_outcome,
+    _smoke_response_has_usage,
 )
 from .contracts import (
     ArmName,
@@ -45,7 +47,7 @@ from .contracts import (
     load_tool_coverage,
     validate_public_catalog,
 )
-from .evidence import redact_exception, redact_text, serialize_report, write_json, safe_json
+from .evidence import SECRET_KEY_RE, redact_exception, redact_text, serialize_report, write_json, safe_json
 from .execution import (
     BudgetLedger,
     BudgetExceeded,
@@ -200,7 +202,7 @@ class CredentialResolver:
         return value
 
     def secrets_for(self, profile: str) -> tuple[str, ...]:
-        return tuple(dict.fromkeys((*self.model_secrets, self.token_for(profile))))
+        return tuple(dict.fromkeys((*self.secret_values(), self.token_for(profile))))
 
     def required_profiles(self, tasks: list[TaskManifest]) -> list[str]:
         return sorted({task.fixture.credential_profile for task in tasks})
@@ -1000,7 +1002,7 @@ class BenchmarkRunner:
                 incomplete_reasons.add("benchmark incomplete: checkpoint and artifact trial counts differ")
             if checkpoint_doc.reserved_cost_usd != 0:
                 incomplete_reasons.add("benchmark incomplete: checkpoint has an orphaned reservation")
-        if ledger.reserved_cost_usd != Decimal("0"):
+        if self.shared_ledger is None and ledger.reserved_cost_usd != Decimal("0"):
             incomplete_reasons.add("benchmark incomplete: artifact has an orphaned reservation")
         if checkpoint_doc is not None:
             budget_model_requests = checkpoint_doc.spent.model_requests
@@ -1209,6 +1211,39 @@ class BenchmarkRunner:
         if any(value is None for value in cell_fixtures.values()):
             raise RuntimeContractError("smoke gate fixtures are incomplete", stage="smoke_gate")
 
+        observed_cells: dict[str, dict[str, Any]] = {}
+
+        def observe_cell(cell_key: str, status: str, outcome: TrialOutcome, *, reused: bool = False) -> dict[str, Any]:
+            cell = {
+                "cell": cell_key,
+                "status": status,
+                "reused": reused,
+                "outcome": safe_json(outcome.model_dump(mode="json"), self.secrets),
+            }
+            observed_cells[cell_key] = cell
+            self._smoke_gate["cells"] = [observed_cells[key] for key in required_cells if key in observed_cells]
+            return cell
+
+        async def write_smoke(cell_key: str, outcome: TrialOutcome, status: Literal["completed", "failed", "incomplete"]) -> None:
+            assert self._checkpoint_store is not None
+            await asyncio.to_thread(
+                self._checkpoint_store.record_smoke_cell,
+                cell_key,
+                outcome,
+                status=status,
+                timing=self._timing_snapshot(),
+                elapsed_wall_seconds=self._ledger.current_wall_seconds() if self._ledger is not None else None,
+                reserved_cost_usd=float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0,
+            )
+
+        async def finish_smoke_work(write: Awaitable[Any]) -> Any:
+            pending = asyncio.ensure_future(write)
+            try:
+                return await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                await asyncio.shield(pending)
+                raise
+
         async def run_cell(model_spec: Any, transport: str) -> dict[str, Any]:
             cell_key = f"{model_spec.class_name}:{transport}"
             cell_fixture = cell_fixtures[cell_key]
@@ -1219,12 +1254,7 @@ class BenchmarkRunner:
                 else None
             )
             if cached is not None:
-                return {
-                    "cell": cell_key,
-                    "status": "completed",
-                    "reused": True,
-                    "outcome": safe_json(cached.model_dump(mode="json"), self.secrets),
-                }
+                return observe_cell(cell_key, "completed", cached, reused=True)
 
             task = self._smoke_task(transport)
             model = build_model(model_spec)
@@ -1254,27 +1284,20 @@ class BenchmarkRunner:
                     error=f"benchmark incomplete: {redact_exception(exc, self.secrets)}",
                     failure_kind="budget",
                 )
+                reservation_outcome = outcome
+                observe_cell(cell_key, "incomplete", reservation_outcome)
                 if self._checkpoint_store is not None:
-                    async with self._checkpoint_lock:
-                        self._refresh_store_secrets()
-                        await asyncio.to_thread(
-                            self._checkpoint_store.record_smoke_cell,
-                            cell_key,
-                            outcome,
-                            status="incomplete",
-                            timing=self._timing_snapshot(),
-                            elapsed_wall_seconds=(
-                                self._ledger.current_wall_seconds()
-                                if self._ledger is not None
-                                else None
-                            ),
-                            reserved_cost_usd=(float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0),
-                        )
+                    async def persist_reservation_failure() -> None:
+                        async with self._checkpoint_lock:
+                            self._refresh_store_secrets()
+                            await write_smoke(cell_key, reservation_outcome, "incomplete")
+                    await finish_smoke_work(persist_reservation_failure())
                 raise RuntimeContractError(
                     f"smoke gate cell {cell_key} could not reserve its registered budget",
                     stage="smoke_gate",
                 ) from exc
 
+            cancelled = False
             try:
                 await cell_fixture.reset()
                 self._resolver = resolver
@@ -1320,7 +1343,13 @@ class BenchmarkRunner:
                             expected_server_instructions=(catalog_server_instructions or {}).get(catalog_key),
                             timing_sink=self._timing.record if self._timing is not None else None,
                         )
-                await ledger.charge(outcome, guard=request_guard)
+                await finish_smoke_work(ledger.charge(outcome, guard=request_guard))
+            except asyncio.CancelledError:
+                if outcome is None:
+                    raise
+                outcome.error = "benchmark incomplete: benchmark interrupted"
+                outcome.failure_kind = "interrupted"
+                cancelled = True
             except Exception as exc:
                 with_context = exc if isinstance(exc, RuntimeContractError) else RuntimeContractError(
                     f"smoke gate cell {cell_key} failed: {redact_exception(exc, self.secrets)}",
@@ -1342,54 +1371,95 @@ class BenchmarkRunner:
                     outcome.error = f"benchmark incomplete: {redact_exception(exc, self.secrets)}"
                     outcome.failure_kind = "budget"
             finally:
-                await request_guard.release()
+                release = asyncio.create_task(request_guard.release())
+                try:
+                    await asyncio.shield(release)
+                except asyncio.CancelledError:
+                    await asyncio.shield(release)
+                    cancelled = True
 
             assert outcome is not None
-            identity_matches = (
-                outcome.model_class == model_spec.class_name
-                and outcome.model_id == model_spec.model_id
-                and outcome.transport == transport
-                and all(
-                    item.get("model") == model_spec.model_id
-                    for item in outcome.provider_evidence
+            completed_outcome = outcome
+            valid_before_redaction = valid_smoke_outcome(completed_outcome, task)
+
+            def classify_smoke(safe_outcome: TrialOutcome) -> tuple[TrialOutcome, Literal["completed", "failed", "incomplete"]]:
+                identity_matches = (
+                    safe_outcome.task_id == task.id
+                    and safe_outcome.locale == task.locale
+                    and safe_outcome.arm == self.arm
+                    and safe_outcome.model_class == model_spec.class_name
+                    and safe_outcome.model_id == model_spec.model_id
+                    and safe_outcome.transport == transport
+                    and all(item.get("model") == model_spec.model_id for item in safe_outcome.provider_evidence)
                 )
-            )
-            valid = identity_matches and valid_smoke_outcome(outcome)
-            if not valid and outcome.error is None:
-                if not identity_matches:
-                    outcome.error = "smoke gate outcome did not match the requested model and transport"
-                    outcome.failure_kind = "provider"
-                elif outcome.successful_mcp_tool_calls == 0:
-                    outcome.error = "smoke gate did not observe a successful MCP tool call"
-                    outcome.failure_kind = "tool"
-                else:
-                    outcome.error = "smoke gate did not observe a follow-up terminal response"
-                    outcome.failure_kind = "terminal_response"
-            status: Literal["completed", "failed", "incomplete"] = "completed" if valid else (
-                "incomplete" if outcome.error and outcome.error.startswith("benchmark incomplete:") else "failed"
-            )
+                valid = identity_matches and valid_smoke_outcome(safe_outcome, task)
+                if not valid and safe_outcome.error is None:
+                    if not identity_matches:
+                        safe_outcome.error = "smoke gate outcome did not match the requested task, model and transport"
+                        safe_outcome.failure_kind = "provider"
+                    elif safe_outcome.successful_mcp_tool_calls == 0:
+                        safe_outcome.error = "smoke gate did not observe a successful MCP tool call"
+                        safe_outcome.failure_kind = "tool"
+                    elif not safe_outcome.follow_up_terminal_response:
+                        safe_outcome.error = "smoke gate did not observe a follow-up terminal response"
+                        safe_outcome.failure_kind = "terminal_response"
+                    else:
+                        if valid_before_redaction:
+                            reason = "evidence is invalid after redaction"
+                            safe_outcome.failure_kind = "unknown"
+                        elif (
+                            not safe_outcome.routing_observed or not safe_outcome.routing_valid
+                            or safe_outcome.model_requests < 2
+                            or len(safe_outcome.provider_evidence) != safe_outcome.model_requests
+                            or not all(_smoke_response_has_usage(item, safe_outcome.model_id) for item in safe_outcome.provider_evidence)
+                        ):
+                            reason = "provider usage or routing evidence is incomplete"
+                            safe_outcome.failure_kind = "provider"
+                        elif valid_smoke_outcome(safe_outcome):
+                            reason = "task-specific measurement evidence is missing"
+                            safe_outcome.failure_kind = "unknown"
+                        else:
+                            reason = "state or raw call evidence is incomplete"
+                            safe_outcome.failure_kind = "unknown"
+                        safe_outcome.error = f"benchmark incomplete: smoke gate {reason}"
+                status: Literal["completed", "failed", "incomplete"] = "completed" if valid else (
+                    "incomplete" if safe_outcome.error and safe_outcome.error.startswith("benchmark incomplete:") else "failed"
+                )
+                for call in safe_outcome.tool_calls:
+                    raw = call.raw_model_args
+                    if not isinstance(raw, str):
+                        continue
+                    try:
+                        decoded = json.loads(raw)
+                    except json.JSONDecodeError:
+                        if SECRET_KEY_RE.search(raw):
+                            call.raw_model_args = "[redacted]"
+                        continue
+                    redacted = safe_json(decoded, self.secrets)
+                    if redacted != decoded:
+                        call.raw_model_args = json.dumps(redacted, ensure_ascii=False)
+                if status == "completed" and not valid_smoke_outcome(safe_outcome, task):
+                    safe_outcome.error = "benchmark incomplete: smoke gate evidence is invalid after redaction"
+                    safe_outcome.failure_kind = "unknown"
+                    status = "incomplete"
+                return safe_outcome, status
+
             if self._checkpoint_store is not None:
-                async with self._checkpoint_lock:
-                    self._refresh_store_secrets()
-                    await asyncio.to_thread(
-                        self._checkpoint_store.record_smoke_cell,
-                        cell_key,
-                        outcome,
-                        status=status,
-                        timing=self._timing_snapshot(),
-                        elapsed_wall_seconds=(
-                            self._ledger.current_wall_seconds()
-                            if self._ledger is not None
-                            else None
-                        ),
-                        reserved_cost_usd=(float(self._ledger.reserved_cost_usd) if self._ledger is not None else 0.0),
-                    )
-            return {
-                "cell": cell_key,
-                "status": status,
-                "reused": False,
-                "outcome": safe_json(outcome.model_dump(mode="json"), self.secrets),
-            }
+                async def persist_outcome() -> tuple[TrialOutcome, Literal["completed", "failed", "incomplete"]]:
+                    assert self._checkpoint_store is not None
+                    async with self._checkpoint_lock:
+                        self._refresh_store_secrets()
+                        safe_outcome, status = classify_smoke(self._checkpoint_store._safe_outcome(completed_outcome))
+                        observe_cell(cell_key, status, safe_outcome)
+                        await write_smoke(cell_key, safe_outcome, status)
+                        return safe_outcome, status
+                outcome, status = await finish_smoke_work(persist_outcome())
+            else:
+                outcome, status = classify_smoke(TrialOutcome.model_validate(safe_json(outcome.model_dump(mode="json"), self.secrets)))
+            cell = observe_cell(cell_key, status, outcome)
+            if cancelled:
+                raise asyncio.CancelledError
+            return cell
 
         jobs = [
             (model_spec, transport)
@@ -1397,7 +1467,12 @@ class BenchmarkRunner:
             for transport in self.manifest.transports
         ]
         if self.descriptor.benchmark_cells:
-            results = await asyncio.gather(*(run_cell(model, transport) for model, transport in jobs))
+            try:
+                async with asyncio.TaskGroup() as group:
+                    pending = [group.create_task(run_cell(model, transport)) for model, transport in jobs]
+            except ExceptionGroup as exc:
+                raise _normalize_task_group_error(exc) from exc
+            results = [item.result() for item in pending]
         else:
             results = [await run_cell(model, transport) for model, transport in jobs]
         cells = {item["cell"]: item for item in results}
@@ -2656,6 +2731,11 @@ def _state_observations(
             raise ValueError(f"{label}-state HTTP status is invalid")
         if error is not None and not isinstance(error, str):
             raise ValueError(f"{label}-state error is invalid")
+        if before and not expectation.check_before and raw == {
+            "available": True, "status_code": None, "payload": None, "error": None,
+        }:
+            observations.append(StateObservation(True, None, None, None))
+            continue
         expected_status = (
             expectation.resolved_before_expected_status if before else expectation.probe.expected_status
         )
@@ -3082,6 +3162,41 @@ def _validate_shared_budget(
             aggregate_cost += max(outcome.cost_usd, outcome.provider_cost_usd or 0.0)
             aggregate_work += outcome.latency_seconds
 
+    resume_source = baseline.get("resume_source")
+    if resume_source != candidate.get("resume_source"):
+        raise ValueError("paired resume accounting sources do not match")
+    if resume_source is not None:
+        if not isinstance(resume_source, dict):
+            raise ValueError("paired resume accounting source is invalid")
+        source = resume_source.get("source_accounting")
+        if not isinstance(source, dict):
+            raise ValueError("paired resume accounting source is invalid")
+        parent = source.get("parent_paired_budget_used")
+        spent = source.get("parent_checkpoint_spent")
+        residual = source.get("residual")
+        if not isinstance(parent, dict) or not isinstance(spent, dict) or not isinstance(residual, dict):
+            raise ValueError("paired resume accounting source is invalid")
+        if set(spent) != {"baseline", "candidate"} or not all(isinstance(value, dict) for value in spent.values()):
+            raise ValueError("paired resume checkpoint accounting is invalid")
+        for key in ("model_requests", "provider_setup_requests", "input_tokens", "output_tokens"):
+            values = [parent.get(key), residual.get(key), *(spent[arm].get(key) for arm in ("baseline", "candidate"))]
+            if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in values):
+                raise ValueError("paired resume accounting contains an invalid count")
+            if values[0] != sum(values[1:]):
+                raise ValueError("paired resume accounting does not match its parent receipts")
+            if key in aggregate:
+                aggregate[key] += values[1]
+        for key, residual_key in (("cost_usd", "conservative_cost_usd"), ("model_work_seconds", "model_work_seconds")):
+            try:
+                values_decimal = [Decimal(str(value)) for value in (parent.get(key), residual.get(residual_key), *(spent[arm].get(key) for arm in ("baseline", "candidate")))]
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError("paired resume accounting contains an invalid amount") from exc
+            if any(not value.is_finite() or value < 0 for value in values_decimal) or not math.isclose(float(values_decimal[0]), float(sum(values_decimal[1:])), rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError("paired resume accounting does not match its parent receipts")
+            if key == "cost_usd":
+                aggregate_cost += float(values_decimal[1])
+            else:
+                aggregate_work += float(values_decimal[1])
     for key, expected in aggregate.items():
         if budget.get(key) != expected:
             raise ValueError(f"shared budget {key} does not match the paired trial and smoke outcomes")
@@ -3773,187 +3888,6 @@ def attach_paired_execution_evidence(
     return artifact
 
 
-_ORPHANED_RESERVATION_REASON = "benchmark incomplete: artifact has an orphaned reservation"
-
-
-def _reconcile_paired_artifact_reservations(
-    artifacts: dict[str, dict[str, Any]],
-    *,
-    paired_budget_used: dict[str, Any],
-    paired_run_terminal: bool,
-) -> None:
-    """Clear only stale peer-reservation failures after paired accounting reconciles."""
-
-    if not paired_run_terminal or set(artifacts) != {"baseline", "candidate"}:
-        return
-
-    def decimal(value: Any) -> Decimal | None:
-        try:
-            parsed = Decimal(str(value))
-        except (InvalidOperation, TypeError, ValueError):
-            return None
-        return parsed if parsed.is_finite() and parsed >= 0 else None
-
-    arm_spent: dict[str, dict[str, Decimal]] = {}
-    resume_sources: list[dict[str, Any]] = []
-    for arm, artifact in artifacts.items():
-        checkpoint = artifact.get("checkpoint")
-        smoke_gate = artifact.get("smoke_gate")
-        if not isinstance(checkpoint, dict) or not isinstance(smoke_gate, dict):
-            return
-        spent = checkpoint.get("spent")
-        if not isinstance(spent, dict) or checkpoint.get("lifecycle") != "finalized":
-            return
-        if (
-            checkpoint.get("smoke_status") != "passed"
-            or checkpoint.get("smoke_cell_count") != 4
-            or smoke_gate.get("status") != "passed"
-        ):
-            return
-        if decimal(checkpoint.get("reserved_cost_usd")) != Decimal("0"):
-            return
-
-        runs = artifact.get("runs")
-        if not isinstance(runs, dict):
-            return
-        trial_rows = [
-            row
-            for run in runs.values()
-            if isinstance(run, dict)
-            for row in run.get("trials", [])
-            if isinstance(row, dict)
-        ]
-        smoke_cells = smoke_gate.get("cells")
-        if (
-            artifact.get("completed_trials") != len(trial_rows)
-            or checkpoint.get("record_count") != len(trial_rows)
-            or checkpoint.get("valid_completed_trials") != len(trial_rows)
-            or not isinstance(smoke_cells, list)
-            or len(smoke_cells) != 4
-            or any(
-                not isinstance(cell, dict)
-                or cell.get("status") != "completed"
-                or not isinstance(cell.get("outcome"), dict)
-                for cell in smoke_cells
-            )
-        ):
-            return
-
-        outcome_rows = [*trial_rows, *(cell["outcome"] for cell in smoke_cells)]
-        observed = {
-            "model_requests": sum(int(row.get("model_requests", 0)) for row in outcome_rows),
-            "input_tokens": sum(int(row.get("input_tokens", 0)) for row in outcome_rows),
-            "output_tokens": sum(int(row.get("output_tokens", 0)) for row in outcome_rows),
-            "cost_usd": sum(
-                max(float(row.get("cost_usd", 0.0)), float(row.get("provider_cost_usd") or 0.0))
-                for row in outcome_rows
-            ),
-            "model_work_seconds": sum(float(row.get("latency_seconds", 0.0)) for row in outcome_rows),
-        }
-        for name, value in observed.items():
-            recorded = decimal(spent.get(name))
-            expected = decimal(value)
-            if recorded is None or expected is None or not math.isclose(
-                float(recorded), float(expected), rel_tol=0.0, abs_tol=1e-9
-            ):
-                return
-        checkpoint_hash = checkpoint.get("spent_hash")
-        if checkpoint_hash != hash_json(spent):
-            return
-        budget = artifact.get("budget_used")
-        if not isinstance(budget, dict):
-            return
-        for name in ("model_requests", "provider_setup_requests", "input_tokens", "output_tokens", "cost_usd"):
-            if name in spent and decimal(budget.get(name)) != decimal(spent.get(name)):
-                return
-        arm_spent[arm] = {
-            name: parsed
-            for name in (
-                "model_requests",
-                "provider_setup_requests",
-                "input_tokens",
-                "output_tokens",
-                "cost_usd",
-                "model_work_seconds",
-            )
-            if (parsed := decimal(spent.get(name))) is not None
-        }
-        source = artifact.get("resume_source")
-        if source is not None:
-            if not isinstance(source, dict):
-                return
-            resume_sources.append(source)
-
-    residual = {
-        "model_requests": Decimal("0"),
-        "provider_setup_requests": Decimal("0"),
-        "input_tokens": Decimal("0"),
-        "output_tokens": Decimal("0"),
-        "cost_usd": Decimal("0"),
-        "model_work_seconds": Decimal("0"),
-    }
-    if resume_sources:
-        if any(source != resume_sources[0] for source in resume_sources[1:]):
-            return
-        source_accounting = resume_sources[0].get("source_accounting")
-        source_residual = source_accounting.get("residual") if isinstance(source_accounting, dict) else None
-        if not isinstance(source_residual, dict):
-            return
-        for key in residual:
-            raw = source_residual.get("conservative_cost_usd") if key == "cost_usd" else source_residual.get(key)
-            parsed = decimal(raw)
-            if parsed is None:
-                return
-            residual[key] = parsed
-
-    expected_pair = {
-        key: sum((values.get(key, Decimal("0")) for values in arm_spent.values()), Decimal("0"))
-        + residual[key]
-        for key in residual
-    }
-    if decimal(paired_budget_used.get("final_reserved_cost_usd")) != Decimal("0"):
-        return
-    for name in ("model_requests", "provider_setup_requests", "input_tokens", "output_tokens", "cost_usd", "model_work_seconds"):
-        recorded = decimal(paired_budget_used.get(name))
-        if recorded is None or not math.isclose(
-            float(recorded), float(expected_pair[name]), rel_tol=0.0, abs_tol=1e-9
-        ):
-            return
-    if decimal(paired_budget_used.get("total_tokens")) != expected_pair["input_tokens"] + expected_pair["output_tokens"]:
-        return
-
-    for artifact in artifacts.values():
-        reasons = artifact.get("incomplete_reasons")
-        if not isinstance(reasons, list) or _ORPHANED_RESERVATION_REASON not in reasons:
-            continue
-        updated_reasons = [reason for reason in reasons if reason != _ORPHANED_RESERVATION_REASON]
-        artifact["incomplete_reasons"] = updated_reasons
-        if not updated_reasons and "failure" not in artifact:
-            artifact["status"] = "complete"
-        hash_input = artifact.get("artifact_hash_input")
-        if not isinstance(hash_input, dict):
-            continue
-        trial_order = hash_input.get("trial_order")
-        try:
-            if isinstance(trial_order, list):
-                artifact["artifact_hash_input"] = _build_artifact_hash_input(
-                    artifact,
-                    trial_order=trial_order,
-                )
-            else:
-                hash_input["status"] = artifact.get("status")
-        except (KeyError, TypeError, ValueError):
-            hash_input["status"] = artifact.get("status")
-            receipt = hash_input.get("checkpoint_receipt")
-            checkpoint = artifact.get("checkpoint")
-            if isinstance(receipt, dict) and isinstance(checkpoint, dict):
-                for key in receipt:
-                    if key in checkpoint:
-                        receipt[key] = checkpoint[key]
-            artifact["artifact_hash_input"] = hash_input
-        artifact["artifact_hash"] = hash_json(artifact["artifact_hash_input"])
-
-
 def _validate_paired_execution_evidence(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
     evidence = baseline.get("paired_execution")
     if not isinstance(evidence, dict) or evidence != candidate.get("paired_execution"):
@@ -3973,6 +3907,11 @@ def _validate_paired_execution_evidence(baseline: dict[str, Any], candidate: dic
     if event_sequences != list(range(1, len(events) + 1)):
         raise ValueError("paired execution sequence is not contiguous")
     records: dict[tuple[str, str, int, str], tuple[str, int | None]] = {}
+    reused_identities: set[tuple[str, str, int, str]] = set()
+    last_event: dict[tuple[str, str, int, str], dict[str, Any]] = {}
+    unfinished = evidence.get("unfinished_starts", [])
+    if not isinstance(unfinished, list) or any(not isinstance(item, dict) or item not in events for item in unfinished):
+        raise ValueError("paired unfinished execution evidence is invalid")
     for status, items in (("executed", events), ("reused", reused)):
         for item in items:
             if not isinstance(item, dict):
@@ -3988,12 +3927,41 @@ def _validate_paired_execution_evidence(baseline: dict[str, Any], candidate: dic
                 and isinstance(identity[1], str)
                 and isinstance(identity[2], int)
                 and identity[3] in {"baseline", "candidate"}
-            ) or identity in records:
+            ):
                 raise ValueError("paired execution identity is invalid or duplicated")
+            typed_identity = cast(tuple[str, str, int, str], identity)
+            if status == "reused" and identity in records:
+                if (
+                    typed_identity in reused_identities
+                    or records[typed_identity][0] != "executed"
+                    or item.get("order_position")
+                    != planned_arm_order(identity[1], identity[2], manifest["paired_order_seed"]).index(identity[3])
+                ):
+                    raise ValueError("paired execution identity is invalid or duplicated")
+                reused_identities.add(typed_identity)
+                continue
+            if identity in records:
+                previous = last_event.get(typed_identity)
+                previous_attempt = previous.get("attempt", 1) if previous is not None else None
+                if (
+                    status != "executed"
+                    or previous is None
+                    or not isinstance(previous_attempt, int)
+                    or isinstance(previous_attempt, bool)
+                    or previous not in unfinished
+                    or item.get("retry_of_sequence") != previous.get("sequence")
+                    or item.get("attempt") != previous_attempt + 1
+                    or item.get("order_position") != previous.get("order_position")
+                ):
+                    raise ValueError("paired execution identity is invalid or duplicated")
             records[cast(tuple[str, str, int, str], identity)] = (
                 status,
                 item.get("sequence") if status == "executed" else None,
             )
+            if status == "executed":
+                last_event[typed_identity] = item
+    if any(event in unfinished for event in last_event.values()):
+        raise ValueError("paired execution has an unfinished terminal attempt")
     outcomes: dict[tuple[str, str, int, str], TrialOutcome] = {}
     for artifact in (baseline, candidate):
         for cell, run in artifact["runs"].items():

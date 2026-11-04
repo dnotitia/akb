@@ -9,6 +9,7 @@ from typing import Any
 import yaml  # type: ignore[import-untyped]
 
 from .contracts import StateCheckpointContract, StateContract, StateExpectation, StateExpectationSet
+from .evidence import canonical_json
 from .runtime import StateObservation
 
 MISSING = object()
@@ -236,10 +237,13 @@ def evaluate_checkpoint_contract(
 
 
 def _result(expectation: StateExpectation, passed: bool, actual: Any, phase: str) -> StateCheckResult:
-    actual_text = "missing" if actual is MISSING else repr(actual)[:240]
+    def display(value: Any) -> str:
+        return canonical_json(value) if isinstance(value, (dict, list)) else repr(value)
+
+    actual_text = "missing" if actual is MISSING else display(actual)[:240]
     return StateCheckResult(
         passed,
         expectation.pointer,
         f"{phase}:{expectation.operator}",
-        f"expected {expectation.value!r}; actual {actual_text}",
+        f"expected {display(expectation.value)}; actual {actual_text}",
     )
