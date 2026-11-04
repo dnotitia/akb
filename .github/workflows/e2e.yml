@@ -16,9 +16,11 @@ jobs:
   shell-e2e:
     name: shell e2e (repository runtime)
     runs-on: ubuntu-latest
-    # Includes runtime preparation, API suites, and the full browser regression.
-    # Playwright has a shorter global budget so failures can upload diagnostics.
-    timeout-minutes: 60
+    # Runtime preparation, the API suites, and the browser specs that need the
+    # runtime's backend. The specs that answer their own HTTP run in the
+    # fixture job. Playwright has a shorter global budget so failures can
+    # upload diagnostics.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -144,6 +146,53 @@ jobs:
           CI: "1"
           AKB_FE_E2E_SCENARIO: markdown-reference-adapters
         run: pnpm run test:e2e:mock e2e/markdown-link-search.spec.ts
+
+  frontend-fixture-e2e:
+    name: frontend e2e (fixture ${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    # The specs that answer their own HTTP need no backend. They run against a
+    # production build, one test at a time per job, split across shards.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.4"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium for frontend E2E
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run fixture-owned browser specs
+        working-directory: frontend
+        env:
+          CI: "1"
+        run: pnpm run test:e2e:fixture --shard=${{ matrix.shard }}/3
+
+      - name: Keep failing tests' traces and screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-fixture-e2e-results-${{ matrix.shard }}
+          path: frontend/test-results
+          retention-days: 7
+          if-no-files-found: ignore
 
   keycloak-theme:
     name: keycloak login theme (real Keycloak)

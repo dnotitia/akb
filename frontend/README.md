@@ -13,8 +13,9 @@ pnpm lint             # eslint src
 pnpm test             # vitest run
 pnpm build            # tsc && vite build
 pnpm preview          # serve dist locally
-pnpm run test:e2e:mock # Playwright + MSW, no backend required
-pnpm run test:e2e:real # Playwright against AKB_FRONTEND_URL from the runtime descriptor
+pnpm run test:e2e:mock    # Playwright + MSW, no backend required
+pnpm run test:e2e:fixture # Playwright against a production build; specs answer their own HTTP
+pnpm run test:e2e:real    # Playwright against AKB_FRONTEND_URL from the runtime descriptor
 ```
 
 ## Editing documents
@@ -80,7 +81,9 @@ Unit tests live under `src/**/__tests__/`. Vitest runs against jsdom +
 and interactive components (`TagInput`) have explicit coverage. Add a
 test alongside any change to those code paths.
 
-Playwright e2e specs live in `e2e/`. Choose `mock` or `real` explicitly:
+Playwright e2e specs live in `e2e/`. Choose `mock`, `fixture` or `real`
+explicitly. The mode names the server a spec needs, and each spec runs in one
+of them:
 
 - `pnpm run test:e2e:mock` starts Vite with the browser MSW worker, exposes
   mock readiness/discovery/reset at `/__akb_mock__/health`,
@@ -91,7 +94,15 @@ Playwright e2e specs live in `e2e/`. Choose `mock` or `real` explicitly:
   external HTTP client can reset the active browser run without reaching into
   the page. Once the mock listener is ready, Vite also prints the same
   schema-v2 descriptor as one JSON line on stdout for runtime helpers.
-- `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` consumes the
+- `pnpm run test:e2e:fixture` builds the app, serves it with `vite preview`,
+  and runs every spec that answers its requests through `page.route`. No
+  backend runs: `/api` is proxied to a closed port, so a request a spec does
+  not answer gets a 502 and a `http proxy error` line on stderr. These specs do
+  not share state, so CI splits them across jobs with `--shard`. A spec that
+  needs the runtime backend or the mock server's state belongs in
+  `serverStateSpecs` in `playwright.config.ts`; every other spec runs here.
+- `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` runs the
+  specs in `serverStateSpecs` that need a backend, and consumes the
   common schema-v2 descriptor. The backend, fixture reset, and process shutdown
   remain owned by the repository runtime.
 - `AKB_FE_E2E_SCENARIO=markdown-reference-adapters` exposes a source-neutral reference

@@ -159,10 +159,10 @@ Real-browser contract scenarios (production build with intercepted API fixtures)
 
 ```sh
 cd frontend
-pnpm run preview --host 127.0.0.1 --port 4176
-# In another terminal:
-AKB_FRONTEND_URL=http://127.0.0.1:4176 pnpm exec playwright test search-contract.spec.ts
+AKB_FE_E2E_MODE=fixture pnpm exec playwright test e2e/search-contract.spec.ts
 ```
+
+Fixture mode builds and serves the production frontend itself, with no backend.
 
 These browser tests exercise HTTP request serialization, filter selection, reload,
 history, viewport overflow, and light/dark rendering. They do not prove real login,
@@ -189,8 +189,8 @@ For the non-mocked Chromium scenario, serve the production frontend build with
 
 ```sh
 cd frontend
-AKB_SEARCH_LIVE=1 AKB_FRONTEND_URL=http://127.0.0.1:4177 \
-  pnpm exec playwright test search-live.spec.ts
+AKB_FE_E2E_MODE=real AKB_SEARCH_LIVE=1 AKB_FRONTEND_URL=http://127.0.0.1:4177 \
+  pnpm exec playwright test e2e/search-live.spec.ts
 ```
 
 This signs in through the actual local-login form and exercises search filters,
