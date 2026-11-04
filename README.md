@@ -300,6 +300,13 @@ Task-oriented guides for teams evaluating or adopting an agent knowledge layer:
 - [Applying permissions at query time when agents search shared knowledge](docs/guides/query-time-permissions-for-agent-search.md)
 - [Keeping a record of what coding agents decided](docs/guides/recording-coding-agent-decisions.md)
 - [Keeping search current when documents and embedding models change](docs/guides/keeping-embeddings-current.md)
+- [Adding a knowledge layer to an existing agent stack](docs/guides/adding-a-knowledge-layer-to-an-existing-agent-stack.md)
+- [Adding a new department without rebuilding the setup](docs/guides/adding-a-new-department-without-a-rebuild.md)
+- [Exporting a vault to the Open Knowledge Format](docs/guides/exporting-a-vault-to-open-knowledge-format.md)
+- [Keeping model calls inside your network](docs/guides/keeping-model-calls-inside-your-network.md)
+- [Moving agent memory from one laptop to a team-wide store](docs/guides/moving-agent-memory-to-a-team-store.md)
+- [Moving Markdown notes into a searchable store](docs/guides/moving-markdown-notes-into-a-searchable-store.md)
+- [Why a vector store alone is a weak agent memory](docs/guides/why-a-vector-store-alone-is-a-weak-agent-memory.md)
 
 ## Quick Start
 
