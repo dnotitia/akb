@@ -249,9 +249,12 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 # specific exception class runs in Starlette's ExceptionMiddleware and is not
 # re-raised, unlike the `Exception` handler below, which ServerErrorMiddleware
 # re-raises to the server after responding (a second traceback).
+# The path logged is the matched route's template where there is one: upload
+# capability paths carry their credential as a path segment.
 @app.exception_handler(ClientDisconnect)
 async def client_disconnect_handler(request: Request, exc: ClientDisconnect):
-    logger.info("Client disconnected before its request body was read: %s %s", request.method, request.url.path)
+    path = getattr(request.scope.get("route"), "path", None) or request.url.path
+    logger.info("Client disconnected before its request body was read: %s %s", request.method, path)
     return Response(status_code=499)
 
 
