@@ -83,7 +83,7 @@ RUN echo "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f  /usr
 # bookworm 3.11 fails with "requires a different Python: 3.11 not in
 # '>=3.14'" — the all-in-one was unbuildable from 0.6.5's 3.14 bump
 # until this.
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN curl -LsSf https://astral.sh/uv/0.12.12/install.sh | sh
 ENV PATH=/root/.local/bin:$PATH
 RUN uv venv --python 3.14 /opt/venv
 

@@ -32,15 +32,16 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/* \
 WORKDIR /app
 
 # The requirements file is the complete locked set, so `--no-deps` installs
-# exactly it. The project install below then finds every dependency already
-# satisfied and adds only the `akb` package itself.
+# exactly it. The project install below adds only the `akb` package itself
+# (`--no-deps`), and `pip check` fails the build if the lock left out anything
+# `akb` or a locked package requires, instead of fetching it from the index.
 COPY --from=requirements /requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --no-deps --require-hashes -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
 COPY . .
 RUN printf '%s\n' "$AKB_SOURCE_REVISION" > /app/.akb-source-revision
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps . && pip check
 RUN /usr/local/bin/python -I -B -c "import app.cli; import mcp_server"
 
 # Create vault storage directory

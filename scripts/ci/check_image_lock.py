@@ -53,8 +53,78 @@ def normalize(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _version(value: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in re.findall(r"\d+", value))
+# PEP 440 public versions (no local segment), as `packaging` spells the pattern.
+_PEP440 = re.compile(
+    r"""v?(?:(?P<epoch>\d+)!)?(?P<release>\d+(?:\.\d+)*)
+    (?:[-_.]?(?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)[-_.]?(?P<pre_n>\d+)?)?
+    (?:-(?P<post_n1>\d+)|[-_.]?(?P<post_l>post|rev|r)[-_.]?(?P<post_n2>\d+)?)?
+    (?:[-_.]?(?P<dev_l>dev)[-_.]?(?P<dev_n>\d+)?)?""",
+    re.VERBOSE | re.IGNORECASE,
+)
+_PRE_RANK = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2, "pre": 2, "preview": 2}
+
+
+def _pep440(value: str) -> tuple[int, tuple[int, ...], tuple[int, int] | None, int | None, int | None]:
+    """Parse a version into (epoch, release, pre, post, dev); refuse anything else."""
+    match = _PEP440.fullmatch(value.strip())
+    if not match:
+        raise ValueError(f"not a PEP 440 version: {value!r}")
+    pre = None
+    if match["pre_l"]:
+        pre = (_PRE_RANK[match["pre_l"].lower()], int(match["pre_n"] or 0))
+    post = None
+    if match["post_n1"] or match["post_l"]:
+        post = int(match["post_n1"] or match["post_n2"] or 0)
+    dev = int(match["dev_n"] or 0) if match["dev_l"] else None
+    release = tuple(int(part) for part in match["release"].split("."))
+    return int(match["epoch"] or 0), release, pre, post, dev
+
+
+def _base(version: tuple) -> tuple[int, tuple[int, ...]]:
+    """Epoch and release with trailing zeros dropped: 3.14 and 3.14.0 are one version."""
+    release = list(version[1])
+    while release and release[-1] == 0:
+        release.pop()
+    return version[0], tuple(release)
+
+
+def _sort_key(version: tuple) -> tuple:
+    _, _, pre, post, dev = version
+    if pre is None:
+        # A dev-only release sorts before its pre-releases, a final one after them.
+        pre = (-1, 0) if post is None and dev is not None else (3, 0)
+    return (*_base(version), pre, -1 if post is None else post, (1, 0) if dev is None else (0, dev))
+
+
+def _version_holds(candidate: str, op: str, spec: str) -> bool:
+    """`candidate op spec` under PEP 440, as `packaging` (pip's marker evaluator) decides it.
+
+    Stdlib only, so the check runs on any `python3` without `packaging`
+    installed; backend/tests/test_check_image_lock_unit.py holds it to
+    `packaging`. A comparison it cannot decide raises ValueError (exit 2).
+    """
+    have = _pep440(candidate)
+    if spec.endswith(".*"):
+        if op not in ("==", "!=") or not re.fullmatch(r"\d+(?:\.\d+)*", spec[:-2]):
+            raise ValueError(f"invalid wildcard comparison {op} {spec!r}")
+        prefix = tuple(int(part) for part in spec[:-2].split("."))
+        matches = have[0] == 0 and (have[1] + (0,) * len(prefix))[: len(prefix)] == prefix
+        return matches == (op == "==")
+    want = _pep440(spec)
+    a, b = _sort_key(have), _sort_key(want)
+    if op == "<":
+        # `< V` excludes pre-releases of V itself (anything from V.dev0 up)
+        # unless V is a pre-release.
+        is_pre = have[2] is not None or have[4] is not None
+        if is_pre and want[2] is None and want[4] is None and a >= _sort_key((*want[:4], 0)):
+            return False
+        return a < b
+    if op == ">":
+        # `> V` excludes post-releases of V itself unless V is a post-release.
+        if have[3] is not None and want[3] is None and _sort_key((*have[:3], None, None)) == b:
+            return False
+        return a > b
+    return {"==": a == b, "!=": a != b, "<=": a <= b, ">=": a >= b}[op]
 
 
 def evaluate_marker(marker: str, env: dict[str, str]) -> bool:
@@ -95,12 +165,11 @@ def evaluate_marker(marker: str, env: dict[str, str]) -> bool:
         if op in ("in", "not in"):
             return (left in right) == (op == "in")
         if left_name in _VERSION_VARS or right_name in _VERSION_VARS:
-            a, b = _version(left), _version(right)
-        else:
-            if op not in ("==", "!="):
-                raise ValueError(f"ordering on a string in {marker!r}")
-            a, b = left, right  # type: ignore[assignment]
-        return {"==": a == b, "!=": a != b, "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[op]
+            # As in `packaging`, the right operand is the specifier.
+            return _version_holds(left, op, right)
+        if op not in ("==", "!="):
+            raise ValueError(f"ordering on a string in {marker!r}")
+        return (left == right) == (op == "==")
 
     def conjunction() -> bool:
         result = compare()
