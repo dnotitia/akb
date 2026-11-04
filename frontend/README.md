@@ -103,7 +103,9 @@ skip themselves there):
   run on one worker unless you pass `--workers`. Run one fixture run per host
   at a time: its port (4174) and build directory are fixed. A spec that needs
   the runtime backend or the mock server's state belongs in `serverStateSpecs`
-  in `playwright.config.ts`; every other spec runs here.
+  in `playwright.config.ts`; every other spec runs here. A spec that skips
+  itself outside real mode (`AKB_FE_E2E_MODE !== "real"`) would otherwise run
+  nowhere, so the config refuses to load until it is listed.
 - `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` runs the
   specs in `serverStateSpecs` that need a backend, and consumes the
   common schema-v2 descriptor. The backend, fixture reset, and process shutdown

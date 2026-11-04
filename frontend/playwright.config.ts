@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { defineConfig, devices, type PlaywrightTestConfig } from "@playwright/test";
 
 // A mode names the server its specs need:
@@ -41,6 +43,19 @@ const serverStateSpecs = [
   "markdown-link-search",
 ];
 const serverStateMatch = new RegExp(`/(${serverStateSpecs.join("|")})\\.spec\\.ts$`);
+
+// A spec that skips itself outside real mode and is not listed above would
+// run nowhere: fixture mode skips it and real mode never selects it. Refuse
+// that instead of reporting a green run without it.
+const e2eDir = fileURLToPath(new URL("./e2e/", import.meta.url));
+const unlistedRealOnly = readdirSync(e2eDir)
+  .filter((file) => file.endsWith(".spec.ts") && !serverStateMatch.test(`/${file}`))
+  .filter((file) => /AKB_FE_E2E_MODE\s*!==\s*["']real["']/.test(readFileSync(e2eDir + file, "utf8")));
+if (unlistedRealOnly.length > 0) {
+  throw new Error(
+    `${unlistedRealOnly.join(", ")} only run in real mode; add them to serverStateSpecs in playwright.config.ts`,
+  );
+}
 
 // These scenarios read the mock server's fixture, so they select their spec
 // in mock mode only.
