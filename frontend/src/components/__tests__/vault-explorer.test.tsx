@@ -81,12 +81,19 @@ function PublishCurrent({ value, onlyOnResource = false }: { value: ResourceLoca
   return null;
 }
 
+// Answer a name search the way the backend does: echo the query and return
+// only matching rows. The tree hook rejects a page that does not echo the
+// query as an unsupported name search and empties the tree.
+function answerBrowse<T extends { name: string; path: string }>(items: T[]) {
+  return async (_vault: string, _collection: string, _depth: number, options: { name_query?: string } = {}) => ({
+    ...sample, name_query: options.name_query,
+    items: options.name_query ? items.filter(item => `${item.name} ${item.path}`.toLocaleLowerCase().includes(options.name_query!.toLocaleLowerCase())) : items,
+  });
+}
+
 beforeEach(() => {
   browseMock.mockReset();
-  browseMock.mockImplementation(async (_vault: string, _collection: string, _depth: number, options: { name_query?: string } = {}) => ({
-    ...sample, name_query: options.name_query,
-    items: options.name_query ? sample.items.filter(item => `${item.name} ${item.path}`.toLocaleLowerCase().includes(options.name_query!.toLocaleLowerCase())) : sample.items,
-  }));
+  browseMock.mockImplementation(answerBrowse(sample.items));
   vaultInfoMock.mockReset();
   // Default to reader so the existing tests don't accidentally render
   // the mutation affordances. Tests that need writer+ override this.
@@ -427,7 +434,7 @@ describe("collection shortcut navigation", () => {
   });
 
   it("chooses a nested Collection with the keyboard and keeps only its resource subtree", async () => {
-    browseMock.mockResolvedValue({ ...sample, items: [...sample.items,
+    browseMock.mockImplementation(answerBrowse([...sample.items,
       { type: "collection", name: "design", path: "architecture/design" },
       { type: "collection", name: "design-old", path: "architecture/design-old" },
       { type: "collection", name: "sub", path: "architecture/design/sub" },
@@ -436,7 +443,13 @@ describe("collection shortcut navigation", () => {
       { type: "document", name: "Shared outside", path: "architecture/design-old/guide.md" },
       { type: "table", name: "shared_table", path: "shared_table", collection: "architecture/design" },
       { type: "file", name: "shared.txt", path: "shared.txt", collection: "architecture/design", uri: "akb://v/coll/architecture/design/file/shared" },
-    ] });
+    ]));
+    // The name filter is debounced, then searched by the server. Assert on the
+    // settled answer for each scope, not on the rows left over from before it.
+    const searchSettled = async (collection: string | undefined) => waitFor(() => {
+      expect(browseMock).toHaveBeenCalledWith("v", collection, -1, expect.objectContaining({ name_query: "shared" }));
+      expect(screen.queryByText("Searching content")).not.toBeInTheDocument();
+    });
     const user = userEvent.setup();
     renderAt("/vault/v");
     await screen.findByRole("button", { name: "architecture" });
@@ -447,6 +460,7 @@ describe("collection shortcut navigation", () => {
     await user.keyboard("{ArrowDown}{Enter}");
     expect(screen.getByRole("button", { name: "Collection search scope" })).toHaveTextContent("architecture/design");
     await user.type(screen.getByRole("searchbox", { name: "Filter resources" }), "shared");
+    await searchSettled("architecture/design");
     expect(screen.getByRole("treeitem", { name: /Document:\s*Shared guide/ })).toBeInTheDocument();
     expect(screen.getByRole("treeitem", { name: /Document:\s*Shared child/ })).toBeInTheDocument();
     expect(screen.getByRole("treeitem", { name: /Table:\s*shared_table/ })).toBeInTheDocument();
@@ -454,6 +468,7 @@ describe("collection shortcut navigation", () => {
     expect(screen.queryByRole("treeitem", { name: /Shared outside/ })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Clear collection scope" }));
     expect(screen.getByRole("searchbox", { name: "Filter resources" })).toHaveValue("shared");
+    await searchSettled(undefined);
     expect(await screen.findByRole("treeitem", { name: /Shared outside/ })).toBeInTheDocument();
   });
 
