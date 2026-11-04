@@ -131,6 +131,15 @@ specifically; the proxy has its own log in
   the client's connection. AKB still serves no notification stream, and
   `server/discover` still advertises `tools.listChanged: false`.
 
+- A client that disconnects while AKB is still reading its request body is
+  now logged as one INFO line with the method and path, and answered with
+  status 499 (client closed request). It used to be logged as `Unhandled
+  request error` with a traceback and produce an HTTP 500, and the exception
+  then left the application, so the server logged a second traceback. This
+  affects the requests whose body AKB reads itself: the MCP endpoint and the
+  raw-body uploads. What each route does with a partly received body is
+  unchanged.
+
 ### Documents
 
 - **Breaking:** whole-body document updates, including empty bodies and proxy

@@ -10,8 +10,9 @@ import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import ClientDisconnect
 from starlette.middleware.gzip import DEFAULT_EXCLUDED_CONTENT_TYPES, GZipMiddleware
 
 from app.api.deps import get_current_user, get_optional_user
@@ -238,6 +239,20 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
             legacy_detail=details,
         ),
     )
+
+
+# A peer that closes its connection while its request body is still being read
+# makes `request.stream()` raise `ClientDisconnect`. The peer is gone, so no
+# response reaches it; this is not a server fault. Log one INFO line, with the
+# method and path only, and answer 499 (client closed request) so access logs
+# and metrics that read the status do not count it as a 500. A handler for a
+# specific exception class runs in Starlette's ExceptionMiddleware and is not
+# re-raised, unlike the `Exception` handler below, which ServerErrorMiddleware
+# re-raises to the server after responding (a second traceback).
+@app.exception_handler(ClientDisconnect)
+async def client_disconnect_handler(request: Request, exc: ClientDisconnect):
+    logger.info("Client disconnected before its request body was read: %s %s", request.method, request.url.path)
+    return Response(status_code=499)
 
 
 @app.exception_handler(Exception)
