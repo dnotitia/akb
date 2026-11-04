@@ -243,9 +243,10 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 # A peer that closes its connection while its request body is still being read
 # makes `request.stream()` raise `ClientDisconnect`. The peer is gone, so no
-# response reaches it; this is not a server fault. Log one INFO line, with the
-# method and path only, and answer 499 (client closed request) so access logs
-# and metrics that read the status do not count it as a 500. A handler for a
+# response reaches it (the server writes nothing to a disconnected peer) and
+# this is not a server fault. Log one INFO line, with the method and path only.
+# A handler must return a response; 499 (client closed request) names the event
+# for anything in the process that reads the status. A handler for a
 # specific exception class runs in Starlette's ExceptionMiddleware and is not
 # re-raised, unlike the `Exception` handler below, which ServerErrorMiddleware
 # re-raises to the server after responding (a second traceback).
