@@ -84,18 +84,25 @@ def _stub_file_upload(main, monkeypatch) -> None:
         monkeypatch.setattr(file_service.s3_adapter, name, no_object_storage)
 
 
-# (stub, method, request path, query, content type, partial chunk, logged path).
-# A matched route is logged by its template: the File upload path carries its
-# capability, which is a credential, as a path segment.
+# (stub, method, request path, query, content type, partial chunk, accepted
+# logged paths). A matched route is logged by its template: the File upload
+# path carries its capability, which is a credential, as a path segment.
+# Whether the MCP mount counts as the matched route depends on the Starlette
+# release: 1.10 records a matched Mount in scope["route"] (logged as "/mcp"),
+# 1.6 records only FastAPI routes (the literal "/mcp/" is logged). Both are
+# the mount's own path and carry nothing from the request.
 _CASES = {
-    "mcp": (_stub_mcp, "POST", "/mcp/", b"", b"application/json", b'{"jsonrpc":"2.0","id":1,', "/mcp/"),
+    "mcp": (
+        _stub_mcp, "POST", "/mcp/", b"", b"application/json", b'{"jsonrpc":"2.0","id":1,',
+        frozenset({"/mcp", "/mcp/"}),
+    ),
     "asset-upload": (
         _stub_asset_upload, "POST", "/api/v1/assets/fixture", b"filename=fixture.png", b"image/png",
-        b"\x89PNG\r\n\x1a\n", "/api/v1/assets/{vault}",
+        b"\x89PNG\r\n\x1a\n", frozenset({"/api/v1/assets/{vault}"}),
     ),
     "file-upload": (
         _stub_file_upload, "PUT", "/api/v1/files/upload/fixture-capability", b"",
-        b"application/octet-stream", b"partial file bytes", "/api/v1/files/upload/{token}",
+        b"application/octet-stream", b"partial file bytes", frozenset({"/api/v1/files/upload/{token}"}),
     ),
 }
 
@@ -136,7 +143,7 @@ async def _drive(app, method: str, path: str, query: bytes, content_type: bytes,
 
 @pytest.mark.parametrize("case", sorted(_CASES))
 async def test_client_disconnect_mid_body_is_one_info_line_and_a_499(main, monkeypatch, caplog, case):
-    stub, method, path, query, content_type, chunk, logged_path = _CASES[case]
+    stub, method, path, query, content_type, chunk, logged_paths = _CASES[case]
     stub(main, monkeypatch)
     caplog.set_level(logging.INFO)
     caplog.set_level(logging.INFO, logger="akb")
@@ -155,7 +162,9 @@ async def test_client_disconnect_mid_body_is_one_info_line_and_a_499(main, monke
     assert len(handler_records) == 1
     record = handler_records[0]
     assert record.levelno == logging.INFO
-    assert record.args == (method, logged_path)
+    logged_method, logged_path = record.args
+    assert logged_method == method
+    assert logged_path in logged_paths
     # Method and path only: never the query string, body or credential.
     text = record.getMessage()
     assert text == _HANDLER_MESSAGE % (method, logged_path)
