@@ -7,6 +7,8 @@ const titles: Record<string, string> = {
   "reading.md": "Reading workflow",
   "architecture/review.md": "Architecture decisions and accessibility review for a responsive document reading workspace",
   "notes/review.md": "Review notes",
+  "archive/review.md": "Review notes",
+  "archive/untitled.md": "",
   ...Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`notes/chapter-${index}.md`, `Chapter ${index + 1}`])),
   "closed.md": "Previous research notes",
 };
@@ -19,7 +21,7 @@ async function fixture(page: Page, dark = false) {
   await page.route("**/api/v1/documents/fixture/**", route => {
     const url = new URL(route.request().url());
     const path = decodeURIComponent(url.pathname.split("/documents/fixture/")[1]);
-    if (!titles[path]) return route.fallback();
+    if (!Object.hasOwn(titles, path)) return route.fallback();
     return route.fulfill({ json: { uri: `akb://fixture/doc/${path}`, path, title: titles[path], content: `# ${titles[path]}\n\nReading content.`, current_commit: "aaaaaaaaaaaaa", status: "active", created_by_name: "Reading reviewer" } });
   });
   await page.goto("/vault/fixture/doc/reading.md");
@@ -34,6 +36,37 @@ async function fixture(page: Page, dark = false) {
   expect(violations).toEqual([]);
   return manager;
 }
+
+test("shows only titles in the strip and reveals paths for matching titles", async ({ page }) => {
+  await page.setViewportSize({ width: 900, height: 720 });
+  const manager = await fixture(page);
+  const listButton = page.getByRole("button", { name: "Open document list", exact: true });
+  await page.keyboard.press("Escape");
+  await expect(listButton).toBeFocused();
+
+  const strip = page.getByRole("tablist", { name: "Open documents", exact: true });
+  const reviews = strip.getByRole("tab", { name: "Review notes", exact: true });
+  await expect(reviews).toHaveText(["Review notes", "Review notes"]);
+  await expect(strip.getByRole("tab", { name: "untitled.md", exact: true })).toHaveAccessibleDescription("fixture / archive/untitled.md");
+  const longTitle = titles["architecture/review.md"];
+  const longTab = strip.getByRole("tab", { name: longTitle, exact: true });
+  expect(await longTab.locator("span").evaluate(label => label.scrollWidth > label.clientWidth)).toBe(true);
+
+  await longTab.hover();
+  await expect(page.getByRole("tooltip")).toHaveText("fixture / architecture/review.md");
+  await expect(page.getByText(longTitle, { exact: true }).filter({ visible: true })).toHaveCount(2);
+  await longTab.press("ArrowRight");
+  await expect(reviews.first()).toBeFocused();
+  await expect(page.getByRole("tooltip")).toHaveText("fixture / notes/review.md");
+  await reviews.first().press("ArrowRight");
+  await expect(reviews.last()).toHaveAccessibleDescription("fixture / archive/review.md");
+
+  await listButton.click();
+  const search = manager.getByRole("searchbox", { name: "Find open documents" });
+  await search.fill("archive/review.md");
+  await expect(manager.getByRole("listitem")).toHaveCount(1);
+  await expect(manager.getByRole("listitem")).toContainText("fixture / archive/review.md");
+});
 
 test("filters by path, keeps contextual actions reachable and opens a side document", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 960 });
