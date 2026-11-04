@@ -1597,7 +1597,6 @@ body::before {
 .reading-tab-wrap[data-selected=true] .reading-tab { color: var(--color-link); font-weight: 600; }
 .reading-tab > svg { flex: none; }
 .reading-tab > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.reading-tab small { display: block; overflow: hidden; text-overflow: ellipsis; font-weight: 400; font-size: .6875rem; }
 .reading-icon-button { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: .25rem; width: 2.75rem; min-height: 2.75rem; color: var(--color-foreground-muted); border-radius: var(--radius-sm); }
 .reading-icon-button:hover { color: var(--color-foreground); background: var(--color-surface-selected); }
 .reading-tab-close { width: 2rem; }

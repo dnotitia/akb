@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { FileText, X } from "lucide-react";
+import { FileText, History, X } from "lucide-react";
+import { Portal as TooltipPortal } from "@radix-ui/react-tooltip";
 import { useReadingWorkspace } from "@/contexts/reading-workspace-context";
 import { readingDocumentKey } from "@/lib/reading-workspace";
 import { ReadingTabManager } from "@/components/reading-tab-manager";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 export function DocumentTabs({ active, panelId }: { active: string; panelId: string }) {
   const workspace = useReadingWorkspace()!;
@@ -59,28 +61,41 @@ export function DocumentTabs({ active, panelId }: { active: string; panelId: str
     }
     if (event.key === "Escape") { setDragging(null); setDropTarget(null); }
   };
-  return <>
+  return <TooltipProvider delayDuration={300}>
     <div ref={listRef} className="reading-tabs rail-scroll" role="tablist" aria-label="Open documents" aria-orientation="horizontal">
       {workspace.tabs.map((tab, index) => {
         const key = readingDocumentKey(tab), selected = key === active;
-        const duplicate = workspace.tabs.some(other => other !== tab && other.title === tab.title);
+        const title = tab.title.trim();
+        const label = title && title !== tab.path ? title : tab.path.split("/").at(-1) || tab.path;
+        const details = `${tab.vault} / ${tab.path}${tab.version ? ` · Version ${tab.version}` : ""}`;
+        const Icon = tab.version ? History : FileText;
         return <div key={key} className="reading-tab-wrap" role="presentation" data-selected={selected} data-drop-target={dragging && key !== dragging && dropTarget === key}
           data-drop-direction={workspace.tabs.findIndex(item => readingDocumentKey(item) === dragging) < index ? "after" : "before"}
           onDragOver={event => { if (!dragging) return; event.preventDefault(); setDropTarget(key); if (listRef.current) { const bounds = listRef.current.getBoundingClientRect(); if (event.clientX < bounds.left + 32) listRef.current.scrollLeft -= 20; else if (event.clientX > bounds.right - 32) listRef.current.scrollLeft += 20; } }}
           onDrop={event => { if (dragging) { event.preventDefault(); workspace.reorder(dragging, key); setNotice("Document tabs reordered"); } setDragging(null); setDropTarget(null); }}>
-          <button ref={selected ? activeButtonRef : undefined} type="button" role="tab" id={`${panelId}-tab-${encodeURIComponent(key)}`}
-            draggable onDragStart={event => { setDragging(key); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("application/x-akb-reading-tab", key); }} onDragEnd={() => { setDragging(null); setDropTarget(null); }}
-            aria-selected={selected} aria-controls={selected ? panelId : undefined} tabIndex={(focused ?? active) === key ? 0 : -1}
-            title={`${tab.title}\n${tab.vault}/${tab.path}${tab.version ? ` · ${tab.version}` : ""}`} className="reading-tab"
-            onMouseDown={event => { if (event.button === 1) event.preventDefault(); }} onAuxClick={event => { if (event.button === 1) { event.preventDefault(); workspace.close(key, active); } }}
-            onFocus={() => setFocused(key)} onKeyDown={event => onKey(event, index)} onClick={() => navigate(tab.href)}>
-            <FileText size={14} aria-hidden /><span>{tab.title}{duplicate && <small>{tab.vault} / {tab.path}</small>}{tab.version && <small>Version {tab.version.slice(0, 8)}</small>}</span>
-          </button>
-          <button type="button" className="reading-icon-button reading-tab-close" aria-label={`Close ${tab.title}`} tabIndex={selected ? 0 : -1} onClick={() => workspace.close(key, active)}><X size={14} aria-hidden /></button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button ref={selected ? activeButtonRef : undefined} type="button" role="tab" id={`${panelId}-tab-${encodeURIComponent(key)}`}
+                draggable onDragStart={event => { setDragging(key); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("application/x-akb-reading-tab", key); }} onDragEnd={() => { setDragging(null); setDropTarget(null); }}
+                aria-selected={selected} aria-controls={selected ? panelId : undefined} aria-description={details} tabIndex={(focused ?? active) === key ? 0 : -1}
+                className="reading-tab"
+                onMouseDown={event => { if (event.button === 1) event.preventDefault(); }} onAuxClick={event => { if (event.button === 1) { event.preventDefault(); workspace.close(key, active); } }}
+                onFocus={() => setFocused(key)} onKeyDown={event => onKey(event, index)} onClick={() => navigate(tab.href)}>
+                <Icon size={14} aria-hidden /><span>{label}</span>
+              </button>
+            </TooltipTrigger>
+            <TooltipPortal>
+              <TooltipContent side="top" aria-label={details} className="max-w-[min(28rem,90vw)] wrap-anywhere tracking-normal">
+                <span className="block">{label}</span>
+                <span className="block font-normal text-foreground-muted">{details}</span>
+              </TooltipContent>
+            </TooltipPortal>
+          </Tooltip>
+          <button type="button" className="reading-icon-button reading-tab-close" aria-label={`Close ${label}`} aria-description={details} tabIndex={selected ? 0 : -1} onClick={() => workspace.close(key, active)}><X size={14} aria-hidden /></button>
         </div>;
       })}
     </div>
     <ReadingTabManager active={active} />
     <span role="status" className="sr-only">{notice}</span>
-  </>;
+  </TooltipProvider>;
 }
