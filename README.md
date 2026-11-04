@@ -307,6 +307,13 @@ Task-oriented guides for teams evaluating or adopting an agent knowledge layer:
 - [Moving agent memory from one laptop to a team-wide store](docs/guides/moving-agent-memory-to-a-team-store.md)
 - [Moving Markdown notes into a searchable store](docs/guides/moving-markdown-notes-into-a-searchable-store.md)
 - [Why a vector store alone is a weak agent memory](docs/guides/why-a-vector-store-alone-is-a-weak-agent-memory.md)
+- [Choosing what to ingest into a knowledge base](docs/guides/choosing-what-to-ingest.md)
+- [Combining search, grep, relations and SQL for agent lookups](docs/guides/combining-search-grep-relations-and-sql.md)
+- [Connectors or your own ingestion](docs/guides/connectors-or-your-own-ingestion.md)
+- [Keeping ingested copies linked to their source](docs/guides/keeping-ingested-copies-linked-to-their-source.md)
+- [Reaching people in the tools they already use](docs/guides/reaching-people-in-the-tools-they-already-use.md)
+- [Running agent knowledge alongside a wiki](docs/guides/running-agent-knowledge-alongside-a-wiki.md)
+- [Separating teams and agents with vault permissions](docs/guides/separating-teams-and-agents-with-vault-permissions.md)
 
 ## Quick Start
 
