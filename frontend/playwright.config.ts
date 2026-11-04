@@ -14,7 +14,7 @@ import { defineConfig, devices, type PlaywrightTestConfig } from "@playwright/te
 // - real: the repository runtime's frontend and backend, at AKB_FRONTEND_URL.
 //   Its specs write to that one backend, so they run one at a time.
 //
-// Fixture and real split the suite between them; mock is unchanged.
+// Fixture and real split the suite between them; mock still loads every spec.
 const mode = process.env.AKB_FE_E2E_MODE;
 if (mode !== "mock" && mode !== "fixture" && mode !== "real") {
   throw new Error("Set AKB_FE_E2E_MODE to mock, fixture or real before running Playwright");

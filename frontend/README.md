@@ -100,9 +100,10 @@ skip themselves there):
   backend runs: `/api` is proxied to a closed port, so a request a spec does
   not answer gets a 502 and a `http proxy error` line on stderr. These specs do
   not share state, so CI splits them across jobs with `--shard`; locally they
-  run on one worker unless you pass `--workers`. A spec that needs the runtime
-  backend or the mock server's state belongs in `serverStateSpecs` in
-  `playwright.config.ts`; every other spec runs here.
+  run on one worker unless you pass `--workers`. Run one fixture run per host
+  at a time: its port (4174) and build directory are fixed. A spec that needs
+  the runtime backend or the mock server's state belongs in `serverStateSpecs`
+  in `playwright.config.ts`; every other spec runs here.
 - `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` runs the
   specs in `serverStateSpecs` that need a backend, and consumes the
   common schema-v2 descriptor. The backend, fixture reset, and process shutdown
