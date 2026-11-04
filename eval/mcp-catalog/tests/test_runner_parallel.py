@@ -105,6 +105,7 @@ def _outcome(task, model_spec, transport, repeat_index: int) -> TrialOutcome:
     return TrialOutcome(
         task_id=task.id,
         category=task.category,
+        locale=task.locale,
         arm="baseline",
         model_class=model_spec.class_name,
         model_id=model_spec.model_id,
