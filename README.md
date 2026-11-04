@@ -314,6 +314,13 @@ Task-oriented guides for teams evaluating or adopting an agent knowledge layer:
 - [Reaching people in the tools they already use](docs/guides/reaching-people-in-the-tools-they-already-use.md)
 - [Running agent knowledge alongside a wiki](docs/guides/running-agent-knowledge-alongside-a-wiki.md)
 - [Separating teams and agents with vault permissions](docs/guides/separating-teams-and-agents-with-vault-permissions.md)
+- [Building curation on change events](docs/guides/building-curation-on-change-events.md)
+- [Citing the exact source behind an answer](docs/guides/citing-the-exact-source-behind-an-answer.md)
+- [Finding duplicate and outdated documents](docs/guides/finding-duplicate-and-outdated-documents.md)
+- [Reconciling conflicting names across systems](docs/guides/reconciling-conflicting-names-across-systems.md)
+- [Reviewing agent writes before they go live](docs/guides/reviewing-agent-writes-before-they-go-live.md)
+- [Rolling back a document to an earlier version](docs/guides/rolling-back-a-document-to-an-earlier-version.md)
+- [Running a shared vocabulary as living documents](docs/guides/running-a-shared-vocabulary-as-living-documents.md)
 
 ## Quick Start
 
