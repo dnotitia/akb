@@ -141,6 +141,20 @@ specifically; the proxy has its own log in
   help and SDK types describe the same rules; MCP rejects invalid input
   without echoing the rejected body. See `docs/operations/document-write-preconditions.md`.
 
+### Build
+
+- The backend image installs its third-party packages from `uv.lock`,
+  hash-checked and with no dependency resolution at build time, so an image
+  runs exactly the versions its commit locks. It used to run `pip install .`,
+  which took whatever was newest on the build day. The unit and live-DB test
+  jobs install from the same lock (`uv sync --locked --extra dev`), as the e2e
+  job already did. The lock first moved 26 packages to the versions an
+  unpinned image build was already installing (for example Starlette 1.10.0,
+  anyio 4.16.0, websockets 17.4), so the image's versions do not change; the
+  tests now run them. The image now also contains `/app/uv.lock`.
+  `scripts/ci/check_image_lock.py IMAGE` reports any package in a built image
+  that differs from the lock.
+
 ## 0.17.0 — 2026-10-19
 
 ### Accounts

@@ -87,11 +87,19 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH=/root/.local/bin:$PATH
 RUN uv venv --python 3.14 /opt/venv
 
-COPY backend/pyproject.toml /tmp/akb-backend/pyproject.toml
+# Third-party packages come from backend/uv.lock, hash-checked, with no
+# resolution at build time, so this image runs the versions the backend
+# image and CI run (see backend/Dockerfile).
+COPY backend/pyproject.toml backend/uv.lock /tmp/akb-backend/
 COPY backend/app /tmp/akb-backend/app
 COPY backend/mcp_server /tmp/akb-backend/mcp_server
-RUN uv pip install --python /opt/venv/bin/python --no-cache /tmp/akb-backend \
-    && rm -rf /tmp/akb-backend
+RUN UV_PYTHON_DOWNLOADS=never uv export --quiet --locked --no-dev --no-emit-project \
+        --project /tmp/akb-backend --format requirements.txt --no-header \
+        --output-file /tmp/akb-requirements.txt \
+    && uv pip install --python /opt/venv/bin/python --no-cache --no-deps \
+        --require-hashes -r /tmp/akb-requirements.txt \
+    && uv pip install --python /opt/venv/bin/python --no-cache --no-deps /tmp/akb-backend \
+    && rm -rf /tmp/akb-backend /tmp/akb-requirements.txt
 
 # Backend source (used at runtime — venv only carries dependencies).
 COPY backend /app/backend

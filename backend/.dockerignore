@@ -27,6 +27,3 @@ build/
 
 # OS
 .DS_Store
-
-# Project-local lock (bake into image only via pyproject install)
-uv.lock
