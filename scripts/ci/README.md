@@ -645,7 +645,7 @@ the job, while the other selected builds continue unless the run is cancelled.
 
 The consolidated status is named `Docker images`; repositories with required
 checks configured should replace the old `Docker image (...)` contexts with
-that name. The five test/static status names are unchanged.
+that name. The consolidation leaves the test and static status names unchanged.
 
 Validate the selector locally without Docker or registry access:
 
