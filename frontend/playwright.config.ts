@@ -1,17 +1,20 @@
 import { defineConfig, devices, type PlaywrightTestConfig } from "@playwright/test";
 
-// A mode names the server a spec needs, and each spec belongs to one mode:
+// A mode names the server its specs need:
 //
 // - mock: the Vite dev server with the browser MSW worker and the mock
-//   reset/discovery endpoints. Its fixture state is shared, so its specs run
-//   one at a time.
+//   reset/discovery endpoints. Every spec file loads here; the page.route
+//   specs skip themselves because MSW answers instead. Its fixture state is
+//   shared, so its specs run one at a time.
 // - fixture: a production build served by `vite preview`, with no backend.
-//   These specs answer every request themselves through page.route, so they
+//   These specs answer their requests themselves through page.route, so they
 //   shard across CI jobs. The /api proxy points at a closed port: a request a
 //   spec does not answer gets a 502 and a "http proxy error" line on stderr
-//   instead of reaching some backend.
+//   instead of a response from some backend.
 // - real: the repository runtime's frontend and backend, at AKB_FRONTEND_URL.
 //   Its specs write to that one backend, so they run one at a time.
+//
+// Fixture and real split the suite between them; mock is unchanged.
 const mode = process.env.AKB_FE_E2E_MODE;
 if (mode !== "mock" && mode !== "fixture" && mode !== "real") {
   throw new Error("Set AKB_FE_E2E_MODE to mock, fixture or real before running Playwright");
@@ -24,8 +27,9 @@ const minutes = (count: number) => count * 60 * 1000;
 
 // Specs that need state outside the page: the runtime backend (real mode) or
 // the mock server's shared fixture state (mock mode). Every other spec owns
-// its HTTP and runs in fixture mode. A new spec that needs a backend and is
-// not listed here fails in fixture mode on the closed proxy port.
+// its HTTP and runs in fixture mode. A spec that depends on a backend response
+// and is not listed here fails in fixture mode, where that response is a 502;
+// a request no assertion depends on only leaves a proxy error line.
 const serverStateSpecs = [
   "smoke",
   "search-live",
@@ -38,9 +42,12 @@ const serverStateSpecs = [
 ];
 const serverStateMatch = new RegExp(`/(${serverStateSpecs.join("|")})\\.spec\\.ts$`);
 
+// These scenarios read the mock server's fixture, so they select their spec
+// in mock mode only.
 const scenario = process.env.AKB_FE_E2E_SCENARIO;
 const scenarioMatch =
-  scenario === "document-edit-recovery" || scenario === "markdown-image-rendering"
+  mode === "mock" &&
+  (scenario === "document-edit-recovery" || scenario === "markdown-image-rendering")
     ? new RegExp(`/${scenario}\\.spec\\.ts$`)
     : undefined;
 
@@ -73,11 +80,12 @@ const modes: Record<"mock" | "fixture" | "real", PlaywrightTestConfig> = {
       timeout: 120_000,
     },
     testIgnore: serverStateMatch,
-    // Lets --shard split by test rather than by file. On a 4-vCPU runner more
-    // than one worker slowed each test enough to break timing assertions, so
-    // CI scales by shards and keeps one worker per job.
+    // Lets --shard split by test rather than by file. On four vCPUs, two to
+    // four workers saved a third of the time at most and slowed each test
+    // enough to break timing assertions, so the default is one worker and CI
+    // scales by shards. Pass --workers to trade that risk for speed locally.
     fullyParallel: true,
-    workers: ci ? 1 : undefined,
+    workers: 1,
     globalTimeout: ci ? minutes(20) : undefined,
   },
   real: {

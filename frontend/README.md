@@ -82,8 +82,9 @@ and interactive components (`TagInput`) have explicit coverage. Add a
 test alongside any change to those code paths.
 
 Playwright e2e specs live in `e2e/`. Choose `mock`, `fixture` or `real`
-explicitly. The mode names the server a spec needs, and each spec runs in one
-of them:
+explicitly. The mode names the server its specs need; fixture and real split
+the suite between them, and mock loads every spec file (the `page.route` specs
+skip themselves there):
 
 - `pnpm run test:e2e:mock` starts Vite with the browser MSW worker, exposes
   mock readiness/discovery/reset at `/__akb_mock__/health`,
@@ -98,9 +99,10 @@ of them:
   and runs every spec that answers its requests through `page.route`. No
   backend runs: `/api` is proxied to a closed port, so a request a spec does
   not answer gets a 502 and a `http proxy error` line on stderr. These specs do
-  not share state, so CI splits them across jobs with `--shard`. A spec that
-  needs the runtime backend or the mock server's state belongs in
-  `serverStateSpecs` in `playwright.config.ts`; every other spec runs here.
+  not share state, so CI splits them across jobs with `--shard`; locally they
+  run on one worker unless you pass `--workers`. A spec that needs the runtime
+  backend or the mock server's state belongs in `serverStateSpecs` in
+  `playwright.config.ts`; every other spec runs here.
 - `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` runs the
   specs in `serverStateSpecs` that need a backend, and consumes the
   common schema-v2 descriptor. The backend, fixture reset, and process shutdown

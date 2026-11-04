@@ -534,7 +534,8 @@ shared suite runner, not from duplicated workflow shell steps.
 The runtime job runs preparation, the API suites, and only the browser specs
 that need its backend (`smoke.spec.ts` and the opt-in live specs). Its budget is
 30 minutes and its Playwright budget 10 minutes; preparation and the API suites
-took 11-15 minutes in recent runs.
+took 11-15 minutes in recent runs. Mock mode also has a 10-minute Playwright
+budget; it runs in about a minute.
 
 The browser specs that answer their own HTTP run in the `frontend e2e
 (fixture)` jobs instead: no backend, a production build served by `vite
@@ -607,10 +608,11 @@ repository contribution guide before committing runtime changes.
 
 ## CI checks and packaging coverage
 
-Every PR retains the five existing checks: static analysis/package tests,
-backend unit tests, live PostgreSQL tests, the repository runtime E2E gate,
-and frontend mock E2E. Application packaging is one additional **Docker
-images** check, rather than four independent image jobs.
+Every PR runs static analysis/package tests, backend unit tests, live
+PostgreSQL tests, the repository runtime E2E gate, frontend mock E2E, the
+three frontend fixture E2E shards, and the Keycloak login theme check.
+Application packaging is one additional **Docker images** check, rather than
+four independent image jobs.
 
 The PostgreSQL image is built and exercised by both the live-DB job and the
 repository runtime. It needs no third build in the packaging workflow.
