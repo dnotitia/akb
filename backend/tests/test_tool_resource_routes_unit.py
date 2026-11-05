@@ -32,7 +32,8 @@ ROWS = [
 
 
 @pytest.fixture
-def boundary(monkeypatch, rsa_keypair):  # noqa: F811
+def boundary(monkeypatch, rsa_keypair, tmp_path):  # noqa: F811
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
     issuer, _, resource = _configure_keycloak(monkeypatch)
     service = keycloak_oidc.KeycloakOIDC()
     service._jwks = {"keys": [rsa_keypair["jwk"]]}
