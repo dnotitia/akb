@@ -4,22 +4,15 @@
 
 - Select browser OAuth with a URL-only invocation, or PAT with the existing argument and environment inputs. Reject contradictory or unsafe configuration.
 - Send MCP requests directly to the mounted `/mcp/` endpoint while keeping the OAuth resource at `/mcp`. Control redirects remain refused.
-- Serve the complete generated tool catalog immediately and add local connection status.
+- Serve the complete generated tool catalog immediately and add local connection status. Check canonical drift, schemas, names, and versions before every source pack.
+- Compare every shared HTTP and stdio tool schema through Inspector with explicit proxy and installation exceptions. Retain the representative read result comparison.
 - Add browser Authorization Code with S256 PKCE, strict discovery, private shared grant storage, coordinated refresh rotation, and explicit sign-in recovery.
-- Publish a replacement grant only after durable storage and a separate committed ownership marker. Interrupted exchanges require fresh authorization.
+- Publish a replacement grant only after durable storage and a separate committed ownership marker. Interrupted exchanges require fresh authorization. Discovery outages preserve the saved grant, and short-lived access tokens use a bounded lifetime-based expiry margin.
 - Use the current shared credential for every file and image control. Keep byte capabilities bearer-free, reject redirects, and verify download size and SHA-256 before replacing a local destination.
-- Preserve stable reservation and replacement receipts on partial and unknown outcomes.
+- Preserve stable reservation and replacement receipts on partial and unknown outcomes. Malformed dispatched control responses report an unknown outcome without exposing upstream body snippets.
 - Keep local protocol requests responsive during backend work. Submit caller operations once and report uncertain outcomes without replay.
 
-
-## Unreleased — the proxy's own refusals set `isError`
-
-The file tools the proxy answers itself (`akb_put_file`, `akb_get_file`,
-`akb_update_file`, `akb_delete_file`, `akb_put_image`, `akb_discard_image`) now
-set `isError: true` when they refuse. That covers a failed call, a local
-`vault_skill_required`, and a `file` argument that cannot be read. The backend
-does the same for its own refusals, so both kinds of refusal carry the flag. The
-`{"error", ...}` body is unchanged.
+- Mark proxy file refusals and vault-guide challenges with `isError: true`.
 
 ## 2.3.2 — opt-in per-call usage record
 

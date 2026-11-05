@@ -69,9 +69,11 @@ Centrally governed:
 
 Backend (Streamable HTTP) handles all business logic. Proxy (stdio) handles local filesystem operations.
 
-- **Proxy-only features**: `akb_put_file`, `akb_get_file`, `akb_delete_file`, `file` param on `akb_put`/`akb_update`
-- **Proxy injects** these into `tools/list` response — backend never sees them
-- **Rule**: Anything requiring local filesystem access MUST be in the proxy, never in the backend
+- **Proxy-only features**: six local file and image tools, `akb_connection`, and the `file` parameter on `akb_put`/`akb_update`.
+- **Catalog**: generate the complete server grammar with `scripts/generate_mcp_catalog.py`; `npm pack` always checks drift and exact local composition. Initial tool discovery never waits for authentication or the backend.
+- **Credentials**: URL-only selects OAuth; `--pat` or `AKB_PAT` selects PAT. One credential owner serves MCP and admitted file controls. PAT never loads the OAuth store. The direct transport endpoint is `B/mcp/`; the OAuth resource is exactly `B/mcp`.
+- **Lifecycle**: local protocol handling stays responsive, and caller business operations never replay after authentication, reconnect, cancellation, or an uncertain response. Preserve durable refresh intent and publication fencing.
+- **Rule**: Anything requiring local filesystem access MUST be in the proxy, never in the backend.
 
 ## Deployment
 

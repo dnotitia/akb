@@ -15,7 +15,7 @@ const assetId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
 const bytes = Buffer.alloc(2 * 1024 * 1024, 71);
 const hash = createHash('sha256').update(bytes).digest('hex');
 
-async function fixture({ rejectConfirm = false, badHash = false, redirectBytes = false, dropConfirm = false } = {}) {
+async function fixture({ rejectConfirm = false, badHash = false, redirectBytes = false, dropConfirm = false, malformedConfirm = false, removeSource = null } = {}) {
   let origin;
   let generation = 0;
   const controls = [];
@@ -41,11 +41,12 @@ async function fixture({ rejectConfirm = false, badHash = false, redirectBytes =
     assert.ok(path.startsWith('/prefix/api/v1/'));
     controls.push({ path, method: request.method });
     let result;
-    if (path.endsWith('/upload')) result = { uri, upload_url: origin + '/bytes/upload' };
+    if (path.endsWith('/upload')) { if (removeSource) await rm(removeSource); result = { uri, upload_url: origin + '/bytes/upload' }; }
     else if (path.endsWith('/download')) result = { name: 'file.bin', download_url: origin + '/bytes/download', size_bytes: bytes.length, content_hash: badHash ? '0'.repeat(64) : hash, hash_algorithm: 'sha256' };
     else if (path.endsWith('/replace')) result = { replacement_id: replacementId, upload_url: origin + '/bytes/replace', mime_type: 'application/octet-stream' };
     else if (path.endsWith('/confirm')) {
       if (dropConfirm) return response.destroy();
+      if (malformedConfirm) return response.writeHead(200).end('upstream-private-marker');
       if (rejectConfirm) return response.writeHead(401).end('upstream-private-marker');
       result = { uri, file_id: fileId, content_hash: hash, hash_algorithm: 'sha256' };
     } else if (path === '/prefix/api/v1/assets/example') result = { id: assetId, url: `/api/assets/${assetId}`, name: 'image.png', mime_type: 'image/png', size_bytes: raw.length, width: 1, height: 1 };
@@ -131,4 +132,38 @@ test('write-only guide refusal is narrowly admitted while auth and ACL failures 
     }
     assert.equal(run.controls.length, 0);
   } finally { await run.close(); }
+});
+
+
+test('a local byte source disappearing after reservation settles once without confirming', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'akb-transfer-source-interrupted-'));
+  const file = join(root, 'source.bin');
+  await writeFile(file, bytes);
+  const run = await fixture({ removeSource: file });
+  let timeout;
+  try {
+    const result = await Promise.race([
+      run.call('akb_put_file', { vault: 'example', file_path: file }),
+      new Promise((_resolve, reject) => { timeout = setTimeout(() => reject(new Error('Interrupted local source did not settle promptly.')), 2000); }),
+    ]);
+    assert.equal(result.isError, true);
+    assert.equal(result.execution, 'unknown');
+    assert.deepEqual(result.receipt, { stage: 'reserved', vault: 'example', uri, file_id: fileId });
+    assert.equal(run.controls.filter((operation) => operation.path.endsWith('/upload')).length, 1);
+    assert.equal(run.controls.filter((operation) => operation.path.endsWith('/confirm')).length, 0);
+  } finally { clearTimeout(timeout); await run.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+
+test('a malformed dispatched confirm reports unknown without upstream response snippets', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'akb-transfer-malformed-'));
+  const run = await fixture({ malformedConfirm: true });
+  try {
+    const file = join(root, 'source.bin'); await writeFile(file, bytes);
+    const result = await run.call('akb_put_file', { vault: 'example', file_path: file });
+    assert.equal(result.execution, 'unknown');
+    assert.equal(result.receipt.file_id, fileId);
+    assert.equal(run.controls.length, 2);
+    assert.doesNotMatch(JSON.stringify(result), /upstream-private-marker/);
+  } finally { await run.close(); await rm(root, { recursive: true, force: true }); }
 });

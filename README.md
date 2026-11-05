@@ -24,11 +24,13 @@ Any agent client that speaks **MCP (Streamable HTTP or stdio)**:
   [`akb-mcp`](https://www.npmjs.com/package/akb-mcp) stdio proxy
 - Custom agents — direct HTTP `POST /mcp/` with a Bearer token
 
-The default flow uses a Personal Access Token. Deployments with the
-optional **MCP OAuth Resource Server** path turned on (via Keycloak as
-the AS — see [`docs/mcp-clients/web-connectors.md`](./docs/mcp-clients/web-connectors.md))
-also accept Claude Code's `mcp add --transport http` + `mcp login` flow
-end-to-end, without a PAT.
+The stdio proxy supports browser OAuth with a URL-only definition on OAuth-enabled
+installations. Existing `--pat` and `AKB_PAT` inputs explicitly select PAT mode,
+including on installations without an authorization server. Both modes cover MCP
+and the admitted local file and image workflows. See the
+[`akb-mcp` setup and recovery guide](./packages/akb-mcp-client/README.md).
+Direct HTTP OAuth setup is documented in
+[`web connectors`](./docs/mcp-clients/web-connectors.md).
 
 ## MCP protocol compatibility
 
@@ -40,8 +42,7 @@ AKB keeps one tool and authorization core behind two protocol adapters:
 | `akb-mcp` stdio proxy | `2026-07-28` discovery and per-request metadata | `2025-06-18` initialize |
 
 The proxy answers either handshake locally and normalizes backend calls to the
-modern stateless contract when available. For older backends without modern discovery, the proxy can fall back to
-legacy initialization and retain a session ID if that older server returns one.
+modern stateless contract. The proxy rejects an incompatible backend contract.
 The current backend runs both adapters statelessly. A process
 cannot mix generations, and unsupported revisions or conflicting protocol
 evidence fail closed before a tool or local-file operation runs.

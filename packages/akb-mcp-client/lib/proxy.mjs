@@ -4,7 +4,8 @@ import { request as httpRequest } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { ToolConnection } from "./connection.mjs";
 import { createCredentialOwner, CredentialUnavailable } from "./credentials.mjs";
-import { ToolCatalog } from "./catalog.mjs";
+import { createCatalog } from "./catalog.mjs";
+import { FILE_TOOL_NAMES, FILE_WRITE_TOOL_NAMES, FILE_CONTENT_TOOLS, VAULT_SKILL_ACK_ARGUMENT } from "./local-tools.mjs";
 import { StdioDispatcher } from "./stdio-dispatch.mjs";
 import { appendFileSync, createReadStream, createWriteStream, readFileSync, statSync } from "node:fs";
 import { mkdir, rename, rm, stat as fsStat } from "node:fs/promises";
@@ -56,7 +57,11 @@ const DOCUMENT_IMAGE_MIMES = new Set([
   "image/gif",
   "image/webp",
 ]);
-const VAULT_SKILL_ACK_ARGUMENT = "_vault_skill_ack";
+
+function controlJson(response) {
+  try { return JSON.parse(response.text); }
+  catch { throw Object.assign(new Error("The backend returned an invalid control response. The dispatched outcome is unknown."), { code: "invalid_control_response", execution: "unknown" }); }
+}
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -69,15 +74,6 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
-function vaultSkillAckProperty() {
-  return {
-    type: "string",
-    maxLength: 128,
-    description:
-      "Opaque acknowledgement from vault_skill.ack_token. Apply the guide, then retry " +
-      "the unchanged operation with this value. The bundled proxy fills it on an exact retry.",
-  };
-}
 const ASSET_URL_RE = /^\/api\/assets\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\/?$/i;
 
 function parseAssetUrl(url) {
@@ -155,170 +151,7 @@ function _resolveParent(args) {
 
 // ── File tool definitions (injected into tools/list) ────────
 
-const FILE_TOOLS = [
-  {
-    name: "akb_put_file",
-    description:
-      "Upload a local file to a vault's file storage (S3-backed). Use for PDFs, images, datasets, or any binary content too large for akb_put. Response includes the canonical `uri` — `akb://{vault}/coll/{collection}/file/{uuid}` when stored under a collection, or `akb://{vault}/file/{uuid}` at the vault root — pass that to akb_get_file / akb_update_file / akb_delete_file. MIME type is auto-detected from the filename extension unless overridden.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        parent: {
-          type: "string",
-          description:
-            "Parent location as a canonical URI — `akb://{vault}` for the vault root, " +
-            "`akb://{vault}/coll/{path}` for a collection. When given, the file is " +
-            "uploaded there and `vault`/`collection` are derived from the URI.",
-        },
-        vault: { type: "string", description: "Vault name. Required unless `parent` is given." },
-        file_path: {
-          type: "string",
-          description: "Absolute path to the local file to upload",
-        },
-        collection: {
-          type: "string",
-          description: "Logical grouping (like document collections). Ignored when `parent` is given.",
-          default: "",
-        },
-        description: {
-          type: "string",
-          description: "Brief description of the file",
-        },
-        mime_type: {
-          type: "string",
-          description:
-            "MIME type of the file (e.g. 'text/html', 'application/pdf', 'image/png'). " +
-            "Optional — if omitted, it is auto-detected from the filename extension. " +
-            "Override only when the extension is missing, ambiguous, or wrong.",
-        },
-      },
-      required: ["file_path"],
-    },
-  },
-  {
-    name: "akb_put_image",
-    description:
-      "Upload a local PNG, JPEG, GIF, or WebP (maximum 10 MiB) for inline use in an AKB Markdown document. Returns a stable `/api/assets/{uuid}` URL and a ready-to-paste `markdown` image expression. For a new document, place it with akb_put. For an existing document, prefer a targeted akb_edit; akb_update(content=...) replaces the entire body and must never receive only an image fragment. Images are immutable: upload a replacement and edit the Markdown reference. This creates a hidden document attachment, not a standalone File; use akb_put_file when the binary should appear in browse/search. If the document write fails, call akb_discard_image with the returned URL.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        parent: {
-          type: "string",
-          description:
-            "Vault or collection URI (`akb://{vault}` or `akb://{vault}/coll/{path}`). " +
-            "The image is owned by that vault; the collection portion only identifies the vault.",
-        },
-        vault: {
-          type: "string",
-          description: "Vault name. Required unless `parent` is given.",
-        },
-        file_path: {
-          type: "string",
-          description: "Absolute path to the local image file (maximum 10 MiB).",
-        },
-        alt_text: {
-          type: "string",
-          description:
-            "Accessible Markdown alt text. Defaults to the filename without its extension.",
-        },
-        mime_type: {
-          type: "string",
-          enum: ["image/png", "image/jpeg", "image/gif", "image/webp"],
-          description:
-            "Optional MIME override for extensionless or unusually named files. The server verifies it against decoded bytes.",
-        },
-      },
-      required: ["file_path"],
-    },
-  },
-  {
-    name: "akb_discard_image",
-    description:
-      "Discard a document image upload that was never committed in an AKB document. Use this only to clean up after a failed or abandoned akb_put/akb_update. Images already claimed by a document or retained Git revision cannot be discarded through this tool.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        parent: {
-          type: "string",
-          description:
-            "Vault or collection URI used for the upload. The vault is derived from it.",
-        },
-        vault: {
-          type: "string",
-          description: "Vault name. Required unless `parent` is given.",
-        },
-        url: {
-          type: "string",
-          description: "Stable `/api/assets/{uuid}` URL returned by akb_put_image.",
-        },
-      },
-      required: ["url"],
-    },
-  },
-  {
-    name: "akb_get_file",
-    description: "Download a file from vault storage to a local path. Pass the file URI — `akb://{vault}[/coll/{coll_path}]/file/{uuid}` — from akb_browse or akb_put_file.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        uri: {
-          type: "string",
-          description: "File URI (akb://{vault}/file/{id})",
-        },
-        save_to: {
-          type: "string",
-          description: "Local directory or file path to save to",
-        },
-      },
-      required: ["uri", "save_to"],
-    },
-  },
-  {
-    name: "akb_update_file",
-    description:
-      "Replace the bytes of an existing vault file while preserving its URI. The local file is hashed before transfer; identical content is skipped. Pass expected_content_hash and/or expected_version from akb_get_file to reject stale writes with HTTP 409 instead of overwriting a concurrent change.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        uri: {
-          type: "string",
-          description: "Existing file URI (`akb://{vault}[/coll/{path}]/file/{uuid}`)",
-        },
-        file_path: {
-          type: "string",
-          description: "Absolute path to the local replacement file",
-        },
-        expected_content_hash: {
-          type: "string",
-          description: "Optional sha256 returned by akb_get_file; stale values are rejected with 409",
-        },
-        expected_version: {
-          type: "string",
-          description: "Optional opaque `version` returned by akb_get_file; stale values are rejected with 409",
-        },
-        mime_type: {
-          type: "string",
-          description: "Optional replacement MIME type. The existing file type is preserved when omitted.",
-        },
-      },
-      required: ["uri", "file_path"],
-    },
-  },
-  {
-    name: "akb_delete_file",
-    description: "Delete a file from vault storage by its URI.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        uri: {
-          type: "string",
-          description: "File URI (akb://{vault}/file/{id})",
-        },
-      },
-      required: ["uri"],
-    },
-  },
-];
+
 
 // Parse an akb://{vault}/file/{id} URI into (vault, id). Throws if malformed.
 function parseFileUri(uri) {
@@ -339,18 +172,6 @@ function parseFileUri(uri) {
   }
   return { vault: rootMatch[1], id: rootMatch[2] };
 }
-
-const FILE_TOOL_NAMES = new Set(FILE_TOOLS.map((t) => t.name));
-const FILE_WRITE_TOOL_NAMES = new Set([
-  "akb_put_file",
-  "akb_put_image",
-  "akb_discard_image",
-  "akb_update_file",
-  "akb_delete_file",
-]);
-
-// Tools where proxy injects a `file` param as alternative to `content`
-const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);
 
 const MODERN_PROTOCOL_VERSION = "2026-07-28";
 const LEGACY_PROTOCOL_VERSION = "2025-06-18";
@@ -425,7 +246,7 @@ export class AKBProxy {
     this.connection = new ToolConnection(this.installation, this.credentials);
     this.context = new AsyncLocalStorage();
     this.shutdown = new AbortController();
-    this.catalog = new ToolCatalog(this._fileToolsForClient(), (tools) => this._decorateTools({ tools }).tools);
+    this.catalog = createCatalog();
     this.msgId = 0;
     this._initialized = false;
     this._clientGeneration = null; // fixed by the first request
@@ -828,48 +649,6 @@ export class AKBProxy {
     return { jsonrpc: "2.0", id, result };
   }
 
-  // Decorate a raw backend tools/list result with the proxy-local file
-  // tools and the injected `file` param. Never mutates the cached result.
-  _decorateTools(resp) {
-    const tools = (resp.tools || []).map((t) => {
-      if (FILE_CONTENT_TOOLS.has(t.name) && t.inputSchema?.properties) {
-        return {
-          ...t,
-          inputSchema: {
-            ...t.inputSchema,
-            properties: {
-              ...t.inputSchema.properties,
-              file: {
-                type: "string",
-                description:
-                  "Local file path to read as document body (alternative to content). " +
-                  "Provide either file or content, not both.",
-              },
-            },
-          },
-        };
-      }
-      return { ...t };
-    });
-    return { ...resp, tools };
-  }
-
-  _fileToolsForClient() {
-    return FILE_TOOLS.map((tool) => {
-      if (!FILE_WRITE_TOOL_NAMES.has(tool.name)) return { ...tool };
-      return {
-        ...tool,
-        inputSchema: {
-          ...tool.inputSchema,
-          properties: {
-            ...(tool.inputSchema?.properties || {}),
-            [VAULT_SKILL_ACK_ARGUMENT]: vaultSkillAckProperty(),
-          },
-        },
-      };
-    });
-  }
-
   async _toolsList(id) {
     return { jsonrpc: "2.0", id, result: this._clientToolsListResult(this.catalog.initialCatalog()) };
   }
@@ -1089,7 +868,7 @@ export class AKBProxy {
       `/api/v1/files/${encodeURIComponent(vault)}/upload?${params}`,
     );
     receipt.stage = "reservation_received";
-    const initBody = JSON.parse(initResp.text);
+    const initBody = controlJson(initResp);
     const { uri, upload_url } = initBody;
     const { id: fileId, vault: reservedVault } = parseFileUri(uri);
     if (reservedVault !== vault) throw new Error("The upload reservation belongs to a different vault.");
@@ -1110,7 +889,7 @@ export class AKBProxy {
           hash_algorithm: "sha256",
         }),
     );
-    return JSON.parse(confirmResp.text);
+    return controlJson(confirmResp);
   }
 
   async _putImage(args) {
@@ -1154,11 +933,11 @@ export class AKBProxy {
       readFileSync(filePath),
       { "Content-Type": mimeType },
     );
-    const asset = JSON.parse(response.text);
-    const assetId = parseAssetUrl(asset.url);
-    if (asset.id !== assetId) {
-      throw new Error("AKB returned inconsistent document image identifiers.");
-    }
+    const asset = controlJson(response);
+    let assetId;
+    try { assetId = parseAssetUrl(asset.url); }
+    catch { throw Object.assign(new Error("The backend returned an invalid document image contract."), { code: "invalid_control_response", execution: "unknown" }); }
+    if (asset.id !== assetId) throw Object.assign(new Error("The backend returned inconsistent document image identifiers."), { code: "invalid_control_response", execution: "unknown" });
 
     const defaultAlt = filename.slice(0, filename.length - extname(filename).length);
     const altText = markdownAltText(args.alt_text ?? defaultAlt);
@@ -1191,7 +970,7 @@ export class AKBProxy {
     let discarded = null;
     const responseText = response.text?.trim();
     if (responseText) {
-      const body = JSON.parse(responseText);
+      const body = controlJson(response);
       if (typeof body.discarded === "boolean") discarded = body.discarded;
     }
     return {
@@ -1223,7 +1002,7 @@ export class AKBProxy {
       etag,
       storage_version,
       version,
-    } = JSON.parse(resp.text);
+    } = controlJson(resp);
 
     if (typeof filename !== "string" || filename !== basename(filename) || [".", ".."].includes(filename) || filename.includes("\\")) throw new Error("The download capability has an unsafe filename.");
     if (!Number.isSafeInteger(size_bytes) || size_bytes < 0 || hash_algorithm !== "sha256" || !/^[a-f0-9]{64}$/.test(content_hash ?? "")) throw new Error("The download capability must declare its exact size and SHA-256 hash.");
@@ -1280,7 +1059,7 @@ export class AKBProxy {
       `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/replace?${initiateParams}`,
     );
     receipt.stage = "replacement_response_received";
-    const initiated = JSON.parse(initiateResp.text);
+    const initiated = controlJson(initiateResp);
     if (initiated.unchanged) return initiated;
 
     const { replacement_id, upload_url } = initiated;
@@ -1304,7 +1083,7 @@ export class AKBProxy {
       `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}` +
         `/replace/${encodeURIComponent(replacement_id)}/confirm?${confirmParams}`,
     );
-    return JSON.parse(confirmResp.text);
+    return controlJson(confirmResp);
   }
 
   async _deleteFile(args) {
@@ -1316,7 +1095,7 @@ export class AKBProxy {
       "DELETE",
       `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
     );
-    return JSON.parse(resp.text);
+    return controlJson(resp);
   }
 
   // ── S3 direct transfer ────────────────────────────────────
