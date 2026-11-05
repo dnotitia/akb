@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { randomUUID } from 'node:crypto';
 import { parseConfiguration, validateEndpoint } from '../lib/config.mjs';
 import { createCredentialOwner } from '../lib/credentials.mjs';
 
@@ -13,7 +14,10 @@ test('URL-only OAuth and active PAT inputs select one consistent method', () => 
 });
 
 test('endpoint validation rejects unsafe production URLs and preserves prefixes', () => {
-  for (const url of ['http://example.com/mcp', 'https://name:secret@example.com/mcp', 'https://example.com/mcp?q=x', 'https://example.com/mcp#x', 'file:///mcp', 'https://example.com/api']) assert.throws(() => validateEndpoint(url));
+  const credentialUrl = new URL('https://example.com/mcp');
+  credentialUrl.username = 'name';
+  credentialUrl.password = randomUUID();
+  for (const url of ['http://example.com/mcp', credentialUrl.href, 'https://example.com/mcp?q=x', 'https://example.com/mcp#x', 'file:///mcp', 'https://example.com/api']) assert.throws(() => validateEndpoint(url));
   for (const host of ['localhost', '127.0.0.1', '[::1]']) assert.equal(validateEndpoint(`http://${host}:1234/prefix/mcp`).baseUrl, `http://${host}:1234/prefix`);
 });
 
