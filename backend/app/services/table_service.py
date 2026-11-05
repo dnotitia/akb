@@ -1926,6 +1926,7 @@ async def execute_sql(
     sql: str,
     params: list[Any] | None = None,
     is_admin: bool = False,
+    read_only: bool = False,
 ) -> dict:
     """Execute raw SQL scoped to vault tables.
 
@@ -2060,6 +2061,7 @@ async def execute_sql(
             params=params,
             is_admin=is_admin,
             vault_names=vault_names,
+            read_only=read_only,
         )
     except PermissionDeniedError as e:
         # PG ACL denied — the boundary working as designed. Surface
