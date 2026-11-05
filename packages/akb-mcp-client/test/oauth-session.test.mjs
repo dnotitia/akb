@@ -133,7 +133,7 @@ test('durable intent survives owner death and a suspended owner has no timeout t
   const directory = await mkdtemp(join(tmpdir(), 'akb-oauth-crash-'));
   const resource = 'https://resource.example/mcp';
   const moduleUrl = new URL('../lib/oauth-store.mjs', import.meta.url).href;
-  const script = `import { OAuthStore } from ${JSON.stringify(moduleUrl)}; const store = new OAuthStore(${JSON.stringify(resource)}, { directory: process.env.TEST_AUTH_DIR }); if (!store.acquire()) process.exit(2); store.save({binding:{resource:${JSON.stringify(resource)},issuer:'https://issuer.example',clientId:'native'},grantId:'grant',generation:1,tokens:{access_token:'old-access',refresh_token:'old-refresh'},expiresAt:Date.now()+3600000,refreshIntent:{grantId:'grant',generation:1}}); process.stdout.write('owned\\n'); setInterval(()=>{},1000);`;
+  const script = `import { OAuthStore } from ${JSON.stringify(moduleUrl)}; const store = new OAuthStore(${JSON.stringify(resource)}, { directory: process.env.TEST_AUTH_DIR }); if (!store.acquire()) process.exit(2); store.save({binding:{resource:${JSON.stringify(resource)},issuer:'https://issuer.example',clientId:'native'},grantId:'grant',generation:1,tokens:{access_token:'old-access',refresh_token:'old-refresh'},expiresAt:Date.now()+3600000,refreshIntent:{grantId:'grant',generation:1}}); process.stdout.write('owned\\n'); setInterval(()=>{ if (!store.owned) process.exit(3); },1000);`;
   const child = spawn(process.execPath, ['--input-type=module', '-e', script], { env: { ...process.env, TEST_AUTH_DIR: directory }, stdio: ['ignore', 'pipe', 'pipe'] });
   child.stderr.resume();
   let store;
