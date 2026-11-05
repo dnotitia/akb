@@ -21,7 +21,7 @@ export class ToolConnection {
     this.connectivity = 'unknown';
   }
   close() { for (const agent of Object.values(this.agents)) agent.destroy(); }
-  mcp(body, headers, options) { return this._request('POST', new URL(this.installation.resource), body, headers, options); }
+  mcp(body, headers, options) { return this._request('POST', new URL(this.installation.endpointUrl), body, headers, options); }
   control(method, path, body, headers, options) {
     const pathname = path.split('?')[0];
     if (!controls.some(([verb, pattern]) => verb === method && pattern.test(pathname))) {

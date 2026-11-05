@@ -424,7 +424,7 @@ function encodeMcpHeaderValue(value) {
 export class AKBProxy {
   constructor({ installation, authentication, credentialOwner }) {
     this.installation = installation;
-    this.url = new URL(installation.resource);
+    this.url = new URL(installation.endpointUrl);
     this.credentials = credentialOwner ?? createCredentialOwner(authentication, installation);
     this.connection = new ToolConnection(this.installation, this.credentials);
     this.context = new AsyncLocalStorage();

@@ -417,7 +417,7 @@ itAsync("_http honors the per-call probe timeout", async () => {
     const started = Date.now();
 
     await assert.rejects(
-      () => proxy._http("POST", "/mcp", null, {}, { timeoutMs: 30 }),
+      () => proxy._http("POST", "/mcp/", null, {}, { timeoutMs: 30 }),
       /backend connection failed/,
     );
 

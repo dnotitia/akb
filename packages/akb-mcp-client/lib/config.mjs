@@ -10,7 +10,7 @@ export function validateEndpoint(value) {
   }
   if (!/\/mcp\/?$/.test(url.pathname)) throw new Error('The MCP URL path must end in /mcp.');
   url.pathname = url.pathname.replace(/\/$/, '');
-  return { resource: url.href, baseUrl: url.href.slice(0, -4) };
+  return { resource: url.href, endpointUrl: url.href + '/', baseUrl: url.href.slice(0, -4) };
 }
 
 export function parseConfiguration(argv, env = process.env) {

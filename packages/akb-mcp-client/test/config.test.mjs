@@ -5,7 +5,7 @@ import { createCredentialOwner } from '../lib/credentials.mjs';
 
 test('URL-only OAuth and active PAT inputs select one consistent method', () => {
   const url = 'https://example.com/prefix/mcp/';
-  assert.deepEqual(parseConfiguration(['--url', url], {}), { installation: { resource: 'https://example.com/prefix/mcp', baseUrl: 'https://example.com/prefix' }, authentication: { kind: 'oauth' } });
+  assert.deepEqual(parseConfiguration(['--url', url], {}), { installation: { resource: 'https://example.com/prefix/mcp', endpointUrl: 'https://example.com/prefix/mcp/', baseUrl: 'https://example.com/prefix' }, authentication: { kind: 'oauth' } });
   assert.equal(parseConfiguration(['--url', url, '--pat', 'test'], {}).authentication.kind, 'pat');
   assert.equal(parseConfiguration([], { AKB_MCP_URL: url, AKB_PAT: 'test' }).authentication.kind, 'pat');
   for (const args of [['--url', url, '--auth-mode', 'oauth', '--pat', 'test'], ['--url', url, '--auth-mode', 'pat'], ['--url', url, '--insecure'], ['--url'], ['--url', url, '--url', url], ['--url', url, '--auth-mode', 'other']]) assert.throws(() => parseConfiguration(args, {}));

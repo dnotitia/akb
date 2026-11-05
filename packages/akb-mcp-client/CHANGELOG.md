@@ -3,6 +3,7 @@
 ## 2.4.0
 
 - Select browser OAuth with a URL-only invocation, or PAT with the existing argument and environment inputs. Reject contradictory or unsafe configuration.
+- Send MCP requests directly to the mounted `/mcp/` endpoint while keeping the OAuth resource at `/mcp`. Control redirects remain refused.
 - Serve the complete generated tool catalog immediately and add local connection status.
 - Keep local protocol requests responsive during backend work. Submit caller operations once and report uncertain outcomes without replay.
 
