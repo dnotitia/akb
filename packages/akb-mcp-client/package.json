@@ -8,7 +8,7 @@
   },
   "scripts": {
     "inspect": "node scripts/mcp-inspector-smoke.mjs",
-    "test": "node --test test/config.test.mjs test/connection.test.mjs && node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs && node test/usage-log.test.mjs && node --test test/mcp-inspector-smoke.test.mjs test/packed-runtime.test.mjs"
+    "test": "node --test test/config.test.mjs test/connection.test.mjs test/oauth-session.test.mjs test/stdio-lifecycle.test.mjs && node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs && node test/usage-log.test.mjs && node --test test/mcp-inspector-smoke.test.mjs test/packed-runtime.test.mjs"
   },
   "type": "module",
   "engines": {

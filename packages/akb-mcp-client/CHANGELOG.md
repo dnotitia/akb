@@ -5,6 +5,8 @@
 - Select browser OAuth with a URL-only invocation, or PAT with the existing argument and environment inputs. Reject contradictory or unsafe configuration.
 - Send MCP requests directly to the mounted `/mcp/` endpoint while keeping the OAuth resource at `/mcp`. Control redirects remain refused.
 - Serve the complete generated tool catalog immediately and add local connection status.
+- Add browser Authorization Code with S256 PKCE, strict discovery, private shared grant storage, coordinated refresh rotation, and explicit sign-in recovery.
+- Publish a replacement grant only after durable storage and a separate committed ownership marker. Interrupted exchanges require fresh authorization.
 - Keep local protocol requests responsive during backend work. Submit caller operations once and report uncertain outcomes without replay.
 
 
