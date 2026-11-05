@@ -69,13 +69,24 @@ export class OAuthSession {
     if (!this.store || !this.binding || this.failure) return null;
     try {
       const record = this.store.read();
-      if (!record || !sameBinding(record.binding, this.binding)) {
+      const bindingMatches = sameBinding(record?.binding, this.binding);
+      const pendingExchange = bindingMatches && (record.refreshIntent || (!record.signedOut && !record.recovery && !this.store.isPublished(record)));
+      if (!this.store.owned && (!record || pendingExchange)) {
+        if (!this.store.acquire()) {
+          this.state = { authentication: 'owner_busy', message: 'Another proxy owns sign-in or refresh. Local MCP requests remain available.' };
+          return null;
+        }
+        this.store.release();
+        this.state = { authentication: 'reauthorization_required', message: pendingExchange ? 'A token exchange was interrupted. Use sign_in for a fresh authorization.' : 'No shared OAuth session is available. Use sign_in for a fresh authorization.' };
+        return null;
+      }
+      if (!record || !bindingMatches) {
         if (!this.task || this.state.authentication === 'ready') {
           this.state = { authentication: 'reauthorization_required', message: record ? 'The shared OAuth binding changed. Use sign_in for a fresh authorization.' : 'The shared OAuth session was removed. Use sign_in for a fresh authorization.' };
         }
         return null;
       }
-      if (record.refreshIntent || (!record.signedOut && !record.recovery && !this.store.isPublished(record))) {
+      if (pendingExchange) {
         if (!this.task) this.state = { authentication: 'reauthorization_required', message: 'A token exchange was interrupted. Use sign_in for a fresh authorization.' };
         return null;
       }

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createServer, request as httpRequest } from 'node:http';
 import { AKBProxy } from '../lib/proxy.mjs';
-import { mkdtemp, rm, chmod, symlink } from 'node:fs/promises';
+import { mkdtemp, rm, chmod, symlink, mkdir, rename, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -361,5 +361,89 @@ for (const changed of ['binding', 'missing']) {
       assert.equal(issuer.openings(), 1);
       assert.deepEqual(issuer.exchanges, ['authorization_code']);
     } finally { await session.close(); peer?.close(); await issuer.close(); await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
+for (const stage of ['authorization', 'refresh']) {
+  test(`a peer waiting for ${stage} reports the active owner before a shared grant is usable`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'akb-oauth-peer-status-'));
+    const issuer = await mockIssuer();
+    const options = { storeOptions: { directory }, browserOpener: issuer.browserOpener };
+    const first = new OAuthSession(issuer.installation, options);
+    const second = new OAuthSession(issuer.installation, options);
+    let observer;
+    let release;
+    try {
+      first.start();
+      await until(() => issuer.authorization());
+      second.start();
+      await until(() => second.binding && !second.task);
+      let peer = second;
+      if (stage === 'refresh') {
+        await issuer.finish();
+        await until(() => first.currentCredential() && second.currentCredential());
+        observer = new OAuthStore(issuer.installation.resource, { directory });
+        await until(() => observer.acquire());
+        observer.save({ ...observer.read(), expiresAt: Date.now() - 1 });
+        observer.release();
+        release = issuer.hold();
+        await until(() => issuer.exchanges.length === 2);
+        peer = first.store.owned ? second : first;
+      }
+      assert.equal(peer.currentCredential(), null);
+      const status = peer.status();
+      assert.equal(status.authentication, 'owner_busy', JSON.stringify(status));
+      assert.match(status.message, /Another proxy owns/);
+      assert.equal(issuer.openings(), 1);
+      assert.deepEqual(issuer.exchanges, stage === 'authorization' ? [] : ['authorization_code', 'refresh_token']);
+      if (stage === 'authorization') await issuer.finish();
+      else { release(); release = null; }
+      await until(() => first.currentCredential() && second.currentCredential());
+      assert.equal(first.status().authentication, 'ready');
+      assert.equal(second.status().authentication, 'ready');
+      assert.equal(issuer.openings(), 1);
+    } finally {
+      release?.();
+      await first.close(); await second.close(); observer?.close(); await issuer.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const mode of [0o700, 0o777]) {
+  test(`a mutable intermediate storage symlink under a ${mode.toString(8)} parent is refused`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'akb-oauth-ancestor-'));
+    let accepted;
+    try {
+      const target = join(root, 'private', 'parent', 'auth');
+      await mkdir(target, { recursive: true, mode: 0o700 });
+      const parent = join(root, 'shared');
+      await mkdir(parent, { mode }); await chmod(parent, mode);
+      await symlink(join(root, 'private'), join(parent, 'route'));
+      assert.throws(() => { accepted = new OAuthStore('https://ancestor.example/mcp', { directory: join(parent, 'route', 'parent', 'auth') }); }, /ancestor|symlink|writable/);
+    } finally { accepted?.close(); await rm(root, { recursive: true, force: true }); }
+  });
+}
+
+for (const replaced of ['directory', 'database']) {
+  test(`a replaced storage ${replaced} cannot split ownership from credential operations`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'akb-oauth-identity-'));
+    const directory = join(root, 'auth');
+    const store = new OAuthStore('https://identity.example/mcp', { directory });
+    try {
+      assert.equal(store.acquire(), true);
+      store.save({ binding: { resource: 'https://identity.example/mcp' }, publicationId: 'original' });
+      if (replaced === 'directory') {
+        await rename(directory, join(root, 'retired'));
+        await mkdir(directory, { mode: 0o700 });
+      } else {
+        const database = store.recordPath.replace(/\.json$/, '.sqlite');
+        await rename(database, database + '.retired');
+        await writeFile(database, '', { mode: 0o600 });
+      }
+      for (const operation of [() => store.read(), () => store.isPublished({ publicationId: 'original' }), () => store.acquire(), () => store.save({ binding: { resource: 'https://identity.example/mcp' } }), () => store.publish('replacement')]) {
+        assert.throws(operation, /identity changed/);
+      }
+    } finally { store.close(); await rm(root, { recursive: true, force: true }); }
   });
 }
