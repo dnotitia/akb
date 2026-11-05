@@ -210,7 +210,13 @@ class NativeRealm:
             result = self.client
         elif "/protocol-mappers/models" in path:
             if method == "POST":
-                self.mappers.append({**body, "id": "mapper"})
+                mapper = copy.deepcopy(body)
+                mapper["config"] = {
+                    "introspection.token.claim": "true",
+                    "userinfo.token.claim": "false",
+                    **mapper["config"],
+                }
+                self.mappers.append({**mapper, "id": "mapper"})
             if method == "DELETE":
                 self.mappers.clear()
             result = self.mappers
@@ -240,6 +246,56 @@ def test_provisioning_converges_and_rereads_registration_mapper_scopes_rotation(
     assert realm.client["redirectUris"] == [setup_script.NATIVE_REDIRECT_URI]
     assert len(realm.mappers) == 1
     assert all("/components" not in path for _method, path, _body in realm.calls)
+
+
+def test_provisioning_accepts_keycloak_default_audience_mapper_claims():
+    realm = NativeRealm()
+    setup_script.provision_native_client("https://kc.example/admin/realms/test", "admin-token",
+                                        "akb-mcp-native", "https://akb.example.com/mcp", request=realm.request)
+    assert realm.mappers[0]["config"] == {
+        "included.custom.audience": "https://akb.example.com/mcp",
+        "access.token.claim": "true",
+        "id.token.claim": "false",
+        "introspection.token.claim": "true",
+        "userinfo.token.claim": "false",
+    }
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("included.custom.audience", "https://other.example.com/mcp"),
+    ("access.token.claim", "false"),
+    ("id.token.claim", "true"),
+    ("introspection.token.claim", "false"),
+    ("userinfo.token.claim", "true"),
+    ("included.client.audience", "another-client"),
+    ("unexpected.setting", "true"),
+])
+def test_provisioning_rejects_changed_audience_mapper_config(key, value):
+    realm = NativeRealm()
+
+    def altered_mapper(method, url, token, body=None):
+        status, payload, headers = realm.request(method, url, token, body)
+        if method == "GET" and url.endswith("/protocol-mappers/models") and payload:
+            payload[0]["config"][key] = value
+        return status, payload, headers
+
+    with pytest.raises(RuntimeError, match="Native audience mapper differs"):
+        setup_script.provision_native_client("https://kc.example/admin/realms/test", "admin-token",
+                                            "akb-mcp-native", "https://akb.example.com/mcp", request=altered_mapper)
+
+
+def test_provisioning_rejects_an_extra_audience_mapper():
+    realm = NativeRealm()
+
+    def extra_mapper(method, url, token, body=None):
+        status, payload, headers = realm.request(method, url, token, body)
+        if method == "GET" and url.endswith("/protocol-mappers/models") and payload:
+            payload.append({**copy.deepcopy(payload[0]), "id": "another-mapper"})
+        return status, payload, headers
+
+    with pytest.raises(RuntimeError, match="Native audience mapper differs"):
+        setup_script.provision_native_client("https://kc.example/admin/realms/test", "admin-token",
+                                            "akb-mcp-native", "https://akb.example.com/mcp", request=extra_mapper)
 
 
 def test_refused_admin_write_stops_provisioning():

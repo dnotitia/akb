@@ -220,7 +220,13 @@ def native_client(client_id: str, audience: str) -> dict:
             "protocol": "openid-connect",
             "protocolMapper": "oidc-audience-mapper",
             "consentRequired": False,
-            "config": {"included.custom.audience": audience, "access.token.claim": "true", "id.token.claim": "false"},
+            "config": {
+                "included.custom.audience": audience,
+                "access.token.claim": "true",
+                "id.token.claim": "false",
+                "introspection.token.claim": "true",
+                "userinfo.token.claim": "false",
+            },
         }],
     }
 
