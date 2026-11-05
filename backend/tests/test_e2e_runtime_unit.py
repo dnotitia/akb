@@ -27,6 +27,7 @@ from e2e_runtime import (  # noqa: E402
     CredentialNames,
     E2ERuntime,
     ManagedProcess,
+    ProductAssertionFailure,
     ProvisioningFailure,
     SOURCE_REVISION_ENV,
     RuntimeConfig,
@@ -1992,6 +1993,63 @@ def test_transport_profile_exposes_real_proxy_boundary_without_secret(tmp_path):
     assert "akb_runtime_secret" not in serialized
     assert "AKB_E2E_PAT" in serialized
     assert descriptor["evidence"]["transport"] == ["http", "stdio"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_response", [
+    {"error": {"code": -32000, "message": "authentication_pending"}},
+    {"result": {"isError": True, "content": [{
+        "type": "text", "text": '{"vaults":[],"total":0,"returned":0}',
+    }]}},
+    {"result": {}},
+    {"result": {"content": [{"type": "image", "data": "invalid"}]}},
+    {"result": {"content": [{"type": "text", "text": "authentication_pending"}]}},
+    {"result": {"content": [{"type": "text", "text": "[]"}]}},
+    {"result": {"content": [{"type": "text", "text": '{"error":"network_unavailable"}'}]}},
+    {"result": {"content": [{"type": "text", "text": '{"vaults":[],"total":true,"returned":0}'}]}},
+    {"result": {"content": [{"type": "text", "text": '{"vaults":[],"total":1,"returned":1}'}]}},
+    {"result": {"content": [{"type": "text", "text": '{"vaults":[{}],"total":0,"returned":1}'}]}},
+])
+async def test_stdio_probe_never_advertises_a_failed_or_malformed_read(tmp_path, monkeypatch, read_response):
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), profile="transport-proxy"))
+    runtime._stdio_read_call_observed = True
+
+    async def request(method, params):
+        if method == "tools/list":
+            return {"result": {"tools": [{"name": name} for name in [
+                "akb_list_vaults", "akb_put", "akb_delete_vault",
+            ]]}}
+        assert params == {"name": "akb_list_vaults", "arguments": {}}
+        return read_response
+
+    monkeypatch.setattr(runtime, "_stdio_request", request)
+
+    with pytest.raises(ProductAssertionFailure):
+        await runtime._probe_stdio_behavior()
+
+    assert runtime.runtime_evidence()["stdio"]["read_call_observed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("public", [
+    {"vaults": [], "total": 0, "returned": 0},
+    {"vaults": [{"name": "fixture-vault"}], "total": 2, "returned": 1},
+])
+async def test_stdio_probe_advertises_a_valid_vault_list_read(tmp_path, monkeypatch, public):
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), profile="transport-proxy"))
+
+    async def request(method, params):
+        if method == "tools/list":
+            return {"result": {"tools": [{"name": name} for name in [
+                "akb_list_vaults", "akb_put", "akb_delete_vault",
+            ]]}}
+        return {"result": {"isError": False, "content": [{"type": "text", "text": json.dumps(public)}]}}
+
+    monkeypatch.setattr(runtime, "_stdio_request", request)
+
+    await runtime._probe_stdio_behavior()
+
+    assert runtime.runtime_evidence()["stdio"]["read_call_observed"] is True
 
 
 @pytest.mark.asyncio

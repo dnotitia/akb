@@ -2710,6 +2710,7 @@ class E2ERuntime:
 
         if not self.profile.needs_stdio:
             return
+        self._stdio_read_call_observed = False
         response = await self._stdio_request("tools/list", {})
         result = response.get("result")
         if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
@@ -2729,8 +2730,23 @@ class E2ERuntime:
             {"name": "akb_list_vaults", "arguments": {}},
         )
         read_result = read_response.get("result")
-        if not isinstance(read_result, dict) or "error" in read_response:
+        if (not isinstance(read_result, dict) or "error" in read_response
+                or read_result.get("isError", False) is not False):
             raise ProductAssertionFailure("stdio read tool call was not accepted")
+        content = read_result.get("content")
+        if (not isinstance(content, list) or not content or not isinstance(content[0], dict)
+                or content[0].get("type") != "text" or not isinstance(content[0].get("text"), str)):
+            raise ProductAssertionFailure("stdio read tool call returned no public JSON text")
+        try:
+            public = json.loads(content[0]["text"])
+        except ValueError:
+            raise ProductAssertionFailure("stdio read tool call returned invalid public JSON") from None
+        if not isinstance(public, dict):
+            raise ProductAssertionFailure("stdio read tool call returned a non-object result")
+        vaults, total, returned = public.get("vaults"), public.get("total"), public.get("returned")
+        if (not isinstance(vaults, list) or type(total) is not int or type(returned) is not int
+                or returned != len(vaults) or total < returned):
+            raise ProductAssertionFailure("stdio read tool call returned an invalid Vault list")
         self._stdio_read_call_observed = True
 
     @staticmethod
