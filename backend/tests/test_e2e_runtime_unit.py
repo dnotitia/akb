@@ -3218,9 +3218,10 @@ async def test_publication_replica_phase_owns_processes_and_fences_reset(tmp_pat
     assert ("publication-replica" in runtime._children) is (outcome == "drain")
 
 
-def test_oidc_runtime_admits_only_its_dedicated_tool_client(tmp_path):
+def test_oidc_runtime_admits_only_its_dedicated_tool_client(tmp_path, monkeypatch):
     import jwt
     from app.config import Settings
+    from app.services import lifecycle
 
     runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), profile="oidc-resource-server"))
     prepare_private_runtime_root(runtime.config.runtime_root)
@@ -3228,12 +3229,15 @@ def test_oidc_runtime_admits_only_its_dedicated_tool_client(tmp_path):
     app_config = yaml.safe_load((runtime.config.config_dir / "app.yaml").read_text())
     secret_config = yaml.safe_load((runtime.config.config_dir / "secret.yaml").read_text())
     settings = Settings.model_validate(app_config | secret_config)
+    monkeypatch.setattr(lifecycle, "settings", settings)
+    lifecycle._validate_required_settings()
     key = jwt.PyJWKSet.from_dict(runtime.oidc_fixture.jwks()).keys[0].key
     claims = jwt.decode(runtime.oidc_fixture.mint("valid"), key, algorithms=["RS256"],
                         issuer=runtime.oidc_fixture.issuer, audience=settings.mcp_oauth_resource)
     assert claims["azp"] in settings.mcp_oauth_client_ids
     assert claims["azp"] not in settings.keycloak_human_client_ids
-    assert settings.mcp_oauth_native_client_id == ""
+    assert settings.mcp_oauth_native_client_id == claims["azp"]
+    assert settings.mcp_oauth_direct_client_ids == []
 
 
 def test_oidc_runtime_reports_the_current_resource_metadata_path(tmp_path):

@@ -1959,7 +1959,7 @@ class E2ERuntime:
                     "keycloak_internal_url": self.oidc_fixture.origin,
                     "keycloak_realm": self.oidc_fixture.realm,
                     "keycloak_client_id": "runtime-api-client",
-                    "mcp_oauth_direct_client_ids": ["runtime-mcp-client"],
+                    "mcp_oauth_native_client_id": "runtime-mcp-client",
                     "keycloak_enrollment_mode": "open",
                     "keycloak_require_verified_email": True,
                 }
