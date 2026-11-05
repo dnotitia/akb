@@ -262,16 +262,15 @@ test("Node security floor rejects unpatched and unsupported release lines", () =
 });
 
 
-test("complete catalog parity records only exact proxy and installation exceptions", () => {
+test("complete catalog parity records only exact proxy exceptions", () => {
   const catalog = createCatalog();
-  const http = structuredClone(catalog.canonical).filter((tool) => tool.name !== "akb_import");
+  const http = structuredClone(catalog.canonical);
   const stdio = structuredClone(catalog.initialCatalog().tools);
   const result = compareCatalogs(http, stdio);
   assert.equal(result.status, "passed");
   assert.equal(result.shared_tool_count, http.length);
   assert.equal(result.exceptions.local_tools.length, 7);
   assert.deepEqual(result.exceptions.file_arguments.sort(), ["akb_put", "akb_update"]);
-  assert.deepEqual(result.exceptions.installation_filtered_initial_only_tools, ["akb_import"]);
   assert.ok(result.exceptions.shared_skill_acknowledgements.includes("akb_put"));
   for (const mutate of [
     (tools) => { tools.find((tool) => tool.name === "akb_search").inputSchema.properties.query.type = "number"; },
@@ -285,4 +284,19 @@ test("complete catalog parity records only exact proxy and installation exceptio
     const changed = structuredClone(stdio); mutate(changed);
     assert.equal(compareCatalogs(http, changed).status, "failed");
   }
+  assert.equal(compareCatalogs([], stdio).status, "failed");
+  assert.equal(compareCatalogs(http.slice(1), stdio).status, "failed");
+});
+
+test("current Native schemas can differ from the initial complete grammar", () => {
+  const catalog = createCatalog();
+  const http = structuredClone(catalog.canonical);
+  const create = http.find((tool) => tool.name === "akb_create_vault");
+  delete create.inputSchema.properties.template;
+  delete create.inputSchema.properties.external_git;
+  const stdio = structuredClone(catalog.initialCatalog().tools);
+  assert.equal(compareCatalogs(http, stdio).status, "passed");
+  const unrelated = structuredClone(http);
+  unrelated.find((tool) => tool.name === create.name).inputSchema.properties.name.type = "number";
+  assert.equal(compareCatalogs(unrelated, stdio).status, "failed");
 });

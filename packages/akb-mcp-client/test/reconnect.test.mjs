@@ -204,6 +204,34 @@ itAsync("catalog refinement notifies only when the effective contract changes", 
   assert.equal(notes.length, 1);
 });
 
+itAsync("current Native creation options refine the complete catalog once", async () => {
+  const proxy = newProxy();
+  const tools = structuredClone(proxy.catalog.canonical);
+  const create = tools.find((tool) => tool.name === "akb_create_vault");
+  delete create.inputSchema.properties.template;
+  delete create.inputSchema.properties.external_git;
+  create.description = "This deployment supports empty vault creation.";
+  const notes = [];
+  proxy._notify = (method) => notes.push(method);
+  proxy._rpc = async () => ({ tools });
+  await proxy._syncTools();
+  const refined = (await proxy._toolsList(1, {})).result.tools;
+  assert.deepEqual(refined.find((tool) => tool.name === create.name), create);
+  assert.equal(refined.length, proxy.catalog.canonical.length + 7);
+  assert.deepEqual(notes, ["notifications/tools/list_changed"]);
+  await proxy._syncTools();
+  assert.equal(notes.length, 1);
+});
+
+itAsync("catalog refinement refuses empty and incomplete backend grammars", async () => {
+  for (const tools of [[], structuredClone(newProxy().catalog.canonical).slice(1)]) {
+    const proxy = newProxy();
+    const before = structuredClone(proxy.catalog.initialCatalog());
+    assert.throws(() => proxy.catalog.refine({ tools }), /incompatible/);
+    assert.deepEqual(proxy.catalog.initialCatalog(), before);
+  }
+});
+
 itAsync("monitor stays silent on recovery when the list was never degraded", async () => {
   const proxy = newProxy();
   proxy._ensureBackend = async () => {
