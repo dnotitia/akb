@@ -139,6 +139,15 @@ def validate_owner_id(owner_id: str | None) -> str | None:
     return owner_id
 
 
+async def _require_target_realm(target, expected_realm_id):
+    # An external administrator can still replace a realm during the
+    # subsequent REST call; this read cannot make that boundary atomic.
+    realm = await management_targets.read_realm(target)
+    if expected_realm_id is not None and realm["realm_id"] != str(expected_realm_id):
+        raise _error("sso_management_realm_conflict")
+    return realm
+
+
 async def set_ownership(alias: str, *, owner_id: str | None, expected_revision: int,
                         expected_fingerprint: str, clear_emergency: bool, actor_id: uuid.UUID, target_id: uuid.UUID | None = None) -> dict[str, Any]:
     alias = _canonical_alias(alias)
@@ -153,7 +162,7 @@ async def set_ownership(alias: str, *, owner_id: str | None, expected_revision: 
 
 async def change_ownership_in(conn, alias: str, *, owner_id: str | None, expected_revision: int,
                               expected_fingerprint: str, clear_emergency: bool, actor_id: uuid.UUID,
-                              target_id: uuid.UUID | None = None):
+                              target_id: uuid.UUID | None = None, expected_realm_id: str | None = None):
     """The ownership compare-and-set, on the caller's transaction.
 
     An approved ownership claim runs exactly this with the approving human as
@@ -172,6 +181,8 @@ async def change_ownership_in(conn, alias: str, *, owner_id: str | None, expecte
     if fingerprint != expected_fingerprint:
         raise _error("sso_provider_fingerprint_conflict")
     emergency = bool(row and row["emergency_disabled"] and not clear_emergency)
+    if expected_realm_id is not None:
+        await _require_target_realm(target, expected_realm_id)
     await conn.execute("""INSERT INTO sso_provider_ownership
         (alias,owner_id,revision,fingerprint,emergency_disabled,updated_by,target_id)
         VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(target_id,alias) DO UPDATE SET
@@ -277,12 +288,8 @@ async def provider_credentials_guard(alias: str, actor, *, expected_fingerprint:
                 alias, provider_fingerprint(mutation.after), actor_id, target.target_id, label)
             await emit_event(conn, "auth.sso_provider_client_credentials_changed", actor_id=str(actor_id),
                              payload={"provider_alias": alias, "provider_revision": revision, **mutation.audit_view()})
-        # The read narrows replacement races; an external administrator can
-        # still replace the realm while the subsequent REST write is in flight.
         if expected_realm_id is not None:
-            realm = await management_targets.read_realm(target)
-            if realm["realm_id"] != str(expected_realm_id):
-                raise _error("sso_management_realm_conflict")
+            await _require_target_realm(target, expected_realm_id)
         yield ProviderCredentialsGuard(control=target.control, check=check, complete=complete)
 
 
@@ -336,12 +343,8 @@ async def provider_initialization_guard(alias: str, actor, *, expected_fingerpri
                 RETURNING revision""", alias, provider_fingerprint(after), actor_id, target.target_id, label)
             await emit_event(conn, "auth.sso_provider_initialized", actor_id=str(actor_id),
                              payload={"provider_alias": alias, "provider_revision": revision, **mutation.audit_view()})
-        # The read narrows replacement races; an external administrator can
-        # still replace the realm while the subsequent REST write is in flight.
         if expected_realm_id is not None:
-            realm = await management_targets.read_realm(target)
-            if realm["realm_id"] != str(expected_realm_id):
-                raise _error("sso_management_realm_conflict")
+            await _require_target_realm(target, expected_realm_id)
         yield ProviderInitializationGuard(control=target.control, complete=complete)
 
 
@@ -434,9 +437,7 @@ async def grant_in(conn, spec: dict[str, Any], *, granted_by: uuid.UUID, expires
     target = await management_targets.resolve(conn, spec.get("target_id"))
     if expected_target_id is not None and target.target_id != expected_target_id:
         raise _error("sso_management_target_changed")
-    realm = await management_targets.read_realm(target)
-    if spec.get("expected_target_realm_id", realm["realm_id"]) != realm["realm_id"]:
-        raise _error("sso_management_target_unavailable")
+    realm = await _require_target_realm(target, spec.get("expected_target_realm_id"))
     if spec.get("target_id") is not None and (not spec.get("expected_source") or not spec.get("expected_target_realm_id") or not spec.get("target_session_epoch") or not spec.get("expected_target_runtime_generation") or "expected_target_source_revision" not in spec):
         raise _error("sso_operation_target_binding_required", 422)
     target_epoch = str(spec.get("target_session_epoch") or expected_source["sso_session_epoch"])
@@ -488,6 +489,8 @@ async def grant_in(conn, spec: dict[str, Any], *, granted_by: uuid.UUID, expires
         if expires_at <= await conn.fetchval("SELECT clock_timestamp()"):
             raise _error("sso_operation_request_expired", 403)
         expires = expires_at
+    if spec.get("expected_target_realm_id") is not None:
+        await _require_target_realm(target, spec["expected_target_realm_id"])
     await conn.execute("""INSERT INTO sso_identity_operations
         (operation_id,installation_id,credential_hash,granted_by,actor_id,actor_token_id,
          provider_alias,owner_id,provider_revision,provider_fingerprint,runtime_generation,session_epoch,
@@ -542,11 +545,13 @@ async def _execute_provider(conn, row, request, request_hash, actor_expires_at, 
             # binds it to the secret-free summary the human actually saw.
             raise _error("sso_operation_summary_conflict", 403)
         await _check_window(conn, row, request, actor_expires_at=actor_expires_at)
+        await _require_target_realm(target, row["target_realm_id"])
         mutation = await control.configure(ProviderConfigureSpec(alias=row["provider_alias"], **spec.model_dump()))
     else:
         if payload:
             raise _error("sso_operation_payload_conflict", 403)
         await _check_window(conn, row, request, actor_expires_at=actor_expires_at)
+        await _require_target_realm(target, row["target_realm_id"])
         mutation = await control.set_enabled(row["provider_alias"], enabled=verb == "enable")
     await _check_window(conn, row, request, actor_expires_at=actor_expires_at)
     if verb == "configure" and payload.get("client_secret") is not None:

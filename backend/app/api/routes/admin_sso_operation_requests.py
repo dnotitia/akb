@@ -71,6 +71,7 @@ class OwnershipClaimProposal(RequestModel):
     expected_fingerprint: str = Field(pattern=_SHA256)
     request_nonce: str | None = Field(default=None, pattern=_UUID)
     expected_target_id: uuid.UUID | None = None
+    expected_realm_id: uuid.UUID | None = None
 
 
 class ProviderGrantProposal(RequestModel):
@@ -88,6 +89,7 @@ class ProviderGrantProposal(RequestModel):
     recipient_public_key: str = Field(min_length=43, max_length=43)
     request_nonce: str | None = Field(default=None, pattern=_UUID)
     expected_target_id: uuid.UUID | None = None
+    expected_realm_id: uuid.UUID | None = None
 
 
 Proposal = Annotated[OwnershipClaimProposal | ProviderGrantProposal, Field(discriminator="kind")]
@@ -122,7 +124,8 @@ class RequestDocument(RequestModel):
     owner_id: str
     requested_by: uuid.UUID
     requested_token_id: uuid.UUID
-    request_nonce: uuid.UUID | None = None
+    request_nonce: uuid.UUID | None = Field(default=None, exclude_if=lambda value: value is None)
+    expected_realm_id: uuid.UUID | None = Field(default=None, exclude_if=lambda value: value is None)
     claim: ClaimTerms | None
     grant: GrantTerms | None
 

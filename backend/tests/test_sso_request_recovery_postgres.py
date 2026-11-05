@@ -123,3 +123,117 @@ async def test_nonce_grant_replays_terminal_state_without_second_credential(lane
         assert await lane["pool"].fetchval("SELECT count(*) FROM sso_operation_requests") == 1
         assert [kind for kind, _ in await events(lane)] == ["auth.sso_operation_request_proposed",
             "auth.sso_operation_request_approved", "auth.sso_operation_request_credential_issued"]
+
+
+async def test_realm_bound_claim_refuses_replacement_before_ownership_cas(lane, monkeypatch):
+    realm = {"id": str(uuid.uuid4())}
+
+    async def read_realm():
+        return {"realm_id": realm["id"], "realm_name": "akb", "issuer": "https://auth.akb.example.com/realms/akb"}
+
+    monkeypatch.setattr(lane["control"], "read_realm_identity", read_realm)
+    before = await ops.ownership("workforce")
+    original = realm["id"]
+    body = {**await claim_body(), "request_nonce": str(uuid.uuid4()),
+            "expected_target_id": before["target_id"], "expected_realm_id": original}
+    async with review_http_client() as client:
+        bad = await client.post(BASE, headers=lane["pat"], json={**body, "expected_realm_id": str(uuid.uuid4())})
+        assert (bad.status_code, bad.json()["code"]) == (409, "sso_management_realm_conflict")
+        proposed = await client.post(BASE, headers=lane["pat"], json=body)
+        assert proposed.status_code == 201
+        request = proposed.json()
+        assert request["request"]["expected_realm_id"] == original
+        assert request["request_sha256"] == digest(request["request"])
+        csrf = await review_human_cookies(client)
+        realm["id"] = str(uuid.uuid4())
+        refused = await client.post(f"{BASE}/{request['request_id']}/approve", headers=csrf,
+                                    json={"expected_request_sha256": request["request_sha256"]})
+        assert (refused.status_code, refused.json()["code"]) == (409, "sso_management_realm_conflict")
+        assert await lane["pool"].fetchval("SELECT count(*) FROM sso_provider_ownership") == 0
+        assert (await client.get(f"{BASE}/{request['request_id']}", headers=lane["pat"])).json()["status"] == "pending"
+        realm["id"] = original
+
+        # Replacement can also happen after the initial approval read but
+        # before the ownership row is written.
+        original_provider = ops._provider
+
+        async def replace_after_provider(*args, **kwargs):
+            result = await original_provider(*args, **kwargs)
+            realm["id"] = str(uuid.uuid4())
+            return result
+
+        monkeypatch.setattr(ops, "_provider", replace_after_provider)
+        raced = await client.post(f"{BASE}/{request['request_id']}/approve", headers=csrf,
+                                  json={"expected_request_sha256": request["request_sha256"]})
+        assert (raced.status_code, raced.json()["code"]) == (409, "sso_management_realm_conflict")
+        assert await lane["pool"].fetchval("SELECT count(*) FROM sso_provider_ownership") == 0
+        monkeypatch.setattr(ops, "_provider", original_provider)
+        realm["id"] = original
+        approved = await client.post(f"{BASE}/{request['request_id']}/approve", headers=csrf,
+                                     json={"expected_request_sha256": request["request_sha256"]})
+        assert approved.status_code == 200 and approved.json()["status"] == "approved"
+
+
+async def test_realm_bound_grant_checks_collection_and_immediate_provider_write(lane, monkeypatch):
+    from tests.test_sso_operation_requests_postgres import PAYLOAD, SECRET, execute_body, unseal
+
+    realm = {"id": str(uuid.uuid4()), "reads": 0, "replace_on": 0}
+
+    async def read_realm():
+        realm["reads"] += 1
+        current = str(uuid.uuid4()) if realm["replace_on"] and realm["reads"] >= realm["replace_on"] else realm["id"]
+        return {"realm_id": current, "realm_name": "akb", "issuer": "https://auth.akb.example.com/realms/akb"}
+
+    monkeypatch.setattr(lane["control"], "read_realm_identity", read_realm)
+    owned = await own(lane)
+    private, public = keypair()
+    original = realm["id"]
+    body = grant_body(public, owned["revision"], request_nonce=str(uuid.uuid4()),
+                      expected_target_id=owned["target_id"], expected_realm_id=original)
+    async with review_http_client() as client:
+        proposed = await client.post(BASE, headers=lane["pat"], json=body)
+        assert proposed.status_code == 201
+        request = proposed.json()
+        assert request["request"]["expected_realm_id"] == original
+        csrf = await review_human_cookies(client)
+        approved = await client.post(f"{BASE}/{request['request_id']}/approve", headers=csrf,
+                                     json={"expected_request_sha256": request["request_sha256"]})
+        assert approved.status_code == 200
+        realm["id"] = str(uuid.uuid4())
+        path = f"{BASE}/{request['request_id']}/credential"
+        refused = await client.post(path, headers=lane["pat"])
+        assert (refused.status_code, refused.json()["code"]) == (409, "sso_management_realm_conflict")
+        assert await lane["pool"].fetchval("SELECT count(*) FROM sso_identity_operations") == 0
+        realm["id"] = original
+        original_provider = ops._provider
+
+        async def replace_during_collection(*args, **kwargs):
+            result = await original_provider(*args, **kwargs)
+            realm["id"] = str(uuid.uuid4())
+            return result
+
+        monkeypatch.setattr(ops, "_provider", replace_during_collection)
+        raced = await client.post(path, headers=lane["pat"])
+        assert (raced.status_code, raced.json()["code"]) == (409, "sso_management_realm_conflict")
+        assert await lane["pool"].fetchval("SELECT count(*) FROM sso_identity_operations") == 0
+        monkeypatch.setattr(ops, "_provider", original_provider)
+        realm["id"] = original
+        issued = await client.post(path, headers=lane["pat"])
+        assert issued.status_code == 200
+        sealed = issued.json()
+        credential = unseal(sealed["sealed_credential"], private, sealed["seal"]["info"])
+        operation = await lane["pool"].fetchrow("SELECT * FROM sso_identity_operations")
+        assert operation["target_realm_id"] == original
+
+        # The first execute boundary sees the original realm; replacement
+        # after that read must still fail immediately before the REST write.
+        realm["reads"], realm["replace_on"] = 0, 2
+        effect = await client.post(
+            f"/api/v1/admin/sso/identity-operations/{operation['operation_id']}/execute",
+            headers={"Authorization": "AKB-Operation " + credential},
+            json=execute_body("configure", PAYLOAD),
+        )
+        assert (effect.status_code, effect.json()["code"]) == (409, "sso_management_realm_conflict")
+        assert lane["control"].configured_secret is None
+        assert await lane["pool"].fetchval("SELECT count(*) FROM sso_identity_operation_requests") == 0
+        assert SECRET not in effect.text and credential not in effect.text

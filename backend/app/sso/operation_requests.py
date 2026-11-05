@@ -151,6 +151,7 @@ async def propose(spec: dict[str, Any], *, actor) -> dict[str, Any]:
         raise _error("sso_operation_request_invalid", 422)
     nonce = uuid.UUID(str(spec["request_nonce"])) if spec.get("request_nonce") else None
     expected_target = uuid.UUID(str(spec["expected_target_id"])) if spec.get("expected_target_id") else None
+    expected_realm = uuid.UUID(str(spec["expected_realm_id"])) if spec.get("expected_realm_id") else None
     proposal_digest = ops._digest({"proposal": spec, "source": source}) if nonce else None
     pool = await get_pool()
     await _expire_due(pool)
@@ -161,6 +162,8 @@ async def propose(spec: dict[str, Any], *, actor) -> dict[str, Any]:
             raise _error("sso_operation_runtime_conflict")
         if expected_target is not None and target.target_id != expected_target:
             raise _error("sso_management_target_conflict")
+        if expected_realm is not None:
+            await ops._require_target_realm(target, expected_realm)
         installation = await conn.fetchval("SELECT installation_id FROM sso_operation_installation WHERE singleton")
         prior = None
         if nonce is not None:
@@ -179,6 +182,8 @@ async def propose(spec: dict[str, Any], *, actor) -> dict[str, Any]:
                     "claim": claim, "grant": grant}
         if nonce is not None:
             document["request_nonce"] = str(nonce)
+        if expected_realm is not None:
+            document["expected_realm_id"] = str(expected_realm)
         digest = ops._digest(document)
         if prior is not None:
             if not secrets.compare_digest(prior["request_sha256"], digest):
@@ -193,6 +198,8 @@ async def propose(spec: dict[str, Any], *, actor) -> dict[str, Any]:
                 OR EXISTS(SELECT 1 FROM sso_operation_requests WHERE operation_id=$1)""", uuid.UUID(grant["operation_id"])):
                 raise _error("sso_operation_id_conflict")
         await _live_requester(conn, user_id, token_id)
+        if expected_realm is not None:
+            await ops._require_target_realm(target, expected_realm)
         now = await conn.fetchval("SELECT clock_timestamp()")
         await conn.execute("""INSERT INTO sso_operation_requests
             (request_id,kind,request,request_sha256,target_id,provider_alias,requested_by,requested_token_id,
@@ -286,12 +293,16 @@ async def _decide(request_id: uuid.UUID, *, expected_request_sha256: str, human_
         if approve:
             # Never act on a proposal whose requesting key is no longer trusted.
             await _live_requester(conn, row["requested_by"], row["requested_token_id"])
+            if document.get("expected_realm_id"):
+                target = await management_targets.resolve(conn, row["target_id"])
+                await ops._require_target_realm(target, document["expected_realm_id"])
         if approve and row["kind"] == "ownership_claim":
             claim = document["claim"]
             await ops.change_ownership_in(conn, document["provider_alias"], owner_id=document["owner_id"],
                                           expected_revision=claim["expected_revision"],
                                           expected_fingerprint=claim["expected_fingerprint"],
-                                          clear_emergency=False, actor_id=human_id, target_id=row["target_id"])
+                                          clear_emergency=False, actor_id=human_id, target_id=row["target_id"],
+                                          expected_realm_id=document.get("expected_realm_id"))
         if approve:
             await _live_requester(conn, row["requested_by"], row["requested_token_id"])
         now = await conn.fetchval("SELECT clock_timestamp()")
@@ -367,6 +378,8 @@ async def collect(request_id: uuid.UUID, *, actor) -> dict[str, Any]:
                 "expected_source": terms["source"], "ttl_seconds": terms["ttl_seconds"],
                 "verbs": terms["verbs"], "cohort": [], "provider_payload_sha256": terms["provider_payload_sha256"],
                 "provider_secret_revision": terms["provider_secret_revision"]}
+        if document.get("expected_realm_id"):
+            spec["expected_target_realm_id"] = document["expected_realm_id"]
         issued = await ops.grant_in(conn, spec, granted_by=row["decided_by"], expires_at=row["operation_expires_at"],
                                     expected_target_id=row["target_id"], configure_summary=terms["configure_summary"],
                                     approval_request_id=row["request_id"])
