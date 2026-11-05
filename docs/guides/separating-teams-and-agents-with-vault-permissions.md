@@ -56,8 +56,9 @@ for the details.
 ## Scoping agents
 
 - **Read-only tokens.** A Personal Access Token can be issued read-only. It
-  cannot call tools that change a vault, or `akb_sql` even for `SELECT`,
-  because that tool also accepts writes.
+  cannot call tools that change a vault. It can query tables through `akb_sql`
+  within its Vault and PostgreSQL access. AKB automatically runs its SQL in a
+  PostgreSQL read-only transaction, which denies database mutations.
 - **Vault scope.** A read-and-write token can carry a vault scope: vault-name
   prefixes such as `agent-` and exact vault names. The token's write access is
   the user's access limited to that list, and so is its `akb_sql` access.
