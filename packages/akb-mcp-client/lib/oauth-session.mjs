@@ -142,7 +142,7 @@ export class OAuthSession {
     if (resource.resource !== this.installation.resource || resource.authorization_servers?.length !== 1 || typeof resource.akb_native_client_id !== 'string' || !resource.akb_native_client_id.trim()) throw new Error('The installation OAuth resource or native-client metadata is incompatible.');
     const issuer = secureUrl(resource.authorization_servers[0]);
     const metadata = await discoverAuthorizationServerMetadata(issuer, { fetchFn });
-    if (!metadata || metadata.issuer !== issuer || !metadata.response_types_supported?.includes('code') || !metadata.grant_types_supported?.includes('authorization_code') || !metadata.grant_types_supported?.includes('refresh_token') || !metadata.code_challenge_methods_supported?.includes('S256') || !metadata.token_endpoint_auth_methods_supported?.includes('none')) throw new Error('The authorization server must support a public S256 native client and rotating refresh tokens.');
+    if (!metadata || metadata.issuer !== issuer || !metadata.response_types_supported?.includes('code') || !metadata.grant_types_supported?.includes('authorization_code') || !metadata.grant_types_supported?.includes('refresh_token') || !metadata.code_challenge_methods_supported?.includes('S256')) throw new Error('The authorization server must support a public S256 native client and rotating refresh tokens.');
     secureUrl(metadata.authorization_endpoint);
     secureUrl(metadata.token_endpoint);
     const binding = { resource: this.installation.resource, issuer, clientId: resource.akb_native_client_id };

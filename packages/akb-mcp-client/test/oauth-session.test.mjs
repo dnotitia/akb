@@ -17,7 +17,7 @@ async function until(check, timeout = 3000) {
   throw new Error('Timed out waiting for the expected OAuth state.');
 }
 
-async function mockIssuer() {
+async function mockIssuer({ advertisedAuthMethods = ['none'] } = {}) {
   let origin;
   let authorization;
   let generation = 0;
@@ -32,12 +32,13 @@ async function mockIssuer() {
     response.setHeader('Content-Type', 'application/json');
     if (!available && url.pathname.includes('.well-known')) return response.writeHead(503).end('{}');
     if (url.pathname === '/.well-known/oauth-protected-resource/prefix/mcp') return response.end(JSON.stringify({ resource: origin + '/prefix/mcp', authorization_servers: [origin], scopes_supported: ['akb:vault:read', 'akb:vault:write'], akb_native_client_id: 'native-test' }));
-    if (url.pathname.includes('.well-known')) return response.end(JSON.stringify({ issuer: origin, authorization_endpoint: origin + '/authorize', token_endpoint: origin + '/token', response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'], code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none'], authorization_response_iss_parameter_supported: true }));
+    if (url.pathname.includes('.well-known')) return response.end(JSON.stringify({ issuer: origin, authorization_endpoint: origin + '/authorize', token_endpoint: origin + '/token', response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'], code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: advertisedAuthMethods, authorization_response_iss_parameter_supported: true }));
     if (url.pathname === '/token') {
       const params = new URLSearchParams(body);
       assert.equal(params.get('resource'), origin + '/prefix/mcp');
       assert.equal(params.get('client_id'), 'native-test');
       assert.equal(params.has('client_secret'), false);
+      assert.equal(request.headers.authorization, undefined);
       exchanges.push(params.get('grant_type'));
       if (params.get('grant_type') === 'authorization_code') {
         assert.equal(params.get('redirect_uri'), authorization.searchParams.get('redirect_uri'));
@@ -313,4 +314,26 @@ test('absolute-form and network-path callback targets never consume the valid at
     assert.equal(await submit('/oauth/callback' + query), 200);
     assert.deepEqual(await callback.result, { code: 'good', iss: 'https://issuer.example' });
   } finally { callback.close(); }
+});
+
+
+test('a pre-registered public client works when Keycloak metadata omits the none auth method', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'akb-oauth-public-client-'));
+  const issuer = await mockIssuer({ advertisedAuthMethods: ['private_key_jwt', 'client_secret_basic', 'client_secret_post', 'tls_client_auth', 'client_secret_jwt'] });
+  const session = new OAuthSession(issuer.installation, { storeOptions: { directory }, browserOpener: issuer.browserOpener });
+  let store;
+  try {
+    session.start(); await issuer.finish();
+    const original = await until(() => session.currentCredential());
+    store = new OAuthStore(issuer.installation.resource, { directory });
+    await until(() => store.acquire());
+    store.save({ ...store.read(), expiresAt: Date.now() - 1 }); store.release();
+    const rotated = await until(() => {
+      const credential = session.currentCredential();
+      return credential?.generation === original.generation + 1 ? credential : null;
+    });
+    assert.equal(rotated.grantId, original.grantId);
+    assert.deepEqual(issuer.exchanges, ['authorization_code', 'refresh_token']);
+    assert.equal(issuer.openings(), 1);
+  } finally { await session.close(); store?.close(); await issuer.close(); await rm(directory, { recursive: true, force: true }); }
 });

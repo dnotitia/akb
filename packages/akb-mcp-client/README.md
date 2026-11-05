@@ -25,7 +25,7 @@ An MCP definition needs only the endpoint:
 
 The proxy opens the system browser after its first local protocol response is flushed. Sign in in that browser, then submit a new tool call on the same MCP connection. Initialization, discovery, the complete initial tool list, ping, and `akb_connection` remain available while authorization is pending.
 
-The installation must advertise its protected resource, one authorization server, and `akb_native_client_id`. Its registered public native client must support Authorization Code, S256 PKCE, refresh rotation, and `http://127.0.0.1:<dynamic-port>/oauth/callback`. No client secret or prior CLI login is required. The proxy requests the advertised AKB read and write scopes and does not request `offline_access`.
+The installation must advertise its protected resource, one authorization server, and `akb_native_client_id`. Its registered public native client must support Authorization Code, S256 PKCE, refresh rotation, and `http://127.0.0.1:<dynamic-port>/oauth/callback`. No client secret or prior CLI login is required. This published, pre-registered public-client profile sends `client_id` without a client secret or an HTTP Authorization header at the token endpoint. Its registration determines that behavior; the server-wide advertised methods list does not select a different client authentication method. The proxy requests the advertised AKB read and write scopes and does not request `offline_access`.
 
 The transport endpoint is `B/mcp/`, including any installation prefix. The OAuth resource and token audience are exactly `B/mcp`. Both input spellings select that direct transport endpoint. Control and discovery redirects are refused.
 
