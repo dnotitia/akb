@@ -139,22 +139,52 @@ async def propose(spec: dict[str, Any], *, actor) -> dict[str, Any]:
     alias = ops._canonical_alias(spec["provider_alias"])
     owner_id = ops.validate_owner_id(spec["owner_id"])
     if owner_id is None:
-        # Releasing ownership is a human decision, never a request.
         raise _error("sso_provider_owner_invalid", 422)
     claim = grant = None
+    source = source_tuple()
     if kind == "ownership_claim":
         claim = {"expected_revision": spec["expected_revision"], "expected_fingerprint": spec["expected_fingerprint"]}
     elif kind == "provider_grant":
         grant = _grant_terms(spec)
+        grant["source"] = source
     else:
         raise _error("sso_operation_request_invalid", 422)
+    nonce = uuid.UUID(str(spec["request_nonce"])) if spec.get("request_nonce") else None
+    expected_target = uuid.UUID(str(spec["expected_target_id"])) if spec.get("expected_target_id") else None
+    proposal_digest = ops._digest({"proposal": spec, "source": source}) if nonce else None
     pool = await get_pool()
     await _expire_due(pool)
-    request_id = uuid.uuid4()
     async with pool.acquire() as conn, conn.transaction():
         await _live_requester(conn, user_id, token_id)
         target = await management_targets.resolve(conn)
+        if source != source_tuple():
+            raise _error("sso_operation_runtime_conflict")
+        if expected_target is not None and target.target_id != expected_target:
+            raise _error("sso_management_target_conflict")
         installation = await conn.fetchval("SELECT installation_id FROM sso_operation_installation WHERE singleton")
+        prior = None
+        if nonce is not None:
+            # A global nonce lock prevents even different service keys from
+            # racing the same id into distinct requests.
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", f"sso-request-nonce:{nonce}")
+            prior = await conn.fetchrow(_SELECT + " WHERE r.request_nonce=$1", nonce)
+            if prior is not None and (prior["requested_by"] != user_id or prior["requested_token_id"] != token_id
+                                      or prior["proposal_sha256"] != proposal_digest):
+                raise _error("sso_operation_request_nonce_conflict")
+        request_id = prior["request_id"] if prior else uuid.uuid4()
+        document = {"schema_version": 1, "request_id": str(request_id), "kind": kind,
+                    "installation_id": str(installation), "target_id": str(target.target_id),
+                    "provider_alias": alias, "owner_id": owner_id,
+                    "requested_by": str(user_id), "requested_token_id": str(token_id),
+                    "claim": claim, "grant": grant}
+        if nonce is not None:
+            document["request_nonce"] = str(nonce)
+        digest = ops._digest(document)
+        if prior is not None:
+            if not secrets.compare_digest(prior["request_sha256"], digest):
+                raise _error("sso_operation_request_nonce_conflict")
+            await _live_requester(conn, user_id, token_id)
+            return view(prior)
         if grant is not None:
             # An approved request must still be able to become this operation.
             await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -162,21 +192,15 @@ async def propose(spec: dict[str, Any], *, actor) -> dict[str, Any]:
             if await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM sso_identity_operations WHERE operation_id=$1)
                 OR EXISTS(SELECT 1 FROM sso_operation_requests WHERE operation_id=$1)""", uuid.UUID(grant["operation_id"])):
                 raise _error("sso_operation_id_conflict")
-        document = {"schema_version": 1, "request_id": str(request_id), "kind": kind,
-                    "installation_id": str(installation), "target_id": str(target.target_id),
-                    "provider_alias": alias, "owner_id": owner_id,
-                    "requested_by": str(user_id), "requested_token_id": str(token_id),
-                    "claim": claim, "grant": grant}
-        digest = ops._digest(document)
         await _live_requester(conn, user_id, token_id)
         now = await conn.fetchval("SELECT clock_timestamp()")
         await conn.execute("""INSERT INTO sso_operation_requests
             (request_id,kind,request,request_sha256,target_id,provider_alias,requested_by,requested_token_id,
-             operation_id,ttl_seconds,created_at,expires_at,requester_scope)
-            VALUES($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10,$11,$12,'sso_operation_requests')""",
+             operation_id,ttl_seconds,created_at,expires_at,requester_scope,request_nonce,proposal_sha256)
+            VALUES($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10,$11,$12,'sso_operation_requests',$13,$14)""",
             request_id, kind, ops._json(document), digest, target.target_id, alias, user_id, token_id,
             uuid.UUID(grant["operation_id"]) if grant else None, grant["ttl_seconds"] if grant else None,
-            now, now + timedelta(seconds=PENDING_SECONDS))
+            now, now + timedelta(seconds=PENDING_SECONDS), nonce, proposal_digest)
         await emit_event(conn, "auth.sso_operation_request_proposed", actor_id=str(user_id),
                          payload={"request_id": str(request_id), "kind": kind, "provider_alias": alias,
                                   "owner_id": owner_id, "request_sha256": digest,
@@ -185,21 +209,46 @@ async def propose(spec: dict[str, Any], *, actor) -> dict[str, Any]:
         return view(await conn.fetchrow(_SELECT + " WHERE r.request_id=$1", request_id))
 
 
-async def list_requests(*, actor) -> dict[str, Any]:
+async def list_requests(*, actor, page_size: int | None = None, cursor: uuid.UUID | None = None) -> dict[str, Any]:
     pool = await get_pool()
     await _expire_due(pool)
-    # Open requests first, so a burst of closed ones cannot hide them.
-    order = (" ORDER BY CASE r.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,"
-             " r.created_at DESC, r.request_id LIMIT $1")
-    if getattr(actor, "account_kind", "human") == "service":
-        user_id, token_id = _service_identity(actor)
-        async with pool.acquire() as conn, conn.transaction():
-            await _live_requester(conn, user_id, token_id)
-            rows = await conn.fetch(_SELECT + " WHERE r.requested_token_id=$2 AND r.requested_by=$3" + order,
-                                    LIST_LIMIT, token_id, user_id)
-    else:
-        rows = await pool.fetch(_SELECT + order, LIST_LIMIT)
-    return {"schema_version": 1, "requests": [view(row) for row in rows]}
+    if page_size is None:
+        if cursor is not None:
+            raise _error("sso_operation_request_cursor_invalid", 422)
+        # Retain the legacy human/default ordering and envelope.
+        order = (" ORDER BY CASE r.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,"
+                 " r.created_at DESC, r.request_id LIMIT $1")
+        if getattr(actor, "account_kind", "human") == "service":
+            user_id, token_id = _service_identity(actor)
+            async with pool.acquire() as conn, conn.transaction():
+                await _live_requester(conn, user_id, token_id)
+                rows = await conn.fetch(_SELECT + " WHERE r.requested_token_id=$2 AND r.requested_by=$3" + order,
+                                        LIST_LIMIT, token_id, user_id)
+        else:
+            rows = await pool.fetch(_SELECT + order, LIST_LIMIT)
+        return {"schema_version": 1, "requests": [view(row) for row in rows]}
+    if not isinstance(page_size, int) or not 1 <= page_size <= LIST_LIMIT:
+        raise _error("sso_operation_request_cursor_invalid", 422)
+    user_id, token_id = _service_identity(actor)
+    async with pool.acquire() as conn, conn.transaction():
+        await _live_requester(conn, user_id, token_id)
+        after = None
+        if cursor is not None:
+            after = await conn.fetchrow("""SELECT created_at,request_id FROM sso_operation_requests
+                WHERE request_id=$1 AND requested_by=$2 AND requested_token_id=$3""", cursor, user_id, token_id)
+            if after is None:
+                raise _error("sso_operation_request_cursor_invalid", 422)
+        if after is None:
+            rows = await conn.fetch(_SELECT + """ WHERE r.requested_by=$1 AND r.requested_token_id=$2
+                ORDER BY r.created_at DESC,r.request_id DESC LIMIT $3""", user_id, token_id, page_size+1)
+        else:
+            rows = await conn.fetch(_SELECT + """ WHERE r.requested_by=$1 AND r.requested_token_id=$2
+                AND (r.created_at,r.request_id)<($3,$4)
+                ORDER BY r.created_at DESC,r.request_id DESC LIMIT $5""", user_id, token_id,
+                                    after["created_at"], after["request_id"], page_size+1)
+    page = rows[:page_size]
+    next_cursor = str(page[-1]["request_id"]) if len(rows) > page_size else None
+    return {"schema_version": 1, "requests": [view(row) for row in page], "next_cursor": next_cursor}
 
 
 async def read(request_id: uuid.UUID, *, actor) -> dict[str, Any]:

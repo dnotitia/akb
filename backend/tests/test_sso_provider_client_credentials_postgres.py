@@ -347,3 +347,22 @@ async def test_client_credentials_pin_target_and_use_resolved_control_transport(
         assert accepted.status_code == 200, accepted.text
         assert sum(method == "PUT" for method, _ in selected_fixture.requests) == 1
         assert not wrong_fixture.requests and _SECRET not in accepted.text
+
+
+async def test_client_credentials_refuse_different_realm_before_write(standalone, monkeypatch):
+    lane, control = standalone, standalone["control"]
+    actual_realm = uuid.uuid4()
+
+    async def read_realm():
+        return {"realm_id": str(actual_realm), "realm_name": "akb", "issuer": "https://auth.akb.example.com/realms/akb"}
+
+    monkeypatch.setattr(control, "read_realm_identity", read_realm)
+    async with review_http_client() as client:
+        before = await _ownership(client, lane)
+        request = _body(before["fingerprint"], expected_target_id=before["target_id"], expected_realm_id=str(uuid.uuid4()))
+        refused = await client.put(_PATH, headers=lane["pat"], json=request)
+        assert (refused.status_code, refused.json()["code"]) == (409, "sso_management_realm_conflict")
+        assert control.credential_writes == [] and await _row(lane) is None
+        request["expected_realm_id"] = str(actual_realm)
+        accepted = await client.put(_PATH, headers=lane["pat"], json=request)
+        assert accepted.status_code == 200 and len(control.credential_writes) == 1

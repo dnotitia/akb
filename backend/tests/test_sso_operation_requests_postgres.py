@@ -77,7 +77,8 @@ async def lane(monkeypatch):
 
         async with pool.acquire() as conn:
             for name in ("082_pending_admissions.py", "121_sso_identity_operations.py",
-                         "127_sso_operation_requests.py", "127_sso_operation_requests.py"):
+                         "127_sso_operation_requests.py", "127_sso_operation_requests.py",
+                         "129_sso_request_recovery.py", "129_sso_request_recovery.py"):
                 migration = _load_migration(name)
                 assert migration is not None
                 await migration.migrate(conn=conn)

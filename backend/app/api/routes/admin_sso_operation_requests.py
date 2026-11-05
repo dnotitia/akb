@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 import uuid
 
-from fastapi import APIRouter, Body, Depends, Header, Request, Response
+from fastapi import APIRouter, Body, Depends, Header, Query, Request, Response
 from pydantic import Field
 
 from app.api.deps import get_sso_operation_request_service_key
@@ -23,6 +23,7 @@ from app.sso import operation_requests
 router = APIRouter(route_class=ValueLessRoute)
 _ALIAS = r"^[a-z0-9][a-z0-9._-]{0,62}$"
 _SHA256 = r"^[a-f0-9]{64}$"
+_UUID = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 
 
 async def get_requesting_service_key(request: Request, authorization: str | None = Header(default=None)):
@@ -68,6 +69,8 @@ class OwnershipClaimProposal(RequestModel):
     owner_id: str = Field(min_length=1, max_length=255)
     expected_revision: int = Field(ge=0, strict=True)
     expected_fingerprint: str = Field(pattern=_SHA256)
+    request_nonce: str | None = Field(default=None, pattern=_UUID)
+    expected_target_id: uuid.UUID | None = None
 
 
 class ProviderGrantProposal(RequestModel):
@@ -83,6 +86,8 @@ class ProviderGrantProposal(RequestModel):
     provider_secret_revision: str | None = Field(default=None, min_length=1, max_length=255)
     # Raw 32-byte X25519 public key, unpadded base64url.
     recipient_public_key: str = Field(min_length=43, max_length=43)
+    request_nonce: str | None = Field(default=None, pattern=_UUID)
+    expected_target_id: uuid.UUID | None = None
 
 
 Proposal = Annotated[OwnershipClaimProposal | ProviderGrantProposal, Field(discriminator="kind")]
@@ -117,6 +122,7 @@ class RequestDocument(RequestModel):
     owner_id: str
     requested_by: uuid.UUID
     requested_token_id: uuid.UUID
+    request_nonce: uuid.UUID | None = None
     claim: ClaimTerms | None
     grant: GrantTerms | None
 
@@ -140,6 +146,7 @@ class OperationRequestView(RequestModel):
 class OperationRequestList(RequestModel):
     schema_version: Literal[1]
     requests: list[OperationRequestView]
+    next_cursor: uuid.UUID | None = None
 
 
 class Decision(RequestModel):
@@ -163,37 +170,38 @@ class SealedCredentialResponse(RequestModel):
     seal: SealDescription
 
 
-@router.post("/admin/sso/operation-requests", response_model=OperationRequestView, status_code=201)
+@router.post("/admin/sso/operation-requests", response_model=OperationRequestView, response_model_exclude_unset=True, status_code=201)
 async def propose_operation_request(proposal: Annotated[Proposal, Body()],
                                     actor=Depends(get_requesting_service_key)):
-    return await operation_requests.propose(proposal.model_dump(), actor=actor)
+    return await operation_requests.propose(proposal.model_dump(mode="json"), actor=actor)
 
 
-@router.get("/admin/sso/operation-requests", response_model=OperationRequestList)
-async def list_operation_requests(actor=Depends(get_request_reader)):
-    return await operation_requests.list_requests(actor=actor)
+@router.get("/admin/sso/operation-requests", response_model=OperationRequestList, response_model_exclude_unset=True)
+async def list_operation_requests(page_size: int | None = Query(default=None, ge=1, le=100),
+                                  cursor: uuid.UUID | None = None, actor=Depends(get_request_reader)):
+    return await operation_requests.list_requests(actor=actor, page_size=page_size, cursor=cursor)
 
 
-@router.get("/admin/sso/operation-requests/{request_id}", response_model=OperationRequestView)
+@router.get("/admin/sso/operation-requests/{request_id}", response_model=OperationRequestView, response_model_exclude_unset=True)
 async def read_operation_request(request_id: uuid.UUID, actor=Depends(get_request_reader)):
     return await operation_requests.read(request_id, actor=actor)
 
 
-@router.post("/admin/sso/operation-requests/{request_id}/approve", response_model=OperationRequestView)
+@router.post("/admin/sso/operation-requests/{request_id}/approve", response_model=OperationRequestView, response_model_exclude_unset=True)
 async def approve_operation_request(request_id: uuid.UUID, decision: Decision,
                                     actor: ProductAdminActor = Depends(get_product_admin_mutation)):
     return await operation_requests.approve(request_id, expected_request_sha256=decision.expected_request_sha256,
                                             human_id=_human(actor))
 
 
-@router.post("/admin/sso/operation-requests/{request_id}/deny", response_model=OperationRequestView)
+@router.post("/admin/sso/operation-requests/{request_id}/deny", response_model=OperationRequestView, response_model_exclude_unset=True)
 async def deny_operation_request(request_id: uuid.UUID, decision: Decision,
                                  actor: ProductAdminActor = Depends(get_product_admin_mutation)):
     return await operation_requests.deny(request_id, expected_request_sha256=decision.expected_request_sha256,
                                          human_id=_human(actor))
 
 
-@router.post("/admin/sso/operation-requests/{request_id}/cancel", response_model=OperationRequestView)
+@router.post("/admin/sso/operation-requests/{request_id}/cancel", response_model=OperationRequestView, response_model_exclude_unset=True)
 async def cancel_operation_request(request_id: uuid.UUID, actor=Depends(get_requesting_service_key)):
     return await operation_requests.cancel(request_id, actor=actor)
 

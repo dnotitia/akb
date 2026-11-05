@@ -138,7 +138,7 @@ def _client(monkeypatch, control: Control, *, admin=None, guard_calls=None) -> T
         yield complete
 
     @asynccontextmanager
-    async def unowned_credentials_guard(alias, _actor, *, expected_fingerprint, secret_revision, expected_target_id=None):
+    async def unowned_credentials_guard(alias, _actor, *, expected_fingerprint, secret_revision, expected_target_id=None, expected_realm_id=None):
         guard_calls.append((alias, expected_fingerprint, secret_revision))
 
         async def complete(_mutation):

@@ -74,6 +74,7 @@ class InitializeProviderRequest(ConfigureProviderRequest):
     expected_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
     secret_revision: str = Field(min_length=1, max_length=255)
     expected_target_id: uuid.UUID | None = None
+    expected_realm_id: uuid.UUID | None = None
 
 
 class ProviderClientCredentialsRequest(BaseModel):
@@ -85,6 +86,7 @@ class ProviderClientCredentialsRequest(BaseModel):
     expected_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
     secret_revision: str | None = Field(default=None, min_length=1, max_length=255)
     expected_target_id: uuid.UUID | None = None
+    expected_realm_id: uuid.UUID | None = None
 
 
 class _ValueLessValidationRoute(APIRoute):
@@ -529,6 +531,7 @@ async def initialize_sso_provider(
         async with provider_initialization_guard(
             alias, actor, expected_fingerprint=request.expected_fingerprint,
             secret_revision=request.secret_revision, expected_target_id=request.expected_target_id,
+            expected_realm_id=request.expected_realm_id,
         ) as guard:
             mutation = await guard.control.configure(spec, require_absent=True)
             await guard.complete(mutation)
@@ -568,6 +571,7 @@ async def change_sso_provider_client_credentials(
             actor,
             expected_fingerprint=request.expected_fingerprint,
             secret_revision=request.secret_revision, expected_target_id=request.expected_target_id,
+            expected_realm_id=request.expected_realm_id,
         ) as guard:
             mutation = await guard.control.set_client_credentials(
                 alias,

@@ -37,6 +37,7 @@ CAPABILITIES = [
     "sso.provider-client-credentials.v1",
     "sso.provider-initialize.v1",
     "sso.provider-target-cas.v1",
+    "sso.operation-request-recovery.v1",
     "sso.operation-requests.v1",
     "sso.operation-request-service-key.v1",
 ]
@@ -235,7 +236,8 @@ def _secret_revision_label(value: str | None) -> str | None:
 @asynccontextmanager
 async def provider_credentials_guard(alias: str, actor, *, expected_fingerprint: str,
                                      secret_revision: str | None,
-                                     expected_target_id: uuid.UUID | None = None):
+                                     expected_target_id: uuid.UUID | None = None,
+                                     expected_realm_id: uuid.UUID | None = None):
     """Serialize one client-credential change of an unowned provider.
 
     Only an unowned provider without an emergency latch qualifies; an owned
@@ -275,6 +277,12 @@ async def provider_credentials_guard(alias: str, actor, *, expected_fingerprint:
                 alias, provider_fingerprint(mutation.after), actor_id, target.target_id, label)
             await emit_event(conn, "auth.sso_provider_client_credentials_changed", actor_id=str(actor_id),
                              payload={"provider_alias": alias, "provider_revision": revision, **mutation.audit_view()})
+        # The read narrows replacement races; an external administrator can
+        # still replace the realm while the subsequent REST write is in flight.
+        if expected_realm_id is not None:
+            realm = await management_targets.read_realm(target)
+            if realm["realm_id"] != str(expected_realm_id):
+                raise _error("sso_management_realm_conflict")
         yield ProviderCredentialsGuard(control=target.control, check=check, complete=complete)
 
 
@@ -287,7 +295,8 @@ class ProviderInitializationGuard:
 @asynccontextmanager
 async def provider_initialization_guard(alias: str, actor, *, expected_fingerprint: str,
                                         secret_revision: str,
-                                        expected_target_id: uuid.UUID | None = None):
+                                        expected_target_id: uuid.UUID | None = None,
+                                        expected_realm_id: uuid.UUID | None = None):
     """Serialize absent-only initialization against AKB ownership changes."""
     alias = _canonical_alias(alias)
     label = _secret_revision_label(secret_revision)
@@ -327,6 +336,12 @@ async def provider_initialization_guard(alias: str, actor, *, expected_fingerpri
                 RETURNING revision""", alias, provider_fingerprint(after), actor_id, target.target_id, label)
             await emit_event(conn, "auth.sso_provider_initialized", actor_id=str(actor_id),
                              payload={"provider_alias": alias, "provider_revision": revision, **mutation.audit_view()})
+        # The read narrows replacement races; an external administrator can
+        # still replace the realm while the subsequent REST write is in flight.
+        if expected_realm_id is not None:
+            realm = await management_targets.read_realm(target)
+            if realm["realm_id"] != str(expected_realm_id):
+                raise _error("sso_management_realm_conflict")
         yield ProviderInitializationGuard(control=target.control, complete=complete)
 
 
