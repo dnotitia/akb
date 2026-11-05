@@ -47,6 +47,7 @@ from app.sso.realm_residue import realm_account_residue
 from app.sso.registry import provider_types
 from app.sso.identity_operations import (
     provider_credentials_guard,
+    provider_initialization_guard,
     provider_mutation_guard,
 )
 from app.api.routes.admin_sso_operations import router as operations_router
@@ -67,6 +68,15 @@ class ConfigureProviderRequest(BaseModel):
     client_secret: SkipValidation[str] | None = Field(default=None, repr=False)
 
 
+class InitializeProviderRequest(ConfigureProviderRequest):
+    # This route is create-only; a new provider must receive a credential.
+    client_secret: SkipValidation[str] = Field(repr=False)
+    expected_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    secret_revision: str = Field(min_length=1, max_length=255)
+    expected_target_id: uuid.UUID | None = None
+    expected_realm_id: uuid.UUID | None = None
+
+
 class ProviderClientCredentialsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -75,6 +85,8 @@ class ProviderClientCredentialsRequest(BaseModel):
     client_secret: SkipValidation[str] | None = Field(default=None, repr=False)
     expected_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
     secret_revision: str | None = Field(default=None, min_length=1, max_length=255)
+    expected_target_id: uuid.UUID | None = None
+    expected_realm_id: uuid.UUID | None = None
 
 
 class _ValueLessValidationRoute(APIRoute):
@@ -494,6 +506,49 @@ async def disable_sso_provider(
 
 
 @credentials_router.put(
+    "/admin/sso/providers/{alias}/initialize",
+    response_model=SsoProviderMutationResponse,
+    summary="Initialize an absent, disabled SSO provider",
+)
+async def initialize_sso_provider(
+    alias: str,
+    request: InitializeProviderRequest,
+    actor: ProductAdminActor = Depends(get_sso_provider_control_actor),
+):
+    action = "admin.sso.provider.initialize"
+    _audit(f"{action}.requested", actor, alias)
+    try:
+        raw_secret: object = request.client_secret
+        if raw_secret is None:
+            raise ProviderControlError("provider_client_secret_required")
+        if not isinstance(raw_secret, str):
+            raise ProviderControlError("provider_client_secret_invalid")
+        spec = ProviderConfigureSpec(
+            provider_type=request.provider_type, alias=alias, display_name=request.display_name,
+            issuer=request.issuer, discovery_url=request.discovery_url,
+            client_id=request.client_id, client_secret=raw_secret,
+        )
+        async with provider_initialization_guard(
+            alias, actor, expected_fingerprint=request.expected_fingerprint,
+            secret_revision=request.secret_revision, expected_target_id=request.expected_target_id,
+            expected_realm_id=request.expected_realm_id,
+        ) as guard:
+            mutation = await guard.control.configure(spec, require_absent=True)
+            await guard.complete(mutation)
+    except ProviderControlError as error:
+        _audit(action, actor, alias, outcome="error", code=error.code)
+        _raise_control_error(error)
+    except AKBError as error:
+        _audit(action, actor, alias, outcome="error", code=error.code)
+        raise
+    except Exception:
+        _audit(action, actor, alias, outcome="error", code="internal_error")
+        raise
+    _audit(action, actor, alias, mutation=mutation)
+    return {"provider": mutation.after.admin_view()}
+
+
+@credentials_router.put(
     "/admin/sso/providers/{alias}/client-credentials",
     response_model=SsoProviderMutationResponse,
     summary="Change an SSO provider's upstream client credentials without disabling it",
@@ -515,9 +570,10 @@ async def change_sso_provider_client_credentials(
             alias,
             actor,
             expected_fingerprint=request.expected_fingerprint,
-            secret_revision=request.secret_revision,
+            secret_revision=request.secret_revision, expected_target_id=request.expected_target_id,
+            expected_realm_id=request.expected_realm_id,
         ) as guard:
-            mutation = await get_keycloak_provider_control().set_client_credentials(
+            mutation = await guard.control.set_client_credentials(
                 alias,
                 client_id=request.client_id,
                 client_secret=raw_secret,

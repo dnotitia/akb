@@ -103,7 +103,11 @@ def test_configure_summary_keeps_every_field_but_the_secret():
 
 
 def test_capability_is_advertised():
+    from app.sso.runtime_identity import BASE_CAPABILITIES
+
     assert "sso.operation-requests.v1" in ops.CAPABILITIES
+    for capability in ("sso.provider-initialize.v1", "sso.operation-request-service-key.v1"):
+        assert capability in ops.CAPABILITIES and capability in BASE_CAPABILITIES
 
 
 def _reader_request(authorization):
@@ -165,3 +169,28 @@ async def test_an_sso_mode_bearer_is_only_ever_a_service_key(monkeypatch):
 
     assert await routes.get_request_reader(_reader_request("Bearer akb_key"), authorization="Bearer akb_key") is service_actor
     human.assert_not_awaited()
+
+
+
+def test_admin_and_generic_scopes_never_imply_the_dedicated_scope():
+    from app.services.auth_service import token_has_scope
+
+    scope = "sso_operation_requests"
+    assert token_has_scope(frozenset({scope}), scope)
+    for granted in (None, frozenset({"admin"}), frozenset({"read", "write"}),
+                    frozenset({"admin", scope}), frozenset({"read", scope})):
+        assert not token_has_scope(granted, scope)
+    assert token_has_scope(frozenset({"admin"}), "write")
+    assert token_has_scope(None, "read")
+
+
+@pytest.mark.asyncio
+async def test_dedicated_scope_cannot_call_read_or_write_mcp_tools():
+    from mcp_server.server import _dispatch, _MCPUser
+
+    actor = _MCPUser(user_id="requester", token_scopes=frozenset({"sso_operation_requests"}))
+    for tool, args, required in (("akb_search", {"query": "x"}, "read"),
+                                 ("akb_put", {"vault": "v", "title": "t", "content": "c"}, "write")):
+        result = await _dispatch(tool, args, actor)
+        assert result["code"] == "insufficient_scope"
+        assert result["details"]["required_scope"] == required
