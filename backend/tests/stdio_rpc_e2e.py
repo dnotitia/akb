@@ -31,19 +31,17 @@ def request(method, params, deadline):
             return response
 
 
-def call(method, params, timeout):
-    deadline = time.monotonic() + timeout
-    response = request(method, params, deadline)
+def acknowledgement_retry(method, params, response):
     if method != "tools/call":
-        return response
+        return None
     content = response.get("result", {}).get("content", [])
     text = next((item.get("text") for item in content if item.get("type") == "text"), None)
     try:
         result = json.loads(text) if text else {}
     except json.JSONDecodeError:
-        return response
+        return None
     if not isinstance(result, dict) or result.get("code") != "vault_skill_required":
-        return response
+        return None
 
     guide = result["vault_skill"]
     body = guide["body"]
@@ -53,8 +51,14 @@ def call(method, params, timeout):
     if not isinstance(acknowledgement, str) or not acknowledgement:
         raise ValueError("The vault write guide has no acknowledgement")
     print(f"Vault write guide read before retry:\n{body}", file=sys.stderr)
-    retry = {**params, "arguments": {**params["arguments"], "_vault_skill_ack": acknowledgement}}
-    return request(method, retry, deadline)
+    return {**params, "arguments": {**params["arguments"], "_vault_skill_ack": acknowledgement}}
+
+
+def call(method, params, timeout):
+    deadline = time.monotonic() + timeout
+    response = request(method, params, deadline)
+    retry = acknowledgement_retry(method, params, response)
+    return request(method, retry, deadline) if retry is not None else response
 
 
 if __name__ == "__main__":

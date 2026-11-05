@@ -73,6 +73,30 @@ and old-refresh rejection. A pending mutation must remain absent after login.
 `SIGINT` or `SIGTERM` stops startup and verifies cleanup of both owners. Private
 reports and logs remain in the selected runtime root. A failure exits nonzero.
 
-This command is the bounded browser and session gate. It does not report file,
-prefix, negative-authority, concurrent-host, or native CLI acceptance. The common
-runtime selects `bare_git`; this command is not Native revision-storage proof.
+## Add file and prefix checks
+
+Add `--files` to run the existing stdio file and file-content suites against
+the installed archive using the shared OAuth grant. Their default standalone
+mode remains PAT; `AKB_E2E_AUTH_MODE=oauth` selects the shared private grant and
+`AKB_MCP_BIN` selects the installed executable. Each suite owns its temporary
+files and FIFOs.
+
+Add `--prefix /nested/workspace` to publish the real installation below a path
+prefix. A transparent loopback relay forwards the real backend responses and
+records request methods, sanitized paths, bearer fingerprints, and byte hashes.
+It preserves origin-root protected-resource metadata paths. It records no bearer,
+capability URL, query, or request body. Backend access logging is disabled in this
+fixture so opaque byte capabilities do not enter request logs.
+
+The file check observes all eight successful file/image control routes using
+published OAuth generations after real refresh rotation. Byte upload/download
+capabilities must carry no Authorization header, and downloaded bytes must
+match uploaded bytes. The existing suites retain their skill, content hash,
+optimistic concurrency, and cleanup assertions. A real image upload is also
+discarded; another is referenced by a real document and independently read
+using the runtime's existing PAT to check its bytes, MIME type, and dimensions.
+Peer suite processes must reuse the grant without opening another browser.
+
+These commands do not report negative-authority, concurrent-host, or native CLI
+acceptance. The common runtime selects `bare_git`; they are not Native
+revision-storage proof.

@@ -17,28 +17,44 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 
 import httpx
 import jwt
 import yaml
 
 from fixture import NativeOAuthFixture, free_port
+from file_flow import exercise_files
+from relay import ResourceRelay
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "scripts/ci"))
 from e2e_runtime import E2ERuntime, PROTOCOL_REVISION, RuntimeConfig  # noqa: E402
+sys.path.insert(0, str(REPO / "backend/tests"))
+from stdio_rpc_e2e import acknowledgement_retry  # noqa: E402
 
 
 class NativeOAuthRuntime(E2ERuntime):
-    def __init__(self, config: RuntimeConfig, authority: NativeOAuthFixture):
+    def __init__(self, config: RuntimeConfig, authority: NativeOAuthFixture, relay: ResourceRelay | None = None):
         super().__init__(config)
         self.authority = authority
+        self.relay = relay
+
+    async def _spawn_host_process(self, name, command, log_name, *, environment=None, cwd=None):
+        if name == "backend" and self.relay is not None:
+            command = [*command, "--app", "quiet_backend:app"]
+            environment = {
+                **(environment or {}),
+                "PYTHONPATH": str(Path(__file__).parent) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            }
+        return await super()._spawn_host_process(name, command, log_name, environment=environment, cwd=cwd)
 
     def _write_config(self) -> None:
         super()._write_config()
         path = self.config.config_dir / "app.yaml"
         config = yaml.safe_load(path.read_text())
         config.update({
+            "public_base_url": self.authority.resource.removesuffix("/mcp"),
             "keycloak_enabled": True, "mcp_oauth_enabled": True,
             "keycloak_server_url": self.authority.origin, "keycloak_internal_url": self.authority.origin,
             "keycloak_realm": self.authority.realm, "mcp_oauth_native_client_id": self.authority.client_id,
@@ -62,7 +78,13 @@ def public_result(response: dict, *, error: bool = False) -> dict:
 
 
 async def call(runtime: E2ERuntime, name: str, arguments: dict | None = None, *, error: bool = False) -> dict:
-    return public_result(await runtime._stdio_request("tools/call", {"name": name, "arguments": arguments or {}}), error=error)
+    params = {"name": name, "arguments": arguments or {}}
+    async with asyncio.timeout(20):
+        response = await runtime._stdio_request("tools/call", params)
+        retry = acknowledgement_retry("tools/call", params, response)
+        if retry is not None:
+            response = await runtime._stdio_request("tools/call", retry)
+    return public_result(response, error=error)
 
 
 async def start_oauth_stdio(runtime: E2ERuntime, authority: NativeOAuthFixture, store: Path, opener: Path, capture: Path) -> int:
@@ -111,14 +133,25 @@ async def exercise(args) -> int:
         port = free_port()
         if port not in ports:
             ports.append(port)
-    authority = NativeOAuthFixture(checkout=args.checkout, runtime_root=root / "authority", resource=f"http://127.0.0.1:{ports[0]}/mcp")
+    relay = None
+    public_base = f"http://127.0.0.1:{ports[0]}"
+    if args.files or args.prefix:
+        relay_port = free_port()
+        while relay_port in ports:
+            relay_port = free_port()
+        relay = ResourceRelay(port=relay_port, target=public_base, prefix=args.prefix)
+        public_base = relay.base_url
+        ports_to_close = [*ports, relay_port]
+    else:
+        ports_to_close = ports
+    authority = NativeOAuthFixture(checkout=args.checkout, runtime_root=root / "authority", resource=public_base + "/mcp")
     config = RuntimeConfig(
         checkout=args.checkout.resolve(), runtime_root=root / "product", mode="serve",
         compose_file=args.compose_file.resolve(), compose_project="akb-native-product-" + secrets.token_hex(6),
         profile="transport-proxy", app_port=ports[0], embed_port=ports[1], fixture_port=ports[2],
         postgres_port=ports[3], minio_port=ports[4],
     )
-    runtime = NativeOAuthRuntime(config, authority)
+    runtime = NativeOAuthRuntime(config, authority, relay)
     report: dict = {"scope": "Real packed proxy browser, MCP read, signed grant, refresh and restart. Files, crash and native hosts remain separate gates.", "stage": "authority", "result": "FAIL", "source_revision": os.environ.get("AKB_E2E_SOURCE_REVISION"), "commands": []}
     store = root / "oauth-state"
     capture = root / "authorization-url.private"
@@ -136,6 +169,8 @@ async def exercise(args) -> int:
     for signum in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(signum, request_stop)
     try:
+        if relay is not None:
+            await relay.start()
         authority_start = asyncio.create_task(asyncio.to_thread(authority.start))
         try:
             await asyncio.shield(authority_start)
@@ -239,6 +274,10 @@ async def exercise(args) -> int:
                 raise RuntimeError("real refresh rotation did not publish a new generation")
             assert current["tokens"]["refresh_token"] != grant["tokens"]["refresh_token"]
             report["rotation"] = {"old_generation": grant["generation"], "new_generation": current["generation"], "replacement_pair": current["tokens"]["access_token"] != grant["tokens"]["access_token"]}
+            if args.files:
+                await wait_ready(runtime)
+                report["stage"] = "files"
+                report["files"] = await exercise_files(runtime, authority, relay, store, root, lambda name, arguments=None: call(runtime, name, arguments))
             report["stage"] = "restart"
             openings = len(capture.read_text().splitlines())
             second_pid = await start_oauth_stdio(runtime, authority, store, opener, capture)
@@ -258,9 +297,22 @@ async def exercise(args) -> int:
         report["result"] = "FAIL"
     except Exception as error:
         report["error_type"] = type(error).__name__
+        report["error_frames"] = [{"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name} for frame in traceback.extract_tb(error.__traceback__)]
         if isinstance(error, RuntimeError):
             report["error"] = str(error)
     finally:
+        if relay is not None:
+            try:
+                await runtime._stop_named_process("stdio")
+                await relay.close()
+                report["relay_cleanup_completed"] = True
+            except Exception as error:
+                report["relay_cleanup_error"] = type(error).__name__
+                report["result"] = "FAIL"
+            relay_report = root / "resource-observations.json"
+            relay_report.write_text(json.dumps(relay.events, indent=2) + "\n")
+            relay_report.chmod(0o600)
+            report["resource_observations"] = str(relay_report)
         try:
             await runtime.cleanup()
             report["runtime_cleanup_completed"] = True
@@ -278,7 +330,7 @@ async def exercise(args) -> int:
             result = await asyncio.to_thread(subprocess.run, [*command, "--filter", "label=com.docker.compose.project=" + config.compose_project], capture_output=True, text=True, timeout=20)
             report["cleanup"][kind] = result.returncode == 0 and not result.stdout.strip()
         report["cleanup"]["ports_closed"] = True
-        for port in ports:
+        for port in ports_to_close:
             with socket.socket() as connection:
                 connection.settimeout(1)
                 report["cleanup"]["ports_closed"] &= connection.connect_ex(("127.0.0.1", port)) != 0
@@ -298,6 +350,8 @@ def main() -> int:
     parser.add_argument("--checkout", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--compose-file", type=Path, required=True)
+    parser.add_argument("--files", action="store_true", help="reuse existing file suites and observe all eight OAuth controls")
+    parser.add_argument("--prefix", default="", help="loopback installation prefix for the transparent resource relay")
     return asyncio.run(exercise(parser.parse_args()))
 
 

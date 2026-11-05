@@ -6,6 +6,11 @@
 set -uo pipefail
 
 BASE_URL="${AKB_URL:-http://localhost:8000}"
+AUTH_MODE="${AKB_E2E_AUTH_MODE:-pat}"
+if [[ "$AUTH_MODE" != pat && "$AUTH_MODE" != oauth ]]; then
+  echo "ERROR: AKB_E2E_AUTH_MODE must be pat or oauth" >&2
+  exit 1
+fi
 PASS=0
 FAIL=0
 ERRORS=()
@@ -22,39 +27,44 @@ echo ""
 # ── 0. Setup: register user + get PAT ───────────────────────
 echo "▸ 0. Setup"
 
-E2E_USER="stdio-file-$(date +%s)"
-curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
-  -H 'Content-Type: application/json' \
-  -d "{\"username\":\"$E2E_USER\",\"email\":\"$E2E_USER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
+PAT=""
+if [[ "$AUTH_MODE" == pat ]]; then
+  E2E_USER="stdio-file-$(date +%s)"
+  curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
+    -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$E2E_USER\",\"email\":\"$E2E_USER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
 
-PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
-  -H 'Content-Type: application/json' \
-  -d "{\"username\":\"$E2E_USER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+  PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
+    -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$E2E_USER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 
-PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
-  -H "Authorization: Bearer $PAT" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"stdio-e2e"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+  PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
+    -H "Authorization: Bearer $PAT" \
+    -H 'Content-Type: application/json' \
+    -d '{"name":"stdio-e2e"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 
-[ -n "$PAT" ] && pass "PAT acquired" || { fail "PAT" "could not get PAT"; exit 1; }
+  [ -n "$PAT" ] && pass "PAT acquired" || { fail "PAT" "could not get PAT"; exit 1; }
+else
+  pass "OAuth selected from the shared private session"
+fi
 
 # ── Start akb-mcp stdio proxy as a coprocess ─────────────────
-AKB_MCP_BIN="$(dirname "$0")/../../packages/akb-mcp-client/bin/akb-mcp.mjs"
-if [ ! -f "$AKB_MCP_BIN" ]; then
-  AKB_MCP_BIN="$(which akb-mcp 2>/dev/null || echo "")"
-fi
-if [ -z "$AKB_MCP_BIN" ]; then
-  echo "ERROR: akb-mcp binary not found"
+AKB_MCP_BIN="${AKB_MCP_BIN:-$(dirname "$0")/../../packages/akb-mcp-client/bin/akb-mcp.mjs}"
+if [[ ! -f "$AKB_MCP_BIN" ]]; then
+  echo "ERROR: selected akb-mcp executable does not exist" >&2
   exit 1
 fi
 
 # Create fifos for communication
-FIFO_IN=$(mktemp -u /tmp/akb-mcp-in.XXXXXX)
-FIFO_OUT=$(mktemp -u /tmp/akb-mcp-out.XXXXXX)
+TEST_PARENT="${TMPDIR:-/tmp}"
+TEST_PARENT="${TEST_PARENT%/}"
+TEST_ROOT=$(mktemp -d "$TEST_PARENT/akb-stdio-files.XXXXXX")
+FIFO_IN="$TEST_ROOT/in"
+FIFO_OUT="$TEST_ROOT/out"
 mkfifo "$FIFO_IN" "$FIFO_OUT"
 
-node "$AKB_MCP_BIN" \
-  --url "$BASE_URL/mcp/" --pat "$PAT" \
+AKB_PAT="$PAT" node "$AKB_MCP_BIN" \
+  --url "$BASE_URL/mcp/" \
   < "$FIFO_IN" > "$FIFO_OUT" 2>/dev/null &
 MCP_PID=$!
 
@@ -64,7 +74,7 @@ exec 3>"$FIFO_IN" 4<"$FIFO_OUT"
 cleanup() {
   exec 3>&- 4<&- 2>/dev/null
   kill $MCP_PID 2>/dev/null; wait $MCP_PID 2>/dev/null
-  rm -f "$FIFO_IN" "$FIFO_OUT"
+  [[ "$TEST_ROOT" == "$TEST_PARENT/akb-stdio-files."* ]] && rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
 
@@ -107,6 +117,17 @@ print(len(file_tools))
 TOTAL_TOOLS=$(echo "$TOOLS" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["result"]["tools"]))' 2>/dev/null)
 [ "$TOTAL_TOOLS" -ge 40 ] 2>/dev/null && pass "Total tools: $TOTAL_TOOLS" || fail "Total tools" "expected >=40, got $TOTAL_TOOLS"
 
+if [[ "$AUTH_MODE" == oauth ]]; then
+  AUTH_READY=false
+  for _attempt in $(seq 1 100); do
+    STATUS=$(rpc_call "tools/call" '{"name":"akb_connection","arguments":{}}')
+    AUTH_STATE=$(tool_result "$STATUS" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("authentication",""))' 2>/dev/null)
+    if [[ "$AUTH_STATE" == ready ]]; then AUTH_READY=true; break; fi
+    sleep 0.1
+  done
+  [[ "$AUTH_READY" == true ]] && pass "Shared OAuth grant is ready" || { fail "OAuth readiness" "shared grant is unavailable"; exit 1; }
+fi
+
 # ── 3. Create vault for file tests ──────────────────────────
 echo ""
 echo "▸ 3. Create vault"
@@ -121,8 +142,8 @@ echo ""
 echo "▸ 4. Upload file"
 
 # Create test files
-TEST_FILE1="/tmp/akb-stdio-test1.txt"
-TEST_FILE2="/tmp/akb-stdio-test2.pdf"
+TEST_FILE1="$TEST_ROOT/test1.txt"
+TEST_FILE2="$TEST_ROOT/test2.pdf"
 echo "Hello from stdio E2E test — file 1" > "$TEST_FILE1"
 dd if=/dev/urandom bs=1024 count=10 of="$TEST_FILE2" 2>/dev/null  # 10KB binary
 
@@ -151,7 +172,7 @@ DOCS_COUNT=$(tool_result "$BROWSE_DOCS" | python3 -c 'import sys,json; print(len
 echo ""
 echo "▸ 6. Download file"
 
-DL_PATH="/tmp/akb-stdio-dl"
+DL_PATH="$TEST_ROOT/downloads"
 mkdir -p "$DL_PATH"
 DL1=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"$FILE1_URI\",\"save_to\":\"$DL_PATH\"}}")
 DL1_PATH=$(tool_result "$DL1" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("save_to",""))' 2>/dev/null)
@@ -177,7 +198,7 @@ fi
 echo ""
 echo "▸ 7. Replace file with optimistic concurrency"
 
-REPLACEMENT_FILE="/tmp/akb-stdio-replacement.txt"
+REPLACEMENT_FILE="$TEST_ROOT/replacement.txt"
 echo "Updated through akb_update_file" > "$REPLACEMENT_FILE"
 
 UPDATE1=$(rpc_call "tools/call" "{\"name\":\"akb_update_file\",\"arguments\":{\"uri\":\"$FILE1_URI\",\"file_path\":\"$REPLACEMENT_FILE\",\"expected_content_hash\":\"$DL1_HASH\",\"expected_version\":\"$DL1_VERSION\"}}")
@@ -230,7 +251,7 @@ ERR_UPLOAD=$(rpc_call "tools/call" "{\"name\":\"akb_put_file\",\"arguments\":{\"
 ERR_MSG=$(tool_result "$ERR_UPLOAD" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)
 [ -n "$ERR_MSG" ] && pass "Upload nonexistent file returns error" || fail "Error case" "no error for missing file"
 
-ERR_DL=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"akb://$VAULT/file/00000000-0000-0000-0000-000000000000\",\"save_to\":\"/tmp\"}}")
+ERR_DL=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"akb://$VAULT/file/00000000-0000-0000-0000-000000000000\",\"save_to\":\"$TEST_ROOT\"}}")
 ERR_DL_MSG=$(tool_result "$ERR_DL" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)
 [ -n "$ERR_DL_MSG" ] && pass "Download nonexistent file returns error" || fail "Error case" "no error for missing file"
 
@@ -242,7 +263,7 @@ echo "▸ 10. Vault delete cleans S3 files"
 VAULT2="stdio-file-e2e-cleanup-$(date +%s)"
 rpc_call "tools/call" "{\"name\":\"akb_create_vault\",\"arguments\":{\"name\":\"$VAULT2\",\"description\":\"cleanup test\"}}" >/dev/null
 
-CLEANUP_FILE="/tmp/akb-stdio-cleanup.txt"
+CLEANUP_FILE="$TEST_ROOT/cleanup.txt"
 echo "cleanup test file" > "$CLEANUP_FILE"
 UPLOAD_CL=$(rpc_call "tools/call" "{\"name\":\"akb_put_file\",\"arguments\":{\"vault\":\"$VAULT2\",\"file_path\":\"$CLEANUP_FILE\",\"collection\":\"test\"}}")
 CL_FILE_URI=$(tool_result "$UPLOAD_CL" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
@@ -252,7 +273,7 @@ CL_FILE_URI=$(tool_result "$UPLOAD_CL" | python3 -c 'import sys,json; print(json
 rpc_call "tools/call" "{\"name\":\"akb_delete_vault\",\"arguments\":{\"vault\":\"$VAULT2\"}}" >/dev/null
 
 # Try to download the deleted file's presigned URL — should fail
-ERR_GONE=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"$CL_FILE_URI\",\"save_to\":\"/tmp\"}}")
+ERR_GONE=$(rpc_call "tools/call" "{\"name\":\"akb_get_file\",\"arguments\":{\"uri\":\"$CL_FILE_URI\",\"save_to\":\"$TEST_ROOT\"}}")
 ERR_GONE_MSG=$(tool_result "$ERR_GONE" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)
 [ -n "$ERR_GONE_MSG" ] && pass "Deleted vault's files are inaccessible" || fail "Vault cleanup" "file still accessible after vault delete"
 rm -f "$CLEANUP_FILE"
