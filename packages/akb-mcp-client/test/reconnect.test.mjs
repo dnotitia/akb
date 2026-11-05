@@ -11,6 +11,7 @@
 
 import assert from "node:assert/strict";
 import { AKBProxy } from "../lib/proxy.mjs";
+import { parseConfiguration } from "../lib/config.mjs";
 
 let pass = 0;
 let fail = 0;
@@ -32,7 +33,7 @@ function itAsync(name, fn) {
 
 const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
 function newProxy() {
-  return new AKBProxy({ url: "http://akb.test/mcp", pat: "test-pat" });
+  return new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp", "--pat", "test-pat"], {}));
 }
 const fileToolNames = [
   "akb_put_file",
@@ -106,7 +107,7 @@ itAsync("backend modern discovery carries vault-guide preflight without dropping
   let forwarded;
   proxy._rpc = async (method, params, options) => {
     assert.equal(method, "server/discover");
-    assert.equal(options.protocolMode, "modern");
+    assert.equal(options.timeoutMs, proxy._probeTimeoutMs());
     forwarded = proxy._modernizeParams(params);
     return { supportedVersions: ["2026-07-28"] };
   };
@@ -137,7 +138,7 @@ itAsync("backend modern discovery carries vault-guide preflight without dropping
 
 // ── tools/list degrades to file tools when the backend is unreachable ─
 
-itAsync("tools/list serves file tools only when backend is down and nothing cached", async () => {
+itAsync("tools/list serves the complete generated catalog without backend access", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
   proxy._ensureBackend = async () => false;
@@ -145,8 +146,9 @@ itAsync("tools/list serves file tools only when backend is down and nothing cach
   const res = await proxy._toolsList(2, {});
   const names = res.result.tools.map((t) => t.name);
 
-  assert.deepEqual(names.sort(), [...fileToolNames].sort(), "only file tools served");
-  assert.equal(proxy._servedDegraded, true, "flags the degraded list for later re-list");
+  for (const name of [...fileToolNames, "akb_search", "akb_put", "akb_connection"]) assert.ok(names.includes(name));
+  assert.ok(names.length > fileToolNames.length + 1);
+  assert.equal(new Set(names).size, names.length);
 });
 
 itAsync("tools/list serves the full decorated list from cache", async () => {
@@ -172,7 +174,6 @@ itAsync("tools/list serves the full decorated list from cache", async () => {
   assert.match(image.description, /targeted akb_edit/);
   assert.match(image.description, /replaces the entire body/);
   assert.ok(image.inputSchema.properties._vault_skill_ack);
-  assert.equal(proxy._servedDegraded, false, "cached full list is not degraded");
   // The cache must not be mutated by decoration.
   assert.ok(
     !proxy._cachedTools.tools[0].inputSchema.properties.file,
@@ -198,28 +199,23 @@ itAsync("modern tools/list cache metadata covers degraded and cached catalogs", 
 
 // ── background monitor recovers the toolset after an outage ──────────
 
-itAsync("monitor emits tools/list_changed after backend recovers from a degraded list", async () => {
+itAsync("catalog refinement notifies only when the effective contract changes", async () => {
   const proxy = newProxy();
-  proxy._servedDegraded = true; // client was previously handed file-tools-only
-  proxy._ensureBackend = async () => {
-    proxy._backendReady = true;
-    return true;
-  };
-  proxy._syncTools = async () => ({ tools: [] });
+  const initial = structuredClone(proxy.catalog.canonical);
   const notes = [];
   proxy._notify = (method) => notes.push(method);
-
-  proxy._startBackendMonitor();
-  await tick();
-
-  assert.ok(notes.includes("notifications/tools/list_changed"), "list_changed pushed on recovery");
-  assert.equal(proxy._servedDegraded, false, "degraded flag cleared");
-  proxy._closed = true;
+  proxy._rpc = async () => ({ tools: initial });
+  await proxy._syncTools();
+  assert.equal(notes.length, 0);
+  initial[0].description += " Refined description.";
+  await proxy._syncTools();
+  assert.deepEqual(notes, ["notifications/tools/list_changed"]);
+  await proxy._syncTools();
+  assert.equal(notes.length, 1);
 });
 
 itAsync("monitor stays silent on recovery when the list was never degraded", async () => {
   const proxy = newProxy();
-  proxy._servedDegraded = false;
   proxy._ensureBackend = async () => {
     proxy._backendReady = true;
     return true;
@@ -313,7 +309,7 @@ itAsync("vault-guide acknowledgement never authorizes an unrelated queued write"
 
 // ── _forward never kills the process; it recovers or surfaces an error ─
 
-itAsync("_forward retries a connection error then surfaces it (process survives)", async () => {
+itAsync("_forward submits once after a connection error and keeps the process alive", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {}; // observe restart without spinning a loop
   let restarts = 0;
@@ -332,26 +328,18 @@ itAsync("_forward retries a connection error then surfaces it (process survives)
   await assert.rejects(() => proxy._forward({ method: "tools/call", id: 5, params: {} }));
   assert.equal(proxy._backendReady, false, "marks backend not-ready");
   assert.ok(restarts >= 1, "kicks the reconnect monitor");
-  assert.ok(calls >= 3, "attempted the initial call plus retries");
+  assert.equal(calls, 1, "caller operation is never replayed");
 });
 
-itAsync("_forward recovers on a later attempt once the backend returns", async () => {
+itAsync("a new explicit call can succeed after a lost first response", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
-  proxy._backendReady = true;
   let calls = 0;
-  proxy._rpc = async () => {
-    calls++;
-    if (calls === 1) throw new Error("socket hang up");
-    return { ok: true };
-  };
-  proxy._ensureBackend = async () => {
-    proxy._backendReady = true;
-    return true;
-  };
-
-  const res = await proxy._forward({ method: "tools/call", id: 7, params: {} });
-  assert.equal(res.result.ok, true, "second attempt succeeds");
+  proxy._rpc = async () => { calls++; if (calls === 1) throw new Error("socket hang up"); return { ok: true }; };
+  await assert.rejects(() => proxy._forward({ method: "tools/call", id: 7, params: {} }));
+  assert.equal(calls, 1);
+  const response = await proxy._forward({ method: "tools/call", id: 8, params: {} });
+  assert.equal(response.result.ok, true);
   assert.equal(calls, 2);
 });
 

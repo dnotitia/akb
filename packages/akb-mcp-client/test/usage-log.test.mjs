@@ -10,6 +10,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AKBProxy } from "../lib/proxy.mjs";
+import { parseConfiguration } from "../lib/config.mjs";
 
 let pass = 0;
 let fail = 0;
@@ -24,7 +25,7 @@ function itAsync(name, fn) {
 const ORIGINAL_LOG = process.env.AKB_MCP_USAGE_LOG;
 
 function backedBy(text) {
-  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const proxy = new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp", "--pat", "test"], {}));
   proxy._ensureBackend = async () => true;
   proxy._rpc = async () => ({ content: [{ type: "text", text }] });
   return proxy;
@@ -105,7 +106,7 @@ itAsync("appends one record per tools/call with the documented fields", async ()
 itAsync("sums text_chars across every text block, in characters", async () => {
   await withLogPath(async (path) => {
     const parts = ["첫 번째 블록입니다.", "second block", "세 번째 블록"];
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp", "--pat", "test"], {}));
     proxy._ensureBackend = async () => true;
     proxy._rpc = async () => ({
       content: [
@@ -128,7 +129,7 @@ itAsync("sums text_chars across every text block, in characters", async () => {
 
 itAsync("records concurrent calls as whole lines, one per call", async () => {
   await withLogPath(async (path) => {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp", "--pat", "test"], {}));
     proxy._ensureBackend = async () => true;
     proxy._rpc = async () => {
       await new Promise((resolve) => setTimeout(resolve, 1));
@@ -149,12 +150,14 @@ itAsync("records concurrent calls as whole lines, one per call", async () => {
 
 itAsync("records a call that threw, with error true and no payload", async () => {
   await withLogPath(async (path) => {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp", "--pat", "test"], {}));
     proxy._forward = async () => {
       throw new Error("backend unreachable");
     };
 
-    await assert.rejects(() => proxy._handle(searchCall(1)), /backend unreachable/);
+    const refused = await proxy._handle(searchCall(1));
+    assert.equal(refused.result.isError, true);
+    assert.equal(JSON.parse(refused.result.content[0].text).execution, "unknown");
 
     const [record] = await readLines(path);
     assert.equal(record.tool, "akb_search");
@@ -167,7 +170,7 @@ itAsync("records a call that threw, with error true and no payload", async () =>
 itAsync("marks an isError result as an error without losing its size", async () => {
   await withLogPath(async (path) => {
     const body = JSON.stringify({ error: "vault not found", code: "not_found" });
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp", "--pat", "test"], {}));
     proxy._ensureBackend = async () => true;
     proxy._rpc = async () => ({ content: [{ type: "text", text: body }], isError: true });
 
@@ -234,7 +237,7 @@ itAsync("records a bigger payload as more bytes", async () => {
 
 itAsync("measures a proxy-local file tool too", async () => {
   await withLogPath(async (path) => {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp", "--pat", "test"], {}));
     proxy._fileToolSkillPreflight = async () => null;
     proxy._getFile = async () => ({ kind: "file", save_to: "/tmp/a.bin" });
 

@@ -1,0 +1,1872 @@
+[
+  {
+    "name": "akb_list_vaults",
+    "description": "List accessible vaults as {name, description} pairs. Response is slim — no metadata (id/role/created_at) — to fit large tenants in agent context. Returns {vaults, total, returned, truncated?, hint?}.\nOptional args:\n- filter: substring match on name+description (case-insensitive). Use to narrow to a domain (e.g. filter='finance').\n- limit / offset: pagination when there are many matches.\n- include_archived: include archived vaults (default false).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "filter": {
+          "type": "string",
+          "description": "Substring filter against name+description (case-insensitive)."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Cap result count."
+        },
+        "offset": {
+          "type": "integer",
+          "description": "Skip first N (default 0)."
+        },
+        "include_archived": {
+          "type": "boolean",
+          "description": "Include archived vaults (default false)."
+        }
+      }
+    }
+  },
+  {
+    "name": "akb_create_vault",
+    "description": "Create a new knowledge base vault (a separate, access-controlled repository for documents). Its name is unique across the AKB installation and becomes part of the canonical akb:// URI. Pass `external_git` to instead create a read-only mirror of an upstream git repo — the vault tracks the remote on a polling schedule and rejects user writes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Globally unique Vault name: lowercase letters and digits, with single hyphens between words"
+        },
+        "description": {
+          "type": "string",
+          "description": "What this vault is for"
+        },
+        "template": {
+          "type": "string",
+          "enum": [
+            "engineering",
+            "finance",
+            "hr",
+            "issue-tracking",
+            "management",
+            "product",
+            "qa"
+          ],
+          "description": "Vault template to apply (pre-creates collections with guides). Ignored when external_git is set."
+        },
+        "public_access": {
+          "type": "string",
+          "enum": [
+            "none",
+            "reader",
+            "writer"
+          ],
+          "default": "none",
+          "description": "Public access: none=private, reader=public read, writer=public read+write"
+        },
+        "external_git": {
+          "type": "object",
+          "description": "Optional: turn the new vault into a read-only mirror of an upstream git repo.",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "HTTPS clone URL of the upstream repo"
+            },
+            "branch": {
+              "type": "string",
+              "default": "main",
+              "description": "Upstream branch to track"
+            },
+            "auth_token": {
+              "type": "string",
+              "description": "Optional PAT for private repos. Stored in DB; rotate via vault admin."
+            },
+            "poll_interval_secs": {
+              "type": "integer",
+              "default": 300,
+              "minimum": 60,
+              "description": "Seconds between upstream polls"
+            }
+          },
+          "required": [
+            "url"
+          ]
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  },
+  {
+    "name": "akb_put",
+    "description": "Store a new document. The response carries the canonical `uri` — `akb://{vault}/coll/{collection}/doc/{filename}` when stored under a collection, or `akb://{vault}/doc/{filename}` at the vault root. Use that URI to address the document from every other tool. Automatically chunked and indexed for semantic search.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "parent": {
+          "type": "string",
+          "description": "Parent location as a canonical URI — `akb://{vault}` for the vault root, `akb://{vault}/coll/{path}` for a collection. When given, the doc is placed there and `vault`/`collection` are derived from the URI. Use this in drill-down chains: paste the `uri` from an `akb_browse` response straight back in."
+        },
+        "vault": {
+          "type": "string",
+          "description": "Target vault name. Required unless `parent` is given."
+        },
+        "collection": {
+          "type": "string",
+          "description": "Collection (directory) path, e.g. 'api-specs' or 'meeting-notes'. Ignored when `parent` is given. 'overview' is a reserved system collection (vault-skill only)."
+        },
+        "slug": {
+          "type": "string",
+          "description": "Optional explicit slug for the document filename. When stored under a collection the URI is `akb://{vault}/coll/{collection}/doc/{slug}.md`; at the vault root it is `akb://{vault}/doc/{slug}.md`. When omitted, the slug is derived from the title. Pass it to keep the path stable and meaningful when the title is friendly, changeable text (e.g. slug `github-issue-123` with a human-readable title)."
+        },
+        "title": {
+          "type": "string",
+          "description": "Document title"
+        },
+        "content": {
+          "type": "string",
+          "description": "Document body in Markdown"
+        },
+        "type": {
+          "type": "string",
+          "description": "Document type. Free-form — any string is accepted, EXCEPT 'skill', which is reserved for the system-managed vault-skill document. Recommended vocabulary: note (default), report, decision, spec, plan, session, task, reference. Use a custom value when none fit (e.g. an OKF concept type).",
+          "default": "note"
+        },
+        "status": {
+          "type": "string",
+          "description": "Lifecycle status. Defaults to 'draft'; pass 'active' to publish on create instead of promoting later with akb_update. Descriptive metadata only — it does not gate search, browse, or access.",
+          "enum": [
+            "draft",
+            "active",
+            "archived"
+          ],
+          "default": "draft"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Tags for classification"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain: engineering, product, ops, legal, etc."
+        },
+        "summary": {
+          "type": "string",
+          "description": "Brief summary (auto-generated if omitted)"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Same-vault akb:// URIs this depends on. Use an ordinary Markdown link for a cross-vault reference."
+        },
+        "related_to": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Same-vault akb:// URIs of related resources. Use an ordinary Markdown link for a cross-vault reference."
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "title",
+        "content"
+      ]
+    }
+  },
+  {
+    "name": "akb_get",
+    "description": "Retrieve a document by its URI. Returns full content with metadata. Use akb_browse or akb_search first to obtain the URI. Optionally pass a commit hash (from akb_history) to read a previous version.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Document URI — akb://{vault}[/coll/{coll_path}]/doc/{filename}"
+        },
+        "version": {
+          "type": "string",
+          "description": "Git commit hash for a specific version (from akb_history)"
+        }
+      },
+      "required": [
+        "uri"
+      ]
+    }
+  },
+  {
+    "name": "akb_update",
+    "description": "Update an existing document. Only provide fields you want to change. The `content` field replaces the complete Markdown body; never pass a partial fragment such as a newly uploaded image. Use a targeted akb_edit for inline insertion or replacement. Whole-body updates require expected_commit or expected_content_hash from the original akb_get read; both supplied conditions must match. This also applies to proxy file input.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Document URI"
+        },
+        "content": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Whole replacement body, including empty string; requires an original-read condition. Null leaves the body unchanged."
+        },
+        "title": {
+          "type": "string",
+          "description": "New title"
+        },
+        "type": {
+          "type": "string",
+          "description": "New document type"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "active",
+            "archived"
+          ]
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "domain": {
+          "type": "string",
+          "description": "New document domain"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Update the same-vault dependency list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."
+        },
+        "related_to": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Update the same-vault related list (akb:// URIs). Use an ordinary Markdown link in content for a cross-vault reference."
+        },
+        "message": {
+          "type": "string",
+          "description": "Commit message describing the change"
+        },
+        "expected_commit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$",
+          "minLength": 40,
+          "maxLength": 40,
+          "description": "Original current_commit, full 40 lowercase hex. Protects the exact revision, including metadata changes."
+        },
+        "expected_content_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64,
+          "description": "Original content_hash, full 64 lowercase hex. Protects body equality only, not metadata or intermediate A-to-B-to-A changes."
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "uri"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "content"
+            ],
+            "properties": {
+              "content": {
+                "type": "string"
+              }
+            }
+          },
+          "then": {
+            "anyOf": [
+              {
+                "required": [
+                  "expected_commit"
+                ],
+                "properties": {
+                  "expected_commit": {
+                    "type": "string"
+                  }
+                }
+              },
+              {
+                "required": [
+                  "expected_content_hash"
+                ],
+                "properties": {
+                  "expected_content_hash": {
+                    "type": "string"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "akb_edit",
+    "description": "Edit a single document by replacing exact text. Scope is one document. old_string must be unique within the document (or use replace_all). If old_string is not found or appears multiple times, the call fails with a clear error. Use this for inserting, replacing, or removing an inline image without resending the complete document body. For find-and-replace across many documents, use akb_grep with replace instead.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Document URI"
+        },
+        "old_string": {
+          "type": "string",
+          "description": "Exact text to replace. Must be unique in the document body unless replace_all=true. Include surrounding context if needed for uniqueness."
+        },
+        "new_string": {
+          "type": "string",
+          "description": "Replacement text. Can be empty to delete."
+        },
+        "replace_all": {
+          "type": "boolean",
+          "default": false,
+          "description": "Replace all occurrences (default: false, requires old_string to be unique)"
+        },
+        "message": {
+          "type": "string",
+          "description": "Commit message describing the change"
+        },
+        "base_commit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$",
+          "minLength": 40,
+          "maxLength": 40,
+          "description": "Optional original-read current_commit (full 40 lowercase hex). Without it only exact current text is checked, not the surrounding revision context."
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "uri",
+        "old_string",
+        "new_string"
+      ]
+    }
+  },
+  {
+    "name": "akb_move",
+    "description": "Move or rename a document — change its collection and/or slug while keeping its identity and full git history. The old akb:// URI keeps resolving (a redirect is recorded), and graph links/publications are rewritten. Provide collection and/or slug (at least one must change). The title is unchanged; use akb_update to change the displayed title.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Document URI to move"
+        },
+        "collection": {
+          "type": "string",
+          "description": "New collection path (omit to keep the current collection)"
+        },
+        "slug": {
+          "type": "string",
+          "description": "New slug / filename base, e.g. 'final-spec' (omit to keep the current slug)"
+        },
+        "message": {
+          "type": "string",
+          "description": "Commit message describing the move"
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "uri"
+      ]
+    }
+  },
+  {
+    "name": "akb_delete",
+    "description": "Delete a document. Removes from Git, search index, and knowledge graph.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Document URI"
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "uri"
+      ]
+    }
+  },
+  {
+    "name": "akb_browse",
+    "description": "Browse ALL vault content — documents, tables, and files — under a browse root. The browse root can be addressed two ways: pass a canonical `uri` (`akb://V` for vault root or `akb://V/coll/X` for a collection), or the legacy `vault` + optional `collection` pair. Use the URI form when drilling down from a previous response — every item carries a `uri` that can be pasted straight back in.\n\n`depth` is tree-depth from the browse root, mirroring `tree -L N`: 0 = direct children only (no descent), N = descend N collection levels, -1 = entire subtree. Collection rows are always emitted as navigation aids regardless of depth.\n\nThe response includes metadata for the current browse root in `context`, and collection items include `summary` by default so agents understand their intended purpose. Other resource summaries stay opt-in so large vaults fit in the agent's context window. Returns {vault, path, context, items, total, returned, truncated?, hint?}. For large Vaults use page_size (1–200) and next_cursor: identities are selected before body reads; complete marks traversal exhaustion, not an exact inventory total. A filtered page may be empty and still have a cursor. Use collection with depth=0 to drill down. Legacy limit/offset slices a fully materialized listing and is not a bounded database read.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Canonical browse target: `akb://{vault}` (vault root) or `akb://{vault}/coll/{path}` (collection-scoped). Takes precedence over `vault` + `collection` when both are given."
+        },
+        "vault": {
+          "type": "string",
+          "description": "Vault name. Required unless `uri` is given."
+        },
+        "collection": {
+          "type": "string",
+          "description": "Collection path to use as the browse root (omit for vault root). Ignored when `uri` is given."
+        },
+        "depth": {
+          "type": "integer",
+          "description": "Tree depth from the browse root. 0 = direct children only (no descent into any collection). N = descend N collection levels. -1 = unbounded (entire subtree). Collections themselves are always emitted regardless of depth.",
+          "default": 1,
+          "minimum": -1
+        },
+        "content_type": {
+          "type": "string",
+          "enum": [
+            "all",
+            "collections",
+            "documents",
+            "tables",
+            "files"
+          ],
+          "default": "all",
+          "description": "Filter by content type"
+        },
+        "filter": {
+          "type": "string",
+          "description": "Substring filter on item name/path (case-insensitive)."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Cap returned item count."
+        },
+        "offset": {
+          "type": "integer",
+          "description": "Skip first N items (default 0)."
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Opt into identity-bounded pages. Do not combine with limit/offset. In this mode depth applies to collections too."
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 32768,
+          "description": "Previous next_cursor; keep Vault, collection, depth and content_type unchanged. Follow until complete=true, including after an empty filtered page."
+        },
+        "include_summary": {
+          "type": "boolean",
+          "description": "Include document, table, and file summaries. Collection summaries and browse-root context are always included."
+        },
+        "include_hashes": {
+          "type": "boolean",
+          "description": "Include AKB-certified content_hash/hash_algorithm and resource version fields for documents/files."
+        },
+        "include_archived": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include archived documents. Default false — `status: archived` docs are hidden from browse."
+        }
+      }
+    }
+  },
+  {
+    "name": "akb_search",
+    "description": "Search documents with hybrid retrieval — dense vector (semantic) fused with BM25 sparse (keyword) via Reciprocal Rank Fusion. Handles both natural-language questions and short keyword queries well. For exact string / regex matches (code, URLs, version numbers) prefer akb_grep. Returns each hit's `uri`; `collection_summary` and `vault_description` describe the hit's parent context but do not affect matching or ranking. Use akb_drill_down or akb_get with that URI for full content. Response reports `returned` (in `results`) and `total_matches` (size of the deduped prefetch pool — NOT a corpus-wide hit count; vector ANN is top-K only). When `truncated=true` the prefetch pool was capped, meaning the corpus may hold more hits than reported — switch to akb_grep with count_only=true for an exact literal-substring count, or refine the query. A page shorter than `limit` has exactly two explanations, and they are separate fields. `excluded` counts what a FILTER removed from this page, keyed by cause (e.g. `{\"archived\": 1}` — the default scope hides archived documents; pass include_archived=true to see them). Nothing went wrong when it is non-empty, so do not retry: the same request returns the same page. It is `{}` when nothing was excluded. When `degraded=true` a retrieval leg failed (vector-store outage, a degraded leg) or a hit was lost to a stale source row, AND the page came back short because of it, so results are incomplete or empty — this is NOT a genuine zero-match; `degradation_reason` names the cause. Retry shortly, or fall back to akb_grep for a literal search. A filter never sets this flag and never appears in that reason. Neither does a fault the search already made good: when a dropped candidate was replaced from the prefetch pool the page is complete, so `degraded` stays false and the fault is counted in `recovered` (e.g. `{\"hydration_miss\": 2}`, `{}` when there was nothing to replace). `recovered` reports corpus health, not a problem with your results — do not retry on it and do not warn the user about it; every result you asked for is in `results`.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Natural language search query"
+        },
+        "vault": {
+          "type": "string",
+          "description": "Limit search to a specific vault"
+        },
+        "collection": {
+          "type": "string",
+          "description": "Limit search to a specific collection"
+        },
+        "type": {
+          "type": "string",
+          "description": "Filter by document type (any string). Common values: note, report, decision, spec, plan, session, task, reference, skill."
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Filter by tags"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 50
+        },
+        "include_archived": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include archived documents. Default false — `status: archived` docs are hidden from search."
+        },
+        "source_uris": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Restrict the search to a specific set of already-known resources by their canonical akb:// URIs (e.g. from a previous akb_search / akb_browse). Hybrid retrieval (dense + BM25 + ranking) runs only inside this set, intersected with the other filters and your access. Omit for the normal whole-vault search."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "akb_grep",
+    "description": "Search for exact text or regex patterns across document content. On a native Document backend, optionally include admitted searchable text Files with `include_text_files=true`; binary Files remain excluded. Unlike akb_search (semantic/meaning-based), this finds exact string matches — use it for specific terms, URLs, code snippets, version numbers, etc. Native matching and replacement use per-line Python regex semantics; case-insensitive literals use the same Unicode rules as replacement. Native results include body-relative line numbers and searched revision identity. Returns matching documents (each with its `uri`) and matched lines. Optionally pass `replace` to find-and-replace across all matching documents; the call writes nothing if the scope exceeds `max_replacements`. Three response shapes (mutually exclusive): default lines, `count_only=true` (grep -c — per-doc counts + total, no snippets), `files_with_matches=true` (grep -l — just the URIs that contain the pattern). The default shape always reports BOTH `returned_*` (what fit under `limit`) and `total_*` (full corpus matches) plus a `truncated` flag. When response safety bounds truncate snippets, the `truncation` object names the applied resource, match, and byte limits; use count_only for exact counts without snippets. Result limit does not reduce candidates scanned. A protective grep_scope_too_large error requires narrowing vault/collection, not retrying or lowering limit; path is not a supported scope parameter.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Non-empty search pattern. By default matched as literal text — metacharacters like |, ., *, (), [], +, ? are treated as literal characters. Set regex=true for regex matching (native: Python regex per line; legacy: PostgreSQL candidate matching)."
+        },
+        "vault": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            }
+          ],
+          "description": "Limit to one or more vaults. Omit to search accessible vaults; replace requires an explicit nonempty scope with writer access to every vault."
+        },
+        "doc_types": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Document types (OR); intersects other filters. Excludes Files when nonempty."
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Document tags (OR); intersects other filters. Excludes Files when nonempty."
+        },
+        "include_archived": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include archived Documents; defaults to true for compatibility."
+        },
+        "archive_scope": {
+          "type": "string",
+          "enum": [
+            "unarchived",
+            "archived",
+            "all"
+          ],
+          "description": "Overrides include_archived. Archived scope excludes Files."
+        },
+        "collection": {
+          "type": "string",
+          "description": "Limit to a specific collection"
+        },
+        "regex": {
+          "type": "boolean",
+          "default": false,
+          "description": "Treat pattern as regex (native: Python per line; legacy: PostgreSQL candidates). REQUIRED to use alternation (|), wildcards (.*), character classes, anchors, etc. When false (default), the entire pattern including any metacharacters is matched literally."
+        },
+        "case_sensitive": {
+          "type": "boolean",
+          "default": false,
+          "description": "Case-sensitive matching (default: case-insensitive)"
+        },
+        "replace": {
+          "type": "string",
+          "description": "Replacement string. If provided and the full scope fits max_replacements, replaces all matches in EVERY matching document (git commit + re-index per doc); otherwise writes nothing. Treated literally when regex=false; supports regex backreferences (\\1, \\2) only when regex=true. For precise edits to a single known document, prefer akb_edit instead."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Max documents to return; does not limit replacement writes"
+        },
+        "max_replacements": {
+          "type": "integer",
+          "default": 50,
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Maximum documents a replace call may rewrite, independent of the response limit. If the full scope matches more documents, the call fails before writing anything. Preview with count_only or files_with_matches, then set this budget to cover the intended scope."
+        },
+        "count_only": {
+          "type": "boolean",
+          "default": false,
+          "description": "Return counts only (grep -c semantics). Response: {pattern, total_matches, total_docs, by_doc:{uri:count,...}}. Use for 'how many X are there?' questions — much cheaper than fetching every line."
+        },
+        "files_with_matches": {
+          "type": "boolean",
+          "default": false,
+          "description": "Return only the URIs that contain matches (grep -l semantics). Response: {pattern, n_files, files:[uri,...]}. Use for 'which documents mention X?' questions."
+        },
+        "include_text_files": {
+          "type": "boolean",
+          "description": "Native mode: include admitted searchable text Files as well as Documents. File results include resource_type=file, their canonical akb:// URI, revision, and content_hash; native results also report payload_placement, the body placement their bytes were read from. With this option, total_resources counts all matches and returned_resources counts returned rows; count_only adds by_resource, and files_with_matches adds resources with resource_type and n_resources. The total_docs, returned_docs, by_doc, and files fields remain Document-only. Binary Files are never searchable. Cannot be combined with replace. Omitted means Documents only. Rejected unless postgres_native or the exact guarded native measurement backend is active."
+        },
+        "measurement_include_text_files": {
+          "type": "boolean",
+          "description": "Native mode: deprecated alias for include_text_files. If both are supplied they must agree."
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "pattern"
+      ]
+    }
+  },
+  {
+    "name": "akb_drill_down",
+    "description": "Read section-level (L3) content of a document, or list its section headings.\nTwo modes:\n- `mode='sections'` (default): return body content of matched sections. Filter with `section` (heading substring) and/or `pattern` (substring grep on body). On empty match the response carries an `outline` so you can retry.\n- `mode='outline'`: return heading paths only (no bodies). Use this to discover the document's structure cheaply before deciding which section to read.\nReturns {uri, sections|outline, returned, total?, truncated?, hint?}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Document URI"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "sections",
+            "outline"
+          ],
+          "default": "sections",
+          "description": "'sections' for body content, 'outline' for heading paths only."
+        },
+        "section": {
+          "type": "string",
+          "description": "Section heading filter (partial match). Used in `sections` mode."
+        },
+        "pattern": {
+          "type": "string",
+          "description": "Substring grep inside matched section bodies (case-insensitive). Used in `sections` mode."
+        }
+      },
+      "required": [
+        "uri"
+      ]
+    }
+  },
+  {
+    "name": "akb_activity",
+    "description": "Get activity history for a vault — who changed what, when, and why. Returns Git commit history with changed file list. Use akb_diff to see the actual content changes for a specific commit.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        },
+        "collection": {
+          "type": "string",
+          "description": "Filter by collection path prefix"
+        },
+        "author": {
+          "type": "string",
+          "description": "Filter by author name"
+        },
+        "since": {
+          "type": "string",
+          "description": "ISO datetime to filter from (e.g. 2026-04-01)"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "vault"
+      ]
+    }
+  },
+  {
+    "name": "akb_diff",
+    "description": "Get the content diff for a document at a specific commit. Shows what was added/removed/modified. Use akb_history or akb_activity to find commit hashes first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Document URI"
+        },
+        "commit": {
+          "type": "string",
+          "description": "Commit hash (from akb_history or akb_activity)"
+        }
+      },
+      "required": [
+        "uri",
+        "commit"
+      ]
+    }
+  },
+  {
+    "name": "akb_relations",
+    "description": "Get relations for any resource (document, table, or file). Shows same-vault cross-type connections: doc→table, doc→file, table→file, etc. Each row identifies whether it is an explicit link or implicit document-derived edge.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Resource URI (akb://vault/doc/path, akb://vault/table/name, akb://vault/file/uuid)"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "incoming",
+            "outgoing",
+            "both"
+          ],
+          "default": "both"
+        },
+        "type": {
+          "type": "string",
+          "description": "Filter by relation type (depends_on, related_to, implements, references, attached_to, derived_from)"
+        }
+      },
+      "required": [
+        "uri"
+      ]
+    }
+  },
+  {
+    "name": "akb_graph",
+    "description": "Get a same-vault knowledge graph — nodes (documents, tables, files) and edges (relations). Provide `uri` to get a subgraph centered on any resource with BFS traversal. Provide `vault` (without uri) to get the full vault graph.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Center resource URI (omit + pass vault for full vault graph)"
+        },
+        "vault": {
+          "type": "string",
+          "description": "Vault name (only when uri is omitted — for full vault graph)"
+        },
+        "hops": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 5,
+          "description": "BFS traversal radius in edge hops. Disambiguated from `akb_browse.depth` (which is collection-tree depth) — hops here counts relations followed, not folder levels."
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50,
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Max nodes"
+        }
+      }
+    }
+  },
+  {
+    "name": "akb_link",
+    "description": "Create a relation between any two resources (documents, tables, files). Source and target are AKB URIs in the same vault. Relation types: depends_on, related_to, implements, references, attached_to, derived_from. Example: link a design doc to its data table, or attach a diagram file to a spec.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "Source resource URI (e.g. akb://vault/doc/specs/api.md)"
+        },
+        "target": {
+          "type": "string",
+          "description": "Target resource URI (e.g. akb://vault/table/experiments)"
+        },
+        "relation": {
+          "type": "string",
+          "description": "Relation type",
+          "enum": [
+            "depends_on",
+            "related_to",
+            "implements",
+            "references",
+            "attached_to",
+            "derived_from"
+          ]
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "source",
+        "target",
+        "relation"
+      ]
+    }
+  },
+  {
+    "name": "akb_unlink",
+    "description": "Remove an explicit same-vault relation between two resources. Implicit relations are removed by editing their source document. If relation type is omitted, removes all explicit relations between the two resources.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "Source resource URI"
+        },
+        "target": {
+          "type": "string",
+          "description": "Target resource URI"
+        },
+        "relation": {
+          "type": "string",
+          "description": "Specific explicit relation type to remove, one of: depends_on, related_to, implements, references, attached_to, derived_from (omit to remove all explicit relations)",
+          "enum": [
+            "depends_on",
+            "related_to",
+            "implements",
+            "references",
+            "attached_to",
+            "derived_from"
+          ]
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "source",
+        "target"
+      ]
+    }
+  },
+  {
+    "name": "akb_provenance",
+    "description": "Get provenance for a document — who created it, when, which entities were extracted, and its visible same-vault relations.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Document URI"
+        }
+      },
+      "required": [
+        "uri"
+      ]
+    }
+  },
+  {
+    "name": "akb_create_table",
+    "description": "Create a structured data table in a vault. The response carries the canonical `uri` — `akb://{vault}/coll/{collection}/table/{name}` when stored under a collection, or `akb://{vault}/table/{name}` at the vault root. Tables live alongside documents inside collections and follow the same permissions. Define columns with name and type (text, number, boolean, date, json). Optional `collection` (e.g. 'sessions/learnings') groups the table under that collection so it appears beside the documents and files there in akb_browse; omit for vault root.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "parent": {
+          "type": "string",
+          "description": "Parent location as a canonical URI — `akb://{vault}` for the vault root, `akb://{vault}/coll/{path}` for a collection. When given, the table is created there and `vault`/`collection` are derived from the URI."
+        },
+        "vault": {
+          "type": "string",
+          "description": "Target vault name. Required unless `parent` is given."
+        },
+        "name": {
+          "type": "string",
+          "description": "Table name (unique within the vault)"
+        },
+        "if_not_exists": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, an existing table is NOT an error: returns created=false instead of a 409 conflict. Nothing is altered either way. If you also hold READ access to the vault the response carries the STORED schema plus matches_request and mismatches[], so divergence from your spec is explicit; a write-only credential gets only {kind, name, created, outcome}. Must be a real boolean — the string \"true\" is rejected. Default false keeps the 409."
+        },
+        "collection": {
+          "type": "string",
+          "description": "Collection path (e.g. 'specs' or 'sessions/learnings'). Omit for vault root. Ignored when `parent` is given."
+        },
+        "description": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "array",
+          "description": "Column definitions",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "SQL identifier, used as written in akb_sql: a lowercase ASCII letter, then lowercase letters, digits or underscores, at most 63 bytes, and not a word PostgreSQL reserves (`user`, `order`, …) or a system column (`xmin`, …). Name the column for what it holds (e.g. `category`)."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text",
+                  "number",
+                  "boolean",
+                  "date",
+                  "json"
+                ]
+              },
+              "required": {
+                "type": "boolean",
+                "default": false
+              },
+              "description": {
+                "type": "string",
+                "description": "What the column holds. When the table comes from a document, put the original header here (e.g. `분류`) — akb_vault_info shows it and search indexes it."
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ]
+          }
+        },
+        "unique_keys": {
+          "type": "array",
+          "description": "Declarative UNIQUE keys. Each item is {name?, columns}. `columns` is a list of existing column names (single or composite). `name` is optional — when omitted AKB generates a deterministic, stable name. Use this (not `indexes`) for unique indexes.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "columns": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1
+              }
+            },
+            "required": [
+              "columns"
+            ]
+          }
+        },
+        "indexes": {
+          "type": "array",
+          "description": "Declarative lookup (btree) indexes. Each item is {name?, columns}. A column is a bare string or {name, order} where order is 'asc' (default) or 'desc'. Unique indexes are expressed via `unique_keys`, not here.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "columns": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "order": {
+                          "type": "string",
+                          "enum": [
+                            "asc",
+                            "desc"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "name"
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            "required": [
+              "columns"
+            ]
+          }
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "name",
+        "columns"
+      ]
+    }
+  },
+  {
+    "name": "akb_sql",
+    "description": "Execute SQL on vault tables. Tables are real PostgreSQL tables. Use table names directly (e.g. 'pipeline', 'partners') — they are auto-resolved to the vault's tables. For cross-vault queries, list all vaults in the vaults parameter. Prefix table names with vault name for cross-vault: sales__pipeline, external_projects__partners. SELECT requires reader role. INSERT/UPDATE/DELETE requires writer role. Add a LIMIT to SELECTs unless you truly need every row — the full result set is returned (nothing is silently truncated), so an unbounded SELECT on a large table can send back a very large response.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sql": {
+          "type": "string",
+          "description": "SQL query to execute. For large tables, add a LIMIT to cap the rows returned unless you need the full set."
+        },
+        "vaults": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Vault names whose tables are referenced (default: single vault)"
+        },
+        "vault": {
+          "type": "string",
+          "description": "Single vault shorthand (instead of vaults array)"
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "sql"
+      ]
+    }
+  },
+  {
+    "name": "akb_drop_table",
+    "description": "Permanently delete a table and all its rows. Cannot be undone. Requires admin role on the vault.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Table URI — akb://{vault}[/coll/{coll_path}]/table/{name}"
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "uri"
+      ]
+    }
+  },
+  {
+    "name": "akb_alter_table",
+    "description": "Modify a table's schema — add, remove, or rename columns via ALTER TABLE DDL. Requires admin role.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Table URI — akb://{vault}[/coll/{coll_path}]/table/{name}"
+        },
+        "add_columns": {
+          "type": "array",
+          "description": "Columns to add",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "SQL identifier, used as written in akb_sql: a lowercase ASCII letter, then lowercase letters, digits or underscores, at most 63 bytes, and not a word PostgreSQL reserves (`user`, `order`, …) or a system column (`xmin`, …). Name the column for what it holds (e.g. `category`)."
+              },
+              "description": {
+                "type": "string",
+                "description": "What the column holds. When the table comes from a document, put the original header here (e.g. `분류`) — akb_vault_info shows it and search indexes it."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text",
+                  "int",
+                  "float",
+                  "numeric",
+                  "number",
+                  "boolean",
+                  "uuid",
+                  "date",
+                  "timestamp",
+                  "jsonb",
+                  "json",
+                  "text[]",
+                  "enum"
+                ]
+              },
+              "default": {},
+              "check": {
+                "type": "object"
+              },
+              "enum": {
+                "type": "array"
+              },
+              "references": {
+                "type": "object"
+              },
+              "on_delete": {
+                "type": "string"
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "unique": {
+                "type": "boolean"
+              },
+              "index": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ]
+          }
+        },
+        "alter_columns": {
+          "type": "array",
+          "description": "Rich column ops: [{name, set_default?, drop_default?, set_check?, drop_check?, set_not_null?, drop_not_null?, set_enum?/enum?, rename_enum_values?}]",
+          "items": {
+            "type": "object"
+          }
+        },
+        "drop_columns": {
+          "type": "array",
+          "description": "Column names to remove",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rename_columns": {
+          "type": "object",
+          "description": "Rename columns: {old_name: new_name}"
+        },
+        "add_unique_keys": {
+          "type": "array",
+          "description": "UNIQUE keys to add: [{name?, columns}]. Adding a key on a table with existing data preflights for duplicate rows and fails before any DDL if any are found.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "columns": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1
+              }
+            },
+            "required": [
+              "columns"
+            ]
+          }
+        },
+        "drop_unique_keys": {
+          "type": "array",
+          "description": "UNIQUE-key names to drop (as shown in unique_keys metadata).",
+          "items": {
+            "type": "string"
+          }
+        },
+        "add_indexes": {
+          "type": "array",
+          "description": "Lookup indexes to add: [{name?, columns}]. A column is a bare string or {name, order} (order 'asc'|'desc').",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "columns": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "order": {
+                          "type": "string",
+                          "enum": [
+                            "asc",
+                            "desc"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "name"
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            "required": [
+              "columns"
+            ]
+          }
+        },
+        "drop_indexes": {
+          "type": "array",
+          "description": "Index names to drop (as shown in indexes metadata).",
+          "items": {
+            "type": "string"
+          }
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "uri"
+      ]
+    }
+  },
+  {
+    "name": "akb_publish",
+    "description": "Create a public, no-auth share URL for a document, file, or table query. Document/file: pass the resource `uri`. Table query: pass `query_sql` plus `vault` (and `query_vault_names` if the query touches more than one). Returns the canonical publication dict — `slug` is the only identifier you need; `share_url` is always an absolute URL ready to paste.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Resource URI to publish — required when resource_type is document or file. Omit for table_query."
+        },
+        "resource_type": {
+          "type": "string",
+          "enum": [
+            "document",
+            "table_query",
+            "file"
+          ],
+          "default": "document",
+          "description": "Kind of resource. document/file → pass `uri`. table_query → pass `query_sql` + `vault`."
+        },
+        "vault": {
+          "type": "string",
+          "description": "Vault name. Required only for resource_type=table_query (doc/file vault is inferred from the URI)."
+        },
+        "query_sql": {
+          "type": "string",
+          "description": "SELECT/WITH SQL with :param placeholders. resource_type=table_query only."
+        },
+        "query_vault_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Vaults the query reads from. Defaults to [vault]. resource_type=table_query only."
+        },
+        "query_params": {
+          "type": "object",
+          "description": "Parameter declarations: {name: {type, default, required}}. resource_type=table_query only."
+        },
+        "password": {
+          "type": "string",
+          "description": "Require this password to view the share."
+        },
+        "max_views": {
+          "type": "integer",
+          "description": "Auto-expire after N views."
+        },
+        "expires_in": {
+          "type": "string",
+          "description": "Expiration window: '1h', '7d', '30d', or 'never' (default)."
+        },
+        "title": {
+          "type": "string",
+          "description": "Override the display title (defaults to the resource's own title)."
+        },
+        "section_filter": {
+          "type": "string",
+          "description": "Filter to a specific heading section. resource_type=document only."
+        },
+        "allow_embed": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow the share to be embedded via iframe/oEmbed."
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      }
+    }
+  },
+  {
+    "name": "akb_unpublish",
+    "description": "Remove publication(s). Pass `slug` to remove one specific publication, OR `uri` to remove every publication of that document/file resource (handy when re-publishing). table_query publications have no resource URI, so remove them by slug. Returns {deleted: N}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string",
+          "description": "Publication slug — remove exactly this publication."
+        },
+        "uri": {
+          "type": "string",
+          "description": "Document or file URI — remove every publication tied to that resource."
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      }
+    }
+  },
+  {
+    "name": "akb_publications",
+    "description": "List every publication in a vault. Each item is the canonical publication dict (same shape as `akb_publish` returns).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        },
+        "resource_type": {
+          "type": "string",
+          "enum": [
+            "document",
+            "table_query",
+            "file"
+          ],
+          "description": "Filter by resource type"
+        }
+      },
+      "required": [
+        "vault"
+      ]
+    }
+  },
+  {
+    "name": "akb_publication_snapshot",
+    "description": "Freeze a table_query publication's current result to S3 and flip its mode to 'snapshot' (subsequent visits return the cached result). Identified by `slug` alone — the vault is resolved from the publication. Returns the updated publication dict.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string",
+          "description": "Publication slug"
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "slug"
+      ]
+    }
+  },
+  {
+    "name": "akb_vault_info",
+    "description": "Get detailed vault information: owner, member count, document/table/file/edge counts, last activity.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        }
+      },
+      "required": [
+        "vault"
+      ]
+    }
+  },
+  {
+    "name": "akb_vault_members",
+    "description": "List all members of a vault with their roles (owner, admin, writer, reader).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        }
+      },
+      "required": [
+        "vault"
+      ]
+    }
+  },
+  {
+    "name": "akb_grant",
+    "description": "Grant vault access to a user. You must be owner or admin of the vault. A rule-driven grantor should name its own source_key so it can later withdraw its own reason without deleting anybody else's.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        },
+        "user": {
+          "type": "string",
+          "description": "Target username"
+        },
+        "role": {
+          "type": "string",
+          "description": "Role to grant",
+          "enum": [
+            "reader",
+            "writer",
+            "admin"
+          ]
+        },
+        "source_key": {
+          "type": "string",
+          "description": "The basis on which the role is held, as '<namespace>:<id>'. Omit it and the grant is 'direct', which is what every grant was before bases could coexist."
+        },
+        "revision": {
+          "type": "integer",
+          "description": "Monotonic per (vault, user, source). A retry carrying a revision no newer than the stored one is a no-op rather than an overwrite."
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "vault",
+        "user",
+        "role"
+      ]
+    }
+  },
+  {
+    "name": "akb_revoke",
+    "description": "Revoke a user's vault access. You must be owner or admin. Omit source_key and the person is out of the vault entirely; name one and only that basis is withdrawn, which may downgrade rather than remove.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        },
+        "user": {
+          "type": "string",
+          "description": "Target username"
+        },
+        "source_key": {
+          "type": "string",
+          "description": "Withdraw only this basis. Omit it and EVERY basis goes — an administrator's revoke, which must not leave the person holding rule-given access."
+        },
+        "revision": {
+          "type": "integer",
+          "description": "Monotonic per (vault, user, source); a stale one is a no-op."
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "vault",
+        "user"
+      ]
+    }
+  },
+  {
+    "name": "akb_explain_access",
+    "description": "Explain why a user holds the role they hold on a vault: every independent basis, and the effective role derived from them. A member list shows the result, never the reasons.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        },
+        "user": {
+          "type": "string",
+          "description": "Target username"
+        }
+      },
+      "required": [
+        "vault",
+        "user"
+      ]
+    }
+  },
+  {
+    "name": "akb_search_users",
+    "description": "Search for users by username, display name, or email. Use this to find users before granting vault access.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search query (name, email, etc.)"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      }
+    }
+  },
+  {
+    "name": "akb_whoami",
+    "description": "Get your current profile — username, email, display name, role. Use this to check who you are authenticated as.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "akb_transfer_ownership",
+    "description": "Transfer vault ownership to another user. The current owner or a system admin can do this.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        },
+        "new_owner": {
+          "type": "string",
+          "description": "Username of the new owner"
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "vault",
+        "new_owner"
+      ]
+    }
+  },
+  {
+    "name": "akb_archive_vault",
+    "description": "Archive a vault (makes it read-only). Only the owner can do this.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "vault"
+      ]
+    }
+  },
+  {
+    "name": "akb_delete_vault",
+    "description": "Permanently delete a vault and ALL its data — documents, chunks, tables, files, edges, Git repo. This cannot be undone. Owner or admin only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name to delete"
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "vault"
+      ]
+    }
+  },
+  {
+    "name": "akb_create_collection",
+    "description": "Create an empty collection (folder) inside a vault. Idempotent — returns {created: false} if the collection already exists. Writer or higher role.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        },
+        "path": {
+          "type": "string",
+          "description": "Collection path, e.g. 'api-specs' or 'docs/guides'"
+        },
+        "summary": {
+          "type": "string",
+          "description": "Optional one-line description"
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "vault",
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "akb_delete_collection",
+    "description": "Delete a collection. If empty, removes the metadata row. If non-empty, requires recursive=true to cascade delete every document, file, and table under the path. Cascade emits one git commit for the document batch. Writer or higher role; admin or higher when any table is included.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        },
+        "path": {
+          "type": "string",
+          "description": "Collection path to delete"
+        },
+        "recursive": {
+          "type": "boolean",
+          "default": false,
+          "description": "Required when the collection is non-empty."
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "vault",
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "akb_set_public",
+    "description": "Set vault public access level. Owner only. 'none'=private, 'reader'=public read, 'writer'=public read+write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault name"
+        },
+        "level": {
+          "type": "string",
+          "enum": [
+            "none",
+            "reader",
+            "writer"
+          ],
+          "description": "Public access level"
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "vault",
+        "level"
+      ]
+    }
+  },
+  {
+    "name": "akb_history",
+    "description": "Get version history of a document — who changed it, when, and why. Each entry is a Git commit. Use the commit hash with akb_get to read a previous version.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "description": "Document URI"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20,
+          "description": "Max entries"
+        }
+      },
+      "required": [
+        "uri"
+      ]
+    }
+  },
+  {
+    "name": "akb_help",
+    "description": "Get help on AKB tools and workflows. Call with no arguments for an overview. Drill down into categories or specific tools for details and examples. START HERE if you're new to AKB.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string",
+          "description": "What to get help on. Options: categories (quickstart, documents, search, tables, files, access, history, publishing, relations), tool names (akb_put, akb_search, etc.), or workflow names (link-resources, research, onboarding, data-tracking, vault-skill)"
+        },
+        "vault": {
+          "type": "string",
+          "description": "Vault name. Required for topic='vault-skill' — returns that vault's full skill text (the auto-attached `vault_skill` payload may be truncated). Read-only mirror vaults have no skill; a fallback guide is returned instead."
+        }
+      }
+    }
+  },
+  {
+    "name": "akb_export",
+    "description": "Export an entire vault as a portable knowledge bundle. Returns the bundle inline as a {path: content} map. The `format` parameter selects the on-disk format — currently 'okf' (Open Knowledge Format: markdown + YAML frontmatter, the only required field being `type`). Documents export 1:1; tables and files become OKF concept documents (schema / metadata + a `resource` pointer — the rows/bytes stay in AKB). Reader role required. For a downloadable zip, use the REST endpoint GET /api/v1/vaults/{vault}/export.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Vault to export"
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "okf"
+          ],
+          "default": "okf",
+          "description": "Bundle format. Currently only 'okf'."
+        }
+      },
+      "required": [
+        "vault"
+      ]
+    }
+  },
+  {
+    "name": "akb_import",
+    "description": "Import a knowledge bundle into a vault. Pass `files` as a {path: content} map (the shape akb_export returns). `format` selects the bundle format — currently 'okf'. Concept documents are imported as AKB documents; a `type: table`/`file` concept doc (which carries only schema/metadata, not rows/bytes) imports as a regular document describing that asset. Existing paths are skipped, not overwritten. Records targeting the reserved 'overview' collection or carrying type='skill' are skipped per-record and reported in the response's 'reserved' list. Writer role required.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "vault": {
+          "type": "string",
+          "description": "Target vault"
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "okf"
+          ],
+          "default": "okf",
+          "description": "Bundle format. Currently only 'okf'."
+        },
+        "files": {
+          "type": "object",
+          "description": "Bundle as a {bundle-relative-path: markdown-content} map.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "active",
+            "archived"
+          ],
+          "description": "Optional: override status for every imported document."
+        },
+        "_vault_skill_ack": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+        }
+      },
+      "required": [
+        "vault",
+        "files"
+      ]
+    }
+  }
+]

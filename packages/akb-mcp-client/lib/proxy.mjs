@@ -1,31 +1,16 @@
-/**
- * AKB MCP Proxy — stdio ↔ Streamable HTTP with auto-reconnect.
- *
- * - Reads JSON-RPC from stdin, forwards to AKB server over HTTP
- * - Handles file tools locally:
- *   - Gets presigned URLs from AKB server
- *   - Uploads/downloads directly to/from S3 (AKB never touches file bytes)
- *   - Uploads bounded document images through AKB for validation and ACLs
- * - Auto-reconnects on server restart
- * - Zero dependencies (Node.js built-in only)
- */
+/** AKB stdio protocol adapters and proxy-owned local file workflows. */
 
-import { request as httpsRequest, Agent as httpsAgent } from "node:https";
-import { request as httpRequest, Agent as httpAgent } from "node:http";
-import { createInterface } from "node:readline";
+import { request as httpsRequest } from "node:https";
+import { request as httpRequest } from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { ToolConnection } from "./connection.mjs";
+import { createCredentialOwner, CredentialUnavailable } from "./credentials.mjs";
+import { ToolCatalog } from "./catalog.mjs";
+import { StdioDispatcher } from "./stdio-dispatch.mjs";
 import { appendFileSync, createReadStream, createWriteStream, readFileSync, statSync } from "node:fs";
 import { mkdir, stat as fsStat } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
-
-// ── Connection reuse ───────────────────────────────────────
-// Without keepAlive agents, every MCP tool call (search, browse, put,
-// update, relations, …) triggers a fresh TCP+TLS handshake to the backend.
-// A typical agent session chains 5–15 tool calls; reusing connections
-// saves one round-trip per call (40–100 ms on a nearby cloud backend,
-// more across regions or with slow TLS termination).
-const httpKeepAlive = new httpAgent({ keepAlive: true });
-const httpsKeepAlive = new httpsAgent({ keepAlive: true });
 
 // ── MIME type inference ────────────────────────────────────
 // Covers common file types. Unknown extensions fall back to octet-stream.
@@ -380,8 +365,8 @@ const UNSUPPORTED_PROTOCOL_VERSION = -32022;
 // Kept in sync with package.json `version`. Reported to the client in the
 // local `initialize` response, so it must not silently drift on a proxy
 // behaviour change. There is no import of package.json here to keep lib/
-// zero-dependency and load-safe across Node versions.
-const PROXY_VERSION = "2.3.2";
+// load-safe across supported Node versions.
+const PROXY_VERSION = "2.4.0";
 const VAULT_SKILL_PREFLIGHT_CAPABILITY =
   "io.dnotitia.akb/vault-skill-preflight";
 const PROXY_INSTRUCTIONS =
@@ -437,12 +422,16 @@ function encodeMcpHeaderValue(value) {
 }
 
 export class AKBProxy {
-  constructor({ url, pat, insecure = false }) {
-    this.url = new URL(url);
-    this.pat = pat;
-    this.insecure = insecure;
+  constructor({ installation, authentication, credentialOwner }) {
+    this.installation = installation;
+    this.url = new URL(installation.resource);
+    this.credentials = credentialOwner ?? createCredentialOwner(authentication, installation);
+    this.connection = new ToolConnection(this.installation, this.credentials);
+    this.context = new AsyncLocalStorage();
+    this.shutdown = new AbortController();
+    this.catalog = new ToolCatalog(this._fileToolsForClient(), (tools) => this._decorateTools({ tools }).tools);
     this.sessionId = null;
-    this._backendMode = null; // "modern" or legacy rolling-upgrade fallback
+    this._backendMode = "modern";
     this.msgId = 0;
     this._initialized = false;
     this._clientGeneration = null; // fixed by the first request
@@ -456,8 +445,7 @@ export class AKBProxy {
     // out of band via a background monitor.
     this._backendReady = false; // backend MCP session established
     this._connecting = null; // in-flight backend-connect promise (single-flight lock)
-    this._cachedTools = null; // last successful backend tools/list result (raw)
-    this._servedDegraded = false; // client was handed a fallback (file-tools-only) list
+    this._cachedTools = null;
     this._monitorRunning = false; // background reconnect monitor active
     this._closed = false; // stdin closed / shutting down
     // Exact-operation acknowledgement cache for backend and proxy-local
@@ -474,44 +462,36 @@ export class AKBProxy {
   }
 
   _sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise((resolve) => {
+      if (this.shutdown.signal.aborted) return resolve();
+      const done = () => { clearTimeout(timer); this.shutdown.signal.removeEventListener("abort", done); resolve(); };
+      const timer = setTimeout(done, ms);
+      this.shutdown.signal.addEventListener("abort", done, { once: true });
+    });
   }
 
-  // Short timeout for backend liveness probes (initialize / tools-list) so
-  // the reconnect monitor cycles quickly and a single tool call fails fast
-  // when the backend is unreachable, instead of blocking on the generous
-  // per-request timeout used for legitimately slow operations.
-  _probeTimeoutMs() {
-    return Number(process.env.AKB_MCP_CONNECT_TIMEOUT_MS) || 10000;
-  }
+  _probeTimeoutMs() { return Number(process.env.AKB_MCP_CONNECT_TIMEOUT_MS) || 10000; }
 
   async start() {
-    const rl = createInterface({ input: process.stdin });
+    this.dispatcher = new StdioDispatcher({
+      handle: (message, signal) => this.context.run({ signal, receipt: null }, () => this._handle(message)),
+      afterHandshake: () => { this.credentials.start(); this._startBackendMonitor(); },
+      close: async () => {
+        this._closed = true;
+        this.shutdown.abort();
+        this.connection.close();
+        await this.credentials.close();
+      },
+    });
+    await this.dispatcher.start();
+  }
 
-    for await (const line of rl) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+  _toolResponse(id, value, isError = false) {
+    return { jsonrpc: "2.0", id, result: this._clientResult({ content: [{ type: "text", text: JSON.stringify(value) }], isError }) };
+  }
 
-      let msg;
-      try {
-        msg = JSON.parse(trimmed);
-      } catch {
-        this._writeError(null, -32700, "Parse error");
-        continue;
-      }
-
-      try {
-        const result = await this._handle(msg);
-        if (result !== null) {
-          this._write(result);
-        }
-      } catch (err) {
-        this._writeError(msg?.id ?? null, err.code || -32603, err.message, err.data);
-      }
-    }
-    // stdin closed → client disconnected. Stop the background monitor so
-    // the process can exit cleanly instead of looping forever.
-    this._closed = true;
+  _connectionStatus() {
+    return { ...this.credentials.status(), connectivity: this.connection.connectivity, ...(this._contractMismatch ? { contract: "incompatible", message: this._contractMismatch } : {}) };
   }
 
   async _handle(msg) {
@@ -573,6 +553,21 @@ export class AKBProxy {
       return await this._toolsList(id, params);
     }
 
+    if (method === "ping") return { jsonrpc: "2.0", id, result: this._clientResult({}) };
+    if (method === "tools/call" && params?.name === "akb_connection") {
+      const action = params.arguments?.action ?? "status";
+      const actions = { sign_in: "signIn", cancel: "cancel", sign_out: "signOut" };
+      if (action === "status") return this._toolResponse(id, this._connectionStatus());
+      if (!actions[action]) return this._toolResponse(id, { code: "invalid_action", execution: "not_started" }, true);
+      const result = this.credentials[actions[action]]();
+      return this._toolResponse(id, { ...result, ...this._connectionStatus() }, Boolean(result?.code));
+    }
+    if (method === "tools/call" && !this.credentials.currentCredential()) {
+      const error = new CredentialUnavailable(this.credentials.status());
+      return this._toolResponse(id, { code: error.code, error: error.message, execution: "not_started", ...this._connectionStatus() }, true);
+    }
+    if (this._contractMismatch) return this._toolResponse(id, { code: "server_contract_mismatch", error: this._contractMismatch, execution: "not_started" }, true);
+
     // Resolve `file` → `content` for akb_put / akb_update before forwarding
     if (method === "tools/call" && FILE_CONTENT_TOOLS.has(params?.name)) {
       const args = params.arguments;
@@ -615,6 +610,7 @@ export class AKBProxy {
       return response;
     } catch (err) {
       threw = true;
+      if (method === "tools/call") return this._toolResponse(id, { code: err.code ?? "request_failed", error: err.message, execution: err.execution ?? "unknown" }, true);
       throw err;
     } finally {
       if (measuring) {
@@ -809,16 +805,12 @@ export class AKBProxy {
     this._clientCapabilities = isObject(params?.capabilities) ? params.capabilities : {};
     this._clientInfo = isObject(params?.clientInfo) ? params.clientInfo : null;
     this._initialized = true;
-    // Kick off the backend session + tool prefetch in the background.
-    this._startBackendMonitor();
 
     return {
       jsonrpc: "2.0",
       id,
       result: {
         protocolVersion: LEGACY_PROTOCOL_VERSION,
-        // Advertise listChanged so we can push the real toolset after a
-        // degraded (backend-unreachable) tools/list is recovered.
         capabilities: { tools: { listChanged: true } },
         serverInfo: { name: "akb-mcp", version: PROXY_VERSION },
         instructions: PROXY_INSTRUCTIONS,
@@ -831,7 +823,6 @@ export class AKBProxy {
     // while the backend or VPN is unavailable. The backend monitor separately
     // refreshes the real catalog once it can reach AKB.
     this._initialized = true;
-    this._startBackendMonitor();
     const result = modernResult({
       supportedVersions: [MODERN_PROTOCOL_VERSION],
       capabilities: { tools: { listChanged: true } },
@@ -863,7 +854,6 @@ export class AKBProxy {
       }
       return { ...t };
     });
-    tools.push(...this._fileToolsForClient());
     return { ...resp, tools };
   }
 
@@ -883,38 +873,8 @@ export class AKBProxy {
     });
   }
 
-  async _toolsList(id, params) {
-    // Serve a live or cached backend tool list. If the backend is
-    // unreachable and nothing is cached, degrade to the local file tools
-    // only — a valid (partial) response the client can register — and mark
-    // the list stale so the monitor re-lists it on recovery. Never error
-    // the whole tools/list on backend unreachability.
-    let resp = this._cachedTools;
-    if (!resp) {
-      const ok = await this._ensureBackend();
-      if (ok) {
-        try {
-          resp = await this._syncTools();
-        } catch {
-          resp = null;
-        }
-      }
-    }
-
-    if (!resp) {
-      this._servedDegraded = true;
-      this._startBackendMonitor();
-      process.stderr.write(
-        "[akb-mcp] backend unreachable — serving file tools only; will re-list on recovery\n",
-      );
-      return {
-        jsonrpc: "2.0",
-        id,
-        result: this._clientToolsListResult({ tools: this._fileToolsForClient() }),
-      };
-    }
-
-    return { jsonrpc: "2.0", id, result: this._clientToolsListResult(this._decorateTools(resp)) };
+  async _toolsList(id) {
+    return { jsonrpc: "2.0", id, result: this._clientToolsListResult(this.catalog.initialCatalog()) };
   }
 
   // ── File-to-content resolution ─────────────────────────
@@ -1376,7 +1336,6 @@ export class AKBProxy {
           "Content-Length": fileSize,
         },
       };
-      if (isHttps && this.insecure) opts.rejectUnauthorized = false;
 
       const req = doRequest(opts, (res) => {
         let data = "";
@@ -1415,7 +1374,6 @@ export class AKBProxy {
         path: url.pathname + url.search,
         method: "GET",
       };
-      if (isHttps && this.insecure) opts.rejectUnauthorized = false;
 
       const req = doRequest(opts, (res) => {
         if (res.statusCode >= 400) {
@@ -1448,88 +1406,9 @@ export class AKBProxy {
   // ── AKB HTTP helper ───────────────────────────────────────
 
   _http(method, path, body = null, extraHeaders = {}, callOptions = {}) {
-    return new Promise((resolve, reject) => {
-      const isHttps = this.url.protocol === "https:";
-      const doRequest = isHttps ? httpsRequest : httpRequest;
-
-      const headers = {
-        Authorization: `Bearer ${this.pat}`,
-        ...extraHeaders,
-      };
-      if (body && !extraHeaders["Content-Type"]) {
-        headers["Content-Type"] = "application/json";
-      }
-      if (body) {
-        headers["Content-Length"] = Buffer.byteLength(body);
-      }
-
-      const requestOptions = {
-        hostname: this.url.hostname,
-        port: this.url.port || (isHttps ? 443 : 80),
-        path,
-        method,
-        headers,
-        agent: isHttps ? httpsKeepAlive : httpKeepAlive,
-      };
-      if (isHttps && this.insecure) requestOptions.rejectUnauthorized = false;
-
-      // Connect-phase timeout, separate from the (long) response timeout.
-      // A VPN blackhole leaves a brand-new socket stuck in `connecting`;
-      // without this the request would hang until the 5-min response
-      // timeout. We only arm it for sockets still connecting — reused
-      // keep-alive sockets are already established.
-      let connectTimer = null;
-      const connectMs = this._probeTimeoutMs();
-      const clearConnectTimer = () => {
-        if (connectTimer) {
-          clearTimeout(connectTimer);
-          connectTimer = null;
-        }
-      };
-
-      const req = doRequest(requestOptions, (res) => {
-        clearConnectTimer();
-        let data = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          if (res.statusCode >= 400) {
-            const error = new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`);
-            error.statusCode = res.statusCode;
-            error.body = data;
-            reject(error);
-          } else {
-            resolve({ text: data, headers: res.headers, statusCode: res.statusCode });
-          }
-        });
-      });
-
-      req.on("socket", (socket) => {
-        if (socket.connecting) {
-          connectTimer = setTimeout(() => {
-            req.destroy(new Error(`Connect timeout (${Math.round(connectMs / 1000)}s)`));
-          }, connectMs);
-          socket.once("connect", clearConnectTimer);
-        }
-      });
-
-      req.on("error", (err) => {
-        clearConnectTimer();
-        reject(err);
-      });
-      // Default 5 min — destructive ops like `akb_delete_vault` on
-      // large vaults (7K+ docs) take well over 30s for the backend
-      // cascade (chunks + vector outbox + git cleanup). Hardcoding
-      // 30s caused the client to abort while the backend continued
-      // processing, leaving the operator with a misleading timeout
-      // error. Override via `AKB_MCP_REQUEST_TIMEOUT_MS`, or per-call via
-      // `callOptions.timeoutMs` (liveness probes use the short probe timeout).
-      const reqTimeoutMs =
-        callOptions.timeoutMs || Number(process.env.AKB_MCP_REQUEST_TIMEOUT_MS) || 300000;
-      req.setTimeout(reqTimeoutMs, () => req.destroy(new Error(`Request timeout (${Math.round(reqTimeoutMs / 1000)}s)`)));
-      if (body) req.write(body);
-      req.end();
-    });
+    const options = { ...callOptions, signal: callOptions.signal ?? this.context.getStore()?.signal ?? this.shutdown.signal, connectTimeoutMs: this._probeTimeoutMs() };
+    if (path === this.url.pathname) return this.connection.mcp(body, extraHeaders, options);
+    return this.connection.control(method, path, body, extraHeaders, options);
   }
 
   // ── Backend session + reconnect monitor ───────────────────
@@ -1542,31 +1421,6 @@ export class AKBProxy {
     return /ECONNREFUSED|ECONNRESET|socket hang up|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|ENOTFOUND|EPIPE|timeout|unreachable/i.test(
       error?.message || String(error || ""),
     );
-  }
-
-  _isLegacyBackendGap(error) {
-    if (this._isConnError(error)) return false;
-    return (
-      error?.code === METHOD_NOT_FOUND ||
-      error?.statusCode === 404 ||
-      error?.statusCode === 405 ||
-      (error?.code === INVALID_REQUEST && /missing session id/i.test(error?.message || ""))
-    );
-  }
-
-  _legacyBackendParams() {
-    const sourceCapabilities = this._clientCapabilities;
-    return {
-      protocolVersion: LEGACY_PROTOCOL_VERSION,
-      capabilities: {
-        ...sourceCapabilities,
-        experimental: {
-          ...(isObject(sourceCapabilities.experimental) ? sourceCapabilities.experimental : {}),
-          [VAULT_SKILL_PREFLIGHT_CAPABILITY]: { version: 2 },
-        },
-      },
-      clientInfo: this._clientInfo || { name: "akb-mcp-client", version: PROXY_VERSION },
-    };
   }
 
   _modernizeParams(params) {
@@ -1598,53 +1452,24 @@ export class AKBProxy {
     };
   }
 
-  // Establish the backend modern stateless capability. A legacy initialize
-  // fallback is allowed only for a rolling upgrade in which the peer clearly
-  // lacks server/discover; network and protocol errors stay fail-closed.
   async _ensureBackend() {
     if (this._backendReady) return true;
+    if (!this.credentials.currentCredential() || this._contractMismatch || this._closed) return false;
     if (this._connecting) return this._connecting;
     this._connecting = (async () => {
-      this._backendMode = null;
-      this.sessionId = null;
       try {
-        const discovered = await this._rpc(
-          "server/discover",
-          null,
-          { timeoutMs: this._probeTimeoutMs(), protocolMode: "modern" },
-        );
-        if (!Array.isArray(discovered.supportedVersions) ||
-            !discovered.supportedVersions.includes(MODERN_PROTOCOL_VERSION)) {
-          const error = new Error("Backend does not advertise the supported modern protocol");
-          error.protocolError = true;
-          throw error;
+        const discovered = await this._rpc("server/discover", null, { timeoutMs: this._probeTimeoutMs() });
+        if (!discovered.supportedVersions?.includes(MODERN_PROTOCOL_VERSION)) {
+          this._contractMismatch = "Backend protocol is incompatible. Install the matching proxy version.";
+          return false;
         }
-        this._backendMode = "modern";
         this._backendReady = true;
         return true;
       } catch (error) {
-        if (!this._isLegacyBackendGap(error)) {
-          this._backendReady = false;
-          return false;
-        }
-        try {
-          this._backendMode = "legacy";
-          await this._rpc(
-            "initialize",
-            this._legacyBackendParams(),
-            { timeoutMs: this._probeTimeoutMs(), protocolMode: "legacy" },
-          );
-          this._backendReady = true;
-          return true;
-        } catch {
-          this._backendMode = null;
-          this.sessionId = null;
-          this._backendReady = false;
-          return false;
-        }
-      } finally {
-        this._connecting = null;
-      }
+        this._backendReady = false;
+        if (error.protocolError || [400, 404, 405].includes(error.statusCode)) this._contractMismatch = "Backend protocol is incompatible. Install the matching proxy version.";
+        return false;
+      } finally { this._connecting = null; }
     })();
     return this._connecting;
   }
@@ -1653,16 +1478,14 @@ export class AKBProxy {
   // an established backend mode. Uses the short probe timeout.
   async _syncTools() {
     const resp = await this._rpc("tools/list", {}, { timeoutMs: this._probeTimeoutMs() });
+    try {
+      if (this.catalog.refine(resp)) this._notify("notifications/tools/list_changed", {});
+    } catch (error) { this._contractMismatch = error.message; throw error; }
     this._cachedTools = resp;
     return resp;
   }
 
-  // Background loop that keeps trying to (re)establish the backend session
-  // with exponential backoff — effectively forever while the client is
-  // connected. On (re)connect it refreshes the tool cache and, if the
-  // client was previously handed a degraded list, pushes a
-  // tools/list_changed notification so the full toolset reappears WITHOUT a
-  // session restart. Idempotent: at most one loop runs at a time.
+  // Only discovery and catalog probes retry in the background.
   _startBackendMonitor() {
     if (this._monitorRunning || this._closed) return;
     this._monitorRunning = true;
@@ -1670,17 +1493,12 @@ export class AKBProxy {
     const loop = async () => {
       let delay = 1000;
       const maxDelay = 30000;
-      while (!this._closed) {
+      while (!this._closed && !this._contractMismatch) {
         const ok = await this._ensureBackend();
         if (ok) {
           try {
             await this._syncTools();
-            if (this._servedDegraded) {
-              this._servedDegraded = false;
-              this._notify("notifications/tools/list_changed", {});
-              process.stderr.write("[akb-mcp] backend recovered — re-listing tools\n");
-            }
-            break; // connected + synced; idle until a forward detects a drop
+            break;
           } catch {
             // initialize succeeded but tools/list failed — treat as not
             // ready and keep retrying.
@@ -1701,35 +1519,13 @@ export class AKBProxy {
   // ── MCP RPC forwarding ────────────────────────────────────
 
   async _forward(msg) {
-    const maxRetries = 2;
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      try {
-        if (!this._backendReady) {
-          const ok = await this._ensureBackend();
-          if (!ok) throw new Error("backend unreachable");
-        }
-        const resp = await this._rpc(msg.method, msg.params || {});
-        return { jsonrpc: "2.0", id: msg.id, result: this._clientResult(resp) };
-      } catch (err) {
-        if (this._isConnError(err)) {
-          // Drop the dead session and let the background monitor restore
-          // it. The proxy process and the client-visible server stay
-          // alive, so calls recover once connectivity returns.
-          this._backendReady = false;
-          this._backendMode = null;
-          this.sessionId = null;
-          this._startBackendMonitor();
-
-          if (attempt < maxRetries) {
-            process.stderr.write(
-              `[akb-mcp] backend unreachable, retrying (attempt ${attempt + 1})...\n`,
-            );
-            continue;
-          }
-        }
-        throw err;
-      }
+    if (!this.credentials.currentCredential()) throw new CredentialUnavailable(this.credentials.status());
+    try {
+      const resp = await this._rpc(msg.method, msg.params || {});
+      return { jsonrpc: "2.0", id: msg.id, result: this._clientResult(resp) };
+    } catch (error) {
+      if (this._isConnError(error)) { this._backendReady = false; this._startBackendMonitor(); }
+      throw error;
     }
   }
 
@@ -1745,7 +1541,6 @@ export class AKBProxy {
     });
 
     const headers = {
-      Authorization: `Bearer ${this.pat}`,
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
     };
@@ -1778,7 +1573,7 @@ export class AKBProxy {
         this.url.pathname,
         Buffer.from(body),
         headers,
-        { timeoutMs: rpcOpts.timeoutMs },
+        { timeoutMs: rpcOpts.timeoutMs, signal: rpcOpts.signal },
       );
     } catch (error) {
       if (error?.body) {
@@ -1811,7 +1606,7 @@ export class AKBProxy {
     try {
       parsed = JSON.parse(resp.text);
     } catch {
-      throw new Error(`Invalid JSON response: ${resp.text.slice(0, 200)}`);
+      throw Object.assign(new Error("The backend returned an invalid MCP response. The dispatched outcome is unknown."), { execution: "unknown" });
     }
 
     if (parsed.error) {
@@ -1826,7 +1621,7 @@ export class AKBProxy {
   }
 
   _write(obj) {
-    process.stdout.write(JSON.stringify(obj) + "\n");
+    return this.dispatcher?.write(obj) ?? Promise.resolve();
   }
 
   // Emit a JSON-RPC notification (no id) to the client. Used for

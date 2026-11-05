@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.4.0
+
+- Select browser OAuth with a URL-only invocation, or PAT with the existing argument and environment inputs. Reject contradictory or unsafe configuration.
+- Serve the complete generated tool catalog immediately and add local connection status.
+- Keep local protocol requests responsive during backend work. Submit caller operations once and report uncertain outcomes without replay.
+
+
 ## Unreleased — the proxy's own refusals set `isError`
 
 The file tools the proxy answers itself (`akb_put_file`, `akb_get_file`,

@@ -11,6 +11,8 @@ import { createInterface } from "node:readline";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { AKBProxy } from "../lib/proxy.mjs";
+import { parseConfiguration } from "../lib/config.mjs";
+import canonical from "../lib/generated-tools.json" with { type: "json" };
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const proxyEntrypoint = join(packageRoot, "bin", "akb-mcp.mjs");
@@ -28,45 +30,9 @@ const FILE_TOOL_NAMES = [
   "akb_update_file",
   "akb_delete_file",
 ];
-const DEFAULT_BACKEND_TOOLS = [{
-  name: "akb_search",
-  description: "search",
-  inputSchema: { type: "object", properties: {} },
-}];
-const RICH_BACKEND_TOOLS = [
-  {
-    name: "akb_search",
-    description: "search",
-    inputSchema: {
-      type: "object",
-      properties: { query: { type: "string" } },
-      additionalProperties: false,
-    },
-    annotations: {
-      title: "Search",
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  },
-  {
-    name: "akb_custom",
-    description: "preserve this tool contract",
-    inputSchema: {
-      type: "object",
-      properties: { mode: { type: "string" } },
-      additionalProperties: false,
-    },
-    annotations: {
-      title: "Custom",
-      readOnlyHint: false,
-      destructiveHint: true,
-      idempotentHint: false,
-      openWorldHint: true,
-    },
-  },
-];
+const DEFAULT_BACKEND_TOOLS = structuredClone(canonical);
+const RICH_BACKEND_TOOLS = structuredClone(canonical);
+RICH_BACKEND_TOOLS[0].description += " Live description.";
 
 function waitForLine(lines, id, timeoutMs = 3000) {
   const existing = lines.find((line) => line?.id === id);
@@ -210,8 +176,8 @@ async function testModernDegradedProcessWithExternalParser() {
     assert.equal(result.cacheScope, "private", "degraded modern tools/list is private");
     assert.deepEqual(
       result.tools.map((tool) => tool.name),
-      FILE_TOOL_NAMES,
-      "degraded catalog still exposes only proxy-local file tools",
+      [...canonical.map((tool) => tool.name), ...FILE_TOOL_NAMES, "akb_connection"],
+      "the complete catalog is available before any backend response",
     );
   });
 }
@@ -224,17 +190,16 @@ async function testModernReachableProcessWithExternalParser() {
 
       assert.equal(result.ttlMs, 0, "reachable modern tools/list is immediately stale");
       assert.equal(result.cacheScope, "private", "reachable modern tools/list is private");
-      assert.deepEqual(
-        result.tools.slice(0, RICH_BACKEND_TOOLS.length),
-        RICH_BACKEND_TOOLS,
-        "backend tool schemas, ordering, and annotations are preserved",
-      );
-      assert.deepEqual(
-        result.tools.map((tool) => tool.name),
-        [...RICH_BACKEND_TOOLS.map((tool) => tool.name), ...FILE_TOOL_NAMES],
-        "proxy-local tools remain appended to the backend catalog",
-      );
-      assert.ok(backend.requests.some((request) => request.body.method === "tools/list"));
+      assert.deepEqual(result.tools.map((tool) => tool.name), [...canonical.map((tool) => tool.name), ...FILE_TOOL_NAMES, "akb_connection"]);
+      const deadline = Date.now() + 2000;
+      while (!backend.requests.some((request) => request.body.method === "tools/list") && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      let refined;
+      do {
+        refined = await client.listTools();
+        if (refined.tools[0].description === RICH_BACKEND_TOOLS[0].description) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      } while (Date.now() < deadline);
+      assert.deepEqual(refined.tools[0], RICH_BACKEND_TOOLS[0], JSON.stringify(await client.callTool({ name: "akb_connection", arguments: {} })));
       for (const request of backend.requests) {
         assert.equal(request.headers.authorization, "Bearer akb_test");
       }
@@ -254,6 +219,7 @@ async function testModernProcess() {
     const { responses } = await runProxy(backend.url, [
       { jsonrpc: "2.0", id: 1, method: "server/discover", params: { _meta: MODERN_META } },
       { jsonrpc: "2.0", id: 2, method: "tools/list", params: { _meta: MODERN_META } },
+      { jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "akb_list_vaults", arguments: {}, _meta: MODERN_META } },
     ]);
     assert.equal(responses[0].result.supportedVersions[0], "2026-07-28");
     assert.equal(responses[0].result.resultType, "complete");
@@ -314,41 +280,29 @@ async function testLegacyProcess() {
   }
 }
 
-async function testLegacyBackendFallback() {
+async function testLegacyBackendMismatch() {
   const backend = await fakeBackend({ legacyOnly: true });
   try {
-    const { responses } = await runProxy(backend.url, [
-      { jsonrpc: "2.0", id: 5, method: "server/discover", params: { _meta: MODERN_META } },
-      { jsonrpc: "2.0", id: 6, method: "tools/list", params: { _meta: MODERN_META } },
-    ]);
-    assert.equal(responses[0].result.supportedVersions[0], "2026-07-28");
-    assert.ok(responses[1].result.tools.some((tool) => tool.name === "akb_search"));
-
-    const discover = backend.requests.find((request) => request.body.method === "server/discover");
-    const initialize = backend.requests.find((request) => request.body.method === "initialize");
-    const list = backend.requests.find((request) => request.body.method === "tools/list");
-    assert.ok(discover);
-    assert.ok(initialize, "old backends receive the limited legacy initialize fallback");
-    assert.ok(list);
-    // The legacy revision is declared on every legacy request. A stateless
-    // backend keeps no session to remember the handshake, so this header is
-    // what tells it -- and its audit trail -- which revision the exchange is.
-    assert.equal(initialize.headers["mcp-protocol-version"], "2025-06-18");
-    assert.equal(initialize.headers["mcp-session-id"], undefined);
-    // A session id is still echoed back when an older backend hands one out;
-    // a stateless one hands out none and the proxy simply omits it.
-    assert.equal(list.headers["mcp-session-id"], "legacy-session");
-    assert.equal(list.headers["mcp-protocol-version"], "2025-06-18");
-  } finally {
-    await backend.close();
-  }
+    await withExternalModernClient(backend.url, async (client) => {
+      const deadline = Date.now() + 2000;
+      let status;
+      do {
+        const result = await client.callTool({ name: "akb_connection", arguments: {} });
+        status = JSON.parse(result.content[0].text);
+        if (status.contract === "incompatible") break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      } while (Date.now() < deadline);
+      assert.equal(status.contract, "incompatible");
+      const rejected = await client.callTool({ name: "akb_list_vaults", arguments: {} });
+      assert.equal(JSON.parse(rejected.content[0].text).execution, "not_started");
+      assert.equal(backend.requests.filter((request) => request.body.method === "initialize").length, 0);
+      assert.equal(backend.requests.filter((request) => request.body.method === "tools/call").length, 0);
+    });
+  } finally { await backend.close(); }
 }
 
 async function testGenerationMixingIsFailClosed() {
-  const legacy = new AKBProxy({
-    url: "http://127.0.0.1/mcp/",
-    pat: "akb_test",
-  });
+  const legacy = new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp/", "--pat", "akb_test"], {}));
   legacy._startBackendMonitor = () => {};
   let forwarded = false;
   legacy._forward = async () => {
@@ -370,10 +324,7 @@ async function testGenerationMixingIsFailClosed() {
   assert.equal(mixed.error.code, -32600);
   assert.equal(forwarded, false);
 
-  const modern = new AKBProxy({
-    url: "http://127.0.0.1/mcp/",
-    pat: "akb_test",
-  });
+  const modern = new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp/", "--pat", "akb_test"], {}));
   modern._startBackendMonitor = () => {};
   const discover = await modern._handle({
     jsonrpc: "2.0",
@@ -407,7 +358,7 @@ async function testLocalToolRefusalsAreFlaggedAsErrors() {
     params: { name: "akb_put_file", arguments: { vault: "v", file_path: "/nonexistent/akb-proxy-test.bin" } },
   });
 
-  const failing = new AKBProxy({ url: "http://127.0.0.1/mcp/", pat: "akb_test" });
+  const failing = new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp/", "--pat", "akb_test"], {}));
   failing._startBackendMonitor = () => {};
   failing._fileToolSkillPreflight = async () => null;
   await failing._handle(legacyInit);
@@ -415,7 +366,7 @@ async function testLocalToolRefusalsAreFlaggedAsErrors() {
   assert.equal(failed.result.isError, true);
   assert.match(JSON.parse(failed.result.content[0].text).error, /not found/i);
 
-  const guided = new AKBProxy({ url: "http://127.0.0.1/mcp/", pat: "akb_test" });
+  const guided = new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp/", "--pat", "akb_test"], {}));
   guided._startBackendMonitor = () => {};
   guided._fileToolSkillPreflight = async () => ({ ack_token: "challenge", body: "guide" });
   await guided._handle(legacyInit);
@@ -428,7 +379,7 @@ await testModernDegradedProcessWithExternalParser();
 await testModernReachableProcessWithExternalParser();
 await testModernProcess();
 await testLegacyProcess();
-await testLegacyBackendFallback();
+await testLegacyBackendMismatch();
 await testGenerationMixingIsFailClosed();
 await testLocalToolRefusalsAreFlaggedAsErrors();
 console.log("  ✓ stdio modern and legacy processes preserve their client surfaces");
