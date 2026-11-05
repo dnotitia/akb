@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -152,6 +153,38 @@ afterEach(() => {
 });
 
 describe("operation requests", () => {
+  it("renders and approves a service-key claim and grant with the optional UUIDs", async () => {
+    const modern = requests.slice(0, 2).map((entry, index) => {
+      const request = {
+        ...entry.request,
+        request_nonce: `12345678-1234-4567-89ab-123456789ab${index}`,
+        expected_realm_id: "abcdefab-1234-4567-89ab-123456789abc",
+      };
+      // Matches the backend's sorted-key, compact JSON for this ASCII fixture.
+      const canonical = JSON.stringify(request, (_key, value: unknown) => {
+        if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+        return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+      });
+      return { ...entry, request, request_sha256: createHash("sha256").update(canonical).digest("hex") };
+    });
+    const parsed = parseAdminSsoOperationRequests({ schema_version: 1, requests: modern });
+    vi.mocked(getAdminSsoOperationRequests).mockResolvedValue(parsed);
+    vi.mocked(approveAdminSsoOperationRequest).mockResolvedValue({ ...parsed[0], status: "approved" });
+    const user = userEvent.setup();
+    renderPage();
+
+    const claimCard = await screen.findByRole("listitem", { name: "Ownership claim for workforce" });
+    const grantCard = screen.getByRole("listitem", { name: "Provider operation for workforce" });
+    expect(within(claimCard).getByText(modern[0].request_sha256)).toBeInTheDocument();
+    expect(within(grantCard).getByText(modern[1].request_sha256)).toBeInTheDocument();
+    expect(within(grantCard).getByText("configure, enable")).toBeInTheDocument();
+    expect(screen.queryByText("Operation requests could not be loaded")).toBeNull();
+    await user.click(within(claimCard).getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(approveAdminSsoOperationRequest).toHaveBeenCalledWith(
+      modern[0].request_id, modern[0].request_sha256,
+    ));
+  });
+
   it("shows what a pending request asks for and approves exactly the digest it showed", async () => {
     vi.mocked(approveAdminSsoOperationRequest).mockResolvedValue({ ...claim, status: "approved" });
     const user = userEvent.setup();

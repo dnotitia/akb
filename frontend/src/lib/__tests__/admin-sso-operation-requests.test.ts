@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import { parseAdminSsoOperationRequests, parseAdminSsoOwnership } from "@/lib/api";
+import { parseAdminSsoOperationRequest, parseAdminSsoOperationRequests, parseAdminSsoOwnership } from "@/lib/api";
 
 // The same document the backend validates against its declared response model.
 const fixture = JSON.parse(readFileSync(
@@ -23,6 +23,55 @@ describe("parseAdminSsoOperationRequests", () => {
       ["provider_grant", "approved"],
     ]);
     expect(requests[1].request.grant?.configure_summary?.client_secret_supplied).toBe(true);
+  });
+
+  it("accepts the optional service-request UUIDs independently and on claims and grants", () => {
+    const fields = {
+      request_nonce: "12345678-1234-4567-89ab-123456789abc",
+      expected_realm_id: "abcdefab-1234-4567-89ab-123456789abc",
+    };
+    for (const key of Object.keys(fields) as (keyof typeof fields)[]) {
+      const changed = clone(fixture);
+      (changed.requests[0].request as Record<string, unknown>)[key] = fields[key];
+      expect(parseAdminSsoOperationRequests(changed)[0].request[key]).toBe(fields[key]);
+    }
+    const changed = clone(fixture);
+    for (const [index, entry] of changed.requests.entries()) {
+      Object.assign(entry.request as object, {
+        ...fields,
+        request_nonce: `12345678-1234-4567-89ab-123456789ab${index}`,
+      });
+    }
+    const parsed = parseAdminSsoOperationRequests(changed);
+    expect(parsed[0].request).toMatchObject({ ...fields, request_nonce: "12345678-1234-4567-89ab-123456789ab0" });
+    expect(parsed[1].request).toMatchObject({ ...fields, request_nonce: "12345678-1234-4567-89ab-123456789ab1" });
+    expect(parseAdminSsoOperationRequest(changed.requests[0])).toEqual(parsed[0]);
+    expect(parseAdminSsoOperationRequest(changed.requests[1])).toEqual(parsed[1]);
+    expect(parseAdminSsoOperationRequests(fixture)[0].request).not.toHaveProperty("request_nonce");
+    expect(parseAdminSsoOperationRequests(fixture)[0].request).not.toHaveProperty("expected_realm_id");
+  });
+
+  it("rejects malformed optional UUIDs and unknown keys even with the new fields", () => {
+    const fields = ["request_nonce", "expected_realm_id"] as const;
+    for (const key of fields) {
+      for (const value of [null, undefined, 42, {}, "", "not-a-uuid", "ABCDEFAB-1234-4567-89AB-123456789ABC"]) {
+        for (const index of [0, 1]) {
+          const changed = clone(fixture);
+          (changed.requests[index].request as Record<string, unknown>)[key] = value;
+          expect(() => parseAdminSsoOperationRequests(changed)).toThrow();
+          expect(() => parseAdminSsoOperationRequest(changed.requests[index])).toThrow();
+        }
+      }
+    }
+    for (const extra of ["credential", "unexpected_field"]) {
+      const changed = clone(fixture);
+      Object.assign(changed.requests[1].request as object, {
+        request_nonce: "12345678-1234-4567-89ab-123456789abc",
+        expected_realm_id: "abcdefab-1234-4567-89ab-123456789abc",
+        [extra]: "never accepted",
+      });
+      expect(() => parseAdminSsoOperationRequests(changed)).toThrow();
+    }
   });
 
   it("refuses a response that carries anything beyond the secret-free shape", () => {
