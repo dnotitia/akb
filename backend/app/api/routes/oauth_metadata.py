@@ -1,4 +1,3 @@
-"""Path-specific OAuth protected-resource metadata for tool access."""
 
 from urllib.parse import urlsplit
 

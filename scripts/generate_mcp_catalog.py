@@ -10,8 +10,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from mcp_server.tool_catalog import complete_catalog  # noqa: E402
-from mcp_server.tools import TOOLS  # noqa: E402
+from mcp_server.tool_catalog import complete_catalog
+from mcp_server.tools import TOOLS
 
 
 def main() -> int:

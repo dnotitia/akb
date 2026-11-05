@@ -964,9 +964,6 @@ class KeycloakOIDC:
                 return None
         if "email_verified" in claims and type(claims["email_verified"]) is not bool:
             return None
-        # The dedicated browser-admin client is an authentication proof only.
-        # Its access token must never become an API or MCP resource credential,
-        # including explicitly admitted direct MCP clients.
         if claims["azp"] == settings.keycloak_admin_client_id:
             return None
         # A client an operator named as the non-human service authority is

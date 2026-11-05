@@ -392,7 +392,6 @@ async def test_resolve_mcp_rs256_rejected_when_mcp_oauth_off(monkeypatch, rsa_ke
 
 @pytest.mark.asyncio
 async def test_dispatch_skips_scope_check_when_oauth_scopes_none(monkeypatch):
-    """PAT and service callers retain their existing downstream authority."""
     from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
 
     captured = []
@@ -507,7 +506,6 @@ async def test_dispatch_read_only_pat_scope_allows_read_tool():
 
 # ── akb_grep: scope depends on the arguments, not just the tool ────
 #
-# Rationale lives with the rule, at `ARG_WRITE_TRIGGERS` in server.py.
 
 
 @pytest.mark.asyncio
@@ -638,17 +636,6 @@ def test_the_omission_guard_itself_is_not_vacuous():
 
 
 def test_read_scoped_tools_that_can_write_declare_an_arg_trigger():
-    """The omission guard — the failure mode that actually recurs.
-
-    `MCP_OPERATION_SCOPES` has a completeness guard (a new tool must be mapped);
-    `ARG_WRITE_TRIGGERS` needs the mirror of it, or the next read-mapped
-    tool that grows a mutating argument reproduces this bug silently.
-
-    The invariant is checkable against code that already exists: a
-    handler that can reach a writer-gated `check_vault_access` performs a
-    write, so its tool cannot be read-grade unless an argument promotes
-    it.
-    """
     from app.services.tool_resource_policy import ARG_WRITE_TRIGGERS, MCP_OPERATION_SCOPES, READ_SCOPE
     from mcp_server.server import (
         _HANDLERS,
@@ -739,15 +726,9 @@ def test_www_authenticate_carries_resource_metadata_when_oauth_on(monkeypatch):
     assert 'resource_metadata="https://akb.example.com/.well-known/oauth-protected-resource/mcp"' in h
 
 
-# ── MCP_OPERATION_SCOPES completeness (CI guard) ──────────────────────────
 
 
 def test_every_registered_tool_has_an_explicit_scope_mapping():
-    """A new tool added to `_HANDLERS` without an entry in `MCP_OPERATION_SCOPES`
-    would silently fail closed to write (which is safe) — but the
-    intent is that every tool's scope is an explicit, reviewed choice.
-    Lock that down here so a PR adding a read-grade tool can't
-    inadvertently promote it to write-grade by forgetting the map."""
     from app.services.tool_resource_policy import MCP_OPERATION_SCOPES
     from mcp_server.server import _HANDLERS
 

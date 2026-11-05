@@ -1,4 +1,3 @@
-"""The packaged grammar is complete, deterministic and configuration-free."""
 
 import json
 import os

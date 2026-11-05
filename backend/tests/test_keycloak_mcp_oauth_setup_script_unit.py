@@ -1,4 +1,3 @@
-"""Credential and native registration contracts for the operator script."""
 
 from __future__ import annotations
 

@@ -1,4 +1,3 @@
-"""One stdio fixture call, with an exact vault-guide acknowledgement retry."""
 
 import json
 import os

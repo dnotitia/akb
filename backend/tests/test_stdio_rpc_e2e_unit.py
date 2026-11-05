@@ -1,4 +1,3 @@
-"""Exercise the shell fixture's JSON-RPC boundary through its real CLI."""
 
 import json
 from pathlib import Path

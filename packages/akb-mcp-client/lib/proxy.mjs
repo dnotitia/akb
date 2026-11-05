@@ -1,4 +1,3 @@
-/** AKB stdio protocol adapters and proxy-owned local file workflows. */
 
 import { request as httpsRequest } from "node:https";
 import { request as httpRequest } from "node:http";
@@ -363,10 +362,6 @@ const INVALID_REQUEST = -32600;
 const INVALID_PARAMS = -32602;
 const UNSUPPORTED_PROTOCOL_VERSION = -32022;
 
-// Kept in sync with package.json `version`. Reported to the client in the
-// local `initialize` response, so it must not silently drift on a proxy
-// behaviour change. There is no import of package.json here to keep lib/
-// load-safe across supported Node versions.
 const PROXY_VERSION = "2.4.0";
 const VAULT_SKILL_PREFLIGHT_CAPABILITY =
   "io.dnotitia.akb/vault-skill-preflight";
@@ -1480,7 +1475,6 @@ export class AKBProxy {
     return resp;
   }
 
-  // Only discovery and catalog probes retry in the background.
   _startBackendMonitor() {
     if (this._monitorRunning || this._closed) return;
     this._monitorRunning = true;

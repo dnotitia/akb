@@ -1,4 +1,3 @@
-"""Signed tool credentials enter only the eight declared file controls."""
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace

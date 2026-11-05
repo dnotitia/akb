@@ -1,4 +1,3 @@
-"""Operation scope policy shared by MCP and admitted file controls."""
 
 from collections.abc import Mapping
 from typing import Any
@@ -6,14 +5,11 @@ from typing import Any
 READ_SCOPE = "akb:vault:read"
 WRITE_SCOPE = "akb:vault:write"
 MCP_OPERATION_SCOPES: dict[str, str] = {
-    # --- read ---
     "akb_help": READ_SCOPE,
     "akb_whoami": READ_SCOPE,
     "akb_list_vaults": READ_SCOPE,
     "akb_vault_info": READ_SCOPE,
     "akb_vault_members": READ_SCOPE,
-    # A read: it reports the reasons behind a role, and reporting a reason is
-    # never authority to change one.
     "akb_explain_access": READ_SCOPE,
     "akb_search_users": READ_SCOPE,
     "akb_browse": READ_SCOPE,
@@ -29,7 +25,6 @@ MCP_OPERATION_SCOPES: dict[str, str] = {
     "akb_provenance": READ_SCOPE,
     "akb_publications": READ_SCOPE,
     "akb_export": READ_SCOPE,
-    # --- write ---
     "akb_publication_snapshot": WRITE_SCOPE,
     "akb_put": WRITE_SCOPE,
     "akb_update": WRITE_SCOPE,

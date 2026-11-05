@@ -66,14 +66,6 @@ def _parse_resource_uri(uri: str, expected_type: str | None = None) -> tuple[str
     return vault, rtype, ident
 
 
-# ── Relation write surface (link / unlink) ───────────────────
-#
-# REST twins of the MCP akb_link / akb_unlink handlers. Same writer
-# gate, same-vault guard, and the same relation vocabulary — the two
-# surfaces must accept and reject identically. `RelationType` is the
-# single-source `LinkRelationType` from app.models.relation_type (which the MCP
-# akb_link tool schema also derives from), so a relation one surface
-# rejects can never sneak in through the other.
 
 
 # kg_service.link_resources returns an err()-envelope dict instead of

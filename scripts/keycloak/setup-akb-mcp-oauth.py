@@ -232,7 +232,6 @@ def native_client(client_id: str, audience: str) -> dict:
 
 
 def provision_native_client(base: str, token: str, client_id: str, audience: str, *, request=http) -> None:
-    """Converge the pinned public registration, scopes and refresh rotation."""
     def call(method: str, path: str, body=None):
         status, payload, _headers = request(method, base + path, token, body=body)
         if status not in {200, 201, 204}:

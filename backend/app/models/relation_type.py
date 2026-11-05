@@ -1,4 +1,3 @@
-"""Explicit relation vocabulary for API, MCP and graph validation."""
 
 from typing import Literal, get_args
 

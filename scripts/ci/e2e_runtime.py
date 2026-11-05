@@ -2551,7 +2551,6 @@ class E2ERuntime:
         self._fixture_private_values = (*self._fixture_private_values, token)
 
     async def _install_stdio_proxy(self) -> Path:
-        """Pack the candidate and install its production dependencies privately."""
 
         consumer = self.config.proxy_consumer_dir
         consumer.mkdir(parents=True, exist_ok=True, mode=0o700)

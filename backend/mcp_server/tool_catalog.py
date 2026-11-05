@@ -1,4 +1,3 @@
-"""Pure composition of the public tool catalog and write acknowledgement."""
 
 from mcp.types import Tool
 
