@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import secrets
 import sys
 from pathlib import Path
 
@@ -175,14 +176,33 @@ def test_native_client_has_only_public_code_pkce_and_exact_loopback_callback():
     assert all(client[name] is False for name in ["implicitFlowEnabled", "directAccessGrantsEnabled", "serviceAccountsEnabled", "fullScopeAllowed"])
     assert client["attributes"] == {"pkce.code.challenge.method": "S256", "use.refresh.tokens": "true"}
     assert client["redirectUris"] == ["http://127.0.0.1/oauth/callback"]
-    assert client["defaultClientScopes"] == ["profile", "email"]
+    assert client["defaultClientScopes"] == ["basic", "profile", "email"]
     assert client["optionalClientScopes"] == ["akb:vault:read", "akb:vault:write"]
     assert client["protocolMappers"][0]["config"]["included.custom.audience"] == "https://akb.example.com/prefix/mcp"
 
 
 class NativeRealm:
     def __init__(self):
-        self.scopes = [{"id": name, "name": name} for name in ["profile", "email"]]
+        self.scopes = [
+            {"id": name, "name": name, "protocol": "openid-connect"}
+            for name in ["basic", "profile", "email", "roles", "web-origins", "acr", "offline_access", "address", "phone"]
+        ]
+        self.scope_mappers = {"basic": [
+            {
+                "id": "basic-sub", "name": "sub", "protocol": "openid-connect",
+                "protocolMapper": "oidc-sub-mapper", "consentRequired": False,
+                "config": {"introspection.token.claim": "true", "access.token.claim": "true"},
+            },
+            {
+                "id": "basic-auth-time", "name": "auth_time", "protocol": "openid-connect",
+                "protocolMapper": "oidc-usersessionmodel-note-mapper", "consentRequired": False,
+                "config": {
+                    "user.session.note": "AUTH_TIME", "introspection.token.claim": "true",
+                    "userinfo.token.claim": "true", "id.token.claim": "true", "access.token.claim": "true",
+                    "claim.name": "auth_time", "jsonType.label": "long",
+                },
+            },
+        ]}
         self.client = None
         self.realm = {}
         self.calls = []
@@ -197,7 +217,14 @@ class NativeRealm:
                 self.scopes.append({**body, "id": body["name"]})
             result = self.scopes
         elif path.startswith("/client-scopes/"):
-            result = []
+            scope_id = path.split("/")[2]
+            if "/protocol-mappers/models" in path:
+                result = self.scope_mappers.get(scope_id, [])
+            else:
+                scope = next(scope for scope in self.scopes if scope["id"] == scope_id)
+                if method == "PUT":
+                    scope.update(copy.deepcopy(body))
+                result = scope
         elif path.startswith("/clients?"):
             result = [self.client] if self.client else []
         elif path == "/clients":
@@ -225,6 +252,9 @@ class NativeRealm:
                 name = path.rsplit("/", 1)[1]
                 if name not in [scope["name"] for scope in self.assigned[kind]]:
                     self.assigned[kind].append({"id": name, "name": name})
+            if method == "DELETE":
+                identifier = path.rsplit("/", 1)[1]
+                self.assigned[kind] = [scope for scope in self.assigned[kind] if scope["id"] != identifier]
             result = self.assigned[kind]
         elif path == "":
             if method == "PUT":
@@ -260,6 +290,44 @@ def test_provisioning_accepts_keycloak_default_audience_mapper_claims():
     }
 
 
+def test_provisioning_keeps_basic_subject_scope_and_removes_unwanted_scope_assignments():
+    realm = NativeRealm()
+    realm.assigned = {
+        "default": [{"id": name, "name": name} for name in ["basic", "profile", "email", "roles", "web-origins", "acr"]],
+        "optional": [{"id": name, "name": name} for name in ["offline_access", "address", "phone"]],
+    }
+    for _ in range(2):
+        setup_script.provision_native_client("https://kc.example/admin/realms/test", "admin-token",
+                                            "akb-mcp-native", "https://akb.example.com/mcp", request=realm.request)
+    assert {scope["name"] for scope in realm.assigned["default"]} == {"basic", "profile", "email"}
+    assert {scope["name"] for scope in realm.assigned["optional"]} == {"akb:vault:read", "akb:vault:write"}
+
+
+@pytest.mark.parametrize("defect", [
+    "scope_missing", "scope_protocol", "mapper_missing", "mapper_protocol", "mapper_type", "claim_disabled", "claim_missing",
+])
+def test_provisioning_refuses_a_basic_scope_without_access_token_subject_issuance(defect):
+    realm = NativeRealm()
+    if defect == "scope_missing":
+        realm.scopes = [scope for scope in realm.scopes if scope["name"] != "basic"]
+    elif defect == "scope_protocol":
+        realm.scopes[0]["protocol"] = "saml"
+    elif defect == "mapper_missing":
+        realm.scope_mappers["basic"].pop(0)
+    elif defect == "mapper_protocol":
+        realm.scope_mappers["basic"][0]["protocol"] = "saml"
+    elif defect == "mapper_type":
+        realm.scope_mappers["basic"][0]["protocolMapper"] = "oidc-usermodel-property-mapper"
+    elif defect == "claim_disabled":
+        realm.scope_mappers["basic"][0]["config"]["access.token.claim"] = "false"
+    else:
+        del realm.scope_mappers["basic"][0]["config"]["access.token.claim"]
+    with pytest.raises(RuntimeError, match="Required Keycloak basic"):
+        setup_script.provision_native_client("https://kc.example/admin/realms/test", "admin-token",
+                                            "akb-mcp-native", "https://akb.example.com/mcp", request=realm.request)
+    assert all(method == "GET" for method, _path, _body in realm.calls)
+
+
 @pytest.mark.parametrize(("key", "value"), [
     ("included.custom.audience", "https://other.example.com/mcp"),
     ("access.token.claim", "false"),
@@ -274,7 +342,7 @@ def test_provisioning_rejects_changed_audience_mapper_config(key, value):
 
     def altered_mapper(method, url, token, body=None):
         status, payload, headers = realm.request(method, url, token, body)
-        if method == "GET" and url.endswith("/protocol-mappers/models") and payload:
+        if method == "GET" and url.endswith("/clients/native-id/protocol-mappers/models") and payload:
             payload[0]["config"][key] = value
         return status, payload, headers
 
@@ -288,7 +356,7 @@ def test_provisioning_rejects_an_extra_audience_mapper():
 
     def extra_mapper(method, url, token, body=None):
         status, payload, headers = realm.request(method, url, token, body)
-        if method == "GET" and url.endswith("/protocol-mappers/models") and payload:
+        if method == "GET" and url.endswith("/clients/native-id/protocol-mappers/models") and payload:
             payload.append({**copy.deepcopy(payload[0]), "id": "another-mapper"})
         return status, payload, headers
 
@@ -347,7 +415,7 @@ def test_operator_http_rejects_real_redirect_without_forwarding_credentials():
     thread.start()
     try:
         status, _, _ = setup_script.http("POST", f"http://127.0.0.1:{server.server_port}/token", "bearer-marker",
-                                         body={"client_secret": "secret-marker"})
+                                         body={"client_secret": secrets.token_urlsafe(24)})
         assert status == 302
         assert paths == ["/token"]
     finally:

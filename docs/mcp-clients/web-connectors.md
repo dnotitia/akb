@@ -31,9 +31,13 @@ registered redirect. Keycloak's loopback redirect rule admits an ephemeral
 port while retaining the exact IP and callback path. The proxy binds that port
 before opening the system browser. No wildcard path or client secret is used.
 The script disables implicit, password, and service-account grants for this
-client. It assigns `profile` and `email` as default client scopes and the two
-AKB scopes as optional client scopes. It installs a client-local audience
-mapper for the exact resource.
+client. It assigns `basic`, `profile`, and `email` as default client scopes and
+the two AKB scopes as optional client scopes. The realm's `basic` scope must
+contain an `oidc-sub-mapper` with `access.token.claim` enabled so access tokens
+identify the human subject. The script fails before changing the realm if
+this required subject configuration is missing. It removes other client scope
+assignments, including `roles`, and installs a client-local audience mapper for
+the exact resource.
 
 The script enables realm-wide refresh-token revocation with maximum reuse 0.
 This affects every client in that realm. It does not request `offline_access`

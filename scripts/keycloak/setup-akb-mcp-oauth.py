@@ -212,7 +212,7 @@ def native_client(client_id: str, audience: str) -> dict:
         "consentRequired": True,
         "redirectUris": [NATIVE_REDIRECT_URI],
         "webOrigins": [],
-        "defaultClientScopes": ["profile", "email"],
+        "defaultClientScopes": ["basic", "profile", "email"],
         "optionalClientScopes": list(VAULT_SCOPES),
         "attributes": {"pkce.code.challenge.method": "S256", "use.refresh.tokens": "true"},
         "protocolMappers": [{
@@ -239,6 +239,17 @@ def provision_native_client(base: str, token: str, client_id: str, audience: str
         return payload
 
     scopes = call("GET", "/client-scopes")
+    basic = next((scope for scope in scopes if scope.get("name") == "basic"), None)
+    if basic is None or basic.get("protocol") != "openid-connect":
+        raise RuntimeError("Required Keycloak basic OIDC client scope is missing")
+    basic_mappers = call("GET", f"/client-scopes/{basic['id']}/protocol-mappers/models")
+    if not any(
+        mapper.get("protocol") == "openid-connect"
+        and mapper.get("protocolMapper") == "oidc-sub-mapper"
+        and mapper.get("config", {}).get("access.token.claim") == "true"
+        for mapper in basic_mappers
+    ):
+        raise RuntimeError("Required Keycloak basic scope must enable oidc-sub-mapper for access-token subjects")
     for name in VAULT_SCOPES:
         scope = next((scope for scope in scopes if scope.get("name") == name), None)
         if scope is None:
