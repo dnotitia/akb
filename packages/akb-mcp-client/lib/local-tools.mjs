@@ -183,5 +183,4 @@ export const FILE_WRITE_TOOL_NAMES = new Set([
   "akb_delete_file",
 ]);
 
-// Tools where proxy injects a `file` param as alternative to `content`
 export const FILE_CONTENT_TOOLS = new Set(["akb_put", "akb_update"]);

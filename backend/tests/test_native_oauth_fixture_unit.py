@@ -1,4 +1,3 @@
-"""Input boundaries for the disposable real native OAuth fixture."""
 
 from __future__ import annotations
 
