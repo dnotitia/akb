@@ -314,3 +314,28 @@ test("current Native schemas can differ from the initial complete grammar", () =
   delete otherRefinement.find((tool) => tool.name === create.name).inputSchema.properties.template;
   assert.equal(compareCatalogs(http, otherRefinement).status, "failed");
 });
+
+test("HTTP without negotiated acknowledgement preserves exact shared catalog parity", () => {
+  const catalog = createCatalog();
+  const http = structuredClone(catalog.canonical);
+  const acknowledgementTools = [];
+  for (const tool of http) {
+    if (Object.hasOwn(tool.inputSchema.properties, "_vault_skill_ack")) {
+      acknowledgementTools.push(tool.name);
+      delete tool.inputSchema.properties._vault_skill_ack;
+    }
+  }
+  const stdio = structuredClone(catalog.initialCatalog().tools);
+  const result = compareCatalogs(http, stdio);
+  assert.equal(result.status, "passed", JSON.stringify(result.mismatches));
+  assert.deepEqual(result.exceptions.shared_skill_acknowledgements, acknowledgementTools);
+  const invalidAcknowledgement = structuredClone(http);
+  invalidAcknowledgement.find((tool) => tool.name === "akb_put").inputSchema.properties._vault_skill_ack = { type: "number" };
+  assert.equal(compareCatalogs(invalidAcknowledgement, stdio).status, "failed");
+  const invalidBusinessSchema = structuredClone(http);
+  delete invalidBusinessSchema.find((tool) => tool.name === "akb_put").inputSchema.properties.title;
+  assert.equal(compareCatalogs(invalidBusinessSchema, stdio).status, "failed");
+  const invalidStdio = structuredClone(stdio);
+  delete invalidStdio.find((tool) => tool.name === "akb_put").inputSchema.properties._vault_skill_ack;
+  assert.equal(compareCatalogs(http, invalidStdio).status, "failed");
+});

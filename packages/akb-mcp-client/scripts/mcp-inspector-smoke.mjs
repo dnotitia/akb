@@ -394,13 +394,18 @@ export function compareCatalogs(httpTools, stdioTools) {
     const proxied = stdio.get(name);
     if (!canonical.has(name) || !proxied) { mismatches.push({ tool: name, reason: canonical.has(name) ? "missing_shared_tool" : "unknown_backend_tool" }); continue; }
     const contracts = currentToolContracts(name);
-    const httpVariant = contracts.findIndex((contract) => toolSchemasEqual(tool, contract));
+    const httpVariant = contracts.findIndex((contract) => {
+      if (Object.hasOwn(tool.inputSchema?.properties ?? {}, VAULT_SKILL_ACK_ARGUMENT) || !Object.hasOwn(contract.inputSchema.properties ?? {}, VAULT_SKILL_ACK_ARGUMENT)) return toolSchemasEqual(tool, contract);
+      const properties = { ...contract.inputSchema.properties };
+      delete properties[VAULT_SKILL_ACK_ARGUMENT];
+      return toolSchemasEqual(tool, { ...contract, inputSchema: { ...contract.inputSchema, properties } });
+    });
     const stdioVariant = contracts.findIndex((contract) => toolSchemasEqual(proxied, catalog.decorate([contract])[0]));
     if (httpVariant < 0 || stdioVariant < 0 || (httpVariant > 0 && stdioVariant > 0 && httpVariant !== stdioVariant)) {
       mismatches.push({ tool: name, reason: "shared_schema_mismatch" });
     } else if (httpVariant !== stdioVariant) creationRefinements.push(name);
     if (FILE_CONTENT_TOOLS.has(name)) fileArguments.push(name);
-    if (tool.inputSchema?.properties?.[VAULT_SKILL_ACK_ARGUMENT]) acknowledgements.push(name);
+    if (contracts[0].inputSchema.properties?.[VAULT_SKILL_ACK_ARGUMENT]) acknowledgements.push(name);
   }
   const local = [];
   for (const [name, tool] of stdio) {
