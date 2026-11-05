@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import { AKBProxy } from '../lib/proxy.mjs';
 import { mkdtemp, rm, chmod, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +21,8 @@ async function mockIssuer() {
   let origin;
   let authorization;
   let generation = 0;
+  let available = true;
+  let openings = 0;
   const exchanges = [];
   let holdRefresh = null;
   const server = createServer(async (request, response) => {
@@ -27,6 +30,7 @@ async function mockIssuer() {
     let body = '';
     for await (const chunk of request) body += chunk;
     response.setHeader('Content-Type', 'application/json');
+    if (!available && url.pathname.includes('.well-known')) return response.writeHead(503).end('{}');
     if (url.pathname === '/.well-known/oauth-protected-resource/prefix/mcp') return response.end(JSON.stringify({ resource: origin + '/prefix/mcp', authorization_servers: [origin], scopes_supported: ['akb:vault:read', 'akb:vault:write'], akb_native_client_id: 'native-test' }));
     if (url.pathname.includes('.well-known')) return response.end(JSON.stringify({ issuer: origin, authorization_endpoint: origin + '/authorize', token_endpoint: origin + '/token', response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'], code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none'], authorization_response_iss_parameter_supported: true }));
     if (url.pathname === '/token') {
@@ -52,7 +56,9 @@ async function mockIssuer() {
   origin = `http://127.0.0.1:${server.address().port}`;
   return {
     installation: { resource: origin + '/prefix/mcp', endpointUrl: origin + '/prefix/mcp/', baseUrl: origin + '/prefix' }, exchanges,
-    browserOpener: async (value) => { authorization = new URL(value); return false; },
+    browserOpener: async (value) => { openings++; authorization = new URL(value); return false; },
+    openings: () => openings,
+    outage: (value) => { available = !value; },
     authorization: () => authorization,
     async finish() {
       await until(() => authorization);
@@ -257,4 +263,54 @@ test('a current 401 during external ownership stays unusable and a replacement g
     assert.equal(session.currentCredential().grantId, 'replacement-grant');
     assert.deepEqual(issuer.exchanges, ['authorization_code']);
   } finally { await session.close(); store?.close(); await issuer.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+
+test('restart discovery outage preserves the grant, reports connectivity, and recovers without another browser', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'akb-oauth-discovery-outage-'));
+  const issuer = await mockIssuer();
+  const options = { storeOptions: { directory }, browserOpener: issuer.browserOpener };
+  const first = new OAuthSession(issuer.installation, options);
+  let restarted;
+  let proxy;
+  try {
+    first.start(); await issuer.finish();
+    const original = await until(() => first.currentCredential());
+    await first.close();
+    issuer.outage(true);
+    restarted = new OAuthSession(issuer.installation, options);
+    restarted.start();
+    await until(() => restarted.status().discovery === 'unavailable');
+    proxy = new AKBProxy({ installation: issuer.installation, authentication: { kind: 'oauth' }, credentialOwner: restarted });
+    const response = await proxy._handle({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'akb_connection', arguments: {} } });
+    const status = JSON.parse(response.result.content[0].text);
+    assert.equal(status.authentication, 'pending');
+    assert.equal(status.connectivity, 'unreachable');
+    assert.equal(status.backendConnectivity, 'unknown');
+    assert.equal(status.discoveryConnectivity, 'unreachable');
+    assert.equal(issuer.openings(), 1);
+    assert.deepEqual(issuer.exchanges, ['authorization_code']);
+    issuer.outage(false);
+    const recovered = await until(() => restarted.currentCredential());
+    assert.equal(recovered.grantId, original.grantId);
+    assert.equal(recovered.generation, original.generation);
+    assert.equal(issuer.openings(), 1);
+    assert.deepEqual(issuer.exchanges, ['authorization_code']);
+  } finally { await first.close(); await restarted?.close(); proxy?.connection.close(); await issuer.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('absolute-form and network-path callback targets never consume the valid attempt', async () => {
+  const callback = await createCallback({ state: 'correct-state', issuer: 'https://issuer.example', issuerRequired: true, timeoutMs: 3000 });
+  const origin = new URL(callback.redirectUri);
+  const query = '?state=correct-state&code=good&iss=https%3A%2F%2Fissuer.example';
+  const submit = (path) => new Promise((resolve, reject) => {
+    const request = httpRequest({ hostname: origin.hostname, port: origin.port, path, headers: { Host: origin.host } }, (response) => { response.resume(); response.once('end', () => resolve(response.statusCode)); });
+    request.on('error', reject); request.end();
+  });
+  try {
+    assert.equal(await submit('http://foreign.example/oauth/callback' + query), 400);
+    assert.equal(await submit('//foreign.example/oauth/callback' + query), 400);
+    assert.equal(await submit('/oauth/callback' + query), 200);
+    assert.deepEqual(await callback.result, { code: 'good', iss: 'https://issuer.example' });
+  } finally { callback.close(); }
 });

@@ -41,6 +41,11 @@ function openBrowser(url, signal) {
   });
 }
 
+function usable(record) {
+  const lifetime = record?.tokens?.expires_in * 1000;
+  return Number.isFinite(lifetime) && lifetime > 0 && record.expiresAt > Date.now() + Math.min(30000, lifetime / 10);
+}
+
 export class OAuthSession {
   constructor(installation, { storeOptions, fetchFn = boundedFetch, browserOpener = openBrowser, callbackTimeoutMs } = {}) {
     this.installation = installation;
@@ -54,10 +59,11 @@ export class OAuthSession {
     this.timer = null;
     this.failure = null;
     this.rejection = null;
+    this.connectivity = 'unknown';
   }
   status() {
     this.currentCredential();
-    return { mode: 'oauth', ...this.state };
+    return { mode: 'oauth', ...this.state, connectivity: this.connectivity };
   }
   currentCredential() {
     if (!this.store || !this.binding || this.failure) return null;
@@ -77,7 +83,7 @@ export class OAuthSession {
         return null;
       }
       if (!record.tokens || !record.grantId || !Number.isSafeInteger(record.generation) || !Number.isFinite(record.expiresAt)) throw new Error('Invalid OAuth grant.');
-      if (record.expiresAt <= Date.now() + 30000) { if (!this.task) this.state = { authentication: 'refresh_pending' }; return null; }
+      if (!usable(record)) { if (!this.task) this.state = { authentication: 'refresh_pending' }; return null; }
       this.state = { authentication: 'ready' };
       return Object.freeze({ kind: 'oauth', accessToken: record.tokens.access_token, grantId: record.grantId, generation: record.generation });
     } catch (error) {
@@ -122,7 +128,16 @@ export class OAuthSession {
     return true;
   }
   async _discover(signal) {
-    const fetchFn = (url, options) => this.options.fetchFn(url, options, signal);
+    const fetchFn = async (url, options) => {
+      try {
+        const response = await this.options.fetchFn(url, options, signal);
+        if (response.status >= 500 || [408, 429].includes(response.status)) throw new Error('Discovery endpoint unavailable.');
+        return response;
+      } catch (error) {
+        if (signal.aborted) throw error;
+        throw Object.assign(new Error('OAuth discovery is unavailable. Existing authorization was not rejected. Connectivity will retry.'), { code: 'discovery_unavailable' });
+      }
+    };
     const resource = await discoverOAuthProtectedResourceMetadata(this.installation.resource, undefined, fetchFn);
     if (resource.resource !== this.installation.resource || resource.authorization_servers?.length !== 1 || typeof resource.akb_native_client_id !== 'string' || !resource.akb_native_client_id.trim()) throw new Error('The installation OAuth resource or native-client metadata is incompatible.');
     const issuer = secureUrl(resource.authorization_servers[0]);
@@ -136,13 +151,23 @@ export class OAuthSession {
     this.metadata = metadata;
     this.scope = ['akb:vault:read', 'akb:vault:write'].filter((scope) => resource.scopes_supported?.includes(scope)).join(' ');
     if (!this.scope) throw new Error('The installation advertises no supported AKB scope.');
+    this.connectivity = 'reachable';
   }
   _run(action) {
-    if (this.closed || this.task || this.failure) return this.task;
+    if (this.closed || this.task || this.failure || (action === 'observe' && this.state.authentication === 'configuration_error')) return this.task;
     this.controller = new AbortController();
     const signal = this.controller.signal;
     this.task = this._work(action, signal).catch((error) => {
       if (this.failure) return;
+      if (error.code === 'discovery_unavailable') {
+        this.connectivity = 'unreachable';
+        this.state = { authentication: 'pending', discovery: 'unavailable', message: error.message };
+        return;
+      }
+      if (error.code === 'discovery_invalid') {
+        this.state = { authentication: 'configuration_error', discovery: 'incompatible', message: 'OAuth discovery metadata is incompatible. Repair the installation settings, then use sign_in.' };
+        return;
+      }
       const code = signal.aborted ? 'cancelled' : ['denied', 'timeout'].includes(error.code) ? error.code : 'reauthorization_required';
       this.state = { authentication: code, message: code === 'reauthorization_required' ? 'Authorization could not finish safely. Check network and installation settings, then use sign_in.' : error.message };
       if (this.store?.owned && this.binding) {
@@ -162,9 +187,15 @@ export class OAuthSession {
         this._storageFailure(); throw error;
       }
     }
-    if (!this.binding || action === 'explicit') await this._discover(signal);
+    if (!this.binding || action === 'explicit') {
+      try { await this._discover(signal); }
+      catch (error) {
+        if (!error.code && !signal.aborted) error.code = 'discovery_invalid';
+        throw error;
+      }
+    }
     let record = this.store.read();
-    if (!this.rejection && sameBinding(record?.binding, this.binding) && this.store.isPublished(record) && !record.refreshIntent && !record.signedOut && !record.recovery && record.expiresAt > Date.now() + 30000 && action !== 'explicit') { this.currentCredential(); return; }
+    if (!this.rejection && sameBinding(record?.binding, this.binding) && this.store.isPublished(record) && !record.refreshIntent && !record.signedOut && !record.recovery && usable(record) && action !== 'explicit') { this.currentCredential(); return; }
     if (action === 'observe' && (!record || !sameBinding(record.binding, this.binding) || record.refreshIntent || !this.store.isPublished(record) || record.signedOut || record.recovery)) { this.currentCredential(); return; }
     if (!this.store.acquire()) { this.state = { authentication: 'owner_busy', message: 'Another proxy owns sign-in or refresh. Local MCP requests remain available.' }; return; }
     record = this.store.read();
@@ -172,7 +203,7 @@ export class OAuthSession {
     this.rejection = null;
     if (action !== 'explicit' && record) {
       if (!sameBinding(record.binding, this.binding) || record.refreshIntent || !this.store.isPublished(record) || record.signedOut || record.recovery) { this.state = { authentication: record.signedOut ? 'signed_out' : record.recovery ?? 'reauthorization_required' }; return; }
-      if (record.expiresAt > Date.now() + 30000) { this.currentCredential(); return; }
+      if (usable(record)) { this.currentCredential(); return; }
       if (record.tokens?.refresh_token) { await this._refresh(record, signal); return; }
       this.state = { authentication: 'reauthorization_required' }; return;
     }
@@ -224,6 +255,7 @@ export class OAuthSession {
     } finally { callback.close(); }
   }
   async close() {
+    if (this.closed) return;
     this.closed = true;
     clearInterval(this.timer);
     this.controller?.abort();

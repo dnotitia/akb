@@ -15,7 +15,7 @@ async function until(check, timeout = 4000) {
   throw new Error('Timed out waiting for stdio lifecycle outcome.');
 }
 
-async function runtime({ oauth = false } = {}) {
+async function runtime({ oauth = false, expiresIn = 3600 } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'akb-stdio-lifecycle-'));
   const openDirectory = join(root, 'bin');
   await mkdir(openDirectory, { mode: 0o700 });
@@ -23,6 +23,7 @@ async function runtime({ oauth = false } = {}) {
   for (const executable of ['open', 'xdg-open']) await writeFile(join(openDirectory, executable), opener, { mode: 0o700 });
   let origin;
   const calls = [];
+  const tokenRequests = [];
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, origin);
     let body = '';
@@ -30,7 +31,7 @@ async function runtime({ oauth = false } = {}) {
     response.setHeader('Content-Type', 'application/json');
     if (url.pathname.includes('oauth-protected-resource')) return response.end(JSON.stringify({ resource: origin + '/prefix/mcp', authorization_servers: [origin], akb_native_client_id: 'native-test', scopes_supported: ['akb:vault:read', 'akb:vault:write'] }));
     if (url.pathname.includes('.well-known')) return response.end(JSON.stringify({ issuer: origin, authorization_endpoint: origin + '/authorize', token_endpoint: origin + '/token', response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'], code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none'], authorization_response_iss_parameter_supported: true }));
-    if (url.pathname === '/token') return response.end(JSON.stringify({ access_token: 'mock-access', refresh_token: 'mock-refresh', token_type: 'Bearer', expires_in: 3600 }));
+    if (url.pathname === '/token') { tokenRequests.push(new URLSearchParams(body).get('grant_type')); return response.end(JSON.stringify({ access_token: 'mock-access', refresh_token: 'mock-refresh', token_type: 'Bearer', expires_in: expiresIn })); }
     assert.equal(url.pathname, '/prefix/mcp/');
     const message = JSON.parse(body);
     if (message.method === 'server/discover') return response.end(JSON.stringify({ result: { supportedVersions: ['2026-07-28'] } }));
@@ -55,7 +56,7 @@ async function runtime({ oauth = false } = {}) {
   const response = (id) => until(() => lines.find((message) => message.id === id));
   let nextId = 1000;
   return {
-    root, child, calls, lines, send, response,
+    root, child, calls, tokenRequests, lines, send, response,
     async call(name, arguments_ = {}) { const id = nextId++; send(id, 'tools/call', { name, arguments: arguments_ }); return response(id); },
     async authorization() { return until(async () => { try { return new URL(await readFile(env.AKB_TEST_AUTH_URL, 'utf8')); } catch { return null; } }); },
     async eof() { child.stdin.end(); const result = await Promise.race([exited, pause(2000).then(() => { throw new Error('EOF did not stop the proxy.'); })]); assert.equal(result.code, 0, diagnostics); },
@@ -123,5 +124,26 @@ test('EOF during mock OAuth closes the owned loopback listener', async () => {
     await run.eof();
     await assert.rejects(fetch(callback));
     assert.equal(run.calls.length, 0);
+  } finally { await run.close(); }
+});
+
+
+test('a short-lived mock OAuth token is ready for a new stdio call without an immediate refresh loop', async () => {
+  const run = await runtime({ oauth: true, expiresIn: 5 });
+  try {
+    run.send(1, 'initialize'); await run.response(1);
+    const authorization = await run.authorization();
+    const callback = new URL(authorization.searchParams.get('redirect_uri'));
+    callback.searchParams.set('state', authorization.searchParams.get('state'));
+    callback.searchParams.set('iss', authorization.origin);
+    callback.searchParams.set('code', 'mock-code');
+    await fetch(callback);
+    await until(async () => payload(await run.call('akb_connection')).authentication === 'ready');
+    assert.equal(payload(await run.call('akb_list_vaults')).completed, true);
+    await pause(650);
+    assert.equal(payload(await run.call('akb_connection')).authentication, 'ready');
+    assert.deepEqual(run.tokenRequests, ['authorization_code']);
+    assert.equal(run.calls.length, 1);
+    await run.eof();
   } finally { await run.close(); }
 });

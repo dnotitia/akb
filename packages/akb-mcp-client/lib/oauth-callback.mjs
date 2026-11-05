@@ -9,7 +9,7 @@ export async function createCallback({ state, issuer, issuerRequired, signal, ti
   const server = createServer((request, response) => {
     const fail = () => { response.writeHead(400, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' }); response.end('Invalid authorization callback.'); };
     const hostCount = request.rawHeaders.filter((_value, index) => index % 2 === 0 && request.rawHeaders[index].toLowerCase() === 'host').length;
-    if (consumed || hostCount !== 1 || request.method !== 'GET' || request.headers.host !== `127.0.0.1:${server.address().port}` || (request.url?.length ?? 0) > 8192) return fail();
+    if (consumed || !/^\/oauth\/callback(?:\?|$)/.test(request.url ?? '') || hostCount !== 1 || request.method !== 'GET' || request.headers.host !== `127.0.0.1:${server.address().port}` || (request.url?.length ?? 0) > 8192) return fail();
     let url;
     try { url = new URL(request.url, 'http://127.0.0.1'); } catch { return fail(); }
     if (url.pathname !== '/oauth/callback' || url.hash) return fail();

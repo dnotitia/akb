@@ -489,7 +489,11 @@ export class AKBProxy {
   }
 
   _connectionStatus() {
-    return { ...this.credentials.status(), connectivity: this.connection.connectivity, ...(this._contractMismatch ? { contract: "incompatible", message: this._contractMismatch } : {}) };
+    const status = this.credentials.status();
+    const backend = this.connection.connectivity;
+    const discovery = status.connectivity ?? "unknown";
+    const connectivity = [backend, discovery].includes("unreachable") ? "unreachable" : backend === "unknown" ? discovery : backend;
+    return { ...status, connectivity, backendConnectivity: backend, ...(status.mode === "oauth" ? { discoveryConnectivity: discovery } : {}), ...(this._contractMismatch ? { contract: "incompatible", message: this._contractMismatch } : {}) };
   }
 
   async _handle(msg) {
