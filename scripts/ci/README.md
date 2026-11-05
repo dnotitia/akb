@@ -328,8 +328,9 @@ benchmark-topology knowledge.
 
 Each invocation also selects one explicit capability profile. The default
 `tool-only` profile starts only the HTTP backend, PAT fixture, and shared
-fixture control app. `transport-proxy` adds a clean install of the checkout's
-`akb-mcp` package into the private runtime root and starts its real executable
+fixture control app. `transport-proxy` packs the checkout's `akb-mcp` package,
+installs that tarball with production dependencies into a private consumer,
+and starts its executable
 over stdin/stdout. `oidc-resource-server` adds an ephemeral RSA issuer/JWKS
 fixture with deterministic token variants. `transport-oidc` composes both.
 `keycloak-overlay` is intentionally rejected with
@@ -368,8 +369,11 @@ value, and exposes only the configured PAT environment-name in descriptor and
 discovery. The private discovery `runtime` object records the exact source
 revision, backend/proxy artifact versions, protocol revision, transport,
 selected capabilities, tool-case coordinates, fixture reset, and whether the
-stdio initialize/tools-list/read probes crossed the process boundary. The
-OIDC discovery object exposes issuer/JWKS/token coordinates and variant names,
+stdio initialize/tools-list/read probes crossed the process boundary. The stdio
+evidence also records the packed archive's SHA256 and installed package version.
+The consumer uses a copied archive, never a link to the checkout. Package
+lifecycle checks run during packing; consumer install scripts are disabled.
+The OIDC discovery object exposes issuer/JWKS/token coordinates and variant names,
 never an access token or signing key.
 
 With `serve --with-frontend`, the same descriptor adds a `web` service whose

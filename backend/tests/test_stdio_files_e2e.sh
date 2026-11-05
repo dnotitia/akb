@@ -53,8 +53,8 @@ FIFO_IN=$(mktemp -u /tmp/akb-mcp-in.XXXXXX)
 FIFO_OUT=$(mktemp -u /tmp/akb-mcp-out.XXXXXX)
 mkfifo "$FIFO_IN" "$FIFO_OUT"
 
-NODE_TLS_REJECT_UNAUTHORIZED=0 node "$AKB_MCP_BIN" \
-  --url "$BASE_URL/mcp/" --pat "$PAT" --insecure \
+node "$AKB_MCP_BIN" \
+  --url "$BASE_URL/mcp/" --pat "$PAT" \
   < "$FIFO_IN" > "$FIFO_OUT" 2>/dev/null &
 MCP_PID=$!
 

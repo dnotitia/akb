@@ -671,6 +671,7 @@ class E2ERuntime:
         self._pat_value = ""
         self._candidate_revision: str | None = None
         self._proxy_version: str | None = None
+        self._proxy_package_artifact: dict[str, object] | None = None
         self._stdio_initialize_observed = False
         self._stdio_tools_list_observed = False
         self._stdio_read_call_observed = False
@@ -839,6 +840,7 @@ class E2ERuntime:
                 "package": "akb-mcp",
                 "executable": "akb-mcp",
                 "consumer_root": str(self.config.proxy_consumer_dir),
+                "package_artifact": self._proxy_package_artifact,
                 "environment": {
                     "AKB_MCP_URL": f"{self.config.app_origin}/mcp/",
                     "AKB_PAT": self.config.credentials.pat_env,
@@ -2549,12 +2551,26 @@ class E2ERuntime:
         self._fixture_private_values = (*self._fixture_private_values, token)
 
     async def _install_stdio_proxy(self) -> Path:
-        """Install the checkout package into the private clean Node consumer."""
+        """Pack the candidate and install its production dependencies privately."""
 
         consumer = self.config.proxy_consumer_dir
         consumer.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(consumer, 0o700)
+        package_root = self.config.runtime_root / "node-package"
+        package_root.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(package_root, 0o700)
         try:
+            await self._run_logged_command(
+                [
+                    "npm", "pack", str(self.config.proxy_package_dir),
+                    "--pack-destination", str(package_root),
+                ],
+                log_path=self.config.logs_dir / "stdio-pack.log",
+            )
+            archives = list(package_root.glob("*.tgz"))
+            if len(archives) != 1:
+                raise BlockedRuntimeConfig("npm pack did not produce exactly one archive")
+            archive = archives[0]
             await self._run_logged_command(
                 [
                     "npm",
@@ -2564,20 +2580,27 @@ class E2ERuntime:
                     "--no-save",
                     "--package-lock=false",
                     "--ignore-scripts",
+                    "--omit=dev",
                     "--no-audit",
                     "--no-fund",
-                    str(self.config.proxy_package_dir),
+                    str(archive),
                 ],
                 log_path=self.config.logs_dir / "stdio-install.log",
             )
         except ProvisioningFailure as exc:
-            raise BlockedRuntimeConfig("clean Node consumer installation failed") from exc
+            raise BlockedRuntimeConfig("packed production Node consumer installation failed") from exc
         executable = consumer / "node_modules" / ".bin" / "akb-mcp"
-        if not executable.is_file():
-            executable = consumer / "node_modules" / "akb-mcp" / "bin" / "akb-mcp.mjs"
-        if not executable.is_file():
+        installed_package = consumer / "node_modules" / "akb-mcp"
+        if (not executable.is_file() or installed_package.is_symlink()
+                or not executable.resolve().is_relative_to(installed_package)):
             raise BlockedRuntimeConfig("installed akb-mcp package did not expose its bin")
-        self._proxy_version = self._artifact_version(self.config.proxy_package_dir)
+        self._proxy_version = self._artifact_version(installed_package)
+        self._proxy_package_artifact = {
+            "format": "npm-tarball",
+            "filename": archive.name,
+            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "production_dependencies_only": True,
+        }
         return executable
 
     async def _start_stdio_proxy(self) -> None:

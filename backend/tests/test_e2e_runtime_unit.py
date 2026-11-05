@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -94,6 +95,41 @@ def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
         compose_project="akb-e2e-unit",
         credentials=CredentialNames("TEST_USERNAME_ENV", "TEST_PASSWORD_ENV"),
     )
+
+
+@pytest.mark.asyncio
+async def test_stdio_consumer_runs_an_archive_copy_with_only_production_dependencies(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    package = checkout / "packages" / "akb-mcp-client"
+    (package / "bin").mkdir(parents=True)
+    (package / "package.json").write_text(json.dumps({
+        "name": "akb-mcp",
+        "version": "1.2.3",
+        "bin": {"akb-mcp": "bin/akb-mcp.mjs"},
+        "files": ["bin/"],
+    }))
+    script = package / "bin" / "akb-mcp.mjs"
+    script.write_text('#!/usr/bin/env node\nconsole.log("archive-copy");\n')
+    script.chmod(0o755)
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), checkout=checkout))
+    consumer = runtime.config.proxy_consumer_dir
+    consumer.mkdir(parents=True)
+    (consumer / "package.json").write_text(json.dumps({
+        "name": "fixture-consumer",
+        "private": True,
+        "devDependencies": {"akb-missing-development-fixture": "file:missing"},
+    }))
+
+    executable = await runtime._install_stdio_proxy()
+    script.write_text('#!/usr/bin/env node\nconsole.log("changed-source");\n')
+    result = subprocess.run(["node", str(executable)], text=True, capture_output=True, check=True)
+
+    assert result.stdout.strip() == "archive-copy"
+    assert executable.resolve().is_relative_to(consumer)
+    assert not (consumer / "node_modules" / "akb-mcp").is_symlink()
+    assert not (consumer / "node_modules" / "akb-missing-development-fixture").exists()
+    assert runtime._proxy_version == "1.2.3"
+    assert os.stat(consumer).st_mode & 0o777 == 0o700
 
 
 @pytest.mark.asyncio
