@@ -15,7 +15,7 @@ const assetId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
 const bytes = Buffer.alloc(2 * 1024 * 1024, 71);
 const hash = createHash('sha256').update(bytes).digest('hex');
 
-async function fixture({ rejectConfirm = false, badHash = false, redirectBytes = false, dropConfirm = false, malformedConfirm = false, removeSource = null } = {}) {
+async function fixture({ mode = 'oauth', rejectConfirm = false, badHash = false, redirectBytes = false, dropConfirm = false, malformedConfirm = false, removeSource = null } = {}) {
   let origin;
   let generation = 0;
   const controls = [];
@@ -56,8 +56,8 @@ async function fixture({ rejectConfirm = false, badHash = false, redirectBytes =
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   origin = `http://127.0.0.1:${server.address().port}`;
-  const configuration = parseConfiguration(['--url', origin + '/prefix/mcp/', '--auth-mode', 'oauth'], {});
-  const owner = { currentCredential: () => ({ kind: 'oauth', grantId: 'test-grant', generation, accessToken: `current-${generation}` }), status: () => ({ mode: 'oauth', authentication: 'ready' }), rejectCredential() {}, close() {} };
+  const configuration = parseConfiguration(['--url', origin + '/prefix/mcp/', ...(mode === 'pat' ? ['--pat', 'fixture'] : ['--auth-mode', 'oauth'])], {});
+  const owner = { currentCredential: () => ({ kind: mode, grantId: 'test-grant', generation, accessToken: `current-${generation}` }), status: () => ({ mode, authentication: 'ready' }), rejectCredential() {}, close() {} };
   const proxy = new AKBProxy({ ...configuration, credentialOwner: owner });
   proxy._startBackendMonitor = () => {};
   const call = async (name, arguments_) => {
@@ -130,8 +130,31 @@ test('write-only guide refusal is narrowly admitted while auth and ACL failures 
       run.proxy._rpc = async () => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ code, details: { required_scope: 'akb:vault:write' } }) }] });
       await assert.rejects(run.proxy._fileToolSkillPreflight('example'), (error) => error.code === code);
     }
+    run.proxy._rpc = async () => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ code: 'insufficient_scope', details: { required_scope: 'read' } }) }] });
+    await assert.rejects(run.proxy._fileToolSkillPreflight('example'), (error) => error.code === 'insufficient_scope');
     assert.equal(run.controls.length, 0);
   } finally { await run.close(); }
+});
+
+test('write-only PAT file upload proceeds after the reader-only guide refusal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'akb-transfer-write-only-pat-'));
+  const run = await fixture({ mode: 'pat' });
+  try {
+    const file = join(root, 'source.bin'); await writeFile(file, bytes);
+    run.proxy._ensureBackend = async () => true;
+    run.proxy._rpc = async () => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ code: 'insufficient_scope', details: { required_scope: 'read' } }) }] });
+    const result = await run.call('akb_put_file', { vault: 'example', file_path: file });
+    assert.equal(result.isError, false, JSON.stringify(result));
+    assert.equal(run.controls.length, 2);
+    assert.equal(run.transfers.length, 1);
+    assert.deepEqual(run.transfers[0].bytes, bytes);
+    for (const code of ['authentication_rejected', 'access_denied', 'insufficient_scope']) {
+      run.proxy._rpc = async () => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ code, details: { required_scope: 'write' } }) }] });
+      await assert.rejects(run.proxy._fileToolSkillPreflight('example'), (error) => error.code === code);
+    }
+    run.proxy._rpc = async () => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ code: 'insufficient_scope', details: { required_scope: 'akb:vault:read' } }) }] });
+    await assert.rejects(run.proxy._fileToolSkillPreflight('example'), (error) => error.code === 'insufficient_scope');
+  } finally { await run.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 

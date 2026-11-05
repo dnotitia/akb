@@ -795,7 +795,8 @@ export class AKBProxy {
     let envelope;
     try { envelope = JSON.parse(text); } catch { throw Object.assign(new Error("The vault guide response is invalid."), { code: "invalid_guide_response", execution: "not_started" }); }
     if (response.isError) {
-      if (envelope?.code === "insufficient_scope" && envelope.details?.required_scope === "akb:vault:read") return null;
+      const readScope = this.credentials.status().mode === "pat" ? "read" : "akb:vault:read";
+      if (envelope?.code === "insufficient_scope" && envelope.details?.required_scope === readScope) return null;
       throw Object.assign(new Error("The vault guide request was refused. Check authentication, scope, and vault access."), { code: envelope?.code ?? "guide_access_denied", execution: "not_started" });
     }
     const projected = envelope?.vault_skill || null;
