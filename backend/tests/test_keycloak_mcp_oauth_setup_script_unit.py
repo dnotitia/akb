@@ -13,6 +13,7 @@ manifest facts that make the client-credentials path the required one.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import sys
 from pathlib import Path
@@ -143,163 +144,6 @@ def test_describe_identifies_the_credential_without_leaking_it():
     assert "hunter2" not in password.describe()
 
 
-# ── the "Allowed Client Scopes" policy, both subtypes ──────────────
-#
-# Keycloak ships this policy twice. It rejects any spec-compliant DCR body
-# for the same reason in both: the body carries `scope=openid`, and `openid`
-# is the OIDC sentinel rather than an entry in the realm's client-scope
-# catalog, so no setting of the policy can permit it. The script used to
-# remove only the `anonymous` one.
-#
-# The `authenticated` one is what an Initial Access Token registration hits
-# — an IAT does not bypass registration policies, it switches which subtype
-# applies. So Protected DCR, the option the design offers for hostile
-# internet exposure, ran into the wall this script exists to remove, while
-# the open path worked. Measured on a realm the script had already
-# configured: IAT + a scope field → 403 "Policy 'Allowed Client Scopes'
-# rejected request … Not permitted to use specified clientScope"; the same
-# registration with the scope field omitted → 201.
-
-
-def _policy(subtype: str, provider: str = "allowed-client-templates") -> dict:
-    return {"id": f"id-{provider}-{subtype}", "providerId": provider, "subType": subtype}
-
-
-def test_both_policy_subtypes_are_selected_for_removal():
-    components = [
-        _policy("anonymous"),
-        _policy("authenticated"),
-        _policy("anonymous", provider="trusted-hosts"),
-        _policy("anonymous", provider="max-clients"),
-    ]
-    selected = setup_script.client_scope_policies(components)
-    assert [p["subType"] for p in selected] == ["anonymous", "authenticated"]
-
-
-def test_the_authenticated_policy_alone_is_still_selected():
-    """The state the old script left behind, and the one that traps Protected DCR.
-
-    A realm the previous version had "configured" has only the
-    authenticated policy left. Selecting nothing here is exactly the
-    regression: the open path works and the hardened path does not.
-    """
-    assert setup_script.client_scope_policies([_policy("authenticated")]) != []
-
-
-def test_other_registration_policies_are_left_alone():
-    # `consent-required`, `trusted-hosts` (URI) and `max-clients` are the
-    # meaningful guards and must survive.
-    components = [
-        _policy("anonymous", provider="trusted-hosts"),
-        _policy("anonymous", provider="consent-required"),
-        _policy("anonymous", provider="max-clients"),
-    ]
-    assert setup_script.client_scope_policies(components) == []
-
-
-def test_a_realm_already_cleaned_selects_nothing():
-    assert setup_script.client_scope_policies([]) == []
-
-
-@pytest.mark.parametrize("payload", [None, "error body", {"error": "nope"}, [None, "x", 3]])
-def test_a_non_list_or_ragged_response_selects_nothing_rather_than_raising(payload):
-    # `http()` hands back whatever the admin API said; an error body used to
-    # reach `.get()` on a string as an AttributeError.
-    assert setup_script.client_scope_policies(payload) == []
-
-
-# ── trusted-hosts: absence is a configuration, not a failure ──────────
-
-
-def _trusted_hosts(hosts=("localhost",), sender_check="true") -> dict:
-    return {
-        "id": "th-1",
-        "providerId": "trusted-hosts",
-        "config": {
-            "trusted-hosts": list(hosts),
-            "host-sending-registration-request-must-match": [sender_check],
-            "client-uris-must-match": ["true"],
-        },
-    }
-
-
-class _Recorder:
-    """Stands in for the script's HTTP call and remembers what it was asked."""
-
-    def __init__(self, status: int = 204):
-        self.calls: list[tuple] = []
-        self.status = status
-
-    def __call__(self, method, url, token=None, body=None, **_):
-        self.calls.append((method, url, body))
-        return self.status, {}, {}
-
-
-def test_a_realm_without_the_policy_is_configured_not_broken():
-    """The regression. A realm that enforces redirects through a client policy
-    has no trusted-hosts policy, and it is exactly the realm that still needs
-    every later step. Stopping here skipped all of them."""
-    http = _Recorder()
-    outcome = setup_script.configure_trusted_hosts(
-        "https://kc.example/admin/realms/r", "tok", [_policy("anonymous")],
-        ["localhost"], request=http,
-    )
-    assert outcome == "absent"
-    assert http.calls == []
-
-
-def test_a_present_policy_is_opened_for_moving_clients():
-    http = _Recorder()
-    outcome = setup_script.configure_trusted_hosts(
-        "https://kc.example/admin/realms/r", "tok", [_trusted_hosts()],
-        ["127.0.0.1"], request=http,
-    )
-    assert outcome == "updated"
-    assert len(http.calls) == 1
-    method, url, body = http.calls[0]
-    assert method == "PUT"
-    assert url.endswith("/components/th-1")
-    assert body["config"]["trusted-hosts"] == ["127.0.0.1", "localhost"]
-    assert body["config"]["host-sending-registration-request-must-match"] == ["false"]
-
-
-def test_a_policy_that_already_says_it_is_not_written_again():
-    http = _Recorder()
-    outcome = setup_script.configure_trusted_hosts(
-        "https://kc.example/admin/realms/r", "tok",
-        [_trusted_hosts(hosts=("localhost",), sender_check="false")],
-        ["localhost"], request=http,
-    )
-    assert outcome == "no-op"
-    assert http.calls == []
-
-
-def test_a_write_that_fails_still_stops_the_run():
-    """Absence is tolerated; a refused write is not."""
-    http = _Recorder(status=500)
-    with pytest.raises(SystemExit):
-        setup_script.configure_trusted_hosts(
-            "https://kc.example/admin/realms/r", "tok", [_trusted_hosts()],
-            ["127.0.0.1"], request=http,
-        )
-
-
-@pytest.mark.parametrize("payload", [None, {}, "nope", [None, 3, "x"]])
-def test_a_ragged_component_list_reads_as_absent_rather_than_raising(payload):
-    http = _Recorder()
-    assert setup_script.configure_trusted_hosts(
-        "https://kc.example/admin/realms/r", "tok", payload, ["localhost"],
-        request=http,
-    ) == "absent"
-    assert http.calls == []
-
-
-def test_verify_step_names_the_subtypes_still_present():
-    subtypes = setup_script._policy_subtypes([_policy("anonymous"), _policy("authenticated")])
-    assert sorted(subtypes) == ["anonymous", "authenticated"]
-    assert setup_script._policy_subtypes([]) == []
-
-
 # ── the manifest facts that make the above required ────────────────
 
 
@@ -333,3 +177,86 @@ def test_dev_compose_fixture_still_bootstraps_a_user():
     """The password path exists for this fixture; keep the reason visible."""
     compose = _REPO_ROOT / "deploy" / "keycloak-dev" / "broker-chain" / "compose.yaml"
     assert "KC_BOOTSTRAP_ADMIN_USERNAME" in compose.read_text(encoding="utf-8")
+
+
+def test_native_client_has_only_public_code_pkce_and_exact_loopback_callback():
+    client = setup_script.native_client("akb-mcp-native", "https://akb.example.com/prefix/mcp")
+    assert client["publicClient"] is True
+    assert "secret" not in client
+    assert client["standardFlowEnabled"] is True
+    assert all(client[name] is False for name in ["implicitFlowEnabled", "directAccessGrantsEnabled", "serviceAccountsEnabled", "fullScopeAllowed"])
+    assert client["attributes"] == {"pkce.code.challenge.method": "S256", "use.refresh.tokens": "true"}
+    assert client["redirectUris"] == ["http://127.0.0.1/oauth/callback"]
+    assert client["defaultClientScopes"] == ["profile", "email"]
+    assert client["optionalClientScopes"] == ["akb:vault:read", "akb:vault:write"]
+    assert client["protocolMappers"][0]["config"]["included.custom.audience"] == "https://akb.example.com/prefix/mcp"
+
+
+class NativeRealm:
+    def __init__(self):
+        self.scopes = [{"id": name, "name": name} for name in ["profile", "email"]]
+        self.client = None
+        self.realm = {}
+        self.calls = []
+        self.assigned = {"default": [], "optional": []}
+        self.mappers = []
+
+    def request(self, method, url, token, body=None):
+        path = url.split("/admin/realms/test", 1)[1]
+        self.calls.append((method, path, copy.deepcopy(body)))
+        if path == "/client-scopes":
+            if method == "POST":
+                self.scopes.append({**body, "id": body["name"]})
+            result = self.scopes
+        elif path.startswith("/client-scopes/"):
+            result = []
+        elif path.startswith("/clients?"):
+            result = [self.client] if self.client else []
+        elif path == "/clients":
+            self.client = {**body, "id": "native-id"}
+            result = None
+        elif path == "/clients/native-id":
+            if method == "PUT":
+                self.client = {**body, "id": "native-id"}
+            result = self.client
+        elif "/protocol-mappers/models" in path:
+            if method == "POST":
+                self.mappers.append({**body, "id": "mapper"})
+            if method == "DELETE":
+                self.mappers.clear()
+            result = self.mappers
+        elif "-client-scopes" in path:
+            kind = "default" if "/default-" in path else "optional"
+            if method == "PUT":
+                name = path.rsplit("/", 1)[1]
+                if name not in [scope["name"] for scope in self.assigned[kind]]:
+                    self.assigned[kind].append({"id": name, "name": name})
+            result = self.assigned[kind]
+        elif path == "":
+            if method == "PUT":
+                self.realm.update(body)
+            result = self.realm
+        else:
+            raise AssertionError((method, path))
+        return (200, copy.deepcopy(result), {})
+
+
+def test_provisioning_converges_and_rereads_registration_mapper_scopes_rotation():
+    realm = NativeRealm()
+    for _ in range(2):
+        setup_script.provision_native_client("https://kc.example/admin/realms/test", "admin-token",
+                                            "akb-mcp-native", "https://akb.example.com/mcp", request=realm.request)
+    assert sum(method == "POST" and path == "/clients" for method, path, _ in realm.calls) == 1
+    assert realm.realm == {"revokeRefreshToken": True, "refreshTokenMaxReuse": 0}
+    assert realm.client["redirectUris"] == [setup_script.NATIVE_REDIRECT_URI]
+    assert len(realm.mappers) == 1
+    assert all("/components" not in path for _method, path, _body in realm.calls)
+
+
+def test_refused_admin_write_stops_provisioning():
+    def refused(*_args, **_kwargs):
+        return 403, {}, {}
+
+    with pytest.raises(RuntimeError, match="failed"):
+        setup_script.provision_native_client("https://kc.example/admin/realms/test", "token", "native",
+                                            "https://akb.example.com/mcp", request=refused)

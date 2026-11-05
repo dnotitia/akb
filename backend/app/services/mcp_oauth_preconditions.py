@@ -1,40 +1,8 @@
-"""Realm-side preconditions for the MCP OAuth Resource Server path.
+"""Cached public discovery checks for the optional native OAuth client.
 
-``config.py`` already refuses ``mcp_oauth_enabled=true`` with
-``keycloak_enabled=false``, because that one is decidable from AKB's own
-configuration. The other half of the same deployment — whether the realm
-was ever given the client scopes and the DCR policy the path needs — is
-not in AKB's config at all, and until this module existed AKB had no
-opinion about it. A realm that was never set up fails at the IdP, before
-any AKB code runs: the client gets a bare ``403`` naming a Keycloak
-policy, and nothing in AKB says which script would fix it.
-
-**Where this runs, and why it is not at startup.** This is a ``/health``
-section, not a boot check. A boot check would have to be non-fatal (the
-IdP can be briefly unreachable while AKB comes up, and MCP OAuth must
-never become a boot dependency), and a non-fatal boot check that could
-not reach the IdP is a check that silently never ran — with no second
-chance for the rest of the process lifetime. On ``/health`` the probe
-re-evaluates: a transient IdP outage reports ``unknown`` and heals on the
-next poll, and the answer is available at the moment an operator is
-actually debugging a connector, which is when they reach for ``/health``.
-The cost is bounded by the TTL and the probe timeout below.
-
-**What it can and cannot see.** Everything here comes from the
-authorization server's public discovery document, so it covers exactly
-two of the four walls an unconfigured realm puts up: whether DCR is
-offered at all (``registration_endpoint``) and whether the two vault
-scopes exist (``scopes_supported``). The audience mapper on those scopes
-and the DCR policy configuration are admin-API state, invisible from
-discovery — so ``ok`` here means "the preconditions visible in discovery
-hold", never "the realm is fully configured". The report says so rather
-than implying more than it checked.
-
-**Auth posture.** This section sits on the unauthenticated half of
-``/health``. Every input is already public: the protected-resource
-metadata names the authorization server to any caller, and its discovery
-document is public by OIDC Discovery. So there is no marginal disclosure
-here, only a statement about documents the caller can already read.
+Discovery cannot prove a client registration, signed audience or rotation.
+The operator script verifies admin state. Real code/PKCE acceptance verifies
+issued tokens. An `ok` health result describes public discovery only.
 """
 
 from __future__ import annotations
@@ -56,17 +24,6 @@ logger = logging.getLogger("akb.mcp_oauth")
 SETUP_SCRIPT = "scripts/keycloak/setup-akb-mcp-oauth.py"
 RUNBOOK = "docs/mcp-clients/web-connectors.md"
 
-# The scopes `/.well-known/oauth-protected-resource` advertises and the
-# consent screen has to be able to offer. Keycloak lists a realm client
-# scope in `scopes_supported` once it is a default or optional scope,
-# which is the state the setup script leaves behind.
-#
-# These are the DISCRIMINATING signal, measured on a live realm: they
-# appear in the discovery document only after the setup script has run.
-# `registration_endpoint` is advertised either way, so its presence
-# proves nothing about whether the realm was configured — it is checked
-# below because an IdP that offers no DCR at all cannot serve this path,
-# not because it separates a configured realm from an unconfigured one.
 REQUIRED_SCOPES = ("akb:vault:read", "akb:vault:write")
 
 # A settled answer is cheap to keep: realm configuration changes on
@@ -114,69 +71,38 @@ def reset_cache() -> None:
 
 
 def evaluate_discovery(document: object) -> dict:
-    """Classify one discovery document. Pure — no I/O, no settings.
-
-    ``missing`` is what the document positively lacks; ``unverifiable``
-    is what it does not say enough about to judge. The distinction
-    matters: ``scopes_supported`` is only RECOMMENDED by OIDC Discovery,
-    so an authorization server that omits it is not misconfigured, it is
-    merely unreadable from here — reporting that as a missing scope would
-    be a false alarm pointing at a setup script that would not help.
-    """
     if not isinstance(document, dict):
-        return {
-            "status": "unknown",
-            "missing": [],
-            "unverifiable": ["registration_endpoint", *(f"scope:{s}" for s in REQUIRED_SCOPES)],
-            "reason": "discovery document unavailable or not a JSON object",
-        }
-
+        return {"status": "unknown", "missing": [], "unverifiable": ["discovery"],
+                "reason": "discovery document unavailable or not a JSON object"}
     missing: list[str] = []
     unverifiable: list[str] = []
-
-    registration = document.get("registration_endpoint")
-    if not (isinstance(registration, str) and registration.strip()):
-        missing.append("registration_endpoint")
-
-    advertised = document.get("scopes_supported")
-    if isinstance(advertised, list):
-        known = {item for item in advertised if isinstance(item, str)}
-        missing.extend(f"scope:{scope}" for scope in REQUIRED_SCOPES if scope not in known)
-    else:
-        unverifiable.extend(f"scope:{scope}" for scope in REQUIRED_SCOPES)
-
-    if missing:
-        status = "unconfigured"
-    elif unverifiable:
-        status = "unknown"
-    else:
-        status = "ok"
+    for name in ("authorization_endpoint", "token_endpoint"):
+        if not isinstance(document.get(name), str) or not document[name].strip():
+            missing.append(name)
+    for name, required in (("scopes_supported", REQUIRED_SCOPES),
+                           ("grant_types_supported", ("authorization_code", "refresh_token")),
+                           ("code_challenge_methods_supported", ("S256",))):
+        values = document.get(name)
+        if not isinstance(values, list):
+            unverifiable.append(name)
+        else:
+            missing.extend(f"{name}:{value}" for value in required if value not in values)
+    status = "unconfigured" if missing else "unknown" if unverifiable else "ok"
     return {"status": status, "missing": missing, "unverifiable": unverifiable, "reason": ""}
 
 
 def describe(report: dict) -> str:
-    """The operator-facing sentence for one report. Names the fix."""
-    status = report.get("status")
-    if status == "ok":
+    if report.get("status") == "ok":
         return (
-            "The authorization server advertises a registration endpoint and both vault "
-            "scopes. The audience mapper and the DCR registration policies are admin-API "
-            f"state and are not visible here — see {RUNBOOK} if registration still fails."
+            "Public discovery advertises code, refresh, S256 and both vault scopes. "
+            "The native registration, exact audience mapper and refresh rotation are "
+            f"not visible here. Verify them with {SETUP_SCRIPT} and the code/PKCE flow in {RUNBOOK}."
         )
-    if status == "unconfigured":
+    if report.get("status") == "unconfigured":
         absent = ", ".join(report.get("missing") or ())
-        return (
-            f"The authorization server does not advertise: {absent}. MCP clients cannot "
-            f"register or obtain usable tokens until the realm is configured. Run "
-            f"{SETUP_SCRIPT} against this realm, or follow the hand-edit checklist in "
-            f"{RUNBOOK}."
-        )
+        return f"Public discovery lacks {absent}. Run {SETUP_SCRIPT}; see {RUNBOOK}."
     reason = report.get("reason") or "the discovery document did not answer"
-    return (
-        f"Realm preconditions could not be checked ({reason}); this is not a verdict on "
-        f"the realm. If MCP clients are failing to register, {SETUP_SCRIPT} is what "
-        f"configures the realm and {RUNBOOK} documents the same steps by hand."
-    )
+    return f"OAuth preconditions are unknown ({reason}); this is not a verdict on the realm. See {SETUP_SCRIPT} and {RUNBOOK}."
 
 
 async def _fetch_discovery() -> object | None:
@@ -220,6 +146,8 @@ async def health_section() -> dict:
             "enabled": True,
             "status": report["status"],
             "authorization_server": settings.keycloak_issuer,
+            "native_client_id": settings.mcp_oauth_native_client_id,
+            "registration_verified": False,
             "missing": report["missing"],
             "unverifiable": report["unverifiable"],
             "detail": describe(report),

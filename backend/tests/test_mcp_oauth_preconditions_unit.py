@@ -31,7 +31,10 @@ from app.services import mcp_oauth_preconditions as preconditions
 
 CONFIGURED_REALM = {
     "issuer": "https://auth.example.com/realms/akb",
-    "registration_endpoint": "https://auth.example.com/realms/akb/clients-registrations/openid-connect",
+    "authorization_endpoint": "https://auth.example.com/realms/akb/protocol/openid-connect/auth",
+    "token_endpoint": "https://auth.example.com/realms/akb/protocol/openid-connect/token",
+    "grant_types_supported": ["authorization_code", "refresh_token"],
+    "code_challenge_methods_supported": ["S256"],
     "scopes_supported": ["openid", "profile", "email", "akb:vault:read", "akb:vault:write", "offline_access"],
 }
 
@@ -73,24 +76,24 @@ def test_configured_realm_is_ok():
     assert report["unverifiable"] == []
 
 
-def test_realm_without_dcr_endpoint_is_unconfigured():
-    document = {k: v for k, v in CONFIGURED_REALM.items() if k != "registration_endpoint"}
+def test_realm_without_authorization_endpoint_is_unconfigured():
+    document = {k: v for k, v in CONFIGURED_REALM.items() if k != "authorization_endpoint"}
     report = preconditions.evaluate_discovery(document)
     assert report["status"] == "unconfigured"
-    assert report["missing"] == ["registration_endpoint"]
+    assert report["missing"] == ["authorization_endpoint"]
 
 
-def test_blank_dcr_endpoint_counts_as_absent():
-    report = preconditions.evaluate_discovery({**CONFIGURED_REALM, "registration_endpoint": "   "})
+def test_blank_authorization_endpoint_counts_as_absent():
+    report = preconditions.evaluate_discovery({**CONFIGURED_REALM, "authorization_endpoint": "   "})
     assert report["status"] == "unconfigured"
-    assert "registration_endpoint" in report["missing"]
+    assert "authorization_endpoint" in report["missing"]
 
 
 def test_missing_vault_scopes_are_named_individually():
     document = {**CONFIGURED_REALM, "scopes_supported": ["openid", "akb:vault:read"]}
     report = preconditions.evaluate_discovery(document)
     assert report["status"] == "unconfigured"
-    assert report["missing"] == ["scope:akb:vault:write"]
+    assert report["missing"] == ["scopes_supported:akb:vault:write"]
 
 
 def test_a_never_configured_realm_names_everything_that_is_absent():
@@ -98,9 +101,10 @@ def test_a_never_configured_realm_names_everything_that_is_absent():
                                                "scopes_supported": ["openid", "profile", "email"]})
     assert report["status"] == "unconfigured"
     assert report["missing"] == [
-        "registration_endpoint",
-        "scope:akb:vault:read",
-        "scope:akb:vault:write",
+        "authorization_endpoint",
+        "token_endpoint",
+        "scopes_supported:akb:vault:read",
+        "scopes_supported:akb:vault:write",
     ]
 
 
@@ -112,7 +116,7 @@ def test_an_idp_that_omits_scopes_supported_is_unknown_not_unconfigured():
     report = preconditions.evaluate_discovery(document)
     assert report["status"] == "unknown"
     assert report["missing"] == []
-    assert report["unverifiable"] == ["scope:akb:vault:read", "scope:akb:vault:write"]
+    assert report["unverifiable"] == ["scopes_supported"]
 
 
 @pytest.mark.parametrize("document", [None, "not json", 42, ["a", "list"]])
@@ -128,7 +132,7 @@ def test_an_unreadable_document_is_unknown(document):
 def test_unconfigured_detail_names_the_setup_script_and_what_is_missing():
     detail = preconditions.describe(preconditions.evaluate_discovery({"scopes_supported": []}))
     assert preconditions.SETUP_SCRIPT in detail
-    assert "registration_endpoint" in detail
+    assert "authorization_endpoint" in detail
     assert "akb:vault:read" in detail
 
 
@@ -359,7 +363,7 @@ async def test_non_json_body_is_unreadable_rather_than_an_exception(enabled, mon
 # ── wiring ─────────────────────────────────────────────────────────
 
 
-def test_health_route_reports_the_section():
+def test_health_route_reports_the_section(monkeypatch, tmp_path):
     """A source-level assertion, deliberately.
 
     Calling the `/health` handler needs a database and a vector-store
@@ -367,6 +371,7 @@ def test_health_route_reports_the_section():
     silently regress here is the wiring — the section being computed and
     then not returned — so that is what this pins.
     """
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
     from app import main
 
     source = inspect.getsource(main.health)
