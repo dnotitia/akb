@@ -9,7 +9,6 @@ BASE_URL="${AKB_URL:-http://localhost:8000}"
 PASS=0
 FAIL=0
 ERRORS=()
-MSGID=0
 
 pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
@@ -69,22 +68,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Helper: send JSON-RPC and read response
-rpc() {
-  MSGID=$((MSGID+1))
-  echo "$1" >&3
-  read -r -t 15 RESPONSE <&4
-  echo "$RESPONSE"
-}
-
 rpc_call() {
-  local method="$1"
-  local params="$2"
-  MSGID=$((MSGID+1))
-  local msg="{\"jsonrpc\":\"2.0\",\"id\":$MSGID,\"method\":\"$method\",\"params\":$params}"
-  echo "$msg" >&3
-  read -r -t 15 RESPONSE <&4
-  echo "$RESPONSE"
+  python3 "$(dirname "$0")/stdio_rpc_e2e.py" "$1" "$2" "${3:-15}"
 }
 
 # Extract tool result text
