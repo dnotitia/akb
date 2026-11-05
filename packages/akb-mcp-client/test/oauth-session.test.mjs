@@ -337,3 +337,29 @@ test('a pre-registered public client works when Keycloak metadata omits the none
     assert.equal(issuer.openings(), 1);
   } finally { await session.close(); store?.close(); await issuer.close(); await rm(directory, { recursive: true, force: true }); }
 });
+
+for (const changed of ['binding', 'missing']) {
+  test(`a shared ${changed} record never leaves status ready without a usable credential`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'akb-oauth-shared-record-'));
+    const issuer = await mockIssuer();
+    const session = new OAuthSession(issuer.installation, { storeOptions: { directory }, browserOpener: issuer.browserOpener });
+    let peer;
+    try {
+      session.start(); await issuer.finish();
+      await until(() => session.currentCredential());
+      assert.equal(session.status().authentication, 'ready');
+      peer = new OAuthStore(issuer.installation.resource, { directory });
+      await until(() => peer.acquire());
+      if (changed === 'binding') {
+        peer.save({ ...peer.read(), binding: { resource: issuer.installation.resource, issuer: 'https://another-issuer.example', clientId: 'another-native' }, grantId: 'replacement-grant', publicationId: 'replacement-publication' });
+        peer.publish('replacement-publication');
+      } else { await rm(peer.recordPath); peer.release(); }
+      assert.equal(session.currentCredential(), null);
+      assert.equal(session.status().authentication, 'reauthorization_required');
+      assert.match(session.status().message, /sign_in/);
+      await pause(600);
+      assert.equal(issuer.openings(), 1);
+      assert.deepEqual(issuer.exchanges, ['authorization_code']);
+    } finally { await session.close(); peer?.close(); await issuer.close(); await rm(directory, { recursive: true, force: true }); }
+  });
+}

@@ -69,7 +69,12 @@ export class OAuthSession {
     if (!this.store || !this.binding || this.failure) return null;
     try {
       const record = this.store.read();
-      if (!record || !sameBinding(record.binding, this.binding)) return null;
+      if (!record || !sameBinding(record.binding, this.binding)) {
+        if (!this.task || this.state.authentication === 'ready') {
+          this.state = { authentication: 'reauthorization_required', message: record ? 'The shared OAuth binding changed. Use sign_in for a fresh authorization.' : 'The shared OAuth session was removed. Use sign_in for a fresh authorization.' };
+        }
+        return null;
+      }
       if (record.refreshIntent || (!record.signedOut && !record.recovery && !this.store.isPublished(record))) {
         if (!this.task) this.state = { authentication: 'reauthorization_required', message: 'A token exchange was interrupted. Use sign_in for a fresh authorization.' };
         return null;
