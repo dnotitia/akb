@@ -19,7 +19,7 @@ import logging
 import re
 import uuid
 from itertools import zip_longest
-from typing import Literal, NamedTuple, get_args
+from typing import NamedTuple
 
 from markdown_it import MarkdownIt
 
@@ -44,31 +44,6 @@ from app.util.errors import (
 from app.util.text import like_escape
 
 logger = logging.getLogger("akb.graph")
-
-# ── Relation vocabulary — single source of truth ─────────────
-#
-# The explicit (agent-driven) link/unlink write surface accepts exactly
-# these relation types. This is THE definition: the REST request model
-# (`app.api.routes.knowledge.RelationType`) and the MCP `akb_link` /
-# `akb_unlink` tool inputSchemas (`mcp_server.tools`) both derive from it
-# rather than re-spelling the list, so the surfaces cannot drift apart.
-#
-# NOTE: this is the *user-settable* set. The document edge-extraction
-# pipeline additionally stores `links_to` edges (markdown body links —
-# see `extract_and_store_links`), which are never set through link/unlink
-# and so are intentionally excluded here. A `links_to` edge is removed by
-# its document's lifecycle (re-extraction / deletion), or via unlink with
-# the relation omitted (bulk remove), not by naming it.
-LinkRelationType = Literal[
-    "depends_on",
-    "related_to",
-    "implements",
-    "references",
-    "attached_to",
-    "derived_from",
-]
-LINK_RELATION_TYPES: tuple[str, ...] = get_args(LinkRelationType)
-
 
 def validate_new_structured_relation_refs(
     vault: str,

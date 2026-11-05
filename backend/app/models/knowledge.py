@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.services.kg_service import LinkRelationType
+from app.models.relation_type import LinkRelationType
 from app.util.text import NFCModel
 
 

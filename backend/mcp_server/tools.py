@@ -36,9 +36,8 @@ from mcp.types import Tool
 from app.models.document_preconditions import BODY_UPDATE_CONDITION, CONTENT_HASH_PATTERN, REVISION_PATTERN
 
 from app.services import template_registry
-from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS, MAX_REPLACEMENTS
-from app.services.kg_service import LINK_RELATION_TYPES
+from app.models.relation_type import LINK_RELATION_TYPES
 
 # The link/unlink relation vocabulary is defined once in kg_service; the
 # tool schemas below derive from it so the MCP surface and the REST
@@ -1436,6 +1435,8 @@ def available_tools() -> list[Tool]:
     TOOLS remains the accepted argument catalog for older clients, whose
     explicit unsupported requests must reach the service's stable error.
     """
+    from app.services.vault_creation_capabilities import get_vault_creation_capabilities
+
     capabilities = get_vault_creation_capabilities()
     if capabilities.templates and capabilities.external_git:
         return TOOLS
