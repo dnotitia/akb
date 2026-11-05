@@ -11,4 +11,3 @@ LinkRelationType = Literal[
     "derived_from",
 ]
 LINK_RELATION_TYPES: tuple[str, ...] = get_args(LinkRelationType)
-
