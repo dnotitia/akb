@@ -479,6 +479,8 @@ async def test_tool_profile_requires_exact_resource_and_admitted_client(monkeypa
                                 claim_overrides={"azp": client_id})
     principal = await service.verify_access_token(token, resource, route_profile="mcp")
     assert (principal is not None) is (allowed and audience_kind in {"string", "singleton"})
+    if principal is not None:
+        assert principal.profile_id == "keycloak-tool-resource-v1"
 
 
 @pytest.mark.asyncio

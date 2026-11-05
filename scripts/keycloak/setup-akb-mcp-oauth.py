@@ -27,6 +27,14 @@ from dataclasses import dataclass
 from typing import Literal
 
 
+HTTP_TIMEOUT_SECS = 10.0
+
+
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def http(method: str, url: str, token: str | None = None, body=None,
          ctype: str = "application/json") -> tuple[int, object, dict]:
     """Tiny stdlib HTTP wrapper — keeps the script dependency-free."""
@@ -42,12 +50,14 @@ def http(method: str, url: str, token: str | None = None, body=None,
         headers["Content-Type"] = ctype
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req) as r:
+        with urllib.request.build_opener(RejectRedirects()).open(req, timeout=HTTP_TIMEOUT_SECS) as r:
             raw = r.read().decode()
             payload = json.loads(raw) if raw and r.headers.get_content_type() == "application/json" else raw
             return r.status, payload, dict(r.headers)
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode(), dict(e.headers)
+    except (urllib.error.URLError, TimeoutError):
+        raise RuntimeError("Keycloak request failed or timed out") from None
 
 
 class AdminCredentialError(RuntimeError):
@@ -175,10 +185,10 @@ def get_admin_token(kc_url: str, credential: AdminCredential) -> str:
         ctype="application/x-www-form-urlencoded",
     )
     if status != 200 or not isinstance(payload, dict):
-        sys.exit(f"admin auth failed ({credential.describe()}): {status} {payload}")
+        sys.exit(f"admin auth failed ({credential.describe()}): HTTP {status}")
     tok = payload.get("access_token")
-    if not tok:
-        sys.exit(f"admin auth ({credential.describe()}): no access_token in {payload}")
+    if not isinstance(tok, str) or not tok:
+        sys.exit(f"admin auth ({credential.describe()}): no access_token in HTTP {status} response")
     return tok
 
 

@@ -159,7 +159,10 @@ def test_tool_credential_cannot_enter_other_rest_even_for_admin(boundary, monkey
         ("POST", f"/files/team/{FILE_ID}/cancel-upload"), ("GET", "/files/team"),
         ("GET", f"/files/team/{FILE_ID}"), ("GET", "/files/team/body-placements"),
         ("GET", "/assets/team/policy"), ("POST", f"/assets/team/from-file/{FILE_ID}"),
-        ("GET", "/tables/team"), ("GET", "/users/search?q=alice"), ("GET", "/auth/me"),
+        ("GET", "/vaults"), ("GET", "/tables/team"),
+        ("GET", f"/assets/team/{FILE_ID}/metadata"),
+        ("GET", f"/apps/{FILE_ID}/credentials"), ("GET", "/admin/sso/operation-requests"),
+        ("POST", "/app/authorize"), ("GET", "/users/search?q=alice"), ("GET", "/auth/me"),
         ("GET", "/auth/tokens"), ("POST", "/admin/reconcile-roles"),
         ("GET", "/my/account/lifecycle"),
     ]
@@ -185,5 +188,26 @@ def test_invalid_selected_tool_verifier_never_falls_back_to_api_or_cookie(bounda
     client.cookies.set("session", "valid-cookie")
     response = client.post("/api/v1/files/team/upload?filename=x", headers={"Authorization": "Bearer " + token})
     assert response.status_code == 401
+    assert boundary.principals == []
+    assert boundary.calls == []
+
+
+def test_only_eight_routes_install_the_tool_credential_dependency(boundary):
+    from app.api.deps import ToolControlUser
+    from app.services.tool_resource_policy import REST_OPERATION_SCOPES
+
+    found = []
+    for route in boundary.app.routes:
+        for dependency in getattr(getattr(route, "dependant", None), "dependencies", []):
+            if isinstance(dependency.call, ToolControlUser):
+                found.append(dependency.call.operation)
+    assert len(found) == 8
+    assert set(found) == set(REST_OPERATION_SCOPES)
+
+
+def test_tool_bearer_never_substitutes_for_an_upload_capability(boundary):
+    response = TestClient(boundary.app).put("/api/v1/files/upload/!", content=b"image",
+                                          headers={"Authorization": "Bearer " + boundary.token("akb:vault:write")})
+    assert response.status_code == 404
     assert boundary.principals == []
     assert boundary.calls == []

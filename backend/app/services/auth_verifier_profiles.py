@@ -14,6 +14,7 @@ from app.config import AuthModeConfigurationError, settings
 
 LOCAL_SESSION_RS256_V2 = "local-session-rs256-v2"
 KEYCLOAK_ACCESS_V1 = "keycloak-access-v1"
+KEYCLOAK_TOOL_RESOURCE_V1 = "keycloak-tool-resource-v1"
 KEYCLOAK_SERVICE_AUTHORITY_V1 = "keycloak-service-authority-v1"
 
 CredentialType = Literal["session", "access_token"]

@@ -45,6 +45,7 @@ from app.services.admission_service import record_arrival
 from app.services.auth_policy import require_local_auth_enabled
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
+    KEYCLOAK_TOOL_RESOURCE_V1,
     KEYCLOAK_SERVICE_AUTHORITY_V1,
     LOCAL_SESSION_RS256_V2,
     KeycloakRouteProfile,
@@ -1075,7 +1076,7 @@ async def project_verified_principal_with_reason(
                 for_credential_change=for_credential_change,
             )
         )
-    if principal.profile_id == KEYCLOAK_ACCESS_V1:
+    if principal.profile_id in {KEYCLOAK_ACCESS_V1, KEYCLOAK_TOOL_RESOURCE_V1}:
         return await _project_keycloak_principal(principal, provider_alias=provider_alias)
     if principal.profile_id == KEYCLOAK_SERVICE_AUTHORITY_V1:
         return ProjectionOutcome(

@@ -1556,8 +1556,8 @@ class Settings(BaseModel):
     @property
     def keycloak_human_client_ids(self) -> frozenset[str]:
         """OIDC clients allowed to authorize human API access tokens.
-        MCP DCR clients are intentionally excluded: MCP has its own route
-        profile, audience, and scope contract rather than this static list.
+        Tool clients are separate. Their exact resource, client allowlist and
+        scope contract belong to the tool-resource profile.
         """
         return frozenset(
             client_id.strip()

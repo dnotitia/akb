@@ -1,7 +1,7 @@
 """Pinned Keycloak verification plus separated browser OIDC primitives.
 
 Request authorization uses :meth:`verify_access_token` only. The
-route-selected ``keycloak-access-v1`` profile pins RS256, issuer, JWKS, route
+route-selected access-token profiles pin RS256, issuer, JWKS, route
 audience, token kind, and required claims before exact ``(issuer, subject)``
 projection. It never treats an ID token as an API access token.
 
@@ -35,6 +35,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError, AuthenticationError
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
+    KEYCLOAK_TOOL_RESOURCE_V1,
     KEYCLOAK_SERVICE_AUTHORITY_V1,
     KeycloakRouteProfile,
     VerifiedPrincipal,
@@ -889,7 +890,7 @@ class KeycloakOIDC:
         *,
         route_profile: KeycloakRouteProfile,
     ) -> VerifiedPrincipal | None:
-        """Verify one route-selected keycloak-access-v1 credential.
+        """Verify the selected human API or tool-resource credential.
 
         The caller supplies the already-selected API or MCP audience. Token
         headers may only confirm this fixed RS256/JWKS profile; they never
@@ -1007,7 +1008,7 @@ class KeycloakOIDC:
             return None
 
         return VerifiedPrincipal(
-            profile_id=KEYCLOAK_ACCESS_V1,
+            profile_id=KEYCLOAK_TOOL_RESOURCE_V1 if route_profile == "mcp" else KEYCLOAK_ACCESS_V1,
             issuer=claims["iss"],
             subject=claims["sub"],
             credential_type="access_token",

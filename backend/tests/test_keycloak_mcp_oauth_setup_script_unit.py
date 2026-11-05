@@ -1,15 +1,4 @@
-"""The realm setup script must be runnable against the way this repo ships Keycloak.
-
-`scripts/keycloak/setup-akb-mcp-oauth.py` authenticated with a password
-grant only, while both Kubernetes paths bootstrap Keycloak with an admin
-*service account* and no admin user at all. The script therefore worked
-against the dev compose fixture it was written on and against neither
-shipped manifest, and the only way past it was to create an admin account
-the deployment deliberately did not create (akb#635).
-
-These tests pin both halves: the credential resolution itself, and the
-manifest facts that make the client-credentials path the required one.
-"""
+"""Credential and native registration contracts for the operator script."""
 
 from __future__ import annotations
 
@@ -260,3 +249,68 @@ def test_refused_admin_write_stops_provisioning():
     with pytest.raises(RuntimeError, match="failed"):
         setup_script.provision_native_client("https://kc.example/admin/realms/test", "token", "native",
                                             "https://akb.example.com/mcp", request=refused)
+
+
+@pytest.mark.parametrize("status", [400, 200])
+def test_admin_auth_error_never_prints_response_credentials(monkeypatch, capsys, status):
+    marker = "private-response-marker"
+    payload = {"refresh_token": marker, "id_token": marker, "error_description": marker}
+    monkeypatch.setattr(setup_script, "http", lambda *_args, **_kwargs: (status, payload, {}))
+    credential = setup_script.resolve_admin_credential({"KC_ADMIN_USER": "admin", "KC_ADMIN_PASS": "input-marker"})
+    with pytest.raises(SystemExit) as error:
+        setup_script.get_admin_token("https://kc.example", credential)
+    captured = capsys.readouterr()
+    output = str(error.value) + captured.out + captured.err
+    assert marker not in output
+    assert "input-marker" not in output
+    assert str(status) in output
+
+
+def test_operator_http_rejects_real_redirect_without_forwarding_credentials():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    paths = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            paths.append(self.path)
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/credential-receiver")
+            self.end_headers()
+
+        def do_GET(self):
+            paths.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, _ = setup_script.http("POST", f"http://127.0.0.1:{server.server_port}/token", "bearer-marker",
+                                         body={"client_secret": "secret-marker"})
+        assert status == 302
+        assert paths == ["/token"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_operator_http_has_a_bounded_timeout(monkeypatch):
+    calls = []
+
+    class Opener:
+        def open(self, request, *, timeout):
+            calls.append(timeout)
+            raise TimeoutError("sensitive-network-marker")
+
+    monkeypatch.setattr(setup_script.urllib.request, "build_opener", lambda *_args: Opener())
+    with pytest.raises(RuntimeError, match="timed out") as error:
+        setup_script.http("GET", "https://kc.example", "bearer-marker")
+    assert "sensitive-network-marker" not in str(error.value)
+    assert calls == [10.0]
