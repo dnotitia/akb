@@ -1,0 +1,144 @@
+{
+  "akb_create_vault": [
+    {
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Globally unique Vault name: lowercase letters and digits, with single hyphens between words"
+          },
+          "description": {
+            "type": "string",
+            "description": "What this vault is for"
+          },
+          "public_access": {
+            "type": "string",
+            "enum": [
+              "none",
+              "reader",
+              "writer"
+            ],
+            "default": "none",
+            "description": "Public access: none=private, reader=public read, writer=public read+write"
+          },
+          "_vault_skill_ack": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Globally unique Vault name: lowercase letters and digits, with single hyphens between words"
+          },
+          "description": {
+            "type": "string",
+            "description": "What this vault is for"
+          },
+          "public_access": {
+            "type": "string",
+            "enum": [
+              "none",
+              "reader",
+              "writer"
+            ],
+            "default": "none",
+            "description": "Public access: none=private, reader=public read, writer=public read+write"
+          },
+          "external_git": {
+            "type": "object",
+            "description": "Optional: turn the new vault into a read-only mirror of an upstream git repo.",
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "HTTPS clone URL of the upstream repo"
+              },
+              "branch": {
+                "type": "string",
+                "default": "main",
+                "description": "Upstream branch to track"
+              },
+              "auth_token": {
+                "type": "string",
+                "description": "Optional PAT for private repos. Stored in DB; rotate via vault admin."
+              },
+              "poll_interval_secs": {
+                "type": "integer",
+                "default": 300,
+                "minimum": 60,
+                "description": "Seconds between upstream polls"
+              }
+            },
+            "required": [
+              "url"
+            ]
+          },
+          "_vault_skill_ack": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Globally unique Vault name: lowercase letters and digits, with single hyphens between words"
+          },
+          "description": {
+            "type": "string",
+            "description": "What this vault is for"
+          },
+          "template": {
+            "type": "string",
+            "enum": [
+              "engineering",
+              "finance",
+              "hr",
+              "issue-tracking",
+              "management",
+              "product",
+              "qa"
+            ],
+            "description": "Vault template to apply (pre-creates collections with guides). Ignored when external_git is set."
+          },
+          "public_access": {
+            "type": "string",
+            "enum": [
+              "none",
+              "reader",
+              "writer"
+            ],
+            "default": "none",
+            "description": "Public access: none=private, reader=public read, writer=public read+write"
+          },
+          "_vault_skill_ack": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Opaque acknowledgement returned as vault_skill.ack_token. After applying that guide, retry the unchanged operation with this value. The bundled proxy supplies it automatically."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  ]
+}

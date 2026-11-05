@@ -286,6 +286,13 @@ test("complete catalog parity records only exact proxy exceptions", () => {
   }
   assert.equal(compareCatalogs([], stdio).status, "failed");
   assert.equal(compareCatalogs(http.slice(1), stdio).status, "failed");
+  assert.equal(compareCatalogs([...http, http[0]], stdio).status, "failed");
+  assert.equal(compareCatalogs(http, [...stdio, stdio[0]]).status, "failed");
+  const unknown = structuredClone(http);
+  unknown[0].inputSchema.additionalProperties = false;
+  const equallyUnknown = structuredClone(stdio);
+  equallyUnknown[0].inputSchema.additionalProperties = false;
+  assert.equal(compareCatalogs(unknown, equallyUnknown).status, "failed");
 });
 
 test("current Native schemas can differ from the initial complete grammar", () => {
@@ -295,8 +302,15 @@ test("current Native schemas can differ from the initial complete grammar", () =
   delete create.inputSchema.properties.template;
   delete create.inputSchema.properties.external_git;
   const stdio = structuredClone(catalog.initialCatalog().tools);
-  assert.equal(compareCatalogs(http, stdio).status, "passed");
+  const initial = compareCatalogs(http, stdio);
+  assert.equal(initial.status, "passed");
+  assert.deepEqual(initial.exceptions.creation_option_refinements, ["akb_create_vault"]);
+  catalog.refine({ tools: http });
+  assert.equal(compareCatalogs(http, catalog.initialCatalog().tools).status, "passed");
   const unrelated = structuredClone(http);
   unrelated.find((tool) => tool.name === create.name).inputSchema.properties.name.type = "number";
   assert.equal(compareCatalogs(unrelated, stdio).status, "failed");
+  const otherRefinement = structuredClone(stdio);
+  delete otherRefinement.find((tool) => tool.name === create.name).inputSchema.properties.template;
+  assert.equal(compareCatalogs(http, otherRefinement).status, "failed");
 });

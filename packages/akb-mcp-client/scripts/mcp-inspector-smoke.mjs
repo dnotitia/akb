@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, parseArgs } from "node:util";
 
 import { requireSupportedNode } from "../lib/node-runtime.mjs";
-import { createCatalog } from "../lib/catalog.mjs";
+import { createCatalog, currentToolContracts, toolSchemasEqual } from "../lib/catalog.mjs";
 import { FILE_CONTENT_TOOLS, VAULT_SKILL_ACK_ARGUMENT } from "../lib/local-tools.mjs";
 
 export const INSPECTOR_VERSION = "2.4.0";
@@ -382,34 +382,38 @@ export function compareCatalogs(httpTools, stdioTools) {
   const catalog = createCatalog();
   const expected = new Map(catalog.initialCatalog().tools.map((tool) => [tool.name, tool]));
   const canonical = new Set(catalog.canonical.map((tool) => tool.name));
-  const http = new Map((httpTools ?? []).map((tool) => [tool.name, tool]));
-  const stdio = new Map((stdioTools ?? []).map((tool) => [tool.name, tool]));
+  const http = new Map((Array.isArray(httpTools) ? httpTools : []).map((tool) => [tool.name, tool]));
+  const stdio = new Map((Array.isArray(stdioTools) ? stdioTools : []).map((tool) => [tool.name, tool]));
   const mismatches = [];
   if (!Array.isArray(httpTools) || !Array.isArray(stdioTools) || http.size !== httpTools.length || stdio.size !== stdioTools.length) mismatches.push({ reason: "invalid_or_duplicate_catalog" });
   const fileArguments = [];
   const acknowledgements = [];
+  const creationRefinements = [];
+  for (const name of canonical) if (!http.has(name)) mismatches.push({ tool: name, reason: "missing_backend_tool" });
   for (const [name, tool] of http) {
     const proxied = stdio.get(name);
     if (!canonical.has(name) || !proxied) { mismatches.push({ tool: name, reason: canonical.has(name) ? "missing_shared_tool" : "unknown_backend_tool" }); continue; }
-    const decorated = catalog.decorate([tool])[0];
-    if (!isDeepStrictEqual(decorated.inputSchema, proxied.inputSchema) || !isDeepStrictEqual(tool.outputSchema, proxied.outputSchema)) mismatches.push({ tool: name, reason: "shared_schema_mismatch" });
+    const contracts = currentToolContracts(name);
+    const httpVariant = contracts.findIndex((contract) => toolSchemasEqual(tool, contract));
+    const stdioVariant = contracts.findIndex((contract) => toolSchemasEqual(proxied, catalog.decorate([contract])[0]));
+    if (httpVariant < 0 || stdioVariant < 0 || (httpVariant > 0 && stdioVariant > 0 && httpVariant !== stdioVariant)) {
+      mismatches.push({ tool: name, reason: "shared_schema_mismatch" });
+    } else if (httpVariant !== stdioVariant) creationRefinements.push(name);
     if (FILE_CONTENT_TOOLS.has(name)) fileArguments.push(name);
     if (tool.inputSchema?.properties?.[VAULT_SKILL_ACK_ARGUMENT]) acknowledgements.push(name);
   }
   const local = [];
-  const initialOnly = [];
   for (const [name, tool] of stdio) {
-    if (http.has(name)) continue;
-    const canonicalTool = expected.get(name);
-    if (!canonicalTool) { mismatches.push({ tool: name, reason: "unexpected_stdio_tool" }); continue; }
-    if (!isDeepStrictEqual(canonicalTool.inputSchema, tool.inputSchema) || !isDeepStrictEqual(canonicalTool.outputSchema, tool.outputSchema)) mismatches.push({ tool: name, reason: "initial_or_local_schema_mismatch" });
-    if (canonical.has(name)) initialOnly.push(name);
-    else local.push(name);
+    if (canonical.has(name)) continue;
+    const localTool = expected.get(name);
+    if (!localTool) { mismatches.push({ tool: name, reason: "unexpected_stdio_tool" }); continue; }
+    if (!toolSchemasEqual(localTool, tool)) mismatches.push({ tool: name, reason: "local_schema_mismatch" });
+    local.push(name);
   }
   for (const name of expected.keys()) if (!stdio.has(name)) mismatches.push({ tool: name, reason: "missing_initial_or_local_tool" });
   return {
     status: mismatches.length ? "failed" : "passed", shared_tool_count: http.size, mismatches,
-    exceptions: { local_tools: local, file_arguments: fileArguments, shared_skill_acknowledgements: acknowledgements, installation_filtered_initial_only_tools: initialOnly },
+    exceptions: { local_tools: local, file_arguments: fileArguments, shared_skill_acknowledgements: acknowledgements, creation_option_refinements: creationRefinements },
   };
 }
 

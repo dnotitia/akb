@@ -1429,16 +1429,9 @@ TOOLS = [
 ]
 
 
-def available_tools() -> list[Tool]:
-    """Advertise only supported creation options without mutating validation.
-
-    TOOLS remains the accepted argument catalog for older clients, whose
-    explicit unsupported requests must reach the service's stable error.
-    """
-    from app.services.vault_creation_capabilities import get_vault_creation_capabilities
-
-    capabilities = get_vault_creation_capabilities()
-    if capabilities.templates and capabilities.external_git:
+def tools_for_creation_options(*, templates: bool, external_git: bool) -> list[Tool]:
+    """Advertise supported creation options without mutating canonical tools."""
+    if templates and external_git:
         return TOOLS
     result = []
     for tool in TOOLS:
@@ -1447,9 +1440,9 @@ def available_tools() -> list[Tool]:
             continue
         tool = tool.model_copy(deep=True)
         properties = tool.input_schema["properties"]
-        if not capabilities.templates:
+        if not templates:
             properties.pop("template", None)
-        if not capabilities.external_git:
+        if not external_git:
             properties.pop("external_git", None)
         tool.description = (
             "Create a new knowledge base vault. Its name is unique across the "
@@ -1460,3 +1453,10 @@ def available_tools() -> list[Tool]:
         )
         result.append(tool)
     return result
+
+
+def available_tools() -> list[Tool]:
+    from app.services.vault_creation_capabilities import get_vault_creation_capabilities
+
+    capabilities = get_vault_creation_capabilities()
+    return tools_for_creation_options(templates=capabilities.templates, external_git=capabilities.external_git)

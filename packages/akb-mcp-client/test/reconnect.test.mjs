@@ -202,6 +202,10 @@ itAsync("catalog refinement notifies only when the effective contract changes", 
   assert.deepEqual(notes, ["notifications/tools/list_changed"]);
   await proxy._syncTools();
   assert.equal(notes.length, 1);
+  initial.reverse();
+  initial[0].inputSchema.properties = Object.fromEntries(Object.entries(initial[0].inputSchema.properties).reverse());
+  await proxy._syncTools();
+  assert.equal(notes.length, 1, "object and tool ordering do not change the effective catalog");
 });
 
 itAsync("current Native creation options refine the complete catalog once", async () => {
@@ -232,13 +236,40 @@ itAsync("catalog refinement refuses empty and incomplete backend grammars", asyn
   }
 });
 
+itAsync("catalog accepts current creation refinements and rejects other schema or name changes", async () => {
+  for (const removed of [["template"], ["external_git"], ["template", "external_git"]]) {
+    const proxy = newProxy();
+    const tools = structuredClone(proxy.catalog.canonical);
+    const create = tools.find((tool) => tool.name === "akb_create_vault");
+    for (const argument of removed) delete create.inputSchema.properties[argument];
+    assert.equal(proxy.catalog.refine({ tools }), true);
+    assert.deepEqual(proxy.catalog.initialCatalog().tools.find((tool) => tool.name === create.name), create);
+    assert.equal(proxy.catalog.refine({ tools }), false);
+  }
+  for (const mutate of [
+    (tools) => { tools[tools.length - 1] = tools[0]; },
+    (tools) => { tools[0].name = "akb_unexpected"; },
+    (tools) => { tools.push(tools[0]); },
+    (tools) => { tools[0].outputSchema = { type: "object" }; },
+    (tools) => { tools[0].inputSchema.additionalProperties = false; },
+    (tools) => { delete tools.find((tool) => tool.name === "akb_create_vault").inputSchema.properties.description; },
+  ]) {
+    const proxy = newProxy();
+    const tools = structuredClone(proxy.catalog.canonical);
+    mutate(tools);
+    const before = structuredClone(proxy.catalog.initialCatalog());
+    assert.throws(() => proxy.catalog.refine({ tools }), /incompatible/);
+    assert.deepEqual(proxy.catalog.initialCatalog(), before);
+  }
+});
+
 itAsync("monitor stays silent on recovery when the list was never degraded", async () => {
   const proxy = newProxy();
   proxy._ensureBackend = async () => {
     proxy._backendReady = true;
     return true;
   };
-  proxy._syncTools = async () => ({ tools: [] });
+  proxy._syncTools = async () => ({ tools: proxy.catalog.canonical });
   const notes = [];
   proxy._notify = (method) => notes.push(method);
 

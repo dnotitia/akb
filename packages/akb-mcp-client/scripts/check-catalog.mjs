@@ -21,6 +21,7 @@ process.stderr.write(`Validated ${catalog.canonical.length} canonical and ${tool
 
 const repository = fileURLToPath(new URL('../../../', import.meta.url));
 const generated = fileURLToPath(new URL('../lib/generated-tools.json', import.meta.url));
-const check = spawnSync('uv', ['run', '--locked', '--project', resolve(repository, 'backend'), 'python', resolve(repository, 'scripts/generate_mcp_catalog.py'), '--output', generated, '--check'], { cwd: repository, stdio: 'inherit' });
+const refinements = fileURLToPath(new URL('../lib/generated-tool-refinements.json', import.meta.url));
+const check = spawnSync('uv', ['run', '--locked', '--project', resolve(repository, 'backend'), 'python', resolve(repository, 'scripts/generate_mcp_catalog.py'), '--output', generated, '--refinements-output', refinements, '--check'], { cwd: repository, stdio: 'inherit' });
 if (check.error) throw new Error('Catalog generation requires a full repository checkout and uv on PATH.', { cause: check.error });
-if (check.status !== 0) throw new Error('The canonical catalog drift check failed. Regenerate lib/generated-tools.json before packing.');
+if (check.status !== 0) throw new Error('The catalog drift check failed. Regenerate both catalog artifacts before packing.');

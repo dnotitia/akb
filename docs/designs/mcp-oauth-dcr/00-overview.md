@@ -70,8 +70,10 @@ canonical `TOOLS`, including optional creation arguments. Installation-specific
 live refinements do not determine the initial public grammar.
 
 ```bash
-uv run --locked --project backend python scripts/generate_mcp_catalog.py --output /tmp/akb-tools.json
-uv run --locked --project backend python scripts/generate_mcp_catalog.py --output /tmp/akb-tools.json --check
+uv run --locked --project backend python scripts/generate_mcp_catalog.py \
+  --output /tmp/akb-tools.json --refinements-output /tmp/akb-tool-refinements.json
+uv run --locked --project backend python scripts/generate_mcp_catalog.py \
+  --output /tmp/akb-tools.json --refinements-output /tmp/akb-tool-refinements.json --check
 ```
 
 Generation refuses duplicate names, missing operation classifications,

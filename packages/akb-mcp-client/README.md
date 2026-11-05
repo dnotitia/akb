@@ -62,7 +62,7 @@ Multi-step file failures include a receipt with `stage`, `vault`, and any known 
 
 ## Local files and authority
 
-The initial catalog contains every generated server tool plus six local file and image tools and `akb_connection`. `akb_put` and `akb_update` also accept a local `file` argument. Installation-specific features can remain unavailable even though their grammar is listed. An incompatible live schema requires the matching proxy version.
+The initial catalog contains every generated server tool plus six local file and image tools and `akb_connection`. `akb_put` and `akb_update` also accept a local `file` argument. Background discovery can narrow the advertised vault creation options to the installation's current capabilities. Every canonical tool name remains required. Other live schema changes require the matching proxy version.
 
 File and image controls obtain the current credential for each request. Read and write scopes remain independent, and existing vault and document permissions still apply. The selected tool credential has no authority on unrelated account, browser, administrator, or service REST routes. Existing administrator MCP permissions remain unchanged.
 
@@ -91,15 +91,16 @@ npm --prefix packages/akb-mcp-client test
 npm pack ./packages/akb-mcp-client
 ```
 
-`prepack` always checks schema structure, tool-name collisions, the pinned production SDK, protocol version consistency, and canonical generator drift. A missing backend generator or failed check stops packing. Regenerate the artifact after a deliberate server grammar change:
+`prepack` always checks schema structure, tool-name collisions, the pinned production SDK, protocol version consistency, and drift in both generated catalog artifacts. A missing backend generator or failed check stops packing. Regenerate both artifacts after a deliberate server grammar change:
 
 ```sh
 uv run --locked --project backend python scripts/generate_mcp_catalog.py \
-  --output packages/akb-mcp-client/lib/generated-tools.json
+  --output packages/akb-mcp-client/lib/generated-tools.json \
+  --refinements-output packages/akb-mcp-client/lib/generated-tool-refinements.json
 ```
 
 Registry tarball installs and `npx` consumption do not run `prepack`. Consumers need Node and declared production dependencies, including the pinned MCP client SDK. They do not need Python, `uv`, the source backend, or Inspector.
 
 Package tests exercise production storage and actual stdio processes with a mocked authorization server. They also install an npm tarball with production dependencies and use the installed CLI through the real SDK. These tests do not establish real IdP or native-host OAuth acceptance.
 
-The repository's Inspector smoke compares every live HTTP tool schema with the shared stdio grammar, records exact file-argument and acknowledgement composition, checks all local tool schemas, and identifies installation-filtered initial-only tools. Unexpected schema differences fail the comparison. It also retains the representative `akb_list_vaults` result comparison.
+The repository's Inspector smoke requires every canonical backend tool and compares its live HTTP schema with the stdio grammar. It records exact file-argument and acknowledgement composition and checks all local tool schemas. The backend's current creation-option refinements are generated from the same availability transform as live discovery. Inspector accepts these refinements against the complete initial grammar, but rejects different noncanonical refinements between transports and all unknown schema changes. It also retains the representative `akb_list_vaults` result comparison.

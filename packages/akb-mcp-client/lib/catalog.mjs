@@ -1,6 +1,18 @@
 import generated from './generated-tools.json' with { type: 'json' };
+import refinements from './generated-tool-refinements.json' with { type: 'json' };
 import { isDeepStrictEqual } from 'node:util';
 import { FILE_TOOLS, FILE_WRITE_TOOL_NAMES, FILE_CONTENT_TOOLS, VAULT_SKILL_ACK_ARGUMENT, vaultSkillAckProperty } from './local-tools.mjs';
+
+const canonicalByName = new Map(generated.map((tool) => [tool.name, tool]));
+
+export function currentToolContracts(name) {
+  const tool = canonicalByName.get(name);
+  return tool ? [tool, ...(refinements[name] ?? []).map((schema) => ({ name, ...schema }))] : [];
+}
+
+export function toolSchemasEqual(actual, expected) {
+  return isDeepStrictEqual(actual.inputSchema, expected.inputSchema) && isDeepStrictEqual(actual.outputSchema, expected.outputSchema);
+}
 
 export const CONNECTION_TOOL = {
   name: 'akb_connection',
@@ -20,20 +32,17 @@ export class ToolCatalog {
   compose(tools) { return [...this.decorate(tools), ...this.localTools]; }
   initialCatalog() { return { tools: this.tools }; }
   refine(live) {
-    if (!Array.isArray(live.tools)) throw new Error('Backend tool catalog is incompatible. Install the matching proxy version.');
-    const canonical = new Map(this.canonical.map((tool) => [tool.name, tool]));
+    if (!Array.isArray(live?.tools) || live.tools.length !== this.canonical.length) throw new Error('Backend tool catalog is incompatible. Install the matching proxy version.');
     const seen = new Set();
     for (const tool of live.tools) {
-      const expected = canonical.get(tool.name);
+      const expected = canonicalByName.get(tool?.name);
       if (!expected || seen.has(tool.name) || tool.inputSchema?.type !== 'object') throw new Error('Backend tool catalog is incompatible. Install the matching proxy version.');
       seen.add(tool.name);
-      const before = expected.inputSchema;
-      const after = tool.inputSchema;
-      if (!isDeepStrictEqual(before, after) || !isDeepStrictEqual(expected.outputSchema, tool.outputSchema)) throw new Error('Backend tool schemas are incompatible. Install the matching proxy version.');
+      if (!currentToolContracts(tool.name).some((contract) => toolSchemasEqual(tool, contract))) throw new Error('Backend tool schemas are incompatible. Install the matching proxy version.');
     }
     const liveByName = new Map(live.tools.map((tool) => [tool.name, tool]));
-    const next = this.compose(this.canonical.map((tool) => liveByName.get(tool.name) ?? tool));
-    const changed = JSON.stringify(next) !== JSON.stringify(this.tools);
+    const next = this.compose(this.canonical.map((tool) => liveByName.get(tool.name)));
+    const changed = !isDeepStrictEqual(next, this.tools);
     this.tools = next;
     return changed;
   }

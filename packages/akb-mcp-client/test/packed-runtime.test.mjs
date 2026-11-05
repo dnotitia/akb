@@ -58,6 +58,9 @@ test("production tarball includes the SDK and catalog and rejects unsupported ru
     for (const excluded of ["backend", "test", "scripts", "node_modules/@modelcontextprotocol/inspector"]) await assert.rejects(readFile(join(installed, excluded)), { code: "ENOENT" });
     await assert.rejects(readFile(join(consumer, "node_modules/@modelcontextprotocol/inspector/package.json")), { code: "ENOENT" });
     const canonical = JSON.parse(await readFile(join(installed, "lib/generated-tools.json"), "utf8"));
+    const refinements = JSON.parse(await readFile(join(installed, "lib/generated-tool-refinements.json"), "utf8"));
+    assert.deepEqual(Object.keys(refinements), ["akb_create_vault"]);
+    assert.equal(refinements.akb_create_vault.length, 3);
     const driver = join(consumer, "consumer.mjs");
     await writeFile(driver, `import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
