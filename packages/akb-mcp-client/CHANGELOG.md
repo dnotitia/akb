@@ -7,6 +7,8 @@
 - Serve the complete generated tool catalog immediately and add local connection status.
 - Add browser Authorization Code with S256 PKCE, strict discovery, private shared grant storage, coordinated refresh rotation, and explicit sign-in recovery.
 - Publish a replacement grant only after durable storage and a separate committed ownership marker. Interrupted exchanges require fresh authorization.
+- Use the current shared credential for every file and image control. Keep byte capabilities bearer-free, reject redirects, and verify download size and SHA-256 before replacing a local destination.
+- Preserve stable reservation and replacement receipts on partial and unknown outcomes.
 - Keep local protocol requests responsive during backend work. Submit caller operations once and report uncertain outcomes without replay.
 
 

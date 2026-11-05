@@ -90,3 +90,11 @@ test('an MCP redirect is refused without a second transport request', async () =
     assert.deepEqual(paths, ['/prefix/mcp/']);
   } finally { connection.close(); server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); }
 });
+
+test('admitted control paths cannot escape through encoded separators or dot segments', () => {
+  const configuration = parseConfiguration(['--url', 'https://example.com/prefix/mcp/', '--pat', 'selected-pat'], {});
+  const connection = new ToolConnection(configuration.installation, createCredentialOwner(configuration.authentication, configuration.installation));
+  try {
+    for (const vault of ['..', '%2e%2e', '..%2F..', '%5c', '%00']) assert.throws(() => connection.control('POST', `/api/v1/files/${vault}/upload`), /escape|prefix/);
+  } finally { connection.close(); }
+});

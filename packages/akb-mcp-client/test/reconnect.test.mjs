@@ -151,15 +151,10 @@ itAsync("tools/list serves the complete generated catalog without backend access
   assert.equal(new Set(names).size, names.length);
 });
 
-itAsync("tools/list serves the full decorated list from cache", async () => {
+itAsync("tools/list decorates the generated catalog without changing its source", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
-  proxy._cachedTools = {
-    tools: [
-      { name: "akb_put", inputSchema: { type: "object", properties: {} } },
-      { name: "akb_search", inputSchema: { type: "object", properties: {} } },
-    ],
-  };
+  const source = structuredClone(proxy.catalog.canonical);
 
   const res = await proxy._toolsList(3, {});
   const names = res.result.tools.map((t) => t.name);
@@ -174,11 +169,7 @@ itAsync("tools/list serves the full decorated list from cache", async () => {
   assert.match(image.description, /targeted akb_edit/);
   assert.match(image.description, /replaces the entire body/);
   assert.ok(image.inputSchema.properties._vault_skill_ack);
-  // The cache must not be mutated by decoration.
-  assert.ok(
-    !proxy._cachedTools.tools[0].inputSchema.properties.file,
-    "cached tool schema left untouched",
-  );
+  assert.deepEqual(proxy.catalog.canonical, source, "canonical schemas remain unchanged");
 });
 
 itAsync("modern tools/list cache metadata covers degraded and cached catalogs", async () => {
@@ -191,7 +182,6 @@ itAsync("modern tools/list cache metadata covers degraded and cached catalogs", 
   assert.equal(degraded.result.ttlMs, 0, "degraded catalog expires immediately");
   assert.equal(degraded.result.cacheScope, "private", "degraded catalog is private");
 
-  proxy._cachedTools = { tools: [{ name: "akb_search", inputSchema: { type: "object" } }] };
   const cached = await proxy._toolsList(5, {});
   assert.equal(cached.result.ttlMs, 0, "cached catalog expires immediately");
   assert.equal(cached.result.cacheScope, "private", "cached catalog is private");

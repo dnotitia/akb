@@ -27,7 +27,14 @@ export class ToolConnection {
     if (!controls.some(([verb, pattern]) => verb === method && pattern.test(pathname))) {
       throw new Error('This operation is outside the tool resource control contract.');
     }
-    return this._request(method, new URL(this.installation.baseUrl + path), body, headers, options);
+    const base = new URL(this.installation.baseUrl);
+    const target = new URL(this.installation.baseUrl + path);
+    for (const segment of pathname.split('/').slice(1)) {
+      const decoded = decodeURIComponent(segment);
+      if (['.', '..'].includes(decoded) || /[\\/\0]/.test(decoded)) throw new Error('Control path segments must not escape their admitted operation.');
+    }
+    if (target.origin !== base.origin || target.pathname !== base.pathname.replace(/\/$/, '') + pathname) throw new Error('Control paths must retain the installation prefix.');
+    return this._request(method, target, body, headers, options);
   }
   _request(method, url, body, extraHeaders = {}, options = {}) {
     const snapshot = this.owner.currentCredential();
