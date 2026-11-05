@@ -139,6 +139,8 @@ def _configure_keycloak(monkeypatch) -> tuple[str, str, str]:
     monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_audience", mcp_audience, raising=False)
     monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com", raising=False)
+    monkeypatch.setattr(settings, "mcp_oauth_native_client_id", "native-client")
+    monkeypatch.setattr(settings, "mcp_oauth_direct_client_ids", ["direct-client"])
     return issuer, api_audience, mcp_audience
 
 
@@ -462,45 +464,21 @@ async def test_keycloak_api_profile_binds_azp_to_configured_human_clients(
 
 
 @pytest.mark.asyncio
-async def test_keycloak_mcp_profile_does_not_apply_static_human_azp_allowlist(
-    monkeypatch,
-    rsa_keypair,
-):
+@pytest.mark.parametrize("client_id,allowed", [("native-client", True), ("direct-client", True),
+                                              ("dynamically-registered-mcp-client", False), ("akb-admin", False)])
+@pytest.mark.parametrize("audience_kind", ["string", "singleton", "mixed", "duplicate", "browser"])
+async def test_tool_profile_requires_exact_resource_and_admitted_client(monkeypatch, rsa_keypair, client_id, allowed, audience_kind):
     from app.services.keycloak_oidc import KeycloakOIDC
 
-    issuer, _, mcp_audience = _configure_keycloak(monkeypatch)
+    issuer, api_audience, resource = _configure_keycloak(monkeypatch)
     service = KeycloakOIDC()
     service._jwks = {"keys": [rsa_keypair["jwk"]]}
-    dcr_token = _mint_keycloak_token(
-        rsa_keypair,
-        issuer=issuer,
-        audience=mcp_audience,
-        claim_overrides={"azp": "dynamically-registered-mcp-client"},
-    )
-
-    assert (
-        await service.verify_access_token(
-            dcr_token,
-            mcp_audience,
-            route_profile="mcp",
-        )
-        is not None
-    )
-
-    admin_client_token = _mint_keycloak_token(
-        rsa_keypair,
-        issuer=issuer,
-        audience=mcp_audience,
-        claim_overrides={"azp": settings.keycloak_admin_client_id},
-    )
-    assert (
-        await service.verify_access_token(
-            admin_client_token,
-            mcp_audience,
-            route_profile="mcp",
-        )
-        is None
-    )
+    audiences = {"string": resource, "singleton": [resource], "mixed": [resource, "account"],
+                 "duplicate": [resource, resource], "browser": [resource, api_audience]}
+    token = _mint_keycloak_token(rsa_keypair, issuer=issuer, audience=audiences[audience_kind],
+                                claim_overrides={"azp": client_id})
+    principal = await service.verify_access_token(token, resource, route_profile="mcp")
+    assert (principal is not None) is (allowed and audience_kind in {"string", "singleton"})
 
 
 @pytest.mark.asyncio

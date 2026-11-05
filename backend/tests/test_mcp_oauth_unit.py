@@ -35,6 +35,12 @@ from app.config import settings
 settings.git_storage_path = tempfile.mkdtemp(prefix="akb-mcp-oauth-test-vaults-")
 
 
+@pytest.fixture(autouse=True)
+def _native_client(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_oauth_native_client_id", "test-browser-client")
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com")
+
+
 # ── Helpers ────────────────────────────────────────────────────────
 
 
@@ -122,11 +128,13 @@ def test_audience_effective_default_derives_from_public_base_url(monkeypatch):
     assert settings.mcp_oauth_audience_effective == "https://akb.example.com/mcp"
 
 
-def test_audience_effective_explicit_override(monkeypatch):
-    monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "mcp_oauth_audience", "https://alt.example.com/mcp", raising=False)
-    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com", raising=False)
-    assert settings.mcp_oauth_audience_effective == "https://alt.example.com/mcp"
+def test_audience_effective_rejects_divergent_override(monkeypatch):
+    from app.config import AuthModeConfigurationError
+
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", True)
+    monkeypatch.setattr(settings, "mcp_oauth_audience", "https://alt.example.com/mcp")
+    with pytest.raises(AuthModeConfigurationError, match="must equal"):
+        _ = settings.mcp_oauth_audience_effective
 
 
 # ── KeycloakOIDC.verify_access_token ───────────────────────────────
@@ -672,7 +680,7 @@ def test_metadata_route_404_when_disabled(monkeypatch):
     app = FastAPI()
     app.include_router(oauth_metadata.router)
     client = TestClient(app)
-    resp = client.get("/.well-known/oauth-protected-resource")
+    resp = client.get("/.well-known/oauth-protected-resource/mcp")
     assert resp.status_code == 404
 
 
@@ -692,14 +700,15 @@ def test_metadata_route_full_shape_when_enabled(monkeypatch):
     app = FastAPI()
     app.include_router(oauth_metadata.router)
     client = TestClient(app)
-    resp = client.get("/.well-known/oauth-protected-resource")
+    resp = client.get("/.well-known/oauth-protected-resource/mcp")
     assert resp.status_code == 200
     body = resp.json()
     assert body["resource"] == "https://akb.example.com/mcp"
     assert body["authorization_servers"] == ["https://kc.example.com/realms/akb"]
     assert "akb:vault:read" in body["scopes_supported"]
     assert "akb:vault:write" in body["scopes_supported"]
-    assert "offline_access" in body["scopes_supported"]
+    assert "offline_access" not in body["scopes_supported"]
+    assert body["akb_native_client_id"] == "test-browser-client"
     # OIDC base scopes are also advertised so spec-compliant MCP
     # clients (which request exactly scopes_supported) include them in
     # DCR + authorize. Open-mode first-login fallback still needs email;
@@ -727,7 +736,7 @@ def test_www_authenticate_carries_resource_metadata_when_oauth_on(monkeypatch):
     monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com", raising=False)
     h = _www_authenticate_header()
     assert h.startswith("Bearer realm=")
-    assert 'resource_metadata="https://akb.example.com/.well-known/oauth-protected-resource"' in h
+    assert 'resource_metadata="https://akb.example.com/.well-known/oauth-protected-resource/mcp"' in h
 
 
 # ── MCP_OPERATION_SCOPES completeness (CI guard) ──────────────────────────
@@ -830,3 +839,43 @@ async def test_verify_rejects_spa_audience_token(monkeypatch, rsa_keypair):
         )
         is None
     )
+
+
+def test_prefixed_metadata_is_exact_and_challenge_is_path_aware(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from app.api.routes.oauth_metadata import router
+    from mcp_server.http_app import _www_authenticate_header
+
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", True)
+    monkeypatch.setattr(settings, "keycloak_enabled", True)
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com/prefix/")
+    monkeypatch.setattr(settings, "mcp_oauth_audience", "")
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    response = client.get("/.well-known/oauth-protected-resource/prefix/mcp")
+    assert response.status_code == 200
+    assert response.json()["resource"] == "https://akb.example.com/prefix/mcp"
+    assert response.json()["akb_native_client_id"] == "test-browser-client"
+    for path in ["", "/mcp", "/prefix/mcp/", "/other/mcp"]:
+        assert client.get("/.well-known/oauth-protected-resource" + path).status_code == 404
+    assert 'resource_metadata="https://akb.example.com/.well-known/oauth-protected-resource/prefix/mcp"' in _www_authenticate_header()
+
+
+@pytest.mark.asyncio
+async def test_scope_refusal_precedes_skill_projection(monkeypatch):
+    from mcp_server import server
+
+    async def actor():
+        return server._MCPUser(user_id="u-1", oauth_scopes=["akb:vault:read"])
+
+    async def forbidden(*_args):
+        raise AssertionError("Insufficient scope must precede preflight service access")
+
+    monkeypatch.setattr(server, "_get_user", actor)
+    monkeypatch.setattr(server, "_vault_skill_preflight_version", lambda: 2)
+    monkeypatch.setattr(server, "_can_read_vault", forbidden)
+    result = await server.call_tool("akb_put", {"vault": "team", "title": "x", "body": "x"})
+    import json
+    assert json.loads(result.content[0].text)["code"] == "insufficient_scope"

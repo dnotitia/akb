@@ -965,7 +965,7 @@ class KeycloakOIDC:
             return None
         # The dedicated browser-admin client is an authentication proof only.
         # Its access token must never become an API or MCP resource credential,
-        # even on the MCP profile where dynamic client IDs are otherwise valid.
+        # including explicitly admitted direct MCP clients.
         if claims["azp"] == settings.keycloak_admin_client_id:
             return None
         # A client an operator named as the non-human service authority is
@@ -977,11 +977,18 @@ class KeycloakOIDC:
             return None
         if route_profile == "api" and claims["azp"] not in settings.keycloak_human_client_ids:
             return None
+        if route_profile == "mcp" and claims["azp"] not in settings.mcp_oauth_client_ids:
+            return None
         if type(claims.get("iat")) is not int or type(claims.get("exp")) is not int:
             return None
         if claims["exp"] <= claims["iat"]:
             return None
         raw_audience = claims.get("aud")
+        if route_profile == "mcp" and (
+            audience != settings.mcp_oauth_resource
+            or not (raw_audience == audience or raw_audience == [audience])
+        ):
+            return None
         if isinstance(raw_audience, str):
             audiences = {raw_audience}
         elif isinstance(raw_audience, list) and all(isinstance(item, str) and item for item in raw_audience):

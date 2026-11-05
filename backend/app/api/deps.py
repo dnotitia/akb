@@ -19,6 +19,7 @@ from app.services.auth_service import (
     resolve_delegated_human_authorization,
     resolve_rest_credential_change_authorization,
     resolve_rest_user_authorization,
+    resolve_tool_control_authorization,
     token_has_scope,
 )
 from app.services.app_identity_service import (
@@ -26,6 +27,7 @@ from app.services.app_identity_service import (
     record_app_audit,
     resolve_app_authorization,
 )
+from app.services.tool_resource_policy import REST_OPERATION_SCOPES, required_oauth_scope
 from app.services.auth_policy import sso_browser_session_ready
 from app.services.sso_browser_session_service import (
     SSO_BROWSER_CSRF_HEADER,
@@ -172,15 +174,29 @@ async def get_current_user(
     return await _authenticated_user(request)
 
 
+@dataclass(frozen=True)
+class ToolControlUser:
+    operation: str
+
+    def __post_init__(self) -> None:
+        if self.operation not in REST_OPERATION_SCOPES:
+            raise ValueError(f"Not an admitted tool control: {self.operation}")
+
+    async def __call__(self, request: Request) -> AuthenticatedUser:
+        return await _authenticated_user(request, tool_operation=self.operation)
+
+
 async def _authenticated_user(
     request: Request,
     *,
     for_credential_change: bool = False,
+    tool_operation: str | None = None,
 ) -> AuthenticatedUser:
     current_request_jwt_claims.set(None)
     authorization = request.headers.get("authorization")
-    if authorization:
+    if authorization is not None:
         resolve = (
+            resolve_tool_control_authorization if tool_operation is not None else
             resolve_rest_credential_change_authorization
             if for_credential_change
             else resolve_rest_user_authorization
@@ -192,6 +208,15 @@ async def _authenticated_user(
             raise HTTPException(status_code=401, detail="Authentication required")
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if tool_operation is not None and user.oauth_audience == settings.mcp_oauth_resource:
+        required = required_oauth_scope(tool_operation, {})
+        if required not in (user.oauth_scopes or []):
+            raise HTTPException(status_code=403, detail={
+                "message": f"OAuth token is missing required scope '{required}'",
+                "code": "insufficient_scope",
+                "required_scope": required,
+                "granted_scopes": sorted(user.oauth_scopes or []),
+            })
     required_scope = _required_scope_for_request(request)
     if not token_has_scope(user.token_scopes, required_scope):
         raise HTTPException(

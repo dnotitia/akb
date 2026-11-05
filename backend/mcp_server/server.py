@@ -1649,7 +1649,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
     recorded = False
     try:
         is_write = name in OPERATION_SCOPES and required_oauth_scope(name, arguments) == WRITE_SCOPE
-        result: dict | None = None
+        result = _scope_refusal(name, arguments, user)
 
         # A guide cannot influence a write that has already committed.  For a
         # reader-authorized caller's first write (or the first write after the
@@ -1657,7 +1657,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # the agent applies it and retries the same idempotency/OCC-aware call.
         # Write-only credentials proceed without disclosure.
         preflight_version = _vault_skill_preflight_version()
-        if is_write and preflight_version is not None:
+        if result is None and is_write and preflight_version is not None:
             try:
                 from app.services.tool_usage import vault_of_call
                 from app.services import vault_skill_service
@@ -1837,13 +1837,7 @@ server.add_request_handler("tools/list", PaginatedRequestParams, _list_tools_req
 server.add_request_handler("tools/call", CallToolRequestParams, _call_tool_request)
 
 
-async def _dispatch(name: str, args: dict, user: "_MCPUser"):
-    uid = user.user_id
-
-    handler = _HANDLERS.get(name)
-    if not handler:
-        return err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
-
+def _scope_refusal(name: str, args: dict, user: "_MCPUser") -> dict | None:
     try:
         required = required_oauth_scope(name, args)
     except UnclassifiedOperation:
@@ -1865,6 +1859,20 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 required_scope=required_token_scope,
                 granted_scopes=sorted(user.token_scopes),
             )
+
+    return None
+
+
+async def _dispatch(name: str, args: dict, user: "_MCPUser"):
+    uid = user.user_id
+
+    handler = _HANDLERS.get(name)
+    if not handler:
+        return err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
+
+    refusal = _scope_refusal(name, args, user)
+    if refusal is not None:
+        return refusal
 
     # Reject unknown arguments before the handler sees them. Without
     # this, a typo like `akb_activity(user=...)` (real name: `author`)
