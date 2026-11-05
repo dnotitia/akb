@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -72,6 +73,8 @@ class NativeOAuthFixture:
         self.registration: dict[str, object] = {}
         self.cleanup: dict[str, object] = {}
         self.admin_token = ""
+        self._stop_requested = threading.Event()
+        self._active_process: subprocess.Popen | None = None
 
     @property
     def issuer(self) -> str:
@@ -81,6 +84,8 @@ class NativeOAuthFixture:
         return ["docker", "compose", "--project-name", self.project, "--file", str(self.compose_file), *arguments]
 
     def _command(self, command: list[str], label: str, *, environment: dict[str, str] | None = None) -> None:
+        if self._stop_requested.is_set() and label != "compose-down":
+            raise InterruptedError("native authority startup interrupted")
         log = self.root / f"{label}.log"
         entry: dict[str, object] = {"command": command, "exit": None, "output": str(log)}
         self.commands.append(entry)
@@ -90,6 +95,10 @@ class NativeOAuthFixture:
                 command, env=environment or self.environment, cwd=self.root,
                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
             )
+            self._active_process = process
+            if self._stop_requested.is_set() and label != "compose-down":
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGTERM)
             try:
                 process.wait(timeout=180)
             except BaseException:
@@ -104,10 +113,13 @@ class NativeOAuthFixture:
                 raise
             finally:
                 entry["exit"] = process.returncode
+                self._active_process = None
         if process.returncode:
             raise RuntimeError(f"{label} failed with exit {process.returncode}")
 
     def _admin(self, method: str, path: str, *, body: object = None, expected: int = 200) -> httpx.Response:
+        if self._stop_requested.is_set():
+            raise InterruptedError("native authority startup interrupted")
         response = self.http.request(
             method, f"{self.origin}/admin/{path}", json=body,
             headers={"Authorization": f"Bearer {self.admin_token}"},
@@ -116,6 +128,13 @@ class NativeOAuthFixture:
             raise RuntimeError(f"fixture admin operation failed with HTTP {response.status_code}")
         return response
 
+    def request_stop(self) -> None:
+        self._stop_requested.set()
+        process = self._active_process
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+
     def start(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
@@ -123,6 +142,8 @@ class NativeOAuthFixture:
         self._command(self._compose("up", "--detach", "--pull", "never"), "compose-up")
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
+            if self._stop_requested.is_set():
+                raise InterruptedError("native authority startup interrupted")
             try:
                 ready = self.http.get(f"{self.origin}/realms/master/.well-known/openid-configuration")
                 if ready.status_code == 200:
@@ -177,7 +198,7 @@ class NativeOAuthFixture:
             raise RuntimeError("native client does not require S256")
         if realm.get("revokeRefreshToken") is not True or realm.get("refreshTokenMaxReuse") != 0:
             raise RuntimeError("realm does not require zero-reuse refresh rotation")
-        if set(client.get("defaultClientScopes", [])) != {"profile", "email"}:
+        if set(client.get("defaultClientScopes", [])) != {"basic", "profile", "email"}:
             raise RuntimeError("native default scopes differ from human profile claims")
         if set(client.get("optionalClientScopes", [])) != SCOPES:
             raise RuntimeError("native optional scopes differ from the two AKB scopes")

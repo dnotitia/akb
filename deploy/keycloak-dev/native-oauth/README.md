@@ -10,6 +10,8 @@ The fixture calls `scripts/keycloak/setup-akb-mcp-oauth.py` from the selected
 checkout twice. It independently rereads the real realm and client to verify
 public Authorization Code with S256, the exact loopback callback path, human
 claim scopes, the exact MCP audience mapper, and zero-reuse refresh rotation.
+The native defaults are `basic`, `profile`, and `email`. The `basic` scope
+supplies Keycloak's human subject mapper.
 This command verifies provisioning. It does not establish browser, signed-token,
 proxy OAuth, or native-host acceptance.
 
@@ -38,3 +40,39 @@ networks, volumes, and the listener have been removed.
 testing an operator-script change before the next combined source archive.
 The receipt records its path and SHA256 separately from the candidate checkout.
 Such a run proves that script against the real AS, not a final combined product.
+
+## Run the packed browser and session check
+
+Install the frontend's locked dependencies on the Node version required by
+`frontend/package.json`. The browser driver uses that existing Playwright
+dependency and its Chromium installation. Keep the same fixture credential
+environment described above.
+
+```bash
+RUNTIME_ROOT="$(mktemp -d /tmp/akb-native-browser.XXXXXX)"
+uv run --locked --project backend python \
+  deploy/keycloak-dev/native-oauth/run.py \
+  --checkout "$PWD" --runtime-root "$RUNTIME_ROOT" \
+  --compose-file "$PWD/scripts/ci/dependency-compose.yaml"
+```
+
+For a source archive without `.git`, set `AKB_E2E_SOURCE_REVISION` to its verified
+commit before running this command. `--compose-file` has the existing runtime's
+dependency contract. A private override can select an immutable cached
+PostgreSQL image without changing shared image tags or Docker authentication.
+
+The check retains the common runtime's backend, dependency, credential, and
+process ownership. After its normal PAT bootstrap, it replaces the stdio child
+with the same installed tarball in URL-only OAuth mode. A private PATH opener
+captures the real authorization URL. Chromium fills the real Keycloak form and
+consent page, and the actual proxy owns the callback and exchange.
+
+The receipt separates pending catalog and protocol responses, the new successful
+business read, signed required claims, natural refresh rotation, restart reuse,
+and old-refresh rejection. A pending mutation must remain absent after login.
+`SIGINT` or `SIGTERM` stops startup and verifies cleanup of both owners. Private
+reports and logs remain in the selected runtime root. A failure exits nonzero.
+
+This command is the bounded browser and session gate. It does not report file,
+prefix, negative-authority, concurrent-host, or native CLI acceptance. The common
+runtime selects `bare_git`; this command is not Native revision-storage proof.
