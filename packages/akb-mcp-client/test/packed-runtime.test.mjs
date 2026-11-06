@@ -26,7 +26,7 @@ test("production tarball includes the SDK and catalog and rejects unsupported ru
     const options = { cwd: consumer, env, timeout: 30_000 };
     const packed = await exec("npm", ["pack", packageRoot, "--json", "--pack-destination", root], options);
     const archive = join(root, JSON.parse(packed.stdout)[0].filename);
-    await exec("npm", ["install", archive, "--omit=dev", "--offline", "--ignore-scripts", "--no-audit", "--no-fund"], options);
+    await exec("npm", ["install", archive, "--omit=dev", "--cache", join(root, "npm-cache"), "--ignore-scripts", "--no-audit", "--no-fund"], options);
     const installed = join(consumer, "node_modules", "akb-mcp");
     await assert.rejects(readFile(join(installed, ".npmrc")), { code: "ENOENT" });
     const cli = join(installed, "bin", "akb-mcp.mjs");
