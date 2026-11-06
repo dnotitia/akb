@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import Response, StreamingResponse
 
 from app.api.bounded_body import read_bounded_body
-from app.api.deps import get_current_user
+from app.api.deps import ToolControlUser, get_current_user
 from app.api.file_write_context import resolve_file_read_actor, resolve_file_write_context
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ForbiddenError, NotFoundError
@@ -39,7 +39,7 @@ async def upload_document_image(
     request: Request,
     vault: str,
     filename: str = Query(..., min_length=1, max_length=255),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(ToolControlUser("asset.upload")),
 ):
     """Proxy one bounded raster image to object storage.
 
@@ -346,7 +346,7 @@ async def discard_document_image(
     request: Request,
     vault: str,
     file_id: str,
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(ToolControlUser("asset.discard")),
 ):
     """Remove only an upload that has never reached a document commit.
 

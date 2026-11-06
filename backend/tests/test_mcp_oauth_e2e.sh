@@ -2,18 +2,17 @@
 #
 # AKB MCP OAuth Resource Server — E2E
 #
-# Exercises the new /mcp OAuth path against the local-dev Keycloak overlay
-# WITHOUT needing a browser DCR roundtrip: the test realm's human fixture uses
-# the direct-access grant on the existing `akb-web` client. This keeps the
-# verifier fixture human-shaped while still minting a real Keycloak access
-# token from a shell script.
+# Narrow Resource Server checks using a separately provisioned direct tool
+# test client. Configure its exact MCP audience mapper, optional AKB scopes,
+# password grant and mcp_oauth_direct_client_ids admission explicitly. Keep
+# browser/API clients separate and never password-enable the native client.
+# Native browser, S256 and rotation proof lives in the native-oauth fixture.
 #
 # What this script proves (in order):
-#   1. `/.well-known/oauth-protected-resource` returns the expected shape
+#   1. The resource-specific protected-resource metadata has the expected shape
 #   2. `/mcp` rejects no-auth with 401 + WWW-Authenticate including a
 #      `resource_metadata=` parameter (RFC 9728 §5 client tip-off)
-#   3. `/mcp` rejects a syntactically-valid but wrong-audience token
-#      with 401
+#   3. `/mcp` refuses a token without an admitted tool scope with 403
 #   4. `/mcp` accepts a human access token with both scopes
 #      and dispatches a read-grade tool (akb_list_vaults)
 #   5. `/mcp` rejects a local session JWT and accepts a real `akb_` PAT
@@ -35,19 +34,20 @@
 #   AKB_URL=http://localhost:8000
 #   KC_URL=http://localhost:8080
 #   KC_REALM=akb
-#   KC_TEST_CLIENT_ID=akb-web
-#   KC_TEST_CLIENT_SECRET=local-akb-dev-secret
-#   KC_TEST_USERNAME=alice
-#   KC_TEST_PASSWORD=alice-password
+#   KC_TEST_CLIENT_ID=<separate admitted direct tool test client>
+#   KC_TEST_CLIENT_SECRET=<inject when the test client is confidential>
+#   KC_TEST_USERNAME=<lab human username>
+#   KC_TEST_PASSWORD=<inject lab human password>
 set -uo pipefail
 
 AKB_URL="${AKB_URL:-http://localhost:8000}"
+AKB_URL="${AKB_URL%/}"
 KC_URL="${KC_URL:-http://localhost:8080}"
 KC_REALM="${KC_REALM:-akb}"
-KC_TEST_CLIENT_ID="${KC_TEST_CLIENT_ID:-akb-web}"
-KC_TEST_CLIENT_SECRET="${KC_TEST_CLIENT_SECRET:-local-akb-dev-secret}"
-KC_TEST_USERNAME="${KC_TEST_USERNAME:-alice}"
-KC_TEST_PASSWORD="${KC_TEST_PASSWORD:-alice-password}"
+: "${KC_TEST_CLIENT_ID:?set a separate admitted direct tool test client}"
+KC_TEST_CLIENT_SECRET="${KC_TEST_CLIENT_SECRET:-}"
+: "${KC_TEST_USERNAME:?inject the lab human username}"
+: "${KC_TEST_PASSWORD:?inject the lab human password}"
 
 PASS=0
 FAIL=0
@@ -63,11 +63,12 @@ section() { echo; echo "── $1 ──"; }
 mint_token() {
   # $1 = scope (space-delimited). Empty → realm-default scopes only.
   local scope="$1"
-  local data="grant_type=password&client_id=${KC_TEST_CLIENT_ID}&client_secret=${KC_TEST_CLIENT_SECRET}&username=${KC_TEST_USERNAME}&password=${KC_TEST_PASSWORD}"
-  if [ -n "$scope" ]; then data="${data}&scope=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$scope")"; fi
+  local args=(--data-urlencode "grant_type=password" --data-urlencode "client_id=${KC_TEST_CLIENT_ID}" --data-urlencode "username=${KC_TEST_USERNAME}" --data-urlencode "password=${KC_TEST_PASSWORD}")
+  if [ -n "$KC_TEST_CLIENT_SECRET" ]; then args+=(--data-urlencode "client_secret=${KC_TEST_CLIENT_SECRET}"); fi
+  if [ -n "$scope" ]; then args+=(--data-urlencode "scope=${scope}"); fi
   curl -s -X POST "${KC_URL}/realms/${KC_REALM}/protocol/openid-connect/token" \
        -H "Content-Type: application/x-www-form-urlencoded" \
-       -d "$data" \
+       "${args[@]}" \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))"
 }
 
@@ -94,10 +95,11 @@ mcp_tool_call() {
 # ── 1. Protected-resource metadata shape ─────────────────────
 
 section "Protected-resource metadata"
-meta=$(curl -s "${AKB_URL}/.well-known/oauth-protected-resource")
+metadata_url=$(python3 -c 'from urllib.parse import urlsplit,urlunsplit; import sys; url=urlsplit(sys.argv[1]); print(urlunsplit((url.scheme,url.netloc,"/.well-known/oauth-protected-resource"+url.path.rstrip("/")+"/mcp","","")))' "$AKB_URL")
+meta=$(curl -s "$metadata_url")
 echo "    ${meta}"
 res=$(echo "$meta" | python3 -c "import sys,json; print(json.load(sys.stdin).get('resource',''))" 2>/dev/null) || true
-if [ -n "$res" ]; then pass "metadata served"; else fail "metadata served" "empty/missing"; fi
+if [ "$res" = "${AKB_URL}/mcp" ]; then pass "canonical resource metadata served"; else fail "canonical resource metadata served" "unexpected resource"; fi
 as=$(echo "$meta" | python3 -c "import sys,json; print(','.join(json.load(sys.stdin).get('authorization_servers',[])))" 2>/dev/null) || true
 case "$as" in *"realms/${KC_REALM}"*) pass "authorization_servers points at realm" ;;
                   *) fail "authorization_servers points at realm" "got '$as'" ;;
@@ -107,8 +109,8 @@ case "$scopes" in *"akb:vault:read"*) pass "scopes_supported lists akb:vault:rea
                       *) fail "scopes_supported lists akb:vault:read" "got '$scopes'" ;; esac
 case "$scopes" in *"akb:vault:write"*) pass "scopes_supported lists akb:vault:write" ;;
                        *) fail "scopes_supported lists akb:vault:write" "got '$scopes'" ;; esac
-case "$scopes" in *"offline_access"*) pass "scopes_supported lists offline_access" ;;
-                      *) fail "scopes_supported lists offline_access" "got '$scopes'" ;; esac
+case "$scopes" in *"offline_access"*) fail "offline_access is not advertised" "unexpected scope" ;;
+                      *) pass "offline_access is not advertised" ;; esac
 
 # ── 2. No-auth → 401 + WWW-Authenticate with resource_metadata ──
 
@@ -120,21 +122,17 @@ if [ "$status" = "401" ]; then pass "no-auth → 401"; else fail "no-auth → 40
 case "$wa" in *"resource_metadata="*) pass "WWW-Authenticate carries resource_metadata=" ;;
                   *) fail "WWW-Authenticate carries resource_metadata=" "got '$wa'" ;; esac
 
-# ── 3. Token minted for a different audience → 401 ─────────────
+# ── 3. Token without an admitted tool scope → 403 ─────────────
 
-section "Wrong-audience token → 401"
-# Mint a token without our vault scopes — its `aud` should NOT include
-# our resource (the audience mapper only fires when an akb:vault:* scope
-# is requested). So an unscoped token from the same realm is a useful
-# wrong-audience proxy.
-bad_token=$(mint_token "")
-if [ -z "$bad_token" ]; then fail "mint unscoped token" "Keycloak returned no access_token"; else
+section "Token without tool scopes → 403"
+unscoped_token=$(mint_token "")
+if [ -z "$unscoped_token" ]; then fail "mint unscoped token" "Keycloak returned no access_token"; else
   status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${AKB_URL}/mcp/" \
-             -H "Authorization: Bearer ${bad_token}" \
+             -H "Authorization: Bearer ${unscoped_token}" \
              -H "Content-Type: application/json" \
              -H "Accept: application/json, text/event-stream" \
              -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}')
-  if [ "$status" = "401" ]; then pass "wrong-aud → 401"; else fail "wrong-aud → 401" "got $status"; fi
+  if [ "$status" = "403" ]; then pass "missing tool scopes → 403"; else fail "missing tool scopes → 403" "got $status"; fi
 fi
 
 # ── 4. Human access token with both scopes → 200 + tool list ─

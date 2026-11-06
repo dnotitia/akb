@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from e2e_runtime import (  # noqa: E402
     CredentialNames,
     E2ERuntime,
     ManagedProcess,
+    ProductAssertionFailure,
     ProvisioningFailure,
     SOURCE_REVISION_ENV,
     RuntimeConfig,
@@ -94,6 +96,41 @@ def make_config(tmp_path: Path, *, mode: str = "serve") -> RuntimeConfig:
         compose_project="akb-e2e-unit",
         credentials=CredentialNames("TEST_USERNAME_ENV", "TEST_PASSWORD_ENV"),
     )
+
+
+@pytest.mark.asyncio
+async def test_stdio_consumer_runs_an_archive_copy_with_only_production_dependencies(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    package = checkout / "packages" / "akb-mcp-client"
+    (package / "bin").mkdir(parents=True)
+    (package / "package.json").write_text(json.dumps({
+        "name": "akb-mcp",
+        "version": "1.2.3",
+        "bin": {"akb-mcp": "bin/akb-mcp.mjs"},
+        "files": ["bin/"],
+    }))
+    script = package / "bin" / "akb-mcp.mjs"
+    script.write_text('#!/usr/bin/env node\nconsole.log("archive-copy");\n')
+    script.chmod(0o755)
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), checkout=checkout))
+    consumer = runtime.config.proxy_consumer_dir
+    consumer.mkdir(parents=True)
+    (consumer / "package.json").write_text(json.dumps({
+        "name": "fixture-consumer",
+        "private": True,
+        "devDependencies": {"akb-missing-development-fixture": "file:missing"},
+    }))
+
+    executable = await runtime._install_stdio_proxy()
+    script.write_text('#!/usr/bin/env node\nconsole.log("changed-source");\n')
+    result = subprocess.run(["node", str(executable)], text=True, capture_output=True, check=True)
+
+    assert result.stdout.strip() == "archive-copy"
+    assert executable.resolve().is_relative_to(consumer)
+    assert not (consumer / "node_modules" / "akb-mcp").is_symlink()
+    assert not (consumer / "node_modules" / "akb-missing-development-fixture").exists()
+    assert runtime._proxy_version == "1.2.3"
+    assert os.stat(consumer).st_mode & 0o777 == 0o700
 
 
 @pytest.mark.asyncio
@@ -1959,6 +1996,63 @@ def test_transport_profile_exposes_real_proxy_boundary_without_secret(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("read_response", [
+    {"error": {"code": -32000, "message": "authentication_pending"}},
+    {"result": {"isError": True, "content": [{
+        "type": "text", "text": '{"vaults":[],"total":0,"returned":0}',
+    }]}},
+    {"result": {}},
+    {"result": {"content": [{"type": "image", "data": "invalid"}]}},
+    {"result": {"content": [{"type": "text", "text": "authentication_pending"}]}},
+    {"result": {"content": [{"type": "text", "text": "[]"}]}},
+    {"result": {"content": [{"type": "text", "text": '{"error":"network_unavailable"}'}]}},
+    {"result": {"content": [{"type": "text", "text": '{"vaults":[],"total":true,"returned":0}'}]}},
+    {"result": {"content": [{"type": "text", "text": '{"vaults":[],"total":1,"returned":1}'}]}},
+    {"result": {"content": [{"type": "text", "text": '{"vaults":[{}],"total":0,"returned":1}'}]}},
+])
+async def test_stdio_probe_never_advertises_a_failed_or_malformed_read(tmp_path, monkeypatch, read_response):
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), profile="transport-proxy"))
+    runtime._stdio_read_call_observed = True
+
+    async def request(method, params):
+        if method == "tools/list":
+            return {"result": {"tools": [{"name": name} for name in [
+                "akb_list_vaults", "akb_put", "akb_delete_vault",
+            ]]}}
+        assert params == {"name": "akb_list_vaults", "arguments": {}}
+        return read_response
+
+    monkeypatch.setattr(runtime, "_stdio_request", request)
+
+    with pytest.raises(ProductAssertionFailure):
+        await runtime._probe_stdio_behavior()
+
+    assert runtime.runtime_evidence()["stdio"]["read_call_observed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("public", [
+    {"vaults": [], "total": 0, "returned": 0},
+    {"vaults": [{"name": "fixture-vault"}], "total": 2, "returned": 1},
+])
+async def test_stdio_probe_advertises_a_valid_vault_list_read(tmp_path, monkeypatch, public):
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), profile="transport-proxy"))
+
+    async def request(method, params):
+        if method == "tools/list":
+            return {"result": {"tools": [{"name": name} for name in [
+                "akb_list_vaults", "akb_put", "akb_delete_vault",
+            ]]}}
+        return {"result": {"isError": False, "content": [{"type": "text", "text": json.dumps(public)}]}}
+
+    monkeypatch.setattr(runtime, "_stdio_request", request)
+
+    await runtime._probe_stdio_behavior()
+
+    assert runtime.runtime_evidence()["stdio"]["read_call_observed"] is True
+
+
+@pytest.mark.asyncio
 async def test_oidc_profile_serves_jwks_metadata_and_deterministic_variants(tmp_path):
     runtime = E2ERuntime(
         dataclasses.replace(make_config(tmp_path), profile="oidc-resource-server")
@@ -3122,3 +3216,33 @@ async def test_publication_replica_phase_owns_processes_and_fences_reset(tmp_pat
     assert not runtime._reset_lock.locked()
     assert runtime._children["backend"] is primary
     assert ("publication-replica" in runtime._children) is (outcome == "drain")
+
+
+def test_oidc_runtime_admits_only_its_dedicated_tool_client(tmp_path, monkeypatch):
+    import jwt
+    from app.config import Settings
+    from app.services import lifecycle
+
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), profile="oidc-resource-server"))
+    prepare_private_runtime_root(runtime.config.runtime_root)
+    runtime._write_config()
+    app_config = yaml.safe_load((runtime.config.config_dir / "app.yaml").read_text())
+    secret_config = yaml.safe_load((runtime.config.config_dir / "secret.yaml").read_text())
+    settings = Settings.model_validate(app_config | secret_config)
+    monkeypatch.setattr(lifecycle, "settings", settings)
+    lifecycle._validate_required_settings()
+    key = jwt.PyJWKSet.from_dict(runtime.oidc_fixture.jwks()).keys[0].key
+    claims = jwt.decode(runtime.oidc_fixture.mint("valid"), key, algorithms=["RS256"],
+                        issuer=runtime.oidc_fixture.issuer, audience=settings.mcp_oauth_resource)
+    assert claims["azp"] in settings.mcp_oauth_client_ids
+    assert claims["azp"] not in settings.keycloak_human_client_ids
+    assert settings.mcp_oauth_native_client_id == claims["azp"]
+    assert settings.mcp_oauth_direct_client_ids == []
+
+
+def test_oidc_runtime_reports_the_current_resource_metadata_path(tmp_path):
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path), profile="oidc-resource-server"))
+    evidence = runtime.runtime_evidence()["oidc"]
+    assert evidence["resource_metadata"]["url"] == (
+        f"{runtime.config.app_origin}/.well-known/oauth-protected-resource/mcp"
+    )

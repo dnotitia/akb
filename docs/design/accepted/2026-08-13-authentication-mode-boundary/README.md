@@ -122,6 +122,22 @@ trusted API surface declares whether it accepts them and what scope they carry;
 selecting `local` or `sso` neither reclassifies them as user sessions nor grants
 them universal access.
 
+### Tool resource profile
+
+The named `keycloak-tool-resource-v1` profile deliberately replaces the older
+MCP-only OAuth route contract. Its one canonical resource covers MCP and the
+eight file/image controls listed in the
+[tool-resource contract](../../../designs/mcp-oauth-dcr/00-overview.md).
+It requires the exact resource audience and an explicitly admitted native or
+direct client. It has no audience aliases or old-profile fallback.
+
+This profile is independent of local or SSO browser mode. Human API access
+keeps `keycloak-access-v1`; browser, product-admin, and service profiles remain
+separate. A shared control selects one verifier before projection, verifies
+every claim used for selection, and enforces its operation's OAuth scope.
+A tool credential never enters generic REST or substitutes for a byte-transfer
+capability. Existing database administrator authority is preserved.
+
 ### Fail-closed verifier selection
 
 The canonical mode and the trusted credential surface select the allowed

@@ -45,6 +45,7 @@ from app.services.admission_service import record_arrival
 from app.services.auth_policy import require_local_auth_enabled
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
+    KEYCLOAK_TOOL_RESOURCE_V1,
     KEYCLOAK_SERVICE_AUTHORITY_V1,
     LOCAL_SESSION_RS256_V2,
     KeycloakRouteProfile,
@@ -96,6 +97,7 @@ class AuthenticatedUser:
     # caller that presented a valid token with zero scopes is rejected by the
     # dispatcher's `vault:read|write` requirement.
     oauth_scopes: list[str] | None = None
+    oauth_audience: str | None = None
     # Token-table class for PAT/service-key paths. None for JWT/OAuth.
     key_class: str | None = None
     # Coarse read/write/admin scopes carried by tokens.scopes. None means
@@ -984,6 +986,7 @@ async def _project_keycloak_principal(
             is_admin=resolved["is_admin"],
             auth_method="oauth",
             oauth_scopes=scopes,
+            oauth_audience=principal.audience,
         )
     )
 
@@ -1073,7 +1076,7 @@ async def project_verified_principal_with_reason(
                 for_credential_change=for_credential_change,
             )
         )
-    if principal.profile_id == KEYCLOAK_ACCESS_V1:
+    if principal.profile_id in {KEYCLOAK_ACCESS_V1, KEYCLOAK_TOOL_RESOURCE_V1}:
         return await _project_keycloak_principal(principal, provider_alias=provider_alias)
     if principal.profile_id == KEYCLOAK_SERVICE_AUTHORITY_V1:
         return ProjectionOutcome(
@@ -1615,6 +1618,29 @@ async def _verify_sso_rest_bearer(token: str) -> VerifiedPrincipal | None:
     if service_admin_client_id and _unverified_authorized_party(token) == service_admin_client_id:
         return await verify_keycloak_service_authority_v1(token)
     return await verify_keycloak_access_v1(token, "api")
+
+
+async def resolve_tool_control_authorization(authorization: str) -> AuthenticatedUser | None:
+    """Select one verifier for an explicitly admitted file/image control.
+
+    Unverified audience only selects a verifier. That verifier proves every
+    claim. A combined audience selects the strict tool verifier and fails.
+    """
+    _reset_request_credential_context()
+    token = _bearer_token(authorization)
+    if token is None:
+        return None
+    if token.startswith("akb_"):
+        return await _resolve_pat_or_service(token)
+    audience = _unverified_claim(token, "aud")
+    resource = settings.mcp_oauth_resource
+    selects_tool = audience == resource or isinstance(audience, list) and resource in audience
+    if not selects_tool:
+        return await _resolve_rest_authorization(authorization)
+    principal = await verify_keycloak_access_v1(token, "mcp")
+    if principal is None:
+        return None
+    return await project_verified_principal(principal)
 
 
 async def resolve_mcp_authorization(authorization: str) -> AuthenticatedUser | None:

@@ -1,0 +1,12 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
+    command: ["start-dev"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${AKB_NATIVE_OAUTH_ADMIN_USERNAME:?run through fixture.py}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${AKB_NATIVE_OAUTH_ADMIN_PASSWORD:?run through fixture.py}
+      KC_HOSTNAME: http://127.0.0.1:${AKB_NATIVE_OAUTH_KEYCLOAK_PORT:?run through fixture.py}
+    ports:
+      - "127.0.0.1:${AKB_NATIVE_OAUTH_KEYCLOAK_PORT}:8080"
+    tmpfs:
+      - /opt/keycloak/data:uid=1000,gid=0,mode=0700

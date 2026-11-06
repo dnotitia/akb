@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual, parseArgs } from "node:util";
 
 import { requireSupportedNode } from "../lib/node-runtime.mjs";
+import { createCatalog, currentToolContracts, toolSchemasEqual } from "../lib/catalog.mjs";
+import { FILE_CONTENT_TOOLS, VAULT_SKILL_ACK_ARGUMENT } from "../lib/local-tools.mjs";
 
 export const INSPECTOR_VERSION = "2.4.0";
 export const MODERN_PROTOCOL_VERSION = "2026-07-28";
@@ -328,7 +330,7 @@ async function invoke(info, inputs, configPath, runtimeRoot, method, spawnProces
       result.status = "failed";
       result.error = !readTool ? "akb_list_vaults is missing from tools/list" : !schemaValid ? "akb_list_vaults has no input schema" : "tools/list contains schema errors";
     }
-    return { result, parsed, readSchema: schemaValid ? schema : null, publicResult: null };
+    return { result, parsed, readSchema: schemaValid ? schema : null, publicResult: null, tools };
   } else {
     const text = Array.isArray(payload.content) ? payload.content.find((item) => item?.type === "text")?.text : null;
     let publicResult;
@@ -358,27 +360,74 @@ async function runTransport(info, inputs, credential, target, spawnProcess) {
     temporary = await tempConfig(config);
     const operations = [];
     let readSchema = null;
+    let tools = null;
     let publicResult = null;
     for (const method of SMOKE_OPERATIONS) {
       const operation = await invoke(info, inputs, temporary.path, runtimeRoot, method, spawnProcess, credential.secrets);
       operations.push(operation.result);
       if (operation.readSchema) readSchema = operation.readSchema;
+      if (operation.tools) tools = operation.tools;
       if (operation.publicResult) publicResult = operation.publicResult;
       if (operation.result.status !== "passed") break;
     }
     while (operations.length < SMOKE_OPERATIONS.length) operations.push({ operation: SMOKE_OPERATIONS[operations.length], status: "not_run" });
-    return { transport: target, status: operations.every((operation) => operation.status === "passed") ? "passed" : "failed", operations, readSchema, publicResult };
+    return { transport: target, status: operations.every((operation) => operation.status === "passed") ? "passed" : "failed", operations, readSchema, publicResult, tools };
   } finally {
     if (temporary) await rm(temporary.directory, { recursive: true, force: true });
     await rm(runtimeRoot, { recursive: true, force: true });
   }
 }
 
+export function compareCatalogs(httpTools, stdioTools) {
+  const catalog = createCatalog();
+  const expected = new Map(catalog.initialCatalog().tools.map((tool) => [tool.name, tool]));
+  const canonical = new Set(catalog.canonical.map((tool) => tool.name));
+  const http = new Map((Array.isArray(httpTools) ? httpTools : []).map((tool) => [tool.name, tool]));
+  const stdio = new Map((Array.isArray(stdioTools) ? stdioTools : []).map((tool) => [tool.name, tool]));
+  const mismatches = [];
+  if (!Array.isArray(httpTools) || !Array.isArray(stdioTools) || http.size !== httpTools.length || stdio.size !== stdioTools.length) mismatches.push({ reason: "invalid_or_duplicate_catalog" });
+  const fileArguments = [];
+  const acknowledgements = [];
+  const creationRefinements = [];
+  for (const name of canonical) if (!http.has(name)) mismatches.push({ tool: name, reason: "missing_backend_tool" });
+  for (const [name, tool] of http) {
+    const proxied = stdio.get(name);
+    if (!canonical.has(name) || !proxied) { mismatches.push({ tool: name, reason: canonical.has(name) ? "missing_shared_tool" : "unknown_backend_tool" }); continue; }
+    const contracts = currentToolContracts(name);
+    const httpVariant = contracts.findIndex((contract) => {
+      if (Object.hasOwn(tool.inputSchema?.properties ?? {}, VAULT_SKILL_ACK_ARGUMENT) || !Object.hasOwn(contract.inputSchema.properties ?? {}, VAULT_SKILL_ACK_ARGUMENT)) return toolSchemasEqual(tool, contract);
+      const properties = { ...contract.inputSchema.properties };
+      delete properties[VAULT_SKILL_ACK_ARGUMENT];
+      return toolSchemasEqual(tool, { ...contract, inputSchema: { ...contract.inputSchema, properties } });
+    });
+    const stdioVariant = contracts.findIndex((contract) => toolSchemasEqual(proxied, catalog.decorate([contract])[0]));
+    if (httpVariant < 0 || stdioVariant < 0 || (httpVariant > 0 && stdioVariant > 0 && httpVariant !== stdioVariant)) {
+      mismatches.push({ tool: name, reason: "shared_schema_mismatch" });
+    } else if (httpVariant !== stdioVariant) creationRefinements.push(name);
+    if (FILE_CONTENT_TOOLS.has(name)) fileArguments.push(name);
+    if (contracts[0].inputSchema.properties?.[VAULT_SKILL_ACK_ARGUMENT]) acknowledgements.push(name);
+  }
+  const local = [];
+  for (const [name, tool] of stdio) {
+    if (canonical.has(name)) continue;
+    const localTool = expected.get(name);
+    if (!localTool) { mismatches.push({ tool: name, reason: "unexpected_stdio_tool" }); continue; }
+    if (!toolSchemasEqual(localTool, tool)) mismatches.push({ tool: name, reason: "local_schema_mismatch" });
+    local.push(name);
+  }
+  for (const name of expected.keys()) if (!stdio.has(name)) mismatches.push({ tool: name, reason: "missing_initial_or_local_tool" });
+  return {
+    status: mismatches.length ? "failed" : "passed", shared_tool_count: http.size, mismatches,
+    exceptions: { local_tools: local, file_arguments: fileArguments, shared_skill_acknowledgements: acknowledgements, creation_option_refinements: creationRefinements },
+  };
+}
+
 function compareTransports(http, stdio) {
   if (http.status !== "passed" || stdio.status !== "passed") return { status: "not_run" };
   const schemaMatch = isDeepStrictEqual(http.readSchema, stdio.readSchema);
   const resultMatch = isDeepStrictEqual(http.publicResult, stdio.publicResult);
-  return { status: schemaMatch && resultMatch ? "passed" : "failed", schema_match: schemaMatch, result_match: resultMatch };
+  const catalog = compareCatalogs(http.tools, stdio.tools);
+  return { status: schemaMatch && resultMatch && catalog.status === "passed" ? "passed" : "failed", schema_match: schemaMatch, result_match: resultMatch, catalog };
 }
 
 export async function runSmoke({ info, descriptor, target, fetchImpl = globalThis.fetch, spawnProcess = nodeSpawn } = {}) {

@@ -671,6 +671,7 @@ class E2ERuntime:
         self._pat_value = ""
         self._candidate_revision: str | None = None
         self._proxy_version: str | None = None
+        self._proxy_package_artifact: dict[str, object] | None = None
         self._stdio_initialize_observed = False
         self._stdio_tools_list_observed = False
         self._stdio_read_call_observed = False
@@ -839,6 +840,7 @@ class E2ERuntime:
                 "package": "akb-mcp",
                 "executable": "akb-mcp",
                 "consumer_root": str(self.config.proxy_consumer_dir),
+                "package_artifact": self._proxy_package_artifact,
                 "environment": {
                     "AKB_MCP_URL": f"{self.config.app_origin}/mcp/",
                     "AKB_PAT": self.config.credentials.pat_env,
@@ -851,7 +853,7 @@ class E2ERuntime:
             oidc_evidence = self.oidc_fixture.discovery()
             oidc_evidence["resource_metadata"] = {
                 "method": "GET",
-                "url": f"{self.config.app_origin}/.well-known/oauth-protected-resource",
+                "url": f"{self.config.app_origin}/.well-known/oauth-protected-resource/mcp",
             }
             oidc_evidence["challenge"] = {
                 "method": "POST",
@@ -1956,8 +1958,8 @@ class E2ERuntime:
                     "keycloak_server_url": self.oidc_fixture.origin,
                     "keycloak_internal_url": self.oidc_fixture.origin,
                     "keycloak_realm": self.oidc_fixture.realm,
-                    "keycloak_client_id": "runtime-mcp-client",
-                    "mcp_oauth_audience": self.oidc_fixture.audience,
+                    "keycloak_client_id": "runtime-api-client",
+                    "mcp_oauth_native_client_id": "runtime-mcp-client",
                     "keycloak_enrollment_mode": "open",
                     "keycloak_require_verified_email": True,
                 }
@@ -2549,12 +2551,25 @@ class E2ERuntime:
         self._fixture_private_values = (*self._fixture_private_values, token)
 
     async def _install_stdio_proxy(self) -> Path:
-        """Install the checkout package into the private clean Node consumer."""
 
         consumer = self.config.proxy_consumer_dir
         consumer.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(consumer, 0o700)
+        package_root = self.config.runtime_root / "node-package"
+        package_root.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(package_root, 0o700)
         try:
+            await self._run_logged_command(
+                [
+                    "npm", "pack", str(self.config.proxy_package_dir),
+                    "--pack-destination", str(package_root),
+                ],
+                log_path=self.config.logs_dir / "stdio-pack.log",
+            )
+            archives = list(package_root.glob("*.tgz"))
+            if len(archives) != 1:
+                raise BlockedRuntimeConfig("npm pack did not produce exactly one archive")
+            archive = archives[0]
             await self._run_logged_command(
                 [
                     "npm",
@@ -2564,20 +2579,27 @@ class E2ERuntime:
                     "--no-save",
                     "--package-lock=false",
                     "--ignore-scripts",
+                    "--omit=dev",
                     "--no-audit",
                     "--no-fund",
-                    str(self.config.proxy_package_dir),
+                    str(archive),
                 ],
                 log_path=self.config.logs_dir / "stdio-install.log",
             )
         except ProvisioningFailure as exc:
-            raise BlockedRuntimeConfig("clean Node consumer installation failed") from exc
+            raise BlockedRuntimeConfig("packed production Node consumer installation failed") from exc
         executable = consumer / "node_modules" / ".bin" / "akb-mcp"
-        if not executable.is_file():
-            executable = consumer / "node_modules" / "akb-mcp" / "bin" / "akb-mcp.mjs"
-        if not executable.is_file():
+        installed_package = consumer / "node_modules" / "akb-mcp"
+        if (not executable.is_file() or installed_package.is_symlink()
+                or not executable.resolve().is_relative_to(installed_package)):
             raise BlockedRuntimeConfig("installed akb-mcp package did not expose its bin")
-        self._proxy_version = self._artifact_version(self.config.proxy_package_dir)
+        self._proxy_version = self._artifact_version(installed_package)
+        self._proxy_package_artifact = {
+            "format": "npm-tarball",
+            "filename": archive.name,
+            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "production_dependencies_only": True,
+        }
         return executable
 
     async def _start_stdio_proxy(self) -> None:
@@ -2687,6 +2709,7 @@ class E2ERuntime:
 
         if not self.profile.needs_stdio:
             return
+        self._stdio_read_call_observed = False
         response = await self._stdio_request("tools/list", {})
         result = response.get("result")
         if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
@@ -2706,8 +2729,23 @@ class E2ERuntime:
             {"name": "akb_list_vaults", "arguments": {}},
         )
         read_result = read_response.get("result")
-        if not isinstance(read_result, dict) or "error" in read_response:
+        if (not isinstance(read_result, dict) or "error" in read_response
+                or read_result.get("isError", False) is not False):
             raise ProductAssertionFailure("stdio read tool call was not accepted")
+        content = read_result.get("content")
+        if (not isinstance(content, list) or not content or not isinstance(content[0], dict)
+                or content[0].get("type") != "text" or not isinstance(content[0].get("text"), str)):
+            raise ProductAssertionFailure("stdio read tool call returned no public JSON text")
+        try:
+            public = json.loads(content[0]["text"])
+        except ValueError:
+            raise ProductAssertionFailure("stdio read tool call returned invalid public JSON") from None
+        if not isinstance(public, dict):
+            raise ProductAssertionFailure("stdio read tool call returned a non-object result")
+        vaults, total, returned = public.get("vaults"), public.get("total"), public.get("returned")
+        if (not isinstance(vaults, list) or type(total) is not int or type(returned) is not int
+                or returned != len(vaults) or total < returned):
+            raise ProductAssertionFailure("stdio read tool call returned an invalid Vault list")
         self._stdio_read_call_observed = True
 
     @staticmethod

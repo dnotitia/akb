@@ -595,3 +595,23 @@ async def test_replayed_body_leaves_every_later_read_to_the_client_connection():
 
 async def _resolved(user: AuthenticatedUser) -> AuthenticatedUser:
     return user
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("modern", [False, True])
+async def test_oauth_without_admitted_scope_is_refused_before_protocol_state(monkeypatch, modern):
+    user = _user("oauth-user")
+    user.auth_method = "oauth"
+    user.oauth_scopes = ["openid", "email"]
+    monkeypatch.setattr(http_app, "resolve_mcp_authorization", lambda _header: _resolved(user))
+    application = MCPApp()
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": _modern_meta()}} if modern else {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"},
+        },
+    }
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://test") as client:
+        response = await client.post("/mcp/", json=body, headers=_headers())
+    assert response.status_code == 403
+    assert response.json()["code"] == "insufficient_scope"
+    assert application._session_manager is None

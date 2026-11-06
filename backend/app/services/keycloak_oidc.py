@@ -1,7 +1,7 @@
 """Pinned Keycloak verification plus separated browser OIDC primitives.
 
 Request authorization uses :meth:`verify_access_token` only. The
-route-selected ``keycloak-access-v1`` profile pins RS256, issuer, JWKS, route
+route-selected access-token profiles pin RS256, issuer, JWKS, route
 audience, token kind, and required claims before exact ``(issuer, subject)``
 projection. It never treats an ID token as an API access token.
 
@@ -35,6 +35,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError, AuthenticationError
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
+    KEYCLOAK_TOOL_RESOURCE_V1,
     KEYCLOAK_SERVICE_AUTHORITY_V1,
     KeycloakRouteProfile,
     VerifiedPrincipal,
@@ -889,7 +890,7 @@ class KeycloakOIDC:
         *,
         route_profile: KeycloakRouteProfile,
     ) -> VerifiedPrincipal | None:
-        """Verify one route-selected keycloak-access-v1 credential.
+        """Verify the selected human API or tool-resource credential.
 
         The caller supplies the already-selected API or MCP audience. Token
         headers may only confirm this fixed RS256/JWKS profile; they never
@@ -963,9 +964,6 @@ class KeycloakOIDC:
                 return None
         if "email_verified" in claims and type(claims["email_verified"]) is not bool:
             return None
-        # The dedicated browser-admin client is an authentication proof only.
-        # Its access token must never become an API or MCP resource credential,
-        # even on the MCP profile where dynamic client IDs are otherwise valid.
         if claims["azp"] == settings.keycloak_admin_client_id:
             return None
         # A client an operator named as the non-human service authority is
@@ -977,11 +975,18 @@ class KeycloakOIDC:
             return None
         if route_profile == "api" and claims["azp"] not in settings.keycloak_human_client_ids:
             return None
+        if route_profile == "mcp" and claims["azp"] not in settings.mcp_oauth_client_ids:
+            return None
         if type(claims.get("iat")) is not int or type(claims.get("exp")) is not int:
             return None
         if claims["exp"] <= claims["iat"]:
             return None
         raw_audience = claims.get("aud")
+        if route_profile == "mcp" and (
+            audience != settings.mcp_oauth_resource
+            or not (raw_audience == audience or raw_audience == [audience])
+        ):
+            return None
         if isinstance(raw_audience, str):
             audiences = {raw_audience}
         elif isinstance(raw_audience, list) and all(isinstance(item, str) and item for item in raw_audience):
@@ -1000,7 +1005,7 @@ class KeycloakOIDC:
             return None
 
         return VerifiedPrincipal(
-            profile_id=KEYCLOAK_ACCESS_V1,
+            profile_id=KEYCLOAK_TOOL_RESOURCE_V1 if route_profile == "mcp" else KEYCLOAK_ACCESS_V1,
             issuer=claims["iss"],
             subject=claims["sub"],
             credential_type="access_token",

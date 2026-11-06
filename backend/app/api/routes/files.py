@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
 from app.api.bounded_body import read_bounded_body
-from app.api.deps import get_current_user
+from app.api.deps import ToolControlUser, get_current_user
 from app.api.file_write_context import (
     resolve_file_write_context as _resolve_file_write_context,
 )
@@ -163,7 +163,7 @@ async def upload_file(
             "behaviour."
         ),
     ),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(ToolControlUser("file.reserve_upload")),
 ):
     """Reserve a file and return the absolute URL its bytes are PUT to."""
     access, actor_id, _delegated_actor = await _resolve_file_write_context(
@@ -188,7 +188,7 @@ async def confirm_upload(
     file_id: str,
     content_hash: str | None = Query(None, description="Optional client-computed sha256 of uploaded bytes"),
     hash_algorithm: str = Query("sha256", description="Hash algorithm for content_hash"),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(ToolControlUser("file.confirm_upload")),
 ):
     """Certify uploaded bytes; repeating confirmation preserves the stored result."""
     access, actor_id, delegated_actor = await _resolve_file_write_context(
@@ -230,7 +230,7 @@ async def replace_file(
         None,
         description="Reject with 409 unless the current opaque file version matches",
     ),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(ToolControlUser("file.reserve_replacement")),
 ):
     """Return an isolated upload URL for the replacement, or ``unchanged=true``."""
     access, actor_id, _delegated_actor = await _resolve_file_write_context(
@@ -266,7 +266,7 @@ async def confirm_file_replace(
         None,
         description="Reject with 409 unless the current opaque file version matches",
     ),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(ToolControlUser("file.confirm_replacement")),
 ):
     """Certify staged bytes and atomically publish them under the same URI."""
     access, actor_id, delegated_actor = await _resolve_file_write_context(
@@ -497,7 +497,7 @@ async def authorize_gateway_download(token: str, request: Request):
 async def get_download_url(
     vault: str,
     file_id: str,
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(ToolControlUser("file.download")),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="reader")
     return await file_service.get_download_url(
@@ -565,7 +565,7 @@ async def get_file(
 async def delete_file(
     vault: str,
     file_id: str,
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(ToolControlUser("file.delete")),
 ):
     access = await check_vault_access(user.user_id, vault, required_role="writer")
     return await file_service.delete(

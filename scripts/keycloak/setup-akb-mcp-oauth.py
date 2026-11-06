@@ -1,67 +1,17 @@
 #!/usr/bin/env python3
-"""Apply MCP OAuth Resource Server changes to a Keycloak realm.
+"""Provision the public native AKB OAuth client in a Keycloak realm.
 
-Idempotent — running this twice is a no-op on the second call. Survives
-partial state from a prior interrupted run.
-
-What it does (in order):
-
-1. Add ``localhost`` / ``127.0.0.1`` to the realm's DCR ``trusted-hosts``
-   policy so a local Claude Code (or another DCR-capable MCP client
-   running on the operator's laptop) can register itself dynamically,
-   and turn that policy's sender-host check off.
-1b. Delete the ``Allowed Client Scopes`` registration policy from BOTH
-   the ``anonymous`` and the ``authenticated`` policy set — an Initial
-   Access Token switches which set applies rather than bypassing it, so
-   Protected DCR hits the same wall.
-2. Create the ``akb:vault:read`` client scope (if absent) with an
-   ``oidc-audience-mapper`` whose ``included.custom.audience`` is the
-   AKB ``/mcp`` URL the realm should mint tokens for.
-3. Create the ``akb:vault:write`` client scope the same way.
-4. Add both scopes to ``defaultOptionalClientScopes`` so a DCR-registered
-   public client can request them at the authorize endpoint.
-5. Verify everything by re-reading state.
-
-Reads the Keycloak admin credential from the environment; it is never
-accepted on the command line, so it cannot land in shell history or a
-process listing. Two credential shapes are supported, because the two
-ways this repo ships Keycloak bootstrap two different kinds of admin:
-
-* ``KC_ADMIN_CLIENT_ID`` / ``KC_ADMIN_CLIENT_SECRET`` — client
-  credentials for an admin **service account**. This is what both
-  Kubernetes paths create: ``deploy/k8s/standalone-sso/keycloak.yaml``
-  and ``deploy/helm/akb/templates/sso.yaml`` set
-  ``KC_BOOTSTRAP_ADMIN_CLIENT_ID`` / ``KC_BOOTSTRAP_ADMIN_CLIENT_SECRET``
-  and create no admin user at all.
-* ``KC_ADMIN_USER`` / ``KC_ADMIN_PASS`` — password grant on
-  ``admin-cli``. This is what the local dev fixture creates
-  (``deploy/keycloak-dev/broker-chain/compose.yaml`` sets
-  ``KC_BOOTSTRAP_ADMIN_USERNAME`` / ``KC_BOOTSTRAP_ADMIN_PASSWORD``).
-
-``KC_ADMIN_REALM`` (default ``master``) names the realm the credential
-itself lives in, which is not the realm being configured: the bootstrap
-admin is a ``master``-realm identity, while ``--realm`` is the realm
-whose scopes and policies this script edits. Point it at the target
-realm only if the admin service account was created there instead.
+KC_ADMIN_CLIENT_ID + KC_ADMIN_CLIENT_SECRET authenticate an admin service
+account. KC_ADMIN_USER + KC_ADMIN_PASS authenticate an admin user. Credentials
+stay in the environment. KC_ADMIN_REALM defaults to master.
 
 Usage:
-    # Kubernetes (service account — the shipped manifests' bootstrap)
-    KC_ADMIN_CLIENT_ID=akb-bootstrap-temporary KC_ADMIN_CLIENT_SECRET=... \\
-        python3 scripts/keycloak/setup-akb-mcp-oauth.py \\
-            --kc https://auth.example.com \\
-            --realm akb \\
-            --audience https://akb.example.com/mcp
+    python3 scripts/keycloak/setup-akb-mcp-oauth.py --kc https://auth.example.com \
+        --realm akb --audience https://akb.example.com/mcp \
+        --native-client-id akb-mcp-native
 
-    # Local dev compose fixture (admin user)
-    KC_ADMIN_USER=admin KC_ADMIN_PASS=... \\
-        python3 scripts/keycloak/setup-akb-mcp-oauth.py \\
-            --kc https://auth.example.com \\
-            --realm akb \\
-            --audience https://akb.example.com/mcp
-
-See docs/mcp-clients/web-connectors.md for the end-to-end client
-walkthrough (it is the operational authority for realm settings) and
-docs/designs/mcp-oauth-dcr/00-overview.md for the design rationale.
+This deliberately does not open dynamic registration policies. Direct HTTP
+OAuth clients require a separate registration and explicit AKB allowlisting.
 """
 from __future__ import annotations
 
@@ -75,6 +25,14 @@ import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
+
+
+HTTP_TIMEOUT_SECS = 10.0
+
+
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def http(method: str, url: str, token: str | None = None, body=None,
@@ -92,12 +50,14 @@ def http(method: str, url: str, token: str | None = None, body=None,
         headers["Content-Type"] = ctype
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req) as r:
+        with urllib.request.build_opener(RejectRedirects()).open(req, timeout=HTTP_TIMEOUT_SECS) as r:
             raw = r.read().decode()
             payload = json.loads(raw) if raw and r.headers.get_content_type() == "application/json" else raw
             return r.status, payload, dict(r.headers)
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode(), dict(e.headers)
+    except (urllib.error.URLError, TimeoutError):
+        raise RuntimeError("Keycloak request failed or timed out") from None
 
 
 class AdminCredentialError(RuntimeError):
@@ -217,110 +177,6 @@ def resolve_admin_credential(env: Mapping[str, str]) -> AdminCredential:
     raise AdminCredentialError(_CREDENTIAL_HELP)
 
 
-CLIENT_SCOPE_POLICY_PROVIDER = "allowed-client-templates"
-
-
-TRUSTED_HOSTS_POLICY_PROVIDER = "trusted-hosts"
-
-
-def configure_trusted_hosts(
-    base: str,
-    token: str,
-    components: object,
-    hosts: "list[str]",
-    *,
-    request=http,
-) -> str:
-    """Open the realm's trusted-hosts policy for clients that move around.
-
-    Returns what happened: ``absent``, ``updated`` or ``no-op``.
-
-    **An absent policy is a configuration, not damage.** Keycloak ships this
-    policy and refuses to leave both of its checks off ("At least one of
-    hosts verification or client URIs validation must be enabled"), and its
-    URI check validates a client's informational ``client_uri`` exactly like
-    a redirect URI — so a public MCP client whose ``client_uri`` points at
-    its own homepage is rejected for a field that is never redirected to. A
-    deployment that wants loopback redirects and nothing more therefore
-    deletes this policy and enforces redirects through a client policy
-    instead. That realm is precisely the one that still needs every step
-    after this one, so absence skips this step rather than ending the run.
-
-    A refused write is different, and still stops: it means the realm has
-    the policy and would not take the change.
-    """
-    policy = None
-    if isinstance(components, list):
-        policy = next(
-            (
-                component
-                for component in components
-                if isinstance(component, dict)
-                and component.get("providerId") == TRUSTED_HOSTS_POLICY_PROVIDER
-            ),
-            None,
-        )
-    if policy is None:
-        print("    absent — skipping (this realm enforces redirect URIs elsewhere;")
-        print("    the steps below do not depend on this policy)")
-        return "absent"
-
-    config = policy.setdefault("config", {})
-    current = set(config.get("trusted-hosts", []) or [])
-    print(f"    current: {sorted(current)}")
-    desired = current | set(hosts)
-    changed = False
-    if desired != current:
-        config["trusted-hosts"] = sorted(desired)
-        changed = True
-    # The sender-host check rejects every legitimate DCR from a moving
-    # client (Claude Code on a laptop, claude.ai's egress, etc.) because
-    # those hosts can't be allowlisted upfront. The redirect-URI check is
-    # the meaningful guard; turn the sender-host check off so DCR actually
-    # works from anywhere a client lives.
-    if config.get("host-sending-registration-request-must-match") != ["false"]:
-        config["host-sending-registration-request-must-match"] = ["false"]
-        changed = True
-    if not changed:
-        print("    no-op (already permissive on sender + contains requested hosts)")
-        return "no-op"
-    status, payload, _ = request(
-        "PUT", f"{base}/components/{policy['id']}", token, body=policy
-    )
-    if status not in (200, 204):
-        sys.exit(f"PUT trusted-hosts failed: {status} {payload}")
-    print(f"    updated: trusted-hosts={config['trusted-hosts']} sender-check=off")
-    return "updated"
-
-
-def client_scope_policies(components: object) -> list[dict]:
-    """Every "Allowed Client Scopes" registration policy in a realm, both subtypes.
-
-    Keycloak ships this policy twice: ``anonymous`` gates open DCR, and
-    ``authenticated`` gates DCR made with an Initial Access Token. Both
-    reject a spec-compliant DCR body for the same reason — it contains
-    ``scope=openid``, and ``openid`` is the OIDC sentinel rather than an
-    entry in the realm's client-scope catalog, so no configuration of the
-    policy can permit it. Removing only the anonymous one leaves the
-    Protected-DCR path (the one an operator hardening an
-    internet-reachable IdP is told to use) failing exactly the way this
-    script exists to fix.
-    """
-    if not isinstance(components, list):
-        return []
-    return [
-        component
-        for component in components
-        if isinstance(component, dict)
-        and component.get("providerId") == CLIENT_SCOPE_POLICY_PROVIDER
-    ]
-
-
-def _policy_subtypes(components: object) -> list[str]:
-    """Subtypes of the client-scope policies still present. For the verify step."""
-    return [str(p.get("subType") or "unknown") for p in client_scope_policies(components)]
-
-
 def get_admin_token(kc_url: str, credential: AdminCredential) -> str:
     status, payload, _ = http(
         "POST",
@@ -329,262 +185,163 @@ def get_admin_token(kc_url: str, credential: AdminCredential) -> str:
         ctype="application/x-www-form-urlencoded",
     )
     if status != 200 or not isinstance(payload, dict):
-        sys.exit(f"admin auth failed ({credential.describe()}): {status} {payload}")
+        sys.exit(f"admin auth failed ({credential.describe()}): HTTP {status}")
     tok = payload.get("access_token")
-    if not tok:
-        sys.exit(f"admin auth ({credential.describe()}): no access_token in {payload}")
+    if not isinstance(tok, str) or not tok:
+        sys.exit(f"admin auth ({credential.describe()}): no access_token in HTTP {status} response")
     return tok
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--kc", required=True, help="Keycloak base URL, e.g. https://auth.example.com")
-    p.add_argument("--realm", required=True, help="Keycloak realm name, e.g. akb")
-    p.add_argument(
-        "--audience", required=True,
-        help="MCP resource identifier baked into the audience mapper, e.g. https://akb.example.com/mcp",
-    )
-    p.add_argument(
-        "--trusted-host", action="append", default=["localhost", "127.0.0.1"],
-        help="Hostname(s) to add to the DCR trusted-hosts policy (repeatable; defaults: localhost, 127.0.0.1)",
-    )
-    p.add_argument(
-        "--scope-read", default="akb:vault:read",
-        help="Read scope name (default: akb:vault:read)",
-    )
-    p.add_argument(
-        "--scope-write", default="akb:vault:write",
-        help="Write scope name (default: akb:vault:write)",
-    )
-    args = p.parse_args()
+NATIVE_REDIRECT_URI = "http://127.0.0.1/oauth/callback"
+VAULT_SCOPES = ("akb:vault:read", "akb:vault:write")
 
+
+def native_client(client_id: str, audience: str) -> dict:
+    return {
+        "clientId": client_id,
+        "name": "AKB native MCP client",
+        "enabled": True,
+        "protocol": "openid-connect",
+        "publicClient": True,
+        "bearerOnly": False,
+        "standardFlowEnabled": True,
+        "implicitFlowEnabled": False,
+        "directAccessGrantsEnabled": False,
+        "serviceAccountsEnabled": False,
+        "fullScopeAllowed": False,
+        "consentRequired": True,
+        "redirectUris": [NATIVE_REDIRECT_URI],
+        "webOrigins": [],
+        "defaultClientScopes": ["basic", "profile", "email"],
+        "optionalClientScopes": list(VAULT_SCOPES),
+        "attributes": {"pkce.code.challenge.method": "S256", "use.refresh.tokens": "true"},
+        "protocolMappers": [{
+            "name": "akb-tool-resource",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "consentRequired": False,
+            "config": {
+                "included.custom.audience": audience,
+                "access.token.claim": "true",
+                "id.token.claim": "false",
+                "introspection.token.claim": "true",
+                "userinfo.token.claim": "false",
+            },
+        }],
+    }
+
+
+def provision_native_client(base: str, token: str, client_id: str, audience: str, *, request=http) -> None:
+    def call(method: str, path: str, body=None):
+        status, payload, _headers = request(method, base + path, token, body=body)
+        if status not in {200, 201, 204}:
+            raise RuntimeError(f"Keycloak {method} {path} failed ({status})")
+        return payload
+
+    scopes = call("GET", "/client-scopes")
+    basic = next((scope for scope in scopes if scope.get("name") == "basic"), None)
+    if basic is None or basic.get("protocol") != "openid-connect":
+        raise RuntimeError("Required Keycloak basic OIDC client scope is missing")
+    basic_mappers = call("GET", f"/client-scopes/{basic['id']}/protocol-mappers/models")
+    if not any(
+        mapper.get("protocol") == "openid-connect"
+        and mapper.get("protocolMapper") == "oidc-sub-mapper"
+        and mapper.get("config", {}).get("access.token.claim") == "true"
+        for mapper in basic_mappers
+    ):
+        raise RuntimeError("Required Keycloak basic scope must enable oidc-sub-mapper for access-token subjects")
+    for name in VAULT_SCOPES:
+        scope = next((scope for scope in scopes if scope.get("name") == name), None)
+        if scope is None:
+            call("POST", "/client-scopes", {
+                "name": name, "protocol": "openid-connect",
+                "attributes": {"include.in.token.scope": "true", "display.on.consent.screen": "true",
+                               "consent.screen.text": name},
+            })
+        else:
+            scope["attributes"] = {**scope.get("attributes", {}), "include.in.token.scope": "true"}
+            call("PUT", f"/client-scopes/{scope['id']}", scope)
+            mappers = call("GET", f"/client-scopes/{scope['id']}/protocol-mappers/models")
+            for mapper in mappers:
+                if mapper.get("name") == "akb-mcp-audience" and mapper.get("protocolMapper") == "oidc-audience-mapper":
+                    call("DELETE", f"/client-scopes/{scope['id']}/protocol-mappers/models/{mapper['id']}")
+
+    desired = native_client(client_id, audience)
+    clients = call("GET", "/clients?" + urllib.parse.urlencode({"clientId": client_id}))
+    existing = [client for client in clients if client.get("clientId") == client_id]
+    if len(existing) > 1:
+        raise RuntimeError("Duplicate native client registration")
+    if existing:
+        identifier = existing[0]["id"]
+        call("PUT", f"/clients/{identifier}", desired)
+    else:
+        call("POST", "/clients", desired)
+        clients = call("GET", "/clients?" + urllib.parse.urlencode({"clientId": client_id}))
+        identifier = next(client["id"] for client in clients if client.get("clientId") == client_id)
+
+    # Keycloak stores scope associations and mappers in separate resources.
+    scope_ids = {scope["name"]: scope["id"] for scope in call("GET", "/client-scopes")}
+    for kind, names in [("default", desired["defaultClientScopes"]), ("optional", desired["optionalClientScopes"])]:
+        assigned = call("GET", f"/clients/{identifier}/{kind}-client-scopes")
+        for scope in assigned:
+            if scope["name"] not in names:
+                call("DELETE", f"/clients/{identifier}/{kind}-client-scopes/{scope['id']}")
+        for name in names:
+            if name not in scope_ids:
+                raise RuntimeError(f"Required Keycloak client scope is missing: {name}")
+            call("PUT", f"/clients/{identifier}/{kind}-client-scopes/{scope_ids[name]}")
+    mappers = call("GET", f"/clients/{identifier}/protocol-mappers/models")
+    for mapper in mappers:
+        call("DELETE", f"/clients/{identifier}/protocol-mappers/models/{mapper['id']}")
+    call("POST", f"/clients/{identifier}/protocol-mappers/models", desired["protocolMappers"][0])
+    call("PUT", "", {"revokeRefreshToken": True, "refreshTokenMaxReuse": 0})
+
+    actual = call("GET", f"/clients/{identifier}")
+    for key, value in desired.items():
+        if key not in {"protocolMappers", "defaultClientScopes", "optionalClientScopes", "attributes"} and actual.get(key) != value:
+            raise RuntimeError(f"Native client verification failed for {key}")
+    if actual.get("secret"):
+        raise RuntimeError("Native client must have no secret")
+    if any(actual.get("attributes", {}).get(key) != value for key, value in desired["attributes"].items()):
+        raise RuntimeError("Native PKCE/refresh attributes differ")
+    actual_mappers = call("GET", f"/clients/{identifier}/protocol-mappers/models")
+    expected_mapper = desired["protocolMappers"][0]
+    if len(actual_mappers) != 1 or any(actual_mappers[0].get(key) != value for key, value in expected_mapper.items()):
+        raise RuntimeError("Native audience mapper differs")
+    for kind, names in [("default", desired["defaultClientScopes"]), ("optional", desired["optionalClientScopes"])]:
+        assigned = call("GET", f"/clients/{identifier}/{kind}-client-scopes")
+        if {scope["name"] for scope in assigned} != set(names):
+            raise RuntimeError(f"Native {kind} scopes differ")
+    realm = call("GET", "")
+    if realm.get("revokeRefreshToken") is not True or realm.get("refreshTokenMaxReuse") != 0:
+        raise RuntimeError("Refresh rotation verification failed")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--kc", required=True)
+    parser.add_argument("--realm", required=True)
+    parser.add_argument("--audience", required=True, help="Exact public_base_url + '/mcp'")
+    parser.add_argument("--native-client-id", required=True)
+    args = parser.parse_args()
+    resource = urllib.parse.urlsplit(args.audience)
+    if (not resource.hostname or resource.username or resource.password or resource.query or resource.fragment
+            or not resource.path.endswith("/mcp") or resource.scheme not in {"http", "https"}
+            or resource.scheme == "http" and resource.hostname not in {"127.0.0.1", "localhost", "::1"}):
+        parser.error("audience must be the canonical HTTPS tool resource, or loopback HTTP for development")
+    if not args.native_client_id or args.native_client_id != args.native_client_id.strip():
+        parser.error("native-client-id must be nonempty without surrounding whitespace")
     try:
         credential = resolve_admin_credential(os.environ)
-    except AdminCredentialError as exc:
-        sys.exit(str(exc))
-    print(f"admin auth: {credential.describe()}")
-    if credential.shadowed:
-        print(f"    note: {' + '.join(credential.shadowed)} also set — ignored")
-
-    kc = args.kc.rstrip("/")
-    base = f"{kc}/admin/realms/{args.realm}"
-
-    def fresh_token() -> str:
-        # Admin tokens default to 300s; refresh on each section so a
-        # long run does not stall halfway through.
-        return get_admin_token(kc, credential)
-
-    scopes_to_create = [
-        {
-            "name": args.scope_read,
-            "description": (
-                "Read AKB documents, tables, files, and search across vaults "
-                "you are a member of"
-            ),
-            "consent": "Read your AKB vaults (documents, tables, files, search)",
-        },
-        {
-            "name": args.scope_write,
-            "description": (
-                "Create, edit, delete, and publish AKB content in vaults "
-                "where you have writer/admin role"
-            ),
-            "consent": "Create, edit, and delete AKB content",
-        },
-    ]
-
-    # ── 1. trusted-hosts ──────────────────────────────────────
-    token = fresh_token()
-    print("\n[1] trusted-hosts policy")
-    status, comps, _ = http(
-        "GET",
-        f"{base}/components?type=org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy",
-        token,
-    )
-    if status != 200 or not isinstance(comps, list):
-        sys.exit(f"failed to list registration policies: {status} {comps}")
-    configure_trusted_hosts(base, token, comps, args.trusted_host)
-
-    # ── 1b. allowed-client-templates ──────────────────────────
-    # The default "Allowed Client Scopes" policy rejects any DCR body
-    # that includes `scope=openid`, because Keycloak does not list
-    # `openid` in the realm's client-scope catalog (it is the OIDC
-    # sentinel, not a Keycloak scope). MCP-spec clients (Claude Code,
-    # claude.ai, ChatGPT) always send `openid` in the DCR scope field,
-    # so the policy is incompatible with spec-compliant DCR and no
-    # setting of it helps — the value it would have to allow cannot be
-    # added. The `consent-required`, `trusted-hosts` (URI), and
-    # `max-clients` policies remain as the meaningful guards.
-    #
-    # BOTH subtypes go, and the [authenticated] one is the less obvious
-    # half. An Initial Access Token does not bypass registration
-    # policies, it switches which subtype applies — so Protected DCR,
-    # the option the design offers for hostile internet exposure, runs
-    # into this same wall. Measured on a realm this script had already
-    # configured: an IAT registration carrying the scope field returned
-    # 403 "Policy 'Allowed Client Scopes' rejected request ... Not
-    # permitted to use specified clientScope", and returned 201 only
-    # with the scope field omitted. Leaving the authenticated policy in
-    # place meant the open path worked and the hardened path did not,
-    # which is backwards. The IAT itself is the gate on that path.
-    print("\n[1b] allowed-client-templates policies")
-    policies = client_scope_policies(comps)
-    if policies:
-        for policy in policies:
-            subtype = policy.get("subType") or "unknown"
-            s, r, _ = http("DELETE", f"{base}/components/{policy['id']}", token)
-            if s not in (200, 204):
-                sys.exit(f"DELETE allowed-client-templates [{subtype}] failed: {s} {r}")
-            print(f"    removed [{subtype}] (was rejecting DCR bodies that include scope=openid)")
-    else:
-        print("    no-op (already removed)")
-
-    # ── 2. client scopes + audience mappers ───────────────────
-    created_ids: dict[str, str] = {}
-    for sp in scopes_to_create:
-        token = fresh_token()
-        print(f"\n[2] client scope '{sp['name']}'")
-        s, scopes, _ = http("GET", f"{base}/client-scopes", token)
-        if not isinstance(scopes, list):
-            sys.exit(f"failed to list scopes: {s} {scopes}")
-        existing = next((x for x in scopes if x.get("name") == sp["name"]), None)
-        if existing:
-            print(f"    already exists id={existing['id']}")
-            scope_id = existing["id"]
-        else:
-            payload = {
-                "name": sp["name"],
-                "description": sp["description"],
-                "protocol": "openid-connect",
-                "attributes": {
-                    "consent.screen.text": sp["consent"],
-                    "display.on.consent.screen": "true",
-                    "include.in.token.scope": "true",
-                },
-            }
-            s, r, headers = http("POST", f"{base}/client-scopes", token, body=payload)
-            if s not in (201, 204):
-                sys.exit(f"create scope failed: {s} {r}")
-            loc = headers.get("Location", "")
-            scope_id = loc.rstrip("/").split("/")[-1]
-            print(f"    created id={scope_id}")
-        created_ids[sp["name"]] = scope_id
-
-        # Audience mapper attached to the scope.
-        s, mappers, _ = http(
-            "GET", f"{base}/client-scopes/{scope_id}/protocol-mappers/models", token,
-        )
-        if not isinstance(mappers, list):
-            sys.exit(f"failed to read mappers: {s} {mappers}")
-        aud = next(
-            (m for m in mappers if m.get("protocolMapper") == "oidc-audience-mapper"),
-            None,
-        )
-        if aud:
-            current_aud = aud.get("config", {}).get("included.custom.audience")
-            if current_aud != args.audience:
-                aud["config"]["included.custom.audience"] = args.audience
-                aud["config"]["id.token.claim"] = "false"
-                aud["config"]["access.token.claim"] = "true"
-                s, r, _ = http(
-                    "PUT",
-                    f"{base}/client-scopes/{scope_id}/protocol-mappers/models/{aud['id']}",
-                    token, body=aud,
-                )
-                if s not in (200, 204):
-                    sys.exit(f"PUT audience mapper failed: {s} {r}")
-                print(f"    updated audience → {args.audience}")
-            else:
-                print(f"    audience mapper already → {args.audience}")
-        else:
-            mapper = {
-                "name": "akb-mcp-audience",
-                "protocol": "openid-connect",
-                "protocolMapper": "oidc-audience-mapper",
-                "consentRequired": False,
-                "config": {
-                    "included.custom.audience": args.audience,
-                    "id.token.claim": "false",
-                    "access.token.claim": "true",
-                },
-            }
-            s, r, _ = http(
-                "POST",
-                f"{base}/client-scopes/{scope_id}/protocol-mappers/models",
-                token, body=mapper,
-            )
-            if s not in (201, 204):
-                sys.exit(f"create audience mapper failed: {s} {r}")
-            print(f"    created audience mapper → {args.audience}")
-
-    # ── 3. defaultOptionalClientScopes ────────────────────────
-    token = fresh_token()
-    print("\n[3] realm defaultOptionalClientScopes")
-    s, current_opt, _ = http("GET", f"{base}/default-optional-client-scopes", token)
-    if not isinstance(current_opt, list):
-        sys.exit(f"failed to read optional scopes: {s} {current_opt}")
-    have = {x["name"] for x in current_opt}
-    for name, sid in created_ids.items():
-        if name in have:
-            print(f"    {name} already optional — skip")
-            continue
-        s, r, _ = http(
-            "PUT", f"{base}/default-optional-client-scopes/{sid}",
-            token, body={},
-        )
-        if s not in (200, 204):
-            sys.exit(f"PUT default-optional-client-scope failed: {s} {r}")
-        print(f"    added {name}")
-
-    # ── 4. Verify ─────────────────────────────────────────────
-    token = fresh_token()
-    print("\n[verify]")
-    s, comps, _ = http(
-        "GET",
-        f"{base}/components?type=org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy",
-        token,
-    )
-    # Every read below is `object` as far as the type system knows, because
-    # `http` cannot promise a shape. Narrow each one instead of indexing on
-    # faith: an error body here used to reach `for c in comps` as a
-    # TypeError, and the missing-policy case reached `next()` as a bare
-    # StopIteration — two ways for a verification step to fail as something
-    # other than "verification failed".
-    if not isinstance(comps, list):
-        sys.exit(f"verify: could not list registration policies: {s} {comps}")
-    th2 = next(
-        (c for c in comps if isinstance(c, dict) and c.get("providerId") == "trusted-hosts"),
-        None,
-    )
-    print(f"    trusted-hosts: {th2['config'].get('trusted-hosts') if th2 else 'MISSING'}")
-    print(f"    allowed-client-templates: {sorted(_policy_subtypes(comps)) or 'removed'}")
-    s, scopes, _ = http("GET", f"{base}/client-scopes", token)
-    if not isinstance(scopes, list):
-        sys.exit(f"verify: could not list client scopes: {s} {scopes}")
-    by_name = {x["name"]: x for x in scopes if isinstance(x, dict)}
-    for sp in scopes_to_create:
-        x = by_name.get(sp["name"])
-        if not x:
-            print(f"    {sp['name']}: MISSING"); continue
-        s2, m, _ = http(
-            "GET", f"{base}/client-scopes/{x['id']}/protocol-mappers/models", token,
-        )
-        a = None
-        if isinstance(m, list):
-            a = next(
-                (mm for mm in m
-                 if isinstance(mm, dict) and mm.get("protocolMapper") == "oidc-audience-mapper"),
-                None,
-            )
-        aud = a["config"].get("included.custom.audience") if a else "MISSING"
-        print(f"    {sp['name']}: id={x['id'][:8]}.. aud={aud}")
-    s, opt, _ = http("GET", f"{base}/default-optional-client-scopes", token)
-    if not isinstance(opt, list):
-        sys.exit(f"verify: could not read optional scopes: {s} {opt}")
-    print(f"    defaultOptionalClientScopes: {sorted(x['name'] for x in opt if isinstance(x, dict))}")
-    print("\nDONE.")
+        token = get_admin_token(args.kc.rstrip("/"), credential)
+        provision_native_client(f"{args.kc.rstrip('/')}/admin/realms/{urllib.parse.quote(args.realm, safe='')}",
+                                token, args.native_client_id, args.audience)
+    except (AdminCredentialError, RuntimeError) as exc:
+        parser.exit(1, str(exc) + "\n")
+    print(f"Provisioned public native client {args.native_client_id} for {args.audience}")
+    print("Refresh-token rotation is enabled realm-wide with maximum reuse 0.")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

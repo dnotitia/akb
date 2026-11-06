@@ -11,6 +11,7 @@
 
 import assert from "node:assert/strict";
 import { AKBProxy } from "../lib/proxy.mjs";
+import { parseConfiguration } from "../lib/config.mjs";
 
 let pass = 0;
 let fail = 0;
@@ -32,7 +33,7 @@ function itAsync(name, fn) {
 
 const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
 function newProxy() {
-  return new AKBProxy({ url: "http://akb.test/mcp", pat: "test-pat" });
+  return new AKBProxy(parseConfiguration(["--url", "http://127.0.0.1/mcp", "--pat", "test-pat"], {}));
 }
 const fileToolNames = [
   "akb_put_file",
@@ -106,7 +107,7 @@ itAsync("backend modern discovery carries vault-guide preflight without dropping
   let forwarded;
   proxy._rpc = async (method, params, options) => {
     assert.equal(method, "server/discover");
-    assert.equal(options.protocolMode, "modern");
+    assert.equal(options.timeoutMs, proxy._probeTimeoutMs());
     forwarded = proxy._modernizeParams(params);
     return { supportedVersions: ["2026-07-28"] };
   };
@@ -137,7 +138,7 @@ itAsync("backend modern discovery carries vault-guide preflight without dropping
 
 // ── tools/list degrades to file tools when the backend is unreachable ─
 
-itAsync("tools/list serves file tools only when backend is down and nothing cached", async () => {
+itAsync("tools/list serves the complete generated catalog without backend access", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
   proxy._ensureBackend = async () => false;
@@ -145,19 +146,15 @@ itAsync("tools/list serves file tools only when backend is down and nothing cach
   const res = await proxy._toolsList(2, {});
   const names = res.result.tools.map((t) => t.name);
 
-  assert.deepEqual(names.sort(), [...fileToolNames].sort(), "only file tools served");
-  assert.equal(proxy._servedDegraded, true, "flags the degraded list for later re-list");
+  for (const name of [...fileToolNames, "akb_search", "akb_put", "akb_connection"]) assert.ok(names.includes(name));
+  assert.ok(names.length > fileToolNames.length + 1);
+  assert.equal(new Set(names).size, names.length);
 });
 
-itAsync("tools/list serves the full decorated list from cache", async () => {
+itAsync("tools/list decorates the generated catalog without changing its source", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
-  proxy._cachedTools = {
-    tools: [
-      { name: "akb_put", inputSchema: { type: "object", properties: {} } },
-      { name: "akb_search", inputSchema: { type: "object", properties: {} } },
-    ],
-  };
+  const source = structuredClone(proxy.catalog.canonical);
 
   const res = await proxy._toolsList(3, {});
   const names = res.result.tools.map((t) => t.name);
@@ -172,12 +169,7 @@ itAsync("tools/list serves the full decorated list from cache", async () => {
   assert.match(image.description, /targeted akb_edit/);
   assert.match(image.description, /replaces the entire body/);
   assert.ok(image.inputSchema.properties._vault_skill_ack);
-  assert.equal(proxy._servedDegraded, false, "cached full list is not degraded");
-  // The cache must not be mutated by decoration.
-  assert.ok(
-    !proxy._cachedTools.tools[0].inputSchema.properties.file,
-    "cached tool schema left untouched",
-  );
+  assert.deepEqual(proxy.catalog.canonical, source, "canonical schemas remain unchanged");
 });
 
 itAsync("modern tools/list cache metadata covers degraded and cached catalogs", async () => {
@@ -190,7 +182,6 @@ itAsync("modern tools/list cache metadata covers degraded and cached catalogs", 
   assert.equal(degraded.result.ttlMs, 0, "degraded catalog expires immediately");
   assert.equal(degraded.result.cacheScope, "private", "degraded catalog is private");
 
-  proxy._cachedTools = { tools: [{ name: "akb_search", inputSchema: { type: "object" } }] };
   const cached = await proxy._toolsList(5, {});
   assert.equal(cached.result.ttlMs, 0, "cached catalog expires immediately");
   assert.equal(cached.result.cacheScope, "private", "cached catalog is private");
@@ -198,33 +189,87 @@ itAsync("modern tools/list cache metadata covers degraded and cached catalogs", 
 
 // ── background monitor recovers the toolset after an outage ──────────
 
-itAsync("monitor emits tools/list_changed after backend recovers from a degraded list", async () => {
+itAsync("catalog refinement notifies only when the effective contract changes", async () => {
   const proxy = newProxy();
-  proxy._servedDegraded = true; // client was previously handed file-tools-only
-  proxy._ensureBackend = async () => {
-    proxy._backendReady = true;
-    return true;
-  };
-  proxy._syncTools = async () => ({ tools: [] });
+  const initial = structuredClone(proxy.catalog.canonical);
   const notes = [];
   proxy._notify = (method) => notes.push(method);
+  proxy._rpc = async () => ({ tools: initial });
+  await proxy._syncTools();
+  assert.equal(notes.length, 0);
+  initial[0].description += " Refined description.";
+  await proxy._syncTools();
+  assert.deepEqual(notes, ["notifications/tools/list_changed"]);
+  await proxy._syncTools();
+  assert.equal(notes.length, 1);
+  initial.reverse();
+  initial[0].inputSchema.properties = Object.fromEntries(Object.entries(initial[0].inputSchema.properties).reverse());
+  await proxy._syncTools();
+  assert.equal(notes.length, 1, "object and tool ordering do not change the effective catalog");
+});
 
-  proxy._startBackendMonitor();
-  await tick();
+itAsync("current Native creation options refine the complete catalog once", async () => {
+  const proxy = newProxy();
+  const tools = structuredClone(proxy.catalog.canonical);
+  const create = tools.find((tool) => tool.name === "akb_create_vault");
+  delete create.inputSchema.properties.template;
+  delete create.inputSchema.properties.external_git;
+  create.description = "This deployment supports empty vault creation.";
+  const notes = [];
+  proxy._notify = (method) => notes.push(method);
+  proxy._rpc = async () => ({ tools });
+  await proxy._syncTools();
+  const refined = (await proxy._toolsList(1, {})).result.tools;
+  assert.deepEqual(refined.find((tool) => tool.name === create.name), create);
+  assert.equal(refined.length, proxy.catalog.canonical.length + 7);
+  assert.deepEqual(notes, ["notifications/tools/list_changed"]);
+  await proxy._syncTools();
+  assert.equal(notes.length, 1);
+});
 
-  assert.ok(notes.includes("notifications/tools/list_changed"), "list_changed pushed on recovery");
-  assert.equal(proxy._servedDegraded, false, "degraded flag cleared");
-  proxy._closed = true;
+itAsync("catalog refinement refuses empty and incomplete backend grammars", async () => {
+  for (const tools of [[], structuredClone(newProxy().catalog.canonical).slice(1)]) {
+    const proxy = newProxy();
+    const before = structuredClone(proxy.catalog.initialCatalog());
+    assert.throws(() => proxy.catalog.refine({ tools }), /incompatible/);
+    assert.deepEqual(proxy.catalog.initialCatalog(), before);
+  }
+});
+
+itAsync("catalog accepts current creation refinements and rejects other schema or name changes", async () => {
+  for (const removed of [["template"], ["external_git"], ["template", "external_git"]]) {
+    const proxy = newProxy();
+    const tools = structuredClone(proxy.catalog.canonical);
+    const create = tools.find((tool) => tool.name === "akb_create_vault");
+    for (const argument of removed) delete create.inputSchema.properties[argument];
+    assert.equal(proxy.catalog.refine({ tools }), true);
+    assert.deepEqual(proxy.catalog.initialCatalog().tools.find((tool) => tool.name === create.name), create);
+    assert.equal(proxy.catalog.refine({ tools }), false);
+  }
+  for (const mutate of [
+    (tools) => { tools[tools.length - 1] = tools[0]; },
+    (tools) => { tools[0].name = "akb_unexpected"; },
+    (tools) => { tools.push(tools[0]); },
+    (tools) => { tools[0].outputSchema = { type: "object" }; },
+    (tools) => { tools[0].inputSchema.additionalProperties = false; },
+    (tools) => { delete tools.find((tool) => tool.name === "akb_create_vault").inputSchema.properties.description; },
+  ]) {
+    const proxy = newProxy();
+    const tools = structuredClone(proxy.catalog.canonical);
+    mutate(tools);
+    const before = structuredClone(proxy.catalog.initialCatalog());
+    assert.throws(() => proxy.catalog.refine({ tools }), /incompatible/);
+    assert.deepEqual(proxy.catalog.initialCatalog(), before);
+  }
 });
 
 itAsync("monitor stays silent on recovery when the list was never degraded", async () => {
   const proxy = newProxy();
-  proxy._servedDegraded = false;
   proxy._ensureBackend = async () => {
     proxy._backendReady = true;
     return true;
   };
-  proxy._syncTools = async () => ({ tools: [] });
+  proxy._syncTools = async () => ({ tools: proxy.catalog.canonical });
   const notes = [];
   proxy._notify = (method) => notes.push(method);
 
@@ -313,7 +358,7 @@ itAsync("vault-guide acknowledgement never authorizes an unrelated queued write"
 
 // ── _forward never kills the process; it recovers or surfaces an error ─
 
-itAsync("_forward retries a connection error then surfaces it (process survives)", async () => {
+itAsync("_forward submits once after a connection error and keeps the process alive", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {}; // observe restart without spinning a loop
   let restarts = 0;
@@ -332,26 +377,18 @@ itAsync("_forward retries a connection error then surfaces it (process survives)
   await assert.rejects(() => proxy._forward({ method: "tools/call", id: 5, params: {} }));
   assert.equal(proxy._backendReady, false, "marks backend not-ready");
   assert.ok(restarts >= 1, "kicks the reconnect monitor");
-  assert.ok(calls >= 3, "attempted the initial call plus retries");
+  assert.equal(calls, 1, "caller operation is never replayed");
 });
 
-itAsync("_forward recovers on a later attempt once the backend returns", async () => {
+itAsync("a new explicit call can succeed after a lost first response", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
-  proxy._backendReady = true;
   let calls = 0;
-  proxy._rpc = async () => {
-    calls++;
-    if (calls === 1) throw new Error("socket hang up");
-    return { ok: true };
-  };
-  proxy._ensureBackend = async () => {
-    proxy._backendReady = true;
-    return true;
-  };
-
-  const res = await proxy._forward({ method: "tools/call", id: 7, params: {} });
-  assert.equal(res.result.ok, true, "second attempt succeeds");
+  proxy._rpc = async () => { calls++; if (calls === 1) throw new Error("socket hang up"); return { ok: true }; };
+  await assert.rejects(() => proxy._forward({ method: "tools/call", id: 7, params: {} }));
+  assert.equal(calls, 1);
+  const response = await proxy._forward({ method: "tools/call", id: 8, params: {} });
+  assert.equal(response.result.ok, true);
   assert.equal(calls, 2);
 });
 

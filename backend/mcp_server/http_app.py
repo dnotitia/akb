@@ -27,6 +27,7 @@ from mcp_types import HEADER_MISMATCH, INVALID_REQUEST, UNSUPPORTED_PROTOCOL_VER
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 
 from app.config import settings
+from app.services.tool_resource_policy import ADMITTED_SCOPES
 from app.api.bounded_body import read_bounded_body
 from app.exceptions import AKBError
 from app.services.auth_service import (
@@ -44,10 +45,7 @@ def _www_authenticate_header() -> str:
 
     base = 'Bearer realm="akb-mcp"'
     if settings.mcp_oauth_enabled and settings.public_base_url:
-        meta_url = (
-            f"{settings.public_base_url.rstrip('/')}"
-            "/.well-known/oauth-protected-resource"
-        )
+        meta_url = settings.mcp_oauth_metadata_url
         return f'{base}, resource_metadata="{meta_url}"'
     return base
 
@@ -268,6 +266,15 @@ class MCPApp:
                 {"error": "Invalid or expired token"},
                 status_code=401,
                 headers={"WWW-Authenticate": www_auth},
+            )
+            await response(scope, receive, send)
+            return
+
+        if user.oauth_scopes is not None and not ADMITTED_SCOPES.intersection(user.oauth_scopes):
+            response = JSONResponse(
+                {"error": "OAuth token requires at least one admitted AKB scope", "code": "insufficient_scope"},
+                status_code=403,
+                headers={"WWW-Authenticate": 'Bearer error="insufficient_scope"'},
             )
             await response(scope, receive, send)
             return

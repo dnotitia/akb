@@ -11,8 +11,10 @@ import {
   inspectInstallation,
   parseArguments,
   runSmoke,
+  compareCatalogs,
 } from "../scripts/mcp-inspector-smoke.mjs";
 
+import { createCatalog } from "../lib/catalog.mjs";
 const marker = "akb_synthetic_inspector_marker";
 
 function descriptor(consumerRoot) {
@@ -106,7 +108,7 @@ test("smoke runs both transports, redacts the marker, and removes config state",
       const result = method === "initialize"
         ? { protocolVersion: "2026-07-28", serverInfo: { name: "akb", version: "1" } }
         : method === "tools/list"
-          ? { tools: [{ name: "akb_list_vaults", inputSchema: { type: "object", properties: {} } }] }
+          ? { tools: config.mcpServers.akb.command ? createCatalog().initialCatalog().tools : createCatalog().canonical }
           : { content: [{ type: "text", text: JSON.stringify({ vaults: [], total: 0, returned: 0 }) }], isError: false };
       child.stdout.emit("data", `${JSON.stringify({ result })}\n`);
       child.emit("close", 0);
@@ -169,7 +171,7 @@ test("strict catalog errors fail while warnings remain in the operation result",
       const result = method === "initialize"
         ? { protocolVersion: "2026-07-28", serverInfo: { name: "akb", version: "1" } }
         : method === "tools/list"
-          ? { tools: [{ name: "akb_list_vaults", inputSchema: { type: "object", properties: {} } }] }
+          ? { tools: createCatalog().canonical }
           : { content: [{ type: "text", text: JSON.stringify({ vaults: [], total: 0, returned: 0 }) }], isError: false };
       const envelope = { result };
       if (method === "tools/list") envelope.schemaFindings = schemaFindings;
@@ -232,7 +234,7 @@ test("missing credentials and read-call errors cannot pass", async () => {
         const result = method === "initialize"
           ? { protocolVersion: "2026-07-28", serverInfo: { name: "akb", version: "1" } }
           : method === "tools/list"
-            ? { tools: [{ name: "akb_list_vaults", inputSchema: { type: "object", properties: {} } }] }
+            ? { tools: createCatalog().canonical }
             : { content: [{ type: "text", text: JSON.stringify({ vaults: [], total: 0, returned: 0 }) }], isError: true };
         child.stdout.emit("data", `${JSON.stringify({ result })}\n`);
         child.emit("close", 0);
@@ -257,4 +259,83 @@ test("Node security floor rejects unpatched and unsupported release lines", () =
   for (const version of ["18.20.0", "22.23.3", "24.22.0", "26.12.0", "23.0.0", "25.0.0", "27.0.0", "22.23.4-rc.1", "invalid"]) {
     assert.equal(nodeVersionMeetsFloor(version), false, version);
   }
+});
+
+
+test("complete catalog parity records only exact proxy exceptions", () => {
+  const catalog = createCatalog();
+  const http = structuredClone(catalog.canonical);
+  const stdio = structuredClone(catalog.initialCatalog().tools);
+  const result = compareCatalogs(http, stdio);
+  assert.equal(result.status, "passed");
+  assert.equal(result.shared_tool_count, http.length);
+  assert.equal(result.exceptions.local_tools.length, 7);
+  assert.deepEqual(result.exceptions.file_arguments.sort(), ["akb_put", "akb_update"]);
+  assert.ok(result.exceptions.shared_skill_acknowledgements.includes("akb_put"));
+  for (const mutate of [
+    (tools) => { tools.find((tool) => tool.name === "akb_search").inputSchema.properties.query.type = "number"; },
+    (tools) => { delete tools.find((tool) => tool.name === "akb_put").inputSchema.properties._vault_skill_ack; },
+    (tools) => { tools.find((tool) => tool.name === "akb_put").inputSchema.properties.file.type = "number"; },
+    (tools) => { tools.find((tool) => tool.name === "akb_search").inputSchema.additionalProperties = false; },
+    (tools) => { tools.find((tool) => tool.name === "akb_search").outputSchema = { type: "object" }; },
+    (tools) => { tools.pop(); },
+    (tools) => { tools.push({ name: "akb_unexpected", inputSchema: { type: "object", properties: {} } }); },
+  ]) {
+    const changed = structuredClone(stdio); mutate(changed);
+    assert.equal(compareCatalogs(http, changed).status, "failed");
+  }
+  assert.equal(compareCatalogs([], stdio).status, "failed");
+  assert.equal(compareCatalogs(http.slice(1), stdio).status, "failed");
+  assert.equal(compareCatalogs([...http, http[0]], stdio).status, "failed");
+  assert.equal(compareCatalogs(http, [...stdio, stdio[0]]).status, "failed");
+  const unknown = structuredClone(http);
+  unknown[0].inputSchema.additionalProperties = false;
+  const equallyUnknown = structuredClone(stdio);
+  equallyUnknown[0].inputSchema.additionalProperties = false;
+  assert.equal(compareCatalogs(unknown, equallyUnknown).status, "failed");
+});
+
+test("current Native schemas can differ from the initial complete grammar", () => {
+  const catalog = createCatalog();
+  const http = structuredClone(catalog.canonical);
+  const create = http.find((tool) => tool.name === "akb_create_vault");
+  delete create.inputSchema.properties.template;
+  delete create.inputSchema.properties.external_git;
+  const stdio = structuredClone(catalog.initialCatalog().tools);
+  const initial = compareCatalogs(http, stdio);
+  assert.equal(initial.status, "passed");
+  assert.deepEqual(initial.exceptions.creation_option_refinements, ["akb_create_vault"]);
+  catalog.refine({ tools: http });
+  assert.equal(compareCatalogs(http, catalog.initialCatalog().tools).status, "passed");
+  const unrelated = structuredClone(http);
+  unrelated.find((tool) => tool.name === create.name).inputSchema.properties.name.type = "number";
+  assert.equal(compareCatalogs(unrelated, stdio).status, "failed");
+  const otherRefinement = structuredClone(stdio);
+  delete otherRefinement.find((tool) => tool.name === create.name).inputSchema.properties.template;
+  assert.equal(compareCatalogs(http, otherRefinement).status, "failed");
+});
+
+test("HTTP without negotiated acknowledgement preserves exact shared catalog parity", () => {
+  const catalog = createCatalog();
+  const http = structuredClone(catalog.canonical);
+  const acknowledgementTools = [];
+  for (const tool of http) {
+    if (Object.hasOwn(tool.inputSchema.properties, "_vault_skill_ack")) {
+      acknowledgementTools.push(tool.name);
+      delete tool.inputSchema.properties._vault_skill_ack;
+    }
+  }
+  const stdio = structuredClone(catalog.initialCatalog().tools);
+  const result = compareCatalogs(http, stdio);
+  assert.equal(result.status, "passed", JSON.stringify(result.mismatches));
+  assert.deepEqual(result.exceptions.shared_skill_acknowledgements, acknowledgementTools);
+  const invalidAcknowledgement = structuredClone(http);
+  invalidAcknowledgement.find((tool) => tool.name === "akb_put").inputSchema.properties._vault_skill_ack = { type: "number" };
+  assert.equal(compareCatalogs(invalidAcknowledgement, stdio).status, "failed");
+  const invalidBusinessSchema = structuredClone(http);
+  delete invalidBusinessSchema.find((tool) => tool.name === "akb_put").inputSchema.properties.title;
+  assert.equal(compareCatalogs(invalidBusinessSchema, stdio).status, "failed");
+  const invalidStdio = structuredClone(stdio);
+  delete invalidStdio.find((tool) => tool.name === "akb_put").inputSchema.properties._vault_skill_ack;
+  assert.equal(compareCatalogs(http, invalidStdio).status, "failed");
 });

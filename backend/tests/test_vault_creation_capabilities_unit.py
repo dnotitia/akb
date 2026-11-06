@@ -16,7 +16,21 @@ from app.services.native_document_service import (
 )
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from mcp_server.help import HELP, _resolve_help
-from mcp_server.tools import TOOLS, available_tools
+from mcp_server.tools import TOOLS, available_tools, tools_for_creation_options
+
+
+@pytest.mark.parametrize("templates", [False, True])
+@pytest.mark.parametrize("external_git", [False, True])
+def test_creation_options_preserve_all_tool_names_and_canonical_schemas(templates, external_git):
+    before = [tool.model_dump() for tool in TOOLS]
+    tools = tools_for_creation_options(templates=templates, external_git=external_git)
+    assert [tool.name for tool in tools] == [tool.name for tool in TOOLS]
+    create = next(tool for tool in tools if tool.name == "akb_create_vault")
+    properties = create.input_schema["properties"]
+    assert ("template" in properties) is templates
+    assert ("external_git" in properties) is external_git
+    assert create.input_schema["required"] == ["name"]
+    assert [tool.model_dump() for tool in TOOLS] == before
 
 
 @pytest.mark.parametrize("backend", ["bare_git", "bare_git_current", "postgres_native", "native_ledger_m1"])

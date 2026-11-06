@@ -21,8 +21,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
-          # No cache — the only python deps we need here are listed
-          # in the next step; full backend runtime isn't installed.
+      - uses: astral-sh/setup-uv@v6
       - name: Install backend lint/type/sec tools + detect-secrets
         # Exact-pinned to match backend/pyproject.toml [project.optional-dependencies] dev.
         # Floor-only specifiers let a silent dep upgrade flip the same

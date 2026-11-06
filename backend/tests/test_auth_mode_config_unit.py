@@ -304,6 +304,7 @@ def test_local_mcp_oauth_startup_does_not_require_human_oidc_client_config(
             "auth_mode": "local",
             "keycloak_enabled": True,
             "mcp_oauth_enabled": True,
+            "mcp_oauth_native_client_id": "akb-mcp-native",
             "keycloak_server_url": "https://auth.example.com",
             "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
             "db_password": "test-db-password",  # pragma: allowlist secret
@@ -606,7 +607,7 @@ def test_startup_rejects_equal_api_and_mcp_audiences(
 ) -> None:
     from app.services import lifecycle
 
-    shared_audience = "https://akb.example.com/resource"
+    shared_audience = "https://akb.example.com/mcp"
     loaded = _load(
         monkeypatch,
         tmp_path,

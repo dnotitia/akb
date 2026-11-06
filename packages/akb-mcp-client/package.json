@@ -1,29 +1,45 @@
 {
   "name": "akb-mcp",
-  "version": "2.3.2",
+  "version": "2.4.0",
   "mcpName": "io.github.dnotitia/akb",
-  "description": "AKB MCP stdio client — connect any AI agent to AKB knowledge base. Zero dependencies, auto-reconnect.",
+  "description": "AKB MCP stdio client with browser OAuth, PAT authentication, and local file tools",
   "bin": {
     "akb-mcp": "./bin/akb-mcp.mjs"
   },
   "scripts": {
     "inspect": "node scripts/mcp-inspector-smoke.mjs",
-    "test": "node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs && node test/usage-log.test.mjs && node --test test/mcp-inspector-smoke.test.mjs test/packed-runtime.test.mjs"
+    "test": "node --test test/config.test.mjs test/connection.test.mjs test/transfer.test.mjs test/oauth-session.test.mjs test/stdio-lifecycle.test.mjs && node test/contract.test.mjs && node test/reconnect.test.mjs && node test/protocol.test.mjs && node test/usage-log.test.mjs && node --test test/mcp-inspector-smoke.test.mjs test/packed-runtime.test.mjs",
+    "catalog:check": "node scripts/check-catalog.mjs",
+    "prepack": "npm run catalog:check"
   },
   "type": "module",
   "engines": {
     "node": "^22.23.4 || ^24.22.1 || ^26.12.1"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/inspector": "2.4.0"
   },
-  "files": ["bin/", "lib/", "CHANGELOG.md"],
-  "keywords": ["mcp", "akb", "knowledge-base", "claude-code", "cursor", "copilot", "ai-agent"],
+  "files": [
+    "bin/",
+    "lib/",
+    "CHANGELOG.md"
+  ],
+  "keywords": [
+    "mcp",
+    "akb",
+    "knowledge-base",
+    "claude-code",
+    "cursor",
+    "copilot",
+    "ai-agent"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/dnotitia/akb.git",
     "directory": "packages/akb-mcp-client"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0"
   }
 }
