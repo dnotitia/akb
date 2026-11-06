@@ -72,6 +72,37 @@ const DOCUMENT_IMAGE_MIMES = new Set([
 ]);
 const VAULT_SKILL_ACK_ARGUMENT = "_vault_skill_ack";
 
+// Presence matters: an empty body clears a document, while null on update
+// leaves it unchanged. Neither is an absent argument when a file is supplied.
+function documentInputError(name, args) {
+  const invalid = (error, field, reason, extra = {}) => ({
+    error, code: "invalid_argument", details: { field, reason, ...extra },
+  });
+  if (!isObject(args)) {
+    return invalid("Document arguments must be an object.", "/", "invalid_type");
+  }
+  const hasFile = Object.hasOwn(args, "file");
+  const hasContent = Object.hasOwn(args, "content");
+  if (hasFile && hasContent) {
+    return invalid("Provide either file or content, not both.", "/content", "mutually_exclusive", {
+      conflicts_with: "/file",
+    });
+  }
+  if (hasFile && (typeof args.file !== "string" || args.file.length === 0)) {
+    return invalid("file must be a non-empty path string.", "/file", "invalid_value");
+  }
+  if (name === "akb_put" && !hasFile && !hasContent) {
+    return invalid("Provide content or file to create a document.", "/content", "required");
+  }
+  if (hasContent && typeof args.content !== "string" && !(name === "akb_update" && args.content === null)) {
+    return invalid(
+      name === "akb_update" ? "content must be a string or null." : "content must be a string.",
+      "/content", "invalid_type",
+    );
+  }
+  return null;
+}
+
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -573,40 +604,52 @@ export class AKBProxy {
       return await this._toolsList(id, params);
     }
 
-    // Resolve `file` → `content` for akb_put / akb_update before forwarding
-    if (method === "tools/call" && FILE_CONTENT_TOOLS.has(params?.name)) {
-      const args = params.arguments;
-      if (args?.file) {
-        try {
-          msg = {
-            ...msg,
-            params: {
-              ...params,
-              arguments: this._resolveFileToContent(args),
-            },
-          };
-        } catch (err) {
-          return {
-            jsonrpc: "2.0",
-            id,
-            result: this._clientResult({
-              content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
-              isError: true,
-            }),
-          };
-        }
-      }
-    }
-
-    const callKey = method === "tools/call" ? this._vaultSkillCallKey(msg.params) : null;
-    if (callKey) msg = this._withVaultSkillAcknowledgement(msg, callKey);
-
     // Only measured calls read the clock.
     const measuring = method === "tools/call" && this._usageLogPath !== null;
     const startedAt = measuring ? Date.now() : 0;
     let response;
     let threw = false;
     try {
+      // Resolve `file` → `content` for akb_put / akb_update before forwarding
+      if (method === "tools/call" && FILE_CONTENT_TOOLS.has(params?.name)) {
+        const args = params.arguments ?? {};
+        const inputError = documentInputError(params.name, args);
+        if (inputError) {
+          response = {
+            jsonrpc: "2.0", id,
+            result: this._clientResult({
+              content: [{ type: "text", text: JSON.stringify(inputError) }],
+              isError: true,
+            }),
+          };
+          return response;
+        }
+        if (Object.hasOwn(args, "file")) {
+          try {
+            msg = {
+              ...msg,
+              params: {
+                ...params,
+                arguments: this._resolveFileToContent(args),
+              },
+            };
+          } catch (err) {
+            response = {
+              jsonrpc: "2.0",
+              id,
+              result: this._clientResult({
+                content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
+                isError: true,
+              }),
+            };
+            return response;
+          }
+        }
+      }
+
+      const callKey = method === "tools/call" ? this._vaultSkillCallKey(msg.params) : null;
+      if (callKey) msg = this._withVaultSkillAcknowledgement(msg, callKey);
+
       response =
         method === "tools/call" && FILE_TOOL_NAMES.has(msg.params?.name)
           ? await this._handleFileTool(id, msg.params)
@@ -845,19 +888,35 @@ export class AKBProxy {
   _decorateTools(resp) {
     const tools = (resp.tools || []).map((t) => {
       if (FILE_CONTENT_TOOLS.has(t.name) && t.inputSchema?.properties) {
+        const schema = t.inputSchema;
+        // File input becomes a string body before it reaches the backend.
+        // Reuse its conditional body guards (including OCC), without changing
+        // the original content/null or metadata-only update branches.
+        const fileConditions = (schema.allOf || [])
+          .filter((condition) => condition.if?.required?.includes("content"))
+          .map((condition) => ({ ...condition, if: { required: ["file"] } }));
         return {
           ...t,
           inputSchema: {
-            ...t.inputSchema,
+            ...schema,
             properties: {
-              ...t.inputSchema.properties,
+              ...schema.properties,
               file: {
                 type: "string",
+                minLength: 1,
                 description:
                   "Local file path to read as document body (alternative to content). " +
-                  "Provide either file or content, not both.",
+                  "Omit content entirely when using file, including null or an empty string. " +
+                  "Updates require the same original-read conditions as a content update.",
               },
             },
+            required: (schema.required || []).filter((field) => field !== "content"),
+            allOf: [
+              ...(schema.allOf || []),
+              { not: { required: ["file", "content"] } },
+              ...(t.name === "akb_put" ? [{ anyOf: [{ required: ["content"] }, { required: ["file"] }] }] : []),
+              ...fileConditions,
+            ],
           },
         };
       }
@@ -924,13 +983,11 @@ export class AKBProxy {
    * Throws if both `file` and `content` are provided, or file is unreadable.
    */
   _resolveFileToContent(args) {
-    const { file, content, ...rest } = args;
-    if (!file) {
-      throw new Error("'file' parameter is empty.");
+    const inputError = documentInputError("akb_put", args);
+    if (inputError) {
+      throw Object.assign(new Error(inputError.error), inputError);
     }
-    if (content) {
-      throw new Error("Cannot provide both 'file' and 'content'. Use one or the other.");
-    }
+    const { file, ...rest } = args;
 
     const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
     let fileSize;

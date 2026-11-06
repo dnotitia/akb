@@ -7,6 +7,12 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- MCP document creation rejects missing, null or non-string `content` with
+  `invalid_argument` and `details.field=/content`. Updates reject non-string,
+  non-null bodies before storage access. Metadata-only/null updates, empty
+  body replacements and existing revision/hash preconditions retain their
+  semantics. Local file input remains proxy-only.
+
 ### Breaking: retired authentication inputs
 
 - Remove configuration inputs that `auth_mode` and server-custodied SSO
