@@ -285,7 +285,7 @@ for (const width of [375, 1440]) test(`header navigation waits for an active ima
     await pending;
     await route.fulfill({ json: { id: assetId, name: "diagram.png", mime_type: "image/png", size_bytes: bytes.length, target: `/api/assets/${assetId}`, unclaimed_expires_at: "2099-01-01T00:00:00Z" } });
   });
-  await page.route(`**/api/assets/${assetId}?*`, route => route.fulfill({ contentType: "image/png", body: bytes }));
+  await page.route(`**/api/assets/${assetId}*`, route => route.fulfill({ contentType: "image/png", body: bytes }));
   try {
     await page.goto(`${documentUrl}?view=edit`);
     await expect(page.getByRole("textbox", { name: "Document body (markdown)", exact: true })).toBeVisible();

@@ -531,12 +531,26 @@ execution command without exposing credential values to the descriptor or
 runtime files. The curated list and assertion-count behavior come from the
 shared suite runner, not from duplicated workflow shell steps.
 
-The combined API/browser job has a 45-minute budget. In CI, Playwright's whole
-browser suite is bounded to 30 minutes, leaving time for runtime preparation,
-the API suites, cleanup, and failure-log upload. Existing per-test timeouts and
-assertions remain unchanged. A browser-suite timeout is a failing check, not a
-successful or skipped run; its diagnostics stay in `frontend-e2e.log` within the
-runtime's failure artifacts.
+The runtime job runs preparation, the API suites, and only the browser specs
+that need its backend (`smoke.spec.ts` and the opt-in live specs). Its budget is
+30 minutes and its Playwright budget 10 minutes; preparation and the API suites
+took 11-15 minutes in recent runs. Mock mode also has a 10-minute Playwright
+budget; it runs in about a minute.
+
+The browser specs that answer their own HTTP run in the `frontend e2e
+(fixture)` jobs instead: no backend, a production build served by `vite
+preview`, three shards with one worker each, a 20-minute Playwright budget and
+a 30-minute job budget per shard. On four vCPUs the 633 fixture tests took
+35.3-35.5 minutes one at a time against the Vite dev server (five runs), the
+same as in CI, and 18.3-18.6 minutes against the production build: a
+navigation there loads 10 scripts instead of 336. More workers on one runner
+did not scale: two to four workers saved a third of the time at most and broke
+timing assertions, so the suite scales by shards.
+
+Existing per-test timeouts and assertions remain unchanged. A suite timeout is
+a failing check, not a successful or skipped run. The runtime job keeps its
+browser diagnostics in `frontend-e2e.log` within its failure artifacts; each
+fixture shard uploads its failing tests' traces and screenshots.
 
 ### Clean Ubuntu 24.04 host
 
@@ -594,10 +608,11 @@ repository contribution guide before committing runtime changes.
 
 ## CI checks and packaging coverage
 
-Every PR retains the five existing checks: static analysis/package tests,
-backend unit tests, live PostgreSQL tests, the repository runtime E2E gate,
-and frontend mock E2E. Application packaging is one additional **Docker
-images** check, rather than four independent image jobs.
+Every PR runs static analysis/package tests, backend unit tests, live
+PostgreSQL tests, the repository runtime E2E gate, frontend mock E2E, the
+three frontend fixture E2E shards, and the Keycloak login theme check.
+Application packaging is one additional **Docker images** check, rather than
+four independent image jobs.
 
 The PostgreSQL image is built and exercised by both the live-DB job and the
 repository runtime. It needs no third build in the packaging workflow.
@@ -630,7 +645,7 @@ the job, while the other selected builds continue unless the run is cancelled.
 
 The consolidated status is named `Docker images`; repositories with required
 checks configured should replace the old `Docker image (...)` contexts with
-that name. The five test/static status names are unchanged.
+that name. The consolidation leaves the test and static status names unchanged.
 
 Validate the selector locally without Docker or registry access:
 

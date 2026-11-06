@@ -1,57 +1,133 @@
-import { defineConfig, devices } from "@playwright/test";
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { defineConfig, devices, type PlaywrightTestConfig } from "@playwright/test";
 
+// A mode names the server its specs need:
+//
+// - mock: the Vite dev server with the browser MSW worker and the mock
+//   reset/discovery endpoints. Every spec file loads here; the page.route
+//   specs skip themselves because MSW answers instead. Its fixture state is
+//   shared, so its specs run one at a time.
+// - fixture: a production build served by `vite preview`, with no backend.
+//   These specs answer their requests themselves through page.route, so they
+//   shard across CI jobs. The /api proxy points at a closed port: a request a
+//   spec does not answer gets a 502 and a "http proxy error" line on stderr
+//   instead of a response from some backend.
+// - real: the repository runtime's frontend and backend, at AKB_FRONTEND_URL.
+//   Its specs write to that one backend, so they run one at a time.
+//
+// Fixture and real split the suite between them; mock still loads every spec.
 const mode = process.env.AKB_FE_E2E_MODE;
-if (mode !== "mock" && mode !== "real") {
-  throw new Error("Set AKB_FE_E2E_MODE to mock or real before running Playwright");
+if (mode !== "mock" && mode !== "fixture" && mode !== "real") {
+  throw new Error("Set AKB_FE_E2E_MODE to mock, fixture or real before running Playwright");
 }
-
-const mockMode = mode === "mock";
-if (!mockMode && !process.env.AKB_FRONTEND_URL) {
+if (mode === "real" && !process.env.AKB_FRONTEND_URL) {
   throw new Error("Real Playwright mode requires AKB_FRONTEND_URL from the runtime descriptor");
 }
-const baseURL = mockMode
-  ? "http://127.0.0.1:4173"
-  : process.env.AKB_FRONTEND_URL!;
-const recoveryScenario = process.env.AKB_FE_E2E_SCENARIO === "document-edit-recovery";
-const imageRenderingScenario = process.env.AKB_FE_E2E_SCENARIO === "markdown-image-rendering";
+const ci = !!process.env.CI;
+const minutes = (count: number) => count * 60 * 1000;
 
-// Mock mode owns its Vite webServer and browser MSW worker. Real mode consumes
-// the already-ready frontend origin from the repository runtime descriptor.
-//
-// The full browser regression covers the real runtime and isolated HTTP
-// fixtures. Keep one worker and serialization for the shared backend.
+// Specs that need state outside the page: the runtime backend (real mode) or
+// the mock server's shared fixture state (mock mode). Every other spec owns
+// its HTTP and runs in fixture mode. A spec that depends on a backend response
+// and is not listed here fails in fixture mode, where that response is a 502;
+// a request no assertion depends on only leaves a proxy error line.
+const serverStateSpecs = [
+  "smoke",
+  "search-live",
+  "pat-issuance-live",
+  "account-security-live",
+  "profile-photo-live",
+  "document-edit-recovery",
+  "markdown-image-rendering",
+  "markdown-link-search",
+];
+const serverStateMatch = new RegExp(`/(${serverStateSpecs.join("|")})\\.spec\\.ts$`);
+
+// A real-only spec that is not listed above would run nowhere: fixture mode
+// skips it and real mode never selects it, and the run would still be green.
+// The real-only specs skip themselves with `AKB_FE_E2E_MODE !== "real"`; this
+// refuses an unlisted top-level spec that does. Another spelling of that skip
+// is not detected, so keep to this one.
+const e2eDir = fileURLToPath(new URL("./e2e/", import.meta.url));
+const unlistedRealOnly = readdirSync(e2eDir)
+  .filter((file) => file.endsWith(".spec.ts") && !serverStateMatch.test(`/${file}`))
+  .filter((file) => /AKB_FE_E2E_MODE\s*!==\s*["']real["']/.test(readFileSync(e2eDir + file, "utf8")));
+if (unlistedRealOnly.length > 0) {
+  throw new Error(
+    `Real-only specs not in serverStateSpecs (playwright.config.ts) would never run: ` +
+      `${unlistedRealOnly.join(", ")}. Add them there.`,
+  );
+}
+
+// These scenarios read the mock server's fixture, so they select their spec
+// in mock mode only.
+const scenario = process.env.AKB_FE_E2E_SCENARIO;
+const scenarioMatch =
+  mode === "mock" &&
+  (scenario === "document-edit-recovery" || scenario === "markdown-image-rendering")
+    ? new RegExp(`/${scenario}\\.spec\\.ts$`)
+    : undefined;
+
+const fixtureBuild = "node_modules/.cache/akb-e2e-fixture";
+
+// CI budgets: scripts/ci/README.md records the measured durations they come
+// from. Per-test limits are unchanged, and an exhausted suite budget fails.
+const modes: Record<"mock" | "fixture" | "real", PlaywrightTestConfig> = {
+  mock: {
+    use: { baseURL: "http://127.0.0.1:4173" },
+    webServer: {
+      command: "VITE_AKB_TEST_MODE=mock pnpm run dev --host 127.0.0.1 --port 4173 --strictPort",
+      url: "http://127.0.0.1:4173",
+      reuseExistingServer: false,
+      timeout: 120_000,
+    },
+    fullyParallel: false,
+    workers: 1,
+    globalTimeout: ci ? minutes(10) : undefined,
+  },
+  fixture: {
+    use: { baseURL: "http://127.0.0.1:4174" },
+    webServer: {
+      command:
+        `pnpm exec vite build --outDir ${fixtureBuild} --emptyOutDir && ` +
+        `pnpm exec vite preview --outDir ${fixtureBuild} --host 127.0.0.1 --port 4174 --strictPort`,
+      env: { AKB_FRONTEND_BACKEND_URL: "http://127.0.0.1:9" },
+      url: "http://127.0.0.1:4174",
+      reuseExistingServer: false,
+      timeout: 120_000,
+    },
+    testIgnore: serverStateMatch,
+    // Lets --shard split by test rather than by file. On four vCPUs, two to
+    // four workers saved a third of the time at most and slowed each test
+    // enough to break timing assertions, so the default is one worker and CI
+    // scales by shards. Pass --workers to trade that risk for speed locally.
+    fullyParallel: true,
+    workers: 1,
+    globalTimeout: ci ? minutes(20) : undefined,
+  },
+  real: {
+    use: { baseURL: process.env.AKB_FRONTEND_URL },
+    testMatch: serverStateMatch,
+    fullyParallel: false,
+    workers: 1,
+    globalTimeout: ci ? minutes(10) : undefined,
+  },
+};
+const selected = modes[mode];
+
 export default defineConfig({
   testDir: "./e2e",
-  ...(recoveryScenario
-    ? { testMatch: /document-edit-recovery\.spec\.ts/ }
-    : imageRenderingScenario
-      ? { testMatch: /markdown-image-rendering\.spec\.ts/ }
-      : {}),
-  fullyParallel: false,                  // single backend, serialize
-  forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 1 : 0,
-  // Finish inside the repository runtime job's 60-minute budget, leaving room
-  // for API/setup work, cleanup, and failure-artifact upload. Per-test limits
-  // remain unchanged; an exhausted suite budget still fails the check.
-  globalTimeout: process.env.CI ? 40 * 60 * 1000 : undefined,
-  workers: 1,
-  reporter: process.env.CI ? "github" : "list",
+  ...selected,
+  ...(scenarioMatch ? { testMatch: scenarioMatch, testIgnore: undefined } : {}),
+  forbidOnly: ci,
+  retries: ci ? 1 : 0,
+  reporter: ci ? "github" : "list",
   use: {
-    baseURL,
+    ...selected.use,
     trace: "on-first-retry",
     screenshot: "only-on-failure",
   },
-  ...(mockMode
-    ? {
-        webServer: {
-          command:
-            "VITE_AKB_TEST_MODE=mock pnpm run dev --host 127.0.0.1 --port 4173 --strictPort",
-          url: baseURL,
-          reuseExistingServer: false,
-          timeout: 120_000,
-        },
-      }
-    : {}),
   projects: [
     {
       name: "chromium",
