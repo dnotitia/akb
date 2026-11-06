@@ -1587,7 +1587,10 @@ akb_sql(vaults=["sales","external-projects"],
   sql="SELECT * FROM sales__pipeline p JOIN sales__partners c ON ...")
 ```
 
-Permissions: SELECT=reader, INSERT/UPDATE/DELETE=writer""",
+Permissions: SELECT requires a Vault reader role; writes require a writer role.
+A credential with read authority but no write authority runs SQL in a PostgreSQL
+read-only transaction. Database mutations are denied even when the account has
+write privileges. Write-authorized credentials retain the existing write path.""",
 
     "images": """# Inline Document Images
 

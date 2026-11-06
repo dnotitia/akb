@@ -89,7 +89,7 @@ jobs:
           uv run --locked --project backend python \
             scripts/ci/e2e_runtime.py gate \
             --with-frontend \
-            --profile transport-proxy \
+            --profile transport-oidc \
             --scenario empty \
             --checkout "$GITHUB_WORKSPACE" \
             --runtime-root "${{ runner.temp }}/akb-e2e-runtime"
