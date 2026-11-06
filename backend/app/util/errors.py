@@ -86,6 +86,7 @@ INVALID_URI = "invalid_uri"  # akb:// URI parse failure
 INVALID_PATH = "invalid_path"  # collection / file path failure
 UNKNOWN_ARGUMENT = "unknown_argument"  # arg key not in tool schema (0.5.4)
 UNKNOWN_TOOL = "unknown_tool"
+UNCLASSIFIED_OPERATION = "unclassified_operation"
 CONFLICT = "conflict"  # version / expected-state mismatch
 NATIVE_REVISION_SELECTOR_AMBIGUOUS = "native_revision_selector_ambiguous"
 NATIVE_REVISION_SURFACE_UNSUPPORTED = "native_revision_surface_unsupported"

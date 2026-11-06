@@ -502,8 +502,8 @@ async def test_mcp_dispatch_maps_write_busy(monkeypatch):
     async def busy_handler(args, uid, user):
         raise WriteBusyError("v", 10.0)
 
-    monkeypatch.setitem(srv._HANDLERS, "akb_fake_busy_tool", busy_handler)
-    out = await srv._dispatch("akb_fake_busy_tool", {}, srv._MCPUser())
+    monkeypatch.setitem(srv._HANDLERS, "akb_put", busy_handler)
+    out = await srv._dispatch("akb_put", {}, srv._MCPUser(oauth_scopes=[srv.WRITE_SCOPE]))
     assert out["code"] == WRITE_BUSY
     assert out["details"]["retry_after_secs"] == 5
     assert out["hint"]

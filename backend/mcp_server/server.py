@@ -66,6 +66,7 @@ from app.util.errors import (
     VAULT_SKILL_REQUIRED,
     INVALID_URI,
     NOT_FOUND,
+    UNCLASSIFIED_OPERATION,
     UNKNOWN_ARGUMENT,
     UNKNOWN_TOOL,
     WRITE_BUSY,
@@ -1841,7 +1842,7 @@ def _scope_refusal(name: str, args: dict, user: "_MCPUser") -> dict | None:
     try:
         required = required_oauth_scope(name, args)
     except UnclassifiedOperation:
-        return err(f"Unclassified operation: {name}", code="unclassified_operation")
+        return err(f"Unclassified operation: {name}", code=UNCLASSIFIED_OPERATION)
     if user.oauth_scopes is not None:
         if required not in user.oauth_scopes:
             return err(
