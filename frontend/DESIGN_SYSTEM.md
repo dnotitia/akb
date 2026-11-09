@@ -1147,6 +1147,17 @@ an `sr-only` summary, never the only signal.
   the Collection catalog has been traversed. Expanding a branch or searching
   resumes demand; the explicit keyboard action stays available. Never stop the
   Collection catalog itself merely because its rows are collapsed.
+  While the recursive Vault traversal is incomplete, an expanded Collection
+  near the viewport also owns a bounded direct-child cursor (`depth=0`). Keep
+  its loading, retry and continuation at the end of that branch, independent of
+  unrelated Vault-page errors. Restored offscreen branches wait for scroll
+  demand; closing a branch cancels its pending request. On a user disclosure,
+  reveal the first child inside the same scroll pane without moving focus or
+  hiding sibling Collections. Keep the opening row visible. Further user scroll
+  or navigation input cancels a pending reveal so a late response cannot jump
+  back to the opening row.
+  Server name searches use only their matching cursor, never unfiltered branch
+  queries behind the search results.
   Do not show a permanent partial-load or implementation-limit explanation.
   Name/path search is debounced for 250ms, cancels obsolete requests, and queries
   the entire selected Vault/Collection scope on the server. Continue empty
