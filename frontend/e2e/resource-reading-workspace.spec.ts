@@ -705,7 +705,8 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       }))),
       contentType: "application/json",
     });
-    await expect(page.locator("h1#doc-title")).toHaveCount(1);
+    await expect(page.getByRole("heading", { name: title, level: 1, exact: true })).toBeVisible();
+    await expect(page.locator("#document-reading-canvas h1")).toHaveCount(1);
     await expect(page.locator('[data-slot="resource-command-row"]')).toHaveCount(1);
     const readingTools = page.getByRole("group", { name: "Document reading tools", exact: true });
     await expect(readingTools.getByRole("radio", { name: "Preview", exact: true })).toBeVisible();
@@ -801,7 +802,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
         const rect = el.getBoundingClientRect();
         return { x: rect.x, width: rect.width, top: rect.top, margin: getComputedStyle(el).marginTop };
       };
-      return { heading: box("h2"), paragraph: box("p"), table: box(".akb-md-table"), list: box("ul"), code: box("pre") };
+      return { heading: box("h1"), paragraph: box("p"), table: box(".akb-md-table"), list: box("ul"), code: box("pre") };
     });
     for (const box of [measures.paragraph, measures.table, measures.list, measures.code]) {
       expect(box.x).toBeCloseTo(measures.heading.x, 0);

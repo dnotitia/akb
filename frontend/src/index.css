@@ -1583,7 +1583,7 @@ body::before {
 .reading-studio .document-reading-inset { padding: 2.5rem clamp(1.25rem, 4cqi, 4rem) 4rem; }
 .reading-studio .document-reading-flow { --document-reading-measure: 42rem; font-size: 1rem; line-height: 1.8; }
 .reading-studio .document-reading-source { --document-reading-measure: 42rem; }
-.reading-studio .document-reading-flow .ProseMirror > :is(h1,h2) { font-size: 1.65rem; margin-block: 2rem .9rem; letter-spacing: -.025em; }
+.reading-studio .document-reading-flow .ProseMirror > :is(h1,h2) { font-size: 1.375rem; margin-block: 2rem .9rem; letter-spacing: -.025em; }
 .reading-studio .document-reading-flow .ProseMirror > :first-child { margin-top: 0; }
 .reading-studio .document-reading-flow .ProseMirror > h3 { font-size: 1.2rem; margin-block: 1.8rem .7rem; }
 .reading-studio .document-reading-flow .ProseMirror > :is(p,ul,ol) { margin-block: 1rem; }
@@ -1704,13 +1704,15 @@ p.reading-caption { padding: .6rem .5rem .4rem; }
 .document-byline time { max-width: 100%; font-size: .75rem; white-space: normal; overflow: visible; text-overflow: clip; }
 .document-byline-saved { display: inline-flex; align-items: center; gap: .3rem; color: var(--color-success); }
 .reading-studio .document-reading-flow .ProseMirror > :is(h1,h2):first-child { margin-bottom: .5rem; }
-.document-fallback-title, .document-source-identity > h2 { margin: 0 0 .5rem; font-size: 1.65rem; font-weight: 550; line-height: 1.4; letter-spacing: -.025em; overflow-wrap: anywhere; }
+.document-reading-title, .document-source-identity > :is(h1,h2),
+.reader-render[data-document-title-layout="heading"] .document-reading-flow .ProseMirror > :is(h1,h2):first-child { margin: 0 0 .5rem; font-size: 1.65rem; font-weight: 550; line-height: 1.4; letter-spacing: -.025em; overflow-wrap: anywhere; }
 .document-source-identity { font-family: var(--font-sans); }
 .reading-preview-identity { padding: 0; border: 0; }
 .reading-studio .reading-preview-markdown { padding: 2rem 1.25rem 3rem; }
 .reading-preview-path { margin-block: -.75rem .75rem; font-size: .6875rem; color: var(--color-foreground-muted); overflow-wrap: anywhere; }
 .reading-preview-actions { padding-bottom: 1rem; margin: .5rem 0 1.4rem; border-bottom: 1px solid var(--color-border); }
-.reading-studio .reading-preview-markdown .document-fallback-title { font-size: 1.3rem; }
+.reading-studio .reading-preview-markdown .document-reading-title,
+.reader-render[data-document-title-layout="heading"] .reading-preview-markdown .ProseMirror > h2:first-child { font-size: 1.3rem; }
 .reading-reference-sheet-scroll { flex: 1; min-height: 0; overflow-y: auto; }
 .reading-references-dialog .reading-context-toolbar { flex: none; height: auto; border-bottom: 1px solid var(--color-border); }
 .reading-reference-dialog .reading-preview-toolbar { flex: none; height: auto; border-bottom: 1px solid var(--color-border); }

@@ -36,6 +36,7 @@ interface DocumentViewProps {
   bodyOnly?: boolean;
   idPrefix?: string;
   leadingMetadata?: ReactNode;
+  titleLevel?: 1 | 2;
   searchable?: boolean;
 }
 
@@ -65,6 +66,7 @@ export function DocumentView({
   bodyOnly = false,
   idPrefix = "docview",
   leadingMetadata,
+  titleLevel = 2,
   searchable = false,
 }: DocumentViewProps) {
   const queryClient = useQueryClient();
@@ -72,6 +74,7 @@ export function DocumentView({
   const { checking, revision } = useAccessVerification();
   const [localView, setLocalView] = useState<ViewMode>("rendered");
   const { preferences } = useReaderPreferences();
+  const Title = titleLevel === 1 ? "h1" : "h2";
 
   // Controlled vs. uncontrolled view mode
   const view = viewProp ?? localView;
@@ -144,7 +147,8 @@ export function DocumentView({
             markdown={doc.content || ""}
             summary={doc.summary}
             leadingMetadata={leadingMetadata}
-            fallbackTitle={leadingMetadata ? doc.title : undefined}
+            documentTitle={doc.title || "Untitled document"}
+            documentTitleLevel={titleLevel}
             className="document-reading-flow"
             assetContext={{
               mode: "authenticated",
@@ -161,7 +165,7 @@ export function DocumentView({
           aria-label="Raw markdown source"
           className="document-reading-inset relative bg-surface"
         >
-          {leadingMetadata && <div className="document-reading-source document-source-identity"><h2>{doc.title}</h2>{leadingMetadata}</div>}
+          <div className="document-reading-source document-source-identity"><Title>{doc.title || "Untitled document"}</Title>{leadingMetadata}</div>
           <pre
             data-testid="doc-raw"
             className="document-reading-source m-0 wrap-anywhere overflow-x-auto whitespace-pre-wrap font-mono text-[13px] leading-[1.65] text-foreground"

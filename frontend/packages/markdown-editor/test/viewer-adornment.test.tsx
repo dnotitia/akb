@@ -46,4 +46,24 @@ describe('MarkdownViewer read-only adornment', () => {
     unmount()
     expect(container).toBeEmptyDOMElement()
   })
+
+  it('keeps before-content and after-heading slots separate from source headings and search', async () => {
+    const report = vi.fn()
+    const { container, rerender } = render(<MarkdownViewer markdown={'# Source title\n\nBody text\n\n## Section'}
+      headings={{ levelOffset: 1, levels: [1, 3], ids: ['source-title', 'section'] }}
+      beforeContent={<h1>Presentation title</h1>} afterLeadingHeading={<p>Metadata</p>}
+      reading={{ search: { query: 'Presentation', current: 0 }, onSearchResults: report }} />)
+    const title = await within(container).findByRole('heading', { name: 'Presentation title' })
+    const source = container.querySelector('#source-title')!
+    expect(source.tagName).toBe('H1')
+    expect(container.querySelector('#section')?.tagName).toBe('H3')
+    expect(title.compareDocumentPosition(source) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(source.nextElementSibling).toHaveTextContent('Metadata')
+    await waitFor(() => expect(report).toHaveBeenLastCalledWith({ count: 0, limited: false }))
+    rerender(<MarkdownViewer markdown={'# Source title\n\nBody text\n\n## Section'}
+      headings={{ levelOffset: 1, ids: ['source-title', 'section'] }} />)
+    await waitFor(() => expect(container.querySelectorAll('[data-markdown-leading-adornment]')).toHaveLength(0))
+    expect(container.querySelector('#source-title')?.tagName).toBe('H2')
+    expect(within(container).getByText('Body text')).toBeVisible()
+  })
 })

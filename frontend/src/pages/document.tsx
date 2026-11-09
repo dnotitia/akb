@@ -87,6 +87,7 @@ import { recordRecentDocumentView } from "@/lib/recent-document-views";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
 import { ResourceDeleteDialog } from "@/components/resource-delete-dialog";
 import { DocumentMoveDialog } from "@/components/document-move-dialog";
+import { DocumentRenameDialog } from "@/components/document-rename-dialog";
 import { ArchiveVerificationError, changeDocumentArchiveState, checkDocumentArchiveState, documentArchiveDisabledReason } from "@/lib/document-archive";
 import { DocumentTitleConflictNotice } from "@/components/document-title-conflict-notice";
 import {
@@ -219,6 +220,7 @@ function DocumentPageContent({
   const setDocOverride = (value: any) => setOverride(value ? { scope: resourceScope, value } : null);
   const [articleEl, setArticleEl] = useState<HTMLElement | null>(null);
   const [moveOpen, setMoveOpen] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [archiveNotice, setArchiveNotice] = useState("");
@@ -245,6 +247,7 @@ function DocumentPageContent({
   const menuHandoff = useRef<"copy" | "link" | "publication" | "history" | "details" | "find" | "reading" | "split" | null>(null);
   useEffect(() => {
     setDetailsOpen(false);
+    setRenameOpen(false);
     setCopyNotice(null);
     setDetailsTab("outline");
     setHistoryReturnFocus(null);
@@ -574,9 +577,12 @@ function DocumentPageContent({
   }, [docId, name, queryClient]);
 
   const documentAccessDenied = docQuery.error instanceof ApiError && [401, 403, 404].includes(docQuery.error.status);
-  const doc = documentAccessDenied || !docQuery.data ? null : docOverride ?? docQuery.data;
-  // Local content/property overrides can outlive a metadata refetch. Dates
-  // always come from the current server snapshot, never an optimistic clock.
+  const doc = useMemo(() => {
+    if (documentAccessDenied || !docQuery.data) return null;
+    // A saved-body override must not mask a subsequent title-only rename.
+    return docOverride ? { ...docOverride, title: docQuery.data.title } : docQuery.data;
+  }, [documentAccessDenied, docQuery.data, docOverride]);
+  // Dates also come from the current server snapshot, never an optimistic clock.
   const lastEditedAt = docQuery.data?.updated_at;
   useEffect(() => {
     // Access verification intentionally removes the previous query's data.
@@ -1606,6 +1612,7 @@ function DocumentPageContent({
                 });
               }}
               resourceName={doc.title || fileName}
+              onRename={canEdit && !isGuideDocument ? () => setRenameOpen(true) : undefined}
               archiveAction={doc.status === "archived" ? "restore" : "archive"}
               archiveDisabledReason={archiveDisabledReason}
               onArchiveAction={() => setArchiveOpen(true)}
@@ -1658,7 +1665,7 @@ function DocumentPageContent({
       >
         {docQuery.isFetching && <InlineLoadingState label="Updating document" className="shrink-0 px-4 py-2" />}
         {docQuery.isError && <Alert variant="destructive" className="shrink-0 mx-4 my-2">Document could not be updated. Previous content shown. <Button size="sm" variant="outline" loading={docQuery.isFetching} onClick={() => void docQuery.refetch()}>Retry document</Button></Alert>}
-        <h1 id="doc-title" className="sr-only">{doc.title || "Untitled document"}</h1>
+        {(inEditMode || isDiffMode) && <h1 className="sr-only">{doc.title || "Untitled document"}</h1>}
         {presentation === "preview" && (
           <div className="flex min-h-14 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border bg-surface py-1 pl-4 pr-12 sm:pr-14">
             {resolvedLocation ? <ResourceBreadcrumb className="flex-1" location={resolvedLocation} /> : <span className="flex-1 text-sm text-foreground-muted">Document</span>}
@@ -1753,7 +1760,7 @@ function DocumentPageContent({
           >
             <article
               ref={setArticleEl}
-              aria-labelledby="doc-title"
+              aria-label={doc.title || "Untitled document"}
               className={cn(
                 "w-full",
                 inEditMode
@@ -1979,6 +1986,7 @@ function DocumentPageContent({
                   bodyOnly
                   searchable
                   idPrefix={viewId}
+                  titleLevel={1}
                   leadingMetadata={readingChrome ? metadata : undefined}
                 />
               )}
@@ -2114,6 +2122,12 @@ function DocumentPageContent({
           {copyNotice && <span className="inline-flex items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2 text-sm text-foreground shadow-sm"><CheckCircle2 className="h-4 w-4 text-success" aria-hidden />{copyNotice.label}</span>}
         </div>
       </section>
+
+      {renameOpen && canEdit && !accessChecking && <DocumentRenameDialog
+        key={resourceScope} vault={name!} path={doc.path || docId}
+        returnFocusRef={actionsTriggerRef}
+        onOpenChange={setRenameOpen}
+        onRenamed={() => { setDocOverride(null); refetchTree(); setCopyNotice({ label: "Document title updated." }); }} />}
 
       <DocumentMoveDialog
         open={moveOpen}
