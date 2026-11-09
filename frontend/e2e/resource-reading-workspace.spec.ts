@@ -26,9 +26,11 @@ for (const width of [1024, 1280, 1600]) for (const dark of [false, true]) {
     expect(Math.abs(row.y + row.height - rail.y - rail.height)).toBeLessThanOrEqual(1);
     expect(row.height).toBe(48);
     const metadata = (await page.locator("#document-reading-canvas").getByRole("group", { name: "Document metadata", exact: true }).boundingBox())!;
-    const heading = (await page.locator("#document-reading-canvas").getByRole("heading", { name: "Authored heading", exact: true }).boundingBox())!;
+    const heading = (await page.locator("#document-reading-canvas").getByRole("heading", { name: title, level: 1, exact: true }).boundingBox())!;
     expect(Math.abs(metadata.x - heading.x)).toBeLessThanOrEqual(1);
     expect(metadata.y).toBeGreaterThanOrEqual(heading.y + heading.height);
+    const bodyHeading = (await page.locator("#document-reading-canvas").getByRole("heading", { name: "Authored heading", exact: true }).boundingBox())!;
+    expect(bodyHeading.y).toBeGreaterThanOrEqual(metadata.y + metadata.height);
     const identity = (await sidebar.locator('[data-slot="vault-identity-header"]').boundingBox())!;
     const header = (await page.locator(".app-header").boundingBox())!;
     expect(Math.abs(identity.y + identity.height - header.y - header.height)).toBeLessThanOrEqual(1);
