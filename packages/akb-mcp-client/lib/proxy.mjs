@@ -96,6 +96,12 @@ function isRpcError(value) {
   return isObject(value) && Number.isInteger(value.code) && typeof value.message === "string";
 }
 
+function requireResponseId(response, requestId, statusCode) {
+  if (response.id !== requestId) {
+    throw Object.assign(new Error("MCP response ID does not match the request"), { responseError: true, statusCode });
+  }
+}
+
 // Presence matters: an empty body clears a document, while null on update
 // leaves it unchanged. Neither is an absent argument when a file is supplied.
 function documentInputError(name, args) {
@@ -1849,10 +1855,10 @@ export class AKBProxy {
   async _rpc(method, params, rpcOpts = {}) {
     const mode = rpcOpts.protocolMode || this._backendMode || "modern";
     const outboundParams = mode === "modern" ? this._modernizeParams(params) : params;
-    this.msgId++;
+    const requestId = ++this.msgId;
     const body = JSON.stringify({
       jsonrpc: "2.0",
-      id: this.msgId,
+      id: requestId,
       method,
       params: outboundParams,
     });
@@ -1901,6 +1907,21 @@ export class AKBProxy {
         } catch {
           parsedError = null;
         }
+        // The legacy transport can reject the HTTP session before parsing
+        // the RPC request. Its null-ID errors are session signals only.
+        if (parsedError?.id === null && isRpcError(parsedError.error)) {
+          if (method === "server/discover" && error.statusCode === 400 &&
+              parsedError.error.code === INVALID_REQUEST && /missing session id/i.test(parsedError.error.message)) {
+            throw Object.assign(new Error("Missing session ID"), { code: INVALID_REQUEST });
+          }
+          if (mode === "legacy" && error.statusCode === 404) {
+            throw Object.assign(new Error("Legacy MCP session expired"), { connectionError: true });
+          }
+        }
+        if (isObject(parsedError) && (parsedError.jsonrpc === "2.0" ||
+            Object.hasOwn(parsedError, "result") || isRpcError(parsedError.error))) {
+          requireResponseId(parsedError, requestId, error.statusCode);
+        }
         if (isRpcError(parsedError?.error)) {
           const protocolError = new Error(
             `MCP error ${parsedError.error.code}: ${parsedError.error.message}`,
@@ -1916,10 +1937,6 @@ export class AKBProxy {
       throw error;
     }
 
-    if (mode === "legacy" && resp.headers?.["mcp-session-id"]) {
-      this.sessionId = resp.headers["mcp-session-id"];
-    }
-
     let parsed;
     try {
       parsed = JSON.parse(resp.text);
@@ -1929,6 +1946,7 @@ export class AKBProxy {
     if (!isObject(parsed) || (!Object.hasOwn(parsed, "result") && !isRpcError(parsed.error))) {
       throw Object.assign(new Error("Missing MCP response result"), { responseError: true });
     }
+    requireResponseId(parsed, requestId);
 
     if (isRpcError(parsed.error)) {
       const error = new Error(`MCP error ${parsed.error.code}: ${parsed.error.message}`);
@@ -1940,6 +1958,9 @@ export class AKBProxy {
     }
     if (!isObject(parsed.result)) {
       throw Object.assign(new Error("Invalid MCP response result"), { responseError: true });
+    }
+    if (mode === "legacy" && resp.headers?.["mcp-session-id"]) {
+      this.sessionId = resp.headers["mcp-session-id"];
     }
     return parsed.result;
   }
