@@ -17,7 +17,7 @@ import re
 import time
 import uuid
 import functools
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from typing import Literal, ParamSpec
 
 from app.config import settings
@@ -716,6 +716,34 @@ def _decode_slice_prefix(raw: bytes) -> str | None:
         except UnicodeDecodeError:
             continue
     return None
+
+
+async def _native_section_body(vault: str, doc_id: str) -> str:
+    from app.services.native_document_service import NativeDocumentService
+
+    document = await NativeDocumentService(pool=await get_pool()).get(vault, doc_id)
+    return document.content or ""
+
+
+def _native_section_spans(body: str) -> Iterator[tuple[str, int, int]]:
+    """Yield heading paths with their source body bounds, including any preamble."""
+    from app.services.index_service import _HEADING_RE
+
+    path = ""
+    start = 0
+    hierarchy: list[tuple[int, str]] = []
+    for heading in _HEADING_RE.finditer(body):
+        if path or heading.start():
+            yield path, start, heading.start()
+        level = len(heading.group(1))
+        while hierarchy and hierarchy[-1][0] >= level:
+            hierarchy.pop()
+        hierarchy.append((level, f"{heading.group(1)} {heading.group(2).strip()}"))
+        path = " > ".join(label for _, label in hierarchy)
+        start = heading.end()
+        if body[start:start + 1] == "\n":
+            start += 1
+    yield path, start, len(body)
 
 
 class SearchService:
@@ -2489,37 +2517,14 @@ class SearchService:
     async def drill_down(self, vault: str, doc_id: str, section: str | None = None) -> list[dict]:
         """Get L3 section-level content for a document."""
         if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
-            from app.services.native_document_service import NativeDocumentService
-            from app.services.index_service import MAX_CHUNK_SIZE, _HEADING_RE
+            from app.services.index_service import MAX_CHUNK_SIZE
 
-            # Read verified current authority, not a possibly absent/stale derived
-            # chunk or a legacy catalogue row. The adapter resolves IDs/paths/aliases.
-            document = await NativeDocumentService(pool=await get_pool()).get(vault, doc_id)
+            body = await _native_section_body(vault, doc_id)
 
             def native_sections() -> list[dict]:
-                body = document.content or ""
-                headings = list(_HEADING_RE.finditer(body))
-                spans: list[tuple[str, int, int]] = []
-                if not headings:
-                    spans.append(("", 0, len(body)))
-                elif headings[0].start():
-                    spans.append(("", 0, headings[0].start()))
-                hierarchy: list[tuple[int, str]] = []
-                for index, heading in enumerate(headings):
-                    level = len(heading.group(1))
-                    while hierarchy and hierarchy[-1][0] >= level:
-                        hierarchy.pop()
-                    hierarchy.append((level, f"{'#' * level} {heading.group(2).strip()}"))
-                    path = " > ".join(label for _, label in hierarchy)
-                    start = heading.end()
-                    if body[start:start + 1] == "\n":
-                        start += 1  # Only the heading's line terminator belongs to its syntax.
-                    end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
-                    spans.append((path, start, end))
-
                 rows: list[dict] = []
                 chunk_index = 0
-                for path, start, end in spans:
+                for path, start, end in _native_section_spans(body):
                     # Index chunks insert nested overlap and synthetic context.
                     # Current-body reads instead slice source spans directly:
                     # no content guessing, no duplicate bytes, bounded rows.
@@ -2565,30 +2570,35 @@ class SearchService:
 
             return clean_section_rows(rows)
 
-    async def list_section_headings(self, vault: str, doc_id: str, limit: int | None = None) -> list[str]:
-        """Return the document's distinct section paths, without their bodies,
-        in first-occurrence order.
-
-        Used by `akb_drill_down`'s empty-match fallback to surface the
-        available headings cheaply — pulling full content for a 1000-
-        section doc just to extract heading strings is wasteful.
-
-        One heading, one row. A section longer than `MAX_CHUNK_SIZE` is stored
-        as several chunks that all carry the same `section_path`, so the
-        row-per-chunk form repeated a heading once per chunk and the caller's
-        outline cap was spent on duplicates instead of on headings it had not
-        seen yet. `limit` therefore bounds *headings*: the grouping happens in
-        SQL, before the LIMIT, and the Python pass keeps the contract true
-        regardless of how the rows arrive.
-        """
+    async def list_section_headings(
+        self, vault: str, doc_id: str, limit: int | None = None, *, section: str | None = None,
+    ) -> list[str]:
+        """List distinct paths in first-occurrence order, optionally within one heading subtree."""
+        # Indexed Markdown uses "# Parent > ## Child". Older unmarked paths
+        # use "Parent/Child". A slash in a Markdown heading is literal.
+        child_prefix = None
+        if section:
+            delimiter = " > #" if section.startswith("#") else "/"
+            child_prefix = section + delimiter
         if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
-            rows = await self.drill_down(vault, doc_id)
-            native_headings = list(dict.fromkeys(row["section_path"] for row in rows if row["section_path"]))
-            return native_headings[:limit] if isinstance(limit, int) and limit > 0 else native_headings
+            body = await _native_section_body(vault, doc_id)
+
+            def native_headings() -> list[str]:
+                paths: dict[str, None] = {}
+                for path, _, _ in _native_section_spans(body):
+                    if not path or (child_prefix and path != section and not path.startswith(child_prefix)):
+                        continue
+                    paths[path] = None
+                    if limit and limit > 0 and len(paths) == limit:
+                        break
+                return list(paths)
+
+            return await asyncio.to_thread(native_headings)
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
             doc_match = DocumentRepository.match_clause(2)
+            subtree = "AND (c.section_path = $3 OR starts_with(c.section_path, $4))" if child_prefix else ""
             sql = f"""
                 SELECT c.section_path, MIN(c.chunk_index) AS first_chunk_index
                 FROM chunks c
@@ -2597,12 +2607,14 @@ class SearchService:
                 WHERE v.name = $1 AND {doc_match}
                   AND c.section_path IS NOT NULL
                   AND c.section_path <> ''
+                  {subtree}
                 GROUP BY c.section_path
                 ORDER BY first_chunk_index, c.section_path
             """
             if isinstance(limit, int) and limit > 0:
                 sql += f" LIMIT {int(limit)}"
-            rows = await conn.fetch(sql, vault, doc_id)
+            params = (vault, doc_id, section, child_prefix) if child_prefix else (vault, doc_id)
+            rows = await conn.fetch(sql, *params)
             headings: list[str] = []
             seen: set[str] = set()
             for r in rows:

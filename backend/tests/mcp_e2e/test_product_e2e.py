@@ -85,6 +85,29 @@ async def _create_vault(
     return name
 
 
+async def test_drill_down_outline_filters_before_the_heading_cap(
+    mcp_client: Client, runtime_session: RuntimeContext,
+) -> None:
+    vault = await _create_vault(mcp_client, runtime_session, "outline")
+    content = "".join(f"# Early {i}\nbody\n" for i in range(51))
+    content += "# 설치\nintro\n## 설정\nchild\n# 설치법\nsibling\n"
+    doc = await _call_json(mcp_client, runtime_session, "akb_put", {
+        "vault": vault, "title": "Guide", "content": content,
+    })
+    args = {"uri": doc["uri"], "mode": "outline"}
+    full = await _call_json(mcp_client, runtime_session, "akb_drill_down", args)
+    assert full["returned"] == 50 and full["truncated"] is True
+    assert "# 설치" not in full["outline"]
+
+    narrowed = await _call_json(mcp_client, runtime_session, "akb_drill_down", {**args, "section": "# 설치"})
+    assert narrowed["outline"] == ["# 설치", "# 설치 > ## 설정"]
+    assert narrowed["returned"] == narrowed["total"] == 2
+    sections = await _call_json(mcp_client, runtime_session, "akb_drill_down", {
+        "uri": doc["uri"], "section": "설치", "pattern": "sibling",
+    })
+    assert [row["section_path"] for row in sections["sections"]] == ["# 설치법"]
+
+
 async def test_documents_browse_search_and_versioned_reads(
     mcp_client: Client,
     runtime_session: RuntimeContext,
