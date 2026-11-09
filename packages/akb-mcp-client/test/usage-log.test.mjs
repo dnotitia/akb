@@ -147,6 +147,53 @@ itAsync("records concurrent calls as whole lines, one per call", async () => {
 
 // ── failures are measured too ────────────────────────────────────
 
+itAsync("records document validation and file read failures once without arguments", async () => {
+  await withLogPath(async (path) => {
+    const canary = "private-document-input";
+    const proxy = backedBy("unused");
+    let fileReads = 0;
+    proxy._resolveFileToContent = () => {
+      fileReads += 1;
+      throw new Error(`Cannot read /tmp/${canary}.md`);
+    };
+    proxy._forward = async () => assert.fail("invalid input must not be forwarded");
+    const calls = [
+      { name: "akb_put", arguments: { content: canary, file: `/tmp/${canary}.md` } },
+      { name: "akb_update", arguments: { content: { body: canary } } },
+      { name: "akb_update", arguments: { file: `/tmp/${canary}.md` } },
+    ];
+    const responses = [];
+    for (const [id, params] of calls.entries()) {
+      responses.push(await proxy._handle({ jsonrpc: "2.0", id, method: "tools/call", params }));
+    }
+    assert.equal(fileReads, 1, "validation failures must not read files");
+    const records = await readLines(path);
+    assert.equal(records.length, calls.length);
+    for (const [i, record] of records.entries()) {
+      assert.equal(record.tool, calls[i].name);
+      assert.equal(record.error, true);
+      assert.equal(record.result_bytes, Buffer.byteLength(JSON.stringify(responses[i].result), "utf8"));
+      assert.equal(record.text_chars, responses[i].result.content[0].text.length);
+    }
+    assert.ok(!(await readFile(path, "utf8")).includes(canary));
+  });
+});
+
+itAsync("records a converted document file once on successful forwarding", async () => {
+  await withLogPath(async (path) => {
+    const proxy = backedBy("saved");
+    proxy._resolveFileToContent = ({ file, ...args }) => ({ ...args, content: "body" });
+    await proxy._handle({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "akb_put", arguments: { file: "/tmp/draft.md" } },
+    });
+    const records = await readLines(path);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].tool, "akb_put");
+    assert.equal(records[0].error, false);
+  });
+});
+
 itAsync("records a call that threw, with error true and no payload", async () => {
   await withLogPath(async (path) => {
     const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });

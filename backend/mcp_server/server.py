@@ -597,8 +597,24 @@ async def _external_git_view(vault_id: str) -> dict | None:
     }
 
 
+def _document_content_error(args: dict, *, required: bool) -> dict | None:
+    """Validate only the body contract; metadata and OCC keep their own rules."""
+    if "content" not in args:
+        if required:
+            return err("content is required to create a document", code=INVALID_ARGUMENT,
+                       field="/content", reason="required")
+        return None
+    content = args["content"]
+    if isinstance(content, str) or (content is None and not required):
+        return None
+    return err("content must be a string" + (" or null" if not required else ""),
+               code=INVALID_ARGUMENT, field="/content", reason="invalid_type")
+
+
 @_h("akb_put")
 async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
+    if error := _document_content_error(args, required=True):
+        return error
     try:
         vault, collection = _resolve_parent(args, kind_name="document")
     except ValueError as e:
@@ -718,6 +734,8 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_update")
 async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
+    if error := _document_content_error(args, required=False):
+        return error
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     doc_path = to_nfc(doc_path)
     await check_vault_access(uid, vault, required_role="writer")
