@@ -11,6 +11,7 @@ for (const width of [1440, 390]) {
     await page.goto("/vault/fixture/doc/reading.md");
     const canvas = page.locator("#document-reading-canvas");
     await expect(canvas.getByRole("heading", { name: "Reading workflow", exact: true })).toBeVisible();
+    await expect(canvas.getByRole("heading", { name: "Code example", level: 2, exact: true })).toBeVisible();
     const more = page.getByRole("group", { name: "Document reading tools", exact: true }).getByRole("button", { name: "Actions for Reading workflow", exact: true });
     await more.click();
     await page.getByRole("menuitem", { name: "Reading settings", exact: true }).click();

@@ -52,9 +52,12 @@ test.describe("common Markdown image rendering mock contract", () => {
 
     // Missing/undecodable attachments share the same reading boundary as
     // available images, instead of growing out to the full canvas width.
-    const heading = page.getByRole("heading", { level: 2, name: "Image rendering fixture", exact: true });
+    const heading = page.getByRole("heading", { level: 1, name: "Image rendering fixture", exact: true });
     const textBox = (await heading.boundingBox())!;
-    expect(textBox.width).toBe(1024);
+    const readingBox = (await page.locator(".document-reading-flow .ProseMirror").boundingBox())!;
+    expect(textBox.x).toBeCloseTo(readingBox.x, 0);
+    expect(textBox.width).toBeCloseTo(readingBox.width, 0);
+    expect(textBox.width).toBeLessThanOrEqual(1024);
     for (const frame of await frames.all()) {
       const box = (await frame.boundingBox())!;
       expect(box.x).toBeCloseTo(textBox.x, 0);

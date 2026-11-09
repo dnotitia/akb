@@ -76,6 +76,7 @@ import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { docUri, fileUri, tableUri, parseFileUri } from "@/lib/uri";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
+import { DocumentRenameDialog } from "@/components/document-rename-dialog";
 import {
   ResourceDeleteDialog,
   type DeletableResourceKind,
@@ -134,7 +135,8 @@ export function VaultExplorer({
   const focused = presentation === "focused";
   const user = useCurrentUser();
   const currentResource = useResourceLocation();
-  const { checking: checkingAccess } = useAccessVerification();
+  const { checking: checkingAccess, revision: accessRevision } = useAccessVerification();
+  const renameScope = JSON.stringify([vault, user?.user_id, accessRevision]);
   const filterOwner = JSON.stringify([vault, user?.user_id ?? null]);
   const [scopeSelection, setScopeSelection] = useState<{ owner: string; scope: ArchiveScope }>({ owner: filterOwner, scope: "unarchived" });
   const archiveScope = scopeSelection.owner === filterOwner ? scopeSelection.scope : "unarchived";
@@ -348,6 +350,8 @@ export function VaultExplorer({
     rowCount?: number;
     active: boolean;
   } | null>(null);
+  const [renameTarget, setRenameTarget] = useState<{ path: string; scope: string } | null>(null);
+  const [renameNotice, setRenameNotice] = useState("");
   const mutationTriggerRef = useRef<HTMLElement | null>(null);
 
   const rememberMutationTrigger = useCallback(() => {
@@ -864,6 +868,11 @@ export function VaultExplorer({
                 onExploreCollection={focused && !checkingAccess ? node => exploreCollection(node.path) : undefined}
                 canWrite={canWrite}
                 canAdmin={canAdmin}
+                onRenameDocument={(node, trigger) => {
+                  mutationTriggerRef.current = trigger;
+                  setRenameNotice("");
+                  setRenameTarget({ path: node.path, scope: renameScope });
+                }}
                 showDocumentDisambiguator={duplicateDocumentPaths.has(row.node.path)}
                 onCreateDoc={(node) =>
                   openCreateDocument({ collection: node.path })
@@ -977,6 +986,12 @@ export function VaultExplorer({
           }}
         />
       )}
+      {renameTarget?.scope === renameScope && !checkingAccess && <DocumentRenameDialog
+        key={`${renameScope}:${renameTarget.path}`} vault={vault} path={renameTarget.path}
+        returnFocusRef={mutationTriggerRef}
+        onOpenChange={open => { if (!open) setRenameTarget(null); }}
+        onRenamed={() => { handleMutation(); setRenameNotice("Document title updated."); }} />}
+      <span role="status" className="sr-only">{renameNotice}</span>
       <CollectionDetailsDialog
         vault={vault}
         path={detailsTarget?.path ?? ""}
@@ -1113,6 +1128,7 @@ interface RowProps {
   onDeleteCollection?: (node: TreeNode) => void;
   /** Open the matching document/file/table deletion flow. */
   onDeleteResource?: (node: TreeNode) => void;
+  onRenameDocument?: (node: TreeNode, trigger: HTMLButtonElement) => void;
   /** Open the collection metadata and resource-count inspector. */
   onOpenDetails?: (node: TreeNode) => void;
   /** Fired when the user clicks the `+` (new sub-collection) icon on a
@@ -1138,7 +1154,7 @@ function explorerRowActions(active: boolean) {
 }
 
 const TreeRow = memo(function TreeRow({
-  node, disclosure, depth, sig, isOpen, isActive, vault, onToggle, onSearchCollection, onExploreCollection, canWrite, canAdmin, showDocumentDisambiguator, onDeleteCollection, onDeleteResource, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
+  node, disclosure, depth, sig, isOpen, isActive, vault, onToggle, onSearchCollection, onExploreCollection, canWrite, canAdmin, showDocumentDisambiguator, onDeleteCollection, onDeleteResource, onRenameDocument, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
 }: RowProps) {
   const indent = { paddingLeft: `${depth * 12 + (disclosure ? 8 : 12)}px` };
 
@@ -1252,6 +1268,7 @@ const TreeRow = memo(function TreeRow({
     !isSkill &&
     Boolean(onDeleteResource) &&
     (node.kind === "table" ? Boolean(canAdmin) : Boolean(canWrite));
+  const canRenameDocument = node.kind === "document" && node.path !== VAULT_SKILL_PATH && Boolean(canWrite && onRenameDocument);
   const documentDisambiguator =
     node.kind === "document" && showDocumentDisambiguator
       ? compactDocumentIdentifier(node.path)
@@ -1275,7 +1292,7 @@ const TreeRow = memo(function TreeRow({
         style={indent}
         className={cn("flex min-h-9 min-w-0 flex-1 items-center gap-1.5 py-1.5 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring max-sm:min-h-11 pointer-coarse:min-h-11",
           disclosure && "gap-2 rounded-[var(--radius-sm)]",
-          canDeleteResource ? "pr-10 max-sm:pr-12 pointer-coarse:pr-12" : "pr-2",
+          canDeleteResource || canRenameDocument ? "pr-10 max-sm:pr-12 pointer-coarse:pr-12" : "pr-2",
           isActive && "font-medium")}
       >
         {/* Tinted icon chip — the same kind-swatch grammar Home + the vault
@@ -1321,11 +1338,12 @@ const TreeRow = memo(function TreeRow({
           </span>
         )}
       </Link>
-      {canDeleteResource && (
+      {(canDeleteResource || canRenameDocument) && (
         <ResourceActionsMenu
           resourceName={node.name}
-          deleteLabel={`Delete ${node.kind}`}
-          onDelete={() => onDeleteResource?.(node)}
+          onRename={canRenameDocument ? trigger => onRenameDocument?.(node, trigger) : undefined}
+          deleteLabel={canDeleteResource ? `Delete ${node.kind}` : undefined}
+          onDelete={canDeleteResource ? () => onDeleteResource?.(node) : undefined}
           side="right"
           align="start"
           className={explorerRowActions(isActive)}

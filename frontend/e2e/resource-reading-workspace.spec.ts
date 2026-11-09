@@ -26,9 +26,11 @@ for (const width of [1024, 1280, 1600]) for (const dark of [false, true]) {
     expect(Math.abs(row.y + row.height - rail.y - rail.height)).toBeLessThanOrEqual(1);
     expect(row.height).toBe(48);
     const metadata = (await page.locator("#document-reading-canvas").getByRole("group", { name: "Document metadata", exact: true }).boundingBox())!;
-    const heading = (await page.locator("#document-reading-canvas").getByRole("heading", { name: "Authored heading", exact: true }).boundingBox())!;
+    const heading = (await page.locator("#document-reading-canvas").getByRole("heading", { name: title, level: 1, exact: true }).boundingBox())!;
     expect(Math.abs(metadata.x - heading.x)).toBeLessThanOrEqual(1);
     expect(metadata.y).toBeGreaterThanOrEqual(heading.y + heading.height);
+    const bodyHeading = (await page.locator("#document-reading-canvas").getByRole("heading", { name: "Authored heading", exact: true }).boundingBox())!;
+    expect(bodyHeading.y).toBeGreaterThanOrEqual(metadata.y + metadata.height);
     const identity = (await sidebar.locator('[data-slot="vault-identity-header"]').boundingBox())!;
     const header = (await page.locator(".app-header").boundingBox())!;
     expect(Math.abs(identity.y + identity.height - header.y - header.height)).toBeLessThanOrEqual(1);
@@ -705,7 +707,8 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       }))),
       contentType: "application/json",
     });
-    await expect(page.locator("h1#doc-title")).toHaveCount(1);
+    await expect(page.getByRole("heading", { name: title, level: 1, exact: true })).toBeVisible();
+    await expect(page.locator("#document-reading-canvas h1")).toHaveCount(1);
     await expect(page.locator('[data-slot="resource-command-row"]')).toHaveCount(1);
     const readingTools = page.getByRole("group", { name: "Document reading tools", exact: true });
     await expect(readingTools.getByRole("radio", { name: "Preview", exact: true })).toBeVisible();
@@ -801,7 +804,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
         const rect = el.getBoundingClientRect();
         return { x: rect.x, width: rect.width, top: rect.top, margin: getComputedStyle(el).marginTop };
       };
-      return { heading: box("h2"), paragraph: box("p"), table: box(".akb-md-table"), list: box("ul"), code: box("pre") };
+      return { heading: box("h1"), paragraph: box("p"), table: box(".akb-md-table"), list: box("ul"), code: box("pre") };
     });
     for (const box of [measures.paragraph, measures.table, measures.list, measures.code]) {
       expect(box.x).toBeCloseTo(measures.heading.x, 0);

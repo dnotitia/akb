@@ -51,7 +51,9 @@ export interface MarkdownRenderProps {
   headingIdPrefix?: string;
   headingLevelOffset?: number;
   leadingMetadata?: ReactNode;
-  fallbackTitle?: string;
+  /** Canonical document identity; authored headings remain part of the body. */
+  documentTitle?: string;
+  documentTitleLevel?: 1 | 2;
   /** Named read-only document surface for embedded previews. */
   contentLabel?: string;
   searchable?: boolean;
@@ -66,12 +68,34 @@ export function MarkdownRender({
   headingIdPrefix = "",
   headingLevelOffset = 1,
   leadingMetadata,
-  fallbackTitle,
+  documentTitle,
+  documentTitleLevel = 2,
   contentLabel,
   searchable = false,
   readingTools = true,
 }: MarkdownRenderProps) {
   const body = useMemo(() => stripFrontmatter(markdown || ""), [markdown]);
+  const structure = useMemo(() => {
+    if (!documentTitle) return null;
+    const blocks = parseMarkdown(body).content || [];
+    const first = blocks[0];
+    const paragraph = first?.type === "heading" ? blocks[1] : first;
+    const textOf = (node: typeof first): string => node?.text ?? node?.content?.map(textOf).join("") ?? "";
+    const normalize = (text: string) => text.normalize("NFC").trim().replace(/\s+/g, " ");
+    const headingLevels: number[] = [];
+    const visit = (node: typeof first) => {
+      if (node.type === "heading") headingLevels.push(Number(node.attrs?.level ?? 1));
+      node.content?.forEach(visit);
+    };
+    blocks.forEach(visit);
+    return {
+      titleMatches: first?.type === "heading" && first.attrs?.level === 1
+        && normalize(textOf(first)) === normalize(documentTitle),
+      opening: paragraph?.type === "paragraph" ? textOf(paragraph) : "",
+      headingLevels,
+    };
+  }, [body, documentTitle]);
+  const usesLeadingTitle = Boolean(structure?.titleMatches);
   const tools = useReaderTools();
   const { preferences } = useReaderPreferences();
   const [codeState, setCodeState] = useState<{ body: string; overrides: Record<number, boolean> }>({ body, overrides: {} });
@@ -79,11 +103,12 @@ export function MarkdownRender({
   const [sectionState, setSectionState] = useState<{ body: string; collapsed: number[] }>({ body, collapsed: [] });
   const rootRef = useRef<HTMLDivElement>(null);
   const sectionPositions = useReaderSectionControls(rootRef, body);
-  const collapsedSections = useMemo(() => sectionState.body === body ? sectionState.collapsed : [], [body, sectionState]);
-  const renderSectionToggle = useCallback((section: Parameters<NonNullable<MarkdownViewerReadingOptions["renderSectionToggle"]>>[0]) => <button type="button" className="reader-section-toggle" style={sectionPositions[section.index]} aria-label={`${section.collapsed ? "Expand" : "Collapse"} section: ${section.title}`} aria-expanded={!section.collapsed} title={section.collapsed ? "Expand section" : "Collapse section"} onClick={() => setSectionState(previous => {
+  const collapsedSections = useMemo(() => sectionState.body === body
+    ? sectionState.collapsed.filter(index => !usesLeadingTitle || index !== 0) : [], [body, sectionState, usesLeadingTitle]);
+  const renderSectionToggle = useCallback((section: Parameters<NonNullable<MarkdownViewerReadingOptions["renderSectionToggle"]>>[0]) => usesLeadingTitle && section.index === 0 ? null : <button type="button" className="reader-section-toggle" style={sectionPositions[section.index]} aria-label={`${section.collapsed ? "Expand" : "Collapse"} section: ${section.title}`} aria-expanded={!section.collapsed} title={section.collapsed ? "Expand section" : "Collapse section"} onClick={() => setSectionState(previous => {
     const before = previous.body === body ? previous.collapsed : [];
     return { body, collapsed: section.collapsed ? before.filter(index => index !== section.index) : [...before, section.index] };
-  })}>{section.collapsed ? <ChevronRight size={15} aria-hidden /> : <ChevronDown size={15} aria-hidden />}</button>, [body, sectionPositions]);
+  })}>{section.collapsed ? <ChevronRight size={15} aria-hidden /> : <ChevronDown size={15} aria-hidden />}</button>, [body, sectionPositions, usesLeadingTitle]);
   const onRevealSections = useCallback((indices: readonly number[]) => setSectionState(previous => {
     if (previous.body !== body || !previous.collapsed.some(index => indices.includes(index))) return previous;
     return { body, collapsed: previous.collapsed.filter(index => !indices.includes(index)) };
@@ -172,32 +197,35 @@ export function MarkdownRender({
     [publicationSlug],
   );
   const resolver = publicationResolver ?? adapters?.targetResolver;
-  const headingOptions = useMemo(
-    () => ({
+  const headingOptions = useMemo(() => {
+    const headings = parseHeadings(body);
+    const ancestors: { level: number; index: number }[] = [];
+    const levels = structure?.headingLevels.map((sourceLevel, index) => {
+      while (ancestors.length && ancestors.at(-1)!.level >= sourceLevel) ancestors.pop();
+      const titleAncestor = usesLeadingTitle && ancestors[0]?.index === 0;
+      const level = usesLeadingTitle && index === 0 ? documentTitleLevel
+        : Math.min(6, documentTitleLevel + 1 + ancestors.length - (titleAncestor ? 1 : 0));
+      ancestors.push({ level: sourceLevel, index });
+      return level;
+    });
+    return {
       levelOffset: headingLevelOffset,
-      ids: parseHeadings(body).map((heading) => `${headingIdPrefix}${heading.slug}`),
-    }),
-    [body, headingIdPrefix, headingLevelOffset],
-  );
-  // A leading authored heading remains the title and keeps its original ID.
-  // Documents starting with another block receive a UI-only identity instead.
-  const structure = useMemo(() => {
-    if (!fallbackTitle) return null;
-    const blocks = parseMarkdown(body).content || [];
-    const first = blocks[0];
-    const paragraph = first?.type === "heading" ? blocks[1] : first;
-    const textOf = (node: typeof first): string => node?.text ?? node?.content?.map(textOf).join("") ?? "";
-    return { heading: first?.type === "heading", opening: paragraph?.type === "paragraph" ? textOf(paragraph) : "" };
-  }, [body, fallbackTitle]);
+      levels,
+      ids: headings.map((heading) => `${headingIdPrefix}${heading.slug}`),
+    };
+  }, [body, headingIdPrefix, headingLevelOffset, usesLeadingTitle, structure, documentTitleLevel]);
   const summaryRepeatsOpening = Boolean(structure?.opening && summary?.trim().replace(/\s+/g, " ") === structure.opening.trim().replace(/\s+/g, " "));
-  const adornment = leadingMetadata || summary?.trim() ? <>
-    {!structure?.heading && fallbackTitle && <h2 className="document-fallback-title">{fallbackTitle}</h2>}
+  const Title = documentTitleLevel === 1 ? "h1" : "h2";
+  const separateTitle = Boolean(documentTitle && !usesLeadingTitle);
+  const adornment = documentTitle || leadingMetadata || summary?.trim() ? <>
+    {separateTitle && <Title className="document-reading-title">{documentTitle}</Title>}
     {leadingMetadata}
     {summary?.trim() && !summaryRepeatsOpening && <DocumentSummary key={summary} summary={summary} />}
   </> : undefined;
 
   return (
     <MarkdownLocaleProvider locale="en"><div ref={rootRef} className="reader-render" data-table-fit={preferences.tableFit}
+      data-document-title-layout={documentTitle ? usesLeadingTitle ? "heading" : "separate" : undefined}
       onClickCapture={event => { if (!event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !event.button && showFootnote(event.target, false)) { event.preventDefault(); event.stopPropagation(); } else openImage(event); }} onKeyDownCapture={openImage}
       onPointerOverCapture={event => { if (event.pointerType === "mouse" && event.target instanceof Element && event.target.closest("a[data-footnote-link][href]")) { const target = event.target; clearTimeout(footnoteTimer.current); footnoteTimer.current = setTimeout(() => showFootnote(target, true), 250); } }} onPointerOutCapture={leaveFootnote}>
       <MarkdownViewer
@@ -205,7 +233,8 @@ export function MarkdownRender({
         style={{ "--document-reading-measure": preferences.width === "compact" ? "36rem" : preferences.width === "wide" ? "64rem" : "var(--reader-standard-measure, 52rem)", "--reader-font-size": `${preferences.fontSize / 16}rem` } as CSSProperties}
         markdown={body}
         contentAttributes={contentLabel ? { role: "document", "aria-label": contentLabel } : undefined}
-        afterLeadingHeading={adornment}
+        beforeContent={separateTitle ? adornment : undefined}
+        afterLeadingHeading={separateTitle ? undefined : adornment}
         className={cn(
           "akb-md min-w-0 text-[15px] text-foreground prose dark:prose-invert !max-w-none",
           className,

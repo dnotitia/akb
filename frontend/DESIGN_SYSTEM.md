@@ -128,6 +128,13 @@ Tabs use a 40px bar with 12px labels on fine pointers and a 48px bar with
 44px targets on coarse pointers. Header and tab-bar hairlines have 12px side
 insets; tab separators stop short of the bar edges. Metadata remains below the
 title and is never part of copied Markdown.
+The representative title follows the stored document title in Preview, Raw,
+search previews and reference panes. Rename updates that identity, never the
+Markdown body or document address. A matching leading H1 can serve as the one
+visible title while retaining its authored anchor; otherwise the canonical
+title precedes metadata and the intact body. Different headings remain body
+sections with a subordinate visual scale. Main readers expose one H1, while
+reference panes use H2. Filename and path renaming do not belong in Rename.
 Full-page Preview and Raw share a centered 42rem reading measure; route-backed
 search previews retain their existing 52rem measure.
 
