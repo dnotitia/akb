@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,6 +16,15 @@ vi.mock("@/components/global-search-dialog", () => ({ GlobalSearchDialog: () => 
 vi.mock("@/components/header-indexing-status", () => ({ HeaderIndexingStatus: () => null }));
 vi.mock("@/components/notification-bell", () => ({ NotificationBell: () => null }));
 vi.mock("@/components/user-menu", () => ({ UserMenu: () => null }));
+// The shared editor's parent owns permissions, drafts and payload construction.
+// Rich-editor interactions are covered by the deployed browser suite.
+vi.mock("@/components/markdown-editor", () => ({
+  default: function GuideEditorMock({ value, onChange, ariaLabel, readOnly }: { value: string; onChange?: (body: string) => void; ariaLabel?: string; readOnly?: boolean }) {
+    const initial = useRef({ value, onChange });
+    useEffect(() => { initial.current.onChange?.(initial.current.value); }, []);
+    return <textarea aria-label={ariaLabel} defaultValue={value} readOnly={readOnly} onChange={event => onChange?.(event.target.value)} />;
+  },
+}));
 vi.mock("@/lib/api", async original => ({
   ...await original<typeof import("@/lib/api")>(),
   getDocument: vi.fn(), getVaultInfo: vi.fn(), updateDocument: vi.fn(),
@@ -25,7 +35,7 @@ vi.mock("@/lib/api", async original => ({
 }));
 
 import { AppRoutes } from "@/app-routes";
-import { getDocument, getMe, getVaultInfo, updateDocument } from "@/lib/api";
+import { ApiError, getDocument, getMe, getVaultInfo, updateDocument } from "@/lib/api";
 
 const DOC = { path: "overview/vault-skill.md", title: "Vault guide", content: "# Instructions\n\nSaved guide body", current_commit: "original-commit", type: "skill", tags: [] };
 const USER = { user_id: "owner", username: "owner", email: "owner@example.test", display_name: null, is_admin: false, auth_method: "local", key_class: null };
@@ -44,6 +54,7 @@ function renderAt(url: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear();
   vi.mocked(getMe).mockResolvedValue(USER);
   vi.mocked(getVaultInfo).mockResolvedValue({ name: "v", role: "owner", description: "Saved description", public_access: "none" });
   vi.mocked(getDocument).mockResolvedValue(DOC);
@@ -58,90 +69,104 @@ afterEach(async () => {
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 1)); });
 });
 
-describe("one read-first Vault guide flow", () => {
-  it.each([vaultGuideHref("v"), "/vault/v/skill", `${vaultGuideHref("v")}?view=edit`, "/vault/v/doc/document-uuid?view=edit"])("opens %s in the reader and enters only the Settings editor", async url => {
+describe("one Vault guide document workspace", () => {
+  it.each([vaultGuideHref("v"), "/vault/v/skill", vaultGuideEditHref("v"), "/vault/v/doc/document-uuid?view=edit"])("edits only the body in the document workspace from %s", async url => {
     const user = userEvent.setup();
     renderAt(url);
-    const edit = await screen.findByRole("link", { name: "Edit guide" });
-    expect(edit).toHaveAttribute("href", vaultGuideEditHref("v"));
-    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("textbox", { name: "Document title" })).not.toBeInTheDocument();
-    await user.click(edit);
+    await waitFor(() => expect(window.location.pathname).toBe(vaultGuideHref("v")));
+    if (!url.includes("view=edit")) await user.click(await screen.findByRole("button", { name: "Edit guide" }));
     const editor = await screen.findByRole("textbox", { name: "Vault guide body" });
     expect(editor).toHaveValue(DOC.content);
-    await waitFor(() => expect(editor).toHaveFocus());
-    expect(window.location.pathname + window.location.search + window.location.hash).toBe("/vault/v/settings#skill");
-    await user.click(screen.getByRole("button", { name: "Cancel" }));
-    await waitFor(() => expect(screen.queryByLabelText("Vault guide body")).not.toBeInTheDocument());
-    await waitFor(() => expect(screen.getByRole("button", { name: "Edit guide" })).toHaveFocus());
+    expect(screen.queryByRole("textbox", { name: "Document title" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "Document details" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Type")).not.toBeInTheDocument();
+    fireEvent.change(editor, { target: { value: "# Updated instructions" } });
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(updateDocument).toHaveBeenCalledWith("v", expect.any(String), {
+      content: "# Updated instructions", expected_commit: "original-commit",
+    }));
+    expect(window.location.pathname).toContain("/doc/");
+    await waitFor(() => expect(screen.queryByRole("textbox", { name: "Vault guide body" })).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Edit guide" })).toBeVisible();
+  });
+
+  it.each(["reader", "writer", "admin", "archived"])("keeps the guide read-only for %s", async role => {
+    vi.mocked(getVaultInfo).mockResolvedValue({ role: role === "archived" ? "owner" : role, is_archived: role === "archived" });
+    renderAt(vaultGuideEditHref("v"));
+    expect(await screen.findByRole("heading", { level: 1, name: "Vault guide" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit guide" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "Vault guide body" })).not.toBeInTheDocument();
     expect(updateDocument).not.toHaveBeenCalled();
   });
 
-  it.each(["reader", "writer", "admin", "archived"])("keeps the guide readable without a second editor for %s", async role => {
-    vi.mocked(getVaultInfo).mockResolvedValue({ role: role === "archived" ? "owner" : role, is_archived: role === "archived" });
-    renderAt(`${vaultGuideHref("v")}?view=edit`);
-    expect(await screen.findByRole("heading", { level: 1, name: "Vault guide" })).toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "Edit guide" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
-    expect(document.querySelector('[contenteditable="true"]')).toBeNull();
-    expect(screen.queryByLabelText("Vault guide body")).not.toBeInTheDocument();
-  });
-
-  it("preserves all Settings drafts and the original guide revision through preview, Back and Forward", async () => {
+  it.each(["Open guide", "Edit guide"])("%s retains Settings drafts in the same modal through reading, editing and closing", async entry => {
     const user = userEvent.setup();
-    renderAt(vaultGuideEditHref("v"));
-    const editor = await screen.findByLabelText("Vault guide body");
-    fireEvent.change(editor, { target: { value: "Unsaved instructions" } });
-    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Unsaved description" } });
-    await user.click(screen.getByRole("radio", { name: "Everyone can view" }));
-    const previewLink = screen.getByRole("link", { name: "Open guide" });
-    await user.click(previewLink);
+    renderAt("/vault/v/settings#general");
+    fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Unsaved description" } });
+    await user.click(screen.getByRole("tab", { name: "Access permissions" }));
+    const policy = screen.getByRole("radio", { name: "Everyone can view" });
+    await user.click(policy);
+    await user.click(screen.getByRole("tab", { name: "Vault guide" }));
+    const trigger = await screen.findByRole(entry === "Open guide" ? "link" : "button", { name: entry });
+    await user.click(trigger);
     const preview = await screen.findByRole("dialog", { name: "Document preview" });
-    expect(within(preview).getByRole("link", { name: "Edit guide" })).toBeVisible();
-    expect(within(preview).queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("dialog", { name: /Discard unsaved/ })).not.toBeInTheDocument();
-    await user.click(within(preview).getByRole("radio", { name: "Raw markdown" }));
-    await act(async () => window.history.back());
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Document preview" })).not.toBeInTheDocument());
-    expect(screen.getByLabelText("Vault guide body")).toHaveValue("Unsaved instructions");
+    if (entry === "Open guide") await user.click(within(preview).getByRole("button", { name: "Edit guide" }));
+    const editor = await within(preview).findByRole("textbox", { name: "Vault guide body" });
+    expect(editor).toHaveValue(DOC.content);
+    await user.click(within(preview).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(within(preview).queryByRole("textbox", { name: "Vault guide body" })).not.toBeInTheDocument());
+    expect(preview).toBeVisible();
+    expect(window.location.pathname).toBe(vaultGuideHref("v"));
+    await user.click(within(preview).getByRole("button", { name: "Close dialog" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(screen.getByLabelText("Description")).toHaveValue("Unsaved description");
-    expect(screen.getByRole("radio", { name: "Everyone can view" })).toBeChecked();
-    await waitFor(() => expect(previewLink).toHaveFocus());
-    await act(async () => window.history.forward());
-    await screen.findByRole("dialog", { name: "Document preview" });
-    await user.keyboard("{Escape}");
-    await waitFor(() => expect(previewLink).toHaveFocus());
-    vi.mocked(getDocument).mockResolvedValue({ ...DOC, content: "Remote instructions", current_commit: "remote-commit" });
-    await user.click(screen.getByRole("button", { name: "Save guide" }));
-    await waitFor(() => expect(updateDocument).toHaveBeenCalledWith("v", DOC.path, { content: "Unsaved instructions", expected_commit: "original-commit" }));
+    expect(policy).toBeChecked();
+    await waitFor(() => expect(trigger).toHaveFocus());
   });
 
-  it("guards promotion of the preview because that would unmount Settings drafts", async () => {
+  it("protects the modal editor draft on close and retains a failed save", async () => {
     const user = userEvent.setup();
-    renderAt(vaultGuideEditHref("v"));
-    fireEvent.change(await screen.findByLabelText("Vault guide body"), { target: { value: "Unsaved instructions" } });
-    await user.click(screen.getByRole("link", { name: "Open guide" }));
+    vi.mocked(updateDocument).mockRejectedValueOnce(new Error("Guide save failed"));
+    renderAt("/vault/v/settings#skill");
+    await user.click(await screen.findByRole("button", { name: "Edit guide" }));
     const preview = await screen.findByRole("dialog", { name: "Document preview" });
-    await user.click(within(preview).getByRole("button", { name: "Open document in vault" }));
-    const confirmation = await screen.findByRole("dialog", { name: "Discard unsaved settings changes?" });
+    const editor = await within(preview).findByRole("textbox", { name: "Vault guide body" });
+    fireEvent.change(editor, { target: { value: "Unsaved instructions" } });
+    await user.click(within(preview).getByRole("button", { name: "Save changes" }));
+    expect(await within(preview).findByRole("alert")).toHaveTextContent("Guide save failed");
+    await user.click(within(preview).getByRole("button", { name: "Close dialog" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Leave this document?" });
     await user.click(within(confirmation).getByRole("button", { name: "Keep editing" }));
-    expect(screen.getByRole("dialog", { name: "Document preview" })).toBeVisible();
-    await user.keyboard("{Escape}");
-    expect(await screen.findByLabelText("Vault guide body")).toHaveValue("Unsaved instructions");
+    expect(editor).toHaveValue("Unsaved instructions");
+    expect(preview).toBeVisible();
+    expect(updateDocument).toHaveBeenCalledWith("v", DOC.path, { content: "Unsaved instructions", expected_commit: "original-commit" });
   });
 
-  it("resumes the existing Settings draft when Edit guide is selected from its preview", async () => {
-    const user = userEvent.setup();
-    renderAt(vaultGuideEditHref("v"));
-    fireEvent.change(await screen.findByLabelText("Vault guide body"), { target: { value: "Unsaved instructions" } });
-    await user.click(screen.getByRole("link", { name: "Open guide" }));
+  it("opens the legacy Settings edit deep link in the same document modal", async () => {
+    renderAt("/vault/v/settings?edit=guide#skill");
     const preview = await screen.findByRole("dialog", { name: "Document preview" });
-    await user.click(within(preview).getByRole("link", { name: "Edit guide" }));
-    const editor = await screen.findByLabelText("Vault guide body");
-    expect(editor).toHaveValue("Unsaved instructions");
-    await waitFor(() => expect(editor).toHaveFocus());
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Save guide" }));
-    await waitFor(() => expect(updateDocument).toHaveBeenCalledWith("v", DOC.path, { content: "Unsaved instructions", expected_commit: "original-commit" }));
+    expect(await within(preview).findByRole("textbox", { name: "Vault guide body" })).toHaveValue(DOC.content);
+    expect(window.location.pathname + window.location.search).toBe(vaultGuideEditHref("v"));
+  });
+
+  it("preserves the Guide body and original revision after a conflict until explicitly rebased", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateDocument).mockRejectedValueOnce(new ApiError("revision moved", 409, { code: "conflict" }));
+    renderAt(vaultGuideEditHref("v"));
+    const editor = await screen.findByRole("textbox", { name: "Vault guide body" });
+    fireEvent.change(editor, { target: { value: "Local guide instructions" } });
+    vi.mocked(getDocument).mockResolvedValue({ ...DOC, content: "Other owner's changes", current_commit: "new-server-commit" });
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByText("This document changed on the server")).toBeVisible();
+    expect(editor).toHaveValue("Local guide instructions");
+    expect(updateDocument).toHaveBeenCalledExactlyOnceWith("v", DOC.path, {
+      content: "Local guide instructions", expected_commit: "original-commit",
+    });
+    await user.click(screen.getByRole("button", { name: "Apply draft to latest" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(updateDocument).toHaveBeenLastCalledWith("v", DOC.path, {
+      content: "Local guide instructions", expected_commit: "new-server-commit",
+    }));
   });
 });

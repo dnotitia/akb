@@ -1216,6 +1216,8 @@ export interface AdminSsoOperationRequestDocument {
   owner_id: string;
   requested_by: string;
   requested_token_id: string;
+  request_nonce?: string;
+  expected_realm_id?: string;
   claim: { expected_revision: number; expected_fingerprint: string } | null;
   grant: {
     operation_id: string;
@@ -1264,6 +1266,7 @@ const OPERATION_REQUEST_DOCUMENT_KEYS = [
   "schema_version", "request_id", "kind", "installation_id", "target_id", "provider_alias", "owner_id",
   "requested_by", "requested_token_id", "claim", "grant",
 ] as const;
+const OPERATION_REQUEST_DOCUMENT_OPTIONAL_KEYS = ["request_nonce", "expected_realm_id"] as const;
 const OPERATION_GRANT_KEYS = [
   "operation_id", "source", "expected_provider_revision", "verbs", "provider_payload_sha256",
   "configure_summary", "ttl_seconds", "provider_secret_revision", "recipient_public_key",
@@ -1361,8 +1364,11 @@ function parseOperationGrant(value: unknown): NonNullable<AdminSsoOperationReque
 function parseOperationRequestDocument(value: unknown): AdminSsoOperationRequestDocument {
   const document = record(value);
   const claim = document?.claim === null ? null : record(document?.claim);
+  const optionalKeys = document
+    ? OPERATION_REQUEST_DOCUMENT_OPTIONAL_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(document, key))
+    : [];
   if (
-    !hasExactKeys(document, OPERATION_REQUEST_DOCUMENT_KEYS) ||
+    !hasExactKeys(document, [...OPERATION_REQUEST_DOCUMENT_KEYS, ...optionalKeys]) ||
     document.schema_version !== 1 ||
     !isUuid(document.request_id) ||
     (document.kind !== "ownership_claim" && document.kind !== "provider_grant") ||
@@ -1372,6 +1378,8 @@ function parseOperationRequestDocument(value: unknown): AdminSsoOperationRequest
     !isBoundedText(document.owner_id, 255) ||
     !isUuid(document.requested_by) ||
     !isUuid(document.requested_token_id) ||
+    (optionalKeys.includes("request_nonce") && !isUuid(document.request_nonce)) ||
+    (optionalKeys.includes("expected_realm_id") && !isUuid(document.expected_realm_id)) ||
     (document.kind === "ownership_claim") !== (claim !== null && document.grant === null) ||
     (claim !== null && (
       !hasExactKeys(claim, ["expected_revision", "expected_fingerprint"]) ||
@@ -1391,6 +1399,8 @@ function parseOperationRequestDocument(value: unknown): AdminSsoOperationRequest
     owner_id: document.owner_id,
     requested_by: document.requested_by,
     requested_token_id: document.requested_token_id,
+    ...(optionalKeys.includes("request_nonce") ? { request_nonce: document.request_nonce as string } : {}),
+    ...(optionalKeys.includes("expected_realm_id") ? { expected_realm_id: document.expected_realm_id as string } : {}),
     claim: claim === null ? null : {
       expected_revision: claim.expected_revision as number,
       expected_fingerprint: claim.expected_fingerprint as string,
@@ -3257,6 +3267,32 @@ export const createPublication = (vault: string, req: CreatePublicationRequest) 
 export const listPublications = (vault: string, resource_type?: string) => {
   const qs = resource_type ? `?resource_type=${resource_type}` : "";
   return api<{ publications: Publication[] }>(`/publications/${vault}${qs}`);
+};
+
+export type PublicLinkStatus = "active" | "all" | "unavailable";
+export type PublicLinkExpiry = "any" | "none" | "soon" | "long-running";
+export interface DirectoryPublication extends Publication {
+  resource_path: string;
+  availability: "active" | "expired" | "view-limit-reached";
+  can_unpublish: boolean;
+  unpublish_disabled_reason: string | null;
+}
+export interface PublicationDirectoryPage {
+  publications: DirectoryPublication[];
+  total: number;
+  complete: boolean;
+  next_cursor: string | null;
+  observed_at: string;
+}
+export const listPublicationDirectory = (options: {
+  vault?: string; q?: string; status?: PublicLinkStatus; expiry?: PublicLinkExpiry;
+  cursor?: string; page_size?: number; signal?: AbortSignal;
+}) => {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(options)) {
+    if (key !== "signal" && value !== undefined && value !== "") qs.set(key, String(value));
+  }
+  return api<PublicationDirectoryPage>(`/publications?${qs}`, { signal: options.signal });
 };
 
 export const deletePublication = (vault: string, slug: string) =>

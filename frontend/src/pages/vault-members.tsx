@@ -39,7 +39,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { WorkspaceSectionHeader } from "@/components/ui/workspace-section-header";
+import { WorkspacePageHeader } from "@/components/ui/workspace-page-header";
 import { ROLE_ICONS, type Role } from "@/lib/roles";
 import { timeAgo } from "@/lib/utils";
 import {
@@ -299,16 +299,13 @@ function VaultMembersWorkspace({
   return (
     <>
       <div className="workspace-density-compact @container/members mx-auto w-full max-w-7xl">
-        <h1 id="members-heading" className="sr-only">
-          Members
-        </h1>
-        <WorkspaceSectionHeader
-          id="member-roster-heading"
+        <WorkspacePageHeader
+          titleId="members-heading"
           icon={UsersRound}
           title="Members"
-          tone="people"
-          testId="member-roster-header" compact
-          right={
+          variant="page"
+          testId="member-roster-header"
+          actions={
             <>
               {members && !error && (
                 <Badge variant="default">

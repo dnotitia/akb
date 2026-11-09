@@ -283,6 +283,6 @@ Email and username never select the target account.
 
 Provider ownership and short-lived controller grants are documented in
 [operation authority](operation-authority.md), including operation requests: an
-administrator service key proposes an ownership claim or a provider operation,
+dedicated non-admin service key proposes an ownership claim or a provider operation,
 a human approves the exact request in `/admin`, and only the requesting token
 collects the credential, sealed to its own key.

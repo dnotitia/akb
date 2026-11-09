@@ -44,6 +44,7 @@ function browseResponse(vault: string, collection?: string, depth = -1, options:
     return path.startsWith(prefix) && (depth < 0 || !path.slice(prefix.length).includes("/"))
       && (options.content_type !== "collections" || item.type === "collection")
       && (options.content_type !== "resources" || item.type !== "collection")
+      && (!["documents", "tables", "files"].includes(options.content_type ?? "") || `${item.type}s` === options.content_type)
       && (!query || `${item.name} ${path}`.toLocaleLowerCase().includes(query));
   });
   return { vault, path: collection ?? "", complete: true, next_cursor: null, name_query: options.name_query,
@@ -70,7 +71,7 @@ describe("Vault collection workspace", () => {
     expect(screen.getByRole("list", { name: "Collections" })).toBeVisible();
   });
 
-  it("searches nested collections and restricts recent shortcuts to the current verified tree", async () => {
+  it("searches nested collections without repeating recently visited shortcuts", async () => {
     localStorage.setItem("akb.recentCollections.v1:reader", JSON.stringify([
       { vault: "team", path: "guides", viewedAt: new Date(Date.now() - 1000).toISOString() },
       { vault: "team", path: "deleted", viewedAt: new Date(Date.now() - 2000).toISOString() },
@@ -78,8 +79,8 @@ describe("Vault collection workspace", () => {
     ]));
     const user = userEvent.setup();
     mount();
-    const recent = await screen.findByRole("navigation", { name: "Recently visited collections" });
-    expect(within(recent).getAllByRole("link")).toHaveLength(1);
+    await screen.findByRole("list", { name: "Collections" });
+    expect(screen.queryByRole("navigation", { name: "Recently visited collections" })).not.toBeInTheDocument();
     await user.type(screen.getByRole("textbox", { name: "Search collections and content" }), "index");
     expect(screen.queryByRole("navigation", { name: "Recently visited collections" })).toBeNull();
     expect(await screen.findByRole("link", { name: "Open collection architecture/indexing" })).toHaveAttribute("href", "/vault/team?collection=architecture%2Findexing");
@@ -223,4 +224,33 @@ describe("Vault collection workspace", () => {
     await userEvent.click(screen.getByRole("button", { name: "Retry collections" }));
     expect(await screen.findByRole("link", { name: "Open collection guides" })).toBeVisible();
   });
+  it("requests only the active resource kind and creates one history entry per click", async () => {
+    const user = userEvent.setup();
+    mount();
+    await screen.findByRole("link", { name: "Open collection guides" });
+    await user.click(screen.getByRole("tab", { name: /^Documents/ }));
+    expect(await screen.findByRole("link", { name: /Runbook/ })).toBeVisible();
+    expect(browseVault).toHaveBeenCalledWith("team", undefined, -1, expect.objectContaining({ content_type: "documents", page_size: 100 }));
+    expect(screen.queryByRole("link", { name: /services/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: /^Tables/ }));
+    expect(await screen.findByRole("link", { name: /services/ })).toBeVisible();
+    expect(screen.queryByRole("link", { name: /Runbook/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Browser back" }));
+    expect(screen.getByLabelText("Current location")).toHaveTextContent("type=documents");
+    await user.click(screen.getByRole("button", { name: "Browser back" }));
+    expect(screen.getByLabelText("Current location")).toHaveTextContent(/^\/vault\/team$/);
+  });
+
+  it("searches the whole Vault from a Collection and restores that Collection after clearing", async () => {
+    const user = userEvent.setup();
+    mount("/vault/team?collection=guides");
+    await screen.findByRole("link", { name: /Runbook/ });
+    await user.type(screen.getByRole("textbox", { name: "Search collections and content" }), "indexing");
+    expect(await screen.findByRole("link", { name: "Open collection architecture/indexing" })).toBeVisible();
+    expect(browseVault).toHaveBeenCalledWith("team", undefined, -1, expect.objectContaining({ content_type: "collections", name_query: "indexing", page_size: 100 }));
+    expect(screen.queryByRole("navigation", { name: "Collection location" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(await screen.findByRole("navigation", { name: "Collection location" })).toHaveTextContent("guides");
+  });
+
 });

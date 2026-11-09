@@ -133,20 +133,27 @@ async def _protocol_error(
     )(scope, receive, send)
 
 
-def _replay_body(body: bytes) -> Receive:
-    """Give the SDK the one body already consumed by the protocol router."""
+def _replay_body(body: bytes, client_receive: Receive) -> Receive:
+    """Give the SDK the one body already consumed by the protocol router.
+
+    Every later read goes to the client's own connection. This used to answer
+    ``http.disconnect`` instead, on the assumption that no transport reads
+    again after the body. One does: the SDK serves ``subscriptions/listen`` on
+    its streaming branch even in JSON-response mode, and that branch watches
+    receive for the client leaving. An invented disconnect made it cancel the
+    request before answering, so the ASGI server sent a bare 500. A connected
+    client's receive blocks until something happens, and only a client that
+    has really gone reports a disconnect; the replay must not decide that.
+    """
 
     delivered = False
 
-    async def receive() -> dict:
+    async def receive() -> Message:
         nonlocal delivered
         if not delivered:
             delivered = True
             return {"type": "http.request", "body": body, "more_body": False}
-        # The SDK's JSON-response path does not need another frame. Returning
-        # disconnect is safe if a transport asks after consuming the body and
-        # prevents an accidental wait on a caller-owned receive channel.
-        return {"type": "http.disconnect"}
+        return await client_receive()
 
     return receive
 
@@ -397,7 +404,7 @@ class MCPApp:
             # from this request's own Authorization header rather than from
             # whichever replica happened to serve `initialize`.
 
-            routed_receive = _replay_body(body)
+            routed_receive = _replay_body(body, receive)
 
         manager_send = send
         if (

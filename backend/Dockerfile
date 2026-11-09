@@ -1,3 +1,16 @@
+# Third-party packages come from uv.lock, never from a resolver run at build
+# time: a plain `pip install .` takes whatever is newest on the build day, so
+# two builds of one commit could run different versions, neither of them the
+# set CI tested. This stage only turns the lock into a hash-pinned
+# requirements file; uv never reaches the runtime image.
+# `scripts/ci/check_image_lock.py IMAGE` compares a built image with the lock.
+FROM python:3.14-slim AS requirements
+RUN pip install --no-cache-dir uv==0.12.12
+WORKDIR /src
+COPY pyproject.toml uv.lock ./
+RUN UV_PYTHON_DOWNLOADS=never uv export --quiet --locked --no-dev --no-emit-project \
+      --format requirements.txt --no-header --output-file /requirements.txt
+
 FROM python:3.14-slim
 
 ARG AKB_SOURCE_REVISION=unknown
@@ -18,9 +31,17 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/* \
 
 WORKDIR /app
 
+# The requirements file is the complete locked set, so `--no-deps` installs
+# exactly it. The project install below adds only the `akb` package itself
+# (`--no-deps`), and `pip check` fails the build if the lock left out anything
+# `akb` or a locked package requires, instead of fetching it from the index.
+COPY --from=requirements /requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --no-deps --require-hashes -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
+
 COPY . .
 RUN printf '%s\n' "$AKB_SOURCE_REVISION" > /app/.akb-source-revision
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps . && pip check
 RUN /usr/local/bin/python -I -B -c "import app.cli; import mcp_server"
 
 # Create vault storage directory

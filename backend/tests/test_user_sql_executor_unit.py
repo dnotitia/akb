@@ -61,6 +61,57 @@ class _Pool:
 
 
 @pytest.mark.asyncio
+async def test_read_only_transaction_follows_admin_check_and_setup() -> None:
+    from app.services.user_sql_executor import UserSqlExecutor
+
+    events: list[str] = []
+
+    class Conn(_Conn):
+        async def fetchval(self, sql: str, *args: Any) -> bool:
+            events.append(sql)
+            return True
+
+        async def execute(self, sql: str, *args: Any) -> str:
+            events.append(sql)
+            return await super().execute(sql, *args)
+
+        async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+            events.append(sql)
+            return await super().fetch(sql, *args)
+
+    executor = UserSqlExecutor(cast(Any, _Pool(Conn())))
+    await executor.execute(
+        user_id="00000000-0000-0000-0000-000000000001",
+        actor_id="tester", sql="SELECT 1", is_admin=True, read_only=True,
+    )
+    assert "FOR SHARE" in events[0]
+    assert events.index("SET TRANSACTION READ ONLY") > next(
+        i for i, event in enumerate(events) if "akb.actor_id" in event
+    )
+    assert events.index("SET TRANSACTION READ ONLY") < events.index("SELECT 1")
+
+
+@pytest.mark.asyncio
+async def test_read_only_violation_preserves_sqlstate() -> None:
+    import asyncpg
+    from app.services.user_sql_executor import PermissionDeniedError, UserSqlExecutor
+
+    class Conn(_Conn):
+        async def execute(self, sql: str, *args: Any) -> str:
+            if sql.startswith("UPDATE"):
+                raise asyncpg.exceptions.ReadOnlySQLTransactionError("read only")
+            return await super().execute(sql, *args)
+
+    executor = UserSqlExecutor(cast(Any, _Pool(Conn())))
+    with pytest.raises(PermissionDeniedError) as exc:
+        await executor.execute(
+            user_id="00000000-0000-0000-0000-000000000001",
+            actor_id="tester", sql="UPDATE t SET x = 1", is_admin=True, read_only=True,
+        )
+    assert exc.value.pg_sqlstate == "25006"
+
+
+@pytest.mark.asyncio
 async def test_execute_forwards_params_to_select_fetch() -> None:
     from app.services.user_sql_executor import UserSqlExecutor
 

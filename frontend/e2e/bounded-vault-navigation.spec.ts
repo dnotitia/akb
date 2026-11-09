@@ -87,15 +87,17 @@ test("main Collections and content advance independently on scroll", async ({ pa
     await page.waitForTimeout(100);
   }
   await expect(collections.getByRole("link", { name: "Open collection z-last", exact: true })).toBeAttached();
+  expect(state.requests.some(url => url.searchParams.get("cursor") === "documents-next")).toBe(false);
+  await workspace.getByRole("tab", { name: /^Documents/ }).click();
   const resources = workspace.getByRole("region", { name: "Collection resources", exact: true });
   for (let step = 0; step < 6; step++) {
     await resources.getByRole("link").last().scrollIntoViewIfNeeded();
-    if (state.requests.some(url => url.searchParams.get("cursor") === "resources-next")) break;
+    if (state.requests.some(url => url.searchParams.get("cursor") === "documents-next")) break;
     await page.waitForTimeout(100);
   }
   await expect(resources.getByRole("link", { name: /Last document/ })).toBeAttached();
   expect(state.requests.some(url => url.searchParams.get("cursor") === "collections-next")).toBe(true);
-  expect(state.requests.some(url => url.searchParams.get("cursor") === "resources-next")).toBe(true);
+  expect(state.requests.some(url => url.searchParams.get("cursor") === "documents-next")).toBe(true);
 });
 
 test("a README beside closed Collections does not drain hidden document pages", async ({ page }) => {

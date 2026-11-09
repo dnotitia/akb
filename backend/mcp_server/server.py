@@ -297,9 +297,8 @@ _HANDLERS: dict[str, Any] = {}
 # Categorisation rule of thumb: any tool that mutates a vault, table,
 # document, file, edge, publication, vault membership, or vault
 # settings → `akb:vault:write`. Everything else (read / browse /
-# search / metadata / introspection) → `akb:vault:read`. `akb_sql` is
-# write-grade because the surface accepts INSERT/UPDATE/DELETE; the
-# safer "read-only SQL" cut would need a separate tool, deferred.
+# search / metadata / introspection) → `akb:vault:read`. SQL selects its
+# capability from the authenticated credential.
 _READ_SCOPE = "akb:vault:read"
 _WRITE_SCOPE = "akb:vault:write"
 _TOOL_SCOPES: dict[str, str] = {
@@ -414,6 +413,18 @@ def _required_scope(name: str, args: dict) -> str:
     if any(args.get(a) is not None for a in _ARG_WRITE_TRIGGERS.get(name, ())):
         return _WRITE_SCOPE
     return _TOOL_SCOPES.get(name, _WRITE_SCOPE)
+
+
+def _call_scope(name: str, args: dict, user: "_MCPUser") -> str:
+    if name != "akb_sql":
+        return _required_scope(name, args)
+    oauth_write = user.oauth_scopes is None or _WRITE_SCOPE in user.oauth_scopes
+    token_write = user.token_scopes is None or token_has_scope(user.token_scopes, "write")
+    if oauth_write and token_write:
+        return _WRITE_SCOPE
+    oauth_read = user.oauth_scopes is None or _READ_SCOPE in user.oauth_scopes
+    token_read = user.token_scopes is None or token_has_scope(user.token_scopes, "read")
+    return _READ_SCOPE if oauth_read and token_read else _WRITE_SCOPE
 
 
 # Schema-derived: {tool_name: set(allowed_arg_names)}. Used by _dispatch
@@ -1301,6 +1312,7 @@ async def _handle_sql(args: dict, uid: str, user: _MCPUser) -> dict:
         actor_id=user.username,
         sql=sql,
         is_admin=user.is_admin,
+        read_only=_call_scope("akb_sql", args, user) == _READ_SCOPE,
     )
 
 
@@ -1825,7 +1837,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
     # relabelled "error" because the response could not be encoded.
     recorded = False
     try:
-        is_write = _required_scope(name, arguments) == _WRITE_SCOPE
+        is_write = _call_scope(name, arguments, user) == _WRITE_SCOPE
         result: dict | None = None
 
         # A guide cannot influence a write that has already committed.  For a
@@ -1961,7 +1973,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # success path did not already record this invocation (a response-encode
         # failure lands here after a handler that actually succeeded).
         if not recorded:
-            is_write = _required_scope(name, arguments) == _WRITE_SCOPE
+            is_write = _call_scope(name, arguments, user) == _WRITE_SCOPE
             audit_log.record_tool(
                 name, arguments, user, envelope, is_write=is_write, protocol=protocol
             )
@@ -2035,7 +2047,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     # A test in `test_mcp_oauth_unit` asserts every registered handler
     # has an explicit mapping so CI catches the omission anyway.
     if user.oauth_scopes is not None:
-        required = _required_scope(name, args)
+        required = _call_scope(name, args, user)
         if required not in user.oauth_scopes:
             return err(
                 f"OAuth token is missing required scope '{required}' for tool '{name}'",
@@ -2044,7 +2056,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 granted_scopes=list(user.oauth_scopes),
             )
     if user.token_scopes is not None:
-        required = _required_scope(name, args)
+        required = _call_scope(name, args, user)
         required_token_scope = "write" if required == _WRITE_SCOPE else "read"
         if not token_has_scope(user.token_scopes, required_token_scope):
             return err(

@@ -86,7 +86,7 @@ describe("Shared connection setup", () => {
       tokens: [{ token_id: "t1", name: "claude", prefix: "akb_xyz", created_at: "2026-05-19", last_used_at: null }],
     });
     render(wrap());
-    await screen.findByRole("heading", { name: "Connect an agent" });
+    await screen.findByRole("heading", { name: "Agent connections" });
     expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
     expect(screen.queryByText(/akb_xyz…/)).not.toBeInTheDocument();
   });

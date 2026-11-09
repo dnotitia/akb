@@ -7,10 +7,10 @@ export function vaultGuideHref(vault: string) {
 }
 
 export function vaultGuideEditHref(vault: string) {
-  return `/vault/${encodeURIComponent(vault)}/settings?edit=guide#skill`;
+  return `${vaultGuideHref(vault)}?view=edit`;
 }
 
-/** Only a reading preview retaining this exact Settings entry can bypass its
+/** Only a guide preview retaining this exact Settings entry can bypass its
  * departure guard. A full-page guide, another Vault, or promotion still leaves
  * the mounted editor and must protect its draft. */
 export function retainsGuideSettings(vault: string, location: Location, href: string, state: unknown) {

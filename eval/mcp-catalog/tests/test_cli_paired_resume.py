@@ -103,7 +103,6 @@ def test_run_paired_restores_one_parent_budget_after_readonly_validation(
     monkeypatch.setattr(cli_module, "validate_paired_resume_parent", validate_parents)
     monkeypatch.setattr(cli_module, "BenchmarkRunner", FakeRunner)
     monkeypatch.setattr(cli_module, "attach_paired_execution_evidence", lambda _artifact, **kwargs: attached_budgets.append(kwargs["budget_used"]))
-    monkeypatch.setattr(cli_module, "_reconcile_paired_artifact_reservations", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli_module, "compare_artifacts", lambda *_args: {"verdict": "inconclusive"})
     monkeypatch.setattr(cli_module, "write_json", lambda path, payload, *_args: written.append((path, payload)))
 

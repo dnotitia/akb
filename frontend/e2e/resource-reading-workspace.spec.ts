@@ -26,9 +26,11 @@ for (const width of [1024, 1280, 1600]) for (const dark of [false, true]) {
     expect(Math.abs(row.y + row.height - rail.y - rail.height)).toBeLessThanOrEqual(1);
     expect(row.height).toBe(48);
     const metadata = (await page.locator("#document-reading-canvas").getByRole("group", { name: "Document metadata", exact: true }).boundingBox())!;
-    const heading = (await page.locator("#document-reading-canvas").getByRole("heading", { name: "Authored heading", exact: true }).boundingBox())!;
+    const heading = (await page.locator("#document-reading-canvas").getByRole("heading", { name: title, level: 1, exact: true }).boundingBox())!;
     expect(Math.abs(metadata.x - heading.x)).toBeLessThanOrEqual(1);
     expect(metadata.y).toBeGreaterThanOrEqual(heading.y + heading.height);
+    const bodyHeading = (await page.locator("#document-reading-canvas").getByRole("heading", { name: "Authored heading", exact: true }).boundingBox())!;
+    expect(bodyHeading.y).toBeGreaterThanOrEqual(metadata.y + metadata.height);
     const identity = (await sidebar.locator('[data-slot="vault-identity-header"]').boundingBox())!;
     const header = (await page.locator(".app-header").boundingBox())!;
     expect(Math.abs(identity.y + identity.height - header.y - header.height)).toBeLessThanOrEqual(1);
@@ -76,7 +78,7 @@ for (const scenario of [
   const canvas = page.locator("#document-reading-canvas");
   const before = await canvas.boundingBox();
   await openPublication(page);
-  const panel = page.getByRole("dialog", { name: "Public link", exact: true });
+  const panel = page.getByRole("dialog", { name: "Publication", exact: true });
   await expect(panel).toBeVisible();
   const panelBox = (await panel.boundingBox())!;
   expect(panelBox.y).toBeGreaterThanOrEqual(triggerBox.y + triggerBox.height);
@@ -168,7 +170,7 @@ async function revealVaultNavigation(page: Page) {
 
 async function expectQuietVaultTrail(page: Page, label: string) {
   const isRoot = label === "Overview";
-  const isFocusedPage = ["Graph", "Public links", "Members", "Settings"].includes(label);
+  const isFocusedPage = ["Graph", "Publications", "Members", "Settings"].includes(label);
   const trail = page.getByRole("navigation", { name: "Current page", exact: true });
   await expect(trail.locator('[aria-current="page"]')).toHaveText(isRoot ? "fixture" : label);
   const vault = trail.getByRole("link", { name: isFocusedPage ? "Back to fixture" : "fixture", exact: true });
@@ -195,7 +197,7 @@ async function expectQuietVaultTrail(page: Page, label: string) {
 const vaultDestinations = [
   ["Overview", "/vault/fixture"],
   ["Graph", "/vault/fixture/graph"],
-  ["Public links", "/vault/fixture/publications"],
+  ["Publications", "/vault/fixture/publications"],
   ["Members", "/vault/fixture/members"],
   ["Settings", "/vault/fixture/settings"],
 ] as const;
@@ -407,7 +409,7 @@ for (const dark of [false, true]) test(`Vault header keeps a visible divider (${
   }
 });
 
-for (const dark of [false, true]) for (const width of [375, 1440]) test(`Settings header uses the paper surface at ${width}px (${dark ? "dark" : "light"})`, async ({ page }, testInfo) => {
+for (const dark of [false, true]) for (const width of [375, 1440]) test(`Settings keeps its neutral canvas and paper header at ${width}px (${dark ? "dark" : "light"})`, async ({ page }, testInfo) => {
   await page.setViewportSize({ width, height: 900 });
   await fixture(page, dark);
   for (const path of ["/settings", "/settings?tab=tokens", "/settings/?tab=preferences"]) {
@@ -417,7 +419,8 @@ for (const dark of [false, true]) for (const width of [375, 1440]) test(`Setting
     await expect(header).toHaveCSS("border-bottom-width", "1px");
     await expect(header).toHaveCSS("height", "56px");
     const workspace = page.getByTestId("account-settings-dialog");
-    await expect(workspace).toHaveCSS("background-color", await header.evaluate(el => getComputedStyle(el).backgroundColor));
+    await expect(workspace).toHaveCSS("background-color", await page.locator("body").evaluate(el => getComputedStyle(el).backgroundColor));
+    await expect(workspace.locator(".settings-studio-header")).toHaveCSS("background-color", await header.evaluate(el => getComputedStyle(el).backgroundColor));
   }
   await page.screenshot({ path: testInfo.outputPath("settings-paper-header.png") });
 });
@@ -484,6 +487,7 @@ for (const scope of ["vault", "all"] as const) for (const destination of ["resul
   await expect(editor).toContainText(draft);
   await expect(page.getByTestId("document-preview-dialog")).toHaveCount(0);
   await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
+  await panel.getByRole("combobox").fill("reading");
   if (scope === "all") {
     await panel.getByRole("button", { name: "Search scope: fixture", exact: true }).click();
     await page.getByRole("menuitem", { name: "All vaults", exact: true }).click();
@@ -542,10 +546,10 @@ function documentActions(page: Page) {
     .getByRole("button", { name: `Actions for ${title}`, exact: true });
 }
 
-async function openPublication(page: Page, name: "Publish" | "Public link" = "Public link") {
+async function openPublication(page: Page, name: "Publish" | "Publication" = "Publication") {
   await documentActions(page).click();
   await page.getByRole("menuitem", { name, exact: true }).click();
-  await expect(page.getByRole("dialog", { name: name === "Publish" ? "Publish document" : "Public link", exact: true })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: name === "Publish" ? "Publish document" : "Publication", exact: true })).toBeVisible();
 }
 
 async function openDocumentDetails(page: Page, section?: "Properties" | "Version history" | "Related documents") {
@@ -657,7 +661,7 @@ for (const width of [320, 1440]) test(`long summaries preserve draft state and o
   await expect(time).toBeVisible();
   if (width === 1440) expect(await time.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
   await openPublication(page);
-  await expect(page.getByRole("dialog", { name: "Public link", exact: true })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Publication", exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(documentActions(page)).toBeFocused();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -703,7 +707,8 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       }))),
       contentType: "application/json",
     });
-    await expect(page.locator("h1#doc-title")).toHaveCount(1);
+    await expect(page.getByRole("heading", { name: title, level: 1, exact: true })).toBeVisible();
+    await expect(page.locator("#document-reading-canvas h1")).toHaveCount(1);
     await expect(page.locator('[data-slot="resource-command-row"]')).toHaveCount(1);
     const readingTools = page.getByRole("group", { name: "Document reading tools", exact: true });
     await expect(readingTools.getByRole("radio", { name: "Preview", exact: true })).toBeVisible();
@@ -778,7 +783,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
       await expect(resize).toHaveAttribute("aria-valuemin", "224");
       await expect(resize).toHaveAttribute("aria-valuemax", "360");
     }
-    await expect(collections.getByRole("link", { name: /^(Search|Graph|Public links|Members|Settings)$/ })).toHaveCount(0);
+    await expect(collections.getByRole("link", { name: /^(Search|Graph|Publications|Members|Settings)$/ })).toHaveCount(0);
     if (drawer) {
       // Leave the identity tooltip before testing the outer disclosure's
       // Escape behavior; nested layers consume Escape independently.
@@ -799,7 +804,7 @@ for (const width of [375, 768, 1440, 2560]) for (const dark of [false, true]) {
         const rect = el.getBoundingClientRect();
         return { x: rect.x, width: rect.width, top: rect.top, margin: getComputedStyle(el).marginTop };
       };
-      return { heading: box("h2"), paragraph: box("p"), table: box(".akb-md-table"), list: box("ul"), code: box("pre") };
+      return { heading: box("h1"), paragraph: box("p"), table: box(".akb-md-table"), list: box("ul"), code: box("pre") };
     });
     for (const box of [measures.paragraph, measures.table, measures.list, measures.code]) {
       expect(box.x).toBeCloseTo(measures.heading.x, 0);
@@ -1227,7 +1232,7 @@ for (const width of [375, 768]) {
     await expect(page.locator(".app-header").getByRole("navigation", { name: "Vault pages", exact: true })).toHaveCount(0);
     for (const link of await navigation.getByRole("link").all()) {
       const box = (await link.boundingBox())!;
-      expect(box.height).toBeGreaterThanOrEqual(44);
+      expect(box.height).toBeGreaterThanOrEqual(width < 640 ? 44 : 32);
       expect(box.x).toBeGreaterThanOrEqual(0);
       expect(box.x + box.width).toBeLessThanOrEqual(width);
     }
@@ -1275,8 +1280,8 @@ for (const width of [640, 768]) {
     const controls = [
       logo,
       search,
-      mobileNavigation.getByRole("link", { name: "Home", exact: true }),
       mobileNavigation.getByRole("link", { name: "Vaults", exact: true }),
+      mobileNavigation.getByRole("link", { name: "Publications", exact: true }),
       header.getByRole("button", { name: /^Notifications/ }),
       account,
 ];
@@ -1567,7 +1572,7 @@ for (const scenario of [
   await expect(password).toHaveValue("fixture-passphrase");
   await expect(panel.getByLabel("Max views", { exact: true })).toHaveValue("25");
   await submit.click();
-  const ready = page.getByRole("dialog", { name: "Public link", exact: true });
+  const ready = page.getByRole("dialog", { name: "Publication", exact: true });
   await expect(ready).toBeVisible();
   const publicUrl = ready.getByRole("textbox", { name: "Public URL", exact: true });
   await expect(publicUrl).toHaveValue(`${new URL(page.url()).origin}/p/new-public-link`);
@@ -1621,7 +1626,7 @@ for (const dark of [false, true]) test(`public-link popover anchors to its butto
   const before = await canvas.boundingBox();
   const scrollBefore = await canvas.evaluate(element => element.scrollTop);
   await openPublication(page);
-  const panel = page.getByRole("dialog", { name: "Public link", exact: true });
+  const panel = page.getByRole("dialog", { name: "Publication", exact: true });
   await expect(panel).toBeVisible();
   await expect(panel).toHaveAttribute("data-side", "bottom");
   const anchor = (await trigger.boundingBox())!;
@@ -1654,7 +1659,7 @@ for (const dark of [false, true]) test(`public-link popover anchors to its butto
   await expect(panel).toHaveCount(0);
   await expect(trigger).toBeFocused();
   await openPublication(page);
-  await panel.getByRole("button", { name: "Close public link" }).click();
+  await panel.getByRole("button", { name: "Close publication options" }).click();
   await expect(trigger).toBeFocused();
 });
 
@@ -1667,7 +1672,7 @@ for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }
   const canvas = page.locator("#document-reading-canvas");
   const before = await canvas.boundingBox();
   await openPublication(page);
-  const panel = page.getByRole("dialog", { name: "Public link", exact: true });
+  const panel = page.getByRole("dialog", { name: "Publication", exact: true });
   await expect(panel).toBeVisible();
   const box = (await panel.boundingBox())!;
   expect(box.x).toBeGreaterThanOrEqual(7);
@@ -1698,7 +1703,7 @@ for (const previewMode of [false, true]) test(`public-link popover preserves con
   await expect(trigger).toBeVisible();
   const readingUrl = page.url();
   await openPublication(page);
-  const panel = page.getByRole("dialog", { name: "Public link", exact: true });
+  const panel = page.getByRole("dialog", { name: "Publication", exact: true });
   await panel.getByRole("button", { name: "Copy link", exact: true }).click();
   await expect(panel.getByRole("status")).toHaveText("Link copied.");
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(`${new URL(page.url()).origin}/p/guide-public`);

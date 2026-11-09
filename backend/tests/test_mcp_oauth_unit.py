@@ -849,3 +849,81 @@ async def test_verify_rejects_spa_audience_token(monkeypatch, rsa_keypair):
         )
         is None
     )
+
+@pytest.mark.asyncio
+async def test_read_scoped_sql_reaches_handler(monkeypatch):
+    from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
+
+    async def handler(args, uid, user):
+        return {"kind": "table_query", "items": []}
+
+    monkeypatch.setitem(_HANDLERS, "akb_sql", handler)
+    for user in (
+        _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:read"]),
+        _MCPUser(user_id="u-1", token_scopes=frozenset({"read"})),
+    ):
+        result = await _dispatch("akb_sql", {"vault": "v", "sql": "SELECT 1"}, user)
+        assert result == {"kind": "table_query", "items": []}
+
+
+@pytest.mark.parametrize(
+    ("oauth", "token", "expected"),
+    [
+        (["akb:vault:read"], None, "akb:vault:read"),
+        (["akb:vault:write"], None, "akb:vault:write"),
+        (None, frozenset({"read"}), "akb:vault:read"),
+        (None, frozenset({"write"}), "akb:vault:write"),
+        (None, frozenset({"admin"}), "akb:vault:write"),
+        (None, None, "akb:vault:write"),
+    ],
+)
+def test_sql_capability_follows_credential(oauth, token, expected):
+    from mcp_server.server import _call_scope, _MCPUser
+
+    user = _MCPUser(oauth_scopes=oauth, token_scopes=token)
+    assert _call_scope("akb_sql", {"sql": "SELECT 1"}, user) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user", ["oauth", "token"])
+async def test_empty_scope_cannot_dispatch_sql(user):
+    from mcp_server.server import _dispatch, _MCPUser
+
+    actor = _MCPUser(oauth_scopes=[]) if user == "oauth" else _MCPUser(token_scopes=frozenset())
+    result = await _dispatch("akb_sql", {"vault": "v", "sql": "SELECT 1"}, actor)
+    assert result["code"] == "insufficient_scope"
+
+
+@pytest.mark.asyncio
+async def test_read_sql_is_read_for_preflight_audit_and_usage(monkeypatch):
+    from mcp_server import server as srv
+
+    user = srv._MCPUser(user_id="u-1", token_scopes=frozenset({"read"}))
+    recorded = []
+    preflight = []
+
+    async def get_user():
+        return user
+
+    async def dispatch(name, args, actor):
+        return {"kind": "table_query", "items": []}
+
+    async def can_read(*args):
+        return True
+
+    async def preflight_payload(*args, **kwargs):
+        preflight.append(True)
+        return {"unexpected": True}
+
+    monkeypatch.setattr(srv, "_get_user", get_user)
+    monkeypatch.setattr(srv, "_dispatch", dispatch)
+    monkeypatch.setattr(srv, "_can_read_vault", can_read)
+    monkeypatch.setattr(srv, "_vault_skill_preflight_version", lambda: 2)
+    from app.services import vault_skill_service
+    monkeypatch.setattr(vault_skill_service, "preflight_payload", preflight_payload)
+    monkeypatch.setattr(srv.audit_log, "record_tool", lambda *a, **kw: recorded.append(kw["is_write"]))
+    monkeypatch.setattr(srv.tool_usage, "record", lambda *a, **kw: recorded.append(kw["is_write"]))
+    result = await srv.call_tool("akb_sql", {"vault": "v", "sql": "SELECT 1"})
+    assert not result.is_error
+    assert recorded == [False, False]
+    assert preflight == []

@@ -5,11 +5,11 @@ import re
 from typing import NoReturn
 import uuid
 
-from fastapi import HTTPException, Request, Security
+from fastapi import Header, HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import settings
-from app.exceptions import AuthenticationError
+from app.exceptions import AuthenticationError, ForbiddenError
 from app.models.vault_scope import (
     current_request_jwt_claims,
     parse_request_jwt_claims_header,
@@ -33,6 +33,7 @@ from app.services.sso_browser_session_service import (
     sso_browser_csrf_cookie_name,
     sso_browser_session_cookie_name,
 )
+from app.sso.operation_request_scope import SSO_OPERATION_REQUEST_SCOPES
 
 bearer_auth = HTTPBearer(auto_error=False, scheme_name="bearerAuth")
 
@@ -203,6 +204,40 @@ async def _authenticated_user(
             },
         )
     _apply_claim_header(request, user)
+    return user
+
+
+async def get_sso_operation_request_service_key(
+    authorization: str | None = Header(default=None),
+) -> AuthenticatedUser:
+    """Resolve only the dedicated bearer key for operation-request routes.
+
+    This deliberately calls the REST bearer resolver directly rather than the
+    generic request dependency: this one scope is neither read nor write, so
+    treating it as either would grant it every ordinary API route. It also
+    never consults cookies or a browser session.
+    """
+    if not authorization:
+        raise ForbiddenError(
+            "SSO operation requests require a dedicated service key",
+            code="sso_operation_request_service_key_required",
+        )
+    user = await resolve_rest_user_authorization(authorization)
+    if user is None:
+        raise AuthenticationError()
+    if (
+        user.account_kind != "service"
+        or user.is_admin
+        or user.auth_method != "pat"
+        or user.token_id is None
+        or user.key_class != "service"
+        or user.vault_scope is not None
+        or user.token_scopes != SSO_OPERATION_REQUEST_SCOPES
+    ):
+        raise ForbiddenError(
+            "SSO operation requests require a dedicated service key",
+            code="sso_operation_request_service_key_required",
+        )
     return user
 
 

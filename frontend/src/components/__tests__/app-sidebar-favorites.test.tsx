@@ -94,7 +94,7 @@ describe("Workspace favorite navigation", () => {
   it("keeps compact navigation to primary links only", () => {
     mount(true);
     expect(screen.queryByRole("navigation", { name: "Favorite vaults" })).not.toBeInTheDocument();
-    expect(within(screen.getByRole("navigation", { name: "Workspace navigation" })).getAllByRole("link").map(link => link.textContent || link.getAttribute("aria-label"))).toEqual(["Home", "Search", "Vaults"]);
+    expect(within(screen.getByRole("navigation", { name: "Workspace navigation" })).getAllByRole("link").map(link => link.textContent || link.getAttribute("aria-label"))).toEqual(["Home", "Search", "Vaults", "Publications"]);
   });
 
   it.each([false, true])("navigates to the directory through a native Vaults link (compact=%s)", async compact => {

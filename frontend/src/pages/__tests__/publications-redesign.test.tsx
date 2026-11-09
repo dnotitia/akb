@@ -76,17 +76,17 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("Public links page redesign", () => {
+describe("Publications page redesign", () => {
   it("keeps an empty vault focused without a forced context rail", async () => {
     listPublicationsMock.mockResolvedValue({ publications: [] });
     renderPage();
 
-    expect(await screen.findByText("No public links yet")).toBeInTheDocument();
+    expect(await screen.findByText("Nothing published yet")).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { level: 1, name: "Public links" }),
-    ).toHaveClass("sr-only");
-    expect(screen.getByRole("heading", { level: 2, name: "Public links" })).toBeInTheDocument();
-    expect(document.title).toBe("platform-docs · Public links · AKB");
+      screen.getByRole("heading", { level: 1, name: "Publications" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("heading", { level: 2, name: "Publications" })).toBeNull();
+    expect(document.title).toBe("platform-docs · Publications · AKB");
     expect(screen.getByTestId("publication-workspace")).toHaveClass(
       "w-full",
       "mx-auto",
@@ -105,9 +105,9 @@ describe("Public links page redesign", () => {
     expect(within(policy).getByText("Read-only")).toBeInTheDocument();
     expect(within(policy).getByText("No sign-in required")).toBeInTheDocument();
     expect(policy).toHaveTextContent(/Public.*Read-only.*No sign-in required/);
-    expect(screen.getByText("0 links")).toBeInTheDocument();
+    expect(screen.getByText("0 publications")).toBeInTheDocument();
     expect(screen.getByTestId("publication-empty-state")).not.toHaveClass("min-h-80");
-    expect(screen.getByText("Open a document, table, or file and choose Publish to create a public link.")).toBeInTheDocument();
+    expect(screen.getByText("Open a document, table, or file and choose Publish to share it outside your Vault.")).toBeInTheDocument();
     expect(screen.queryByText("Vault content is private by default")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Publish" })).not.toBeInTheDocument();
     const browseLink = screen.getByRole("link", {
@@ -126,7 +126,7 @@ describe("Public links page redesign", () => {
     });
     renderPage();
 
-    const ledger = await screen.findByRole("list", { name: "Public links" });
+    const ledger = await screen.findByRole("list", { name: "Publications" });
     expect(within(ledger).getAllByRole("listitem")).toHaveLength(8);
     expect(screen.queryByTestId("publication-controls")).not.toBeInTheDocument();
   });
@@ -148,12 +148,12 @@ describe("Public links page redesign", () => {
     renderPage();
 
     const search = await screen.findByPlaceholderText(
-      "Filter public links…",
+      "Filter publications…",
     );
     expect(screen.getByTestId("publication-controls")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Files" }));
-    const ledger = screen.getByRole("list", { name: "Public links" });
+    const ledger = screen.getByRole("list", { name: "Publications" });
     expect(within(ledger).getByText("Release bundle")).toBeInTheDocument();
     expect(within(ledger).getByRole("link", { name: "Release bundle" })).toHaveAttribute(
       "href", "/vault/platform-docs/file/release-bundle",
@@ -181,23 +181,23 @@ describe("Public links page redesign", () => {
     });
     renderPage();
 
-    const ledger = await screen.findByRole("list", { name: "Public links" });
+    const ledger = await screen.findByRole("list", { name: "Publications" });
     expect(within(ledger).getAllByRole("listitem")).toHaveLength(30);
-    expect(screen.getByText("Showing 30 of 65 loaded links")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Show more links (35 remaining)" }));
+    expect(screen.getByText("Showing 30 of 65 loaded publications")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Show more publications (35 remaining)" }));
     expect(within(ledger).getAllByRole("listitem")).toHaveLength(60);
 
     await user.click(screen.getByRole("button", { name: "Files" }));
     expect(within(ledger).getAllByRole("listitem")).toHaveLength(1);
     expect(within(ledger).getByTestId("publication-index")).toHaveTextContent("65");
-    expect(screen.getByText("Showing 1 of 1 matching link")).toBeInTheDocument();
+    expect(screen.getByText("Showing 1 of 1 matching publication")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "All" }));
     expect(within(ledger).getAllByRole("listitem")).toHaveLength(30);
-    await user.click(screen.getByRole("button", { name: "Show more links (35 remaining)" }));
-    await user.click(screen.getByRole("button", { name: "Show more links (5 remaining)" }));
+    await user.click(screen.getByRole("button", { name: "Show more publications (35 remaining)" }));
+    await user.click(screen.getByRole("button", { name: "Show more publications (5 remaining)" }));
     expect(within(ledger).getAllByRole("listitem")).toHaveLength(65);
-    expect(screen.getByText("Showing 65 of 65 loaded links")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Show more links/ })).not.toBeInTheDocument();
+    expect(screen.getByText("Showing 65 of 65 loaded publications")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Show more publications/ })).not.toBeInTheDocument();
     expect(listPublicationsMock).toHaveBeenCalledTimes(1);
   });
 
@@ -212,13 +212,13 @@ describe("Public links page redesign", () => {
     });
     renderPage();
 
-    await user.type(await screen.findByRole("searchbox", { name: "Filter public links" }), "No match");
-    expect(screen.getByRole("heading", { name: "No matching public links" })).toBeInTheDocument();
+    await user.type(await screen.findByRole("searchbox", { name: "Filter publications" }), "No match");
+    expect(screen.getByRole("heading", { name: "No matching publications" })).toBeInTheDocument();
     expect(screen.queryByTestId("publication-empty-state")).not.toBeInTheDocument();
     expect(screen.getByTestId("publication-policy-summary")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Clear filters" }));
-    expect(within(screen.getByRole("list", { name: "Public links" })).getAllByRole("listitem")).toHaveLength(9);
-    expect(screen.getByRole("searchbox", { name: "Filter public links" })).toHaveValue("");
+    expect(within(screen.getByRole("list", { name: "Publications" })).getAllByRole("listitem")).toHaveLength(9);
+    expect(screen.getByRole("searchbox", { name: "Filter publications" })).toHaveValue("");
   });
 
   it("retains the compact registry boundary across loading, failure, and retry", async () => {
@@ -229,32 +229,32 @@ describe("Public links page redesign", () => {
     const user = userEvent.setup();
     renderPage();
 
-    expect(screen.getByRole("status", { name: "Loading public links" })).toBeInTheDocument();
-    expect(screen.queryByText("0 links")).not.toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Loading publications" })).toBeInTheDocument();
+    expect(screen.queryByText("0 publications")).not.toBeInTheDocument();
     expect(screen.queryByTestId("publication-empty-state")).not.toBeInTheDocument();
-    await act(async () => { rejectLoad(new Error("HTTP 503: public links unavailable")); });
-    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load public links");
-    expect(screen.getByRole("alert")).toHaveTextContent("HTTP 503: public links unavailable");
+    await act(async () => { rejectLoad(new Error("HTTP 503: publications unavailable")); });
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't load publications");
+    expect(screen.getByRole("alert")).toHaveTextContent("HTTP 503: publications unavailable");
     expect(screen.getByTestId("publication-policy-summary")).toBeInTheDocument();
     expect(screen.queryByTestId("publication-empty-state")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Retry" }));
-    expect(await screen.findByText("No public links yet")).toBeInTheDocument();
+    expect(await screen.findByText("Nothing published yet")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(listPublicationsMock).toHaveBeenCalledTimes(2);
   });
 
-  it("presents public links as a manageable ledger", async () => {
+  it("presents publications as a manageable ledger", async () => {
     const user = userEvent.setup();
     const writeClipboard = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
     listPublicationsMock.mockResolvedValue({ publications: [PUBLICATION] });
     renderPage();
 
-    const ledger = await screen.findByRole("list", { name: "Public links" });
+    const ledger = await screen.findByRole("list", { name: "Publications" });
     expect(within(ledger).getByText("Incident runbook")).toBeInTheDocument();
     expect(within(ledger).getByTestId("publication-index")).toHaveTextContent(
       "1",
     );
-    expect(within(ledger).getByText("Active")).toBeInTheDocument();
+    expect(within(ledger).getByText("Published", { selector: "div" })).toBeInTheDocument();
     expect(within(ledger).getByText("Delivery: Live")).toBeInTheDocument();
     expect(within(ledger).getByText("Document")).toBeInTheDocument();
     expect(within(ledger).getByText("Password")).toBeInTheDocument();
@@ -264,16 +264,16 @@ describe("Public links page redesign", () => {
       within(ledger).getByRole("link", { name: "Incident runbook" }),
     ).toHaveAttribute("href", "/vault/platform-docs/doc/guides%2Frunbook.md");
     expect(
-      within(ledger).getByRole("link", { name: /Open public page/i }),
+      within(ledger).getByRole("link", { name: /Open publication/i }),
     ).toHaveAttribute("href", PUBLICATION.share_url);
     expect(screen.getByRole("link", { name: "Browse vault" })).toHaveAttribute(
       "href",
       "/vault/platform-docs",
     );
 
-    await user.click(within(ledger).getByRole("button", { name: "Copy public link for Incident runbook" }));
+    await user.click(within(ledger).getByRole("button", { name: "Copy publication link for Incident runbook" }));
     expect(writeClipboard).toHaveBeenCalledWith(PUBLICATION.share_url);
-    expect(within(ledger).getByRole("button", { name: "Public link copied" })).toBeInTheDocument();
+    expect(within(ledger).getByRole("button", { name: "Link copied" })).toBeInTheDocument();
 
     await user.click(
       within(ledger).getByRole("button", { name: /More actions/i }),
@@ -326,9 +326,9 @@ describe("Public links page redesign", () => {
   ])("separates delivery from availability %j", async (limits, status) => {
     listPublicationsMock.mockResolvedValue({ publications: [{ ...PUBLICATION, ...limits }] });
     renderPage();
-    const ledger = await screen.findByRole("list", { name: "Public links" });
+    const ledger = await screen.findByRole("list", { name: "Publications" });
     expect(within(ledger).getByText(status)).toBeInTheDocument();
-    expect(within(ledger).queryByText("Active")).toBeNull();
+    expect(within(ledger).queryByText("Published", { selector: "div" })).toBeNull();
     expect(within(ledger).getByText(`Delivery: ${"mode" in limits ? "Snapshot" : "Live"}`)).toBeInTheDocument();
     if ("expires_at" in limits && limits.expires_at === undefined) {
       expect(within(ledger).getByText("Expiry unavailable")).toBeInTheDocument();
@@ -346,8 +346,8 @@ describe("Public links page redesign", () => {
     const user = userEvent.setup();
     renderPage();
     expect(await screen.findByText(reason)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Copy public link/ })).toBeEnabled();
-    expect(screen.getByRole("link", { name: /Open public page/ })).toHaveAttribute("href", PUBLICATION.share_url);
+    expect(screen.getByRole("button", { name: /Copy publication link/ })).toBeEnabled();
+    expect(screen.getByRole("link", { name: /Open publication/ })).toHaveAttribute("href", PUBLICATION.share_url);
     await user.click(screen.getByRole("button", { name: /More actions/ }));
     const item = screen.getByRole("menuitem", { name: "Unpublish" });
     expect(item).toHaveAttribute("aria-disabled", "true");
@@ -361,7 +361,7 @@ describe("Public links page redesign", () => {
     listPublicationsMock.mockResolvedValue({ publications: [PUBLICATION] });
     renderPage();
     expect(await screen.findByText("Unpublish is unavailable until Vault permissions can be verified.")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /Open public page/ })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Open publication/ })).toBeInTheDocument();
   });
 
   it.each(["Vault", "account", "revision"])("ignores late links after the %s boundary changes", async (boundary) => {
@@ -415,7 +415,7 @@ describe("Public links page redesign", () => {
     vi.setSystemTime(new Date("2026-10-14T00:00:00Z"));
     listPublicationsMock.mockResolvedValue({ publications: [{ ...PUBLICATION, expires_at: "2026-10-14T00:00:01Z" }] });
     await act(async () => { renderPage(); });
-    expect(screen.getByText("Active")).toBeInTheDocument();
+    expect(screen.getByText("Published", { selector: "div" })).toBeInTheDocument();
     await act(async () => { vi.advanceTimersByTime(1000); });
     expect(screen.getByText("Expired")).toBeInTheDocument();
     expect(screen.getByText("Delivery: Live")).toBeInTheDocument();
@@ -438,7 +438,7 @@ describe("Public links page redesign", () => {
     listPublicationsMock.mockResolvedValue({ publications: [PUBLICATION] });
     const user = userEvent.setup();
     renderPage();
-    const ledger = await screen.findByRole("list", { name: "Public links" });
+    const ledger = await screen.findByRole("list", { name: "Publications" });
     expect(ledger).toHaveTextContent("Incident runbook");
     expect(screen.getByRole("alert")).toHaveTextContent("HTTP 503: permissions temporarily unavailable");
     await user.click(screen.getByRole("button", { name: /More actions/ }));
@@ -473,7 +473,7 @@ describe("Public links page redesign", () => {
     await user.click(screen.getByRole("button", { name: "Retry permissions" }));
     await screen.findByText("Unpublish requires a Writer, Admin, or Owner role.");
     expect(screen.queryByRole("alert")).toBeNull();
-    expect(screen.getByRole("list", { name: "Public links" })).toHaveTextContent("Incident runbook");
+    expect(screen.getByRole("list", { name: "Publications" })).toHaveTextContent("Incident runbook");
     expect(listPublications).toHaveBeenCalledTimes(1);
     expect(deletePublication).not.toHaveBeenCalled();
   });
@@ -506,8 +506,8 @@ it("shows the public-link ledger while optional titles are still loading", async
   listPublicationsMock.mockResolvedValue({ publications: [{ ...PUBLICATION, title: null }, { ...PUBLICATION, slug: "ready", title: "Ready document" }] });
   renderPage();
   expect(await screen.findByRole("link", { name: "Ready document" })).toBeVisible();
-  expect(screen.getByRole("list", { name: "Public links" }).children).toHaveLength(2);
-  expect(screen.queryByRole("status", { name: "Loading public links" })).toBeNull();
+  expect(screen.getByRole("list", { name: "Publications" }).children).toHaveLength(2);
+  expect(screen.queryByRole("status", { name: "Loading publications" })).toBeNull();
   await act(async () => resolveTitle({ title: "Resolved title" }));
   expect(screen.getByRole("link", { name: "Resolved title" })).toBeVisible();
 });

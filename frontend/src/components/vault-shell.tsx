@@ -464,16 +464,18 @@ export function VaultShell() {
                 data-slot="vault-route-viewport"
                 className={cn(
                   "min-h-0 min-w-0 flex-1 bg-background",
+                  (isOverview || !name) && "vault-library",
+                  isSettings && "vault-control-workspace",
                   "overflow-y-auto",
                 )}
               >
                 <div
                   className={cn(
                     "w-full",
-                    isOverview || isPublications || isMembers || isSettings
-                        ? "min-h-full px-4 py-5 sm:px-6 xl:px-8"
-                        : !name ? "p-0"
-                          : isActivity ? "px-3 py-5 lg:px-4 lg:py-6 xl:px-5"
+                    isOverview || isPublications || isMembers || !name
+                      ? "min-h-full px-4 py-5 sm:px-6 xl:px-8"
+                      : isSettings ? "min-h-full"
+                        : isActivity ? "px-3 py-5 lg:px-4 lg:py-6 xl:px-5"
                             : "px-5 py-5 lg:px-7 lg:py-6 xl:px-8",
                   )}
                 >

@@ -141,6 +141,7 @@ export function useVaultTree(
     // status filtering leaves the resource page empty.
     pastCollectionCatalog: Boolean(lastPage && !lastPage.items.some(item => item.type === "collection")),
     loadingMore: query.isFetchingNextPage,
+    retry: () => { void query.refetch(); },
     loadMore: () => { if (!checking && options.enabled !== false && query.hasNextPage && !query.isFetching) void query.fetchNextPage(); },
     loading: items === null && !error && Boolean(vault),
     refreshing: Boolean(vault) && query.isFetching && !query.isFetchingNextPage && items !== null,

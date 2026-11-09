@@ -70,7 +70,7 @@ export const PublicationsList: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { level: 2, name: "Public links" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { level: 1, name: "Publications" })).toBeInTheDocument();
     await expect(await canvas.findByText("Storybook rollout")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
@@ -90,7 +90,7 @@ export const PublicationsEmpty: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("No public links yet")).toBeInTheDocument();
+    await expect(await canvas.findByText("Nothing published yet")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
 };
@@ -113,7 +113,7 @@ export const PublicationsLoading: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(
-      await canvas.findByRole("status", { name: "Loading public links" }),
+      await canvas.findByRole("status", { name: "Loading publications" }),
     ).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
@@ -135,7 +135,7 @@ export const PublicationsError: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText("Couldn't load public links")).toBeInTheDocument();
+    await expect(await canvas.findByText("Couldn't load publications")).toBeInTheDocument();
     await expect(await canvas.findByText("Publications unavailable")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
   },
@@ -156,7 +156,7 @@ export const MembersOwner: Story = {
   render: () => <AkbRouteTree />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole("heading", { name: "Members", level: 2 })).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { name: "Members", level: 1 })).toBeInTheDocument();
     await expect(await canvas.findByRole("button", { name: "Invite member" })).toBeInTheDocument();
     await expect(await canvas.findByText("Story Writer")).toBeInTheDocument();
     await expectVaultShell(canvasElement);
