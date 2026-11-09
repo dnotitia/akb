@@ -7,6 +7,16 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- Native document create/update accepts an optional UUID `idempotency_key`
+  through MCP and REST. Matching retries return the original write receipt;
+  reuse with different input conflicts. Keys bind the authenticated user,
+  Vault, operation and normalized request, and reuse the immutable Native
+  mutation record without a new request table. Current access is checked on
+  every attempt; original-read conditions remain required for body updates.
+  MCP advertises support per tool. Bare Git rejects keys explicitly, and
+  keyless calls retain existing behavior. See
+  [document retry semantics](../docs/operations/document-idempotency.md).
+
 - MCP document creation rejects missing, null or non-string `content` with
   `invalid_argument` and `details.field=/content`. Updates reject non-string,
   non-null bodies before storage access. Metadata-only/null updates, empty

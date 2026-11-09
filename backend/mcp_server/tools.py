@@ -33,12 +33,23 @@ URI-addressable.
 """
 
 from mcp.types import Tool
+from app.config import settings
 from app.models.document_preconditions import BODY_UPDATE_CONDITION, CONTENT_HASH_PATTERN, REVISION_PATTERN
 
 from app.services import template_registry
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS, MAX_REPLACEMENTS
 from app.services.kg_service import LINK_RELATION_TYPES
+
+DOCUMENT_IDEMPOTENCY_KEY = {
+    "type": ["string", "null"], "format": "uuid",
+    "description": (
+        "PostgreSQL Native only: reuse this UUID with the identical request after a lost "
+        "response to retrieve the original write receipt. Scoped to the authenticated "
+        "user and Vault; different input with the same key conflicts. Preserve original "
+        "revision/hash conditions. See the tool's akb/document_idempotency capability."
+    ),
+}
 
 # The link/unlink relation vocabulary is defined once in kg_service; the
 # tool schemas below derive from it so the MCP surface and the REST
@@ -149,6 +160,7 @@ TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
+                "idempotency_key": DOCUMENT_IDEMPOTENCY_KEY,
                 "parent": {
                     "type": "string",
                     "description": (
@@ -226,6 +238,7 @@ TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
+                "idempotency_key": DOCUMENT_IDEMPOTENCY_KEY,
                 "uri": {"type": "string", "description": "Document URI"},
                 "content": {"type": ["string", "null"], "description": "Whole replacement body, including empty string; requires an original-read condition. Null leaves the body unchanged."},
                 "title": {"type": "string", "description": "New title"},
@@ -1437,11 +1450,19 @@ def available_tools() -> list[Tool]:
     explicit unsupported requests must reach the service's stable error.
     """
     capabilities = get_vault_creation_capabilities()
-    if capabilities.templates and capabilities.external_git:
-        return TOOLS
     result = []
     for tool in TOOLS:
+        if tool.name in {"akb_put", "akb_update"}:
+            tool = tool.model_copy(deep=True)
+            tool.meta = {**(tool.meta or {}), "akb/document_idempotency": {
+                "supported": settings.document_revision_backend in {"postgres_native", "native_ledger_m1"},
+            }}
+            result.append(tool)
+            continue
         if tool.name != "akb_create_vault":
+            result.append(tool)
+            continue
+        if capabilities.templates and capabilities.external_git:
             result.append(tool)
             continue
         tool = tool.model_copy(deep=True)
