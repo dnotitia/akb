@@ -2060,7 +2060,7 @@ describe("DocumentPage view toggle", () => {
     getDocumentMock.mockImplementation(async () =>
       makeDoc(
         saved
-          ? { title: "API contract", content: "Updated contract body" }
+          ? { title: "API contract", content: "Updated contract body", current_commit: UPDATED_COMMIT }
           : {},
       ),
     );
@@ -2087,7 +2087,11 @@ describe("DocumentPage view toggle", () => {
         },
       ),
     );
-    expect(await screen.findByRole("heading", { level: 1, name: "API contract" })).toBeInTheDocument();
+    // Saving can replace the reader's heading host as its queries settle.
+    // Assert against the current DOM instead of retaining the first host.
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { level: 1, name: "API contract" })).toBeInTheDocument(),
+    );
     expect(screen.getByTestId("location-pathname")).toHaveTextContent(
       "/vault/v/doc/notes%2Fhello.md",
     );
