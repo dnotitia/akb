@@ -24,8 +24,8 @@ for (const scenario of [{ width: 1440, height: 1000, dark: false }, { width: 144
     await contents.click();
     const panel = page.locator('[data-slot="document-context-panel"]');
     await panel.getByRole("link", { name: "Nested detail", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Nested detail", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Close document panel", exact: true }).click(); await expect(contents).toBeFocused();
+    await expect(page.getByRole("heading", { name: "Nested detail", exact: true })).toBeVisible();
     const diagram = page.getByRole("img", { name: "Flow of documents", exact: true });
     await diagram.scrollIntoViewIfNeeded();
     await expect(diagram).toBeVisible({ timeout: 30_000 });
