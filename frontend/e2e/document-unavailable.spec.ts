@@ -1,6 +1,8 @@
 import { expect, test } from "@playwright/test";
 import { readingFixture } from "./fixtures/reading-workspace";
 
+test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Uses isolated HTTP fixtures in the real frontend regression.");
+
 for (const viewport of [{ width: 1440, height: 900 }, { width: 375, height: 667 }, { width: 1024, height: 320 }]) {
   test(`an inaccessible document has padded, reachable recovery at ${viewport.width}×${viewport.height}`, async ({ page }, testInfo) => {
     await page.setViewportSize(viewport);
