@@ -55,6 +55,8 @@ from app.repositories.native_revision_repo import (
 )
 from app.repositories.vault_repo import VaultRepository
 from app.services import document_counters, skill_policy
+from app.services.access_service import authorized_vault, authorized_vault_id
+from app.services.document_idempotency import DocumentIdempotency
 from app.services.document_service import (
     EditError,
     DocumentService,
@@ -77,6 +79,7 @@ from app.services.native_revision_service import (
     Failpoint,
     NativeRevisionService,
     NativeRevisionSnapshot,
+    NativeMutationResult,
 )
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
@@ -144,6 +147,13 @@ class NativeDocumentService(DocumentService):
             vault_id = await conn.fetchval("SELECT id FROM vaults WHERE name = $1", vault)
         if vault_id is None:
             raise NotFoundError("Vault", vault)
+        # The access check records the UUID before handing off to this service.
+        # A concurrent delete/recreate can make the same name resolve to a
+        # different Vault before even the first receipt or document lookup.
+        approved_name = authorized_vault()
+        if approved_name is not None and to_nfc(approved_name) == to_nfc(vault):
+            if authorized_vault_id() != str(vault_id):
+                raise ConflictError("Vault identity changed after authorization")
         return vault_id
 
     async def _register_collection(self, vault_id: uuid.UUID, path: str) -> None:
@@ -659,13 +669,79 @@ class NativeDocumentService(DocumentService):
         )
 
 
+    async def _request_receipt(
+        self, vault: str, vault_id: uuid.UUID, result: NativeMutationResult,
+    ) -> DocumentPutResponse:
+        """Return immutable write facts, never the current document body."""
+        native = await self._native()
+        snapshot = await native.get_resource_revision(
+            namespace_id=vault_id, surface="document", resource_id=result.resource_id,
+            revision_id=result.revision_id,
+        )
+        previous_hash = None
+        if result.parent_revision_id is not None:
+            parent = await native.get_resource_revision(
+                namespace_id=vault_id, surface="document", resource_id=result.resource_id,
+                revision_id=result.parent_revision_id,
+            )
+            previous_hash = _body_content_hash(_parse_markdown(parent.text)[1])
+        return DocumentPutResponse(
+            uri=doc_uri(vault, result.path), vault=vault, path=result.path,
+            commit_hash=result.revision_id, current_commit=result.revision_id,
+            previous_commit=result.parent_revision_id, previous_content_hash=previous_hash,
+            content_hash=_certified_content_hash(snapshot.text), hash_algorithm=HASH_ALGORITHM,
+            action="created" if result.action == "create" else "updated",
+            chunks_indexed=0, entities_found=0,
+        )
+
+    async def _replay_request(
+        self, vault: str, vault_id: uuid.UUID, identity: DocumentIdempotency,
+    ) -> DocumentPutResponse | None:
+        result = await (await self._native()).find_request_result(
+            namespace_id=vault_id, mutation_id=identity.mutation_id,
+            fingerprint=identity.fingerprint,
+        )
+        return await self._request_receipt(vault, vault_id, result) if result else None
+
     async def put(
+        self, req: DocumentPutRequest, agent_id: str | None = None, *,
+        allow_unavailable_asset_refs: bool = False, skill_internal: bool = False,
+        idempotency_actor: uuid.UUID | None = None,
+    ) -> DocumentPutResponse:
+        identity = None
+        if req.idempotency_key is not None:
+            vault_id = await self._vault_id(req.vault)
+            request = req.model_dump(mode="json", exclude={"idempotency_key"})
+            request["collection"] = normalize_collection_path(req.collection)
+            request["allow_unavailable_asset_refs"] = allow_unavailable_asset_refs
+            request["skill_internal"] = skill_internal
+            identity = DocumentIdempotency.bind(
+                namespace_id=vault_id, actor_id=idempotency_actor, key=req.idempotency_key,
+                operation="document.put", request=request,
+            )
+            if receipt := await self._replay_request(req.vault, vault_id, identity):
+                return receipt
+        try:
+            return await self._put(
+                req, agent_id, allow_unavailable_asset_refs=allow_unavailable_asset_refs,
+                skill_internal=skill_internal, identity=identity,
+            )
+        except ConflictError:
+            # A concurrent identical request may commit between the lookup
+            # and title/slug checks. Recheck its receipt before rejecting it.
+            if identity is not None:
+                if receipt := await self._replay_request(req.vault, vault_id, identity):
+                    return receipt
+            raise
+
+    async def _put(
         self,
         req: DocumentPutRequest,
         agent_id: str | None = None,
         *,
         allow_unavailable_asset_refs: bool = False,
         skill_internal: bool = False,
+        identity: DocumentIdempotency | None = None,
     ) -> DocumentPutResponse:
         if req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
@@ -676,6 +752,8 @@ class NativeDocumentService(DocumentService):
             internal=skill_internal,
         )
         vault_id = await self._vault_id(req.vault)
+        if identity is not None and identity.namespace_id != vault_id:
+            raise ConflictError("Vault identity changed while the document request was in progress")
         now = datetime.now(UTC)
         base_slug = slugify(req.slug) if req.slug else slugify(req.title)
         collection = normalize_collection_path(req.collection)
@@ -712,7 +790,7 @@ class NativeDocumentService(DocumentService):
             frontmatter["created_by"] = agent_id
         raw = _compose_markdown(frontmatter, req.content)
         actor = agent_id or "unknown"
-        mutation_id = uuid.uuid4()
+        mutation_id = identity.mutation_id if identity else uuid.uuid4()
         race_count = 0
         while True:
             message = f"[put] {final_path}\n\nagent: {actor}\naction: create\nsummary: {req.title}"
@@ -729,6 +807,7 @@ class NativeDocumentService(DocumentService):
                     subject=f"[put] {final_path}",
                     summary=req.title,
                     allow_unavailable_asset_refs=allow_unavailable_asset_refs,
+                    request_fingerprint=identity.fingerprint if identity else None,
                 )
                 break
             except ConflictError as exc:
@@ -742,6 +821,8 @@ class NativeDocumentService(DocumentService):
                     path_identity,
                     aliases_own_path=False,
                 )
+        if identity is not None and result.idempotent_replay:
+            return await self._request_receipt(req.vault, vault_id, result)
         content_hash = _certified_content_hash(raw)
         await self._register_collection(vault_id, final_path)
         return DocumentPutResponse(
@@ -847,6 +928,32 @@ class NativeDocumentService(DocumentService):
         )
 
     async def update(
+        self, vault: str, doc_ref: str, req: DocumentUpdateRequest,
+        agent_id: str | None = None, *, skill_internal: bool = False,
+        idempotency_actor: uuid.UUID | None = None,
+    ) -> DocumentPutResponse:
+        identity = None
+        if req.idempotency_key is not None:
+            vault_id = await self._vault_id(vault)
+            request = req.model_dump(mode="json", exclude={"idempotency_key"})
+            request.update(doc_ref=to_nfc(doc_ref), skill_internal=skill_internal)
+            identity = DocumentIdempotency.bind(
+                namespace_id=vault_id, actor_id=idempotency_actor, key=req.idempotency_key,
+                operation="document.update", request=request,
+            )
+            if receipt := await self._replay_request(vault, vault_id, identity):
+                return receipt
+        try:
+            return await self._update(
+                vault, doc_ref, req, agent_id, skill_internal=skill_internal, identity=identity,
+            )
+        except ConflictError:
+            if identity is not None:
+                if receipt := await self._replay_request(vault, vault_id, identity):
+                    return receipt
+            raise
+
+    async def _update(
         self,
         vault: str,
         doc_ref: str,
@@ -854,6 +961,7 @@ class NativeDocumentService(DocumentService):
         agent_id: str | None = None,
         *,
         skill_internal: bool = False,
+        identity: DocumentIdempotency | None = None,
     ) -> DocumentPutResponse:
         validate_update_preconditions(
             content=req.content, expected_commit=req.expected_commit,
@@ -862,6 +970,8 @@ class NativeDocumentService(DocumentService):
         if req.status is not None and req.status not in DOC_STATUSES:
             raise ValidationError(f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}")
         vault_id, current = await self._current(vault, doc_ref)
+        if identity is not None and identity.namespace_id != vault_id:
+            raise ConflictError("Vault identity changed while the document request was in progress")
         skill_policy.check_update(current.path, req.type, internal=skill_internal)
         if req.title is not None and req.title_conflict_policy == "reject":
             collection, _ = split_doc_path(current.path)
@@ -884,6 +994,7 @@ class NativeDocumentService(DocumentService):
             current=current,
             req=req,
             agent_id=agent_id,
+            identity=identity,
         )
 
     async def _update_from_snapshot(
@@ -894,6 +1005,7 @@ class NativeDocumentService(DocumentService):
         current: NativeRevisionSnapshot,
         req: DocumentUpdateRequest,
         agent_id: str | None,
+        identity: DocumentIdempotency | None = None,
     ) -> DocumentPutResponse:
         exact_head_pinned = req.expected_commit is not None
         resource_id = current.resource_id
@@ -956,7 +1068,8 @@ class NativeDocumentService(DocumentService):
                     path=current.path,
                     payload=raw,
                     actor=actor,
-                    mutation_id=uuid.uuid4(),
+                    mutation_id=identity.mutation_id if identity else uuid.uuid4(),
+                    request_fingerprint=identity.fingerprint if identity else None,
                     # This internal compare protects the read/merge/write
                     # attempt. Unpinned callers are transparently recomputed
                     # against the new Head; explicit predicates fail closed.
@@ -981,6 +1094,8 @@ class NativeDocumentService(DocumentService):
                     resource_id=resource_id,
                 )
                 continue
+            if identity is not None and result.idempotent_replay:
+                return await self._request_receipt(vault, vault_id, result)
             if current.path == skill_policy.VAULT_SKILL_PATH:
                 from app.services import vault_skill_service
                 vault_skill_service.invalidate(vault)

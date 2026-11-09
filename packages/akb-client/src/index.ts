@@ -366,6 +366,8 @@ export interface AkbDocumentBrowseOptions extends AkbDocumentVaultOptions {
 }
 
 export interface AkbDocumentPutInput extends AkbDocumentVaultOptions {
+  /** Native only. Keep this UUID and the complete request for a retry. */
+  idempotencyKey?: string | null;
   collection: string;
   title: string;
   content: string;
@@ -380,6 +382,8 @@ export interface AkbDocumentPutInput extends AkbDocumentVaultOptions {
 }
 
 interface AkbDocumentUpdateFields {
+  /** Native only. Reuse with the unchanged request and original-read tokens. */
+  idempotencyKey?: string | null;
   title?: string | null;
   type?: string | null;
   status?: AkbDocumentStatus | null;
@@ -1705,6 +1709,7 @@ function documentPutPayload(
 ): Record<string, unknown> {
   const vault = resolveDocumentVault(input.vault ?? defaultVault);
   return omitUndefined({
+    idempotency_key: input.idempotencyKey,
     vault,
     collection: input.collection,
     title: input.title,
@@ -1722,6 +1727,7 @@ function documentPutPayload(
 
 function documentUpdatePayload(input: AkbDocumentUpdateInput): Record<string, unknown> {
   return omitUndefined({
+    idempotency_key: input.idempotencyKey,
     content: input.content,
     title: input.title,
     type: input.type,

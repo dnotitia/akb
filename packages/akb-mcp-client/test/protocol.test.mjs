@@ -81,7 +81,7 @@ function waitForLine(lines, id, timeoutMs = 3000) {
   });
 }
 
-async function fakeBackend({ legacyOnly = false, tools = DEFAULT_BACKEND_TOOLS } = {}) {
+async function fakeBackend({ legacyOnly = false, transportErrorId = null, tools = DEFAULT_BACKEND_TOOLS } = {}) {
   const requests = [];
   const server = createServer(async (req, res) => {
     let raw = "";
@@ -93,7 +93,7 @@ async function fakeBackend({ legacyOnly = false, tools = DEFAULT_BACKEND_TOOLS }
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({
         jsonrpc: "2.0",
-        id: body.id,
+        id: transportErrorId, // Session rejected before the legacy transport reads the request ID.
         error: { code: -32600, message: "Bad Request: Missing session ID" },
       }));
       return;
@@ -314,8 +314,8 @@ async function testLegacyProcess() {
   }
 }
 
-async function testLegacyBackendFallback() {
-  const backend = await fakeBackend({ legacyOnly: true });
+async function testLegacyBackendFallback(transportErrorId) {
+  const backend = await fakeBackend({ legacyOnly: true, transportErrorId });
   try {
     const { responses } = await runProxy(backend.url, [
       { jsonrpc: "2.0", id: 5, method: "server/discover", params: { _meta: MODERN_META } },
@@ -428,7 +428,8 @@ await testModernDegradedProcessWithExternalParser();
 await testModernReachableProcessWithExternalParser();
 await testModernProcess();
 await testLegacyProcess();
-await testLegacyBackendFallback();
+await testLegacyBackendFallback(null);
+await testLegacyBackendFallback("server-error");
 await testGenerationMixingIsFailClosed();
 await testLocalToolRefusalsAreFlaggedAsErrors();
 console.log("  ✓ stdio modern and legacy processes preserve their client surfaces");

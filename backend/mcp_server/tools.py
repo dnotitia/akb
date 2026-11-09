@@ -33,12 +33,23 @@ URI-addressable.
 """
 
 from mcp.types import Tool
+from app.config import settings
 from app.models.document_preconditions import BODY_UPDATE_CONDITION, CONTENT_HASH_PATTERN, REVISION_PATTERN
 
 from app.services import template_registry
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS, MAX_REPLACEMENTS
 from app.services.kg_service import LINK_RELATION_TYPES
+
+DOCUMENT_IDEMPOTENCY_KEY = {
+    "type": ["string", "null"], "format": "uuid",
+    "description": (
+        "PostgreSQL Native only: reuse this UUID with the identical request after a lost "
+        "response to retrieve the original write receipt. Scoped to the authenticated "
+        "user and Vault; different input with the same key conflicts. Preserve original "
+        "revision/hash conditions. See the tool's akb/document_idempotency capability."
+    ),
+}
 
 # The link/unlink relation vocabulary is defined once in kg_service; the
 # tool schemas below derive from it so the MCP surface and the REST
@@ -74,9 +85,7 @@ TOOLS = [
     Tool(
         name="akb_list_vaults",
         description=(
-            "List accessible vaults as {name, description} pairs. "
-            "Response is slim — no metadata (id/role/created_at) — to "
-            "fit large tenants in agent context. Returns "
+            "List accessible vaults with name, description, and the caller’s effective role. Returns "
             "{vaults, total, returned, truncated?, hint?}.\n"
             "Optional args:\n"
             "- filter: substring match on name+description (case-insensitive). "
@@ -149,6 +158,7 @@ TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
+                "idempotency_key": DOCUMENT_IDEMPOTENCY_KEY,
                 "parent": {
                     "type": "string",
                     "description": (
@@ -226,6 +236,7 @@ TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
+                "idempotency_key": DOCUMENT_IDEMPOTENCY_KEY,
                 "uri": {"type": "string", "description": "Document URI"},
                 "content": {"type": ["string", "null"], "description": "Whole replacement body, including empty string; requires an original-read condition. Null leaves the body unchanged."},
                 "title": {"type": "string", "description": "New title"},
@@ -724,8 +735,7 @@ TOOLS = [
     Tool(
         name="akb_provenance",
         description=(
-            "Get provenance for a document — who created it, when, which entities were "
-            "extracted, and its visible same-vault relations."
+            "Get document identity, creator, timestamps, current_commit, and visible same-vault relations."
         ),
         input_schema={
             "type": "object",
@@ -1202,9 +1212,8 @@ TOOLS = [
     Tool(
         name="akb_explain_access",
         description=(
-            "Explain why a user holds the role they hold on a vault: every "
-            "independent basis, and the effective role derived from them. "
-            "A member list shows the result, never the reasons."
+            "Explain a user’s membership grants, stored and derived roles, and non-member access paths. "
+            "Requires reader access for yourself or admin access for another user."
         ),
         input_schema={
             "type": "object",
@@ -1314,7 +1323,10 @@ TOOLS = [
     ),
     Tool(
         name="akb_set_public",
-        description="Set vault public access level. Owner only. 'none'=private, 'reader'=public read, 'writer'=public read+write.",
+        description=(
+            "Set the access granted to authenticated users on an active vault. Requires owner access. "
+            "Use akb_publish to share a resource by public link."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -1437,11 +1449,19 @@ def available_tools() -> list[Tool]:
     explicit unsupported requests must reach the service's stable error.
     """
     capabilities = get_vault_creation_capabilities()
-    if capabilities.templates and capabilities.external_git:
-        return TOOLS
     result = []
     for tool in TOOLS:
+        if tool.name in {"akb_put", "akb_update"}:
+            tool = tool.model_copy(deep=True)
+            tool.meta = {**(tool.meta or {}), "akb/document_idempotency": {
+                "supported": settings.document_revision_backend in {"postgres_native", "native_ledger_m1"},
+            }}
+            result.append(tool)
+            continue
         if tool.name != "akb_create_vault":
+            result.append(tool)
+            continue
+        if capabilities.templates and capabilities.external_git:
             result.append(tool)
             continue
         tool = tool.model_copy(deep=True)

@@ -34,7 +34,7 @@ All connected via a unified knowledge graph with AKB URI scheme.
 | `tables` | create_table, sql, alter_table, drop_table | Structured data (real PG tables + SQL) |
 | `files` | put_file, get_file, delete_file | Binary files (S3-backed) |
 | `images` | put_image, discard_image | Inline images for Markdown documents |
-| `access` | grant, revoke, vault_members, vault_info, ... | Permissions and vault management |
+| `access` | grant, revoke, vault_members, explain_access, ... | Permissions and vault management |
 | `history` | activity, diff, history | Vault activity + git-based change history |
 | `publishing` | publish, unpublish, publications, publication_snapshot | Public sharing for docs/tables/files |
 | `relations` | link, unlink, relations, graph, provenance | Knowledge graph — cross-type connections |
@@ -297,7 +297,7 @@ akb_sql(vault="finance",
 |------|------|-------|----------------|-------------|
 | reader | ✓ | | | |
 | writer | ✓ | ✓ | | |
-| admin | ✓ | ✓ | ✓ | |
+| admin | ✓ | ✓ | ✓ | ✓ |
 | owner | ✓ | ✓ | ✓ | ✓ |
 
 ## Tools
@@ -306,7 +306,8 @@ akb_sql(vault="finance",
 akb_search_users(query="kim")           # Find a user
 akb_grant(vault="v", user="kim", role="writer")  # Grant access
 akb_revoke(vault="v", user="kim")       # Remove access
-akb_vault_members(vault="v")            # See who has access
+akb_vault_members(vault="v")            # List the owner and explicit members
+akb_explain_access(vault="v", user="kim")  # Inspect membership and other access paths
 akb_vault_info(vault="v")               # Vault stats
 akb_transfer_ownership(vault="v", new_owner="kim")
 akb_archive_vault(vault="v")            # Make read-only
@@ -1083,11 +1084,13 @@ akb_create_table(vault="finance", name="invoices",
 
     "akb_list_vaults": """# akb_list_vaults — List Accessible Vaults
 
-No parameters. Returns all vaults you have access to.
+Lists accessible vaults with your effective `role` on each one. Archived vaults are
+excluded by default. Use `include_archived=true` to include them, `filter` to
+match names or descriptions, and `limit` / `offset` to page through matches.
 
 ```
-akb_list_vaults()
-→ {"vaults": [{"name": "eng", "description": "...", "role": "writer"}, ...]}
+akb_list_vaults(filter="eng", limit=10)
+→ {"vaults": [{"name": "eng", "description": "...", "role": "writer"}], "total": 1, "returned": 1}
 ```""",
 
     "akb_create_vault": """# akb_create_vault — Create a Vault
@@ -1230,7 +1233,7 @@ Shows who created a document, when, and its visible same-vault relations
 ## Example
 ```
 akb_provenance(uri="akb://eng/doc/specs/api.md")
-→ {title, path, vault, uri, created_by, created_at, updated_at, relations: [...]}
+→ {doc_id, title, path, vault, uri, created_by, created_at, updated_at, current_commit, relations: [...]}
 ```""",
 
     "akb_history": """# akb_history — Document Version History
@@ -1409,6 +1412,20 @@ akb_vault_members(vault="v")
 
 Roles: owner, admin, writer, reader.""",
 
+    "akb_explain_access": """# akb_explain_access — Explain a User’s Vault Access
+
+```
+akb_explain_access(vault="eng", user="kim")
+```
+
+Pass the vault name and the target username. You need reader access to look up
+yourself and admin access to look up another user.
+
+`effective_role` is the stored membership role. `derived_role` is computed from
+the grants in `contributions`. Both roles can be null, including for a vault
+owner with no explicit membership. `non_member_paths` reports ownership,
+system administration, the vault’s public access level and its write policy.""",
+
     "akb_search_users": """# akb_search_users — Find Users
 
 ```
@@ -1441,11 +1458,12 @@ akb_set_public(vault="v", level="reader")
 ```
 
 Levels:
-- `none` — private (default, login required)
-- `reader` — anyone can read without login
-- `writer` — anyone can read and write without login
+- `none` — grants no access through the public level
+- `reader` — gives authenticated users read access
+- `writer` — gives authenticated users read and write access
 
-Owner only.""",
+Requires owner access to an active vault. To share a resource through a link
+that people can open without signing in, use `akb_publish`.""",
 
     "akb_whoami": """# akb_whoami — Check Your Identity
 
@@ -1461,10 +1479,10 @@ Use this to verify who you are authenticated as.""",
 ⚠️ **Permanent and irreversible.** Deletes ALL data: documents, tables, files, edges, Git history.
 
 ```
-akb_delete_vault(vault="v", confirm="v")
+akb_delete_vault(vault="v")
 ```
 
-The `confirm` parameter must match the vault name. Owner only.""",
+Requires vault admin or owner access. The call deletes the named vault immediately, including an archived vault.""",
 
     "akb_alter_table": """# akb_alter_table — Modify Table Schema
 

@@ -42,6 +42,7 @@ from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSI
 from app.db.postgres import get_pool, init_db, close_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError, WriteBusyError
 from app.services.document_service import EditError
+from app.services.document_idempotency import document_actor_options
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS
 from app.services.revision_backend import get_revision_backend
 from app.services.search_service import SearchService
@@ -597,8 +598,26 @@ async def _external_git_view(vault_id: str) -> dict | None:
     }
 
 
+def _document_content_error(args: dict, *, required: bool) -> dict | None:
+    """Validate only the body contract; metadata and OCC keep their own rules."""
+    if "content" not in args:
+        if required:
+            return err("content is required to create a document", code=INVALID_ARGUMENT,
+                       field="/content", reason="required")
+        return None
+    content = args["content"]
+    if isinstance(content, str) or (content is None and not required):
+        return None
+    return err("content must be a string" + (" or null" if not required else ""),
+               code=INVALID_ARGUMENT, field="/content", reason="invalid_type")
+
+
 @_h("akb_put")
 async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
+    if error := _document_content_error(args, required=True):
+        return error
+    if error := _document_idempotency_error(args):
+        return error
     try:
         vault, collection = _resolve_parent(args, kind_name="document")
     except ValueError as e:
@@ -617,12 +636,32 @@ async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
         summary=args.get("summary"),
         depends_on=args.get("depends_on", []),
         related_to=args.get("related_to", []),
+        idempotency_key=args.get("idempotency_key"),
     )
     try:
-        result = await doc_service.put(req, agent_id=user.username)
+        result = await doc_service.put(
+            req, agent_id=user.username,
+            **document_actor_options(req.idempotency_key, uid),
+        )
     except ValueError as e:
         return err(str(e), code=INVALID_ARGUMENT)
     return result.model_dump()
+
+
+def _document_idempotency_error(args: dict) -> dict | None:
+    key = args.get("idempotency_key")
+    if key is None:
+        return None
+    try:
+        if not isinstance(key, str):
+            raise ValueError
+        uuid.UUID(key)
+    except ValueError:
+        return err(
+            "idempotency_key must be a UUID string", code=INVALID_ARGUMENT,
+            field="/idempotency_key", reason="invalid_uuid",
+        )
+    return None
 
 
 def _resolve_parent(args: dict, *, kind_name: str) -> tuple[str, str]:
@@ -718,14 +757,20 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_update")
 async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
+    if error := _document_content_error(args, required=False):
+        return error
+    if error := _document_idempotency_error(args):
+        return error
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     doc_path = to_nfc(doc_path)
-    await check_vault_access(uid, vault, required_role="writer")
+    writer_access = await check_vault_access(uid, vault, required_role="writer")
     current = await doc_service.get(vault, doc_path)
     from app.services import skill_policy
     skill_internal = current.path == skill_policy.VAULT_SKILL_PATH
     if skill_internal:
-        await check_vault_access(uid, vault, required_role="owner")
+        owner_access = await check_vault_access(uid, vault, required_role="owner")
+        if owner_access["vault_id"] != writer_access["vault_id"]:
+            raise ConflictError("Vault identity changed after authorization")
     try:
         req = DocumentUpdateRequest(
             content=args.get("content"),
@@ -740,6 +785,7 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
             message=args.get("message"),
             expected_commit=args.get("expected_commit"),
             expected_content_hash=args.get("expected_content_hash"),
+            idempotency_key=args.get("idempotency_key"),
         )
     except ModelValidationError:
         return err(
@@ -749,6 +795,7 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
     result = await doc_service.update(
         vault, doc_path, req, agent_id=user.username,
         skill_internal=skill_internal,
+        **document_actor_options(req.idempotency_key, uid),
     )
     if not result:
         return err("Document not found", code=NOT_FOUND)

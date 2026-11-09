@@ -33,7 +33,7 @@ function itAsync(name, fn) {
   ));
 }
 
-itAsync("document file input preserves original-read predicates without a backend read", async () => {
+itAsync("document file input preserves original-read predicates and retry identity without a backend read", async () => {
   const directory = await mkdtemp(join(tmpdir(), "akb-document-predicate-"));
   try {
     const file = join(directory, "draft.md");
@@ -41,11 +41,13 @@ itAsync("document file input preserves original-read predicates without a backen
     const arguments_ = {
       uri: "akb://example/doc/note.md", file,
       expected_commit: "a".repeat(40), expected_content_hash: "b".repeat(64),
+      idempotency_key: "11111111-2222-4333-8444-555555555555",
     };
     const resolved = AKBProxy.prototype._resolveFileToContent.call({}, arguments_);
     assert.equal(resolved.content, "# Draft from the original read\n");
     assert.equal(resolved.expected_commit, arguments_.expected_commit);
     assert.equal(resolved.expected_content_hash, arguments_.expected_content_hash);
+    assert.equal(resolved.idempotency_key, arguments_.idempotency_key);
     assert.equal(resolved.file, undefined);
     const unpinned = AKBProxy.prototype._resolveFileToContent.call({}, { file });
     assert.equal(unpinned.expected_commit, undefined);

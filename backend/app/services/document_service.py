@@ -613,7 +613,11 @@ class DocumentService:
         *,
         allow_unavailable_asset_refs: bool = False,
         skill_internal: bool = False,
+        idempotency_actor: uuid.UUID | None = None,
     ) -> DocumentPutResponse:
+        if req.idempotency_key is not None:
+            from app.services.document_idempotency import DocumentIdempotencyUnsupportedError
+            raise DocumentIdempotencyUnsupportedError()
         if req.status not in DOC_STATUSES:
             raise ValidationError(
                 f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}"
@@ -1032,7 +1036,11 @@ class DocumentService:
     async def update(
         self, vault: str, doc_ref: str, req: DocumentUpdateRequest,
         agent_id: str | None = None, *, skill_internal: bool = False,
+        idempotency_actor: uuid.UUID | None = None,
     ) -> DocumentPutResponse:
+        if req.idempotency_key is not None:
+            from app.services.document_idempotency import DocumentIdempotencyUnsupportedError
+            raise DocumentIdempotencyUnsupportedError()
         validate_update_preconditions(
             content=req.content, expected_commit=req.expected_commit,
             expected_content_hash=req.expected_content_hash,
