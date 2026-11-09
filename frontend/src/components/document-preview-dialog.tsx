@@ -91,7 +91,7 @@ export function DocumentPreviewDialog() {
         </button>
         <DocumentPreviewEditorContext.Provider value={editorSessionRef}>
           <ResourceNavigationProvider>
-            <CurrentUserProvider user={currentUser ?? user.data ?? null} checking={checking} revision={revision}><DocumentPage presentation="preview" /></CurrentUserProvider>
+            <CurrentUserProvider user={currentUser ?? user.data ?? null} checking={checking} revision={revision}><DocumentPage presentation="preview" onClosePreview={requestClose} /></CurrentUserProvider>
           </ResourceNavigationProvider>
         </DocumentPreviewEditorContext.Provider>
       </DialogContent>

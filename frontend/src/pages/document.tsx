@@ -1,5 +1,6 @@
 import { readWithAccessBoundary } from "@/lib/query-access-boundary";
 import { DocumentReadingWorkspace } from "@/components/document-reading-workspace";
+import { DocumentUnavailableState } from "@/components/document-unavailable-state";
 import { DocumentFindBar, DocumentReaderToolsActions } from "@/components/document-reader-tools";
 import { useReaderTools } from "@/contexts/reader-tools-context";
 import { Suspense, lazy, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -19,7 +20,6 @@ import {
 } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  ArrowLeft,
   CheckCircle2,
   Copy,
   Globe2,
@@ -32,6 +32,7 @@ import {
   SlidersHorizontal,
   Columns2,
   ListTree,
+  FileText,
 } from "lucide-react";
 import {
   ApiError,
@@ -162,6 +163,7 @@ interface DocumentPageProps {
   presentation?: "page" | "preview";
   /** A background editor cannot intercept the foreground preview's history. */
   active?: boolean;
+  onClosePreview?: () => void;
 }
 
 export default function DocumentPage(props: DocumentPageProps) {
@@ -175,6 +177,7 @@ export default function DocumentPage(props: DocumentPageProps) {
 function DocumentPageContent({
   presentation = "page",
   active = true,
+  onClosePreview,
 }: DocumentPageProps) {
   const { name, id } = useParams<{ name: string; id: string }>();
   const currentUser = useCurrentUser();
@@ -1465,20 +1468,23 @@ function DocumentPageContent({
   }
 
   if (docQuery.isError && !doc) {
-    const errorMsg = (docQuery.error as Error)?.message ?? "Unknown error";
+    const unavailableToolbar = <ResourceCommandRow appearance="reader" className="document-unified-toolbar" meta={
+      <span className="flex items-center gap-2"><FileText className="h-4 w-4" aria-hidden />Document</span>
+    } />;
     return (
-      <div ref={(element) => { navigationFocusRef.current = element; }} tabIndex={-1} className="py-8 fade-up">
-        <div className="coord-spark mb-2">⚠ Error</div>
-        <Alert variant="destructive" className="mb-4 max-w-xl">{errorMsg}</Alert>
-        <Button variant="outline" className="mr-2" loading={docQuery.isFetching} onClick={() => void docQuery.refetch()}>Retry document</Button>
-        <Button asChild variant="outline">
-          <Link to={`/vault/${name}`}>
-            <ArrowLeft className="h-4 w-4" aria-hidden />
-            Back to {name}
-          </Link>
-        </Button>
+      <section aria-label="Document workspace" data-presentation={presentation} className="flex h-full min-h-0 flex-col overflow-hidden bg-surface">
+        <div className={presentation === "preview" ? "shrink-0 pr-12 sm:pr-14" : undefined}>
+          {readingChrome?.toolbarHost ? createPortal(unavailableToolbar, readingChrome.toolbarHost) : unavailableToolbar}
+        </div>
+        <div ref={navigationFocusRef} tabIndex={-1} className="document-reading-inset rail-scroll min-h-0 flex-1 overflow-y-auto focus:outline-none">
+          <DocumentUnavailableState error={docQuery.error} retrying={docQuery.isFetching} onRetry={() => void docQuery.refetch()}
+            headingLevel={presentation === "preview" ? 2 : 1}
+            recovery={presentation === "preview" && onClosePreview
+              ? <Button variant={documentAccessDenied ? "default" : "outline"} onClick={onClosePreview}>Close preview</Button>
+              : <Button asChild variant={documentAccessDenied ? "default" : "outline"}><Link to="/vault">Browse Vaults</Link></Button>} />
+        </div>
         {navigationDialog}
-      </div>
+      </section>
     );
   }
 

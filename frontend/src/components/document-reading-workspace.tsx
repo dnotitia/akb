@@ -14,6 +14,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowDownLeft, ArrowLeft, ArrowUpRight, Check, FileText, List, Columns2, Network, Plus, X } from "lucide-react";
 import { ApiError, getDocument, getRelations, type RelationRow } from "@/lib/api";
 import { readWithAccessBoundary } from "@/lib/query-access-boundary";
+import { DocumentUnavailableState } from "@/components/document-unavailable-state";
 import { readingDocumentHref, readingDocumentKey, readingFragment, readingReference, type ReadingDocument } from "@/lib/reading-workspace";
 import { parseUri } from "@/lib/uri";
 import { useReadingWorkspace } from "@/contexts/reading-workspace-context";
@@ -331,7 +332,7 @@ function ReferencePreview({ target, narrow, headerHost, panelControl, canGoBack,
     {!hidden && (!narrow && headerHost ? createPortal(toolbar, headerHost) : toolbar)}
     <div ref={attachScroll} className="reading-preview-scroll rail-scroll" onClickCapture={follow} onKeyDownCapture={follow}>
       {isPending ? <LoadingState label="Loading reference" delayMs={200}><div className="space-y-5 p-6"><Skeleton className="h-7 w-3/4" /><Skeleton className="h-4 w-full" /><Skeleton className="h-4 w-5/6" /></div></LoadingState>
-        : !doc ? <Alert variant="destructive" className="m-5">{denied ? "This reference is unavailable or you no longer have access." : "The reference could not be loaded."}<Button variant="outline" size="sm" loading={isFetching} onClick={() => void refetch()}>Try again</Button></Alert>
+        : !doc ? <div className="p-4"><DocumentUnavailableState compact error={error} retrying={isFetching} onRetry={() => void refetch()} retryLabel="Try again" /></div>
           : <div className="reading-preview-identity">{error && <Alert variant="warning" className="m-4">The reference could not be refreshed. Previous content is shown.<Button variant="ghost" size="sm" onClick={() => void refetch()}>Try again</Button></Alert>}
             <MarkdownRender markdown={doc.content || ""} summary={doc.summary} leadingMetadata={metadata} documentTitle={doc.title || "Untitled document"}
               className="document-reading-flow reading-preview-markdown" headingIdPrefix={`${prefix}-`}

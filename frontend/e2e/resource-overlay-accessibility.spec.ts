@@ -40,12 +40,26 @@ for (const status of [0, 200, 403, 404, 503]) {
     await search.getByRole("option", { name: /Operating guide/ }).click();
     const preview = page.getByTestId("document-preview-dialog");
     await expect(preview).toBeVisible();
-    if (status !== 0 && status !== 200) await expect(preview.getByText("Fixture document is unavailable", { exact: true })).toBeVisible();
+    if (status !== 0 && status !== 200) await expect(preview.getByRole("heading", { name: status === 403 ? "You don’t have access to this document" : status === 404 ? "Document unavailable" : "Couldn’t load this document", exact: true })).toBeVisible();
     await preview.getByRole("button", { name: "Close dialog", exact: true }).click();
     await expect(preview).toHaveCount(0);
     await expect(search).toBeVisible();
   });
 }
+
+test("an unavailable preview offers a direct return to its search results", async ({ page }) => {
+  await fixture(page, 403);
+  await page.goto("/search");
+  await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
+  const search = page.getByTestId("global-search-dialog");
+  await search.getByRole("combobox").fill("guide");
+  await search.getByRole("option", { name: /Operating guide/ }).click();
+  const preview = page.getByTestId("document-preview-dialog");
+  await preview.getByRole("button", { name: "Close preview", exact: true }).click();
+  await expect(preview).toHaveCount(0);
+  await expect(search).toBeVisible();
+  await expect(search.getByRole("combobox")).toHaveValue("guide");
+});
 
 for (const height of [540, 320]) {
 test(`mobile Invite keeps footer reachable at height ${height}`, async ({ page }, testInfo) => {
