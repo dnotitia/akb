@@ -42,6 +42,9 @@ normalization follow the request models. List order is significant.
 
 Every HTTP/MCP attempt checks current write access, token scope and reserved
 Vault-guide permissions before looking up a receipt. A key grants no access.
+Native lookups and writes use the Vault UUID recorded by the access check.
+If the name resolves to a replacement Vault, the request fails with `conflict`
+before it can read that Vault's receipt or write a revision.
 Update routes still resolve the target for those checks; deletion or an
 unresolvable target can return `not_found` rather than an old receipt. The
 receipt is minimal write metadata and never contains the document body.

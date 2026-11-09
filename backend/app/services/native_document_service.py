@@ -55,6 +55,7 @@ from app.repositories.native_revision_repo import (
 )
 from app.repositories.vault_repo import VaultRepository
 from app.services import document_counters, skill_policy
+from app.services.access_service import authorized_vault, authorized_vault_id
 from app.services.document_idempotency import DocumentIdempotency
 from app.services.document_service import (
     EditError,
@@ -146,6 +147,13 @@ class NativeDocumentService(DocumentService):
             vault_id = await conn.fetchval("SELECT id FROM vaults WHERE name = $1", vault)
         if vault_id is None:
             raise NotFoundError("Vault", vault)
+        # The access check records the UUID before handing off to this service.
+        # A concurrent delete/recreate can make the same name resolve to a
+        # different Vault before even the first receipt or document lookup.
+        approved_name = authorized_vault()
+        if approved_name is not None and to_nfc(approved_name) == to_nfc(vault):
+            if authorized_vault_id() != str(vault_id):
+                raise ConflictError("Vault identity changed after authorization")
         return vault_id
 
     async def _register_collection(self, vault_id: uuid.UUID, path: str) -> None:

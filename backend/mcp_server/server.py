@@ -752,12 +752,14 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
         return error
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     doc_path = to_nfc(doc_path)
-    await check_vault_access(uid, vault, required_role="writer")
+    writer_access = await check_vault_access(uid, vault, required_role="writer")
     current = await doc_service.get(vault, doc_path)
     from app.services import skill_policy
     skill_internal = current.path == skill_policy.VAULT_SKILL_PATH
     if skill_internal:
-        await check_vault_access(uid, vault, required_role="owner")
+        owner_access = await check_vault_access(uid, vault, required_role="owner")
+        if owner_access["vault_id"] != writer_access["vault_id"]:
+            raise ConflictError("Vault identity changed after authorization")
     try:
         req = DocumentUpdateRequest(
             content=args.get("content"),

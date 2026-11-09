@@ -262,3 +262,69 @@ async def test_vault_identity_change_between_lookup_and_write_is_rejected(monkey
             await service.put(put_request(idempotency_key=uuid.uuid4()), idempotency_actor=uuid.uuid4())
         assert await counts(pool, original) == (0, 0, 0, 0)
         assert await counts(pool, replacement) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("surface", ["rest", "mcp"])
+@pytest.mark.parametrize("operation,keyed", [("put", True), ("update", True), ("put", False), ("update", False)])
+async def test_recreation_after_writer_check_cannot_target_replacement(monkeypatch, tmp_path, surface, operation, keyed):
+    from app.config import settings
+    from app.services.access_service import check_vault_access, reset_authorized_vault
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
+    from app.api.routes import documents
+    from mcp_server import server
+
+    async with _fresh_database() as pool:
+        name = "recreated-vault"
+        original = await _make_vault(pool, name)
+        async with pool.acquire() as conn:
+            actor = await conn.fetchval(
+                "INSERT INTO users(username,email,password_hash) VALUES('writer','writer@example.invalid','disabled') RETURNING id"
+            )
+            await conn.execute("INSERT INTO vault_access(vault_id,user_id,role) VALUES($1,$2,'writer')", original, actor)
+        service = NativeDocumentService(pool=pool)
+        handler = documents if surface == "rest" else server
+        monkeypatch.setattr(handler, "doc_service", service)
+        # Create the future private Vault separately so it already has a
+        # matching document path. Only the old Vault grants this user access.
+        replacement = await _make_vault(pool, "future-vault")
+        existing = await service.put(put_request(vault="future-vault"))
+        before = await counts(pool, replacement)
+        receipt_lookup = AsyncMock(wraps=service._replay_request)
+        monkeypatch.setattr(service, "_replay_request", receipt_lookup)
+
+        async def authorize_then_replace(*args, **kwargs):
+            approved = await check_vault_access(*args, **kwargs)
+            assert approved["vault_id"] == original
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute("DELETE FROM vaults WHERE id=$1", original)
+                    await conn.execute("UPDATE vaults SET name=$1 WHERE id=$2", name, replacement)
+            with pytest.raises(ForbiddenError):
+                await check_vault_access(*args, **kwargs)
+            return approved
+
+        monkeypatch.setattr(handler, "check_vault_access", authorize_then_replace)
+        user = SimpleNamespace(username="writer", user_id=str(actor))
+        key = uuid.uuid4() if keyed else None
+        try:
+            with pytest.raises(ConflictError, match="Vault identity changed"):
+                if operation == "put":
+                    create = put_request(vault=name, idempotency_key=key)
+                    if surface == "rest":
+                        await documents.put_document(create, user)
+                    else:
+                        await server._handle_put(create.model_dump(mode="json"), str(actor), user)
+                else:
+                    update = DocumentUpdateRequest(title="Unauthorized edit", idempotency_key=key)
+                    if surface == "rest":
+                        await documents.update_document(name, existing.path, update, user)
+                    else:
+                        await server._handle_update(
+                            {"uri": f"akb://{name}/doc/{existing.path}", **update.model_dump(mode="json")},
+                            str(actor), user,
+                        )
+        finally:
+            reset_authorized_vault()
+        receipt_lookup.assert_not_awaited()
+        assert await counts(pool, replacement) == before
+        assert (await service.get(name, existing.path)).current_commit == existing.current_commit

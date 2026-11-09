@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user
+from app.exceptions import ConflictError
 from app.services import skill_policy, template_registry
 from app.services.access_service import (
     check_vault_access,
@@ -162,11 +163,13 @@ async def get_document(
     operation_id="documentsUpdateDocument",
 )
 async def update_document(vault: str, doc_id: str, req: DocumentUpdateRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    await check_vault_access(user.user_id, vault, required_role="writer")
+    writer_access = await check_vault_access(user.user_id, vault, required_role="writer")
     current = await doc_service.get(vault, doc_id)
     skill_internal = current.path == skill_policy.VAULT_SKILL_PATH
     if skill_internal:
-        await check_vault_access(user.user_id, vault, required_role="owner")
+        owner_access = await check_vault_access(user.user_id, vault, required_role="owner")
+        if owner_access["vault_id"] != writer_access["vault_id"]:
+            raise ConflictError("Vault identity changed after authorization")
     return await doc_service.update(
         vault, doc_id, req, agent_id=user.username,
         skill_internal=skill_internal,

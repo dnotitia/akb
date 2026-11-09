@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError as ModelValidationError
 
 from app.config import settings
-from app.exceptions import ForbiddenError, ValidationError
+from app.exceptions import ConflictError, ForbiddenError, ValidationError
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.services.document_idempotency import DocumentIdempotency, DocumentIdempotencyUnsupportedError
 from app.services.document_service import DocumentService
@@ -92,3 +92,26 @@ async def test_mcp_rechecks_current_access_and_supplies_authenticated_actor(monk
     assert error["details"]["field"] == "/idempotency_key"
     assert "private-invalid-key" not in str(error)
     access.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["rest", "mcp"])
+async def test_guide_owner_check_cannot_replace_writer_vault(monkeypatch, tmp_path, surface):
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
+    from app.api.routes import documents
+    from app.services.skill_policy import VAULT_SKILL_PATH
+    from mcp_server import server
+
+    handler = documents if surface == "rest" else server
+    access = AsyncMock(side_effect=[{"vault_id": uuid.uuid4()}, {"vault_id": uuid.uuid4()}])
+    service = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(path=VAULT_SKILL_PATH)), update=AsyncMock())
+    monkeypatch.setattr(handler, "check_vault_access", access)
+    monkeypatch.setattr(handler, "doc_service", service)
+    user = SimpleNamespace(user_id=str(uuid.uuid4()), username="owner")
+    with pytest.raises(ConflictError, match="Vault identity changed"):
+        if surface == "rest":
+            await documents.update_document("example", VAULT_SKILL_PATH, DocumentUpdateRequest(title="Guide"), user)
+        else:
+            await server._handle_update({"uri": f"akb://example/doc/{VAULT_SKILL_PATH}", "title": "Guide"}, user.user_id, user)
+    assert [call.kwargs["required_role"] for call in access.await_args_list] == ["writer", "owner"]
+    service.update.assert_not_awaited()
