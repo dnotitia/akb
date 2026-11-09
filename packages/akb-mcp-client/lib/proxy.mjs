@@ -1908,8 +1908,10 @@ export class AKBProxy {
           parsedError = null;
         }
         // The legacy transport can reject the HTTP session before parsing
-        // the RPC request. Its null-ID errors are session signals only.
-        if (parsedError?.id === null && isRpcError(parsedError.error)) {
+        // the RPC request. Python SDK 1.x emits "server-error" here and
+        // 2.x emits null. Neither ID can identify a tool result.
+        const transportErrorId = parsedError?.id === null || parsedError?.id === "server-error";
+        if (transportErrorId && isRpcError(parsedError.error)) {
           if (method === "server/discover" && error.statusCode === 400 &&
               parsedError.error.code === INVALID_REQUEST && /missing session id/i.test(parsedError.error.message)) {
             throw Object.assign(new Error("Missing session ID"), { code: INVALID_REQUEST });

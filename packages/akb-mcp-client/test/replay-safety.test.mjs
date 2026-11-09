@@ -181,16 +181,16 @@ for (const generation of ["legacy", "modern"]) {
   });
 
   test(`${generation}: an uncorrelated write response is unknown and is never replayed`, async (t) => {
-    for (const [form, status] of [["wrong", 200], ["missing", 200], ["null", 200], ["string", 200],
+    for (const [form, status] of [["wrong", 200], ["missing", 200], ["null", 200], ["string", 200], ["transport", 200],
       ["error", 200], ["error", 403], ["error", 503]]) {
       const fx = await backend(t, generation, (res, body) => {
-        const id = form === "missing" ? undefined : form === "null" ? null
-          : form === "string" ? String(body.id) : body.id + 1000;
+        const ids = { wrong: body.id + 1000, missing: undefined, null: null, string: String(body.id),
+          transport: "server-error", error: body.id + 1000 };
         const payload = form === "error"
           ? { error: { code: -32602, message: "foreign-receipt" } }
           : { result: { content: [{ type: "text", text: "foreign-receipt" }] } };
         res.writeHead(status, { "content-type": "application/json", "mcp-session-id": "foreign-session" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", id, ...payload }));
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: ids[form], ...payload }));
       });
       fx.proxy.sessionId = "original-session";
       const response = await fx.proxy._handle(call("akb_put", { title: "Wanted", content: "body" }, generation));
@@ -279,10 +279,11 @@ test("a failed read retry cannot erase evidence of an earlier dispatch", async (
 });
 
 test("legacy session loss never replays a mutation", async (t) => {
-  for (const nullId of [false, true]) {
+  for (const transportId of [undefined, null, "server-error"]) {
     const fx = await backend(t, "legacy", (res, body) => {
       res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ id: nullId ? null : body.id, error: { code: -32000, message: "Session not found" } }));
+      res.end(JSON.stringify({ id: transportId === undefined ? body.id : transportId,
+        error: { code: -32000, message: "Session not found" } }));
     });
     assert.equal(bodyOf(await fx.proxy._handle(call("akb_put", { content: "body" }))).code, "operation_unknown");
     assert.equal(fx.requests.length, 1);
