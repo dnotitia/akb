@@ -124,6 +124,12 @@ with a separate Back history and explicit Keep in tabs action. Reference lists,
 previews and document details share one context column; map/list are exclusive
 views. The header keeps its baseline while that column changes. Search previews
 retain their existing route-backed modal and draft navigation guards.
+Unavailable documents keep that frame and a generic document header. A centered,
+padded state explains access denial, missing links or transient failures without
+exposing cached document identity or raw server messages. Offer a safe Vault
+directory link on full pages, a close action in search previews, and a separate
+retry. Reference panes and embedded readers use the same compact state. Short
+viewports scroll the state; unfinished-work guards still protect navigation.
 Tabs use a 40px bar with 12px labels on fine pointers and a 48px bar with
 44px targets on coarse pointers. Header and tab-bar hairlines have 12px side
 insets; tab separators stop short of the bar edges. Metadata remains below the

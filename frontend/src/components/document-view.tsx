@@ -1,4 +1,5 @@
 import { readWithAccessBoundary } from "@/lib/query-access-boundary";
+import { DocumentUnavailableState } from "@/components/document-unavailable-state";
 import { Button } from "@/components/ui/button";
 import { useState, type ReactNode, type CSSProperties } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -102,11 +103,9 @@ export function DocumentView({
 
   if (!doc) {
     return (
-      <Alert variant="destructive" className="my-4">
-        Couldn't load this document body.
-        {error instanceof Error ? ` ${error.message}` : ""}
-        <Button variant="outline" size="sm" loading={isFetching} onClick={() => void refetch()}>Retry document body</Button>
-      </Alert>
+      <div className="document-reading-inset min-w-0">
+        <DocumentUnavailableState compact error={error} retrying={isFetching} onRetry={() => void refetch()} headingLevel={titleLevel} retryLabel="Retry document body" />
+      </div>
     );
   }
 

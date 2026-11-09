@@ -590,7 +590,11 @@ describe("DocumentPage resource navigation", () => {
     expect(screen.getByTestId("location-search")).toHaveTextContent("view=edit");
     getDocumentMock.mockRejectedValue(new ApiError("Access denied", 403, {}));
     rendered.rerenderAccess({ checking: false, revision: 1 });
-    await screen.findByText("Access denied");
+    await screen.findByRole("heading", { name: "You don’t have access to this document" });
+    await user.click(screen.getByRole("link", { name: "Browse Vaults" }));
+    dialog = await screen.findByRole("dialog", { name: "Leave this document?" });
+    await user.click(within(dialog).getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByTestId("location-search")).toHaveTextContent("view=edit");
     await user.click(screen.getByRole("link", { name: "Search destination" }));
     dialog = await screen.findByRole("dialog", { name: "Leave this document?" });
     await user.click(within(dialog).getByRole("button", { name: "Leave document" }));
@@ -2234,7 +2238,7 @@ describe("DocumentPage view toggle", () => {
 it("recovers an initial document failure with an explicit retry", async () => {
   getDocumentMock.mockRejectedValueOnce(new Error("Temporary read failure")).mockResolvedValue(makeDoc());
   renderAt("/vault/v/doc/notes%2Fhello.md");
-  await screen.findByText("Temporary read failure");
+  await screen.findByRole("heading", { name: "Couldn’t load this document" });
   await userEvent.setup().click(screen.getByRole("button", { name: "Retry document" }));
   await screen.findByRole("heading", { name: "DocTitle", level: 1 });
 });
@@ -2269,11 +2273,11 @@ it("does not resurrect a denied document after a later transient error", async (
   await screen.findByRole("heading", { name: "DocTitle", level: 1 });
   getDocumentMock.mockRejectedValue(new ApiError("Read denied", 403, {}));
   await act(async () => { await queryClient.refetchQueries({ queryKey: ["document"] }); });
-  await screen.findByText("Read denied");
+  await screen.findByRole("heading", { name: "You don’t have access to this document" });
   expect(screen.queryByRole("heading", { name: "DocTitle", level: 1 })).not.toBeInTheDocument();
   getDocumentMock.mockRejectedValue(new ApiError("Temporary failure", 503, {}));
-  await userEvent.setup().click(screen.getByRole("button", { name: "Retry document" }));
-  await screen.findByText("Temporary failure");
+  await userEvent.setup().click(screen.getByRole("button", { name: "Check access again" }));
+  await screen.findByRole("heading", { name: "Couldn’t load this document" });
   expect(screen.queryByRole("heading", { name: "DocTitle", level: 1 })).not.toBeInTheDocument();
   getDocumentMock.mockResolvedValue(makeDoc({ title: "Fresh document" }));
   await userEvent.setup().click(screen.getByRole("button", { name: "Retry document" }));
