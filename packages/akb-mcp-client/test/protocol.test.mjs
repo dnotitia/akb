@@ -93,7 +93,7 @@ async function fakeBackend({ legacyOnly = false, tools = DEFAULT_BACKEND_TOOLS }
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({
         jsonrpc: "2.0",
-        id: body.id,
+        id: null, // Session rejected before the legacy transport reads the request ID.
         error: { code: -32600, message: "Bad Request: Missing session ID" },
       }));
       return;

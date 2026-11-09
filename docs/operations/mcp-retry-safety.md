@@ -51,6 +51,10 @@ infer non-execution from an error string or a socket-write callback. A failed
 preflight on a later read retry cannot erase an earlier dispatch. Exhausted read
 retries use this same envelope.
 
+Each result or JSON-RPC error must carry the ID sent on that backend request.
+A missing or mismatched ID after tool dispatch yields `operation_unknown`.
+The proxy discards the uncorrelated payload and its session header.
+
 An interrupted/invalid response or a non-protocol HTTP 5xx response is also
 unknown after dispatch. Explicit MCP protocol errors and HTTP rejections retain
 their existing error path; normal tool errors such as `conflict`, access denial,

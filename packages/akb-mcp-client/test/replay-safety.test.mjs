@@ -180,6 +180,47 @@ for (const generation of ["legacy", "modern"]) {
     assert.equal(denied.requests.length, 1);
   });
 
+  test(`${generation}: an uncorrelated write response is unknown and is never replayed`, async (t) => {
+    for (const [form, status] of [["wrong", 200], ["missing", 200], ["null", 200], ["string", 200],
+      ["error", 200], ["error", 403], ["error", 503]]) {
+      const fx = await backend(t, generation, (res, body) => {
+        const id = form === "missing" ? undefined : form === "null" ? null
+          : form === "string" ? String(body.id) : body.id + 1000;
+        const payload = form === "error"
+          ? { error: { code: -32602, message: "foreign-receipt" } }
+          : { result: { content: [{ type: "text", text: "foreign-receipt" }] } };
+        res.writeHead(status, { "content-type": "application/json", "mcp-session-id": "foreign-session" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id, ...payload }));
+      });
+      fx.proxy.sessionId = "original-session";
+      const response = await fx.proxy._handle(call("akb_put", { title: "Wanted", content: "body" }, generation));
+      const error = bodyOf(response);
+      assert.equal(error.code, "operation_unknown");
+      assert.equal(error.details.operation_outcome, "unknown");
+      assert.equal(fx.requests.length, 1);
+      assert.equal(fx.proxy.sessionId, "original-session");
+      assert.equal(JSON.stringify(response).includes("foreign-receipt"), false);
+    }
+  });
+
+  test(`${generation}: concurrent writes keep their own response IDs`, async (t) => {
+    const pending = [];
+    const fx = await backend(t, generation, (res, body) => {
+      pending.push([res, body]);
+      if (pending.length === 2) {
+        for (const [replyTo, request] of pending.reverse()) {
+          reply(replyTo, request, { content: [{ type: "text", text: request.params.arguments.title }] });
+        }
+      }
+    });
+    const titles = ["first", "second"];
+    const results = await Promise.all(titles.map((title, i) => fx.proxy._handle({
+      ...call("akb_put", { title, content: "body" }, generation), id: 90 + i,
+    })));
+    assert.deepEqual(results.map(r => [r.id, r.result.content[0].text]), [[90, "first"], [91, "second"]]);
+    assert.equal(fx.requests.length, 2);
+  });
+
   test(`${generation}: stdio survives response loss without replaying the committed write`, async (t) => {
     let effects = 0;
     const fx = await backend(t, generation, (res, body) => {
@@ -238,13 +279,15 @@ test("a failed read retry cannot erase evidence of an earlier dispatch", async (
 });
 
 test("legacy session loss never replays a mutation", async (t) => {
-  const fx = await backend(t, "legacy", (res, body) => {
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ id: body.id, error: { code: -32000, message: "Session not found" } }));
-  });
-  assert.equal(bodyOf(await fx.proxy._handle(call("akb_put", { content: "body" }))).code, "operation_unknown");
-  assert.equal(fx.requests.length, 1);
-  assert.equal(fx.monitorStarts(), 1);
+  for (const nullId of [false, true]) {
+    const fx = await backend(t, "legacy", (res, body) => {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: nullId ? null : body.id, error: { code: -32000, message: "Session not found" } }));
+    });
+    assert.equal(bodyOf(await fx.proxy._handle(call("akb_put", { content: "body" }))).code, "operation_unknown");
+    assert.equal(fx.requests.length, 1);
+    assert.equal(fx.monitorStarts(), 1);
+  }
 });
 
 test("concurrent calls keep dispatch evidence separate", async () => {
