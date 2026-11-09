@@ -1008,7 +1008,7 @@ async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
         # truncated, total is omitted (we don't know the real value
         # without scanning the whole doc).
         headings = await search_service.list_section_headings(
-            vault, doc_path, limit=OUTLINE_CAP + 1
+            vault, doc_path, limit=OUTLINE_CAP + 1, section=args.get("section")
         )
         truncated = len(headings) > OUTLINE_CAP
         outline = headings[:OUTLINE_CAP]
@@ -1020,8 +1020,8 @@ async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
         if truncated:
             response["truncated"] = True
             response["hint"] = (
-                f"More than {OUTLINE_CAP} headings exist — outline is capped. "
-                f"Call again with `section` set to a known prefix to narrow."
+                f"More than {OUTLINE_CAP} headings matched. "
+                "Set `section` to a full heading path to narrow the outline to that subtree."
             )
         else:
             response["total"] = len(headings)

@@ -590,8 +590,8 @@ TOOLS = [
             "`pattern` (substring grep on body). On empty match the response "
             "carries an `outline` so you can retry.\n"
             "- `mode='outline'`: return heading paths only (no bodies). "
-            "Use this to discover the document's structure cheaply before "
-            "deciding which section to read.\n"
+            "Set `section` to a full heading path to list that heading and its descendants. "
+            "Returns up to 50 matching paths in document order.\n"
             "Returns {uri, sections|outline, returned, total?, truncated?, hint?}."
         ),
         input_schema={
@@ -604,7 +604,7 @@ TOOLS = [
                     "default": "sections",
                     "description": "'sections' for body content, 'outline' for heading paths only.",
                 },
-                "section": {"type": "string", "description": "Section heading filter (partial match). Used in `sections` mode."},
+                "section": {"type": "string", "description": "Heading substring in sections mode. In outline mode, use the exact heading path, including Markdown heading markers, to select its subtree."},
                 "pattern": {"type": "string", "description": "Substring grep inside matched section bodies (case-insensitive). Used in `sections` mode."},
             },
             "required": ["uri"],

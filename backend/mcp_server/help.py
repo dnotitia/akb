@@ -226,7 +226,8 @@ When a document is long and you only need one part:
 
 ```
 akb_drill_down(uri="akb://v/doc/path/to/file.md")                    # All sections
-akb_drill_down(uri="akb://v/doc/path/to/file.md", section="Setup")   # Just "Setup"
+akb_drill_down(uri="akb://v/doc/path/to/file.md", section="Setup")   # Body chunks matching "Setup"
+akb_drill_down(uri="akb://v/doc/path/to/file.md", mode="outline", section="# Setup")  # Heading and descendants
 ```
 
 ## Search → Read Pattern
@@ -990,16 +991,20 @@ Read specific sections of a document without loading everything.
 | Param | Required | Description |
 |-------|----------|-------------|
 | uri | ✓ | Document AKB URI |
-| section | | Section name filter (partial match) |
+| mode | | `sections` (default) reads body chunks. `outline` lists distinct heading paths. |
+| section | | In `sections`, match a heading substring. In `outline`, pass the exact path of a heading to include it and its descendants. |
+| pattern | | Case-insensitive substring in the body, used in `sections` only. |
 
 ## Examples
 ```
-akb_drill_down(uri="akb://eng/doc/specs/api.md")                    # All section headings
-akb_drill_down(uri="akb://eng/doc/specs/api.md", section="Setup")   # Just "Setup" section
-akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API")     # Sections containing "API"
+akb_drill_down(uri="akb://eng/doc/specs/api.md", mode="outline")
+akb_drill_down(uri="akb://eng/doc/specs/api.md", mode="outline", section="# Guide > ## Setup")
+akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API", pattern="token")
 ```
 
-💡 Token-efficient: read summaries via browse, then drill into the section you need.""",
+Outline returns up to 50 matching paths in document order. When truncated,
+use a more specific heading path. An unmatched outline returns an empty list.
+In `sections` mode an empty match includes an outline to help you retry.""",
 
 
     "akb_create_table": """# akb_create_table — Create a Table
