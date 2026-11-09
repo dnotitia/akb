@@ -583,12 +583,91 @@ describe("archive document navigation", () => {
 });
 
 describe("VaultExplorer — rendering", () => {
+  it("does not start unfiltered branch requests for an incomplete server name search", async () => {
+    browseMock.mockImplementation(async (_vault, collection, _depth, options) => ({
+      ...sample, path: collection || "", name_query: options.name_query,
+      complete: !options.name_query, next_cursor: options.name_query ? "search-tail" : null,
+      items: options.name_query
+        ? [{ type: "document", path: "guides/needle.md", name: "Needle result" }]
+        : sample.items.slice(0, 2),
+    }));
+    const user = userEvent.setup();
+    renderAt("/vault/v", "focused");
+    await screen.findByRole("button", { name: "guides" });
+    await user.type(screen.getByRole("searchbox", { name: "Filter resources" }), "needle");
+    await screen.findByRole("link", { name: /^Document:\s*Needle result$/ });
+    await act(async () => {});
+    expect(browseMock.mock.calls.some(call => call[3]?.name_query === "needle")).toBe(true);
+    expect(browseMock.mock.calls.every(call => !call[1])).toBe(true);
+  });
+
+  it("preserves a loaded branch when the unrelated Vault cursor fails", async () => {
+    browseMock.mockImplementation(async (_vault, collection, _depth, options) => {
+      if (collection) return { vault: "v", path: collection, complete: true,
+        items: [{ type: "document", path: `${collection}/ready.md`, name: "Loaded child" }] };
+      if (options.cursor) throw new Error("Vault page unavailable");
+      return { ...sample, complete: false, next_cursor: "global-tail", items: sample.items.slice(0, 2) };
+    });
+    const user = userEvent.setup();
+    renderAt("/vault/v", "focused");
+    const collection = await screen.findByRole("button", { name: "guides" });
+    await user.click(collection);
+    await screen.findByRole("link", { name: /^Document:\s*Loaded child$/ });
+    await user.click(screen.getByRole("button", { name: "Load more content" }));
+    await screen.findByText("Vault page unavailable");
+    await act(async () => {});
+    expect(collection).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("link", { name: /^Document:\s*Loaded child$/ })).toBeVisible();
+  });
+
+  it("loads and retries an expanded collection independently of unfinished Vault pages", async () => {
+    let attempts = 0;
+    browseMock.mockImplementation(async (_vault, collection) => {
+      if (!collection) return { ...sample, complete: false, next_cursor: "global-tail", items: sample.items.slice(0, 2) };
+      if (++attempts === 1) throw new Error("Temporarily unavailable");
+      return { vault: "v", path: collection, complete: true, items: [{ type: "document", path: `${collection}/ready.md`, name: "Recovered child" }] };
+    });
+    const user = userEvent.setup();
+    renderAt("/vault/v", "focused");
+    await user.click(await screen.findByRole("button", { name: "guides" }));
+    await user.click(await screen.findByRole("button", { name: "Retry guides" }));
+    expect(await screen.findByRole("link", { name: /^Document:\s*Recovered child$/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: "architecture" })).toBeVisible();
+    expect(browseMock.mock.calls.filter(call => !call[1])).toHaveLength(1);
+    expect(browseMock.mock.calls.filter(call => call[1] === "guides")).toHaveLength(2);
+    expect(browseMock.mock.calls.every(call => !call[3]?.cursor)).toBe(true);
+  });
+
+  it("cancels a collapsed collection request and ignores its late response", async () => {
+    let release!: (value: unknown) => void;
+    let signal: AbortSignal | undefined;
+    browseMock.mockImplementation(async (_vault, collection, _depth, options) => {
+      if (!collection) return { ...sample, complete: false, next_cursor: "global-tail", items: sample.items.slice(0, 2) };
+      signal = options.signal;
+      return new Promise(resolve => { release = resolve; });
+    });
+    const user = userEvent.setup();
+    const { container } = renderAt("/vault/v", "focused");
+    const collection = await screen.findByRole("button", { name: "guides" });
+    await user.click(collection);
+    await waitFor(() => expect(signal).toBeDefined());
+    expect(container.querySelector('[data-collection-boundary="guides"]')).toHaveTextContent("Loading guides");
+    await user.click(collection);
+    expect(signal?.aborted).toBe(true);
+    await act(async () => release({ vault: "v", path: "guides", complete: true, items: [{ type: "document", path: "guides/late.md", name: "Late child" }] }));
+    expect(collection).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("link", { name: /^Document:\s*Late child$/ })).not.toBeInTheDocument();
+    expect(container.querySelector('[data-collection-boundary="guides"]')).toBeNull();
+  });
+
   it.each([
     ["Document", "guides/last.md", "/vault/v/doc/guides%2Flast.md"],
     ["File", "file-last", "/vault/v/file/file-last"],
     ["Table", "table_last", "/vault/v/table/table_last"],
   ] as const)("reveals an authorized current %s without narrowing the Collection list or traversing every page", async (kind, ref, route) => {
-    browseMock.mockResolvedValue({ ...sample, complete: false, next_cursor: "next", items: [sample.items[0]] });
+    browseMock.mockImplementation(async (_vault, collection) => collection
+      ? { vault: "v", path: collection, complete: true, items: [] }
+      : { ...sample, complete: false, next_cursor: "next", items: [sample.items[0]] });
     // A table's authorized name is also its routing identity; unlike a
     // Document title or File display name, it is not an arbitrary alias.
     const title = kind === "Table" ? ref : "Authorized outlier";
@@ -602,7 +681,8 @@ describe("VaultExplorer — rendering", () => {
     expect(screen.getByRole("button", { name: "architecture" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Reset filters" })).not.toBeInTheDocument();
     expect(browseMock.mock.calls.every(call => !call[3]?.cursor)).toBe(true);
-    expect(browseMock.mock.calls.every(call => !call[1])).toBe(true);
+    expect(browseMock.mock.calls.every(call => !call[1] || call[1] === "guides")).toBe(true);
+    expect(browseMock).toHaveBeenCalledWith("v", "guides", 0, expect.objectContaining({ page_size: 100, content_type: "all" }));
     expect(browseMock).toHaveBeenCalledWith("v", undefined, -1, expect.objectContaining({ page_size: 100, content_type: "all" }));
   });
 
