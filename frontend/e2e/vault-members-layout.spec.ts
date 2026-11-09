@@ -93,7 +93,7 @@ for (const dark of [false, true])
       const roster = page.getByRole("table", { name: "Vault members" });
       await expect(roster).toBeVisible();
       await expect(
-        page.getByRole("heading", { level: 2, name: "Members", exact: true }),
+        page.getByRole("heading", { level: 1, name: "Members", exact: true }),
       ).toBeVisible();
       await expect(
         page.getByRole("link", { name: "Change in Settings", exact: true }),

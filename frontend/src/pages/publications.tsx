@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -37,7 +38,7 @@ import { RelativeTime } from "@/components/ui/relative-time";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { TonalIcon, type TonalIconTone } from "@/components/ui/tonal-icon";
-import { WorkspaceSectionHeader } from "@/components/ui/workspace-section-header";
+import { WorkspacePageHeader } from "@/components/ui/workspace-page-header";
 import {
   deletePublication,
   getDocument,
@@ -174,7 +175,7 @@ function PublicationsWorkspace({
 
     } catch (caught: unknown) {
       if (!active.current || generation !== loadGeneration.current) return;
-      setError(errorMessage(caught, "Failed to load public links"));
+      setError(errorMessage(caught, "Failed to load publications"));
       if ([401, 403].includes((caught as { status?: number })?.status ?? 0)) setItems(null);
     } finally {
       if (active.current && generation === loadGeneration.current) setRefreshing(false);
@@ -215,7 +216,7 @@ function PublicationsWorkspace({
   useEffect(() => {
     if (!name) return;
     const previous = document.title;
-    document.title = `${name} · Public links · AKB`;
+    document.title = `${name} · Publications · AKB`;
     return () => {
       document.title = previous;
     };
@@ -308,21 +309,22 @@ function PublicationsWorkspace({
   return (
     <>
       <div data-testid="publication-workspace" className="workspace-density-compact @container/publications mx-auto w-full max-w-7xl">
-        <h1 id="publications-heading" className="sr-only">
-          Public links
-        </h1>
-
-        <WorkspaceSectionHeader
-          id="published-links-heading"
+        <WorkspacePageHeader
+          titleId="publications-heading"
           icon={Share2}
-          title="Public links"
-          tone="publish"
-          testId="publication-ledger-header" compact
-          right={
+          title="Publications"
+          variant="page"
+          testId="publication-ledger-header"
+          actions={
             <>
+              <Button asChild variant="ghost" size="sm">
+                <Link to="/publications" aria-label="View publications from all vaults" className="workspace-control">
+                  All vaults<ArrowRight className="h-3.5 w-3.5" aria-hidden />
+                </Link>
+              </Button>
               {items !== null && (
                 <Badge variant="default">
-                  {count} link{count === 1 ? "" : "s"}
+                  {count} publication{count === 1 ? "" : "s"}
                 </Badge>
               )}
               {(items === null || count > 0) && (
@@ -330,7 +332,7 @@ function PublicationsWorkspace({
                   {items === null
                     ? error
                       ? "Unavailable"
-                      : "Loading links…"
+                      : "Loading publications…"
                     : `${totalViews.toLocaleString()} total views`}
                 </span>
               )}
@@ -347,7 +349,7 @@ function PublicationsWorkspace({
         />
 
         <Panel variant="workspace" className="w-full">
-          <section aria-labelledby="published-links-heading" aria-busy={refreshing}>
+          <section aria-labelledby="publications-heading" aria-busy={refreshing}>
             <PublicationPolicySummary />
             {items !== null && unpublishDisabledReason && (
               <p id="unpublish-restriction" className="border-b border-border px-4 py-2.5 text-xs text-foreground-muted sm:px-5">
@@ -381,8 +383,8 @@ function PublicationsWorkspace({
               />
             )}
 
-            {refreshing && items !== null && <p role="status" className="px-4 py-3 text-sm text-foreground-muted">Updating public links…</p>}
-            {error && items !== null && <Alert variant="destructive" className="m-4">Could not update public links. Previous links are shown. {error}<Button variant="outline" size="sm" loading={refreshing} onClick={() => void load(name)}>Retry</Button></Alert>}
+            {refreshing && items !== null && <p role="status" className="px-4 py-3 text-sm text-foreground-muted">Updating publications…</p>}
+            {error && items !== null && <Alert variant="destructive" className="m-4">Could not update publications. Previous publications are shown. {error}<Button variant="outline" size="sm" loading={refreshing} onClick={() => void load(name)}>Retry</Button></Alert>}
             {error && items === null ? (
               <PublicationError error={error} loading={refreshing} onRetry={() => void load(name)} />
             ) : items === null ? (
@@ -398,7 +400,7 @@ function PublicationsWorkspace({
               />
             ) : (
               <ol
-                aria-label="Public links"
+                aria-label="Publications"
                 className="divide-y divide-border bg-surface"
               >
                 {filteredItems.slice(0, visibleLimit).map((publication) => (
@@ -418,12 +420,12 @@ function PublicationsWorkspace({
             )}
             {filteredItems.length > visibleLimit && <div className="border-t border-border p-3">
               <Button variant="outline" className="w-full" onClick={() => setVisibleLimit(limit => limit + 30)}>
-                Show more links ({filteredItems.length - visibleLimit} remaining)
+                Show more publications ({filteredItems.length - visibleLimit} remaining)
               </Button>
             </div>}
             {(count > 30 || filtersActive) && filteredItems.length > 0 && (
               <p className="border-t border-border bg-surface px-4 py-2 text-right text-xs tabular-nums text-foreground-muted sm:px-5">
-                Showing {Math.min(visibleLimit, filteredItems.length)} of {filteredItems.length} {filtersActive ? "matching" : "loaded"} link{filteredItems.length === 1 ? "" : "s"}
+                Showing {Math.min(visibleLimit, filteredItems.length)} of {filteredItems.length} {filtersActive ? "matching" : "loaded"} publication{filteredItems.length === 1 ? "" : "s"}
               </p>
             )}
           </section>
@@ -449,7 +451,7 @@ function PublicationsWorkspace({
   );
 }
 
-function PublicationRow({
+export function PublicationRow({
   publication,
   number,
   vault,
@@ -458,6 +460,8 @@ function PublicationRow({
   unpublishDisabledReason,
   onCopy,
   onRevoke,
+  vaultScopeHref,
+  compact = false,
 }: {
   publication: Publication;
   number: number;
@@ -467,7 +471,10 @@ function PublicationRow({
   unpublishDisabledReason?: string;
   onCopy: () => void;
   onRevoke: () => void;
+  vaultScopeHref?: string;
+  compact?: boolean;
 }) {
+  const restrictionId = useId();
   const Icon = RESOURCE_ICON[publication.resource_type];
   const title = publicationTitle(publication);
   const [expiryTick, setExpiryTick] = useState(0);
@@ -481,7 +488,7 @@ function PublicationRow({
   }, [publication.expires_at, expiryTick]);
   const availability = publicationAvailability(publication);
   const availabilityLabel = {
-    active: "Active",
+    active: "Published",
     expired: "Expired",
     "view-limit-reached": "View limit reached",
     unknown: "Availability unknown",
@@ -496,13 +503,13 @@ function PublicationRow({
   return (
     <li className="grid gap-2 px-4 py-3 transition-token hover:bg-surface-hover @lg/publications:px-5 @lg/publications:py-2.5 @min-[42rem]/publications:grid-cols-[minmax(0,1fr)_auto] @min-[42rem]/publications:items-center">
       <div className="flex min-w-0 items-start gap-2.5">
-        <span
+        {!compact && <span
           data-testid="publication-index"
           aria-hidden
           className="w-5 shrink-0 pt-1.5 text-right text-xs tabular-nums text-subtle"
         >
           {number}
-        </span>
+        </span>}
         <TonalIcon tone={RESOURCE_TONE[publication.resource_type]} size="sm">
           <Icon className="h-4 w-4" aria-hidden />
         </TonalIcon>
@@ -525,8 +532,9 @@ function PublicationRow({
           </div>
 
           <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs leading-4 text-foreground-muted">
+            {vaultScopeHref && <><Link to={vaultScopeHref} aria-label={`Show publications in ${vault}`} className="min-w-0 break-words rounded-[var(--radius-sm)] text-link hover:text-link-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{vault}</Link><span aria-hidden>·</span></>}
             <span>{RESOURCE_LABEL[publication.resource_type]}</span><span aria-hidden>·</span>
-            <span>
+            {!compact && <><span>
               Delivery: {publication.mode === "snapshot" ? "Snapshot" : publication.mode === "live" ? "Live" : "Unknown"}
             </span>
             <span aria-hidden>·</span>
@@ -534,21 +542,21 @@ function PublicationRow({
               <span className="block break-all py-1 font-mono">/p/{publication.slug}</span>
             </details>
             <span aria-hidden>·</span>
+            </>}
             <span className="tabular-nums">{views}</span>
             <span aria-hidden>·</span>
-            <span>
+            {!compact && <><span>
               Published <RelativeTime iso={publication.created_at} />
-            </span>
+            </span><span aria-hidden>·</span></>}
             {publication.password_protected && (
               <>
-                <span aria-hidden>·</span>
                 <span className="inline-flex items-center gap-1">
                   <KeyRound className="h-3 w-3" aria-hidden />
                   Password
                 </span>
+                <span aria-hidden>·</span>
               </>
             )}
-            <span aria-hidden>·</span>
             <span className="inline-flex items-center gap-1">
               <Clock3 className="h-3 w-3" aria-hidden />
               {publication.expires_at && Number.isFinite(Date.parse(publication.expires_at))
@@ -558,13 +566,14 @@ function PublicationRow({
           </div>
         </div>
       </div>
+      {compact && unpublishDisabledReason && <span id={restrictionId} className="sr-only">{unpublishDisabledReason}</span>}
 
       <div className="ml-7 flex shrink-0 flex-wrap items-center justify-start gap-1 @min-[42rem]/publications:ml-0 @min-[42rem]/publications:justify-end">
         <button
           type="button"
           onClick={onCopy}
           aria-label={
-            copied ? "Public link copied" : `Copy public link for ${title}`
+            copied ? "Link copied" : `Copy publication link for ${title}`
           }
           className="workspace-control inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-[var(--radius-sm)] px-2.5 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
@@ -573,22 +582,24 @@ function PublicationRow({
           ) : (
             <Copy className="h-3.5 w-3.5" aria-hidden />
           )}
-          {copied ? "Copied" : "Copy"}
+          {copied ? "Copied" : "Copy link"}
         </button>
-        <a
+        {!compact && <a
           href={publication.share_url}
           target="_blank"
           rel="noopener noreferrer"
-          aria-label={`Open public page for ${title}`}
+          aria-label={`Open publication for ${title}`}
           className="workspace-control inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-[var(--radius-sm)] px-2.5 text-xs font-medium text-foreground-muted transition-token hover:bg-surface-hover hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <ExternalLink className="h-3.5 w-3.5" aria-hidden />
           Open
-        </a>
+        </a>}
         <PublicationMenu
           title={title}
           disabled={revoking}
           disabledReason={unpublishDisabledReason}
+          descriptionId={compact ? restrictionId : "unpublish-restriction"}
+          shareUrl={compact ? publication.share_url : undefined}
           onRevoke={onRevoke}
         />
       </div>
@@ -596,7 +607,7 @@ function PublicationRow({
   );
 }
 
-function PublicationPolicySummary() {
+export function PublicationPolicySummary() {
   return (
     <div
       data-testid="publication-policy-summary"
@@ -623,11 +634,15 @@ function PublicationMenu({
   disabled,
   disabledReason,
   onRevoke,
+  descriptionId = "unpublish-restriction",
+  shareUrl,
 }: {
   title: string;
   disabled: boolean;
   disabledReason?: string;
   onRevoke: () => void;
+  descriptionId?: string;
+  shareUrl?: string;
 }) {
   return (
     <DropdownMenu.Root>
@@ -653,11 +668,12 @@ function PublicationMenu({
           sideOffset={6}
           className="z-[var(--z-popover)] min-w-40 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
+          {shareUrl && <DropdownMenu.Item asChild><a href={shareUrl} target="_blank" rel="noopener noreferrer" className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover"><ExternalLink className="h-4 w-4" aria-hidden />Open publication</a></DropdownMenu.Item>}
           <DropdownMenu.Item
             onSelect={onRevoke}
             disabled={Boolean(disabledReason)}
             title={disabledReason}
-            aria-describedby={disabledReason ? "unpublish-restriction" : undefined}
+            aria-describedby={disabledReason ? descriptionId : undefined}
             className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-3 py-2 text-sm text-destructive outline-none data-[highlighted]:bg-surface-hover data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50"
           >
             <Trash2 className="h-4 w-4" aria-hidden />
@@ -690,7 +706,7 @@ function PublicationControls({
       className="flex flex-wrap items-center gap-2 border-b border-border bg-surface px-4 py-3 @lg/publications:px-5 @lg/publications:py-2.5"
     >
       <label className="relative min-w-0 flex-1 basis-64">
-        <span className="sr-only">Filter public links</span>
+        <span className="sr-only">Filter publications</span>
         <Search
           className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-foreground-muted"
           aria-hidden
@@ -699,13 +715,13 @@ function PublicationControls({
           type="search"
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
-          placeholder="Filter public links…"
+          placeholder="Filter publications…"
           className="h-8 rounded-[var(--radius-sm)] pl-8 text-xs"
         />
       </label>
       <div
         role="group"
-        aria-label="Filter public links by type"
+        aria-label="Filter publications by type"
         className="flex flex-wrap items-center gap-1"
       >
         {PUBLICATION_FILTERS.map((filter) => (
@@ -732,7 +748,7 @@ function PublicationNoResults({ onClear }: { onClear: () => void }) {
     <div className="flex flex-wrap items-center justify-between gap-3 bg-surface px-4 py-4 @lg/publications:px-5">
       <div className="min-w-0">
         <h3 className="text-sm font-semibold text-foreground">
-          No matching public links
+          No matching publications
         </h3>
         <p className="mt-1 text-xs leading-relaxed text-foreground-muted">
           Try another title or show all resource types.
@@ -750,10 +766,10 @@ function PublicationEmptyState({ vault }: { vault: string }) {
     <div data-testid="publication-empty-state" className="flex flex-wrap items-center justify-between gap-3 bg-surface px-4 py-4 @lg/publications:px-5">
       <div className="min-w-0 max-w-xl">
         <h3 className="text-sm font-semibold text-foreground">
-          No public links yet
+          Nothing published yet
         </h3>
         <p className="mt-1 text-ui leading-relaxed text-foreground-muted">
-          Open a document, table, or file and choose Publish to create a public link.
+          Open a document, table, or file and choose Publish to share it outside your Vault.
         </p>
       </div>
       <Button asChild variant="outline" size="sm" className="shrink-0">
@@ -777,7 +793,7 @@ function PublicationError({
 }) {
   return (
     <div className="bg-surface p-4 sm:p-5">
-      <Alert variant="destructive" title="Couldn't load public links">
+      <Alert variant="destructive" title="Couldn't load publications">
         {error}
         <div className="mt-3">
           <Button variant="outline" size="sm" loading={loading} onClick={onRetry}>
@@ -789,9 +805,9 @@ function PublicationError({
   );
 }
 
-function PublicationSkeleton() {
+export function PublicationSkeleton() {
   return (
-    <div role="status" aria-live="polite" aria-label="Loading public links">
+    <div role="status" aria-live="polite" aria-label="Loading publications">
       {[0, 1, 2].map((index) => (
         <div
           key={index}
@@ -807,12 +823,13 @@ function PublicationSkeleton() {
           <Skeleton className="h-8 w-28 rounded-[var(--radius-md)]" />
         </div>
       ))}
-      <span className="sr-only">Loading public links…</span>
+      <span className="sr-only">Loading publications…</span>
     </div>
   );
 }
 
 function resourceHref(vault: string, publication: Publication): string {
+  vault = encodeURIComponent(vault);
   if (publication.resource_type === "table_query") {
     // Table publications created by the bounded UI use one safe source table.
     // Older/raw SQL publications keep the Vault fallback if a single source

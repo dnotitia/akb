@@ -290,7 +290,7 @@ export function PublishOptionsForm({
     <form onSubmit={handlePublish} className={compact ? "flex min-h-0 flex-col" : "contents"} aria-busy={working}>
       <div ref={fieldsRef} className={compact ? "min-h-0 space-y-4 overflow-y-auto overscroll-contain scroll-py-4 px-4 pb-4" : "contents"}>
         {header}
-        {!compact && <Alert variant="info" title="Public link">
+        {!compact && <Alert variant="info" title="Publication">
           <span className="inline-flex items-start gap-2">
             <Globe2 className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
             Anyone with the link can open this {resourceLabel} without signing in.

@@ -333,7 +333,7 @@ function ReferencePreview({ target, narrow, headerHost, panelControl, canGoBack,
       {isPending ? <LoadingState label="Loading reference" delayMs={200}><div className="space-y-5 p-6"><Skeleton className="h-7 w-3/4" /><Skeleton className="h-4 w-full" /><Skeleton className="h-4 w-5/6" /></div></LoadingState>
         : !doc ? <Alert variant="destructive" className="m-5">{denied ? "This reference is unavailable or you no longer have access." : "The reference could not be loaded."}<Button variant="outline" size="sm" loading={isFetching} onClick={() => void refetch()}>Try again</Button></Alert>
           : <div className="reading-preview-identity">{error && <Alert variant="warning" className="m-4">The reference could not be refreshed. Previous content is shown.<Button variant="ghost" size="sm" onClick={() => void refetch()}>Try again</Button></Alert>}
-            <MarkdownRender markdown={doc.content || ""} summary={doc.summary} leadingMetadata={metadata} fallbackTitle={doc.title}
+            <MarkdownRender markdown={doc.content || ""} summary={doc.summary} leadingMetadata={metadata} documentTitle={doc.title || "Untitled document"}
               className="document-reading-flow reading-preview-markdown" headingIdPrefix={`${prefix}-`}
               assetContext={{ mode: "authenticated", vault: target.vault, document: doc.path, commit: doc.current_commit }} /></div>}
     </div>

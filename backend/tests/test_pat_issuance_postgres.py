@@ -267,3 +267,28 @@ async def test_human_admin_both_aliases_and_suspended_target(monkeypatch):
             denied = await client.post(f"/api/v1/admin/users/{target.user_id}/tokens", json={"name": "denied"})
             assert denied.status_code == 403, denied.text
         assert await pool.fetchval("SELECT count(*) FROM tokens WHERE user_id=$1", uuid.UUID(target.user_id)) == 2
+
+
+async def test_special_scope_cannot_be_minted_by_admin_or_allowlisted_machine(monkeypatch):
+    async with _fresh_database() as pool:
+        wire(monkeypatch, pool)
+        admin, target = await person(pool, admin=True), await person(pool)
+        await pool.execute("UPDATE users SET account_kind='service' WHERE id=$1", uuid.UUID(target.user_id))
+        credential = await auth_service.create_pat(admin.user_id, "approved", key_class="service")
+        machine = await auth_service._resolve_pat(credential["token"])
+        monkeypatch.setattr(auth_service.settings, "admin_token_issuer_ids", [uuid.UUID(machine.token_id)])
+        for actor in (admin, machine):
+            async with client_for(actor) as client:
+                for alias in ("tokens", "managed-tokens"):
+                    for scopes in (["sso_operation_requests"], ["sso_operation_requests", "admin"]):
+                        result = await client.post(f"/api/v1/admin/users/{target.user_id}/{alias}",
+                            json={"name": "denied", "token_id": str(uuid.uuid4()),
+                                  "key_class": "service", "scopes": scopes})
+                        assert (result.status_code, result.json()["code"]) == (
+                            403, "sso_operation_request_scope_issuance_required"
+                        )
+        with pytest.raises(AKBError) as no_issuer:
+            await auth_service.create_pat(target.user_id, "denied", key_class="service",
+                                          scopes=["sso_operation_requests"], admin_issuance=True)
+        assert no_issuer.value.code == "sso_operation_request_scope_issuance_required"
+        assert await pool.fetchval("SELECT COUNT(*) FROM tokens WHERE user_id=$1", uuid.UUID(target.user_id)) == 0

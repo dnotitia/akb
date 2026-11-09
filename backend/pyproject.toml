@@ -42,7 +42,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Static-analysis tooling is exact-pinned so CI's `pip install -e '.[dev]'`
+# Static-analysis tooling is exact-pinned so CI's `uv sync --locked --extra dev`
 # produces the same gate every PR. Floor-only specifiers (`>=`) let a
 # silent dep upgrade flip CI from pass→fail (or fail→pass) on the same
 # commit without anyone noticing — which is the bug shape we hit in 0.6.4

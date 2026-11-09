@@ -10,7 +10,7 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
+import { BrowserRouter, MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import VaultSettingsPage from "@/pages/vault-settings";
 import { CurrentUserProvider } from "@/contexts/current-user-context";
 import { ResourceNavigationProvider } from "@/contexts/resource-navigation-context";
@@ -79,6 +79,18 @@ function scope(name: "Vault details" | "Access permissions" | "Vault guide" | "D
   return within(screen.getByRole("region", { name }));
 }
 
+async function selectTab(user: ReturnType<typeof userEvent.setup>, name: string) {
+  const tab = await screen.findByRole("tab", { name });
+  await waitFor(() => expect(tab).toBeEnabled());
+  if (tab.getAttribute("aria-selected") !== "true") await user.click(tab);
+}
+
+function SettingsLocationProbe() {
+  const location = useLocation();
+  return <><output data-testid="settings-location">{location.pathname + location.search + location.hash}</output>
+    <output data-testid="settings-preview-state">{JSON.stringify(location.state)}</output></>;
+}
+
 function renderSettings(hash = "") {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -88,6 +100,7 @@ function renderSettings(hash = "") {
       <MemoryRouter initialEntries={[`/vault/platform-docs/settings${hash}`]}>
         <ResourceNavigationProvider>
         <BackButton />
+        <SettingsLocationProbe />
         <AppPageLocation />
         <Routes>
           <Route path="/vault/:name/settings" element={<VaultSettingsPage />} />
@@ -126,6 +139,16 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Vault Settings redesign", () => {
+  it("accepts assistive click activation without a pointer-down sequence", async () => {
+    renderSettings();
+    await screen.findByRole("textbox", { name: "Description" });
+    const accessTab = screen.getByRole("tab", { name: "Access permissions" });
+    fireEvent.click(accessTab);
+    expect(accessTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tabpanel", { name: "Access permissions" })).toBeVisible();
+    expect(screen.queryByRole("textbox", { name: "Description" })).not.toBeInTheDocument();
+  });
+
   it("allows guarded departure while access proof is pending or fails without losing a cancelled draft", async () => {
     const user = userEvent.setup();
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -154,26 +177,17 @@ describe("Vault Settings redesign", () => {
     expect(updateVault).not.toHaveBeenCalled();
   });
 
-  it("preserves a same-account Guide draft and OCC pin across proof but drops another account's buffer", async () => {
+  it.each(["Open guide", "Edit guide"])("routes %s through the same retained document preview", async entry => {
     const user = userEvent.setup();
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const view = (id: string, checking = false, revision = 0) => <QueryClientProvider client={client}><MemoryRouter initialEntries={["/vault/platform-docs/settings#skill"]}><CurrentUserProvider user={{ user_id: id, username: id, email: `${id}@x.test`, display_name: null, is_admin: false, auth_method: "local", key_class: null }} checking={checking} revision={revision}><Routes><Route path="/vault/:name/settings" element={<VaultSettingsPage />} /></Routes></CurrentUserProvider></MemoryRouter></QueryClientProvider>;
-    const { rerender } = render(view("a"));
-    await user.click(await screen.findByRole("button", { name: "Edit guide" }));
-    fireEvent.change(screen.getByLabelText("Vault guide body"), { target: { value: "Private draft A" } });
-    rerender(view("a", true));
-    expect(screen.queryByLabelText("Vault guide body")).not.toBeInTheDocument();
-    vi.mocked(getDocument).mockResolvedValue({ content: "New server body", current_commit: "new-server-commit" });
-    rerender(view("a", false, 1));
-    await waitFor(() => expect(screen.getByLabelText("Vault guide body")).toBeVisible());
-    expect(screen.getByLabelText("Vault guide body")).toHaveValue("Private draft A");
-    vi.mocked(updateDocument).mockResolvedValue({ current_commit: "saved" });
-    await user.click(screen.getByRole("button", { name: "Save guide" }));
-    expect(updateDocument).toHaveBeenCalledWith("platform-docs", "overview/vault-skill.md", { content: "Private draft A", expected_commit: "original-commit" });
-    rerender(view("b", false, 2));
-    await screen.findByText("New server body");
-    expect(screen.queryByDisplayValue("Private draft A")).not.toBeInTheDocument();
+    renderSettings("#skill");
+    await user.click(await screen.findByRole(entry === "Open guide" ? "link" : "button", { name: entry }));
+    expect(screen.getByTestId("settings-location")).toHaveTextContent(`/vault/platform-docs/doc/overview%2Fvault-skill.md${entry === "Edit guide" ? "?view=edit" : ""}`);
+    const state = JSON.parse(screen.getByTestId("settings-preview-state").textContent!);
+    expect(state).toMatchObject({ documentPreview: true, backgroundLocation: { pathname: "/vault/platform-docs/settings", hash: "#skill" } });
+    expect(state.returnFocusId).toEqual(expect.any(String));
+    expect(updateDocument).not.toHaveBeenCalled();
   });
+
   it("distinguishes a failed Guide GET from a confirmed 404 and supports retry", async () => {
     const user = userEvent.setup();
     vi.mocked(getDocument).mockRejectedValueOnce(Object.assign(new Error("Service unavailable"), { status: 503 }));
@@ -196,8 +210,10 @@ describe("Vault Settings redesign", () => {
     let rejectSave!: (error: Error) => void;
     updateVaultMock.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectSave = reject; }));
     renderSettings("#access");
+    await selectTab(user, "Access permissions");
     await user.click(await screen.findByRole("radio", { name: "Everyone can view" }));
     await user.click(scope("Access permissions").getByRole("button", { name: "Save changes" }));
+    await selectTab(user, "Vault details");
     await user.click(screen.getByLabelText("Description"));
     await user.click(screen.getByRole("button", { name: destination }));
     expect(screen.getByLabelText("Description")).toBeVisible();
@@ -208,9 +224,11 @@ describe("Vault Settings redesign", () => {
     expect(savingEvent.defaultPrevented).toBe(true);
     await act(async () => { rejectSave(new Error("Access save failed")); });
     expect(screen.getByRole("alert")).toHaveTextContent("Access save failed");
+    await selectTab(user, "Access permissions");
     expect(screen.getByRole("radio", { name: "Everyone can view" })).toBeChecked();
     await user.click(screen.getByRole("button", { name: destination }));
     await user.click(screen.getByRole("button", { name: "Keep editing" }));
+    await selectTab(user, "Access permissions");
     expect(screen.getByRole("radio", { name: "Everyone can view" })).toBeChecked();
     expect(screen.getByRole("alert")).toHaveTextContent("Access save failed");
   });
@@ -221,6 +239,7 @@ describe("Vault Settings redesign", () => {
     if (scope === "general") {
       fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Unsaved description" } });
     } else {
+      await selectTab(user, "Access permissions");
       await user.click(await screen.findByRole("radio", { name: "Everyone can view" }));
     }
     await user.click(screen.getByRole("link", { name: "Back to platform-docs" }));
@@ -241,10 +260,12 @@ describe("Vault Settings redesign", () => {
     const user = userEvent.setup();
     renderSettings();
     fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Unsaved description" } });
+    await selectTab(user, "Access permissions");
     await user.click(screen.getByRole("radio", { name: "Everyone can view" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await user.click(screen.getByRole("link", { name: "Back to platform-docs" }));
     await user.click(screen.getByRole("button", { name: "Keep editing" }));
+    await selectTab(user, "Access permissions");
     expect(screen.getByRole("radio", { name: "Everyone can view" })).toBeChecked();
     expect(screen.getByLabelText("Description")).toHaveValue("Unsaved description");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -253,18 +274,17 @@ describe("Vault Settings redesign", () => {
     expect(await screen.findByRole("heading", { name: "Vault overview" })).toBeVisible();
   });
 
-  it("uses one leave confirmation for settings and Guide drafts and keeps every draft on cancel", async () => {
+  it("uses one leave confirmation for multiple Settings drafts and keeps them on cancel", async () => {
     const user = userEvent.setup();
     renderSettings();
     fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Unsaved description" } });
+    await selectTab(user, "Access permissions");
     await user.click(screen.getByRole("radio", { name: "Everyone can view" }));
-    await user.click(await screen.findByRole("button", { name: "Edit guide" }));
-    fireEvent.change(screen.getByLabelText("Vault guide body"), { target: { value: "Unsaved guide" } });
     await user.click(screen.getByRole("link", { name: "Back to platform-docs" }));
     expect(screen.getAllByRole("dialog")).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: "Keep editing" }));
-    expect(screen.getByLabelText("Vault guide body")).toHaveValue("Unsaved guide");
     expect(screen.getByLabelText("Description")).toHaveValue("Unsaved description");
+    await selectTab(user, "Access permissions");
     expect(screen.getByRole("radio", { name: "Everyone can view" })).toBeChecked();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await user.click(screen.getByRole("link", { name: "Back to platform-docs" }));
@@ -285,19 +305,18 @@ describe("Vault Settings redesign", () => {
     try {
       renderBrowserSettings();
       fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Unsaved description" } });
-      await user.click(await screen.findByRole("button", { name: "Edit guide" }));
-      fireEvent.change(screen.getByLabelText("Vault guide body"), { target: { value: "Unsaved guide" } });
       pop(3, "/vault/platform-docs/settings#access");
       expect(screen.getByRole("region", { name: "Access permissions" })).toBeVisible();
       expect(go).not.toHaveBeenCalled();
+      await selectTab(user, "Access permissions");
       await user.click(screen.getByRole("radio", { name: "Everyone can view" }));
       pop(2, "/vault/platform-docs/members");
       await waitFor(() => expect(go).toHaveBeenLastCalledWith(1));
       pop(3, "/vault/platform-docs/settings#access");
       await user.click(screen.getByRole("button", { name: "Keep editing" }));
       expect(screen.getByLabelText("Description")).toHaveValue("Unsaved description");
-      expect(screen.getByLabelText("Vault guide body")).toHaveValue("Unsaved guide");
-      expect(screen.getByRole("radio", { name: "Everyone can view" })).toBeChecked();
+        await selectTab(user, "Access permissions");
+    expect(screen.getByRole("radio", { name: "Everyone can view" })).toBeChecked();
       expect(screen.queryByRole("heading", { name: "Vault members" })).not.toBeInTheDocument();
       pop(4, "/vault/platform-docs/members");
       await waitFor(() => expect(go).toHaveBeenLastCalledWith(-1));
@@ -325,6 +344,7 @@ describe("Vault Settings redesign", () => {
     renderSettings();
     fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Saved description" } });
     await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await selectTab(user, "Access permissions");
     await user.click(screen.getByRole("radio", { name: "Invited members only" }));
     await user.click(screen.getByRole("link", { name: "Back to platform-docs" }));
     expect(screen.queryByRole("heading", { name: "Vault overview" })).not.toBeInTheDocument();
@@ -335,53 +355,52 @@ describe("Vault Settings redesign", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("blocks departure while a Guide save is pending and keeps failed Guide and settings drafts", async () => {
+  it("blocks the Guide edit entry while a Settings save is pending and retains failed Settings work", async () => {
     const user = userEvent.setup();
     let failSave!: (error: Error) => void;
-    vi.mocked(updateDocument).mockReturnValueOnce(new Promise((_resolve, reject) => { failSave = reject; }));
+    updateVaultMock.mockReturnValueOnce(new Promise((_resolve, reject) => { failSave = reject; }));
     renderSettings();
     fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Unsaved description" } });
-    await user.click(await screen.findByRole("button", { name: "Edit guide" }));
-    fireEvent.change(screen.getByLabelText("Vault guide body"), { target: { value: "Unsaved guide" } });
-    await user.click(screen.getByRole("button", { name: "Save guide" }));
-    await user.click(screen.getByRole("link", { name: "Back to platform-docs" }));
-    expect(screen.queryByRole("heading", { name: "Vault overview" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    await act(async () => { failSave(new Error("Guide save failed")); });
-    await user.click(screen.getByRole("link", { name: "Back to platform-docs" }));
-    await user.click(screen.getByRole("button", { name: "Keep editing" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await selectTab(user, "Vault guide");
+    expect(screen.getByRole("button", { name: "Edit guide" })).toBeDisabled();
+    expect(screen.getByRole("link", { name: "Open guide" })).toBeVisible();
+    await act(async () => { failSave(new Error("Settings save failed")); });
+    expect(screen.getByRole("alert")).toHaveTextContent("Settings save failed");
     expect(screen.getByLabelText("Description")).toHaveValue("Unsaved description");
-    expect(screen.getByLabelText("Vault guide body")).toHaveValue("Unsaved guide");
-    expect(screen.getByRole("alert")).toHaveTextContent("Guide save failed");
-    await user.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(screen.getByRole("dialog", { name: "Discard unsaved guide changes?" })).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Keep editing" }));
-    expect(screen.getByLabelText("Vault guide body")).toHaveValue("Unsaved guide");
+    await selectTab(user, "Vault guide");
+    expect(screen.getByRole("button", { name: "Edit guide" })).toBeEnabled();
+    expect(updateDocument).not.toHaveBeenCalled();
   });
 
-  it("shows all tasks together with a copyable address but no redundant details, inventory, or tabs", async () => {
+  it("shows one accessible panel with matching tab controls and keeps the other drafts mounted", async () => {
+    const user = userEvent.setup();
     renderSettings();
     await screen.findByRole("textbox", { name: "Description" });
-    const general = screen.getByRole("region", { name: "Vault details" });
-    expect(within(screen.getByTestId("vault-settings-header")).getByRole("heading", { level: 2, name: "Settings" })).toBeVisible();
-    expect(within(general).getByText("akb://platform-docs")).toBeVisible();
-    expect(within(general).getByRole("button", { name: "Copy vault address" })).toBeVisible();
-    expect(screen.queryByLabelText("Vault ownership and dates")).not.toBeInTheDocument();
-    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
-    expect(within(general).getByRole("heading", { name: "Vault details" })).toBeVisible();
-    expect(screen.queryByRole("link", { name: "Manage members" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "Public links" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
-    expect(screen.queryByRole("tabpanel")).not.toBeInTheDocument();
-    for (const category of ["Vault details", "Access permissions", "Vault guide", "Danger zone"]) {
-      const section = screen.getByRole("region", { name: category });
-      expect(section).toBeVisible();
-      for (const label of ["Collections", "Documents", "Tables", "Files", "Graph links"]) {
-        expect(within(section).queryByText(label)).not.toBeInTheDocument();
-      }
+    expect(within(screen.getByTestId("vault-settings-header")).getByRole("heading", { level: 1, name: "Vault settings" })).toBeVisible();
+    const tabs = screen.getByRole("tablist", { name: "Vault settings sections" });
+    expect(within(tabs).getAllByRole("tab")).toHaveLength(4);
+    for (const [tabName, regionName] of [["Vault details", "Vault details"], ["Access permissions", "Access permissions"], ["Vault guide", "Vault guide"], ["Lifecycle actions", "Danger zone"]]) {
+      await selectTab(user, tabName);
+      expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+      const panel = screen.getByRole("tabpanel", { name: tabName });
+      const tab = within(tabs).getByRole("tab", { name: tabName });
+      expect(tab).toHaveAttribute("aria-selected", "true");
+      expect(tab).toHaveAttribute("aria-controls", panel.id);
+      expect(within(panel).getByRole("region", { name: regionName })).toBeVisible();
+      for (const label of ["Collections", "Documents", "Tables", "Files", "Graph links"]) expect(within(panel).queryByText(label)).not.toBeInTheDocument();
     }
+    for (const id of ["general", "access", "skill"]) {
+      const panel = document.getElementById(id)!.closest('[role="tabpanel"]');
+      expect(panel).toHaveAttribute("hidden");
+      expect(panel).toHaveAttribute("inert");
+    }
+    await selectTab(user, "Access permissions");
+    expect(screen.getByRole("link", { name: "Manage members" })).toHaveAttribute("href", "/vault/platform-docs/members");
+    await selectTab(user, "Vault details");
+    expect(screen.getByRole("button", { name: "Copy vault address" })).toBeVisible();
+    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Save changes" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Discard" })).not.toBeInTheDocument();
   });
 
   it("keeps local hash navigation in the same settings sheet and restores it with Back", async () => {
@@ -389,7 +408,11 @@ describe("Vault Settings redesign", () => {
     renderSettings();
     await screen.findByRole("textbox", { name: "Description" });
     fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Preserve across hash changes" } });
-    await user.click(screen.getByRole("button", { name: "Jump to access" }));
+    act(() => {
+      const access = screen.getByRole("tab", { name: "Access permissions" });
+      fireEvent.mouseDown(access, { button: 0, ctrlKey: false });
+      fireEvent.click(access);
+    });
     expect(screen.getByRole("region", { name: "Access permissions" })).toBeVisible();
     expect(screen.getByLabelText("Description")).toHaveValue("Preserve across hash changes");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -398,11 +421,14 @@ describe("Vault Settings redesign", () => {
     expect(screen.getByLabelText("Description")).toHaveValue("Preserve across hash changes");
   });
 
-  it("retains legacy deep-link anchors without hiding the other settings", async () => {
+  it("selects the legacy deep-linked tab and hides the other settings", async () => {
     renderSettings("#access");
     await screen.findByLabelText("Description");
     for (const [id, label] of [["general", "Vault details"], ["access", "Access permissions"], ["skill", "Vault guide"], ["danger", "Danger zone"]]) {
-      expect(screen.getByRole("region", { name: label })).toHaveAttribute("id", id);
+      const section = document.getElementById(id)!;
+      expect(section).toBeInTheDocument();
+      if (id === "access") expect(screen.getByRole("region", { name: label })).toBeVisible();
+      else expect(section).not.toBeVisible();
     }
     expect(screen.queryByRole("complementary", { name: "Vault settings context" })).not.toBeInTheDocument();
   });
@@ -415,19 +441,24 @@ describe("Vault Settings redesign", () => {
         role,
         role_source: "member",
       });
-      renderSettings();
+      renderSettings("#danger");
 
       const message = await screen.findByText(
         "Read only — only the vault owner can change settings.",
       );
       expect(message).toBeVisible();
+      expect(screen.getByRole("tab", { name: "Vault details" })).toHaveAttribute("aria-selected", "true");
+      expect(screen.queryByRole("tab", { name: "Lifecycle actions" })).not.toBeInTheDocument();
       expect(
         screen.getByRole("textbox", { name: "Description" }),
       ).toHaveAttribute("readonly");
       expect(
         screen.queryByRole("button", { name: "Save changes" }),
       ).not.toBeInTheDocument();
+      const user = userEvent.setup();
+      await selectTab(user, "Access permissions");
       expect(screen.getByRole("radio", { name: "Invited members only" })).toBeDisabled();
+      await selectTab(user, "Vault guide");
       expect(
         screen.queryByRole("button", { name: "Edit guide" }),
       ).not.toBeInTheDocument();
@@ -454,6 +485,7 @@ describe("Vault Settings redesign", () => {
       }),
     );
 
+    await selectTab(user, "Access permissions");
     await user.click(screen.getByRole("radio", { name: "Everyone can view" }));
     await user.click(scope("Access permissions").getByRole("button", { name: "Save changes" }));
 
@@ -464,39 +496,23 @@ describe("Vault Settings redesign", () => {
     );
   });
 
-  it("retains description, access, and guide drafts while working across the sheet", async () => {
+  it("retains description and access drafts while browsing Guide and Lifecycle", async () => {
     const user = userEvent.setup();
     renderSettings();
-    const description = await screen.findByRole("textbox", {
-      name: "Description",
-    });
-    await user.clear(description);
-    await user.type(description, "Unsaved description");
+    fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Unsaved description" } });
+    await selectTab(user, "Access permissions");
     await user.click(screen.getByRole("radio", { name: "Everyone can view" }));
-    await user.click(await screen.findByRole("button", { name: "Edit guide" }));
-    await user.type(
-      screen.getByRole("textbox", { name: "Vault guide body" }),
-      " with edits",
-    );
-    await user.click(description);
-    expect(screen.getByRole("textbox", { name: "Description" })).toHaveValue(
-      "Unsaved description",
-    );
+    await selectTab(user, "Vault guide");
+    expect(await screen.findByText("Original guide")).toBeVisible();
+    expect(screen.queryByRole("textbox", { name: "Vault guide body" })).not.toBeInTheDocument();
+    await selectTab(user, "Lifecycle actions");
+    expect(screen.getByRole("button", { name: "Archive" })).toBeVisible();
+    await selectTab(user, "Vault details");
+    expect(screen.getByLabelText("Description")).toHaveValue("Unsaved description");
+    await selectTab(user, "Access permissions");
     expect(screen.getByRole("radio", { name: "Everyone can view" })).toBeChecked();
-    expect(
-      screen.getByRole("textbox", { name: "Vault guide body" }),
-    ).toHaveValue("Original guide with edits");
-    await user.click(screen.getByRole("button", { name: "Save guide" }));
-    await waitFor(() =>
-      expect(updateDocument).toHaveBeenCalledWith(
-        "platform-docs",
-        "overview/vault-skill.md",
-        {
-          content: "Original guide with edits",
-          expected_commit: "original-commit",
-        },
-      ),
-    );
+    expect(updateVault).not.toHaveBeenCalled();
+    expect(updateDocument).not.toHaveBeenCalled();
   });
 
   it("keeps Current on the applied policy until the selected draft is saved", async () => {
@@ -522,6 +538,7 @@ describe("Vault Settings redesign", () => {
   it("explains the signed-in audience and deletion risk before allowing everyone to edit", async () => {
     const user = userEvent.setup();
     renderSettings("#access");
+    await selectTab(user, "Access permissions");
     await user.click(
       await screen.findByRole("radio", { name: "Everyone can edit" }),
     );
@@ -558,8 +575,10 @@ describe("Vault Settings redesign", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Permission changed on server",
     );
+    await selectTab(user, "Access permissions");
     await user.click(screen.getByRole("radio", { name: "Invited members only" }));
     expect(scope("Access permissions").queryByRole("alert")).not.toBeInTheDocument();
+    await selectTab(user, "Vault details");
     expect(screen.getByRole("textbox", { name: "Description" })).toHaveValue(
       "Product and platform knowledge. changed",
     );
@@ -581,10 +600,12 @@ describe("Vault Settings redesign", () => {
       }),
     );
     renderSettings("#access");
+    await selectTab(user, "Access permissions");
     await user.click(
       await screen.findByRole("radio", { name: "Everyone can view" }),
     );
     await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await selectTab(user, "Vault details");
     await user.click(screen.getByLabelText("Description"));
     await act(async () => {
       rejectSave(new Error("Access save failed"));
@@ -611,11 +632,13 @@ describe("Vault Settings redesign", () => {
           " changed",
         );
       } else {
+        await selectTab(user, "Access permissions");
         await user.click(
           await screen.findByRole("radio", { name: "Everyone can view" }),
         );
       }
       await user.click(screen.getByRole("button", { name: "Save changes" }));
+      await selectTab(user, "Vault guide");
       await user.click(screen.getByRole("button", { name: "Guide options" }));
       await user.click(screen.getByRole("menuitem", { name: "Agent view" }));
       const otherSetting = screen.getByRole("button", { name: "Close agent view" });
@@ -625,48 +648,34 @@ describe("Vault Settings redesign", () => {
         finishSave({ ok: true });
         await new Promise((resolve) => requestAnimationFrame(resolve));
       });
-      expect(screen.getByText("Saved")).toBeInTheDocument();
+      expect(screen.getByText(scope === "general" ? "Vault details saved." : "Access permissions saved.")).toBeInTheDocument();
       expect(otherSetting).toHaveFocus();
     },
   );
 
-  it.each(["general", "access", "guide"])("serializes %s saves against other settings, Guide, and lifecycle writes", async saving => {
+  it.each(["general", "access"])("serializes %s saves against other Settings writes and the Guide edit entry", async saving => {
     const user = userEvent.setup();
-    let finish!: (result: { ok: boolean; current_commit: string }) => void;
-    const pending = new Promise<{ ok: boolean; current_commit: string }>(resolve => { finish = resolve; });
-    if (saving === "guide") vi.mocked(updateDocument).mockReturnValueOnce(pending);
-    else updateVaultMock.mockReturnValueOnce(pending);
+    let finish!: (result: { ok: boolean }) => void;
+    updateVaultMock.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
     renderSettings();
     fireEvent.change(await screen.findByLabelText("Description"), { target: { value: "Unsaved description" } });
+    await selectTab(user, "Access permissions");
     await user.click(screen.getByRole("radio", { name: "Everyone can view" }));
-    await user.click(await screen.findByRole("button", { name: "Edit guide" }));
-    fireEvent.change(screen.getByLabelText("Vault guide body"), { target: { value: "Unsaved guide" } });
-    const generalSave = scope("Vault details").getByRole("button", { name: "Save changes" });
-    const accessSave = scope("Access permissions").getByRole("button", { name: "Save changes" });
-    const guideSave = screen.getByRole("button", { name: "Save guide" });
-    await user.click(saving === "general" ? generalSave : saving === "access" ? accessSave : guideSave);
-    expect(generalSave).toBeDisabled();
-    expect(accessSave).toBeDisabled();
-    expect(guideSave).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Archive" })).toBeDisabled();
+    await selectTab(user, saving === "general" ? "Vault details" : "Access permissions");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    const savingTab = saving === "general" ? "Vault details" : "Access permissions";
+    for (const [tabName, buttonName] of [["Vault details", "Save changes"], ["Access permissions", "Save changes"], ["Vault guide", "Edit guide"], ["Lifecycle actions", "Archive"]]) {
+      await selectTab(user, tabName);
+      expect(screen.getByRole("button", { name: tabName === savingTab ? "Saving…" : buttonName })).toBeDisabled();
+    }
     expect(screen.getByRole("button", { name: "Delete vault" })).toBeDisabled();
-    expect(updateVault).toHaveBeenCalledTimes(saving === "guide" ? 0 : 1);
-    expect(updateDocument).toHaveBeenCalledTimes(saving === "guide" ? 1 : 0);
-    await act(async () => { finish({ ok: true, current_commit: "saved-commit" }); });
-    if (saving !== "general") {
-      expect(screen.getByLabelText("Description")).toHaveValue("Unsaved description");
-      expect(scope("Vault details").getByRole("button", { name: "Save changes" })).toBeEnabled();
-    }
-    if (saving !== "access") {
-      expect(screen.getByRole("radio", { name: "Everyone can view" })).toBeChecked();
-      expect(scope("Access permissions").getByRole("button", { name: "Save changes" })).toBeEnabled();
-    }
-    if (saving !== "guide") {
-      expect(screen.getByLabelText("Vault guide body")).toHaveValue("Unsaved guide");
-      expect(screen.getByRole("button", { name: "Save guide" })).toBeEnabled();
-    }
-    expect(screen.getByRole("button", { name: "Archive" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Delete vault" })).toBeEnabled();
+    await act(async () => { finish({ ok: true }); });
+    await selectTab(user, "Vault guide");
+    expect(screen.getByRole("button", { name: "Edit guide" })).toBeEnabled();
+    expect(updateVault).toHaveBeenCalledTimes(1);
+    expect(updateDocument).not.toHaveBeenCalled();
+    await selectTab(user, saving === "general" ? "Access permissions" : "Vault details");
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
   });
 
   it("keeps the legacy danger link at the lifecycle actions without extra operations information", async () => {
@@ -737,6 +746,8 @@ describe("Vault Settings redesign", () => {
     expect(await screen.findByRole("textbox", { name: "Description" })).toBeVisible();
     expect(screen.queryByLabelText("Vault ownership and dates")).not.toBeInTheDocument();
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    const user = userEvent.setup();
+    await selectTab(user, "Lifecycle actions");
     expect(screen.getByText(/All vault data will be removed/)).not.toHaveTextContent(/0 documents|0 tables|0 files/);
   });
 
@@ -744,11 +755,13 @@ describe("Vault Settings redesign", () => {
     const user = userEvent.setup();
     renderSettings();
     await user.type(await screen.findByRole("textbox", { name: "Description" }), " draft");
+    await selectTab(user, "Vault guide");
     await user.click(screen.getByRole("button", { name: "Guide options" }));
     await user.click(screen.getByRole("menuitem", { name: "Agent view" }));
     const dirtyEvent = new Event("beforeunload", { cancelable: true });
     window.dispatchEvent(dirtyEvent);
     expect(dirtyEvent.defaultPrevented).toBe(true);
+    await selectTab(user, "Vault details");
     await user.click(screen.getByRole("button", { name: "Discard" }));
     const cleanEvent = new Event("beforeunload", { cancelable: true });
     window.dispatchEvent(cleanEvent);
@@ -772,6 +785,7 @@ describe("Vault Settings redesign", () => {
     const user = userEvent.setup();
     getVaultInfoMock.mockResolvedValue({ ...VAULT_INFO, is_archived: true });
     renderSettings("#skill");
+    await selectTab(user, "Vault guide");
     await user.click(await screen.findByRole("button", { name: "Guide options" }));
     expect(screen.getByRole("menuitem", { name: "Agent view" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit guide" })).not.toBeInTheDocument();

@@ -184,6 +184,7 @@ class UserSqlExecutor:
         fetch: bool | None = None,
         is_admin: bool = False,
         vault_names: Optional[list[str]] = None,
+        read_only: bool = False,
     ) -> dict:
         """Run `sql` under the caller's PG role. Returns a result envelope
         compatible with the existing `akb_sql` contract.
@@ -234,6 +235,9 @@ class UserSqlExecutor:
                             request_claims.to_json(),
                         )
 
+                    if read_only:
+                        await conn.execute("SET TRANSACTION READ ONLY")
+
                     if should_fetch:
                         rows = await conn.fetch(sql, *bind_params)
                         items = await _coerce_rows_yielding(rows)
@@ -258,6 +262,8 @@ class UserSqlExecutor:
                     if affected_rows is not None:
                         out["affected_rows"] = affected_rows
                     return out
+        except asyncpg.exceptions.ReadOnlySQLTransactionError as e:
+            raise PermissionDeniedError(str(e), pg_sqlstate="25006") from e
         except asyncpg.exceptions.InsufficientPrivilegeError as e:
             # SQLSTATE 42501 — PG ACL denied. This is the *successful*
             # negative path: vault isolation is being enforced by PG.

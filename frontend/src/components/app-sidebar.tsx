@@ -10,6 +10,7 @@ import {
   ChevronsRight,
   Search,
   Settings,
+  Share2,
   type LucideIcon,
 } from "lucide-react";
 import { useRef, useState } from "react";
@@ -57,6 +58,7 @@ const PRIMARY_ITEMS: Array<{
     icon: Boxes,
     active: (pathname) => pathname.startsWith("/vault"),
   },
+  { to: "/publications", label: "Publications", icon: Share2, active: pathname => pathname === "/publications" },
 ];
 
 export function AppSidebar({

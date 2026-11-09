@@ -224,7 +224,7 @@ export function ProfilePhotoEditor({ editor }: { editor: ReturnType<typeof usePr
     chooseButton.current?.focus();
   }
 
-  return <div className="py-5" aria-busy={editor.busy || undefined} data-testid="profile-photo-editor">
+  return <div className="settings-photo-card" aria-busy={editor.busy || undefined} data-testid="profile-photo-editor">
     <div className="flex min-w-0 items-start gap-3">
       {candidate ? <img key={candidate.url} src={candidate.url} alt="Selected profile photo preview" width={48} height={48}
         className="h-12 w-12 shrink-0 rounded-full object-cover" onLoad={event => editor.previewLoaded(event.currentTarget)} onError={editor.previewFailed} />

@@ -29,9 +29,13 @@ jobs:
 
       - name: Install backend (runtime + dev)
         working-directory: backend
+        # From uv.lock, as the backend image and the e2e job install it, so
+        # these tests run the versions that ship. The venv's bin goes on PATH
+        # for the `pytest` and `python` calls in the steps below.
         run: |
-          pip install --upgrade pip
-          pip install -e '.[dev]'
+          pip install 'uv==0.12.12'
+          uv sync --locked --extra dev --python "$(command -v python)"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Run unit tests
         working-directory: backend
@@ -130,9 +134,13 @@ jobs:
 
       - name: Install backend (runtime + dev)
         working-directory: backend
+        # From uv.lock, as the backend image and the e2e job install it, so
+        # these tests run the versions that ship. The venv's bin goes on PATH
+        # for the `pytest` and `python` calls in the steps below.
         run: |
-          pip install --upgrade pip
-          pip install -e '.[dev]'
+          pip install 'uv==0.12.12'
+          uv sync --locked --extra dev --python "$(command -v python)"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Create isolated M1 measurement database
         working-directory: backend

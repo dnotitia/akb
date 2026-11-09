@@ -113,6 +113,14 @@ for (const viewport of [{ width: 375, height: 568 }, { width: 1440, height: 850 
     const pageBefore = await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
     await modal.getByRole("button", { name: "Close dialog", exact: true }).focus();
     await page.keyboard.press("Tab");
+    const firstStep = modal.getByRole("button", { name: "Go to step 1: Prepare access" });
+    await expect(firstStep).toBeFocused();
+    await page.keyboard.press("Tab");
+    const configure = modal.getByRole("button", { name: "Go to step 2: Configure VS Code" });
+    await expect(configure).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(modal.getByRole("heading", { name: "2. Configure VS Code" })).toBeFocused();
+    await page.keyboard.press("Tab");
     await expect(tool).toBeFocused();
     await expect(tool).toBeChecked();
     const bounds = await tool.locator("..").boundingBox();
@@ -127,6 +135,7 @@ for (const viewport of [{ width: 375, height: 568 }, { width: 1440, height: 850 
     await expect(tool).toBeFocused();
     await expect(tool).toBeChecked();
     await page.screenshot({ path: testInfo.outputPath("setup-tabs-focus.png") });
+    await firstStep.focus();
     await page.keyboard.press("Shift+Tab");
     await expect(modal.getByRole("button", { name: "Close dialog", exact: true })).toBeFocused();
     await expect(modal.getByRole("button", { name: "Close dialog", exact: true })).toBeInViewport();

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionSetup } from "../connection-setup";
@@ -11,6 +11,27 @@ vi.mock("@/lib/api-pat-issuance", async () => ({ ...await vi.importActual<typeof
 beforeEach(() => { vi.clearAllMocks(); configureAuthTransport("local"); setToken("fixture-session"); vi.mocked(getPatCapabilities).mockResolvedValue({ contract_version: 1, user_id: "00000000-0000-0000-0000-000000000001", name_max_length: 255, permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"], vault_scope_semantics: "write_restriction_sql_read_write" }); });
 
 describe("Connection setup", () => {
+  it("navigates setup sections without issuing credentials or losing the access draft", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionSetup layout="settings" mcpOauthEnabled={false} />);
+    await user.type(screen.getByLabelText("Token name"), "work laptop");
+    const navigation = screen.getByRole("navigation", { name: "Connection setup steps" });
+    await user.click(within(navigation).getByRole("button", { name: /Go to step 2:/ }));
+    const configuration = screen.getByRole("region", { name: "2. Configure Claude Code" });
+    expect(within(configuration).getByRole("heading")).toHaveFocus();
+    expect(within(configuration).getByRole("group", { name: "AI tool" })).toBeVisible();
+    expect(within(screen.getByRole("region", { name: "1. Prepare access" })).queryByRole("group", { name: "AI tool" })).toBeNull();
+    await user.click(within(configuration).getByRole("radio", { name: "Codex" }));
+    expect(within(navigation).getByRole("button", { name: "Go to step 2: Configure Codex" })).toHaveAttribute("aria-current", "step");
+    await user.click(screen.getByRole("button", { name: "Return to Prepare access" }));
+    expect(screen.getByRole("heading", { name: "1. Prepare access" })).toHaveFocus();
+    expect(screen.getByLabelText("Token name")).toHaveValue("work laptop");
+    await user.click(within(navigation).getByRole("button", { name: /Go to step 3:/ }));
+    expect(screen.getByRole("heading", { name: "3. Try it in your agent" })).toHaveFocus();
+    expect(screen.getByLabelText("Token name")).toHaveValue("work laptop");
+    expect(issuePat).not.toHaveBeenCalled();
+  });
+
   it("does not create credentials or offer a placeholder config on open", () => {
     render(<ConnectionSetup mcpOauthEnabled={false} />);
     expect(issuePat).not.toHaveBeenCalled();

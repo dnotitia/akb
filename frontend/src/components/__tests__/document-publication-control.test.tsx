@@ -48,7 +48,7 @@ function OverflowPublicationHarness(props: Partial<React.ComponentProps<typeof D
       pending.current = false;
       requestAnimationFrame(() => triggerRef.current?.click());
     }}>
-      <DropdownMenu.Item onSelect={() => { pending.current = true; }}>{props.publicSlug ? "Public link" : "Publish"}</DropdownMenu.Item>
+      <DropdownMenu.Item onSelect={() => { pending.current = true; }}>{props.publicSlug ? "Publication" : "Publish"}</DropdownMenu.Item>
     </ResourceActionsMenu>
     <DocumentPublicationControl vault="demo" docId="docs/guide.md" onPublished={() => {}} onUnpublish={async () => {}}
       {...props} triggerRef={triggerRef} menuAnchorRef={menuAnchorRef} />
@@ -95,8 +95,8 @@ describe("DocumentPublicationControl", () => {
     render(<OverflowPublicationHarness publicSlug="guide-public" disabledReason="This Vault is read-only." onUnpublish={onUnpublish} />);
     const actions = screen.getByRole("button", { name: "Actions for Guide" });
     await user.click(actions);
-    await user.click(screen.getByRole("menuitem", { name: "Public link" }));
-    expect(await screen.findByRole("dialog", { name: "Public link" })).toBeVisible();
+    await user.click(screen.getByRole("menuitem", { name: "Publication" }));
+    expect(await screen.findByRole("dialog", { name: "Publication" })).toBeVisible();
     expect(screen.getByRole("textbox", { name: "Public URL" })).toHaveValue(`${window.location.origin}/p/guide-public`);
     const unpublish = screen.getByRole("button", { name: "Unpublish" });
     expect(unpublish).toHaveAttribute("aria-disabled", "true");
@@ -104,7 +104,7 @@ describe("DocumentPublicationControl", () => {
     await user.click(unpublish);
     expect(onUnpublish).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog", { name: "Unpublish this document?" })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Close public link" }));
+    await user.click(screen.getByRole("button", { name: "Close publication options" }));
     await waitFor(() => expect(actions).toHaveFocus());
   });
 
@@ -159,7 +159,7 @@ describe("DocumentPublicationControl", () => {
     await user.click(within(form).getByRole("button", { name: "7 days" }));
     await user.click(submit);
 
-    const ready = await screen.findByRole("dialog", { name: "Public link" });
+    const ready = await screen.findByRole("dialog", { name: "Publication" });
     expect(createPublication).toHaveBeenCalledWith("demo", {
       resource_type: "document", uri: publication.resource_uri, title: "Guide",
       password: "test-passphrase", expires_in: "7d", max_views: 25, // pragma: allowlist secret — synthetic publication fixture
@@ -193,7 +193,7 @@ describe("DocumentPublicationControl", () => {
     expect(within(panel).getByRole("alert")).toHaveTextContent("Publication service unavailable.");
     expect(within(panel).getByLabelText("Max views")).toHaveValue(12);
     await user.click(within(panel).getByRole("button", { name: "Publish" }));
-    expect(await screen.findByRole("dialog", { name: "Public link" })).toBeVisible();
+    expect(await screen.findByRole("dialog", { name: "Publication" })).toBeVisible();
     expect(createPublication).toHaveBeenCalledTimes(2);
   });
 
@@ -204,7 +204,7 @@ describe("DocumentPublicationControl", () => {
     await user.click(screen.getByRole("button", { name: "Publish" }));
     const panel = screen.getByRole("dialog", { name: "Publish document" });
     await user.click(within(panel).getByRole("button", { name: "Publish" }));
-    expect(await screen.findByRole("dialog", { name: "Public link" })).toBeVisible();
+    expect(await screen.findByRole("dialog", { name: "Publication" })).toBeVisible();
     expect(createPublication).not.toHaveBeenCalled();
   });
 
@@ -227,15 +227,15 @@ describe("DocumentPublicationControl", () => {
   it("discloses the same-origin URL and management route, then restores trigger focus", async () => {
     const user = userEvent.setup();
     renderControl({ vault: "team notes", publicSlug: "guide-public" });
-    const trigger = screen.getByRole("button", { name: "Public link" });
+    const trigger = screen.getByRole("button", { name: "Publication" });
     await user.click(trigger);
 
-    const panel = screen.getByRole("dialog", { name: "Public link" });
+    const panel = screen.getByRole("dialog", { name: "Publication" });
     const publicUrl = `${window.location.origin}/p/guide-public`;
     expect(within(panel).getByRole("textbox", { name: "Public URL" })).toHaveValue(publicUrl);
     expect(within(panel).getByRole("link", { name: "Open link" })).toHaveAttribute("href", publicUrl);
     expect(within(panel).getByRole("link", { name: "Open link" })).toHaveAttribute("rel", "noopener noreferrer");
-    expect(within(panel).getByRole("link", { name: "Manage links and access limits" }))
+    expect(within(panel).getByRole("link", { name: "Manage publications and access limits" }))
       .toHaveAttribute("href", "/vault/team%20notes/publications");
     expect(panel).toHaveAccessibleDescription(/Access depends on the link’s limits/);
     expect(trigger).toHaveAttribute("aria-expanded", "true");
@@ -249,7 +249,7 @@ describe("DocumentPublicationControl", () => {
     const user = userEvent.setup();
     const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue(undefined);
     renderControl({ publicSlug: "guide-public" });
-    await user.click(screen.getByRole("button", { name: "Public link" }));
+    await user.click(screen.getByRole("button", { name: "Publication" }));
     await user.click(screen.getByRole("button", { name: "Copy link" }));
 
     expect(copy).toHaveBeenCalledWith(`${window.location.origin}/p/guide-public`);
@@ -259,11 +259,11 @@ describe("DocumentPublicationControl", () => {
   it("keeps the article interactive and lets an outside action dismiss the public-link panel", async () => {
     const user = userEvent.setup();
     renderControl({ publicSlug: "guide-public" });
-    const trigger = screen.getByRole("button", { name: "Public link" });
+    const trigger = screen.getByRole("button", { name: "Publication" });
     await user.click(trigger);
-    expect(screen.getByRole("dialog", { name: "Public link" })).not.toHaveAttribute("aria-modal", "true");
+    expect(screen.getByRole("dialog", { name: "Publication" })).not.toHaveAttribute("aria-modal", "true");
     await user.click(screen.getByRole("button", { name: "Article action 0" }));
-    expect(screen.queryByRole("dialog", { name: "Public link" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Publication" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Article action 1" })).toHaveFocus();
     expect(trigger).toHaveAttribute("aria-expanded", "false");
   });
@@ -271,14 +271,14 @@ describe("DocumentPublicationControl", () => {
   it("toggles from its trigger and has an explicit close action that returns focus", async () => {
     const user = userEvent.setup();
     renderControl({ publicSlug: "guide-public" });
-    const trigger = screen.getByRole("button", { name: "Public link" });
+    const trigger = screen.getByRole("button", { name: "Publication" });
     await user.click(trigger);
     await user.click(trigger);
-    expect(screen.queryByRole("dialog", { name: "Public link" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Publication" })).not.toBeInTheDocument();
     await user.click(trigger);
-    await user.click(screen.getByRole("button", { name: "Close public link" }));
+    await user.click(screen.getByRole("button", { name: "Close publication options" }));
     await waitFor(() => expect(trigger).toHaveFocus());
-    expect(screen.queryByRole("dialog", { name: "Public link" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Publication" })).not.toBeInTheDocument();
   });
 
   it.each(["unavailable", "rejected"])("offers selected manual-copy recovery when clipboard is %s", async (failure) => {
@@ -286,7 +286,7 @@ describe("DocumentPublicationControl", () => {
     if (failure === "unavailable") vi.spyOn(navigator, "clipboard", "get").mockReturnValue(undefined as unknown as Clipboard);
     else vi.spyOn(navigator.clipboard, "writeText").mockRejectedValue(new Error("Clipboard permission denied"));
     renderControl({ publicSlug: "guide-public" });
-    await user.click(screen.getByRole("button", { name: "Public link" }));
+    await user.click(screen.getByRole("button", { name: "Publication" }));
     await user.click(screen.getByRole("button", { name: "Copy link" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("copy it manually");
@@ -300,7 +300,7 @@ describe("DocumentPublicationControl", () => {
   it("confirms all document links, allows cancellation, and restores focus", async () => {
     const user = userEvent.setup();
     const { onUnpublish } = renderControl({ publicSlug: "guide-public" });
-    await user.click(screen.getByRole("button", { name: "Public link" }));
+    await user.click(screen.getByRole("button", { name: "Publication" }));
     const unpublish = screen.getByRole("button", { name: "Unpublish" });
     await user.click(unpublish);
 
@@ -312,14 +312,14 @@ describe("DocumentPublicationControl", () => {
 
     expect(onUnpublish).not.toHaveBeenCalled();
     await waitFor(() => expect(unpublish).toHaveFocus());
-    expect(screen.getByRole("dialog", { name: "Public link" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Publication" })).toBeInTheDocument();
   });
 
   it("retains an unpublish error for retry and closes both dialogs after success", async () => {
     const user = userEvent.setup();
     const onUnpublish = vi.fn().mockRejectedValueOnce(new Error("Network unavailable")).mockResolvedValueOnce(undefined);
     renderControl({ publicSlug: "guide-public", onUnpublish });
-    const trigger = screen.getByRole("button", { name: "Public link" });
+    const trigger = screen.getByRole("button", { name: "Publication" });
     await user.click(trigger);
     await user.click(screen.getByRole("button", { name: "Unpublish" }));
     const confirmation = screen.getByRole("dialog", { name: "Unpublish this document?" });
@@ -336,7 +336,7 @@ describe("DocumentPublicationControl", () => {
   it("keeps existing links inspectable while unavailable unpublishing is guarded", async () => {
     const user = userEvent.setup();
     const { onUnpublish } = renderControl({ publicSlug: "guide-public", disabledReason: "This Vault is read-only." });
-    await user.click(screen.getByRole("button", { name: "Public link" }));
+    await user.click(screen.getByRole("button", { name: "Publication" }));
     const unpublish = screen.getByRole("button", { name: "Unpublish" });
 
     expect(screen.getByRole("textbox", { name: "Public URL" })).toBeInTheDocument();
@@ -352,7 +352,7 @@ describe("DocumentPublicationControl", () => {
     let resolve!: () => void;
     const onUnpublish = vi.fn(() => new Promise<void>((done) => { resolve = done; }));
     renderControl({ publicSlug: "guide-public", onUnpublish });
-    await user.click(screen.getByRole("button", { name: "Public link" }));
+    await user.click(screen.getByRole("button", { name: "Publication" }));
     await user.click(screen.getByRole("button", { name: "Unpublish" }));
     const confirmation = screen.getByRole("dialog", { name: "Unpublish this document?" });
     await user.click(within(confirmation).getByRole("button", { name: "Unpublish" }));
@@ -370,7 +370,7 @@ describe("DocumentPublicationControl", () => {
     const onUnpublish = vi.fn().mockResolvedValue(undefined);
     const onPublished = vi.fn();
     const { rerender } = renderControl({ publicSlug: "guide-public", onUnpublish, onPublished });
-    await user.click(screen.getByRole("button", { name: "Public link" }));
+    await user.click(screen.getByRole("button", { name: "Publication" }));
     await user.click(screen.getByRole("button", { name: "Unpublish" }));
     rerender(
       <MemoryRouter>

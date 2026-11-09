@@ -15,7 +15,7 @@ from app.sso.identity_migration import IdentityMigrationError
 from app.sso.keycloak_admin import ProviderControlError
 from app.models.admin_sso import SsoProviderView, SsoProviderCatalogResponse
 from app.config import settings
-from app.exceptions import AuthenticationError
+from app.exceptions import AuthenticationError, ForbiddenError
 from app.sso import management_targets
 from app.sso.runtime_identity import source_tuple
 from app.db.postgres import get_pool
@@ -225,12 +225,24 @@ def operation_credential(authorization: str | None) -> str | None:
     return authorization[len("AKB-Operation "):] if authorization and authorization.startswith("AKB-Operation ") else None
 
 
+async def _dedicated_requester(authorization: str | None):
+    if not authorization:
+        return None
+    from app.api.deps import get_sso_operation_request_service_key
+    try:
+        return await get_sso_operation_request_service_key(authorization=authorization)
+    except (AuthenticationError, ForbiddenError):
+        return None
+
+
 @router.get("/admin/sso/identity-operations/{operation_id}", response_model=StatusResponse)
 async def operation_status(operation_id: uuid.UUID, request: Request, authorization: str | None = Header(default=None)):
     credential = operation_credential(authorization)
     actor = None
     if credential is None:
-        resolved = await get_metadata_actor(request, authorization=authorization)
+        resolved = await _dedicated_requester(authorization)
+        if resolved is None:
+            resolved = await get_metadata_actor(request, authorization=authorization)
         actor = resolved if getattr(resolved, "account_kind", "human") == "service" else None
     return await operations.status(operation_id, credential=credential, actor=actor)
 
@@ -240,9 +252,13 @@ async def retire_operation(operation_id: uuid.UUID, request: Request, authorizat
                            csrf_header: str | None = Header(default=None, alias="X-AKB-Admin-CSRF")):
     credential = operation_credential(authorization)
     actor = None
+    requester = None
     if credential is None:
-        actor = await get_product_admin_mutation(request, authorization=authorization, csrf_header=csrf_header)
-    return await operations.retire(operation_id, actor_id=uuid.UUID(str(actor.user_id)) if actor else None, credential=credential)
+        requester = await _dedicated_requester(authorization)
+        if requester is None:
+            actor = await get_product_admin_mutation(request, authorization=authorization, csrf_header=csrf_header)
+    return await operations.retire(operation_id, actor_id=uuid.UUID(str(actor.user_id)) if actor else None,
+                                   credential=credential, actor=requester)
 
 
 class TargetView(RequestModel):

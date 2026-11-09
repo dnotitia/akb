@@ -41,7 +41,7 @@ function VaultIndexWorkspace({ checking }: { checking: boolean }) {
 
   if (loadError) {
     return (
-      <div className="mx-auto w-full max-w-6xl p-3 sm:p-4 lg:p-6">
+      <div className="vault-page">
         <Alert variant="destructive" title="Vaults could not be loaded" className="w-full">
           The workspace is still available, but the vault directory did not respond.
           <div className="mt-3">
@@ -61,17 +61,19 @@ function VaultIndexWorkspace({ checking }: { checking: boolean }) {
 
 function VaultIndexLoading() {
   const { view } = useVaultDirectoryView();
-  return <div className="@container/directory mx-auto w-full max-w-6xl p-3 sm:p-4 lg:p-6">
+  return <div className="vault-page vault-directory @container/directory">
     <LoadingState label="Loading available vaults">
-      <Skeleton className="h-12 w-56" />
-      <Skeleton className="mt-4 h-10 w-full" />
-      <div className="my-3 flex h-[2.625rem] items-center justify-between max-sm:h-[3.125rem] [@media(pointer:coarse)]:h-[3.125rem]"><Skeleton className="h-4 w-24" /><Skeleton className="h-9 w-20 max-sm:h-11 max-sm:w-24 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-24" /></div>
-      <div className={view === "grid" ? "grid auto-rows-fr grid-cols-1 gap-3 @min-[30rem]/directory:grid-cols-2 @min-[48rem]/directory:grid-cols-3 @min-[64rem]/directory:grid-cols-4" : "divide-y divide-border overflow-hidden rounded-[var(--radius-md)] border border-border"} aria-hidden>
-        {Array.from({ length: 6 }, (_, index) => <div key={index} className={view === "grid" ? "vault-box vault-box-loading relative flex h-32 flex-col p-3" : "flex h-16 flex-col bg-surface p-3 pr-14"}>
-          {view === "grid" && <div className="vault-box-front" />}
-          {view === "grid" && <div className="mb-2 flex h-8 shrink-0 items-center"><Skeleton className="h-4 w-4" /></div>}
-          <Skeleton className="h-4 w-3/4" />
-          <Skeleton className="mt-auto h-3 w-full" />
+      <div className="vault-directory-heading" aria-hidden><div className="min-w-0 flex-1"><Skeleton className="vault-directory-title-skeleton" /><Skeleton className="vault-directory-description-skeleton mt-1 h-5 w-72 max-w-full" /></div><Skeleton className="vault-control-skeleton w-28" /></div>
+      <div className="vault-directory-tools" aria-hidden><Skeleton className="vault-control-skeleton w-full" /></div>
+      <div className="vault-directory-filter-row" aria-hidden>
+        <div className="vault-directory-filters"><Skeleton className="vault-control-skeleton w-52 max-w-full" /></div>
+        <p><Skeleton className="h-4 w-20" /></p>
+        <div className="vault-view-switch"><Skeleton className="vault-view-placeholder" /><Skeleton className="vault-view-placeholder" /></div>
+      </div>
+      <div className={view === "grid" ? "vault-library-grid" : "vault-library-list"} aria-hidden>
+        {Array.from({ length: 6 }, (_, index) => <div key={index} className="vault-library-card vault-library-card-skeleton">
+          <Skeleton className="h-7 w-7" />
+          <div className="w-full min-w-0"><Skeleton className="h-4 w-3/4" /><Skeleton className="mt-2 h-3 w-full" /></div>
         </div>)}
       </div>
     </LoadingState>
@@ -84,11 +86,13 @@ function VaultSelectionState({ vaults }: { vaults: VaultSummary[] }) {
 
 function FirstVaultState() {
   const create = useOpenVaultCreateDialog();
-  return <section aria-labelledby="first-vault-heading" className="mx-auto w-full max-w-4xl p-6 sm:p-8">
-    <FolderPlus className="mb-4 h-6 w-6 text-link" aria-hidden />
+  return <section aria-labelledby="first-vault-heading" className="vault-page">
+    <div className="vault-first-space">
+    <span className="vault-library-mark mb-5"><FolderPlus className="h-6 w-6" aria-hidden /></span>
     <h1 id="first-vault-heading" className="text-xl font-semibold">Create your first vault.</h1>
     <p className="mt-2 max-w-xl text-sm leading-relaxed text-foreground-muted">A vault keeps related documents, tables, and files together. Add collections as your knowledge grows.</p>
-    <Button variant="accent" className="mt-5" onClick={create}><Plus className="h-4 w-4" aria-hidden />Create first vault</Button>
+    <Button variant="accent" className="vault-primary-action mt-5 shadow-none" onClick={create}><Plus className="h-4 w-4" aria-hidden />Create first vault</Button>
     <p className="mt-4 text-sm text-foreground-muted">Joining an existing team? Ask a vault owner to invite you.</p>
+    </div>
   </section>;
 }

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a source-isolated before-content viewer slot and per-heading
+  level normalization for canonical document-title layouts.
 - Add footnote references and multiline definitions to the shared schema, with
   isolated viewer numbering and return links that never enter serialization.
 - Add section-toggle slots and presentation-only section folding. Explicit target

@@ -1,16 +1,20 @@
-import { useEffect, useRef, useState, type RefObject } from "react";
-import { useLocation, useNavigate, useParams, type NavigateOptions } from "react-router-dom";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import { Link, useLocation, useNavigate, useParams, type NavigateOptions } from "react-router-dom";
 import {
   AlertTriangle,
   Archive,
+  ArrowUpRight,
+  BookOpen,
+  Box,
   CheckCircle2,
   FileText,
   Lock,
   RotateCcw,
   Save,
-  Settings,
+  CircleDot,
   Trash2,
   ShieldCheck,
+  type LucideIcon,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -28,11 +32,8 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { CopyButton } from "@/components/ui/copy-button";
 import { Label } from "@/components/ui/label";
-import { PageShell } from "@/components/ui/page-shell";
-import { Panel } from "@/components/ui/panel";
-import { SettingRow, SettingsSection } from "@/components/ui/settings-section";
 import { Textarea } from "@/components/ui/textarea";
-import { WorkspaceSectionHeader } from "@/components/ui/workspace-section-header";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DeleteVaultDialog } from "@/components/delete-vault-dialog";
 import { useVaultRefresh } from "@/contexts/vault-refresh-context";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
@@ -72,11 +73,11 @@ type PublicAccess = "none" | "reader" | "writer";
 type SaveScope = "general" | "access";
 type SettingsSection = SaveScope | "skill" | "danger";
 type PendingExit = { kind: "navigation"; href: string; options?: NavigateOptions } | { kind: "history"; proceed: () => void };
-const SETTINGS_SECTIONS: Array<{ value: SettingsSection; label: string }> = [
-  { value: "general", label: "Vault details" },
-  { value: "access", label: "Access permissions" },
-  { value: "skill", label: "Vault guide" },
-  { value: "danger", label: "Advanced" },
+const SETTINGS_SECTIONS: Array<{ value: SettingsSection; label: string; shortLabel: string; icon: LucideIcon }> = [
+  { value: "general", label: "Vault details", shortLabel: "Details", icon: FileText },
+  { value: "access", label: "Access permissions", shortLabel: "Access", icon: ShieldCheck },
+  { value: "skill", label: "Vault guide", shortLabel: "Guide", icon: BookOpen },
+  { value: "danger", label: "Lifecycle actions", shortLabel: "Lifecycle", icon: Archive },
 ];
 
 const PUBLIC_LABELS: Record<PublicAccess, string> = {
@@ -103,6 +104,10 @@ export default function VaultSettingsPage() {
 function VaultSettingsWorkspace({ name }: { name: string | undefined }) {
   const navigate = useNavigate();
   const location = useLocation();
+  const locationRef = useRef(location);
+  const navigationHashRef = useRef(location.hash);
+  if (locationRef.current.key !== location.key) navigationHashRef.current = location.hash;
+  locationRef.current = location;
   const { refetchVaults } = useVaultRefresh();
   const user = useCurrentUser();
   const { checking, revision } = useAccessVerification();
@@ -127,6 +132,7 @@ function VaultSettingsWorkspace({ name }: { name: string | undefined }) {
   const generalStatusRef = useRef<HTMLSpanElement>(null);
   const accessStatusRef = useRef<HTMLSpanElement>(null);
   const settingsMainRef = useRef<HTMLDivElement>(null);
+  const sectionNavigationRef = useRef<HTMLDivElement>(null);
   const generalErrorRef = useRef<HTMLDivElement>(null);
   const accessErrorRef = useRef<HTMLDivElement>(null);
   const requestedSection = location.hash.slice(1);
@@ -138,14 +144,20 @@ function VaultSettingsWorkspace({ name }: { name: string | undefined }) {
   const mountedRef = useRef(false);
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+    };
   }, []);
 
   function selectSection(section: string) {
-    if (location.hash === `#${section}`) return;
+    const current = locationRef.current;
+    if (navigationHashRef.current === `#${section}`) return;
+    // Pointer-down, keyboard activation and an assistive click can describe
+    // the same activation before the route transition has rendered.
+    navigationHashRef.current = `#${section}`;
     navigate({
-      pathname: location.pathname,
-      search: location.search,
+      pathname: current.pathname,
+      search: current.search,
       hash: `#${section}`,
     });
   }
@@ -190,26 +202,19 @@ function VaultSettingsWorkspace({ name }: { name: string | undefined }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [name, checking, revision]);
 
-  useEffect(() => {
-    if (!hasInfo || checking || loadedRevision !== revision || !requestedSection) return;
-    const destination = document.getElementById(activeSection);
-    if (!destination || !settingsMainRef.current) return;
-    // Scroll the sheet, not its ancestor rails. Keep old deep links usable.
-    const frame = settingsMainRef.current;
-    const scroller = frame.scrollHeight > frame.clientHeight
-      ? frame
-      : frame.closest<HTMLElement>('[data-slot="vault-route-viewport"]');
-    scroller?.scrollTo?.({ top: scroller.scrollTop + destination.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 16 });
+  useLayoutEffect(() => {
+    if (!hasInfo || checking || loadedRevision !== revision || !settingsMainRef.current) return;
+    revealSettingsPanel(settingsMainRef.current, sectionNavigationRef.current);
   }, [activeSection, requestedSection, hasInfo, checking, loadedRevision, revision]);
 
   useEffect(() => {
-    if (saveError && saveErrorScope) {
+    if (saveError && saveErrorScope && activeSection === saveErrorScope) {
       (saveErrorScope === "general"
         ? generalErrorRef
         : accessErrorRef
       ).current?.focus();
     }
-  }, [saveError, saveErrorScope]);
+  }, [saveError, saveErrorScope, activeSection]);
 
   useEffect(() => {
     if (!name) return;
@@ -232,6 +237,12 @@ function VaultSettingsWorkspace({ name }: { name: string | undefined }) {
   const saving = savingScope !== null;
   const hasDraft = dirty || guideDraft.dirty;
   const busy = saving || guideDraft.saving;
+  const selectedSection = activeSection === "danger" && !canEdit ? "general" : activeSection;
+  const sectionDrafts: Partial<Record<SettingsSection, boolean>> = {
+    general: descriptionDirty,
+    access: accessDirty,
+    skill: guideDraft.dirty,
+  };
 
   function requestExit(exit: PendingExit) {
     if (busy || (pendingExit && exit.kind !== "history")) return;
@@ -244,7 +255,7 @@ function VaultSettingsWorkspace({ name }: { name: string | undefined }) {
   }
 
   const continueNavigation = useResourceNavigationGuard(hasDraft || busy ? (href, options) => {
-    // Anchors within this sheet never discard any of its drafts.
+    // Tab changes within this workspace never discard any of its drafts.
     if (new URL(href, window.location.origin).pathname === location.pathname) return true;
     if (name && retainsGuideSettings(name, location, href, options?.state)) return true;
     requestExit({ kind: "navigation", href, options });
@@ -344,172 +355,117 @@ function VaultSettingsWorkspace({ name }: { name: string | undefined }) {
   const loading = info === null && !loadError;
 
   return (
-    <PageShell
-      header={null}
-      contentWidth="full"
-      className="workspace-density-compact mx-auto w-full max-w-7xl"
-    >
-      <h1 className="sr-only">Settings</h1>
-      <WorkspaceSectionHeader
-        id="vault-settings-heading" icon={Settings} title="Settings"
-        testId="vault-settings-header" compact
-        right={verified && info?.is_archived ? <Badge variant="default">Archived</Badge> : undefined}
-      />
-      {info && !verified && (
-        loadError ? (
-          <Alert variant="destructive">
-            {loadError}
-            <Button variant="outline" size="sm" onClick={() => loadInfo(name)} disabled={checking}>Try again</Button>
-          </Alert>
-        ) : <SettingsLoadingState />
-      )}
-      <div
-        hidden={!!info && !verified}
-        inert={!!info && !verified}
-        className="min-w-0"
-        data-testid="settings-workspace-shell"
-      >
-        <Panel variant="workspace">
-        {info && !canEdit && (
-          <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-3 text-ui text-foreground-muted sm:px-5">
-            <Lock className="h-3.5 w-3.5 shrink-0" aria-hidden />
-            <span>Read only — only the vault owner can change settings.</span>
-            {info.role_source === "public" && <Badge variant="info-outline">Access via public policy</Badge>}
-          </div>
-        )}
-        <div
-          ref={settingsMainRef}
-          data-testid="settings-workspace-frame"
-          className="@container/vault-settings min-w-0"
-        >
-          {verified && busy && <p role="status" className="px-4 py-3 text-ui text-foreground-muted sm:px-5">Saving changes…</p>}
-          {loadError && (
-            <Alert variant="destructive" className="m-4 sm:m-5">
-              {loadError}
-              <div className="mt-3"><Button variant="outline" size="sm" onClick={() => loadInfo(name)}>Try again</Button></div>
-            </Alert>
-          )}
-          {loading && <div className="p-4 sm:p-5"><SettingsLoadingState /></div>}
-          {info && (
-            <div className="divide-y divide-border">
-              <SettingsSection id="general" title="Vault details" layout="form" className="gap-4"
-                icon={<FileText aria-hidden />} description="Describe this vault and copy its address.">
-                <div className="grid min-w-0 max-w-5xl gap-4 @[44rem]/settings-values:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)]">
-                  <div className="min-w-0" data-testid="settings-general-editor">
-                    <Label htmlFor="vault-description" className="mb-2 block text-ui">Description</Label>
-                    <Textarea
-                      id="vault-description"
-                      value={description}
-                      onChange={event => { setDescription(event.target.value); setSavedScope(null); }}
-                      readOnly={!canEdit}
-                      disabled={busy}
-                      placeholder="What belongs in this vault?"
-                      rows={3}
-                      className="min-h-20 resize-y text-base leading-relaxed sm:text-ui"
-                    />
-                    {saveErrorScope === "general" && (
-                      <div ref={generalErrorRef} tabIndex={-1} className="mt-3 outline-none">
-                        <Alert variant="destructive">{saveError}</Alert>
-                      </div>
-                    )}
-                    {canEdit && <SettingsActionBar
-                      dirty={descriptionDirty} saving={savingScope === "general"} disabled={busy}
-                      saved={savedScope === "general" && !descriptionDirty} statusRef={generalStatusRef}
-                      onSave={() => requestSave("general")} onDiscard={() => handleDiscard("general")}
-                    />}
-                  </div>
-                  <div className="min-w-0">
-                    <p id="vault-address-label" className="mb-2 text-ui font-medium">Vault address</p>
-                    <div role="group" aria-labelledby="vault-address-label" className="flex min-h-11 min-w-0 items-center gap-2 rounded-[var(--radius-md)] border border-border bg-background pl-3 pr-1 sm:min-h-9">
-                      <code className="min-w-0 flex-1 text-ui text-foreground [overflow-wrap:anywhere]">akb://{name}</code>
-                      <CopyButton className="workspace-icon-control h-11 w-11 hover:bg-surface-hover" value={`akb://${name}`} label="Copy vault address" />
-                    </div>
-                    <p className="mt-2 text-xs text-foreground-muted">Permanent</p>
-                  </div>
-                </div>
-              </SettingsSection>
-
-              <SettingsSection id="access" title="Access permissions" layout="form" tone="people" className="gap-4"
-                icon={<ShieldCheck aria-hidden />} description="Choose who can open this vault and what they can do.">
-                <div data-testid="settings-access-editor" className="max-w-5xl">
-                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                    <p id="vault-access-label" className="text-ui font-medium">Who can access</p>
-                    <span className="inline-flex items-center gap-1.5 text-xs text-foreground-muted">
-                      <Lock className="h-3 w-3" aria-hidden />Sign-in required
-                    </span>
-                  </div>
-                  <fieldset role="radiogroup" aria-labelledby="vault-access-label" aria-describedby="vault-access-help"
-                    disabled={!canEdit || busy} className="grid divide-y divide-border overflow-hidden rounded-[var(--radius-md)] border border-border @[44rem]/settings-values:grid-cols-3 @[44rem]/settings-values:divide-x @[44rem]/settings-values:divide-y-0">
-                    {PUBLIC_ORDER.map(value => {
-                      const selected = publicAccess === value;
-                      const helpId = selected ? "vault-access-help" : `vault-access-${value}-help`;
-                      return (
-                        <label key={value} className={`flex min-h-14 items-start gap-2.5 px-3 py-3 text-ui ${selected ? "bg-surface-selected text-surface-selected-foreground" : "bg-surface text-foreground hover:bg-surface-hover"} ${canEdit && !busy ? "cursor-pointer" : ""}`}>
-                          <input type="radio" name="vault-default-access" value={value} checked={selected}
-                            aria-labelledby={`vault-access-${value}-label`} aria-describedby={helpId}
-                            onChange={() => { setPublicAccess(value); setSavedScope(null); }}
-                            className="mt-0.5 h-4 w-4 shrink-0 accent-primary focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring" />
-                          <span className="min-w-0 flex-1">
-                            <span className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
-                              <span id={`vault-access-${value}-label`} className="font-medium">{PUBLIC_LABELS[value]}</span>
-                              {value === savedPublic ? <span className="text-xs font-normal text-foreground-muted">Current</span>
-                                : selected && <span className="text-xs font-normal text-link">Not saved</span>}
-                            </span>
-                            <span id={helpId} className={`mt-1 flex items-start gap-1.5 text-xs leading-relaxed ${selected && value === "writer" ? "text-warning-soft-foreground" : "text-foreground-muted"}`}>
-                              {selected && value === "writer" && <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />}
-                              {PUBLIC_DESCRIPTIONS[value]}
-                            </span>
-                          </span>
-                        </label>
-                      );
-                    })}
-                  </fieldset>
-                  {saveErrorScope === "access" && (
-                    <div ref={accessErrorRef} tabIndex={-1} className="mt-3 outline-none">
-                      <Alert variant="destructive">{saveError}</Alert>
-                    </div>
-                  )}
-                  {canEdit && <SettingsActionBar
-                    dirty={accessDirty} saving={savingScope === "access"} disabled={busy}
-                    saved={savedScope === "access" && !accessDirty} statusRef={accessStatusRef}
-                    onSave={() => requestSave("access")} onDiscard={() => handleDiscard("access")}
-                  />}
-                </div>
-              </SettingsSection>
-
-              <SkillSection
-                vault={name} doc={skillDoc} loading={skillQuery.isLoading || (!info && !loadError)}
-                error={skillError} onRetry={() => { void skillQuery.refetch(); }}
-                isMirror={info.is_external_git} canManage={canManageSkill} busy={saving}
-                queryKey={["document", name, VAULT_SKILL_PATH, user?.user_id, revision]}
-                navigationManaged onDraftStateChange={setGuideDraft}
-              />
-
-              {canEdit && (
-                <SettingsSection id="danger" title="Danger zone">
-                  <SettingRow label={info.is_archived ? "Vault archived" : "Archive vault"}>
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <p className="text-ui text-foreground-muted">{info.is_archived ? "Read-only. Restore writing at any time." : "Make this vault read-only. You can restore it later."}</p>
-                      <Button variant="outline" size="sm" disabled={busy} onClick={() => info.is_archived ? setPendingUnarchive(true) : setPendingArchive(true)} className="min-h-10 shrink-0 sm:min-h-8">
-                        {info.is_archived ? <RotateCcw className="h-3.5 w-3.5" aria-hidden /> : <Archive className="h-3.5 w-3.5" aria-hidden />}
-                        {info.is_archived ? "Unarchive" : "Archive"}
-                      </Button>
-                    </div>
-                  </SettingRow>
-                  <SettingRow label="Delete vault permanently">
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <p className="text-ui text-foreground-muted">All vault data will be removed. This cannot be undone.</p>
-                      <Button variant="outline" size="sm" className="min-h-10 shrink-0 border-destructive text-destructive hover:bg-destructive-soft sm:min-h-8" disabled={busy} onClick={() => setDeleteOpen(true)}>
-                        <Trash2 className="h-3.5 w-3.5" aria-hidden />Delete vault
-                      </Button>
-                    </div>
-                  </SettingRow>
-                </SettingsSection>
-              )}
-            </div>
-          )}
+    <div className="vault-control workspace-density-compact @container/vault-control">
+      <header className="vault-control-header" data-testid="vault-settings-header">
+        <div className="vault-control-identity">
+          <span className="vault-control-mark"><Box aria-hidden /></span>
+          <div className="min-w-0"><p className="vault-control-name">{name}</p><h1 id="vault-settings-heading">Vault settings</h1></div>
         </div>
-        </Panel>
+        {verified && info && <div className="vault-control-status">
+          {info.is_archived ? <Badge variant="outline"><Archive className="h-3 w-3" aria-hidden />Archived</Badge>
+            : info.is_archived === false && <Badge variant="outline"><CheckCircle2 className="h-3 w-3" aria-hidden />Active</Badge>}
+          <Badge variant="outline">{canEdit ? <ShieldCheck className="h-3 w-3" aria-hidden /> : <Lock className="h-3 w-3" aria-hidden />}{canEdit ? "Owner" : "Read-only settings"}</Badge>
+          {hasDraft && <span className="vault-control-draft"><CircleDot aria-hidden />Unsaved changes</span>}
+        </div>}
+      </header>
+      {info && !verified && (
+        loadError ? <Alert variant="destructive">{loadError}<Button variant="outline" size="sm" onClick={() => loadInfo(name)} disabled={checking}>Try again</Button></Alert> : <SettingsLoadingState />
+      )}
+      <div hidden={!!info && !verified} inert={!!info && !verified} className="min-w-0" data-testid="settings-workspace-shell">
+        {info && !canEdit && <Alert variant="info" className="mb-4"><Lock className="h-4 w-4" aria-hidden /><span>Read only — only the vault owner can change settings.</span>{info.role_source === "public" && <Badge variant="info-outline">Access via public policy</Badge>}</Alert>}
+        <Tabs value={selectedSection} onValueChange={selectSection} activationMode="manual">
+          <TabsList ref={sectionNavigationRef} className="vault-control-navigation" aria-label="Vault settings sections">
+            {SETTINGS_SECTIONS.filter(section => section.value !== "danger" || canEdit).map(({ value, label, shortLabel, icon: Icon }) => <TabsTrigger
+              key={value} value={value} disabled={!verified} aria-label={label}
+              aria-describedby={sectionDrafts[value] ? `vault-settings-${value}-draft` : undefined}
+              onClick={() => selectSection(value)}
+            ><Icon aria-hidden /><span>{shortLabel}</span>{sectionDrafts[value] && <>
+              <span className="vault-control-tab-draft" aria-hidden />
+              <span id={`vault-settings-${value}-draft`} className="sr-only">Unsaved changes</span>
+            </>}</TabsTrigger>)}
+          </TabsList>
+          {verified && busy && <p role="status" className="vault-control-progress">Saving changes…</p>}
+          {loadError && <Alert variant="destructive" className="mb-4">{loadError}<div className="mt-3"><Button variant="outline" size="sm" onClick={() => loadInfo(name)}>Try again</Button></div></Alert>}
+          <div ref={settingsMainRef} data-testid="settings-workspace-frame" className="vault-control-grid @container/vault-settings">
+            {loading && <SettingsLoadingState />}
+            {info && <>
+              <TabsContent value="general" forceMount hidden={selectedSection !== "general"} inert={selectedSection !== "general"} className="vault-control-panel">
+                <VaultControlCard id="general" title="Vault details" description="Give this space a clear purpose." icon={FileText}>
+                  <div className="vault-control-details-fields">
+                    <div data-testid="settings-general-editor">
+                      <Label htmlFor="vault-description" className="vault-control-label">Description</Label>
+                      <Textarea id="vault-description" value={description} onChange={event => { setDescription(event.target.value); setSavedScope(null); }}
+                        readOnly={!canEdit} disabled={busy} placeholder="What belongs in this vault?" rows={4} className="vault-control-description" />
+                      <p className="vault-control-help">Help people understand what to keep here.</p>
+                      {saveErrorScope === "general" && <div ref={generalErrorRef} tabIndex={-1} className="mt-3 outline-none"><Alert variant="destructive">{saveError}</Alert></div>}
+                      {canEdit && <SettingsActionBar dirty={descriptionDirty} saving={savingScope === "general"} disabled={busy}
+                        saved={savedScope === "general" && !descriptionDirty} statusRef={generalStatusRef} onSave={() => requestSave("general")} onDiscard={() => handleDiscard("general")} />}
+                    </div>
+                    <div className="vault-control-address">
+                      <div className="flex items-center justify-between gap-3"><p id="vault-address-label" className="vault-control-label">Vault address</p><span className="vault-control-help">Permanent</span></div>
+                      <div role="group" aria-labelledby="vault-address-label" className="vault-control-address-value"><code>akb://{name}</code><CopyButton className="workspace-icon-control" value={`akb://${name}`} label="Copy vault address" /></div>
+                    </div>
+                  </div>
+                </VaultControlCard>
+              </TabsContent>
+
+              <TabsContent value="access" forceMount hidden={selectedSection !== "access"} inert={selectedSection !== "access"} className="vault-control-panel">
+                <VaultControlCard id="access" title="Access permissions" description="Choose the default access for signed-in users." icon={ShieldCheck}>
+                  <div data-testid="settings-access-editor">
+                    <div className="vault-control-field-title"><p id="vault-access-label" className="vault-control-label">Who can access</p><span><Lock aria-hidden />Sign-in required</span></div>
+                    <fieldset role="radiogroup" aria-labelledby="vault-access-label" aria-describedby="vault-access-help" disabled={!canEdit || busy} className="vault-control-policies">
+                      {PUBLIC_ORDER.map(value => {
+                        const selected = publicAccess === value;
+                        const helpId = selected ? "vault-access-help" : `vault-access-${value}-help`;
+                        const Icon = value === "none" ? Lock : value === "writer" ? FileText : BookOpen;
+                        return <label key={value} className="vault-control-policy" data-selected={selected} data-editable={canEdit && !busy}>
+                          <input type="radio" name="vault-default-access" value={value} checked={selected} aria-labelledby={`vault-access-${value}-label`} aria-describedby={helpId}
+                            onChange={() => { setPublicAccess(value); setSavedScope(null); }} />
+                          <span className="vault-control-policy-icon"><Icon aria-hidden /></span>
+                          <span className="min-w-0 flex-1"><span className="vault-control-policy-title"><span id={`vault-access-${value}-label`}>{PUBLIC_LABELS[value]}</span>
+                            {value === savedPublic ? <span className="vault-control-policy-current">Current</span> : selected && <span className="vault-control-policy-current">Not saved</span>}</span>
+                            <span id={helpId} className="vault-control-policy-description">{selected && value === "writer" && <AlertTriangle aria-hidden />}{PUBLIC_DESCRIPTIONS[value]}</span>
+                          </span>
+                        </label>;
+                      })}
+                    </fieldset>
+                    <p className="vault-control-help mt-3">These defaults apply inside AKB. Publications have their own access controls.</p>
+                    {saveErrorScope === "access" && <div ref={accessErrorRef} tabIndex={-1} className="mt-3 outline-none"><Alert variant="destructive">{saveError}</Alert></div>}
+                    <div className="vault-control-access-footer">
+                      {canEdit && <SettingsActionBar dirty={accessDirty} saving={savingScope === "access"} disabled={busy} saved={savedScope === "access" && !accessDirty}
+                        statusRef={accessStatusRef} onSave={() => requestSave("access")} onDiscard={() => handleDiscard("access")} />}
+                      <Link to={`/vault/${encodeURIComponent(name)}/members`} className="vault-control-members">Manage members<ArrowUpRight aria-hidden /></Link>
+                    </div>
+                  </div>
+                </VaultControlCard>
+              </TabsContent>
+
+              <TabsContent value="skill" forceMount hidden={selectedSection !== "skill"} inert={selectedSection !== "skill"} className="vault-control-panel">
+                <div className="vault-control-guide">
+                  <SkillSection vault={name} doc={skillDoc} loading={skillQuery.isLoading || (!info && !loadError)} error={skillError} onRetry={() => { void skillQuery.refetch(); }}
+                    isMirror={info.is_external_git} canManage={canManageSkill} busy={saving} headingLevel={2} editInReader
+                    queryKey={["document", name, VAULT_SKILL_PATH, user?.user_id, revision]} navigationManaged onDraftStateChange={setGuideDraft} />
+                </div>
+              </TabsContent>
+
+              {canEdit && <TabsContent value="danger" forceMount hidden={selectedSection !== "danger"} inert={selectedSection !== "danger"} className="vault-control-panel">
+                <VaultControlCard id="danger" title="Danger zone" description="Changes to the availability and lifetime of this vault." icon={Archive} className="vault-control-lifecycle">
+                  <div className="vault-control-lifecycle-row"><div><h3>{info.is_archived ? "Vault archived" : "Archive vault"}</h3><p>{info.is_archived ? "Read-only. Restore writing at any time." : "Make this vault read-only. You can restore it later."}</p></div>
+                    <Button variant="outline" size="sm" disabled={busy} onClick={() => info.is_archived ? setPendingUnarchive(true) : setPendingArchive(true)}>
+                      {info.is_archived ? <RotateCcw className="h-3.5 w-3.5" aria-hidden /> : <Archive className="h-3.5 w-3.5" aria-hidden />}{info.is_archived ? "Unarchive" : "Archive"}
+                    </Button>
+                  </div>
+                  <div className="vault-control-lifecycle-row vault-control-delete"><div><h3>Delete vault permanently</h3><p>All vault data will be removed. This cannot be undone.</p></div>
+                    <Button variant="outline" size="sm" className="border-destructive text-destructive hover:bg-destructive-soft" disabled={busy} onClick={() => setDeleteOpen(true)}><Trash2 className="h-3.5 w-3.5" aria-hidden />Delete vault</Button>
+                  </div>
+                </VaultControlCard>
+              </TabsContent>}
+            </>}
+          </div>
+        </Tabs>
+        {savedScope && selectedSection !== savedScope && <span className="sr-only" role="status">
+          {savedScope === "general" ? "Vault details saved." : "Access permissions saved."}
+        </span>}
       </div>
 
       <span className="sr-only" role="status" aria-live="polite">
@@ -589,8 +545,26 @@ function VaultSettingsWorkspace({ name }: { name: string | undefined }) {
           continueNavigation(() => navigate("/vault"));
         }}
       />
-    </PageShell>
+    </div>
   );
+}
+
+/** Switching from a long panel keeps its replacement below the sticky tabs. */
+function revealSettingsPanel(frame: HTMLElement, navigation: HTMLElement | null) {
+  const scroller = frame.closest<HTMLElement>('[data-slot="vault-route-viewport"]');
+  if (!scroller) return;
+  const offset = (navigation?.offsetHeight ?? 0) + 16;
+  const delta = frame.getBoundingClientRect().top - scroller.getBoundingClientRect().top - offset;
+  if (delta < 0) scroller.scrollTo?.({ top: Math.max(0, scroller.scrollTop + delta), behavior: "instant" });
+}
+
+function VaultControlCard({ id, title, description, icon: Icon, children, className = "" }: {
+  id: string; title: string; description: string; icon: LucideIcon; children: ReactNode; className?: string;
+}) {
+  return <section id={id} role="region" aria-labelledby={`settings-${id}-heading`} className={`vault-control-card ${className}`}>
+    <header className="vault-control-card-heading"><span><Icon aria-hidden /></span><div><h2 id={`settings-${id}-heading`} tabIndex={-1}>{title}</h2><p>{description}</p></div></header>
+    <div data-slot="settings-group" className="vault-control-card-body">{children}</div>
+  </section>;
 }
 
 function SettingsActionBar({
@@ -651,14 +625,14 @@ function SettingsActionBar({
 
 function SettingsLoadingState() {
   return (
-    <div role="status" aria-label="Loading vault settings" className="space-y-6">
-      {[0, 1, 2].map(index => (
-        <div key={index} aria-hidden className="space-y-3">
-          <div className="h-5 w-28 animate-pulse rounded-[var(--radius-sm)] bg-surface-2" />
-          <div className="h-px bg-border" />
-          <div className="h-20 max-w-5xl animate-pulse rounded-[var(--radius-sm)] bg-surface-2" />
+    <div role="status" aria-label="Loading vault settings" className="vault-control-loading vault-control-grid">
+      <div aria-hidden className="vault-control-card">
+        <div className="vault-control-card-heading"><div className="h-5 w-28 animate-pulse rounded-[var(--radius-sm)] bg-surface-2" /></div>
+        <div className="vault-control-card-body space-y-3">
+          <div className="h-5 w-24 animate-pulse rounded-[var(--radius-sm)] bg-surface-2" />
+          <div className="h-28 animate-pulse rounded-[var(--radius-sm)] bg-surface-2" />
         </div>
-      ))}
+      </div>
     </div>
   );
 }

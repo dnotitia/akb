@@ -89,6 +89,10 @@ for (const width of [375, 1440]) for (const dark of [false, true]) test(`Vault d
   await expect(sidebar.getByRole("link")).toHaveCount(1);
   await sidebar.getByRole("link", { name: "engineering", exact: true }).click();
   await expect(page).toHaveURL(/\/vault\/engineering$/);
+  // The URL changes before the router commits the destination route (a React
+  // transition). Wait for the destination so the drawer is opened on it, not on
+  // the previous route, whose drawer state the committed route resets.
+  await expect(page.getByRole("heading", { level: 1, name: "engineering", exact: true })).toBeVisible();
   if (width < 1024) await page.getByRole("button", { name: "Open vault navigation", exact: true }).click();
   await expect(page.getByRole("button", { name: "Switch vault: engineering", exact: true })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "engineering explorer", exact: true })).toBeVisible();
@@ -186,6 +190,10 @@ for (const width of [375, 1440]) test(`Collections leading return reveals the Va
   await expect(page.getByRole("searchbox", { name: "Find a vault in sidebar", exact: true })).toBeFocused();
   await sidebar.getByRole("link", { name: "engineering", exact: true }).click();
   await expect(page).toHaveURL(/\/vault\/engineering$/);
+  // The URL changes before the router commits the destination route (a React
+  // transition). Wait for the destination so the drawer is opened on it, not on
+  // the previous route, whose drawer state the committed route resets.
+  await expect(page.getByRole("heading", { level: 1, name: "engineering", exact: true })).toBeVisible();
   if (width < 1024) await page.getByRole("button", { name: "Open vault navigation", exact: true }).click();
   await expect(back).toBeVisible();
 });

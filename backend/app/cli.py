@@ -1093,6 +1093,51 @@ def _okf_export(args: list[str]) -> int:
     return 0 if report.ok else 1
 
 
+async def _provision_approval_service_credential(args: list[str]) -> int:
+    parser = _SafeArgumentParser(add_help=False)
+    parser.add_argument("--token-id", required=True)
+    parser.add_argument("--receipt-file", required=True)
+    try:
+        parsed = parser.parse_args(args)
+        token_id = uuid.UUID(parsed.token_id)
+        if str(token_id) != parsed.token_id or token_id.int == 0:
+            raise _CLIUsageError()
+    except (ValueError, _CLIUsageError):
+        print("Usage: python -m app.cli provision-approval-service-credential --token-id UUID --receipt-file PATH", file=sys.stderr)
+        return 2
+
+    from app.db.postgres import close_pool
+    from app.services.approval_service_bootstrap import BootstrapRefused, provision, read_pipe
+    from app.services.platform_service_bootstrap import write_receipt
+
+    error = None
+    report = None
+    try:
+        credential = read_pipe(sys.stdin.fileno())
+        await _initialize_operator_database()
+        report = await provision(token_id, credential)
+    except BootstrapRefused as exc:
+        error = str(exc)
+    except Exception:
+        # Database and library errors can carry parameters: never print them.
+        error = "approval_bootstrap_failed"
+    finally:
+        try:
+            await close_pool()
+        except Exception:
+            error = "approval_bootstrap_database_cleanup_failed"
+    if error is None:
+        assert report is not None
+        try:
+            write_receipt(parsed.receipt_file, report)
+        except Exception:
+            error = "approval_bootstrap_receipt_file"
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 1
+    return 0
+
+
 async def _provision_platform_service_credential(args: list[str]) -> int:
     parser = _SafeArgumentParser(add_help=False)
     parser.add_argument("--intent-file", required=True)
@@ -1141,6 +1186,7 @@ def main(argv: list[str] | None = None) -> int:
             "Subcommands: generate-local-session-keyset, "
             "provision-recovery-admin {local|sso}, "
             "issue-recovery-admin-credential, provision-platform-service-credential, "
+            "provision-approval-service-credential, "
             "bootstrap-standalone-sso, "
             "reset-password <username>, repair-resource-hashes, "
             "prepare-native-config, preserve-revision-config, initialize-postgres-native, migrate-revision-backend, "
@@ -1151,6 +1197,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     cmd = argv[0]
+    if cmd == "provision-approval-service-credential":
+        return asyncio.run(_provision_approval_service_credential(argv[1:]))
     if cmd == "provision-platform-service-credential":
         return asyncio.run(_provision_platform_service_credential(argv[1:]))
     if cmd == "prepare-native-config":

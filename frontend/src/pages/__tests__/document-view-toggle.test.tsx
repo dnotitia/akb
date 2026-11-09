@@ -643,8 +643,10 @@ describe("DocumentPage view toggle", () => {
     expect(markdownBody).not.toBeNull();
     const renderedHeadings = within(markdownBody as HTMLElement)
       .getAllByRole("heading")
+      .filter(heading => !heading.closest("[data-markdown-leading-adornment]"))
       .map((heading) => heading.textContent?.trim());
     expect(renderedHeadings).toEqual(expectedHeadings);
+    expect(screen.getByRole("heading", { level: 1, name: "Synthetic operations guide" })).toBeVisible();
     expect(screen.getByText("Opening synthetic paragraph before the subsections.")).toBeVisible();
     expect(screen.getByText("Synthetic closing paragraph before the separator.")).toBeVisible();
     expect(screen.getByText("Synthetic retained timeline entry.")).toBeVisible();
@@ -678,9 +680,9 @@ describe("DocumentPage view toggle", () => {
 
   it.each([
     [{ role: "reader" }, "", "Writer access or higher is required to publish."],
-    [{ role: "owner", is_archived: true }, "", "Restore this Vault before managing public links."],
+    [{ role: "owner", is_archived: true }, "", "Restore this Vault before managing publications."],
     [{ role: "writer", is_external_git: true }, "", "External Git vaults are read-only."],
-    [{ role: "owner" }, "?view=diff&commit=abcdef1234567", "Open the latest document to manage public links."],
+    [{ role: "owner" }, "?view=diff&commit=abcdef1234567", "Open the latest document to manage publications."],
   ])("keeps publishing restrictions visible for %j %s", async (vault, query, reason) => {
     const user = userEvent.setup();
     getVaultInfoMock.mockResolvedValue(vault);
@@ -709,7 +711,8 @@ describe("DocumentPage view toggle", () => {
     renderAt("/vault/v/doc/notes%2Fhello.md");
 
     const heading = await screen.findByRole("heading", { level: 1, name: "DocTitle" });
-    expect(heading).toHaveClass("sr-only");
+    expect(heading).toBeVisible();
+    expect(heading).not.toHaveClass("sr-only");
     expect(screen.queryByText("hello.md")).not.toBeInTheDocument();
 
     const info = await openDocumentDetails(user, "Properties");
@@ -837,6 +840,30 @@ describe("DocumentPage view toggle", () => {
     const panel = await openDocumentDetails(user, "Properties");
     expect(within(panel).getByText("Last edited", { exact: true }).nextElementSibling?.querySelector("time"))
       .toHaveAttribute("datetime", new Date(savedDate).toISOString());
+  });
+
+  it("refreshes a renamed title after saving the body in the same reader", async () => {
+    const user = userEvent.setup();
+    let current = makeDoc();
+    getVaultInfoMock.mockResolvedValue({ role: "writer" });
+    getDocumentMock.mockImplementation(async () => current);
+    updateDocumentMock.mockImplementation(async (_vault, _ref, patch: Record<string, unknown>) => {
+      current = makeDoc({ ...current, ...patch, current_commit: UPDATED_COMMIT });
+      return { current_commit: UPDATED_COMMIT };
+    });
+    const { queryClient } = renderAt("/vault/v/doc/notes%2Fhello.md?view=edit");
+    const editor = await screen.findByRole("textbox", { name: "Document body (markdown)" });
+    await user.clear(editor);
+    await user.type(editor, "Saved body remains readable");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await screen.findByRole("button", { name: "Actions for DocTitle" });
+
+    // A sidebar rename refreshes the shared reader query after a title-only write.
+    current = makeDoc({ ...current, title: "Renamed from the sidebar", current_commit: "opaque-renamed-revision" });
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: ["document", "v"] }); });
+    expect(await screen.findByRole("button", { name: "Actions for Renamed from the sidebar" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Renamed from the sidebar", level: 1 })).toBeInTheDocument();
+    expect(screen.getByText("Saved body remains readable")).toBeVisible();
   });
 
   it("refreshes the edit timestamp after a metadata save even while a saved body override remains", async () => {
@@ -1192,7 +1219,8 @@ describe("DocumentPage view toggle", () => {
     const heading = await screen.findByRole("heading", { level: 1, name: "DocTitle" });
     expect(screen.getByRole("region", { name: "Document workspace" })).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Document content" })).toBeInTheDocument();
-    expect(heading).toHaveClass("sr-only");
+    expect(heading).toBeVisible();
+    expect(heading).not.toHaveClass("sr-only");
     expect(document.querySelectorAll('[data-slot="resource-command-row"]')).toHaveLength(1);
     const article = screen.getByRole("article");
     expect(article).toHaveClass("w-full", "min-h-full");
@@ -1407,7 +1435,9 @@ describe("DocumentPage view toggle", () => {
     expect(readingTools).not.toContainElement(summary);
     expect(screen.getByRole("article")).toContainElement(summary);
     const bodyHeading = screen.getByRole("heading", { name: "BodyHeading", level: 2 });
-    expect(bodyHeading.compareDocumentPosition(summary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const title = screen.getByRole("heading", { name: "DocTitle", level: 1 });
+    expect(title.compareDocumentPosition(summary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(summary.compareDocumentPosition(bodyHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(within(readingTools).queryByRole("button", { name: "Read document summary" })).not.toBeInTheDocument();
     expect(readingTools).toContainElement(screen.getByRole("button", { name: "Table of contents" }));
     expect(within(readingTools).queryByLabelText(/^Document statistics:/)).not.toBeInTheDocument();
@@ -2030,7 +2060,7 @@ describe("DocumentPage view toggle", () => {
     getDocumentMock.mockImplementation(async () =>
       makeDoc(
         saved
-          ? { title: "API contract", content: "Updated contract body" }
+          ? { title: "API contract", content: "Updated contract body", current_commit: UPDATED_COMMIT }
           : {},
       ),
     );
@@ -2057,7 +2087,11 @@ describe("DocumentPage view toggle", () => {
         },
       ),
     );
-    expect(await screen.findByRole("heading", { level: 1, name: "API contract" })).toBeInTheDocument();
+    // Saving can replace the reader's heading host as its queries settle.
+    // Assert against the current DOM instead of retaining the first host.
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { level: 1, name: "API contract" })).toBeInTheDocument(),
+    );
     expect(screen.getByTestId("location-pathname")).toHaveTextContent(
       "/vault/v/doc/notes%2Fhello.md",
     );
