@@ -85,9 +85,7 @@ TOOLS = [
     Tool(
         name="akb_list_vaults",
         description=(
-            "List accessible vaults as {name, description} pairs. "
-            "Response is slim — no metadata (id/role/created_at) — to "
-            "fit large tenants in agent context. Returns "
+            "List accessible vaults with name, description, and the caller’s effective role. Returns "
             "{vaults, total, returned, truncated?, hint?}.\n"
             "Optional args:\n"
             "- filter: substring match on name+description (case-insensitive). "
@@ -737,8 +735,7 @@ TOOLS = [
     Tool(
         name="akb_provenance",
         description=(
-            "Get provenance for a document — who created it, when, which entities were "
-            "extracted, and its visible same-vault relations."
+            "Get document identity, creator, timestamps, current_commit, and visible same-vault relations."
         ),
         input_schema={
             "type": "object",
@@ -1215,9 +1212,8 @@ TOOLS = [
     Tool(
         name="akb_explain_access",
         description=(
-            "Explain why a user holds the role they hold on a vault: every "
-            "independent basis, and the effective role derived from them. "
-            "A member list shows the result, never the reasons."
+            "Explain a user’s membership grants, stored and derived roles, and non-member access paths. "
+            "Requires reader access for yourself or admin access for another user."
         ),
         input_schema={
             "type": "object",
@@ -1327,7 +1323,10 @@ TOOLS = [
     ),
     Tool(
         name="akb_set_public",
-        description="Set vault public access level. Owner only. 'none'=private, 'reader'=public read, 'writer'=public read+write.",
+        description=(
+            "Set the access granted to authenticated users on an active vault. Requires owner access. "
+            "Use akb_publish to share a resource by public link."
+        ),
         input_schema={
             "type": "object",
             "properties": {

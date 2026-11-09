@@ -401,6 +401,7 @@ async def test_relations_activity_provenance_and_document_deletion(
         {"uri": second["uri"]},
     )
     assert provenance.get("title")
+    assert {"doc_id", "created_by", "created_at", "updated_at", "current_commit", "relations"} <= provenance.keys()
 
     activity = await _call_json(mcp_client, runtime_session, "akb_activity", {"vault": vault})
     assert type(activity.get("returned")) is int and activity["returned"] >= 2
@@ -655,6 +656,16 @@ async def test_access_roles_and_public_levels(
         {"vault": vault, "user": secondary_mcp_client.username, "role": "reader"},
     )
     assert granted_reader.get("granted") is True
+    explanation = await _call_json(second, runtime_session, "akb_explain_access", {
+        "vault": vault, "user": secondary_mcp_client.username,
+    })
+    assert explanation["effective_role"] == explanation["derived_role"] == "reader"
+    assert explanation["contributions"] and explanation["non_member_paths"]["public_access"] == "none"
+
+    denied_delete = await _call_json(
+        second, runtime_session, "akb_delete_vault", {"vault": vault}, expect_error=True,
+    )
+    assert denied_delete["code"] == "permission_denied"
     readable = await _call_json(second, runtime_session, "akb_browse", {"vault": vault})
     assert "items" in readable
     searchable = await _call_json(
@@ -744,3 +755,9 @@ async def test_access_roles_and_public_levels(
     )
     assert public_none.get("public_access") == "none"
     await _call_json(second, runtime_session, "akb_browse", {"vault": vault}, expect_error=True)
+
+    await _call_json(mcp_client, runtime_session, "akb_grant", {
+        "vault": vault, "user": secondary_mcp_client.username, "role": "admin",
+    })
+    deleted = await _call_json(second, runtime_session, "akb_delete_vault", {"vault": vault})
+    assert deleted["deleted"] is True
