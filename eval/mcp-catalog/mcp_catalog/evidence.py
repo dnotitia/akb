@@ -120,6 +120,35 @@ def validate_model_input_evidence(value: Any, secrets: Iterable[str] = ()) -> No
     visit(value)
 
 
+def quarantine_invalid_model_inputs(value: Any, secrets: Iterable[str] = ()) -> tuple[Any, int]:
+    """Withhold invalid model inputs while retaining their claimed digests in a failure artifact."""
+
+    secret_values = tuple(secrets)
+    safe = safe_json(value, secret_values)
+    withheld = 0
+
+    def visit(item: Any) -> Any:
+        nonlocal withheld
+        if isinstance(item, dict):
+            if "model_input_canonical_json" in item or "model_input_sha256" in item:
+                try:
+                    validate_model_input_evidence(item, secret_values)
+                except ValueError:
+                    withheld += 1
+                    result = {key: visit(child) for key, child in item.items() if key not in {"model_input_canonical_json", "model_input_sha256"}}
+                    result["withheld_model_input"] = {
+                        "claimed_sha256": item.get("model_input_sha256"),
+                        "reason": "model input evidence integrity validation failed",
+                    }
+                    return result
+            return {key: visit(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child) for child in item]
+        return item
+
+    return visit(safe), withheld
+
+
 def serialize_report(report: EvaluationReport[Any, Any, Any], secrets: Iterable[str] = ()) -> dict[str, Any]:
     raw = EvaluationReportAdapter.dump_python(report, mode="json")
     secret_values = tuple(secrets)

@@ -129,6 +129,25 @@ specifically; the proxy has its own log in
   OpenAPI response contract. Declared enum values, table data, constraints,
   and drift reporting are unchanged.
 
+- A 2026-07-28 MCP client that sends `subscriptions/listen` now gets JSON-RPC
+  `-32601 Method not found` with HTTP 404 instead of an empty HTTP 500. The
+  MCP endpoint replays the request body it has already read, and used to
+  report a client disconnect on the next read; the SDK's listen path watches
+  for that and cancelled the request before answering. Later reads now go to
+  the client's connection. AKB still serves no notification stream, and
+  `server/discover` still advertises `tools.listChanged: false`.
+
+- A client that disconnects while AKB is still reading its request body is
+  now logged as one INFO line with the method and the path (the matched
+  route's template where there is one), and the application gives it status
+  499 (client closed request). It used to be logged as `Unhandled request
+  error` with a traceback and given status 500, and the exception then left
+  the application, so the server logged a second traceback. Neither status
+  reaches the client, which has gone. This
+  affects the requests whose body AKB reads itself: the MCP endpoint and the
+  raw-body uploads. What each route does with a partly received body is
+  unchanged.
+
 ### Documents
 
 - **Breaking:** whole-body document updates, including empty bodies and proxy
@@ -138,6 +157,26 @@ specifically; the proxy has its own log in
   malformed and normalized-away version tokens are rejected. REST, MCP,
   help and SDK types describe the same rules; MCP rejects invalid input
   without echoing the rejected body. See `docs/operations/document-write-preconditions.md`.
+
+### Build
+
+- The backend image installs its third-party runtime packages from
+  `uv.lock`, hash-checked and without resolving them at build time, so an
+  image runs exactly the runtime versions its commit locks. It used to run
+  `pip install .`, which took whatever was newest on the build day. The
+  project itself is now installed with `--no-deps` and the build runs
+  `pip check`, so a dependency missing from the lock fails the build instead
+  of being fetched from the index. Build backends (`hatchling`, and the one
+  for the source-only `kiwipiepy-model`) are still fetched unpinned into
+  pip's isolated build environments; they build the wheels and do not ship in
+  the image. The all-in-one image installs from the same lock, with uv pinned
+  to 0.12.12. The unit and live-DB test jobs install from the same lock
+  (`uv sync --locked --extra dev`), as the e2e job already did. The lock first
+  moved 26 packages to the versions an unpinned image build was already
+  installing (for example Starlette 1.10.0, anyio 4.16.0, websockets 17.4), so
+  the image's versions do not change; the tests now run them. The image now
+  also contains `/app/uv.lock`. `scripts/ci/check_image_lock.py IMAGE` reports
+  any package in a built image that differs from the lock.
 
 ## 0.17.0 — 2026-10-19
 

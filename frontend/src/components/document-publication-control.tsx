@@ -113,9 +113,9 @@ export function DocumentPublicationControl({
   const header = (
     <div className={`space-y-1${publicSlug ? "" : " pt-4"}`}>
       <div className="flex items-center justify-between gap-3">
-        <h2 id={titleId} className="text-sm font-semibold">{publicSlug ? "Public link" : "Publish document"}</h2>
+        <h2 id={titleId} className="text-sm font-semibold">{publicSlug ? "Publication" : "Publish document"}</h2>
         <PopoverClose asChild>
-          <Button type="button" variant="ghost" size="icon" className="h-8 w-8 -mr-1" aria-label={publicSlug ? "Close public link" : "Close publish options"} disabled={publishing}>
+          <Button type="button" variant="ghost" size="icon" className="h-8 w-8 -mr-1" aria-label={publicSlug ? "Close publication options" : "Close publish options"} disabled={publishing}>
             <X className="h-4 w-4" aria-hidden />
           </Button>
         </PopoverClose>
@@ -169,8 +169,8 @@ export function DocumentPublicationControl({
                 >
                   <Globe2 className="h-4 w-4" aria-hidden />
                   <span className="document-publication-label">
-                    <span className="document-publication-reserve" aria-hidden>Public link</span>
-                    <span>{publicSlug ? "Public link" : "Publish"}</span>
+                    <span className="document-publication-reserve" aria-hidden>Publication</span>
+                    <span>{publicSlug ? "Publication" : "Publish"}</span>
                   </span>
                 </Button>
               </PopoverTrigger>
@@ -247,7 +247,7 @@ export function DocumentPublicationControl({
             to={`/vault/${encodeURIComponent(vault)}/publications`}
             className="text-sm text-link hover:text-link-hover hover:underline rounded-[var(--radius-sm)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
           >
-            Manage links and access limits
+            Manage publications and access limits
           </Link>
           <div className="border-t border-border pt-4">
             <TooltipProvider delayDuration={300}>

@@ -1,7 +1,7 @@
 import { Activity, useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
-import { ShieldCheck, TriangleAlert } from "lucide-react";
+import { TriangleAlert } from "lucide-react";
 import { ApiError, authSessionSnapshot, beginAccountLifecycle, clearCompletedAccountSession, isCurrentAuthSession, type AuthSessionSnapshot } from "@/lib/api";
 import { deleteAccount, getAccountLifecycle, getDeletionBlockers, revokeAccountSessions, type AccountLifecycle, type DeletionBlockers } from "@/lib/api-account-lifecycle";
 import { Alert } from "@/components/ui/alert";
@@ -13,6 +13,7 @@ import { Label } from "@/components/ui/label";
 import { Panel, PanelHeader } from "@/components/ui/panel";
 import type { User } from "./profile-section";
 import { useResourceNavigation } from "@/contexts/resource-navigation-context";
+import { SettingsHeading } from "./settings-ui";
 
 function reasonText(reason: string | null | undefined): string {
   switch (reason) {
@@ -206,8 +207,8 @@ export function SecuritySection({ user, onBusyChange, onDirtyChange, ownsOperati
   }
   const feedback = error && <Alert variant="destructive">{error}</Alert>;
   const effects = preview?.data.deletion.effects;
-  return <><Activity mode={visible ? "visible" : "hidden"}><section className="max-w-3xl space-y-6" aria-labelledby="security-title" aria-busy={busy || loading || loadingVaults}>
-    <div><h2 id="security-title" className="flex items-center gap-2 text-lg font-semibold"><ShieldCheck className="h-5 w-5 text-link" aria-hidden />Security</h2><p className="mt-1 text-sm text-foreground-muted">Manage your login sessions and account.</p></div>
+  return <><Activity mode={visible ? "visible" : "hidden"}><section className="settings-security space-y-5" aria-labelledby="security-title" aria-busy={busy || loading || loadingVaults}>
+    <SettingsHeading id="security-title" title="Security" description="Control your sign-in sessions and review account actions." />
     {step !== "review" && step !== "delete" && feedback}
     {loading && <p role="status" className="text-sm text-foreground-muted">Checking account security…</p>}
     {busy && <p role="status" className="text-sm text-foreground-muted">Working… Keep this page open while we verify the result.</p>}

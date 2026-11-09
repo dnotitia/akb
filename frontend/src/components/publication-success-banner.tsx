@@ -24,16 +24,16 @@ export function PublicationSuccessBanner({
       >
         Anyone with the link can open the public, read-only view.
       </Alert>
-      <div className="flex shrink-0 items-center gap-1 self-end sm:self-auto">
+      <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-1 self-end sm:self-auto">
         <Button asChild variant="outline" size="sm">
           <a href={publication.share_url} target="_blank" rel="noreferrer">
-            Open public link
+            Open publication
             <ExternalLink className="h-3.5 w-3.5" aria-hidden />
           </a>
         </Button>
         <Button asChild variant="ghost" size="sm">
           <Link to={`/vault/${encodeURIComponent(vault)}/publications`}>
-            Manage links
+            Manage publications
           </Link>
         </Button>
         <Button

@@ -756,7 +756,7 @@ export function MarkdownSurface({
         }
         managed.set(heading, original)
         const sourceLevel = Number(original.tagName.slice(1))
-        const nextLevel = Math.max(1, Math.min(6, sourceLevel + offset))
+        const nextLevel = Math.max(1, Math.min(6, Math.trunc(headings.levels?.[index] ?? (sourceLevel + offset))))
         let target = heading
         const tagName = `h${nextLevel}`
         if (heading.tagName.toLowerCase() !== tagName) {
@@ -1991,6 +1991,8 @@ export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor'
   reading?: MarkdownViewerReadingOptions
   /** Read-only presentation after a leading heading, or before a headingless body. Never serialized. */
   afterLeadingHeading?: ReactNode
+  /** Read-only presentation before the entire body. Never serialized or searched as source. */
+  beforeContent?: ReactNode
   markdown: string
   profile?: MarkdownProfile
   adapters?: MarkdownAdapters
@@ -2002,6 +2004,7 @@ export function MarkdownViewer({
   markdown,
   reading,
   afterLeadingHeading,
+  beforeContent,
   profile = 'preserve',
   adapters,
   reference,
@@ -2024,9 +2027,17 @@ export function MarkdownViewer({
     element.setAttribute('contenteditable', 'false')
     return element
   })
+  const [beforeHost] = useState(() => {
+    if (typeof document === 'undefined') return null
+    const element = document.createElement('div')
+    element.dataset.markdownLeadingAdornment = 'true'
+    element.setAttribute('contenteditable', 'false')
+    return element
+  })
   const hasAdornment = afterLeadingHeading != null && afterLeadingHeading !== false
+  const hasBefore = beforeContent != null && beforeContent !== false
   useLayoutEffect(() => {
-    if (!rawEditor || !adornmentHost || !hasAdornment) return
+    if (!rawEditor || !adornmentHost || !beforeHost || (!hasAdornment && !hasBefore)) return
     const key = new PluginKey('markdownViewerLeadingAdornment')
     rawEditor.registerPlugin(new Plugin({
       key,
@@ -2034,15 +2045,21 @@ export function MarkdownViewer({
         decorations(state) {
           const first = state.doc.firstChild
           const position = first?.type.name === 'heading' ? first.nodeSize : 0
-          return DecorationSet.create(state.doc, [Decoration.widget(position, adornmentHost, {
+          const decorations = []
+          if (hasBefore) decorations.push(Decoration.widget(0, beforeHost, {
+            key: 'before-content', side: -2, ignoreSelection: true,
+            stopEvent: () => true,
+          }))
+          if (hasAdornment) decorations.push(Decoration.widget(position, adornmentHost, {
             key: 'leading-adornment', side: -1, ignoreSelection: true,
             stopEvent: () => true,
-          })])
+          }))
+          return DecorationSet.create(state.doc, decorations)
         },
       },
     }))
     return () => { rawEditor.unregisterPlugin(key) }
-  }, [rawEditor, adornmentHost, hasAdornment])
+  }, [rawEditor, adornmentHost, beforeHost, hasAdornment, hasBefore])
 
   const resolutions = useMarkdownTargetResolutions(
     markdown,
@@ -2085,6 +2102,7 @@ export function MarkdownViewer({
       <MarkdownViewerReadingTools editor={rawEditor} options={reading} />
       <MarkdownViewerFootnotes editor={rawEditor} />
       {hasAdornment && adornmentHost && createPortal(afterLeadingHeading, adornmentHost)}
+      {hasBefore && beforeHost && createPortal(beforeContent, beforeHost)}
     </>
   )
 }

@@ -108,8 +108,8 @@ describe("Vault Members redesign", () => {
       screen.getByRole("heading", { level: 1, name: "Members" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { level: 2, name: "Members" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("heading", { level: 2, name: "Members" }),
+    ).toBeNull();
     expect(
       screen.queryByRole("complementary", { name: "Member access context" }),
     ).toBeNull();

@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ChevronDown,
@@ -29,6 +29,7 @@ import {
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { AutoLoadMore } from "@/components/ui/auto-load-more";
+import { CollectionBranchBoundary, CollectionBranchLoader, type CollectionBranchPage } from "@/components/collection-branch-paging";
 import { RailCollapseButton, RailFilterField, RailFilterToggle, RailIdentity, RailManagement, RailSearchToolbar } from "@/components/navigation-rail-controls";
 import { OverflowRevealTitle } from "@/components/ui/overflow-reveal-title";
 import { CollectionExplorerContext } from "@/components/collection-explorer-context";
@@ -76,6 +77,7 @@ import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { docUri, fileUri, tableUri, parseFileUri } from "@/lib/uri";
 import { ResourceActionsMenu } from "@/components/resource-actions-menu";
+import { DocumentRenameDialog } from "@/components/document-rename-dialog";
 import {
   ResourceDeleteDialog,
   type DeletableResourceKind,
@@ -90,6 +92,7 @@ import { useDebounce } from "@/hooks/use-debounce";
 const PAGE_SIZE = 10;
 const TYPEAHEAD_TIMEOUT_MS = 500;
 const TREE_RENDER_PAGE = 300;
+const EMPTY_BRANCH_PAGES: Record<string, CollectionBranchPage> = {};
 const RESOURCE_PAGE_SIZE = 50;
 
 /**
@@ -134,7 +137,8 @@ export function VaultExplorer({
   const focused = presentation === "focused";
   const user = useCurrentUser();
   const currentResource = useResourceLocation();
-  const { checking: checkingAccess } = useAccessVerification();
+  const { checking: checkingAccess, revision: accessRevision } = useAccessVerification();
+  const renameScope = JSON.stringify([vault, user?.user_id, accessRevision]);
   const filterOwner = JSON.stringify([vault, user?.user_id ?? null]);
   const [scopeSelection, setScopeSelection] = useState<{ owner: string; scope: ArchiveScope }>({ owner: filterOwner, scope: "unarchived" });
   const archiveScope = scopeSelection.owner === filterOwner ? scopeSelection.scope : "unarchived";
@@ -145,7 +149,7 @@ export function VaultExplorer({
   // refreshes for production.
   const handleMutation = onMutation ?? refreshCtx.refetchTree;
 
-  const { expanded, toggle, revealAncestorsOf } = useExpandedPaths(vault);
+  const { expanded, toggle: toggleExpanded, revealAncestorsOf } = useExpandedPaths(vault);
   const { pathname, search, key: locationKey } = useLocation();
   const requestedCollection = pathname === `/vault/${encodeURIComponent(vault)}`
     ? new URLSearchParams(search).get("collection") : null;
@@ -204,7 +208,7 @@ export function VaultExplorer({
   const nameQuery = useDebounce(filter.trim());
   // Keep the existing expandable hierarchy; bounded pages limit each request.
   const browseDepth = -1;
-  const { tree: pageTree, items: pageItems, loading, refreshing, showingPreviousScope, unsupported, error, refetch,
+  const { tree: serverTree, items: serverItems, loading, refreshing, showingPreviousScope, unsupported, error, refetch,
     complete, paginationUnsupported, hasMore, loadingMore, loadMore, pageCount, pastCollectionCatalog } = useVaultTree(vault, archiveScope, {
       collection: collectionScope || explorationPath || undefined,
       content_type: kindFilter === "all" ? "all" : `${kindFilter}s` as "documents" | "tables" | "files",
@@ -212,6 +216,43 @@ export function VaultExplorer({
       name_query: nameQuery,
     });
   const searching = filter.trim() !== nameQuery || showingPreviousScope;
+  const branchOwner = JSON.stringify([filterOwner, accessRevision, archiveScope, kindFilter, collectionScope, explorationPath, nameQuery]);
+  const liveBranchOwner = useRef(branchOwner);
+  liveBranchOwner.current = branchOwner;
+  const [branchState, setBranchState] = useState<{ owner: string; pages: Record<string, CollectionBranchPage> }>({ owner: branchOwner, pages: {} });
+  const branchPages = branchState.owner === branchOwner ? branchState.pages : EMPTY_BRANCH_PAGES;
+  const receiveBranchPage = useCallback((path: string, page: CollectionBranchPage | null) => {
+    if (liveBranchOwner.current !== branchOwner) return;
+    setBranchState(previous => {
+      const pages = previous.owner === branchOwner ? previous.pages : EMPTY_BRANCH_PAGES;
+      if (!page) {
+        if (!pages[path]) return previous;
+        const remaining = { ...pages };
+        delete remaining[path];
+        return { owner: branchOwner, pages: remaining };
+      }
+      return pages[path] === page ? previous : { owner: branchOwner, pages: { ...pages, [path]: page } };
+    });
+  }, [branchOwner]);
+  const pageItems = useMemo(() => {
+    if (!serverItems || complete || nameQuery) return serverItems;
+    // Global pages stay authoritative when both owners have observed a row.
+    const rows = new Map<string, NonNullable<typeof serverItems>[number]>();
+    for (const page of Object.values(branchPages)) for (const item of page.items ?? []) rows.set(item.uri || `${item.type}:${item.path}`, item);
+    for (const item of serverItems) rows.set(item.uri || `${item.type}:${item.path}`, item);
+    return [...rows.values()];
+  }, [serverItems, complete, nameQuery, branchPages]);
+  const pageTree = useMemo(() => {
+    if (!serverTree || !pageItems || pageItems === serverItems) return serverTree;
+    const navigation: { type: "collection"; name: string; path: string }[] = [];
+    const visit = (nodes: TreeNode[]) => nodes.forEach(node => {
+      if (node.kind !== "collection") return;
+      navigation.push({ ...node.raw, type: "collection", name: node.name, path: node.path });
+      visit(node.children ?? []);
+    });
+    visit(serverTree);
+    return buildTree([...navigation, ...pageItems]);
+  }, [serverTree, pageItems, serverItems]);
   const inventoryComplete = complete && browseDepth === -1 && !nameQuery && kindFilter === "all" && archiveScope === "all";
   const explorationProof = useCollectionProof(vault, explorationPath, focused && !checkingAccess);
   const tree = useMemo(() => {
@@ -278,6 +319,14 @@ export function VaultExplorer({
   );
   const [renderLimit, setRenderLimit] = useState(TREE_RENDER_PAGE);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const pendingExpansion = useRef<{ owner: string; path: string } | null>(null);
+  // Cancel delayed reveals on user input, not on the loading boundary's own
+  // scroll adjustment. A slow response must not undo a later navigation.
+  const cancelExpansionReveal = useCallback(() => { pendingExpansion.current = null; }, []);
+  const toggle = useCallback((path: string) => {
+    pendingExpansion.current = expanded.has(path) ? null : { owner: branchOwner, path };
+    toggleExpanded(path);
+  }, [expanded, branchOwner, toggleExpanded]);
 
   // Role-gated affordances. We fetch the role on mount/vault-change rather
   // than threading it through props because the existing parent
@@ -348,6 +397,8 @@ export function VaultExplorer({
     rowCount?: number;
     active: boolean;
   } | null>(null);
+  const [renameTarget, setRenameTarget] = useState<{ path: string; scope: string } | null>(null);
+  const [renameNotice, setRenameNotice] = useState("");
   const mutationTriggerRef = useRef<HTMLElement | null>(null);
 
   const rememberMutationTrigger = useCallback(() => {
@@ -538,6 +589,62 @@ export function VaultExplorer({
   const visibleRows = useMemo<FlatRow[]>(() => {
     return fullRows.slice(0, renderLimit);
   }, [fullRows, renderLimit]);
+  const branchPaths = useMemo(() => {
+    // A failed later Vault page must not remove a successfully loaded branch.
+    // Initial failures have no pages; access failures already clear the tree.
+    if (nameQuery || complete || paginationUnsupported || !pageCount || loading || searching || checkingAccess || unsupported) return [];
+    const paths = visibleRows.flatMap(row => row.type === "node" && row.node.kind === "collection" && row.isOpen ? [row.node.path] : []);
+    if (explorationRoot && explorationPath) paths.push(explorationPath);
+    return [...new Set(paths)];
+  }, [nameQuery, complete, paginationUnsupported, pageCount, loading, searching, checkingAccess, unsupported, visibleRows, explorationRoot, explorationPath]);
+  const branchBoundaries = useMemo(() => {
+    const owners = new Set(branchPaths);
+    const after = new Map<string, { path: string; depth: number; hasChildren: boolean }[]>();
+    const stack: { path: string; depth: number; start: number }[] = [];
+    const finish = (end: number) => {
+      const branch = stack.pop()!;
+      const sig = fullRows[end]?.sig;
+      if (!sig) return;
+      after.set(sig, [...(after.get(sig) ?? []), { path: branch.path, depth: branch.depth + 1, hasChildren: end > branch.start }]);
+    };
+    fullRows.forEach((row, index) => {
+      while (stack.length && stack.at(-1)!.depth >= row.depth) finish(index - 1);
+      if (row.type === "node" && row.node.kind === "collection" && row.isOpen && owners.has(row.node.path)) stack.push({ path: row.node.path, depth: row.depth, start: index });
+    });
+    while (stack.length) finish(fullRows.length - 1);
+    return after;
+  }, [branchPaths, fullRows]);
+  const branchBoundary = (path: string, depth: number, hasChildren: boolean) => {
+    const page = branchPages[path];
+    const kinds = [...new Set((page?.items ?? []).map(item => item.type).filter(kind => kind !== "collection"))];
+    const allGroupsClosed = kinds.length > 0 && kinds.every(kind => collapsedKindGroups.has(kindGroupKey(path, kind as ResourceKind)));
+    return <CollectionBranchBoundary key={`branch:${path}`} path={path} page={page} depth={depth} hasChildren={hasChildren}
+      paused={checkingAccess || searching || loading || refreshing}
+      autoPaused={Boolean(page?.pastCollectionCatalog && allGroupsClosed)} />;
+  };
+  const branchLoader = (path: string, eager = false) => <CollectionBranchLoader key={`${branchOwner}:${path}`} vault={vault} path={path} archiveScope={archiveScope}
+    eager={eager} contentType={kindFilter === "all" ? "all" : `${kindFilter}s` as "documents" | "tables" | "files"} onPage={receiveBranchPage} />;
+  useLayoutEffect(() => {
+    const request = pendingExpansion.current;
+    const list = listRef.current;
+    if (!request || !list) return;
+    if (request.owner !== branchOwner || !expanded.has(request.path)) { pendingExpansion.current = null; return; }
+    const index = fullRows.findIndex(row => row.type === "node" && row.node.kind === "collection" && row.node.path === request.path);
+    if (index < 0) return;
+    const parent = Array.from(list.querySelectorAll<HTMLElement>("[data-sig]")).find(element => element.dataset.sig === fullRows[index].sig);
+    if (!parent) return;
+    let child = fullRows[index + 1];
+    const hasChild = child && child.depth > fullRows[index].depth;
+    if (hasChild && child.type === "kind-group" && child.isOpen && fullRows[index + 2]?.depth > child.depth) child = fullRows[index + 2];
+    const target = hasChild ? Array.from(list.querySelectorAll<HTMLElement>("[data-sig]")).find(element => element.dataset.sig === child.sig)
+      : Array.from(list.querySelectorAll<HTMLElement>("[data-collection-boundary]")).find(element => element.dataset.collectionBoundary === request.path);
+    if (!target && hasChild) { setRenderLimit(current => Math.max(current, index + TREE_RENDER_PAGE)); return; }
+    if (!target) return;
+    const viewport = list.getBoundingClientRect(), opening = parent.getBoundingClientRect(), reveal = target.getBoundingClientRect();
+    const delta = reveal.bottom - viewport.bottom + 8;
+    if (delta > 0) list.scrollTop += Math.min(delta, Math.max(0, opening.top - viewport.top - 8));
+    if (hasChild || (branchPages[request.path] && !branchPages[request.path].loading)) pendingExpansion.current = null;
+  }, [branchOwner, expanded, fullRows, renderLimit, branchPages]);
   // If an appended resource page only fills closed branches, the sentinel
   // staying visible is not fresh demand. This also covers a short root list
   // containing a README beside closed Collections. Preserve manual paging.
@@ -794,6 +901,10 @@ export function VaultExplorer({
         role={focused ? "navigation" : "tree"}
         aria-label={`${vault} explorer`}
         aria-busy={loading || refreshing || loadingMore || searching || undefined}
+        onWheel={cancelExpansionReveal}
+        onTouchMove={cancelExpansionReveal}
+        onPointerDownCapture={cancelExpansionReveal}
+        onKeyDownCapture={cancelExpansionReveal}
         onKeyDown={onKeyDown}
         className={cn("min-h-0 flex-1 overflow-y-auto rail-scroll", focused && "overscroll-contain px-1.5 pb-3")}
       >
@@ -826,89 +937,104 @@ export function VaultExplorer({
           </div>
         )}
 
+        {branchPaths.includes(explorationPath) && branchLoader(explorationPath, true)}
         {!loading && !unsupported &&
           visibleRows.map((row) => {
-            if (row.type === "kind-group") {
+            const content = (() => {
+              if (row.type === "kind-group") {
+                return (
+                  <KindGroupRow
+                    key={row.sig}
+                    row={row}
+                    disclosure={focused}
+                    countComplete={complete}
+                    onToggle={() => toggleKindGroup(row.parentPath, row.kind)}
+                  />
+                );
+              }
+              if (row.type === "more") {
+                return (
+                  <KindMoreRow
+                    key={row.sig}
+                    row={row}
+                    disclosure={focused}
+                    onShowMore={() => showMoreKind(row.parentPath, row.kind)}
+                  />
+                );
+              }
               return (
-                <KindGroupRow
+                <TreeRow
                   key={row.sig}
-                  row={row}
+                  node={row.node}
                   disclosure={focused}
-                  countComplete={complete}
-                  onToggle={() => toggleKindGroup(row.parentPath, row.kind)}
+                  depth={row.depth}
+                  sig={row.sig}
+                  isOpen={row.isOpen}
+                  isActive={row.sig === activeSig}
+                  vault={vault}
+                  onToggle={toggle}
+                  onSearchCollection={(node) => { changeCollectionScope(node.path); setFiltersOpen(true); focusResourceFilter(); }}
+                  onExploreCollection={focused && !checkingAccess ? node => exploreCollection(node.path) : undefined}
+                  canWrite={canWrite}
+                  canAdmin={canAdmin}
+                  onRenameDocument={(node, trigger) => {
+                    mutationTriggerRef.current = trigger;
+                    setRenameNotice("");
+                    setRenameTarget({ path: node.path, scope: renameScope });
+                  }}
+                  showDocumentDisambiguator={duplicateDocumentPaths.has(row.node.path)}
+                  onCreateDoc={(node) =>
+                    openCreateDocument({ collection: node.path })
+                  }
+                  onUploadFile={(node) => openUpload(node.path)}
+                  onCreateTable={(node) => openTableCreate(node.path)}
+                  onCreateSubCollection={(node) => openCreate(node.path)}
+                  onOpenDetails={(node) => {
+                    const counts = countCollectionResources(node);
+                    setDetailsTarget({
+                      path: node.path,
+                      summary: node.raw?.summary,
+                      counts,
+                      countsComplete: inventoryComplete,
+                      editable: canWrite && !isReservedCollection(node.path),
+                    });
+                  }}
+                  onDeleteCollection={archiveScope === "archived" || showingPreviousScope ? undefined : (node) => {
+                    const counts = countCollectionResources(node);
+                    setDeleteTarget({
+                      path: node.path,
+                      docCount: counts.documents,
+                      tableCount: counts.tables,
+                      fileCount: counts.files,
+                      subCollectionCount: countSubCollections(node),
+                      countsComplete: inventoryComplete,
+                    });
+                  }}
+                  onDeleteResource={(node) => {
+                    setResourceDeleteTarget({
+                      kind: node.kind as DeletableResourceKind,
+                      name: node.name,
+                      ref: node.path,
+                      rowCount: typeof node.raw?.row_count === "number" ? node.raw.row_count : undefined,
+                      active: `${node.kind}:${node.path}` === activeSig,
+                    });
+                  }}
                 />
               );
-            }
-            if (row.type === "more") {
-              return (
-                <KindMoreRow
-                  key={row.sig}
-                  row={row}
-                  disclosure={focused}
-                  onShowMore={() => showMoreKind(row.parentPath, row.kind)}
-                />
-              );
-            }
-            return (
-              <TreeRow
-                key={row.sig}
-                node={row.node}
-                disclosure={focused}
-                depth={row.depth}
-                sig={row.sig}
-                isOpen={row.isOpen}
-                isActive={row.sig === activeSig}
-                vault={vault}
-                onToggle={toggle}
-                onSearchCollection={(node) => { changeCollectionScope(node.path); setFiltersOpen(true); focusResourceFilter(); }}
-                onExploreCollection={focused && !checkingAccess ? node => exploreCollection(node.path) : undefined}
-                canWrite={canWrite}
-                canAdmin={canAdmin}
-                showDocumentDisambiguator={duplicateDocumentPaths.has(row.node.path)}
-                onCreateDoc={(node) =>
-                  openCreateDocument({ collection: node.path })
-                }
-                onUploadFile={(node) => openUpload(node.path)}
-                onCreateTable={(node) => openTableCreate(node.path)}
-                onCreateSubCollection={(node) => openCreate(node.path)}
-                onOpenDetails={(node) => {
-                  const counts = countCollectionResources(node);
-                  setDetailsTarget({
-                    path: node.path,
-                    summary: node.raw?.summary,
-                    counts,
-                    countsComplete: inventoryComplete,
-                    editable: canWrite && !isReservedCollection(node.path),
-                  });
-                }}
-                onDeleteCollection={archiveScope === "archived" || showingPreviousScope ? undefined : (node) => {
-                  const counts = countCollectionResources(node);
-                  setDeleteTarget({
-                    path: node.path,
-                    docCount: counts.documents,
-                    tableCount: counts.tables,
-                    fileCount: counts.files,
-                    subCollectionCount: countSubCollections(node),
-                    countsComplete: inventoryComplete,
-                  });
-                }}
-                onDeleteResource={(node) => {
-                  setResourceDeleteTarget({
-                    kind: node.kind as DeletableResourceKind,
-                    name: node.name,
-                    ref: node.path,
-                    rowCount: typeof node.raw?.row_count === "number" ? node.raw.row_count : undefined,
-                    active: `${node.kind}:${node.path}` === activeSig,
-                  });
-                }}
-              />
-            );
+            })();
+            return <Fragment key={row.sig}>
+              {content}
+              {row.type === "node" && row.node.kind === "collection" && branchPaths.includes(row.node.path) && branchLoader(row.node.path)}
+              {(branchBoundaries.get(row.sig) ?? []).map(branch => branchBoundary(branch.path, branch.depth, branch.hasChildren))}
+            </Fragment>;
           })}
+
+        {branchPaths.includes(explorationPath) && branchBoundary(explorationPath, 0, fullRows.length > 0)}
 
         <AutoLoadMore hasMore={fullRows.length > visibleRows.length || hasMore} loading={loadingMore}
           autoPaused={autoHalted && fullRows.length === visibleRows.length}
           paused={loading || refreshing || searching || unsupported}
-          error={Boolean(error)} requestKey={`${filterOwner}:${archiveScope}:${kindFilter}:${collectionScope}:${explorationPath}:${nameQuery}:${renderLimit}:${pageCount}`}
+          error={Boolean(error)} requestKey={`${filterOwner}:${archiveScope}:${kindFilter}:${collectionScope}:${explorationPath}:${nameQuery}:${renderLimit}:${pageCount}:${fullRows.length}`}
           label="Load more content" loadingLabel={nameQuery && !visibleRows.length ? "" : "Loading more content"}
           className="px-3" onLoadMore={() => fullRows.length > visibleRows.length ? setRenderLimit(current => current + TREE_RENDER_PAGE) : loadMore()} />
 
@@ -977,6 +1103,12 @@ export function VaultExplorer({
           }}
         />
       )}
+      {renameTarget?.scope === renameScope && !checkingAccess && <DocumentRenameDialog
+        key={`${renameScope}:${renameTarget.path}`} vault={vault} path={renameTarget.path}
+        returnFocusRef={mutationTriggerRef}
+        onOpenChange={open => { if (!open) setRenameTarget(null); }}
+        onRenamed={() => { handleMutation(); setRenameNotice("Document title updated."); }} />}
+      <span role="status" className="sr-only">{renameNotice}</span>
       <CollectionDetailsDialog
         vault={vault}
         path={detailsTarget?.path ?? ""}
@@ -1113,6 +1245,7 @@ interface RowProps {
   onDeleteCollection?: (node: TreeNode) => void;
   /** Open the matching document/file/table deletion flow. */
   onDeleteResource?: (node: TreeNode) => void;
+  onRenameDocument?: (node: TreeNode, trigger: HTMLButtonElement) => void;
   /** Open the collection metadata and resource-count inspector. */
   onOpenDetails?: (node: TreeNode) => void;
   /** Fired when the user clicks the `+` (new sub-collection) icon on a
@@ -1138,7 +1271,7 @@ function explorerRowActions(active: boolean) {
 }
 
 const TreeRow = memo(function TreeRow({
-  node, disclosure, depth, sig, isOpen, isActive, vault, onToggle, onSearchCollection, onExploreCollection, canWrite, canAdmin, showDocumentDisambiguator, onDeleteCollection, onDeleteResource, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
+  node, disclosure, depth, sig, isOpen, isActive, vault, onToggle, onSearchCollection, onExploreCollection, canWrite, canAdmin, showDocumentDisambiguator, onDeleteCollection, onDeleteResource, onRenameDocument, onOpenDetails, onCreateSubCollection, onCreateDoc, onUploadFile, onCreateTable,
 }: RowProps) {
   const indent = { paddingLeft: `${depth * 12 + (disclosure ? 8 : 12)}px` };
 
@@ -1252,6 +1385,7 @@ const TreeRow = memo(function TreeRow({
     !isSkill &&
     Boolean(onDeleteResource) &&
     (node.kind === "table" ? Boolean(canAdmin) : Boolean(canWrite));
+  const canRenameDocument = node.kind === "document" && node.path !== VAULT_SKILL_PATH && Boolean(canWrite && onRenameDocument);
   const documentDisambiguator =
     node.kind === "document" && showDocumentDisambiguator
       ? compactDocumentIdentifier(node.path)
@@ -1275,7 +1409,7 @@ const TreeRow = memo(function TreeRow({
         style={indent}
         className={cn("flex min-h-9 min-w-0 flex-1 items-center gap-1.5 py-1.5 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring max-sm:min-h-11 pointer-coarse:min-h-11",
           disclosure && "gap-2 rounded-[var(--radius-sm)]",
-          canDeleteResource ? "pr-10 max-sm:pr-12 pointer-coarse:pr-12" : "pr-2",
+          canDeleteResource || canRenameDocument ? "pr-10 max-sm:pr-12 pointer-coarse:pr-12" : "pr-2",
           isActive && "font-medium")}
       >
         {/* Tinted icon chip — the same kind-swatch grammar Home + the vault
@@ -1321,11 +1455,12 @@ const TreeRow = memo(function TreeRow({
           </span>
         )}
       </Link>
-      {canDeleteResource && (
+      {(canDeleteResource || canRenameDocument) && (
         <ResourceActionsMenu
           resourceName={node.name}
-          deleteLabel={`Delete ${node.kind}`}
-          onDelete={() => onDeleteResource?.(node)}
+          onRename={canRenameDocument ? trigger => onRenameDocument?.(node, trigger) : undefined}
+          deleteLabel={canDeleteResource ? `Delete ${node.kind}` : undefined}
+          onDelete={canDeleteResource ? () => onDeleteResource?.(node) : undefined}
           side="right"
           align="start"
           className={explorerRowActions(isActive)}

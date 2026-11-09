@@ -308,3 +308,61 @@ async def test_secret_revision_survives_ordinary_toggles_and_configure_clears_it
         after_configure = await _ownership(client, lane)
         assert not after_configure["drifted"]
         assert after_configure["provider_secret_revision"] is None
+
+
+async def test_client_credentials_pin_target_and_use_resolved_control_transport(standalone, monkeypatch):
+    import httpx
+    from tests.test_sso_keycloak_admin_unit import KeycloakFixture, _control, _spec
+
+    class WithRealm(KeycloakFixture):
+        def handler(self, request):
+            if request.method == "GET" and request.url.path == "/auth/admin/realms/akb":
+                self.requests.append((request.method, request.url.path))
+                return httpx.Response(200, json={"id": "fixture-realm-id", "realm": "akb", "enabled": True})
+            return super().handler(request)
+
+    lane = standalone
+    selected_fixture, wrong_fixture = WithRealm(), WithRealm()
+    selected, wrong = _control(selected_fixture), _control(wrong_fixture)
+    await selected.configure(_spec())
+    selected_fixture.requests.clear()
+    monkeypatch.setattr(ops, "get_keycloak_provider_control", lambda: selected)
+    monkeypatch.setattr(management_targets, "get_keycloak_provider_control", lambda: selected)
+    # The route's unrelated global getter points at a different control. The
+    # selected target's transport must be the only one used for this effect.
+    monkeypatch.setattr(admin_sso, "get_keycloak_provider_control", lambda: wrong)
+    async with review_http_client() as client:
+        before = await _ownership(client, lane)
+        original = management_targets.resolve
+        async def switched(conn, target_id=None):
+            target = await original(conn, target_id)
+            return replace(target, target_id=uuid.uuid4()) if target_id is None else target
+        monkeypatch.setattr(management_targets, "resolve", switched)
+        refused = await client.put(_PATH, headers=lane["pat"], json=_body(before["fingerprint"], expected_target_id=before["target_id"]))
+        assert (refused.status_code, refused.json()["code"]) == (409, "sso_management_target_conflict")
+        assert not any(method == "PUT" for method, _ in selected_fixture.requests)
+        assert not wrong_fixture.requests and await _row(lane) is None
+        monkeypatch.setattr(management_targets, "resolve", original)
+        accepted = await client.put(_PATH, headers=lane["pat"], json=_body(before["fingerprint"], expected_target_id=before["target_id"]))
+        assert accepted.status_code == 200, accepted.text
+        assert sum(method == "PUT" for method, _ in selected_fixture.requests) == 1
+        assert not wrong_fixture.requests and _SECRET not in accepted.text
+
+
+async def test_client_credentials_refuse_different_realm_before_write(standalone, monkeypatch):
+    lane, control = standalone, standalone["control"]
+    actual_realm = uuid.uuid4()
+
+    async def read_realm():
+        return {"realm_id": str(actual_realm), "realm_name": "akb", "issuer": "https://auth.akb.example.com/realms/akb"}
+
+    monkeypatch.setattr(control, "read_realm_identity", read_realm)
+    async with review_http_client() as client:
+        before = await _ownership(client, lane)
+        request = _body(before["fingerprint"], expected_target_id=before["target_id"], expected_realm_id=str(uuid.uuid4()))
+        refused = await client.put(_PATH, headers=lane["pat"], json=request)
+        assert (refused.status_code, refused.json()["code"]) == (409, "sso_management_realm_conflict")
+        assert control.credential_writes == [] and await _row(lane) is None
+        request["expected_realm_id"] = str(actual_realm)
+        accepted = await client.put(_PATH, headers=lane["pat"], json=request)
+        assert accepted.status_code == 200 and len(control.credential_writes) == 1

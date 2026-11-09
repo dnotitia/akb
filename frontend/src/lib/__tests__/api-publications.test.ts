@@ -3,6 +3,7 @@ import {
   createPublication,
   createPublicationSnapshot,
   previewTablePublicationQuery,
+  listPublicationDirectory,
 } from "@/lib/api";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -18,6 +19,17 @@ describe("publication API", () => {
   beforeEach(() => {
     fetchMock.mockReset();
     globalThis.fetch = fetchMock as unknown as typeof fetch;
+  });
+
+  it("passes server filters and cancellation to the bounded directory", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ publications: [], total: 0, complete: true, next_cursor: null }));
+    const signal = new AbortController().signal;
+    await listPublicationDirectory({ vault: "team vault", q: "100% & guide", status: "unavailable", expiry: "soon", page_size: 30, cursor: "next+page", signal });
+    const [path, options] = fetchMock.mock.calls[0];
+    const url = new URL(path, "https://example.test");
+    expect(url.pathname).toBe("/api/v1/publications");
+    expect(Object.fromEntries(url.searchParams)).toEqual({ vault: "team vault", q: "100% & guide", status: "unavailable", expiry: "soon", page_size: "30", cursor: "next+page" });
+    expect(options.signal).toBe(signal);
   });
 
   it("previews a generated table query through the authenticated SQL endpoint", async () => {

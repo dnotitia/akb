@@ -168,6 +168,11 @@ rewriting. Updating/removing it never writes into the document. Product CSS
 can style its `[data-markdown-leading-adornment]` host. It is intentionally a
 viewer option, not an editable document node.
 
+`MarkdownViewer.beforeContent` offers the same isolated presentation slot before
+the entire body, including a leading heading. Both slots can be used together.
+`headings.levels` can normalize individual rendered heading levels independently
+of `levelOffset`, retaining their authored anchors and serialized heading levels.
+
 The WYSIWYG editor enables one common slash menu by default. It owns these ten
 commands: Heading 1–3, Quote, Bullet list, Numbered list, Task list, Table,
 Code block, and Divider. The menu filters its localized labels, descriptions,

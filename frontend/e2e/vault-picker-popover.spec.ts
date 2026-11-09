@@ -37,6 +37,10 @@ for (const width of [320, 375, 1440]) for (const dark of [false, true]) test(`Va
   await expect(page.getByRole("dialog", { name: "Vaults", exact: true })).toHaveCount(0);
   await page.getByRole("list", { name: "Available vaults" }).getByRole("link", { name: "workspace-01", exact: true }).click();
   await expect(page).toHaveURL(/\/vault\/workspace-01$/);
+  // The URL changes before the router commits the destination route (a React
+  // transition). Wait for the destination so the drawer is opened on it, not on
+  // the previous route, whose drawer state the committed route resets.
+  await expect(page.getByRole("heading", { level: 1, name: "workspace-01", exact: true })).toBeVisible();
   if (width < 1024) await page.getByRole("button", { name: "Open vault navigation", exact: true }).click();
   const trigger = page.getByRole("button", { name: "Switch vault: workspace-01", exact: true });
   await trigger.click();

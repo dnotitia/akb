@@ -10,12 +10,11 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Textarea } from "@/components/ui/textarea";
-import { TonalIcon } from "@/components/ui/tonal-icon";
 import { SettingsSection } from "@/components/ui/settings-section";
 import { authSessionSnapshot, getSkillTemplate, isCurrentAuthSession, updateDocument } from "@/lib/api";
 import { VAULT_SKILL_PATH } from "@/lib/skill";
 import { documentPreviewState } from "@/lib/document-preview-navigation";
-import { retainsGuideSettings, vaultGuideHref } from "@/lib/vault-guide-navigation";
+import { retainsGuideSettings, vaultGuideEditHref, vaultGuideHref } from "@/lib/vault-guide-navigation";
 import { timeAgo } from "@/lib/utils";
 import { useResourceNavigation, useResourceNavigationGuard } from "@/contexts/resource-navigation-context";
 import { useDocumentHistoryGuard } from "@/hooks/use-document-history-guard";
@@ -47,17 +46,15 @@ interface Props {
   /** A containing workspace can protect all its drafts with one confirmation. */
   navigationManaged?: boolean;
   onDraftStateChange?: (state: { dirty: boolean; saving: boolean }) => void;
+  headingLevel?: 2 | 3;
+  /** Open the shared document workspace instead of the legacy inline editor. */
+  editInReader?: boolean;
 }
 
 /**
- * The only guide editing surface. Reading uses the shared route-backed reader;
- * body editing, agent context, reset and history management live here.
- *
- * The body editor is deliberately body-only rather than the document page's
- * FrontmatterEditDialog: that dialog PATCHes `type` along with the body, and
- * `skill` is no longer in DOC_TYPES, so it would send `type: "note"` and the
- * backend's pinned-type guard would reject the save. Title/type/tags on this
- * doc are system-managed anyway.
+ * Guide settings and legacy inline editing. The Settings page opens the shared
+ * route-backed document reader/editor; both editing paths save only the body
+ * and revision pin because the guide's metadata is system-managed.
  */
 export function SkillSection({
   vault,
@@ -71,6 +68,8 @@ export function SkillSection({
   queryKey = ["document", vault, VAULT_SKILL_PATH],
   navigationManaged = false,
   onDraftStateChange,
+  headingLevel,
+  editInReader = false,
 }: Props) {
   const { checking } = useAccessVerification();
   const user = useCurrentUser();
@@ -86,6 +85,7 @@ export function SkillSection({
   const location = useLocation();
   const consumedEditRequest = useRef<string | null>(null);
   const previewId = useId();
+  const editPreviewId = useId();
   const previewHref = vaultGuideHref(vault);
   const previewState = documentPreviewState(location, previewId);
   const { requestNavigation } = useResourceNavigation();
@@ -162,6 +162,13 @@ export function SkillSection({
     // History replacement can precede the router's location-context commit.
     // Claim this entry before updating the draft so Cancel cannot replay it.
     consumedEditRequest.current = request;
+    if (editInReader) {
+      params.delete("edit");
+      const search = params.toString();
+      const background = { ...location, search: search ? `?${search}` : "" };
+      navigate(vaultGuideEditHref(vault), { state: documentPreviewState(background, editPreviewId) });
+      return;
+    }
     // Consume the explicit edit request once. Returning from a reading preview
     // resumes an existing draft and its OCC pin instead of reseeding it.
     if (baseBody === null) {
@@ -180,7 +187,7 @@ export function SkillSection({
     requestAnimationFrame(() => {
       if (mounted.current && latestScope.current === scope) editorRef.current?.focus({ preventScroll: true });
     });
-  }, [location, canManage, checking, loading, busy, doc, baseBody, navigate, ownerScope]);
+  }, [location, canManage, checking, loading, busy, doc, baseBody, navigate, ownerScope, editInReader, editPreviewId, vault]);
 
   function discardDraft() {
     setDraft("");
@@ -280,7 +287,8 @@ export function SkillSection({
   }
 
   return (
-    <SettingsSection ref={sectionRef} id="skill" title="Vault guide">
+    <SettingsSection ref={sectionRef} id="skill" title="Vault guide" headingLevel={headingLevel}
+      layout="card" icon={<BookOpen aria-hidden />} description="Instructions for people and agents working in this vault.">
       <div className="p-4 sm:p-5">
           {error && !isMirror && (
             <Alert variant="destructive" title="Couldn't load the vault guide">
@@ -296,21 +304,20 @@ export function SkillSection({
             <Alert variant="warning">The vault guide is missing. It is restored automatically by the system backfill; contact an administrator if this persists.</Alert>
           ) : (
             <>
-              <div className="flex min-w-0 flex-col gap-3 @[48rem]/settings-section:flex-row @[48rem]/settings-section:items-start">
+              <div className="flex min-w-0 flex-col gap-3 @[24rem]/settings-section:flex-row @[24rem]/settings-section:items-start">
                 <div className="flex min-w-0 flex-1 items-start gap-3">
-                  <TonalIcon tone="guide" size="sm"><BookOpen aria-hidden /></TonalIcon>
                   <div className="min-w-0 space-y-1">
-                    {expanded && <p className="text-sm font-medium text-foreground">
-                      {tab === "edit" ? "Editing guide" : "Agent view"}
-                    </p>}
-                    <div className="flex min-h-8 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-foreground-muted">
+                    <p className="text-sm font-medium text-foreground">
+                      {expanded ? tab === "edit" ? "Editing guide" : "Agent view" : "Workspace instructions"}
+                    </p>
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-foreground-muted">
                       {doc.updated_at && <time dateTime={doc.updated_at}>Updated {timeAgo(doc.updated_at)}</time>}
                       {dirty && <span role="status">Unsaved guide changes</span>}
                       {saved && !dirty && <span role="status" className="text-success">Guide saved</span>}
                     </div>
                   </div>
                 </div>
-              <div className="flex flex-wrap items-center gap-2 pl-11 @[48rem]/settings-section:shrink-0 @[48rem]/settings-section:pl-0">
+              <div className="flex flex-wrap items-center gap-2 @[24rem]/settings-section:shrink-0">
                 <Button asChild variant="ghost" size="sm" className="min-h-11 text-link sm:min-h-8">
                   <Link className="workspace-control" id={previewId} to={previewHref} state={previewState} onClick={event => {
                     if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -318,8 +325,13 @@ export function SkillSection({
                   }}>Open guide</Link>
                 </Button>
                 {canManage && (
-                  <Button ref={editButtonRef} variant="outline" size="sm" className="min-h-11 sm:min-h-8"
-                    disabled={busy || (expanded && tab === "edit")} onClick={() => selectTab("edit")}>Edit guide</Button>
+                  <Button ref={editButtonRef} id={editPreviewId} variant="outline" size="sm" className="min-h-11 sm:min-h-8"
+                    disabled={busy || (expanded && tab === "edit")} onClick={() => {
+                      if (!editInReader) { selectTab("edit"); return; }
+                      const href = vaultGuideEditHref(vault);
+                      const options = { state: documentPreviewState(location, editPreviewId) };
+                      if (requestNavigation(href, options)) navigate(href, options);
+                    }}>Edit guide</Button>
                 )}
                 <DropdownMenu.Root modal={false}>
                   <DropdownMenu.Trigger asChild>
@@ -356,7 +368,7 @@ export function SkillSection({
 
               {!expanded && (doc.content?.trim() ? (
                 <Suspense fallback={<LoadingState label="Loading guide preview"><Skeleton className="mt-4 h-32 w-full" /></LoadingState>}>
-                  <GuidePreview vault={vault} content={doc.content} onNavigate={(event, url) => {
+                  <GuidePreview vault={vault} content={doc.content} headingLevelOffset={headingLevel ?? 3} onNavigate={(event, url) => {
                     if (url.origin !== window.location.origin || url.pathname.startsWith("/api/")) return;
                     event.preventDefault();
                     const href = `${url.pathname}${url.search}${url.hash}`;

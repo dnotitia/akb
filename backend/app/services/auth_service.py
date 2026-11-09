@@ -55,6 +55,7 @@ from app.services.auth_verifier_profiles import (
 )
 from app.services.role_sync import get_role_sync
 from app.services.service_authority_service import resolve_service_authority
+from app.sso.operation_request_scope import SSO_OPERATION_REQUEST_SCOPE
 from app.services.user_identity import (
     display_name_from_external,
     normalize_display_name,
@@ -66,7 +67,7 @@ from app.services.user_identity import (
 
 TOKEN_KEY_CLASSES = frozenset({"pat", "service", "publishable"})
 ISSUABLE_TOKEN_KEY_CLASSES = frozenset({"pat", "service"})
-TOKEN_SCOPES = frozenset({"read", "write", "admin"})
+TOKEN_SCOPES = frozenset({"read", "write", "admin", SSO_OPERATION_REQUEST_SCOPE})
 DEFAULT_TOKEN_SCOPES = ("read", "write")
 
 
@@ -267,6 +268,9 @@ def scopes_from_db(scopes: object) -> frozenset[str]:
 
 def token_has_scope(granted: frozenset[str] | None, required: str) -> bool:
     """Return True if this credential may perform the coarse operation."""
+    if required == SSO_OPERATION_REQUEST_SCOPE:
+        # Even an administrator or an unscoped human is not this capability.
+        return granted == frozenset({SSO_OPERATION_REQUEST_SCOPE})
     if granted is None:
         return True
     return "admin" in granted or required in granted
@@ -1257,6 +1261,13 @@ async def create_pat(
     pool = await get_pool()
     key_class = _normalize_issuable_key_class(key_class)
     token_scopes = normalize_token_scopes(scopes)
+    dedicated_operation_request_scope = SSO_OPERATION_REQUEST_SCOPE in token_scopes
+    if dedicated_operation_request_scope:
+        raise AKBError(
+            "The SSO operation-request scope requires Native bootstrap.",
+            403,
+            code="sso_operation_request_scope_issuance_required",
+        )
     raw_token, token_hash, token_prefix = generate_pat(key_class)
     if token_id is None:
         resolved_token_id = uuid.uuid4()

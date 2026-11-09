@@ -13,9 +13,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The locked Playwright runtime supports Ubuntu 24.04, not Ubuntu 26.04.
+  # Keep browser jobs stable when ubuntu-latest advances to a new release.
   shell-e2e:
     name: shell e2e (repository runtime)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Includes runtime preparation, API suites, and the full browser regression.
     # Playwright has a shorter global budget so failures can upload diagnostics.
     timeout-minutes: 60
@@ -89,7 +91,7 @@ jobs:
           uv run --locked --project backend python \
             scripts/ci/e2e_runtime.py gate \
             --with-frontend \
-            --profile transport-proxy \
+            --profile transport-oidc \
             --scenario empty \
             --checkout "$GITHUB_WORKSPACE" \
             --runtime-root "${{ runner.temp }}/akb-e2e-runtime"
@@ -104,7 +106,7 @@ jobs:
 
   frontend-e2e:
     name: frontend e2e (mock)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -147,7 +149,7 @@ jobs:
 
   keycloak-theme:
     name: keycloak login theme (real Keycloak)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:

@@ -1297,3 +1297,30 @@ CREATE INDEX IF NOT EXISTS sso_operation_requests_token
 -- configure verb requires every non-secret payload field to equal it. Direct
 -- grants leave it null and keep their existing behavior.
 ALTER TABLE sso_identity_operations ADD COLUMN IF NOT EXISTS provider_configure_summary JSONB;
+
+-- Permanent, non-secret lineage survives account or token deletion.
+CREATE TABLE IF NOT EXISTS approval_service_bootstrap (
+    token_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL,
+    installation_id UUID NOT NULL,
+    credential_sha256 TEXT NOT NULL CHECK (credential_sha256 ~ '^[a-f0-9]{64}$'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+-- NULL identifies requests written before dedicated requester keys existed.
+ALTER TABLE sso_operation_requests ADD COLUMN IF NOT EXISTS requester_scope TEXT;
+
+-- Permanent requester idempotency and stable requester history (migration 129).
+ALTER TABLE sso_operation_requests ADD COLUMN IF NOT EXISTS request_nonce UUID;
+ALTER TABLE sso_operation_requests ADD COLUMN IF NOT EXISTS proposal_sha256 TEXT;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'sso_operation_requests'::regclass AND conname = 'sso_operation_requests_nonce_digest_check') THEN
+        ALTER TABLE sso_operation_requests ADD CONSTRAINT sso_operation_requests_nonce_digest_check
+        CHECK ((request_nonce IS NULL AND proposal_sha256 IS NULL) OR
+               (request_nonce IS NOT NULL AND proposal_sha256 IS NOT NULL AND proposal_sha256 ~ '^[0-9a-f]{64}$'));
+    END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS sso_operation_requests_nonce
+    ON sso_operation_requests (request_nonce) WHERE request_nonce IS NOT NULL;
+CREATE INDEX IF NOT EXISTS sso_operation_requests_requester_history
+    ON sso_operation_requests (requested_by, requested_token_id, created_at DESC, request_id DESC);

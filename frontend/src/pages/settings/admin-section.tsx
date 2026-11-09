@@ -109,7 +109,7 @@ export function AdminSection({
   return (
     <>
       <Activity mode={visible ? "visible" : "hidden"}><section aria-labelledby="settings-users-heading" aria-busy={usersLoading}>
-        <header className="mb-4 flex items-start justify-between gap-4 border-b border-border pb-4">
+        <header className="settings-section-heading">
           <div className="flex items-start gap-3">
             <div>
               <h2 id="settings-users-heading" className="text-base font-semibold text-foreground">Users</h2>
@@ -198,7 +198,7 @@ export function AdminSection({
                   className="flex flex-col gap-3 px-4 py-3 transition-token hover:bg-surface-hover sm:flex-row sm:items-center"
                 >
                   <span
-                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border bg-surface-2 text-xs font-semibold text-primary"
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border bg-surface-2 text-xs font-semibold text-link"
                     aria-hidden
                   >
                     {userInitials(u)}
