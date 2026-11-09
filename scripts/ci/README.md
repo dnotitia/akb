@@ -107,8 +107,22 @@ and public levels, tables/SQL/DDL, basic publication, help, and deletion.
 Each pytest test receives the existing fixture's reset/login/SDK lifecycle;
 scenarios that need role boundaries add a second user through the same
 authenticated endpoint and client lifecycle.
-The fixture uses the SDK's public `Client` and Streamable HTTP transport in the
-pytest process; it does not invoke Inspector, Node, or a separate MCP driver.
+The HTTP fixture uses the SDK's public `Client` and Streamable HTTP transport
+in the pytest process. `test_document_file_input_e2e.py` additionally owns a
+short-lived SDK stdio client of the checkout's proxy against that same isolated
+backend. It requires a supported Node runtime on PATH (CI uses `.nvmrc`), even
+when running the complete pytest suite against a `tool-only` runtime. It does
+not start another backend or database, and closes the proxy before fixture reset.
+This file-input boundary checks the served schema, metadata-only/null updates,
+empty-file replacement and both revision/hash conflict predicates. No Inspector
+or alternate MCP driver is involved.
+
+`test_document_idempotency_e2e.py` exercises the unsupported retry-key contract
+through authenticated HTTP MCP and REST in the same mandatory Bare Git runtime
+gate. It checks advertised lack of support, explicit rejection without writes,
+and unchanged keyless behavior. Native receipt interchange, concurrency and
+response-loss oracles run separately in the live-PG lane through
+`test_document_idempotency_postgres.py`.
 
 `test_table_schema_e2e.py` checks the real table and Vault schema HTTP responses
 against the same runtime's served OpenAPI contract after create, alter, and

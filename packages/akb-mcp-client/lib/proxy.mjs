@@ -72,6 +72,67 @@ const DOCUMENT_IMAGE_MIMES = new Set([
 ]);
 const VAULT_SKILL_ACK_ARGUMENT = "_vault_skill_ack";
 
+// Only reviewed reads may be replayed after a lost response. New tools,
+// plugins and SQL fail closed; names and readOnlyHint are not proof of safety.
+const REPLAY_SAFE_TOOLS = new Set([
+  "akb_list_vaults", "akb_get", "akb_browse", "akb_search", "akb_drill_down",
+  "akb_activity", "akb_diff", "akb_relations", "akb_graph", "akb_provenance",
+  "akb_publications", "akb_vault_info", "akb_vault_members", "akb_explain_access",
+  "akb_search_users", "akb_whoami", "akb_history", "akb_help", "akb_export",
+]);
+
+function canReplayRequest(msg) {
+  if (msg.method === "ping" || msg.method === "tools/list") return true;
+  if (msg.method !== "tools/call") return false;
+  const args = msg.params?.arguments ?? {};
+  if (!isObject(args)) return false;
+  if (msg.params?.name === "akb_grep") {
+    return !Object.hasOwn(args, "replace") || args.replace === null;
+  }
+  return REPLAY_SAFE_TOOLS.has(msg.params?.name);
+}
+
+function isRpcError(value) {
+  return isObject(value) && Number.isInteger(value.code) && typeof value.message === "string";
+}
+
+function requireResponseId(response, requestId, statusCode) {
+  if (response.id !== requestId) {
+    throw Object.assign(new Error("MCP response ID does not match the request"), { responseError: true, statusCode });
+  }
+}
+
+// Presence matters: an empty body clears a document, while null on update
+// leaves it unchanged. Neither is an absent argument when a file is supplied.
+function documentInputError(name, args) {
+  const invalid = (error, field, reason, extra = {}) => ({
+    error, code: "invalid_argument", details: { field, reason, ...extra },
+  });
+  if (!isObject(args)) {
+    return invalid("Document arguments must be an object.", "/", "invalid_type");
+  }
+  const hasFile = Object.hasOwn(args, "file");
+  const hasContent = Object.hasOwn(args, "content");
+  if (hasFile && hasContent) {
+    return invalid("Provide either file or content, not both.", "/content", "mutually_exclusive", {
+      conflicts_with: "/file",
+    });
+  }
+  if (hasFile && (typeof args.file !== "string" || args.file.length === 0)) {
+    return invalid("file must be a non-empty path string.", "/file", "invalid_value");
+  }
+  if (name === "akb_put" && !hasFile && !hasContent) {
+    return invalid("Provide content or file to create a document.", "/content", "required");
+  }
+  if (hasContent && typeof args.content !== "string" && !(name === "akb_update" && args.content === null)) {
+    return invalid(
+      name === "akb_update" ? "content must be a string or null." : "content must be a string.",
+      "/content", "invalid_type",
+    );
+  }
+  return null;
+}
+
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -573,40 +634,52 @@ export class AKBProxy {
       return await this._toolsList(id, params);
     }
 
-    // Resolve `file` → `content` for akb_put / akb_update before forwarding
-    if (method === "tools/call" && FILE_CONTENT_TOOLS.has(params?.name)) {
-      const args = params.arguments;
-      if (args?.file) {
-        try {
-          msg = {
-            ...msg,
-            params: {
-              ...params,
-              arguments: this._resolveFileToContent(args),
-            },
-          };
-        } catch (err) {
-          return {
-            jsonrpc: "2.0",
-            id,
-            result: this._clientResult({
-              content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
-              isError: true,
-            }),
-          };
-        }
-      }
-    }
-
-    const callKey = method === "tools/call" ? this._vaultSkillCallKey(msg.params) : null;
-    if (callKey) msg = this._withVaultSkillAcknowledgement(msg, callKey);
-
     // Only measured calls read the clock.
     const measuring = method === "tools/call" && this._usageLogPath !== null;
     const startedAt = measuring ? Date.now() : 0;
     let response;
     let threw = false;
     try {
+      // Resolve `file` → `content` for akb_put / akb_update before forwarding
+      if (method === "tools/call" && FILE_CONTENT_TOOLS.has(params?.name)) {
+        const args = params.arguments ?? {};
+        const inputError = documentInputError(params.name, args);
+        if (inputError) {
+          response = {
+            jsonrpc: "2.0", id,
+            result: this._clientResult({
+              content: [{ type: "text", text: JSON.stringify(inputError) }],
+              isError: true,
+            }),
+          };
+          return response;
+        }
+        if (Object.hasOwn(args, "file")) {
+          try {
+            msg = {
+              ...msg,
+              params: {
+                ...params,
+                arguments: this._resolveFileToContent(args),
+              },
+            };
+          } catch (err) {
+            response = {
+              jsonrpc: "2.0",
+              id,
+              result: this._clientResult({
+                content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
+                isError: true,
+              }),
+            };
+            return response;
+          }
+        }
+      }
+
+      const callKey = method === "tools/call" ? this._vaultSkillCallKey(msg.params) : null;
+      if (callKey) msg = this._withVaultSkillAcknowledgement(msg, callKey);
+
       response =
         method === "tools/call" && FILE_TOOL_NAMES.has(msg.params?.name)
           ? await this._handleFileTool(id, msg.params)
@@ -845,19 +918,35 @@ export class AKBProxy {
   _decorateTools(resp) {
     const tools = (resp.tools || []).map((t) => {
       if (FILE_CONTENT_TOOLS.has(t.name) && t.inputSchema?.properties) {
+        const schema = t.inputSchema;
+        // File input becomes a string body before it reaches the backend.
+        // Reuse its conditional body guards (including OCC), without changing
+        // the original content/null or metadata-only update branches.
+        const fileConditions = (schema.allOf || [])
+          .filter((condition) => condition.if?.required?.includes("content"))
+          .map((condition) => ({ ...condition, if: { required: ["file"] } }));
         return {
           ...t,
           inputSchema: {
-            ...t.inputSchema,
+            ...schema,
             properties: {
-              ...t.inputSchema.properties,
+              ...schema.properties,
               file: {
                 type: "string",
+                minLength: 1,
                 description:
                   "Local file path to read as document body (alternative to content). " +
-                  "Provide either file or content, not both.",
+                  "Omit content entirely when using file, including null or an empty string. " +
+                  "Updates require the same original-read conditions as a content update.",
               },
             },
+            required: (schema.required || []).filter((field) => field !== "content"),
+            allOf: [
+              ...(schema.allOf || []),
+              { not: { required: ["file", "content"] } },
+              ...(t.name === "akb_put" ? [{ anyOf: [{ required: ["content"] }, { required: ["file"] }] }] : []),
+              ...fileConditions,
+            ],
           },
         };
       }
@@ -924,13 +1013,11 @@ export class AKBProxy {
    * Throws if both `file` and `content` are provided, or file is unreadable.
    */
   _resolveFileToContent(args) {
-    const { file, content, ...rest } = args;
-    if (!file) {
-      throw new Error("'file' parameter is empty.");
+    const inputError = documentInputError("akb_put", args);
+    if (inputError) {
+      throw Object.assign(new Error(inputError.error), inputError);
     }
-    if (content) {
-      throw new Error("Cannot provide both 'file' and 'content'. Use one or the other.");
-    }
+    const { file, ...rest } = args;
 
     const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
     let fileSize;
@@ -1492,6 +1579,13 @@ export class AKBProxy {
         let data = "";
         res.setEncoding("utf8");
         res.on("data", (chunk) => (data += chunk));
+        // A partial response can disappear after a committed write. Reject
+        // promptly instead of waiting for the request timeout or treating it
+        // as an empty successful result.
+        res.on("aborted", () => reject(Object.assign(
+          new Error("Backend response interrupted"), { code: "ECONNRESET" },
+        )));
+        res.on("error", reject);
         res.on("end", () => {
           if (res.statusCode >= 400) {
             const error = new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`);
@@ -1538,9 +1632,9 @@ export class AKBProxy {
   // contract result and must never be retried or silently downgraded.
   _isConnError(error) {
     if (error?.connectionError) return true;
-    if (error?.protocolError) return false;
+    if (error?.protocolError || error?.statusCode) return false;
     return /ECONNREFUSED|ECONNRESET|socket hang up|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|ENOTFOUND|EPIPE|timeout|unreachable/i.test(
-      error?.message || String(error || ""),
+      `${error?.code || ""} ${error?.message || String(error || "")}`,
     );
   }
 
@@ -1701,18 +1795,23 @@ export class AKBProxy {
   // ── MCP RPC forwarding ────────────────────────────────────
 
   async _forward(msg) {
-    const maxRetries = 2;
+    const maxAttempts = canReplayRequest(msg) ? 3 : 1;
+    // Per invocation, not shared with concurrent requests or the reconnect
+    // monitor. Once dispatch is entered, an error cannot prove non-execution.
+    let dispatched = false;
 
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         if (!this._backendReady) {
           const ok = await this._ensureBackend();
           if (!ok) throw new Error("backend unreachable");
         }
+        dispatched = true;
         const resp = await this._rpc(msg.method, msg.params || {});
         return { jsonrpc: "2.0", id: msg.id, result: this._clientResult(resp) };
       } catch (err) {
-        if (this._isConnError(err)) {
+        const connectionFailure = this._isConnError(err);
+        if (connectionFailure) {
           // Drop the dead session and let the background monitor restore
           // it. The proxy process and the client-visible server stay
           // alive, so calls recover once connectivity returns.
@@ -1721,12 +1820,32 @@ export class AKBProxy {
           this.sessionId = null;
           this._startBackendMonitor();
 
-          if (attempt < maxRetries) {
+          if (attempt + 1 < maxAttempts) {
             process.stderr.write(
               `[akb-mcp] backend unreachable, retrying (attempt ${attempt + 1})...\n`,
             );
             continue;
           }
+        }
+        // Preserve explicit MCP errors and HTTP rejections. A transport loss,
+        // unreadable response or gateway/server failure leaves the result
+        // unknown; never expose its raw body, arguments, path or credentials.
+        if (msg.method === "tools/call" && (
+          connectionFailure || err?.responseError || (!err?.protocolError && err?.statusCode >= 500)
+        )) {
+          return {
+            jsonrpc: "2.0", id: msg.id,
+            result: this._clientResult({
+              isError: true,
+              content: [{ type: "text", text: JSON.stringify({
+                error: dispatched
+                  ? "The operation outcome is unknown. Check the current state before repeating the request."
+                  : "The backend is unavailable. The tool request was not sent.",
+                code: dispatched ? "operation_unknown" : "backend_unavailable",
+                details: { operation_outcome: dispatched ? "unknown" : "not_started" },
+              }) }],
+            }),
+          };
         }
         throw err;
       }
@@ -1736,10 +1855,10 @@ export class AKBProxy {
   async _rpc(method, params, rpcOpts = {}) {
     const mode = rpcOpts.protocolMode || this._backendMode || "modern";
     const outboundParams = mode === "modern" ? this._modernizeParams(params) : params;
-    this.msgId++;
+    const requestId = ++this.msgId;
     const body = JSON.stringify({
       jsonrpc: "2.0",
-      id: this.msgId,
+      id: requestId,
       method,
       params: outboundParams,
     });
@@ -1788,7 +1907,24 @@ export class AKBProxy {
         } catch {
           parsedError = null;
         }
-        if (parsedError?.error) {
+        // The legacy transport can reject the HTTP session before parsing
+        // the RPC request. Python SDK 1.x emits "server-error" here and
+        // 2.x emits null. Neither ID can identify a tool result.
+        const transportErrorId = parsedError?.id === null || parsedError?.id === "server-error";
+        if (transportErrorId && isRpcError(parsedError.error)) {
+          if (method === "server/discover" && error.statusCode === 400 &&
+              parsedError.error.code === INVALID_REQUEST && /missing session id/i.test(parsedError.error.message)) {
+            throw Object.assign(new Error("Missing session ID"), { code: INVALID_REQUEST });
+          }
+          if (mode === "legacy" && error.statusCode === 404) {
+            throw Object.assign(new Error("Legacy MCP session expired"), { connectionError: true });
+          }
+        }
+        if (isObject(parsedError) && (parsedError.jsonrpc === "2.0" ||
+            Object.hasOwn(parsedError, "result") || isRpcError(parsedError.error))) {
+          requireResponseId(parsedError, requestId, error.statusCode);
+        }
+        if (isRpcError(parsedError?.error)) {
           const protocolError = new Error(
             `MCP error ${parsedError.error.code}: ${parsedError.error.message}`,
           );
@@ -1803,18 +1939,18 @@ export class AKBProxy {
       throw error;
     }
 
-    if (mode === "legacy" && resp.headers?.["mcp-session-id"]) {
-      this.sessionId = resp.headers["mcp-session-id"];
-    }
-
     let parsed;
     try {
       parsed = JSON.parse(resp.text);
     } catch {
-      throw new Error(`Invalid JSON response: ${resp.text.slice(0, 200)}`);
+      throw Object.assign(new Error("Invalid JSON response from backend"), { responseError: true });
     }
+    if (!isObject(parsed) || (!Object.hasOwn(parsed, "result") && !isRpcError(parsed.error))) {
+      throw Object.assign(new Error("Missing MCP response result"), { responseError: true });
+    }
+    requireResponseId(parsed, requestId);
 
-    if (parsed.error) {
+    if (isRpcError(parsed.error)) {
       const error = new Error(`MCP error ${parsed.error.code}: ${parsed.error.message}`);
       error.code = parsed.error.code;
       error.data = parsed.error.data;
@@ -1822,7 +1958,13 @@ export class AKBProxy {
       error.connectionError = mode === "legacy" && resp.statusCode === 404;
       throw error;
     }
-    return parsed.result || {};
+    if (!isObject(parsed.result)) {
+      throw Object.assign(new Error("Invalid MCP response result"), { responseError: true });
+    }
+    if (mode === "legacy" && resp.headers?.["mcp-session-id"]) {
+      this.sessionId = resp.headers["mcp-session-id"];
+    }
+    return parsed.result;
   }
 
   _write(obj) {

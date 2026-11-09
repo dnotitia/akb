@@ -284,6 +284,29 @@ test("search facade scopes search, drill-down, grep, and forwards actingAs claim
   assert.equal(grepResult.throwOnError().data.kind, "grep");
 });
 
+test("docs forwards caller retry keys with the unchanged body and original-read token", async () => {
+  const requests = [];
+  const docs = createClient("https://akb.test/api/v1/", {
+    fetch: async (_url, init) => {
+      requests.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ kind: "document_write", current_commit: "b".repeat(40) }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    },
+  }).vault("example").docs;
+  const input = { collection: "notes", title: "Draft", content: "body", idempotencyKey: "11111111-2222-4333-8444-555555555555" };
+  await docs.put(input);
+  await docs.put(input);
+  assert.equal(requests[0].idempotency_key, input.idempotencyKey);
+  assert.deepEqual(requests[1], requests[0]);
+  const update = { content: "replacement", expectedCommit: "a".repeat(40), idempotencyKey: "11111111-2222-4333-8444-555555555556" };
+  await docs.update("notes/draft.md", update);
+  assert.deepEqual(requests[2], {
+    content: update.content, expected_commit: update.expectedCommit, idempotency_key: update.idempotencyKey,
+  });
+  assert.equal(requests.length, 3);
+});
+
 test("docs facade scopes document operations and maps typed payloads", async () => {
   const seen = [];
   const client = createClient("https://akb.test/api/v1/", {

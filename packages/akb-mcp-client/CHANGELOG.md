@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased — safe retries after response loss
+
+Forwarded tool calls now retry connection failures only for explicitly reviewed
+reads, including `akb_grep` when `replace` is omitted or null. A string replacement
+(even `""`), SQL, writes, and unclassified tools are dispatched at most once per
+proxy call. Tool names and advertised read-only hints do not grant replay safety.
+Session recovery and tools-list refresh continue independently.
+
+An unavailable backend before tool dispatch returns `isError: true`,
+`code: backend_unavailable`, and `details.operation_outcome: not_started`.
+A lost or malformed response after entering dispatch returns `operation_unknown`
+with outcome `unknown`; check current state before repeating the request. This
+also covers incomplete responses and non-protocol HTTP 5xx failures. Original
+MCP errors and explicit HTTP rejections retain their existing behavior. These
+errors omit raw upstream bodies and request arguments, and usage logging records
+the call once. Read retries that are exhausted use the same outcome contract.
+
+This limits automatic replay in this proxy, not duplicate calls from other
+clients. It does not add idempotency keys, operation lookup, rollback on timeout,
+or new retry behavior to the separate proxy-local REST/S3 file tools.
+
+## Unreleased — document body input validation
+
+`akb_put` accepts exactly one of `content` or local `file`; `akb_update`
+continues to accept metadata-only changes and `content: null`. Supplying both
+fields is now rejected even when `content` is empty or null. Integrations that
+send placeholder content alongside a file must omit the content key entirely.
+Empty/non-string file paths and invalid body types return `invalid_argument`
+with `details.field` before file reads or forwarding.
+
+The advertised schema now allows file-only creation and applies the backend's
+whole-body preconditions to file updates. Original-read tokens are forwarded
+unchanged; the proxy never fetches a replacement token or retries a conflict.
+
+Opt-in usage records include document input validation and file-read failures,
+with one record per call and no document content or local paths in the log.
+
 ## Unreleased — the proxy's own refusals set `isError`
 
 The file tools the proxy answers itself (`akb_put_file`, `akb_get_file`,
