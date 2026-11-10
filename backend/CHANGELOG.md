@@ -7,6 +7,13 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- MCP `akb_browse` supports `name_query` to match names and paths, and
+  `content_type="resources"` to list documents, tables and files without
+  collection rows. Both use cursor paging with a default page size of 100.
+  `archive_scope` overrides `include_archived` for both cursor and legacy
+  listings. New name-query cursors bind the trimmed search text. Previously
+  issued cursors still resume their original traversal.
+
 - `akb_search` accepts `doc_types` (any listed document type), `source_type`
   (`document`, `file`, or `table`), and `archive_scope` (`unarchived`,
   `archived`, or `all`). These filters intersect with the caller's readable

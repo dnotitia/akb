@@ -851,12 +851,17 @@ Each item includes its `uri` for use with akb_link, akb_relations, etc.
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
+| uri | | Vault or collection URI. Takes precedence over vault and collection. |
+| vault | | Required when uri is omitted |
 | collection | | Collection path (omit for top-level) |
 | depth | | 0 = direct children; N = descend N collection levels; -1 = entire subtree |
-| content_type | | all, collections, documents, tables, files (default: all) |
+| content_type | | all (default), collections, documents, tables, files, or resources. Resources lists documents, tables and files without collection rows. |
+| name_query | | Literal case-insensitive name/path substring, up to 200 characters. Uses cursor paging, as do resources and collections. Default page size is 100. |
+| filter | | Filter the returned list or page by name/path. Choose filter or name_query. |
+| archive_scope | | unarchived, archived, or all. Overrides include_archived. Archived scope excludes files and tables. Collection navigation depends on content_type. |
+| include_archived | | Include archived documents when true (default false). |
 | page_size | | Opt into identity-bounded pages (1–200); do not combine with legacy limit/offset |
-| cursor | | Previous next_cursor for the same Vault, collection, depth and kind |
+| cursor | | Previous next_cursor for the same Vault, collection, depth, kind, archive scope and name query |
 
 ## Examples
 ```
@@ -865,6 +870,7 @@ akb_browse(vault="eng", content_type="tables")  # Only tables (collections suppr
 akb_browse(vault="eng", collection="specs")     # Drill into specs/, direct children
 akb_browse(vault="eng", depth=-1)               # Entire vault subtree (unbounded)
 akb_browse(vault="eng", depth=0)                # Strict: vault root contents only
+akb_browse(uri="akb://eng/coll/specs", name_query="설계", content_type="resources", archive_scope="all")
 ```
 
 ## Large Vaults

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import uuid
 from types import SimpleNamespace
@@ -304,7 +305,8 @@ async def test_catalog_name_search_filters_before_limit_and_escapes_wildcards(mo
     async with _fresh_database() as pool:
         vault = await _make_vault(pool, "browse-literal-name")
         async with pool.acquire() as conn:
-            for path, title in (("a.md", "Other"), ("b.md", "Literal 50%_\\ title"), ("c.md", "Literal 50abc title")):
+            for path, title in (("a.md", "Straße"), ("b.md", "Literal 50%_\\ title"), ("c.md", "Literal 50abc title"),
+                                ("d.md", "Straße"), ("e.md", "Strasse")):
                 await conn.execute("INSERT INTO documents(vault_id,path,title) VALUES($1,$2,$3)", vault, path, title)
             await conn.execute("INSERT INTO collections(vault_id,path,name) VALUES($1,'slug','Human name')", vault)
         async def get_pool():
@@ -315,3 +317,20 @@ async def test_catalog_name_search_filters_before_limit_and_escapes_wildcards(mo
         assert [item.path for item in page.items] == ["b.md"] and page.complete
         collection = await facade.browse("browse-literal-name", content_type="collections", page_size=1, name_query="human")
         assert [item.path for item in collection.items] == ["slug"] and collection.complete
+        # PostgreSQL ILIKE distinguishes these, even though Python casefold()
+        # maps both to "strasse". A position in one result set cannot page the other.
+        args = {"content_type": "resources", "page_size": 1}
+        first = await facade.browse("browse-literal-name", **args, name_query="Straße")
+        assert [item.path for item in first.items] == ["a.md"] and first.next_cursor
+        other = await facade.browse("browse-literal-name", **args, name_query="Strasse")
+        assert [item.path for item in other.items] == ["e.md"] and other.complete
+        with pytest.raises(ValidationError, match="cursor"):
+            await facade.browse("browse-literal-name", **args, name_query="Strasse", cursor=first.next_cursor)
+        # A pre-upgrade REST client can still finish its original named traversal.
+        old_scope = [str(vault), False, "", 1, "resources", "unarchived", "strasse"]
+        old_binding = hashlib.sha256(json.dumps(old_scope, separators=(",", ":")).encode()).hexdigest()
+        first_id = await pool.fetchval("SELECT id FROM documents WHERE vault_id=$1 AND path='a.md'", vault)
+        old_token = json.dumps([1, old_binding, 1, "a.md", str(first_id)]).encode()
+        old_cursor = base64.urlsafe_b64encode(old_token).decode().rstrip("=")
+        resumed = await facade.browse("browse-literal-name", **args, name_query="Straße", cursor=old_cursor)
+        assert [item.path for item in resumed.items] == ["d.md"] and resumed.complete

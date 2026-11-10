@@ -27,7 +27,12 @@ MAX_PAGE_BODY_BYTES = 16 * 1024 * 1024
 _KINDS = ("collection", "document", "table", "file")
 
 
-def _decode_cursor(cursor: str | None, scope: str) -> tuple[int, str, uuid.UUID] | None:
+def _cursor_binding(scope: list, query: str) -> str:
+    parts = [*scope, query] if query else scope
+    return hashlib.sha256(json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def _decode_cursor(cursor: str | None, scope: list, query: str) -> tuple[int, str, uuid.UUID] | None:
     if cursor is None:
         return None
     try:
@@ -35,7 +40,11 @@ def _decode_cursor(cursor: str | None, scope: str) -> tuple[int, str, uuid.UUID]
             raise ValueError
         raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
         version, bound_scope, kind, path, resource = json.loads(raw)
-        if type(version) is not int or version != 1 or bound_scope != scope or type(kind) is not int or not 0 <= kind < 4:
+        if type(version) is not int or version not in (1, 2) or type(kind) is not int or not 0 <= kind < 4:
+            raise ValueError
+        # Accept previously issued v1 positions. For new named pages bind the
+        # actual query: SQL ILIKE can distinguish strings with the same casefold.
+        if bound_scope != _cursor_binding(scope, query.casefold() if version == 1 else query):
             raise ValueError
         if not isinstance(path, str) or not isinstance(resource, str):
             raise ValueError
@@ -47,8 +56,10 @@ def _decode_cursor(cursor: str | None, scope: str) -> tuple[int, str, uuid.UUID]
         raise ValidationError("Invalid browse cursor; restart from the first page for this scope") from exc
 
 
-def _encode_cursor(scope: str, row: dict) -> str:
-    raw = json.dumps([1, scope, row["kind"], row["path"], str(row["id"])], ensure_ascii=False)
+def _encode_cursor(scope: list, query: str, row: dict) -> str:
+    version = 2 if query else 1
+    position = [version, _cursor_binding(scope, query), row["kind"], row["path"], str(row["id"])]
+    raw = json.dumps(position, ensure_ascii=False)
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
 
 
@@ -88,11 +99,8 @@ async def _browse_page(
     if vault_row is None:
         raise NotFoundError("Vault", vault)
     vault_id = vault_row["id"]
-    binding = hashlib.sha256(json.dumps(
-        [str(vault_id), native, prefix, depth, content_type, scope] + ([name_query.casefold()] if name_query else []),
-        ensure_ascii=False, separators=(",", ":"),
-    ).encode()).hexdigest()
-    after = _decode_cursor(cursor, binding)
+    cursor_scope = [str(vault_id), native, prefix, depth, content_type, scope]
+    after = _decode_cursor(cursor, cursor_scope, name_query)
     if prefix:
         root = await conn.fetchrow(
             "SELECT name, summary FROM collections WHERE vault_id = $1 AND path = $2", vault_id, prefix,
@@ -207,7 +215,7 @@ async def _browse_page(
         vault=vault, path=prefix, archive_scope=scope, context=context, items=items,
         scanned=len(selected), complete=not more,
         name_query=name_query or None,
-        next_cursor=_encode_cursor(binding, selected[-1]) if more else None,
+        next_cursor=_encode_cursor(cursor_scope, name_query, selected[-1]) if more else None,
         hint=(
             "More identities remain; follow next_cursor even when this page has no visible items. "
             "Use collection and depth=0 to drill down. Counts describe this page, not the whole Vault."
