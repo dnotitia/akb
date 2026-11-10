@@ -7,6 +7,11 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- MCP `akb_search` can filter documents by `created_at` or `updated_at` with
+  `source_type="document"` and `time_range`. The start (`gte`) is inclusive
+  and the end (`lt`) is exclusive. Dated responses echo the applied UTC
+  bounds and keep relevance ordering.
+
 - MCP `akb_browse` supports `name_query` to match names and paths, and
   `content_type="resources"` to list documents, tables and files without
   collection rows. Both use cursor paging with a default page size of 100.

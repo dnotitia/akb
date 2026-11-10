@@ -952,6 +952,9 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
         filters = SEARCH_FILTER_OPTIONS.validate_python(args, strict=True)
     except ModelValidationError as exc:
         return _invalid_filter_error(exc)
+    window = filters.get("time_range")
+    if window is not None and filters.get("source_type") != "document":
+        return err("time_range requires source_type='document'.", code=INVALID_ARGUMENT, field="/source_type")
     result = await search_service.search(
         query=args["query"],
         vault=args.get("vault"),
@@ -964,7 +967,10 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
         source_uris=args.get("source_uris"),
         **filters,
     )
-    return result.model_dump()
+    payload = result.model_dump()
+    if window is not None:
+        payload["time_range"] = window.model_dump(mode="json", exclude_none=True)
+    return payload
 
 
 @_h("akb_grep")

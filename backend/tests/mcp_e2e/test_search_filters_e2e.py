@@ -85,6 +85,8 @@ async def test_search_filters_intersect_readable_vaults(
     assert uris(archived) == {allowed["archive"]} and archived["archive_scope"] == "archived"
     only_hidden = await search(**{**combined, "source_uris": list(hidden.values())}, archive_scope="all")
     assert only_hidden["results"] == [] and only_hidden["total_matches"] == 0
+    dated = await search(**combined, time_range={"field": "created_at", "gte": "2000-01-01T00:00:00Z"})
+    assert uris(dated) == {allowed["note"], allowed["report"]}
     denied = await _call_json(secondary_mcp_client.client, runtime_session, "akb_search", {
         **args, **combined, "vault": private,
     }, expect_error=True)

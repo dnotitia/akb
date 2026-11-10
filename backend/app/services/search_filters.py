@@ -6,20 +6,24 @@ from typing import Literal, Self
 from pydantic import AwareDatetime, BaseModel, ConfigDict, field_validator, model_validator
 
 ArchiveScope = Literal["unarchived", "archived", "all"]
+DocumentTimeField = Literal["created_at", "updated_at"]
 
 
 class DocumentTimeRange(BaseModel):
     """Internal, half-open range on the current document's public timestamp."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-    field: Literal["created_at", "updated_at"]
+    field: DocumentTimeField
     gte: AwareDatetime | None = None
     lt: AwareDatetime | None = None
 
     @field_validator("gte", "lt")
     @classmethod
     def _utc(cls, value: datetime | None) -> datetime | None:
-        return value.astimezone(UTC) if value is not None else None
+        try:
+            return value.astimezone(UTC) if value is not None else None
+        except OverflowError as exc:
+            raise ValueError("Timestamp falls outside the supported UTC range") from exc
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Self:
