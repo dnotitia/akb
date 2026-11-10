@@ -1288,16 +1288,22 @@ akb_get(uri="akb://eng/doc/specs/api.md", version="abc123def456")
 
 Each document change creates a Git commit. Use akb_history to see all versions, then akb_get with version= to read any past version.""",
 
-    "akb_activity": """# akb_activity — Vault Activity History (Git-based)
+    "akb_activity": """# akb_activity — Vault Activity History
 
-Shows who changed what, when, and why. Each entry is a Git commit.
+Shows document revision activity, newest first. An author filter matches a
+case-insensitive substring of either the author or the recorded agent.
 
 ```
 akb_activity(vault="eng")                              # All activity
 akb_activity(vault="eng", collection="specs")          # Only specs/ changes
 akb_activity(vault="eng", author="김영로")              # By author
 akb_activity(vault="eng", since="2026-04-01", limit=5) # Since date
+akb_activity(vault="eng", author="김", since="2026-04-01", until="2026-05-01T00:00:00Z")
 ```
+
+When using `until`, supply an RFC 3339 timestamp with an offset and up to six fractional
+digits. The end is exclusive. A paired `since` is inclusive; a date or a
+timezone-free start uses UTC. `truncated` indicates additional matching entries.
 
 Each entry includes:
 - hash: commit hash (use with akb_diff)

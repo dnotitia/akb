@@ -32,7 +32,7 @@ ID parameter (`todo_id`, publication `slug`); these are not
 URI-addressable.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Literal, NotRequired, TypedDict
 
 from mcp.types import Tool
@@ -55,14 +55,34 @@ _TimestampText = Annotated[str, Field(
              r"(\.[0-9]{1,6})?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$"),
     json_schema_extra={"format": "date-time"},
 )]
-_SearchInstant = Annotated[datetime, ValidateAs(_TimestampText, lambda s: datetime.fromisoformat(s.upper()))]
+
+
+def _utc_instant(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value.upper()).astimezone(UTC)
+    except OverflowError as exc:
+        raise ValueError("Timestamp falls outside the supported UTC range") from exc
+
+
+_UtcInstant = Annotated[datetime, ValidateAs(_TimestampText, _utc_instant)]
 
 
 @with_config(ConfigDict(extra="forbid", json_schema_extra={"anyOf": [{"required": ["gte"]}, {"required": ["lt"]}]}))
 class _TimeRangeInput(TypedDict):
     field: DocumentTimeField
-    gte: NotRequired[_SearchInstant]
-    lt: NotRequired[_SearchInstant]
+    gte: NotRequired[_UtcInstant]
+    lt: NotRequired[_UtcInstant]
+
+
+class _ActivityOptions(TypedDict, total=False):
+    collection: Annotated[str, Field(description="Limit activity to the collection path and its descendants.")]
+    since: Annotated[str, Field(description="Inclusive start as an ISO date or datetime, e.g. 2026-04-01.")]
+    author: Annotated[str, Field(description="Case-insensitive literal substring of the author or recorded agent.")]
+    until: Annotated[_UtcInstant, Field(description="Exclusive activity end, as RFC 3339 with an offset.")]
+    limit: Annotated[int, Field(ge=1, le=100, json_schema_extra={"default": 20})]
+
+
+ACTIVITY_OPTIONS = TypeAdapter(_ActivityOptions)
 
 
 class _SearchFilterOptions(TypedDict, total=False):
@@ -701,17 +721,14 @@ TOOLS = [
         name="akb_activity",
         description=(
             "Get activity history for a vault — who changed what, when, and why. "
-            "Returns Git commit history with changed file list. "
+            "Returns document revision activity with changed files. "
             "Use akb_diff to see the actual content changes for a specific commit."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
-                "collection": {"type": "string", "description": "Filter by collection path prefix"},
-                "author": {"type": "string", "description": "Filter by author name"},
-                "since": {"type": "string", "description": "ISO datetime to filter from (e.g. 2026-04-01)"},
-                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+                **ACTIVITY_OPTIONS.json_schema()["properties"],
             },
             "required": ["vault"],
         },

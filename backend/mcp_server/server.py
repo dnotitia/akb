@@ -19,6 +19,7 @@ import logging
 import sys
 import time
 import uuid
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 from pydantic import ValidationError as ModelValidationError
@@ -76,7 +77,8 @@ from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
-from mcp_server.tools import BROWSE_FILTER_OPTIONS, DOCUMENT_TITLE_POLICY, SEARCH_FILTER_OPTIONS, TOOLS, available_tools
+from app.services.activity_filters import parse_activity_since
+from mcp_server.tools import ACTIVITY_OPTIONS, BROWSE_FILTER_OPTIONS, DOCUMENT_TITLE_POLICY, SEARCH_FILTER_OPTIONS, TOOLS, available_tools
 from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
@@ -1160,27 +1162,27 @@ def _sub_sections_of(section_paths: list[str], parent: str | None) -> list[str]:
 @_h("akb_activity")
 async def _handle_activity(args: dict, uid: str, user: _MCPUser) -> dict:
     await check_vault_access(uid, args["vault"], required_role="reader")
-    limit = args.get("limit", 20)
-    # Peek one past the limit so we can flag truncation without a
-    # separate `git rev-list --count` walk (which would re-traverse the
-    # whole vault log just to answer "is there more?"). The trade-off:
-    # `truncated` reflects what git would have produced *before* the
-    # post-fetch author filter below — i.e. when truncated=True the
-    # caller knows commits exist past the window, but cannot tell
-    # without paging whether they would survive the author filter.
+    try:
+        options = ACTIVITY_OPTIONS.validate_python(args, strict=True)
+    except ModelValidationError as exc:
+        return _invalid_filter_error(exc)
+    limit = options.get("limit", 20)
+    since = options.get("since")
+    until = options.get("until")
+    if until is not None and since is not None:
+        try:
+            start = parse_activity_since(since).astimezone(UTC)
+        except (ValueError, OverflowError):
+            return err("since must be an ISO date or datetime when used with until.",
+                       code=INVALID_ARGUMENT, field="/since")
+        if start >= until:
+            return err("since must precede until.", code=INVALID_ARGUMENT, field="/until")
     entries = await revision_backend.vault_activity(
-        args["vault"],
-        max_count=limit + 1,
-        since=args.get("since"),
-        path=args.get("collection"),  # Git-native path filter (like git log -- <path>)
+        args["vault"], max_count=limit + 1, since=since, path=options.get("collection") or None,
+        author=options.get("author"), until=until,
     )
     truncated = len(entries) > limit
-    if truncated:
-        entries = entries[:limit]
-    # Filter by author (post-filter, Git doesn't support Korean author filter well)
-    author = args.get("author")
-    if author:
-        entries = [e for e in entries if author.lower() in e.get("agent", "").lower() or author.lower() in e.get("author", "").lower()]
+    entries = entries[:limit]
     return {
         "vault": args["vault"],
         "activity": entries,
