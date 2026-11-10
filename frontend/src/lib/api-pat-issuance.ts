@@ -19,7 +19,7 @@ export interface PatReceipt extends PatMetadata {
   verified: boolean;
 }
 export class UnverifiedPatReceipt extends Error {
-  constructor(public tokenId: string | null) { super("Creation result needs checking. Review your tokens before trying again; a token may have been created."); }
+  constructor(public tokenId: string | null) { super("We could not confirm whether the key was created. Review your connection keys before trying again."); }
 }
 const record = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === "string");

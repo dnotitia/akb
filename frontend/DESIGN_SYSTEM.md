@@ -64,14 +64,34 @@ Settings shortcuts. They wrap instead of filling equal-width columns; touch
 targets remain 44px. These remain native radio groups because they select form
 values. Switching choices preserves the current credential draft and receipt.
 
-The connection flow is Prepare access → Configure the selected tool → Try the
-connection. Tool selection lives inside Configure. A sticky three-step navigator
-tracks the visible or focused section and moves keyboard focus to the chosen
-heading. All sections remain mounted, including credential drafts and one-time
-receipts. The current card has a quiet teal perimeter and header tint; this
-indicates reading position, never completion or a verified external connection.
-When a selected tool needs a different access method, Configure offers a return
-to Prepare access without resetting the draft.
+AI connections uses three explicit stages: Choose a tool → Add AKB → Check in
+that tool. Only the selected stage is visible; inactive stages and an opened
+credential form stay mounted, hidden and inert so drafts and one-time secrets
+survive navigation. The step bar describes navigation, not completion, and
+scrolling never changes it. Navigation moves focus to the selected heading.
+Tool selection precedes the sign-in/key choice. Key creation and existing-key
+entry are separate choices within the key method. Each client guide states
+where to act, what to do, and where the result appears. Unsupported presets
+never imply that the client itself lacks a protocol capability.
+
+A created key remains available in memory until setup is closed or the verified
+account/session changes. Hide/show removes or reveals secret-bearing content;
+a saved acknowledgement never destroys configuration mid-setup. Clipboard
+success means copied text only. A user-confirmed result is labelled as such,
+never presented as browser-verified connectivity. Existing issuance ownership,
+revocation, uncertain-result and unfinished-work guards remain authoritative.
+Setup and Connection keys use separate views without unmounting their state.
+The key-list recovery link preserves the stable tokens route and selects key
+management using `connectionView=keys`.
+
+Help is one shared task guide available from the desktop sidebar and account
+menu, including narrow screens. Its initial choices are Find a document, Write
+and organise, Use AKB in an AI tool, and Solve a problem. Details use short
+instructions and a real destination action. Header/back/dismissal stay visible
+while the body scrolls. Moving to Settings closes Help before opening the next
+modal and retains the original trigger for focus restoration. Help and setup
+share symptom-based connection troubleshooting. Technical definitions stay
+next to the relevant task instead of filling the initial Help screen.
 
 ### Compact Vault library
 

@@ -1,5 +1,5 @@
 import { Activity, useCallback, useEffect, useRef, useState } from "react";
-import { useNavigate, type NavigateOptions } from "react-router-dom";
+import { useLocation, useNavigate, type NavigateOptions } from "react-router-dom";
 import { useResourceNavigation, useResourceNavigationGuard } from "@/contexts/resource-navigation-context";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import { useDocumentHistoryGuard } from "@/hooks/use-document-history-guard";
@@ -28,6 +28,8 @@ type Pending = { type: "close" } | { type: "tab"; tab: TabId } | { type: "naviga
 export default function SettingsDialog({ initialTab = "profile", onClose, onNavigate, onRestoreFocus }: {
   initialTab?: string; onClose: () => void; onNavigate?: () => void; onRestoreFocus?: () => void;
 }) {
+  const settingsLocation = useLocation();
+  const connectionView = settingsLocation.pathname === "/settings" && new URLSearchParams(settingsLocation.search).get("connectionView") === "keys" ? "keys" : "setup";
   const navigate = useNavigate();
   const { completeSessionNavigation } = useResourceNavigation();
   const { checking, revision } = useAccessVerification();
@@ -191,13 +193,13 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
           <Activity mode={verified ? "visible" : "hidden"}><div>{user && <>
             <TabsContent value="preferences" className="pt-0"><PreferencesSection /></TabsContent>
             <TabsContent value="notifications" className="pt-0"><NotificationsSection onBusyChange={reportBusy} /></TabsContent>
-            <TabsContent value="tokens" className="pt-0"><TokensSection key={user.user_id} visible={verified} ownsOperation={ownsOperation} pats={pats} patsError={patsError} patsLoading={patsLoading} mcpOauthEnabled={authConfig?.available === true && authConfig.mcp_oauth.enabled} onReloadPats={loadPATs} onDirtyChange={reportDirty} onBusyChange={reportBusy} /></TabsContent>
+            <TabsContent value="tokens" className="pt-0"><TokensSection initialView={connectionView} key={user.user_id} visible={verified} ownsOperation={ownsOperation} pats={pats} patsError={patsError} patsLoading={patsLoading} mcpOauthEnabled={authConfig?.available === true && authConfig.mcp_oauth.enabled} onReloadPats={loadPATs} onDirtyChange={reportDirty} onBusyChange={reportBusy} /></TabsContent>
           </>}</div></Activity>
         </div>
       </Tabs>
       <ConfirmDialog open={verified && pending !== null} onOpenChange={open => { if (!open) setPending(null); }} returnFocusRef={confirmFocus}
-        title={activeTab === "tokens" ? "Leave agent connections?" : "Discard unsaved changes?"}
-        description={activeTab === "tokens" ? "Unfinished token setup will be cleared. If you created a token, copy and store its secret first; it cannot be retrieved again. Leaving does not revoke it." : "Your profile, photo or password changes have not been saved. Keep editing, or discard them to continue."}
+        title={activeTab === "tokens" ? "Leave AI connections?" : "Discard unsaved changes?"}
+        description={activeTab === "tokens" ? "Unfinished connection setup will be cleared. Save any new key or its configuration privately first; it cannot be shown again. Existing keys remain active." : "Your profile, photo or password changes have not been saved. Keep editing, or discard them to continue."}
         confirmLabel={activeTab === "tokens" ? "Leave section" : "Discard changes"} cancelLabel={activeTab === "tokens" ? "Stay here" : "Keep editing"} variant="destructive"
         onConfirm={() => { if (pending) { setDirty(false); execute(pending); } }} />
     </DialogContent>

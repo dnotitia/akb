@@ -1,4 +1,4 @@
-import { useState, type FocusEvent, type RefObject } from "react";
+import { useCallback, useState, type FocusEvent, type RefObject } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -30,10 +30,13 @@ export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthE
   returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const [hasSecret, setHasSecret] = useState(false);
+  const [createdSecret, setCreatedSecret] = useState(false);
   const [busy, setBusy] = useState(false);
   const [confirmClose, setConfirmClose] = useState(false);
+  const reportDirty = useCallback((dirty: boolean) => { setHasSecret(dirty); if (!dirty) setCreatedSecret(false); }, []);
   function close() {
     setHasSecret(false);
+    setCreatedSecret(false);
     setConfirmClose(false);
     onOpenChange(false);
   }
@@ -45,7 +48,7 @@ export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthE
   }
   return <>
     <Dialog open={open} onOpenChange={requestClose}>
-      <DialogContent className="flex max-w-3xl flex-col gap-0 overflow-hidden p-0" onCloseAutoFocus={event => {
+      <DialogContent className="connection-dialog flex max-w-3xl flex-col gap-0 overflow-hidden p-0" onCloseAutoFocus={event => {
         if (!returnFocusRef) return;
         event.preventDefault();
         // The floating trigger becomes visible after the last modal releases
@@ -55,14 +58,14 @@ export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthE
           if (target?.isConnected && !isModalOpen()) target.focus({ preventScroll: true });
         });
       }}>
-        <DialogHeader className="shrink-0 border-b border-border px-5 py-5 pr-12 sm:px-7 sm:pr-12">
-          <DialogTitle>Connect an agent</DialogTitle>
-          <DialogDescription>Choose your tool. Follow the three steps below.</DialogDescription>
+        <DialogHeader className="shrink-0 border-b border-border px-5 py-5 pr-14 sm:px-7 sm:pr-14">
+          <DialogTitle>Connect an AI tool</DialogTitle>
+          <DialogDescription>Choose your tool, add AKB, then check the result in that tool.</DialogDescription>
         </DialogHeader>
-        {open && <div data-connection-scroll className="min-h-0 overflow-y-auto px-5 pt-5 sm:px-7" onFocusCapture={revealSetupFocus}><ConnectionSetup mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onTokenCreated} onDirtyChange={setHasSecret} onBusyChange={setBusy} /></div>}
-        <DialogFooter className="shrink-0 border-t border-border px-5 py-3 sm:px-7"><Button variant="outline" disabled={busy} onClick={() => requestClose(false)}>Close</Button></DialogFooter>
+        {open && <div data-connection-scroll className="min-h-0 overflow-y-auto px-5 pt-5 sm:px-7" onFocusCapture={revealSetupFocus}><ConnectionSetup mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onTokenCreated} onDirtyChange={reportDirty} onSecretCreated={() => setCreatedSecret(true)} onBusyChange={setBusy} /></div>}
+        <DialogFooter className="connection-dialog-footer shrink-0 border-t border-border px-5 py-3 sm:px-7"><Button variant="outline" disabled={busy} onClick={() => requestClose(false)}>Close</Button></DialogFooter>
       </DialogContent>
     </Dialog>
-    <ConfirmDialog open={confirmClose} onOpenChange={setConfirmClose} title="Have you saved your token?" description="Unsaved token options will be discarded. Any new token cannot be shown again after closing; save it or its configuration somewhere private first. Closing does not revoke it." confirmLabel="I've saved it — close" cancelLabel="Keep setup open" onConfirm={close} />
+    <ConfirmDialog className="connection-confirmation" open={confirmClose} onOpenChange={setConfirmClose} title={createdSecret ? "Have you saved your connection key?" : "Leave connection setup?"} description={createdSecret ? "Save the key or its configuration privately before closing. The new key cannot be shown again here. Closing does not revoke it." : "Your setup draft and any entered key will be cleared from this window. Existing keys and connections remain active."} confirmLabel={createdSecret ? "I've saved it — close" : "Leave setup"} cancelLabel="Keep setup open" onConfirm={close} />
   </>;
 }

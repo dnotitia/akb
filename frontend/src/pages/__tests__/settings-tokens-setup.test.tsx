@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
 import SettingsDialog from "../settings/settings-dialog";
 
 vi.mock("@/lib/api", async () => ({
@@ -60,21 +61,26 @@ describe("Shared connection setup", () => {
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
     (listPATs as any).mockResolvedValue({ tokens: [] });
     render(wrap());
-    expect(await screen.findByText("No tokens yet")).toBeVisible();
+    await screen.findByRole("heading", { name: "AI connections" });
+    expect(screen.getAllByRole("heading", { level: 3 })).toHaveLength(1);
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Connection keys" }));
+    expect(await screen.findByText("No connection keys yet")).toBeVisible();
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Connection setup" }));
     expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
-    expect(screen.getByRole("heading", { name: "1. Prepare access" })).toBeVisible();
-    expect(screen.getByRole("heading", { name: /2. Configure/ })).toBeVisible();
-    expect(screen.getByRole("heading", { name: "3. Try it in your agent" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "1. Choose your AI tool" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "3. Check the connection" })).toBeNull();
   });
 
-  it("keeps all setup phases visible even when the user has a PAT", async () => {
+  it("keeps setup and key management separately available with an existing PAT", async () => {
     const { listPATs, getMe } = await import("@/lib/api");
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
     (listPATs as any).mockResolvedValue({
       tokens: [{ token_id: "t1", name: "claude", prefix: "akb_xyz", created_at: "2026-05-19", last_used_at: null }],
     });
     render(wrap());
+    await userEvent.setup().click(await screen.findByRole("tab", { name: "Connection keys" }));
     expect(await screen.findByText(/claude/)).toBeVisible();
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Connection setup" }));
     expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
   });
 
@@ -86,7 +92,7 @@ describe("Shared connection setup", () => {
       tokens: [{ token_id: "t1", name: "claude", prefix: "akb_xyz", created_at: "2026-05-19", last_used_at: null }],
     });
     render(wrap());
-    await screen.findByRole("heading", { name: "Agent connections" });
+    await screen.findByRole("heading", { name: "AI connections" });
     expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
     expect(screen.queryByText(/akb_xyz…/)).not.toBeInTheDocument();
   });
@@ -117,7 +123,8 @@ describe("Shared connection setup", () => {
 
     render(wrap());
 
+    await userEvent.setup().click(await screen.findByRole("tab", { name: "Connection keys" }));
     expect(await screen.findByText("automation")).toBeVisible();
-    expect(screen.getByRole("button", { name: /revoke token automation/i })).toBeVisible();
+    expect(screen.getByRole("button", { name: /revoke key automation/i })).toBeVisible();
   });
 });

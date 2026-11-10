@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   ChevronDown,
+  CircleHelp,
   LogOut,
   Settings as SettingsIcon,
 } from "lucide-react";
@@ -14,6 +15,7 @@ import { useSettingsDialog } from "@/contexts/settings-dialog-context";
 import { useResourceNavigation } from "@/contexts/resource-navigation-context";
 import { useCurrentUser, useAccessVerification } from "@/contexts/current-user-context";
 import { clearReadingSessions } from "@/lib/reading-session";
+import { HelpDialog } from "@/components/help-dialog";
 import { UserAvatar } from "@/components/user-avatar";
 
 const THEME_LABELS: Record<Theme, string> = {
@@ -34,6 +36,8 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
   const { completeSessionNavigation } = useResourceNavigation();
   const settings = useSettingsDialog();
   const settingsRequested = useRef(false);
+  const helpRequested = useRef(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
   const queryClient = useQueryClient();
   const { theme, setTheme } = useTheme();
@@ -81,6 +85,7 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
     : label;
 
   return (
+    <>
     <DropdownMenu.Root
       // The account menu is a lightweight popover, not a modal task. Radix's
       // modal default locks document scrolling, removing the viewport scrollbar
@@ -107,6 +112,11 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
       <DropdownMenu.Portal>
         <DropdownMenu.Content
           onCloseAutoFocus={event => {
+            if (helpRequested.current) {
+              event.preventDefault(); helpRequested.current = false;
+              requestAnimationFrame(() => setHelpOpen(true));
+              return;
+            }
             if (!settingsRequested.current) return;
             event.preventDefault(); settingsRequested.current = false;
             requestAnimationFrame(() => settings ? settings.openSettings("profile", trigger.current) : navigate("/settings"));
@@ -175,6 +185,11 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
 
           <DropdownMenu.Separator className="h-px bg-border my-1" />
 
+          <DropdownMenu.Item onSelect={() => { helpRequested.current = true; }}
+            className="flex min-h-11 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover">
+            <CircleHelp className="h-4 w-4 text-foreground-muted" aria-hidden /><span>Help</span>
+          </DropdownMenu.Item>
+
           {signOutError && (
             <div className="px-3 py-2 text-xs text-destructive" role="alert">
               {signOutError}
@@ -195,5 +210,7 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
+    <HelpDialog open={helpOpen} onOpenChange={setHelpOpen} returnFocusRef={trigger} />
+    </>
   );
 }
