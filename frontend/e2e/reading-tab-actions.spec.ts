@@ -134,3 +134,32 @@ for (const width of [390, 1440]) test(`common menus and undo stay usable at ${wi
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("closed-tabs-undo.png") });
 });
+
+test.describe("short touch viewport", () => {
+  test.use({ viewport: { width: 812, height: 375 }, hasTouch: true, isMobile: true });
+  test("keeps the last command reachable in both common menus", async ({ page }, testInfo) => {
+    await setup(page);
+    await page.getByRole("button", { name: "Close Document 4", exact: true }).click();
+    for (const surface of ["context", "list"]) {
+      if (surface === "context") await page.getByRole("tab", { name: "Reading workflow", exact: true }).click({ button: "right" });
+      else {
+        await page.getByRole("button", { name: "Open document list", exact: true }).click();
+        await page.getByRole("button", { name: "Tab actions for Reading workflow", exact: true }).click();
+      }
+      const menu = page.getByRole("menu", { name: "Tab actions for Reading workflow", exact: true });
+      await expect(menu).toBeVisible();
+      const bounds = await menu.boundingBox();
+      expect(bounds!.y).toBeGreaterThanOrEqual(11);
+      expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(364);
+      expect(await menu.evaluate(node => node.scrollHeight > node.clientHeight)).toBe(true);
+      await menu.press("End");
+      const undo = menu.getByRole("menuitem", { name: "Undo close tab", exact: true });
+      await expect(undo).toBeFocused();
+      await expect(undo).toBeInViewport();
+      await page.screenshot({ path: testInfo.outputPath(`tab-menu-${surface}-landscape.png`) });
+      if (surface === "context") await page.keyboard.press("Escape");
+      else await undo.click();
+    }
+    await expect(page.locator('.reading-tabs [role="tab"]')).toHaveCount(4);
+  });
+});

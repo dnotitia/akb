@@ -204,7 +204,9 @@ The tab context menu (right-click, long-press or Shift+F10) and list-row menu
 share close, close others, close left/right, close all, side reading and reorder
 actions. The list header's actions use the current tab as their reference.
 Empty scopes are disabled. Menu focus is released before an editor exit guard
-opens; cancelling leaves every tab unchanged. A close affecting the active
+opens. Both menu surfaces fit the available viewport height and scroll commands
+internally, preserving touch targets and keyboard access on short screens. The guard
+can be cancelled without changing any tab. A close affecting the active
 document commits once, only after guarded navigation succeeds. Closing the last
 tab returns to its Vault and focuses the main landmark. Historical navigation
 state cannot replay a consumed close operation.
