@@ -153,3 +153,84 @@ servers and runs every backend test outside `backend/tests/mcp_e2e` that does
 not declare `@pytest.mark.needs_resource`, failing on any skip, so these suites
 cannot skip in both CI jobs.
 For UI and repository checks, follow [CONTRIBUTING.md](../../CONTRIBUTING.md).
+
+## Document time windows in the storage service
+
+`SearchService.search` accepts an internal `DocumentTimeRange` with
+`source_type="document"`. MCP and REST discovery do not advertise this input.
+Both endpoints of the range are timezone-aware instants. Supply at least one
+of `gte` (inclusive) and `lt` (exclusive). Two bounds must form a nonempty
+interval. Conversion to UTC preserves the instant, including at day boundaries.
+
+Use the clocks returned by a **current document read**:
+
+| Operation | `created_at` | `updated_at` |
+| --- | --- | --- |
+| Create, including import as a new OKF document | AKB creation time; OKF's source timestamp is informational | Initial write |
+| Edit body or update tags/metadata through the document service | Preserved | New document revision |
+| Move to a new path with the same resource identity | Preserved | Move revision, even when body bytes are identical |
+| Rebuild derived chunks or process a Native indexing intent | Preserved | Preserved |
+| Bare Git external mirror catalog upsert | First local sync of that document | Timestamp supplied by the updating sync |
+
+On **Bare Git**, both fields come from the PostgreSQL `documents` row. The Git
+author/committer date and the indexing worker's completion time do not enter
+the predicate.
+
+On **Native**, creation time follows the current head's `created_at`
+frontmatter, with missing metadata filled from a matching frozen legacy row
+after cutover. When neither supplies a value, the resource's creation time
+applies. An imported creation instant may precede the Native resource by
+years. Updated time is `native_resources.updated_at`, the authority clock for
+the published head. A move advances that clock even when the moved payload
+still contains an older frontmatter timestamp.
+
+### Selection and limits
+
+The service intersects the time predicate, readable Vaults, document filters
+and any explicit source URIs before dense/sparse retrieval and reranking.
+The driver receives eligible source IDs and the active document source kind.
+An empty candidate set returns immediately. A driver that returns an ID or kind
+outside the requested scope fails the operation. Hydration also checks the
+current timestamp, so a write that leaves the window during retrieval cannot
+surface as an in-window result.
+
+- Bare Git binds the bounds in catalog SQL. It fetches at most 10,001 IDs to
+  distinguish a supported set of up to 10,000 from a scope that needs narrowing.
+- Native filters `updated_at` in SQL. To match public creation dates and
+  imported metadata, it verifies canonical head bodies in the bounded scope.
+  The candidate transaction refuses scopes above 10,000 resources or 128 MiB
+  of canonical bodies before fetching payload bytes. A missing canonical body
+  or an ambiguous creation timestamp fails explicitly.
+- The date request uses `search_retrieval_timeout_secs` (default 30 seconds)
+  as an overall deadline, including candidate reads and pool waits. A caller
+  cancellation propagates. The integration suite also holds a real catalog
+  lock to exercise timeout, cancellation and pool reuse.
+- pgvector receives the ID and kind predicates on its dense and sparse legs.
+  Qdrant translates these to payload filters and Seahorse Cloud, REST and gRPC
+  use their shared SQL filter builder. These drivers reuse existing retrieval
+  failure/degradation handling. No retry broadens the query by dropping the
+  scope. The integration measurement below uses live pgvector; external
+  driver verification covers request construction in their contract suites.
+
+### Local fixture measurement
+
+`tests/test_document_search_time_postgres.py` exercises both document
+services on disposable PostgreSQL, real Bare Git repositories and a real
+pgvector index. The ranking fixture contains 53 better-scoring, out-of-window
+documents (per-leg prefetch 50), one eligible weaker hit, one same-Vault
+document omitted from the requested URIs, and one matching private document.
+The owner/read scope and source URIs leave 54 readable, requested documents
+before the date test. Each dated query returns exactly the weaker hit.
+
+One local run used fixed query features, a two-dimensional pgvector arrays
+index, reranking disabled, limit 1, one warm-up and 20 measured service calls
+per case. p95 is the 19th sorted observation. Bytes below are canonical
+**candidate** body bytes read, excluding final hit hydration. These timings
+describe this fixture only.
+
+| Storage | Field | Candidate body bytes | Eligible IDs sent | Service p95 |
+| --- | --- | ---: | ---: | ---: |
+| Bare Git | created_at | 0 | 1 | 37.54 ms |
+| Bare Git | updated_at | 0 | 1 | 33.76 ms |
+| Native | created_at | 9,864 (54 heads) | 1 | 46.62 ms |
+| Native | updated_at | 175 (1 head) | 1 | 36.93 ms |
