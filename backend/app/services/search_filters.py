@@ -1,8 +1,43 @@
 """Small shared predicates for search scope; values always remain bound parameters."""
 
-from typing import Literal
+from datetime import UTC, datetime
+from typing import Literal, Self
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, field_validator, model_validator
 
 ArchiveScope = Literal["unarchived", "archived", "all"]
+
+
+class DocumentTimeRange(BaseModel):
+    """Internal, half-open range on the current document's public timestamp."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    field: Literal["created_at", "updated_at"]
+    gte: AwareDatetime | None = None
+    lt: AwareDatetime | None = None
+
+    @field_validator("gte", "lt")
+    @classmethod
+    def _utc(cls, value: datetime | None) -> datetime | None:
+        return value.astimezone(UTC) if value is not None else None
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        if self.gte is None and self.lt is None:
+            raise ValueError("A document time range requires at least one bound")
+        if self.gte is not None and self.lt is not None and self.gte >= self.lt:
+            raise ValueError("gte must precede lt")
+        return self
+
+    def includes(self, stamp: datetime) -> bool:
+        return (self.gte is None or stamp >= self.gte) and (self.lt is None or stamp < self.lt)
+
+    def add_predicates(self, column: str, conditions: list[str], params: list) -> None:
+        """The caller supplies a repository-owned column. Only values are bound."""
+        for operator, bound in ((">=", self.gte), ("<", self.lt)):
+            if bound is not None:
+                params.append(bound)
+                conditions.append(f"{column} {operator} ${len(params)}::timestamptz")
 
 
 def resolve_archive_scope(scope: ArchiveScope | None, include_archived: bool) -> ArchiveScope:
