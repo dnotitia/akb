@@ -162,5 +162,10 @@ async def test_native_source_scope_preserves_pairs_ids_acl_lifecycle_and_archive
         scope_conn, uris, user_uuid=_USER, is_admin=False, archive_scope="archived",
     )
     assert archived == [str(uuid.UUID(int=60_004))]
+    filtered, _ = await _candidates(
+        scope_conn, uris, user_uuid=_USER, is_admin=False, doc_type="note",
+        doc_types=["report", "note"], archive_scope="all",
+    )
+    assert filtered == [str(uuid.UUID(int=i)) for i in (60_001, 60_003, 60_004)]
     scoped, _ = await _candidates(scope_conn, uris, vaults=["b"])
     assert scoped == [str(uuid.UUID(int=1))]

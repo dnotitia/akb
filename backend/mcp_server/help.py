@@ -192,6 +192,7 @@ Combines **vector similarity** (semantic meaning) with **keyword matching**.
 ```
 akb_search(query="how does authentication work")
 akb_search(query="gRPC vs REST", vault="engineering", type="decision")
+akb_search(query="gRPC", doc_types=["spec", "decision"], archive_scope="archived")
 akb_search(query="invoice", tags=["finance"])
 # restrict to a known set of resources (hybrid retrieval runs only inside them):
 akb_search(query="auth flow", source_uris=[
@@ -210,7 +211,7 @@ akb_search(query="auth flow", source_uris=[
 - `vault`, `path`, `tags`, `doc_type`: metadata
 
 `akb_search` surfaces documents **and** tables **and** files in one
-ranked list. Filter by `type="document"|"table"|"file"` to narrow.
+ranked list. Use `source_type="document"`, `"table"`, or `"file"` to select a resource kind.
 
 ## akb_browse — Tree Navigation
 When you want to **see everything** rather than search:
@@ -890,7 +891,12 @@ Combines vector similarity (meaning) with keyword matching.
 | query | ✓ | Natural language search query |
 | vault | | Limit to specific vault |
 | collection | | Limit to specific collection |
-| type | | Filter by type (any string); common: note, report, decision, spec, plan, session, task, reference, skill |
+| type | | Existing single type filter, e.g. `note`, `report`, or `decision` |
+| doc_types | | Match documents of any listed type. An empty list adds no restriction. |
+| source_type | | Restrict the resource kind to `document`, `file`, or `table`. |
+| archive_scope | | `unarchived`, `archived`, or `all`. An explicit scope overrides `include_archived`. Archived-only searches return documents. |
+| include_archived | | Include archived documents when true (default false). |
+| source_uris | | Restrict candidates to these resource URIs. Omit or pass an empty list for the usual search scope. |
 | tags | | Filter by tags |
 | limit | | Max results (default 10, max 50) |
 
@@ -899,7 +905,11 @@ Combines vector similarity (meaning) with keyword matching.
 akb_search(query="deployment process")
 akb_search(query="인증 흐름", vault="eng", type="spec")
 akb_search(query="budget", tags=["finance"], limit=5)
+akb_search(query="release", source_type="document", doc_types=["decision", "report"], archive_scope="all")
 ```
+
+Filters intersect with the caller's readable vaults and with each other. For example,
+`type="report"` together with `doc_types=["report", "note"]` selects only reports.
 
 ## Result Fields
 - `uri`: AKB URI — pass to akb_get / akb_drill_down (docs), akb_get_file (files), akb_sql (tables)
@@ -907,7 +917,7 @@ akb_search(query="budget", tags=["finance"], limit=5)
 - `score`: relevance (0.0-1.0)
 - `matched_section`: the most relevant chunk
 - `source_type`: `"document"`, `"table"`, or `"file"`
-- `vault`, `collection`, `type`, `tags`: metadata""",
+- `vault`, `collection`, `doc_type`, `tags`: metadata""",
 
     "akb_grep": """# akb_grep — Exact Text / Regex Search & Replace
 
