@@ -675,6 +675,7 @@ akb_help(topic="link-resources")    # Workflow guide
 | vault | ✓ | Target vault name |
 | collection | ✓ | Directory path (e.g. "api-specs", "meeting-notes"). `overview` is a reserved system collection (vault-skill only) |
 | title | ✓ | Document title |
+| title_conflict_policy | | `allow` (default) keeps duplicate titles. `reject` checks for an existing title in the target collection before creating the document. |
 | slug | | Optional filename slug. When omitted, the path is derived from `title`; pass this to pin a stable URI filename independently of the display title. |
 | content | ✓ | Markdown body |
 | type | | free-form except reserved `skill`; recommended: note, report, decision, spec, plan, session, task, reference |
@@ -755,6 +756,7 @@ an already-composed stale body. No automatic merge or force overwrite occurs.
 | uri | ✓ | Document AKB URI |
 | content | | New Markdown body (replaces existing) |
 | title | | New title |
+| title_conflict_policy | | `allow` (default) or `reject`. When supplying a title, `reject` checks other documents in this collection. |
 | status | | draft (default), active, archived |
 | tags | | New tag list (replaces existing) |
 | summary | | New summary |
@@ -932,6 +934,20 @@ even for an empty page. Hits are ranked by relevance.
 - `matched_section`: the most relevant chunk
 - `source_type`: `"document"`, `"table"`, or `"file"`
 - `vault`, `collection`, `doc_type`, `tags`: metadata""",
+
+    "akb_move": """# akb_move — Move a Document
+
+Supply the document's `uri` and a new `collection`, `slug`, or both.
+Use `title_conflict_policy="reject"` to check the document's display title in
+the destination collection. A match returns `document_title_conflict` with
+the existing path and title. The source document stays at its original path.
+The default `allow` permits duplicate titles. An explicitly chosen slug
+must still be free.
+
+```
+akb_move(uri="akb://eng/coll/drafts/doc/api-guide.md", collection="guides",
+         title_conflict_policy="reject")
+```""",
 
     "akb_grep": """# akb_grep — Exact Text / Regex Search & Replace
 

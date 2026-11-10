@@ -38,6 +38,7 @@ from typing import Annotated, Literal, NotRequired, TypedDict
 from mcp.types import Tool
 from pydantic import ConfigDict, Field, TypeAdapter, ValidateAs, with_config
 from app.config import settings
+from app.models.document import TitleConflictPolicy
 from app.models.document_preconditions import BODY_UPDATE_CONDITION, CONTENT_HASH_PATTERN, REVISION_PATTERN
 
 from app.services import template_registry
@@ -99,6 +100,16 @@ class _BrowseFilterOptions(TypedDict, total=False):
 
 
 BROWSE_FILTER_OPTIONS = TypeAdapter(_BrowseFilterOptions)
+
+DOCUMENT_TITLE_POLICY = {
+    **TypeAdapter(TitleConflictPolicy).json_schema(),
+    "default": "allow",
+    "description": (
+        "Allow duplicate display titles (default), or reject when another document in the destination "
+        "collection already has the same title. On update this check runs only when a title is supplied. "
+        "An explicit slug still has to be available."
+    ),
+}
 
 DOCUMENT_IDEMPOTENCY_KEY = {
     "type": ["string", "null"], "format": "uuid",
@@ -218,6 +229,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "idempotency_key": DOCUMENT_IDEMPOTENCY_KEY,
+                "title_conflict_policy": DOCUMENT_TITLE_POLICY,
                 "parent": {
                     "type": "string",
                     "description": (
@@ -296,6 +308,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "idempotency_key": DOCUMENT_IDEMPOTENCY_KEY,
+                "title_conflict_policy": DOCUMENT_TITLE_POLICY,
                 "uri": {"type": "string", "description": "Document URI"},
                 "content": {"type": ["string", "null"], "description": "Whole replacement body, including empty string; requires an original-read condition. Null leaves the body unchanged."},
                 "title": {"type": "string", "description": "New title"},
@@ -369,6 +382,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI to move"},
+                "title_conflict_policy": DOCUMENT_TITLE_POLICY,
                 "collection": {
                     "type": "string",
                     "description": "New collection path (omit to keep the current collection)",

@@ -52,6 +52,9 @@ from oidc_fixture import OIDCFixture
 LOGGER = logging.getLogger("akb.e2e_runtime")
 SCHEMA_VERSION = 2
 PROTOCOL_REVISION = "2025-06-18"
+# The stdio catalog is a single newline-delimited JSON-RPC frame. Its
+# descriptions and schemas already exceed asyncio's default 64 KiB line limit.
+STDIO_FRAME_LIMIT = 1024 * 1024
 Scenario = Literal[
     "empty",
     "app-installation-lifecycle",
@@ -2148,6 +2151,7 @@ class E2ERuntime:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=handle,
+                limit=STDIO_FRAME_LIMIT,
                 start_new_session=True,
             )
         managed = ManagedProcess(
@@ -2647,6 +2651,9 @@ class E2ERuntime:
                 line = await asyncio.wait_for(managed.stdout.readline(), timeout=20)
             except asyncio.TimeoutError:
                 raise ProductAssertionFailure("stdio response timed out") from None
+            except ValueError:
+                # StreamReader.readline raises ValueError for an over-limit frame.
+                raise ProductAssertionFailure(f"stdio response exceeded {STDIO_FRAME_LIMIT} bytes") from None
             if not line:
                 raise ProductAssertionFailure("stdio process closed its output")
             try:

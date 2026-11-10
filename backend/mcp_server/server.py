@@ -76,7 +76,7 @@ from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
-from mcp_server.tools import BROWSE_FILTER_OPTIONS, SEARCH_FILTER_OPTIONS, TOOLS, available_tools
+from mcp_server.tools import BROWSE_FILTER_OPTIONS, DOCUMENT_TITLE_POLICY, SEARCH_FILTER_OPTIONS, TOOLS, available_tools
 from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
@@ -618,11 +618,20 @@ def _document_content_error(args: dict, *, required: bool) -> dict | None:
                code=INVALID_ARGUMENT, field="/content", reason="invalid_type")
 
 
+def _document_title_policy_error(args: dict) -> dict | None:
+    if args.get("title_conflict_policy", "allow") not in DOCUMENT_TITLE_POLICY["enum"]:
+        return err("title_conflict_policy must be 'allow' or 'reject'.", code=INVALID_ARGUMENT,
+                   field="/title_conflict_policy", reason="invalid_choice")
+    return None
+
+
 @_h("akb_put")
 async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
     if error := _document_content_error(args, required=True):
         return error
     if error := _document_idempotency_error(args):
+        return error
+    if error := _document_title_policy_error(args):
         return error
     try:
         vault, collection = _resolve_parent(args, kind_name="document")
@@ -634,6 +643,7 @@ async def _handle_put(args: dict, uid: str, user: _MCPUser) -> dict:
         collection=collection,
         slug=args.get("slug"),
         title=args["title"],
+        title_conflict_policy=args.get("title_conflict_policy", "allow"),
         content=args["content"],
         type=args.get("type", "note"),
         status=args.get("status", "draft"),
@@ -767,6 +777,8 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
         return error
     if error := _document_idempotency_error(args):
         return error
+    if error := _document_title_policy_error(args):
+        return error
     vault, doc_path = split_uri(args["uri"], expected_type="doc")
     doc_path = to_nfc(doc_path)
     writer_access = await check_vault_access(uid, vault, required_role="writer")
@@ -781,6 +793,7 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
         req = DocumentUpdateRequest(
             content=args.get("content"),
             title=args.get("title"),
+            title_conflict_policy=args.get("title_conflict_policy", "allow"),
             type=args.get("type"),
             status=args.get("status"),
             tags=args.get("tags"),
@@ -810,6 +823,8 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
 
 @_h("akb_move")
 async def _handle_move(args: dict, uid: str, user: _MCPUser) -> dict:
+    if error := _document_title_policy_error(args):
+        return error
     try:
         vault, doc_path = split_uri(args["uri"], expected_type="doc")
     except ValueError as e:
@@ -825,6 +840,7 @@ async def _handle_move(args: dict, uid: str, user: _MCPUser) -> dict:
         )
     result = await doc_service.move(
         vault, doc_path,
+        title_conflict_policy=args.get("title_conflict_policy", "allow"),
         collection=to_nfc(collection) if collection is not None else None,
         slug=to_nfc(slug) if slug is not None else None,
         message=args.get("message"),

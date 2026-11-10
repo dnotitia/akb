@@ -7,6 +7,11 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- MCP `akb_put`, `akb_update`, and `akb_move` accept `title_conflict_policy`.
+  The default `allow` preserves duplicate display titles. Use `reject` to
+  check for an existing title in the destination collection on creation,
+  title updates, and moves. A match returns `document_title_conflict`.
+
 - MCP `akb_search` can filter documents by `created_at` or `updated_at` with
   `source_type="document"` and `time_range`. The start (`gte`) is inclusive
   and the end (`lt`) is exclusive. Dated responses echo the applied UTC

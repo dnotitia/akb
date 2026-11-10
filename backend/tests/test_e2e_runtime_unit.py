@@ -71,6 +71,23 @@ def test_stdio_sample_image_fixture_is_a_small_decodable_png() -> None:
         assert image.size == (400, 400)
 
 
+@pytest.mark.asyncio
+async def test_stdio_probe_reads_a_catalog_larger_than_64_kib(tmp_path: Path) -> None:
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime.config.logs_dir.mkdir(parents=True)
+    # Use the actual subprocess pipe and JSON line reader used by tools/list.
+    child = (
+        "import json; tools = [{'name': 'akb_put', 'description': 'x' * 70000}]; "
+        "print(json.dumps({'jsonrpc': '2.0', 'id': 2, 'result': {'tools': tools}}))"
+    )
+    await runtime._spawn_interactive_process("stdio", [sys.executable, "-c", child], "stdio.log", environment={})
+    try:
+        response = await runtime._stdio_response(2)
+        assert len(response["result"]["tools"][0]["description"]) == 70000
+    finally:
+        await runtime._stop_named_process("stdio")
+
+
 def test_authorization_fixture_vault_repository_is_initialized_idempotently(tmp_path: Path) -> None:
     runtime = E2ERuntime(make_config(tmp_path))
     runtime.config.vault_dir.mkdir(parents=True)
