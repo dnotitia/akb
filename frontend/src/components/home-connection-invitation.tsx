@@ -164,9 +164,9 @@ function ConnectionInvitation({ userId, eligible, oauthEnabled, onTokenCreated }
           </Button>
         </div>
         <p className="mt-1 text-sm leading-5 text-foreground-muted">Search your vaults from your AI tool.</p>
-        <Button className="mt-4 h-11 w-full text-sm" onClick={openSetup} aria-haspopup="dialog">Connect an agent <ArrowRight className="h-4 w-4" aria-hidden /></Button>
+        <Button className="mt-4 h-11 w-full text-sm" onClick={openSetup} aria-haspopup="dialog">Connect an AI tool <ArrowRight className="h-4 w-4" aria-hidden /></Button>
       </div> : <Button ref={launcherRef} variant="outline" className="h-11 border-border-strong text-sm text-link shadow-md" onClick={openSetup} aria-haspopup="dialog">
-        <PlugZap className="h-4 w-4" aria-hidden /> Connect an agent <ArrowUpRight className="h-4 w-4" aria-hidden />
+        <PlugZap className="h-4 w-4" aria-hidden /> Connect an AI tool <ArrowUpRight className="h-4 w-4" aria-hidden />
       </Button>}
     </aside>, document.body)}
     <QuickstartDialog open={quickstartOpen} onOpenChange={setQuickstartOpen} mcpOauthEnabled={oauthEnabled} returnFocusRef={launcherRef}

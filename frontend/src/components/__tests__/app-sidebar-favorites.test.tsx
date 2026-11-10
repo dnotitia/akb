@@ -66,7 +66,7 @@ describe("Workspace favorite navigation", () => {
     expect(screen.queryByRole("link", { name: "Connect AI tools" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Settings" })).toHaveAttribute("aria-haspopup", "dialog");
     await user.click(screen.getByRole("button", { name: "Help" }));
-    expect(screen.getByRole("dialog", { name: "Getting around AKB" })).toBeVisible();
+    expect(screen.getByRole("dialog", { name: "Help" })).toBeVisible();
     await user.keyboard("{Escape}");
     expect(screen.getByRole("button", { name: "Help" })).toHaveFocus();
   });

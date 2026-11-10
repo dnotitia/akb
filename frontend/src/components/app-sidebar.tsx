@@ -21,7 +21,7 @@ import { useSettingsDialog } from "@/contexts/settings-dialog-context";
 import { readLegacyVaultFavorites, useVaultFavorites } from "@/hooks/use-vault-favorites";
 import { WorkspacePersonalSections } from "@/components/workspace-personal-sections";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { HelpDialog } from "@/components/help-dialog";
 import { listVaults } from "@/lib/api";
 import { TooltipText } from "@/components/ui/tooltip-text";
 import { Link, useLocation, useNavigate } from "react-router-dom";
@@ -231,23 +231,7 @@ export function AppSidebar({
       <ConfirmDialog open={importOpen} onOpenChange={setImportOpen} title="Import saved favorites?" confirmLabel="Import favorites" returnFocusRef={importTrigger}
         description={<div className="space-y-3"><p>These favorites were saved in this browser before accounts were separated. Import them into your current account only if they are yours. Existing favorites stay unchanged.</p><ul className="max-h-48 list-disc overflow-y-auto pl-5">{importable.map(v => <li key={v.id}>{v.name}</li>)}</ul></div>}
         onConfirm={() => { importFavorites(importable.map(v => v.id)); setImportOpen(false); requestAnimationFrame(focusFavorites); }} />
-      <Dialog open={helpOpen} onOpenChange={setHelpOpen}><DialogContent onCloseAutoFocus={event => { event.preventDefault(); helpTrigger.current?.focus(); }}>
-        <DialogHeader><DialogTitle>Getting around AKB</DialogTitle><DialogDescription>Your workspace connects people, knowledge, and AI tools.</DialogDescription></DialogHeader>
-        <div className="space-y-4 text-sm">
-          <p><strong>Vaults</strong> are shared knowledge spaces. Open one to browse its Collections, documents, tables, and files.</p>
-          <p><strong>Favorites and Pinned</strong> are personal shortcuts. Star a Vault, use Pin in the document toolbar, or pin a Collection from its actions menu. They do not change sharing permissions.</p>
-          <p><strong>Recently viewed and Drafts</strong> help you return to work saved in this browser. Drafts are not published documents.</p>
-          <p><strong>Watch</strong> a document to receive changes in Notifications. Pinning does not subscribe you to notifications.</p>
-          <p><strong>Search</strong> in the top bar for quick results, or use the Search page for advanced filters.</p>
-          <p><strong>Sidebar filters</strong> narrow the names in that sidebar. To search content in a Collection, choose Search in collection from its actions menu.</p>
-          <Link to="/settings?tab=tokens" onClick={event => {
-            if (settings && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
-              event.preventDefault(); setHelpOpen(false);
-              requestAnimationFrame(() => settings.openSettings("tokens", helpTrigger.current));
-            }
-          }} className="inline-flex rounded-[var(--radius-sm)] text-link underline focus-visible:ring-2 focus-visible:ring-ring">Set up an AI tool connection</Link>
-        </div>
-      </DialogContent></Dialog>
+      <HelpDialog open={helpOpen} onOpenChange={setHelpOpen} returnFocusRef={helpTrigger} />
     </TooltipProvider>
   );
 }

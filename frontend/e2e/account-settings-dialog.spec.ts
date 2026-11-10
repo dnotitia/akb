@@ -60,7 +60,7 @@ for (const dark of [false, true]) test(`Settings Studio preserves contrast and k
   await page.keyboard.press("Enter");
   await expect(dialog.getByRole("radio", { name: dark ? "Dark" : "Light", exact: true })).toBeChecked();
   await page.addScriptTag({ content: axe.source });
-  for (const section of ["Profile", "Appearance", "Watched documents", "Security", "Administration", "Agent connections"]) {
+  for (const section of ["Profile", "Appearance", "Watched documents", "Security", "Administration", "AI connections"]) {
     await dialog.getByRole("tab", { name: section, exact: true }).click();
     const violations = await page.evaluate(async () => {
       const report = await (window as unknown as { axe: typeof axe }).axe.run(document.querySelector('[data-testid="account-settings-dialog"]')!, {
@@ -151,51 +151,41 @@ test("managed profiles stay read-only and cannot reveal administrator settings",
   await expect(dialog.getByLabel("Current password", { exact: true })).toHaveCount(0);
 });
 
-test("agent connection deep links preserve all three setup phases", async ({ page }) => {
-  await setup(page);
-  await page.goto("/settings?tab=tokens");
+test("AI connection deep links keep setup and key management separate", async ({ page }) => {
+  await setup(page); await page.goto("/settings?tab=tokens");
   const dialog = page.getByRole("dialog", { name: "Settings", exact: true });
-  await expect(dialog.getByRole("heading", { name: "1. Prepare access" })).toBeVisible();
-  await expect(dialog.getByRole("heading", { name: /2. Configure/ })).toBeVisible();
-  await expect(dialog.getByRole("heading", { name: "3. Try it in your agent" })).toBeVisible();
-  await expect(dialog.getByText("No tokens yet", { exact: true })).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "1. Choose your AI tool" })).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "3. Check the connection" })).toHaveCount(0);
+  await dialog.getByRole("tab", { name: "Connection keys", exact: true }).click();
+  await expect(dialog.getByText("No connection keys yet", { exact: true })).toBeVisible();
+  await dialog.getByRole("tab", { name: "Connection setup", exact: true }).click();
+  await expect(dialog.getByRole("heading", { name: "1. Choose your AI tool" })).toBeVisible();
 });
 
-for (const width of [375, 1440]) for (const dark of [false, true]) test(`connection steps follow reading and preserve drafts at ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
-  await setup(page, { dark });
-  await page.setViewportSize({ width, height: 760 });
-  await page.emulateMedia({ reducedMotion: "reduce" });
-  await page.goto("/settings?tab=tokens");
+for (const width of [375, 1440]) for (const dark of [false, true]) test(`guided connection preserves drafts at ${width}px ${dark ? "dark" : "light"}`, async ({ page }, testInfo) => {
+  await setup(page, { dark }); await page.setViewportSize({ width, height: 760 });
+  await page.emulateMedia({ reducedMotion: "reduce" }); await page.goto("/settings?tab=tokens");
   const dialog = page.getByRole("dialog", { name: "Settings", exact: true });
   const navigation = dialog.getByRole("navigation", { name: "Connection setup steps", exact: true });
-  const draft = dialog.getByLabel("Token name", { exact: true });
+  await dialog.getByRole("button", { name: "Continue with Claude Code" }).click();
+  const draft = dialog.getByLabel("Connection key name", { exact: true });
   await draft.fill("Preserved setup draft");
-  await navigation.getByRole("button", { name: /Go to step 2:/ }).focus();
-  await page.keyboard.press("Enter");
-  const configuration = dialog.getByRole("region", { name: "2. Configure Claude Code", exact: true });
-  await expect(configuration.getByRole("heading")).toBeFocused();
-  const navBox = (await navigation.boundingBox())!;
-  expect((await configuration.boundingBox())!.y).toBeGreaterThanOrEqual(navBox.y + navBox.height + 11);
-  await configuration.getByRole("radio", { name: "Codex", exact: true }).locator("..").click();
-  await expect(navigation.getByRole("button", { name: "Go to step 2: Configure Codex", exact: true })).toHaveAttribute("aria-current", "step");
-  await dialog.getByRole("button", { name: "Return to Prepare access", exact: true }).click();
-  await expect(dialog.getByRole("heading", { name: "1. Prepare access", exact: true })).toBeFocused();
+  await navigation.getByRole("button", { name: /Go to step 1:/ }).focus(); await page.keyboard.press("Enter");
+  await expect(dialog.getByRole("heading", { name: "1. Choose your AI tool" })).toBeFocused();
+  await dialog.getByRole("radio", { name: "Codex", exact: true }).locator("..").click();
+  await dialog.getByRole("button", { name: "Continue with Codex" }).click();
+  await expect(dialog.getByRole("heading", { name: "2. Add AKB to Codex" })).toBeFocused();
   await expect(draft).toHaveValue("Preserved setup draft");
   await navigation.getByRole("button", { name: /Go to step 3:/ }).click();
-  await expect(dialog.getByRole("heading", { name: "3. Try it in your agent", exact: true })).toBeFocused();
-  const lastStep = navigation.getByRole("button", { name: /Go to step 3:/ });
-  await expect(lastStep).toHaveAttribute("aria-current", "step");
-  await lastStep.focus();
+  await expect(dialog.getByRole("heading", { name: "3. Check the connection" })).toBeFocused();
   const content = dialog.locator('[data-slot="settings-content"]');
-  await content.evaluate(node => { node.scrollTop = 0; });
-  await expect(navigation.getByRole("button", { name: /Go to step 1:/ })).toHaveAttribute("aria-current", "step");
   await content.evaluate(node => { node.scrollTop = node.scrollHeight; });
-  await expect(lastStep).toHaveAttribute("aria-current", "step");
+  await expect(navigation.getByRole("button", { name: /Go to step 3:/ })).toHaveAttribute("aria-current", "step");
+  await navigation.getByRole("button", { name: /Go to step 2:/ }).click();
   await expect(draft).toHaveValue("Preserved setup draft");
   await expect(page.getByRole("dialog", { name: "Discard unsaved changes?", exact: true })).toHaveCount(0);
   expect(await dialog.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
-  await navigation.getByRole("button", { name: /Go to step 2:/ }).click();
-  await page.screenshot({ path: testInfo.outputPath("connection-steps.png"), animations: "disabled" });
+  await page.screenshot({ path: testInfo.outputPath("connection-guided-steps.png") });
 });
 
 test("account menu opens settings in place and outside dismissal restores focus without layout shift", async ({ page }) => {
@@ -339,14 +329,15 @@ test("leaving a new one-time token requires acknowledgement", async ({ page }) =
     : route.fulfill({ json: { tokens: [] } }));
   await page.goto("/settings?tab=tokens");
   const dialog = page.getByRole("dialog", { name: "Settings", exact: true });
-  await dialog.getByLabel("Token name", { exact: true }).fill("Fixture agent");
-  await dialog.getByRole("button", { name: "Create with server defaults" }).click();
-  await expect(dialog.getByText("Token created — save it now")).toBeVisible();
+  await dialog.getByRole("button", { name: "Continue with Claude Code" }).click();
+  await dialog.getByLabel("Connection key name", { exact: true }).fill("Fixture agent");
+  await dialog.getByRole("button", { name: "Create key with server defaults" }).click();
+  await expect(dialog.getByText("Connection key created")).toBeVisible();
   await dialog.getByRole("button", { name: "Close settings" }).click();
-  const confirmation = page.getByRole("dialog", { name: "Leave agent connections?" });
+  const confirmation = page.getByRole("dialog", { name: "Leave AI connections?" });
   await expect(confirmation).toBeVisible();
   await confirmation.getByRole("button", { name: "Stay here" }).click();
-  await expect(dialog.getByText("Token created — save it now")).toBeVisible();
+  await expect(dialog.getByText("Connection key created")).toBeVisible();
   await dialog.getByRole("tab", { name: "Profile", exact: true }).click();
   await confirmation.getByRole("button", { name: "Leave section" }).click();
   await expect(dialog.getByLabel("Display name")).toBeVisible();

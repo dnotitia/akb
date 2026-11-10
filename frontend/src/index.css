@@ -1917,6 +1917,22 @@ input:focus-visible + .settings-theme-option { outline: 3px solid var(--color-ri
 .connection-step-heading h3 { color: var(--color-foreground); font-size: 14px; font-weight: 600; line-height: 20px; outline: none; }
 .connection-step-heading p { margin-top: 3px; color: var(--color-foreground-muted); font-size: 12px; line-height: 18px; }
 .connection-step-body { min-width: 0; padding: 16px; }
+.connection-step[hidden] { display: none; }
+.connection-step-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; padding-top: .5rem; }
+.connection-inline-help { color: var(--color-foreground-muted); font-size: .8125rem; line-height: 1.65; }
+.connection-inline-help > summary { width: fit-content; max-width: 100%; min-height: 2.25rem; padding-block: .5rem; cursor: pointer; border-radius: var(--radius-sm); color: var(--color-link); font-weight: 500; }
+.connection-inline-help > summary:focus-visible { outline: 2px solid var(--color-ring); outline-offset: 2px; }
+.connection-inline-help > p { margin-block: .5rem; }
+.connection-instruction { display: flex; align-items: flex-start; gap: .75rem; font-size: .8125rem; line-height: 1.65; }
+.connection-instruction > span { display: grid; place-items: center; flex: none; width: 1.5rem; height: 1.5rem; border-radius: var(--radius-sm); background: var(--color-surface-muted); color: var(--color-foreground-muted); font-size: .75rem; }
+.connection-instruction > div { min-width: 0; }
+.connection-instruction h4 { font-weight: 600; color: var(--color-foreground); }
+.connection-instruction p { color: var(--color-foreground-muted); overflow-wrap: anywhere; }
+@media (max-width: 639px), (pointer: coarse) {
+  .connection-setup button, .connection-setup label:has(input[type=radio]), .connection-inline-help > summary { min-height: 2.75rem; }
+  .help-dialog button, .connection-dialog-footer button, .connection-confirmation button { min-height: 2.75rem; }
+  .help-dialog > button[aria-label="Close dialog"], .connection-dialog > button[aria-label="Close dialog"], .connection-confirmation > button[aria-label="Close dialog"] { width: 2.75rem; height: 2.75rem; }
+}
 @container connection-setup (max-width: 32rem) {
   .connection-progress-label { display: none; }
   .connection-progress-short { display: inline; }

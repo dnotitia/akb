@@ -59,9 +59,11 @@ test("workspace sidebar keeps brand and support icon anchors stable", async ({ p
     expect(Math.abs(before[index]!.y - after[index]!.y)).toBeLessThanOrEqual(1);
   }
   await page.getByRole("button", { name: "Help", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Getting around AKB" });
-  await expect(dialog).toContainText("Sidebar filters");
-  await dialog.press("Escape");
+  const dialog = page.getByRole("dialog", { name: "Help" });
+  await dialog.getByRole("button", { name: /^Find a document/ }).click();
+  const article = page.getByRole("dialog", { name: "Find a document", exact: true });
+  await expect(article).toContainText("A sidebar name filter");
+  await article.press("Escape");
   await expect(page.getByRole("button", { name: "Help", exact: true })).toBeFocused();
   await page.screenshot({ path: testInfo.outputPath("workspace-collapsed.png") });
 });

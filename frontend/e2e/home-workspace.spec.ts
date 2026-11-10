@@ -36,7 +36,7 @@ test("Personal navigation imports favorites and restores a browser draft", async
   await sidebar.locator("summary").filter({ hasText: "Pinned" }).click();
   await expect(sidebar.getByRole("link", { name: "Guides", exact: true })).toHaveAttribute("href", "/vault/team?collection=guides");
   await sidebar.getByRole("button", { name: "Help", exact: true }).click();
-  await expect(page.getByRole("dialog", { name: "Getting around AKB" })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Help" })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(sidebar.getByRole("button", { name: "Help", exact: true })).toBeFocused();
   await sidebar.locator("summary").filter({ hasText: "Drafts" }).click();
@@ -101,10 +101,10 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     await expect(directory.getByRole("heading", { level: 3 })).toHaveCount(4);
     await expect(directory.getByText("Documents", { exact: true }).first()).toBeVisible();
     await expect(page.getByTestId("home-connection-invitation")).toHaveAttribute("data-expanded", String(width >= 1024));
-    await expect(page.getByRole("button", { name: "Connect an agent", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Connect an AI tool", exact: true })).toBeVisible();
     // Check explicit minimization before sidebar focus and screenshot scrolling
     // can legitimately minimize the invitation through overlap protection.
-    const connectionLauncher = page.getByRole("button", { name: "Connect an agent", exact: true });
+    const connectionLauncher = page.getByRole("button", { name: "Connect an AI tool", exact: true });
     if (width >= 1024) {
       await page.getByRole("button", { name: "Minimize connection guide" }).click();
       await expect(connectionLauncher).toBeFocused();
@@ -163,20 +163,23 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     expect((await viewed.boundingBox())!.y).toBeLessThan((await directory.boundingBox())!.y);
     await page.screenshot({ path: testInfo.outputPath("home-workspace.png"), fullPage: true });
     await connectionLauncher.click();
-    const connection = page.getByRole("dialog", { name: "Connect an agent" });
+    const connection = page.getByRole("dialog", { name: "Connect an AI tool" });
     await expect(connection.getByRole("group", { name: "AI tool", exact: true })).toBeVisible();
-    await connection.getByRole("radio", { name: "Use a saved token" }).locator("..").click();
-    await connection.getByLabel("Full saved token").fill("akb_fixture_example_only");
-    await expect(connection.getByRole("heading", { name: "3. Try it in your agent" })).toBeVisible();
+    await connection.getByRole("button", { name: "Continue with Claude Code" }).click();
+    await connection.getByRole("radio", { name: "Use an existing key" }).locator("..").click();
+    await connection.getByLabel("Full connection key").fill("akb_fixture_example_only");
+    await connection.getByRole("button", { name: "Check in Claude Code" }).click();
+    await expect(connection.getByRole("heading", { name: "3. Check the connection" })).toBeVisible();
     await expect(connection.getByText(/This browser cannot verify/)).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath("connection-setup.png"), fullPage: true });
     await page.keyboard.press("Escape");
-    const closeConfirmation = page.getByRole("dialog", { name: "Have you saved your token?" });
+    const closeConfirmation = page.getByRole("dialog", { name: "Leave connection setup?" });
     await expect(closeConfirmation).toBeVisible();
     await closeConfirmation.getByRole("button", { name: "Keep setup open" }).click();
-    await expect(connection.getByLabel("Full saved token")).toHaveValue("akb_fixture_example_only");
+    await connection.getByRole("button", { name: "Back to setup" }).click();
+    await expect(connection.getByLabel("Full connection key")).toHaveValue("akb_fixture_example_only");
     await connection.getByRole("button", { name: "Close", exact: true }).click();
-    await closeConfirmation.getByRole("button", { name: "I've saved it — close" }).click();
+    await closeConfirmation.getByRole("button", { name: "Leave setup" }).click();
     await expect(connection).not.toBeVisible();
     await expect(connectionLauncher).toBeFocused();
     await expect(page.getByTestId("home-connection-invitation")).toHaveAttribute("data-expanded", "false");
@@ -204,7 +207,7 @@ for (const width of [2560, 1440, 768, 375]) for (const dark of [false, true]) {
     await page.goto("/settings?tab=tokens");
     await expect(page.getByRole("dialog", { name: "Settings", exact: true })).toBeVisible();
     await page.evaluate(value => document.documentElement.classList.toggle("dark", value), dark);
-    await expect(page.getByRole("heading", { name: "Agent connections", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "AI connections", exact: true })).toBeVisible();
     await expect(page.getByRole("group", { name: "AI tool", exact: true })).toBeVisible();
     await expect(page.getByTestId("account-settings-dialog")).toHaveCSS("background-color", dark ? "rgb(11, 15, 20)" : "rgb(246, 247, 249)");
     if (width >= 1024) {

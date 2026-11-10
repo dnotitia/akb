@@ -8,7 +8,7 @@ import { AppPageLocation } from "../app-page-location";
 describe("App page location", () => {
   it.each([
     ["/", "Home"], ["/search?q=test", "Search"],
-    ["/settings?tab=tokens", "Agent connections"], ["/vault", "Vaults"],
+    ["/settings?tab=tokens", "AI connections"], ["/vault", "Vaults"],
     ["/settings", "Profile"], ["/settings?tab=preferences", "Appearance"],
     ["/settings?tab=notifications", "Watched documents"],
     ["/settings?tab=admin", "Profile"], ["/settings?tab=unknown", "Profile"],

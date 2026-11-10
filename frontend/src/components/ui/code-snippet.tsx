@@ -12,10 +12,12 @@ export function CodeSnippet({
   code,
   filename,
   className,
+  onCopied,
 }: {
   code: string;
   filename?: string;
   className?: string;
+  onCopied?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
@@ -29,6 +31,7 @@ export function CodeSnippet({
       if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
       await navigator.clipboard.writeText(code);
       setCopied(true);
+      onCopied?.();
       setTimeout(() => setCopied(false), 2000);
     } catch {
       setCopyError(true);

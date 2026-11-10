@@ -431,7 +431,7 @@ describe("vault page guide metadata", () => {
       screen.getByRole("button", { name: /Import knowledge bundle/i }),
     );
     expect(setup).toContainElement(
-      screen.getByRole("link", { name: /Connect an agent/i }),
+      screen.getByRole("link", { name: /Connect an AI tool/i }),
     );
     expect(
       screen.getByRole("button", { name: /Write a document/ }),

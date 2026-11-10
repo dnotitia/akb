@@ -14,6 +14,9 @@ for (const width of [375, 767, 768, 874, 1024, 1440, 2560]) {
       if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
       if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "settings-user", username: "fixture", display_name: "Example User", email: "fixture@example.invalid", is_admin: true, auth_method: "local" } });
       if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [] } });
+      // Model a legacy server explicitly; a generic 200 is an invalid contract
+      // and correctly moves focus to the issuance error summary.
+      if (path.endsWith("/auth/tokens/capabilities")) return route.fulfill({ status: 404, json: { detail: "Not Found" } });
       return route.fulfill({ json: { tokens: [], users: [], items: [], unread_count: 0, supported: true } });
     });
     await page.goto("/settings");
@@ -64,10 +67,20 @@ for (const width of [375, 767, 768, 874, 1024, 1440, 2560]) {
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.goto("/settings?tab=tokens");
-    await expect(page.getByRole("heading", { name: "1. Prepare access" })).toBeVisible();
-    await expect(page.getByRole("heading", { name: /2. Configure/ })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "3. Try it in your agent" })).toBeVisible();
-    await page.screenshot({ path: testInfo.outputPath("agent-connections.png"), fullPage: true, animations: "disabled" });
+    await expect(page.getByRole("heading", { name: "1. Choose your AI tool" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 3 })).toHaveCount(1);
+    await page.getByRole("button", { name: "Continue with Claude Code", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "2. Add AKB to Claude Code" })).toBeFocused();
+    await page.getByRole("radio", { name: "Use an existing key", exact: true }).locator("..").click();
+    const key = page.getByLabel("Full connection key", { exact: true });
+    await key.fill("akb_settings_fixture_key");
+    await page.getByRole("button", { name: "Check in Claude Code", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "3. Check the connection" })).toBeFocused();
+    await expect(page.getByRole("heading", { level: 3 })).toHaveCount(1);
+    await expect(page.getByRole("checkbox", { name: "I received an AKB response in my AI tool" })).not.toBeChecked();
+    await page.getByRole("button", { name: "Back to setup", exact: true }).click();
+    await expect(key).toHaveValue("akb_settings_fixture_key");
+    await page.screenshot({ path: testInfo.outputPath("ai-connections.png"), fullPage: true, animations: "disabled" });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   });
 }

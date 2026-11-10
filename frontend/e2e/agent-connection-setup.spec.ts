@@ -27,117 +27,161 @@ async function setup(page: Page, { oauth = false, dark = false } = {}) {
 }
 
 for (const width of [1440, 375]) for (const oauth of [false, true]) {
-  test(`connection setup fits ${width}px ${oauth ? "browser sign-in" : "token"}`, async ({ page }, testInfo) => {
+  test(`guided connection fits ${width}px with ${oauth ? "sign-in" : "a key"}`, async ({ page }, testInfo) => {
     const creations = await setup(page, { oauth, dark: width === 375 });
-    await page.setViewportSize({ width, height: 1000 });
+    await page.setViewportSize({ width, height: 800 });
     await page.goto("/");
-    await page.getByRole("button", { name: "Connect an agent", exact: true }).click();
-    const modal = page.getByRole("dialog", { name: "Connect an agent", exact: true });
-    await expect(modal.getByRole("group", { name: "AI tool" })).toBeVisible();
-    const selectedUnderline = await modal.getByRole("radio", { name: "Claude Code", exact: true }).locator("..").evaluate(el => getComputedStyle(el).borderBottomColor);
-    const inactiveUnderline = await modal.getByRole("radio", { name: "Cursor", exact: true }).locator("..").evaluate(el => getComputedStyle(el).borderBottomColor);
-    expect(selectedUnderline).not.toBe(inactiveUnderline);
-    await expect(modal.getByRole("heading", { name: "1. Prepare access" })).toBeVisible();
-    await expect(modal.getByRole("heading", { name: "3. Try it in your agent" })).toHaveCount(1);
+    await page.getByRole("button", { name: "Connect an AI tool", exact: true }).click();
+    const modal = page.getByRole("dialog", { name: "Connect an AI tool", exact: true });
+    await expect(modal.getByRole("heading", { level: 3 })).toHaveCount(1);
+    await expect(modal.getByLabel("Connection key name")).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath("choose-tool.png") });
+    await modal.getByRole("button", { name: "Continue with Claude Code" }).click();
+    await expect(modal.getByRole("heading", { name: "2. Add AKB to Claude Code" })).toBeFocused();
+    if (oauth) {
+      await expect(modal.getByRole("radio", { name: "Sign in with AKB" })).toBeChecked();
+      await expect(modal.getByText(/--transport http/)).toBeVisible();
+      await expect(modal.getByText(/Open Claude Code, enter \/mcp/)).toBeVisible();
+    } else {
+      await modal.getByRole("radio", { name: "Use an existing key" }).locator("..").click();
+      await modal.getByLabel("Full connection key").fill("akb_complete_fixture_key");
+      await expect(modal.getByText(/npx akb-mcp/)).toContainText("akb_complete_fixture_key");
+    }
     expect(creations()).toBe(0);
-    expect(await modal.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
-    await expect(modal.getByRole("button", { name: "Close", exact: true })).toBeInViewport();
-    await page.screenshot({ path: testInfo.outputPath("connect-initial.png") });
-    await modal.getByRole("radio", { name: "Codex", exact: true }).locator("..").click();
-    await expect(modal.getByRole("radio", { name: "Browser sign-in" })).toHaveCount(0);
-    await modal.getByRole("radio", { name: "Use a saved token" }).locator("..").click();
-    await modal.getByLabel("Full saved token").fill("akb_fixture_saved_secret");
-    await expect(modal.getByText(/codex mcp add/)).toContainText("akb_fixture_saved_secret");
-    await modal.getByRole("heading", { name: "3. Try it in your agent" }).scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath("add-akb.png") });
+    await modal.getByRole("button", { name: "Check in Claude Code", exact: true }).click();
+    await expect(modal.getByRole("heading", { name: "3. Check the connection" })).toBeFocused();
     await expect(modal.getByText(/This browser cannot verify/)).toBeVisible();
+    await modal.getByRole("checkbox", { name: "I received an AKB response in my AI tool" }).check();
+    await expect(modal.getByText(/Confirmed by you/)).toBeVisible();
     await expect(modal.getByRole("button", { name: "Close", exact: true })).toBeInViewport();
-    expect(await modal.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
-    await page.screenshot({ path: testInfo.outputPath("connect-saved-token.png") });
-    // Settings uses the same choice/step vocabulary, not another wizard.
-    await page.goto("/settings?tab=tokens");
-    const settings = page.getByRole("dialog", { name: "Settings", exact: true });
-    await expect(settings.getByRole("group", { name: "AI tool" })).toBeVisible();
-    await expect(settings.getByRole("heading", { name: "1. Prepare access" })).toBeVisible();
-    await expect(settings.getByRole("heading", { name: "3. Try it in your agent" })).toHaveCount(1);
-    await expect(settings.getByRole("heading", { name: "Saved tokens" })).toHaveCount(1);
-    expect(await settings.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
-    await page.screenshot({ path: testInfo.outputPath("settings-setup.png") });
-    expect(creations()).toBe(0);
+    expect(await modal.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath("check-connection.png") });
+    await modal.getByRole("button", { name: "Back to setup" }).click();
+    if (!oauth) await expect(modal.getByLabel("Full connection key")).toHaveValue("akb_complete_fixture_key");
+    await modal.getByRole("button", { name: "Close", exact: true }).click();
+    if (!oauth) await page.getByRole("button", { name: "Leave setup", exact: true }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Connect an AI tool", exact: true })).toBeFocused();
   });
 }
 
-test("setup preserves a draft across choices and protects the one-time token", async ({ page }) => {
+test("a fresh key stays available across client changes and close requires acknowledgement", async ({ page }) => {
   const creations = await setup(page, { oauth: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Connect an agent", exact: true }).click();
-  const modal = page.getByRole("dialog", { name: "Connect an agent", exact: true });
+  await page.getByRole("button", { name: "Connect an AI tool", exact: true }).click();
+  const modal = page.getByRole("dialog", { name: "Connect an AI tool" });
+  await modal.getByRole("radio", { name: "Codex", exact: true }).locator("..").click();
+  await modal.getByRole("button", { name: "Continue with Codex" }).click();
+  await modal.getByLabel("Connection key name").fill("Work laptop");
+  await modal.getByRole("button", { name: "Create connection key", exact: true }).click();
+  await expect(modal.getByText("Connection key created", { exact: true })).toBeVisible();
+  await expect(modal.getByText(/codex mcp add/)).toContainText("akb_fixture_secret_only");
+  await modal.getByRole("button", { name: "Choose a tool", exact: true }).click();
+  await modal.getByRole("radio", { name: "Cursor", exact: true }).locator("..").click();
+  await modal.getByRole("button", { name: "Continue with Cursor" }).click();
+  await expect(modal.getByRole("radio", { name: "Use a connection key" })).toBeChecked();
+  await expect(modal.getByLabel("mcp.json", { exact: true })).toContainText("akb_fixture_secret_only");
+  await modal.getByRole("button", { name: "Hide key and configuration" }).click();
+  await expect(modal.getByLabel("mcp.json", { exact: true })).toHaveCount(0);
+  await modal.getByRole("button", { name: "Show key and configuration" }).click();
+  await expect(modal.getByLabel("mcp.json", { exact: true })).toContainText("akb_fixture_secret_only");
+  expect(creations()).toBe(1);
+  await modal.getByRole("button", { name: "Close", exact: true }).click();
+  const confirmation = page.getByRole("dialog", { name: "Have you saved your connection key?" });
+  await expect(confirmation).toBeVisible();
+  await confirmation.getByRole("button", { name: "Keep setup open" }).click();
+  await expect(modal.getByLabel("mcp.json", { exact: true })).toContainText("akb_fixture_secret_only");
+});
+
+for (const width of [1440, 375]) {
+  test(`Help is reachable and opens one setup surface at ${width}px`, async ({ page }, testInfo) => {
+    await setup(page, { oauth: true, dark: width === 375 });
+    await page.setViewportSize({ width, height: 667 });
+    await page.goto("/");
+    const account = page.getByRole("button", { name: /^Account menu/ });
+    const opener = width === 375 ? account : page.getByRole("button", { name: "Help", exact: true });
+    if (width === 375) { await account.click(); await page.getByRole("menuitem", { name: "Help", exact: true }).click(); }
+    else await opener.click();
+    const help = page.getByRole("dialog", { name: "Help", exact: true });
+    await expect(help).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath("help-home.png") });
+    await help.getByRole("button", { name: /^Find a document/ }).click();
+    await expect(page.getByRole("heading", { name: "Find a document", exact: true })).toBeFocused();
+    await page.getByRole("button", { name: "All help topics" }).click();
+    await expect(page.getByRole("button", { name: /^Find a document/ })).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(opener).toBeFocused();
+    if (width === 375) { await account.click(); await page.getByRole("menuitem", { name: "Help", exact: true }).click(); }
+    else await opener.click();
+    await page.getByRole("button", { name: /^Use AKB in an AI tool/ }).click();
+    await page.getByRole("button", { name: "Set up an AI connection" }).click();
+    await expect(page.getByRole("heading", { name: "AI connections", exact: true })).toBeVisible();
+    await expect(page.getByRole("dialog")).toHaveCount(1);
+    await page.getByRole("button", { name: "Continue with Claude Code" }).click();
+    await page.getByRole("radio", { name: "Use a connection key" }).locator("..").click();
+    await page.getByLabel("Connection key name").fill("Unfinished setup");
+    await page.getByRole("tab", { name: "Connection keys", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Connection keys", exact: true })).toBeVisible();
+    await page.getByRole("tab", { name: "Connection setup", exact: true }).click();
+    await expect(page.getByLabel("Connection key name")).toHaveValue("Unfinished setup");
+    expect(await page.getByRole("dialog").evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath("settings-setup.png") });
+  });
+}
+
+test("short windows keep setup dismissal reachable", async ({ page }) => {
+  await setup(page, { oauth: true }); await page.setViewportSize({ width: 800, height: 320 });
+  await page.goto("/"); await page.getByRole("button", { name: "Connect an AI tool", exact: true }).click();
+  const modal = page.getByRole("dialog", { name: "Connect an AI tool" });
+  await modal.getByRole("button", { name: "Continue with Claude Code" }).click();
+  await expect(modal.getByRole("button", { name: "Close", exact: true })).toBeInViewport();
+  await modal.getByRole("button", { name: "Go to step 1: Choose a tool" }).click();
+  await expect(modal.getByRole("heading", { name: "1. Choose your AI tool" })).toBeFocused();
+  await page.keyboard.press("Escape"); await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("key-list recovery links open management directly", async ({ page }) => {
+  const creations = await setup(page, { oauth: true });
+  await page.goto("/settings?tab=tokens&connectionView=keys");
+  await expect(page.getByRole("tab", { name: "Connection keys", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByText("No connection keys yet", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "1. Choose your AI tool" })).toHaveCount(0);
+  expect(creations()).toBe(0);
+});
+
+test("short Help keeps Back and Close visible while its article scrolls", async ({ page }) => {
+  await setup(page); await page.setViewportSize({ width: 800, height: 320 }); await page.goto("/");
+  await page.getByRole("button", { name: /^Account menu/ }).click();
+  await page.getByRole("menuitem", { name: "Help", exact: true }).click();
+  await page.getByRole("button", { name: /^Solve a problem/ }).click();
+  await page.getByText("I only have part of a connection key", { exact: true }).click();
+  await page.getByText(/The key list shows an identifying prefix/).scrollIntoViewIfNeeded();
+  await expect(page.getByRole("button", { name: "All help topics" })).toBeInViewport();
+  await expect(page.getByRole("button", { name: "Close dialog" })).toBeInViewport();
+  await page.getByRole("button", { name: "All help topics" }).click();
+  await expect(page.getByRole("button", { name: /^Find a document/ })).toBeFocused();
+});
+
+test("keyboard tool selection and copying never claim a verified connection", async ({ page }) => {
+  await page.addInitScript(() => {
+    let text = "";
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
+      writeText: async (value: string) => { text = value; }, readText: async () => text,
+    } });
+  });
+  await setup(page, { oauth: true }); await page.goto("/");
+  await page.getByRole("button", { name: "Connect an AI tool", exact: true }).click();
+  const modal = page.getByRole("dialog", { name: "Connect an AI tool" });
   await modal.getByRole("radio", { name: "Claude Code", exact: true }).focus();
   await page.keyboard.press("ArrowRight");
   await expect(modal.getByRole("radio", { name: "Cursor", exact: true })).toBeChecked();
-  await expect(modal.getByRole("heading", { name: "2. Configure Cursor" })).toBeVisible();
-  await page.keyboard.press("ArrowLeft");
-  await expect(modal.getByRole("radio", { name: "Claude Code", exact: true })).toBeChecked();
-  await modal.getByRole("radio", { name: "Create a new token" }).locator("..").click();
-  await modal.getByLabel("Token name").fill("Work laptop");
-  await modal.getByRole("radio", { name: "Browser sign-in" }).locator("..").click();
-  await modal.getByRole("radio", { name: "Create a new token" }).locator("..").click();
-  await expect(modal.getByLabel("Token name")).toHaveValue("Work laptop");
-  await modal.getByRole("button", { name: "Create token", exact: true }).click();
-  await expect(modal.getByText("Token created — save it now")).toBeVisible();
-  expect(creations()).toBe(1);
-  await modal.getByRole("button", { name: "Hide token and configuration" }).click();
-  await expect(modal).not.toContainText("akb_fixture_secret_only");
-  await modal.getByRole("button", { name: "Show token and configuration" }).click();
-  await expect(modal.getByText(/claude mcp add/)).toContainText("akb_fixture_secret_only");
-  await page.keyboard.press("Escape");
-  await expect(page.getByRole("dialog", { name: "Have you saved your token?" })).toBeVisible();
-  await page.getByRole("button", { name: "Keep setup open" }).click();
-  await expect(modal.getByText("Token created — save it now")).toBeVisible();
-  expect(creations()).toBe(1);
+  await modal.getByRole("button", { name: "Continue with Cursor" }).click();
+  await modal.getByLabel("mcp.json", { exact: true }).locator("..").getByRole("button", { name: "Copy snippet", exact: true }).click();
+  await expect(modal.getByText(/Setup copied. Apply it in Cursor/)).toBeVisible();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toContain("mcpServers");
+  await modal.getByRole("button", { name: "Check in Cursor", exact: true }).click();
+  await expect(modal.getByRole("checkbox")).not.toBeChecked();
+  await expect(modal.getByText(/This browser cannot verify/)).toBeVisible();
 });
-
-for (const viewport of [{ width: 375, height: 568 }, { width: 1440, height: 850 }]) {
-  test(`setup keeps keyboard choices visible after focus wraps at ${viewport.width}px`, async ({ page }, testInfo) => {
-    await setup(page, { oauth: true, dark: viewport.width === 375 });
-    await page.setViewportSize(viewport);
-    await page.goto("/");
-    await page.getByRole("button", { name: "Connect an agent", exact: true }).click();
-    const modal = page.getByRole("dialog", { name: "Connect an agent", exact: true });
-    const tool = modal.getByRole("radio", { name: "VS Code", exact: true });
-    await tool.locator("..").click();
-    await modal.getByRole("radio", { name: "Use a saved token" }).locator("..").click();
-    await modal.getByLabel("Full saved token").fill("akb_fixture_saved_secret");
-    const body = modal.locator("[data-connection-scroll]");
-    await body.evaluate(el => { el.scrollTop = el.scrollHeight; });
-    const modalBefore = await modal.boundingBox();
-    const pageBefore = await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
-    await modal.getByRole("button", { name: "Close dialog", exact: true }).focus();
-    await page.keyboard.press("Tab");
-    const firstStep = modal.getByRole("button", { name: "Go to step 1: Prepare access" });
-    await expect(firstStep).toBeFocused();
-    await page.keyboard.press("Tab");
-    const configure = modal.getByRole("button", { name: "Go to step 2: Configure VS Code" });
-    await expect(configure).toBeFocused();
-    await page.keyboard.press("Enter");
-    await expect(modal.getByRole("heading", { name: "2. Configure VS Code" })).toBeFocused();
-    await page.keyboard.press("Tab");
-    await expect(tool).toBeFocused();
-    await expect(tool).toBeChecked();
-    const bounds = await tool.locator("..").boundingBox();
-    const viewportBounds = await body.boundingBox();
-    expect(bounds!.y).toBeGreaterThanOrEqual(viewportBounds!.y);
-    expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewportBounds!.y + viewportBounds!.height);
-    expect(await modal.boundingBox()).toEqual(modalBefore);
-    expect(await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }))).toEqual(pageBefore);
-    await page.keyboard.press("ArrowRight");
-    await expect(modal.getByRole("radio", { name: "OpenClaw", exact: true })).toBeChecked();
-    await page.keyboard.press("ArrowLeft");
-    await expect(tool).toBeFocused();
-    await expect(tool).toBeChecked();
-    await page.screenshot({ path: testInfo.outputPath("setup-tabs-focus.png") });
-    await firstStep.focus();
-    await page.keyboard.press("Shift+Tab");
-    await expect(modal.getByRole("button", { name: "Close dialog", exact: true })).toBeFocused();
-    await expect(modal.getByRole("button", { name: "Close dialog", exact: true })).toBeInViewport();
-  });
-}

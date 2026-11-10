@@ -5,9 +5,9 @@ import { HomeConnectionInvitation } from "@/components/home-connection-invitatio
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 
 vi.mock("@/components/connection-setup", () => ({
-  ConnectionSetup: ({ onDirtyChange, onTokenCreated, mcpOauthEnabled }: { onDirtyChange: (dirty: boolean) => void; onTokenCreated?: () => void; mcpOauthEnabled: boolean }) => <>
+  ConnectionSetup: ({ onDirtyChange, onTokenCreated, onSecretCreated, mcpOauthEnabled }: { onDirtyChange: (dirty: boolean) => void; onTokenCreated?: () => void; onSecretCreated?: () => void; mcpOauthEnabled: boolean }) => <>
     <p>{mcpOauthEnabled ? "OAuth is available" : "Personal token setup"}</p>
-    <button onClick={() => { onDirtyChange(true); onTokenCreated?.(); }}>Create test token</button>
+    <button onClick={() => { onDirtyChange(true); onTokenCreated?.(); onSecretCreated?.(); }}>Create test token</button>
     <input aria-label="Saved private configuration" defaultValue="private-example" />
   </>,
 }));
@@ -60,14 +60,14 @@ describe("Home connection invitation", () => {
     unmount();
     render(invitation());
     expect(region()).toHaveAttribute("data-expanded", "false");
-    expect(screen.getByRole("button", { name: "Connect an agent" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Connect an AI tool" })).toBeVisible();
   });
 
   it("minimizes to a labelled button and restores keyboard focus", async () => {
     const user = userEvent.setup();
     render(invitation());
     await user.click(screen.getByRole("button", { name: "Minimize connection guide" }));
-    const launcher = screen.getByRole("button", { name: "Connect an agent" });
+    const launcher = screen.getByRole("button", { name: "Connect an AI tool" });
     await waitFor(() => expect(launcher).toHaveFocus());
     expect(launcher).toHaveAttribute("aria-haspopup", "dialog");
     expect(launcher).toHaveClass("h-11");
@@ -84,7 +84,7 @@ describe("Home connection invitation", () => {
   it("only expands after eligibility is verified and uses a neutral launcher otherwise", () => {
     const { rerender } = render(invitation(false));
     expect(region()).toHaveAttribute("data-expanded", "false");
-    expect(screen.getByRole("button", { name: "Connect an agent" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Connect an AI tool" })).toBeVisible();
     rerender(invitation(true));
     expect(region()).toHaveAttribute("data-expanded", "true");
   });
@@ -133,14 +133,14 @@ describe("Home connection invitation", () => {
     const user = userEvent.setup();
     const tokenCreated = vi.fn();
     render(<HomeConnectionInvitation userId={userId} eligible oauthEnabled onTokenCreated={tokenCreated} />);
-    await user.click(screen.getByRole("button", { name: "Connect an agent" }));
+    await user.click(screen.getByRole("button", { name: "Connect an AI tool" }));
     expect(screen.getByText("OAuth is available")).toBeVisible();
     expect(region()).not.toBeVisible();
     await user.click(screen.getByRole("button", { name: "Create test token" }));
     expect(tokenCreated).toHaveBeenCalledOnce();
     expect(screen.getByLabelText("Saved private configuration")).toHaveValue("private-example");
     await user.click(screen.getByRole("button", { name: "Close" }));
-    const confirmation = screen.getByRole("dialog", { name: "Have you saved your token?" });
+    const confirmation = screen.getByRole("dialog", { name: "Have you saved your connection key?" });
     expect(confirmation).toBeVisible();
     expect(region()).not.toBeVisible();
     await user.click(within(confirmation).getByRole("button", { name: "Keep setup open" }));
@@ -149,14 +149,14 @@ describe("Home connection invitation", () => {
     await user.click(screen.getByRole("button", { name: "I've saved it — close" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(region()).toBeVisible();
-    await waitFor(() => expect(screen.getByRole("button", { name: "Connect an agent" })).toHaveFocus());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Connect an AI tool" })).toHaveFocus());
   });
 
   it("also launches setup from the compact entry and clears private setup on identity change", async () => {
     const user = userEvent.setup();
     const { rerender } = render(invitation(false));
-    await user.click(screen.getByRole("button", { name: "Connect an agent" }));
-    expect(screen.getByRole("dialog", { name: "Connect an agent" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Connect an AI tool" }));
+    expect(screen.getByRole("dialog", { name: "Connect an AI tool" })).toBeVisible();
     rerender(invitation(true, `${userId}-new`));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(region()).toHaveAttribute("data-expanded", "true");

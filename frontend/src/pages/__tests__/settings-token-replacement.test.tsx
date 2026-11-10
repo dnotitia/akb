@@ -11,57 +11,60 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 const fetchMock = vi.fn();
 beforeEach(() => { configureAuthTransport("local"); setToken("fixture-session"); fetchMock.mockReset(); fetchMock.mockImplementation(url => Promise.resolve(json(String(url).endsWith("/vaults") ? { vaults: [] } : caps))); vi.stubGlobal("fetch", fetchMock); });
 afterEach(() => { cleanup(); setToken(null); configureAuthTransport(null); vi.unstubAllGlobals(); });
-function mount(pats = [original]) { render(<TokensSection pats={pats} patsError={false} mcpOauthEnabled={false} onReloadPats={vi.fn()} />); }
+function mount(pats = [original]) { render(<TokensSection initialView="keys" pats={pats} patsError={false} mcpOauthEnabled={false} onReloadPats={vi.fn()} />); }
 
 it("preserves the same-account replacement secret while checking and discards it on account-key replacement", async () => {
-  const view = (id: string, active: boolean) => <Activity mode={active ? "visible" : "hidden"}><TokensSection key={id} pats={[original]} patsError={false} mcpOauthEnabled={false} onReloadPats={vi.fn()} /></Activity>;
+  const view = (id: string, active: boolean) => <Activity mode={active ? "visible" : "hidden"}><TokensSection initialView="keys" key={id} pats={[original]} patsError={false} mcpOauthEnabled={false} onReloadPats={vi.fn()} /></Activity>;
   const { rerender } = render(view("a", true));
-  fireEvent.click(screen.getByRole("button", { name: "Replace token original" }));
-  const dialog = screen.getByRole("dialog", { name: "Replace token original" });
-  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement token" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Replace key original" }));
+  const dialog = screen.getByRole("dialog", { name: "Replace key original" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Continue with Claude Code" }));
+  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement key" })).toBeEnabled());
   fetchMock.mockImplementation(() => Promise.resolve(json({ contract_version: 1, user_id: uid, token_id: newId, name: "original", token: "akb_retained_secret", prefix: "akb_retained", issued_at: "2026-09-01T00:00:00.123456Z", key_class: "pat", scopes: original.scopes, vault_scope: original.vault_scope, expires_at: original.expires_at })));
-  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement token" }));
-  await within(dialog).findByText("Token created — save it now");
+  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement key" }));
+  await within(dialog).findByText("Connection key created");
   rerender(view("a", false));
-  expect(screen.queryByRole("dialog", { name: "Replace token original" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("dialog", { name: "Replace key original" })).not.toBeInTheDocument();
   expect(dialog).not.toBeVisible();
   expect(dialog.textContent).toContain("akb_retained_secret");
   rerender(view("a", true));
-  expect(screen.getByRole("dialog", { name: "Replace token original" })).toBe(dialog);
+  expect(screen.getByRole("dialog", { name: "Replace key original" })).toBe(dialog);
   expect(dialog.textContent).toContain("akb_retained_secret");
   setToken("account-b");
   rerender(view("b", true));
   expect(document.body.textContent).not.toContain("akb_retained_secret");
-  expect(screen.queryByRole("dialog", { name: "Replace token original" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("dialog", { name: "Replace key original" })).not.toBeInTheDocument();
 });
 
 it("keeps the original active if replacement creation fails", async () => {
-  mount(); fireEvent.click(screen.getByRole("button", { name: "Replace token original" }));
-  const dialog = screen.getByRole("dialog", { name: "Replace token original" });
+  mount(); fireEvent.click(screen.getByRole("button", { name: "Replace key original" }));
+  const dialog = screen.getByRole("dialog", { name: "Replace key original" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Continue with Claude Code" }));
   expect(within(dialog).getByText(`UTC: ${original.expires_at}`)).toBeVisible();
-  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement token" })).toBeEnabled());
+  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement key" })).toBeEnabled());
   fetchMock.mockImplementation(() => Promise.resolve(json({}, 503)));
-  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement token" }));
-  await within(dialog).findByText(/Creation result needs checking/);
+  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement key" }));
+  await within(dialog).findByText(/We could not confirm whether the key was created/);
   expect(fetchMock.mock.calls.filter(([, init]) => init.method === "DELETE")).toHaveLength(0);
-  expect(screen.queryByRole("button", { name: "Revoke original token" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Revoke original key" })).not.toBeInTheDocument();
 });
 
 it("preserves restrictions and exact expiry, and keeps the new secret after original revocation fails", async () => {
-  mount(); fireEvent.click(screen.getByRole("button", { name: "Replace token original" }));
-  const dialog = screen.getByRole("dialog", { name: "Replace token original" });
+  mount(); fireEvent.click(screen.getByRole("button", { name: "Replace key original" }));
+  const dialog = screen.getByRole("dialog", { name: "Replace key original" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Continue with Claude Code" }));
   expect(within(dialog).getByText(`UTC: ${original.expires_at}`)).toBeVisible();
-  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement token" })).toBeEnabled());
+  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement key" })).toBeEnabled());
   fetchMock.mockImplementation((url, init) => Promise.resolve(init.method === "DELETE" ? json({ detail: "Temporary revocation failure" }, 503) : json({ contract_version: 1, user_id: uid, token_id: newId, name: "original", token: "akb_new_secret", prefix: "akb_new", issued_at: "2026-09-01T00:00:00.123456Z", key_class: "pat", scopes: original.scopes, vault_scope: original.vault_scope, expires_at: original.expires_at })));
-  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement token" }));
-  await screen.findByText("Token created — save it now");
+  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement key" }));
+  await screen.findByText("Connection key created");
   const posts = fetchMock.mock.calls.filter(([, init]) => init.method === "POST");
   expect(posts).toHaveLength(1);
   const submitted = JSON.parse(posts[0][1].body);
   expect(submitted.scopes).toEqual(original.scopes); expect(submitted.vault_scope).toEqual(original.vault_scope); expect(submitted.expires_at).toBe(original.expires_at);
   expect(fetchMock.mock.calls.filter(([, init]) => init.method === "DELETE")).toHaveLength(0);
-  fireEvent.click(screen.getByRole("button", { name: "Revoke original token" }));
-  fireEvent.click(screen.getByRole("button", { name: "Revoke token" }));
+  fireEvent.click(screen.getByRole("button", { name: "Revoke original key" }));
+  fireEvent.click(screen.getByRole("button", { name: "Revoke key" }));
   await screen.findByText("Temporary revocation failure");
   expect(document.body.textContent).toContain("akb_new_secret");
   const deletes = fetchMock.mock.calls.filter(([, init]) => init.method === "DELETE");
@@ -69,20 +72,20 @@ it("preserves restrictions and exact expiry, and keeps the new secret after orig
 });
 
 it("disables replacement when a legacy token omitted its scope metadata", () => {
-  render(<TokensSection pats={[{ token_id: oldId, name: "legacy", prefix: "akb_old" }]} patsError={false} mcpOauthEnabled={false} onReloadPats={vi.fn()} />);
-  expect(screen.getByRole("button", { name: "Replace token legacy" })).toBeDisabled();
+  render(<TokensSection initialView="keys" pats={[{ token_id: oldId, name: "legacy", prefix: "akb_old" }]} patsError={false} mcpOauthEnabled={false} onReloadPats={vi.fn()} />);
+  expect(screen.getByRole("button", { name: "Replace key legacy" })).toBeDisabled();
   expect(screen.getByText(/Vault write restriction unknown/)).toBeVisible();
 });
 
 
 it("retains token rows during refresh failure and gives retry a busy state", () => {
   const reload = vi.fn();
-  const view = (loading: boolean) => <TokensSection pats={[original]} patsError mcpOauthEnabled={false} patsLoading={loading} onReloadPats={reload} />;
+  const view = (loading: boolean) => <TokensSection initialView="keys" pats={[original]} patsError mcpOauthEnabled={false} patsLoading={loading} onReloadPats={reload} />;
   const { rerender } = render(view(false));
-  expect(screen.getByRole("button", { name: "Revoke token original" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Revoke key original" })).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
   expect(reload).toHaveBeenCalledTimes(1);
   rerender(view(true));
   expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
-  expect(screen.getByRole("region", { name: "Saved tokens" })).toHaveAttribute("aria-busy", "true");
+  expect(screen.getByRole("region", { name: "Connection keys" })).toHaveAttribute("aria-busy", "true");
 });
