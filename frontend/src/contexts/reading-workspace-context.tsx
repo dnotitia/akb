@@ -4,8 +4,12 @@ import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { ApiError, getDocument } from "@/lib/api";
 import { readWithAccessBoundary } from "@/lib/query-access-boundary";
 import { readingDocumentKey, type ReadingDocument } from "@/lib/reading-workspace";
-import { emptyReadingSession, readReadingSession, writeReadingSession, READING_TAB_LIMIT, READING_CLOSED_LIMIT, type ReadingSession } from "@/lib/reading-session";
+import { emptyReadingSession, readReadingSession, writeReadingSession, READING_TAB_LIMIT, type ReadingSession } from "@/lib/reading-session";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
+import { closeReadingTabs, readingTabCloseKeys, restoreReadingTabs, type ReadingTabCloseScope } from "@/lib/reading-tab-actions";
+import { isModalOpen, useModalOpen } from "@/lib/modal-visibility";
+import { Button } from "@/components/ui/button";
+import { X } from "lucide-react";
 
 interface ReadingWorkspaceState {
   tabs: ReadingDocument[];
@@ -13,6 +17,9 @@ interface ReadingWorkspaceState {
   remember: (doc: ReadingDocument) => void;
   forget: (key: string) => void;
   close: (key: string, active: string) => void;
+  closeGroup: (scope: ReadingTabCloseScope, target: string, active: string) => void;
+  undoClose: () => void;
+  undoCount: number;
   reorder: (key: string, target: string) => void;
   positions: Map<string, number>;
   savePosition: (key: string, top: number) => void;
@@ -26,6 +33,7 @@ interface ReadingWorkspaceState {
   retryRestore: () => void;
 }
 const ReadingWorkspaceContext = createContext<ReadingWorkspaceState | null>(null);
+type TabOperation = { id: string; owner: string; proof: string; keys: string[]; all: boolean; toVault?: boolean; undoId?: string };
 function limitTabs(tabs: ReadingDocument[], active: string | null, companion: ReadingDocument | null) {
   const result = [...tabs];
   while (result.length > READING_TAB_LIMIT) {
@@ -54,6 +62,10 @@ export function ReadingWorkspaceProvider({ children }: { children: ReactNode }) 
   }), [owner]);
   const navigate = useNavigate();
   const location = useLocation();
+  const pendingOperation = useRef<TabOperation | null>(null);
+  const [dismissedUndo, setDismissedUndo] = useState<string | null>(null);
+  const [undoError, setUndoError] = useState("");
+  const modalOpen = useModalOpen();
   const queryClient = useQueryClient();
   const entries = useMemo(() => [...new Map([...session.tabs, ...session.closed, ...(session.companion ? [session.companion] : [])].map(doc => [readingDocumentKey(doc), doc])).values()], [session.tabs, session.closed, session.companion]);
   const proof = `${owner}:${revision}`;
@@ -119,17 +131,55 @@ export function ReadingWorkspaceProvider({ children }: { children: ReactNode }) 
     return { ...previous, tabs: previous.tabs.filter(item => readingDocumentKey(item) !== key), closed: previous.closed.filter(item => readingDocumentKey(item) !== key),
       companion: previous.companion && readingDocumentKey(previous.companion) === key ? null : previous.companion };
   }), [update]);
-  const remove = useCallback((key: string) => update(previous => {
-    const doc = previous.tabs.find(item => readingDocumentKey(item) === key);
-    if (!doc) return previous;
-    return { ...previous, closed: [doc, ...previous.closed.filter(item => readingDocumentKey(item) !== key)].slice(0, READING_CLOSED_LIMIT), tabs: previous.tabs.filter(item => readingDocumentKey(item) !== key) };
-  }), [update]);
-  const close = useCallback((key: string, active: string) => {
-    if (key !== active) { remove(key); return; }
-    const index = visibleTabs.findIndex(item => readingDocumentKey(item) === key);
-    const next = visibleTabs[index + 1] ?? visibleTabs[index - 1];
-    navigate(next?.href ?? `/vault/${encodeURIComponent(visibleTabs[index]?.vault ?? "")}`, { state: { readingCloseTab: key } });
-  }, [navigate, remove, visibleTabs]);
+  const requestClose = (keys: string[], active: string, all = false) => {
+    if (!owner || checking || latest.current.owner !== owner || latestProof.current.proof !== proof || latestProof.current.checking) return;
+    const current = latest.current.session;
+    if (!keys.length && !(all && current.companion)) return;
+    const operation: TabOperation = { id: crypto.randomUUID(), owner, proof, keys, all };
+    pendingOperation.current = null;
+    setUndoError("");
+    if (!all && !keys.includes(active)) {
+      update(previous => closeReadingTabs(previous, keys, operation.id, proof));
+      return;
+    }
+    const selected = new Set(keys);
+    const index = visibleTabs.findIndex(doc => readingDocumentKey(doc) === active);
+    const next = visibleTabs.slice(index + 1).find(doc => !selected.has(readingDocumentKey(doc)))
+      ?? visibleTabs.slice(0, Math.max(0, index)).reverse().find(doc => !selected.has(readingDocumentKey(doc)));
+    const vault = current.tabs.find(doc => readingDocumentKey(doc) === active)?.vault ?? current.companion?.vault;
+    operation.toVault = !next;
+    pendingOperation.current = operation;
+    // The router's existing editor guards run before this operation commits.
+    navigate(next?.href ?? (vault ? `/vault/${encodeURIComponent(vault)}` : "/vault"),
+      { state: { readingTabAction: operation.id, readingCloseTab: active } });
+  };
+  const close = (key: string, active: string) => requestClose([key], active);
+  const closeGroup = (scope: ReadingTabCloseScope, target: string, active: string) => {
+    requestClose(readingTabCloseKeys(latest.current.session.tabs, scope, target), active, scope === "all");
+  };
+  const undoBatch = !checking && owner && session.undo?.proof === proof ? session.undo : null;
+  const undoClose = () => {
+    if (!undoBatch || latest.current.owner !== owner || !owner || latestProof.current.proof !== proof || latestProof.current.checking) return;
+    const current = latest.current.session;
+    if (current.undo?.id !== undoBatch.id) return;
+    const restored = restoreReadingTabs(current);
+    if (!restored) { setDismissedUndo(null); setUndoError(`Make room in the ${READING_TAB_LIMIT}-tab workspace before restoring this group.`); return; }
+    setUndoError("");
+    pendingOperation.current = null;
+    const target = restored.tabs.find(doc => readingDocumentKey(doc) === undoBatch.active);
+    if (!target || (current.active === undoBatch.active && location.pathname === new URL(target.href, window.location.origin).pathname)) {
+      update(previous => previous.undo?.id === undoBatch.id ? restoreReadingTabs(previous) ?? previous : previous);
+      requestAnimationFrame(() => {
+        if (!isModalOpen() && document.activeElement === document.body) {
+          (document.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]') ?? document.getElementById("main"))?.focus({ preventScroll: true });
+        }
+      });
+      return;
+    }
+    const operation: TabOperation = { id: crypto.randomUUID(), owner, proof, keys: [], all: false, undoId: undoBatch.id };
+    pendingOperation.current = operation;
+    navigate(target.href, { state: { readingTabAction: operation.id, readingCloseTab: "undo" } });
+  };
   const reorder = useCallback((key: string, target: string) => update(previous => {
     const from = previous.tabs.findIndex(tab => readingDocumentKey(tab) === key), to = previous.tabs.findIndex(tab => readingDocumentKey(tab) === target);
     if (from < 0 || to < 0 || from === to) return previous;
@@ -147,9 +197,19 @@ export function ReadingWorkspaceProvider({ children }: { children: ReactNode }) 
   }, [update]);
   const closeBeside = useCallback(() => update(previous => ({ ...previous, companion: null })), [update]);
   useLayoutEffect(() => {
-    const key = (location.state as { readingCloseTab?: string } | null)?.readingCloseTab;
-    if (key && session.tabs.some(item => readingDocumentKey(item) === key)) remove(key);
-  }, [location.key, location.state, remove, session.tabs]);
+    const operation = pendingOperation.current;
+    if (!operation) return;
+    if (operation.owner !== owner || operation.proof !== proof || checking) { pendingOperation.current = null; return; }
+    const id = (location.state as { readingTabAction?: string } | null)?.readingTabAction;
+    if (id !== operation.id) return;
+    pendingOperation.current = null;
+    update(previous => operation.undoId
+      ? previous.undo?.id === operation.undoId ? restoreReadingTabs(previous) ?? previous : previous
+      : closeReadingTabs(previous, operation.keys, operation.id, operation.proof, operation.all));
+    if (operation.toVault) requestAnimationFrame(() => {
+      if (!isModalOpen()) document.getElementById("main")?.focus({ preventScroll: true });
+    });
+  }, [location.key, location.state, owner, proof, checking, update]);
   const retryRestore = useCallback(() => { void (async () => {
     if (verified.some(result => result.isPending)) return;
     const failed = verified.filter(result => result.isError);
@@ -158,10 +218,19 @@ export function ReadingWorkspaceProvider({ children }: { children: ReactNode }) 
       await Promise.allSettled(failed.slice(index, index + 4).map(result => result.refetch()));
     }
   })(); }, [verified, proof]);
-  const value = { tabs: visibleTabs, closed: visibleClosed, remember, forget, close, reorder, activate, positions: session.positions, savePosition,
+  const value = { tabs: visibleTabs, closed: visibleClosed, remember, forget, close, closeGroup, undoClose, undoCount: undoBatch?.keys.length ?? 0, reorder, activate, positions: session.positions, savePosition,
     companion, openBeside, closeBeside, sideRequest, restoring: !!owner && !checking && verified.some(result => result.isPending),
     restoreErrors: verified.filter(result => result.isError && !(result.error instanceof ApiError && [401, 403, 404].includes(result.error.status))).length, retryRestore };
-  return <ReadingWorkspaceContext.Provider value={value}>{children}</ReadingWorkspaceContext.Provider>;
+  return <ReadingWorkspaceContext.Provider value={value}>{children}
+    {undoBatch && dismissedUndo !== undoBatch.id && <div key={undoBatch.id} className="reading-tab-undo" hidden={modalOpen} data-reader={/\/vault\/[^/]+\/doc\//.test(location.pathname)} aria-label="Closed document tabs" role="region">
+      <p role="status">{undoError || `Closed ${undoBatch.keys.length} ${undoBatch.keys.length === 1 ? "tab" : "tabs"}.`}</p>
+      <Button size="sm" variant="ghost" onClick={undoClose}>Undo</Button>
+      <Button size="icon" variant="ghost" className="tab-manager-icon" aria-label="Dismiss tab close notice" onClick={() => {
+        setDismissedUndo(undoBatch.id);
+        requestAnimationFrame(() => (document.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]') ?? document.getElementById("main"))?.focus({ preventScroll: true }));
+      }}><X size={14} aria-hidden /></Button>
+    </div>}
+  </ReadingWorkspaceContext.Provider>;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components

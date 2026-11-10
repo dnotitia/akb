@@ -12,6 +12,17 @@ export interface ReadingSession {
   active: string | null;
   companion: ReadingDocument | null;
   positions: Map<string, number>;
+  /** One in-memory close operation. Never serialize titles or editor state. */
+  undo?: ClosedReadingTabs | null;
+}
+export interface ClosedReadingTabs {
+  id: string;
+  proof: string;
+  tabs: ReadingDocument[];
+  keys: string[];
+  active: string | null;
+  companion: ReadingDocument | null;
+  positions: Map<string, number>;
 }
 export const emptyReadingSession = (): ReadingSession => ({ tabs: [], closed: [], active: null, companion: null, positions: new Map() });
 function safeTop(value: unknown): number { return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(10_000_000, value)) : 0; }
