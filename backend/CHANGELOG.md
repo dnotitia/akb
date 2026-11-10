@@ -7,6 +7,12 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- `akb_search` accepts `doc_types` (any listed document type), `source_type`
+  (`document`, `file`, or `table`), and `archive_scope` (`unarchived`,
+  `archived`, or `all`). These filters intersect with the caller's readable
+  Vaults and existing search filters. An explicit archive scope overrides
+  `include_archived`.
+
 - Native document create/update accepts an optional UUID `idempotency_key`
   through MCP and REST. Matching retries return the original write receipt;
   reuse with different input conflicts. Keys bind the authenticated user,

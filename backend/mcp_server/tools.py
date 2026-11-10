@@ -32,7 +32,10 @@ ID parameter (`todo_id`, publication `slug`); these are not
 URI-addressable.
 """
 
+from typing import Annotated, Literal, TypedDict
+
 from mcp.types import Tool
+from pydantic import Field, TypeAdapter
 from app.config import settings
 from app.models.document_preconditions import BODY_UPDATE_CONDITION, CONTENT_HASH_PATTERN, REVISION_PATTERN
 
@@ -40,6 +43,24 @@ from app.services import template_registry
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS, MAX_REPLACEMENTS
 from app.services.kg_service import LINK_RELATION_TYPES
+from app.services.search_filters import ArchiveScope
+
+
+class _SearchFilterOptions(TypedDict, total=False):
+    doc_types: Annotated[list[str], Field(description=(
+        "Match documents of any listed type, intersected with type and the other filters. "
+        "An empty list adds no restriction."
+    ))]
+    source_type: Annotated[Literal["document", "file", "table"], Field(
+        description="Restrict results to one resource kind."
+    )]
+    archive_scope: Annotated[ArchiveScope, Field(description=(
+        "Overrides include_archived. The archived scope returns documents only. "
+        "Omit to keep the existing include_archived behavior (default: unarchived)."
+    ))]
+
+
+SEARCH_FILTER_OPTIONS = TypeAdapter(_SearchFilterOptions)
 
 DOCUMENT_IDEMPOTENCY_KEY = {
     "type": ["string", "null"], "format": "uuid",
@@ -466,6 +487,7 @@ TOOLS = [
                 "query": {"type": "string", "description": "Natural language search query"},
                 "vault": {"type": "string", "description": "Limit search to a specific vault"},
                 "collection": {"type": "string", "description": "Limit search to a specific collection"},
+                **SEARCH_FILTER_OPTIONS.json_schema()["properties"],
                 "type": {
                     "type": "string",
                     "description": (

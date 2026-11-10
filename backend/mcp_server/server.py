@@ -76,7 +76,7 @@ from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
-from mcp_server.tools import TOOLS, available_tools
+from mcp_server.tools import SEARCH_FILTER_OPTIONS, TOOLS, available_tools
 from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
@@ -931,6 +931,12 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
 async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
     if args.get("vault"):
         await check_vault_access(uid, args["vault"], required_role="reader")
+    try:
+        filters = SEARCH_FILTER_OPTIONS.validate_python(args, strict=True)
+    except ModelValidationError as exc:
+        issue = exc.errors(include_input=False)[0]
+        field = "/" + "/".join(map(str, issue["loc"]))
+        return err(issue["msg"], code=INVALID_ARGUMENT, field=field, reason=issue["type"])
     result = await search_service.search(
         query=args["query"],
         vault=args.get("vault"),
@@ -941,6 +947,7 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
         user_id=uid,
         include_archived=args.get("include_archived", False),
         source_uris=args.get("source_uris"),
+        **filters,
     )
     return result.model_dump()
 
