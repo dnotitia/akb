@@ -76,7 +76,7 @@ from app.services import publication_service, table_service
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import DocumentRepository
 
-from mcp_server.tools import SEARCH_FILTER_OPTIONS, TOOLS, available_tools
+from mcp_server.tools import BROWSE_FILTER_OPTIONS, SEARCH_FILTER_OPTIONS, TOOLS, available_tools
 from mcp_server.response_projection import browse_payload
 from mcp_server.help import _resolve_help
 from mcp_server.instructions import INSTRUCTIONS
@@ -493,6 +493,12 @@ def _filter_arg(args: dict) -> str:
     return raw.strip().lower()
 
 
+def _invalid_filter_error(exc: ModelValidationError) -> dict:
+    issue = exc.errors(include_input=False)[0]
+    field = "/" + "/".join(map(str, issue["loc"]))
+    return err(issue["msg"], code=INVALID_ARGUMENT, field=field, reason=issue["type"])
+
+
 @_h("akb_help")
 async def _handle_help(args: dict, uid: str, user: _MCPUser) -> dict:
     topic = args.get("topic")
@@ -899,16 +905,27 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
         vault = vault_arg
         collection = args.get("collection")
     await check_vault_access(uid, vault, required_role="reader")
-    paged = args.get("page_size") is not None or args.get("cursor") is not None or args.get("content_type") == "collections"
+    try:
+        filters = BROWSE_FILTER_OPTIONS.validate_python(args, strict=True)
+    except ModelValidationError as exc:
+        return _invalid_filter_error(exc)
+    if "name_query" in filters and "filter" in args:
+        return err("Choose either name_query or filter.", code=INVALID_ARGUMENT)
+    content_type = args.get("content_type", "all")
+    paged = (
+        args.get("page_size") is not None or args.get("cursor") is not None
+        or content_type in ("collections", "resources") or "name_query" in filters
+    )
     if paged and ("limit" in args or "offset" in args):
         return err("Use page_size/cursor or legacy limit/offset, not both.", code=INVALID_ARGUMENT)
     result = await doc_service.browse(
         vault,
         collection=collection,
         depth=args.get("depth", 1),
-        content_type=args.get("content_type", "all"),
+        content_type=content_type,
         include_hashes=args.get("include_hashes", False),
         include_archived=args.get("include_archived", False),
+        **filters,
         **({"page_size": args.get("page_size", 100), "cursor": args.get("cursor")} if paged else {}),
     )
     include_summary = args.get("include_summary")
@@ -934,9 +951,7 @@ async def _handle_search(args: dict, uid: str, user: _MCPUser) -> dict:
     try:
         filters = SEARCH_FILTER_OPTIONS.validate_python(args, strict=True)
     except ModelValidationError as exc:
-        issue = exc.errors(include_input=False)[0]
-        field = "/" + "/".join(map(str, issue["loc"]))
-        return err(issue["msg"], code=INVALID_ARGUMENT, field=field, reason=issue["type"])
+        return _invalid_filter_error(exc)
     result = await search_service.search(
         query=args["query"],
         vault=args.get("vault"),
