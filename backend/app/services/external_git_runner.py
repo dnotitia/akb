@@ -601,7 +601,12 @@ class ExternalGitRunner:
         import signal
 
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            # _exec uses start_new_session, so the child's PID identifies our
+            # process group. On Darwin, killing a shell's foreground job can
+            # wake the shell long enough to launch its next command while the
+            # group kill is being delivered. Stop the group before killing it.
+            os.killpg(proc.pid, signal.SIGSTOP)
+            os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.kill()
