@@ -184,7 +184,8 @@ async def test_concurrent_different_requests_with_one_key_have_one_winner():
         assert await counts(pool, vault_id) == (1, 1, 1, 1)
 
 
-async def test_mcp_and_rest_share_receipts_but_reauthorize_scope_and_revoked_membership(monkeypatch, tmp_path):
+@pytest.mark.parametrize("options", [{}, {"title_conflict_policy": "reject"}], ids=["legacy", "reject"])
+async def test_mcp_and_rest_share_receipts_but_reauthorize_scope_and_revoked_membership(monkeypatch, tmp_path, options):
     from app.config import settings
     from app.models.vault_scope import VaultScope, current_vault_scope
     from app.services.access_service import reset_authorized_vault
@@ -201,14 +202,20 @@ async def test_mcp_and_rest_share_receipts_but_reauthorize_scope_and_revoked_mem
         monkeypatch.setattr(server, "doc_service", service)
         monkeypatch.setattr(documents, "doc_service", service)
         user = SimpleNamespace(username="retry-writer", user_id=str(actor))
-        req = put_request(idempotency_key=uuid.uuid4(), slug="fixed")
-        args = req.model_dump(mode="json")
+        req = put_request(idempotency_key=uuid.uuid4(), slug="fixed", **options)
+        args = req.model_dump(mode="json", exclude_unset=True)
         first = await server._handle_put(args, str(actor), user)
         assert (await documents.put_document(req, user)).model_dump() == first
-        update = DocumentUpdateRequest(title="Changed", idempotency_key=uuid.uuid4())
+        other_policy = "allow" if options else "reject"
+        with pytest.raises(ConflictError):
+            await server._handle_put({**args, "title_conflict_policy": other_policy}, str(actor), user)
+        update = DocumentUpdateRequest(title="Changed", idempotency_key=uuid.uuid4(), **options)
         updated = await documents.update_document(req.vault, first["path"], update, user)
-        patch = {"uri": first["uri"], **update.model_dump(mode="json")}
+        patch = {"uri": first["uri"], **update.model_dump(mode="json", exclude_unset=True)}
         assert await server._handle_update(patch, str(actor), user) == updated.model_dump()
+        with pytest.raises(ConflictError):
+            await server._handle_update({**patch, "title_conflict_policy": other_policy}, str(actor), user)
+        assert await server._handle_put(args, str(actor), user) == first
         before = await counts(pool, vault_id)
         token = current_vault_scope.set(VaultScope(prefixes=(), extra_vaults=frozenset()))
         try:
