@@ -5,6 +5,7 @@ import { Portal as TooltipPortal } from "@radix-ui/react-tooltip";
 import { useReadingWorkspace } from "@/contexts/reading-workspace-context";
 import { readingDocumentKey } from "@/lib/reading-workspace";
 import { ReadingTabManager } from "@/components/reading-tab-manager";
+import { ReadingTabContextMenu } from "@/components/reading-tab-actions-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 export function DocumentTabs({ active, panelId }: { active: string; panelId: string }) {
@@ -17,12 +18,13 @@ export function DocumentTabs({ active, panelId }: { active: string; panelId: str
   const listRef = useRef<HTMLDivElement>(null);
   const activeButtonRef = useRef<HTMLButtonElement>(null);
   const [notice, setNotice] = useState("");
-  useEffect(() => { activeButtonRef.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" }); }, [active]);
+  const activeTabAvailable = workspace.tabs.some(tab => readingDocumentKey(tab) === active);
+  useEffect(() => { activeButtonRef.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" }); }, [active, activeTabAvailable]);
   useEffect(() => {
     setFocused(active || null);
     const closed = (location.state as { readingCloseTab?: string } | null)?.readingCloseTab;
     if (closed && active && active !== closed) activeButtonRef.current?.focus({ preventScroll: true });
-  }, [active, location.state]);
+  }, [active, activeTabAvailable, location.state]);
   useEffect(() => {
     const strip = listRef.current;
     if (!strip) return;
@@ -57,7 +59,10 @@ export function DocumentTabs({ active, panelId }: { active: string; panelId: str
     if (next !== null) { event.preventDefault(); buttons[next].focus(); }
     if (event.key === "Delete") {
       event.preventDefault(); const key = readingDocumentKey(workspace.tabs[index]); workspace.close(key, active);
-      if (key !== active) { setFocused(active); activeButtonRef.current?.focus({ preventScroll: true }); }
+      if (key !== active) {
+        const next = buttons[index + 1] ?? buttons[index - 1];
+        next?.focus({ preventScroll: true });
+      }
     }
     if (event.key === "Escape") { setDragging(null); setDropTarget(null); }
   };
@@ -69,7 +74,7 @@ export function DocumentTabs({ active, panelId }: { active: string; panelId: str
         const label = title && title !== tab.path ? title : tab.path.split("/").at(-1) || tab.path;
         const details = `${tab.vault} / ${tab.path}${tab.version ? ` · Version ${tab.version}` : ""}`;
         const Icon = tab.version ? History : FileText;
-        return <div key={key} className="reading-tab-wrap" role="presentation" data-selected={selected} data-drop-target={dragging && key !== dragging && dropTarget === key}
+        return <ReadingTabContextMenu key={key} doc={tab} active={active}><div className="reading-tab-wrap" role="presentation" data-selected={selected} data-drop-target={dragging && key !== dragging && dropTarget === key}
           data-drop-direction={workspace.tabs.findIndex(item => readingDocumentKey(item) === dragging) < index ? "after" : "before"}
           onDragOver={event => { if (!dragging) return; event.preventDefault(); setDropTarget(key); if (listRef.current) { const bounds = listRef.current.getBoundingClientRect(); if (event.clientX < bounds.left + 32) listRef.current.scrollLeft -= 20; else if (event.clientX > bounds.right - 32) listRef.current.scrollLeft += 20; } }}
           onDrop={event => { if (dragging) { event.preventDefault(); workspace.reorder(dragging, key); setNotice("Document tabs reordered"); } setDragging(null); setDropTarget(null); }}>
@@ -77,7 +82,7 @@ export function DocumentTabs({ active, panelId }: { active: string; panelId: str
             <TooltipTrigger asChild>
               <button ref={selected ? activeButtonRef : undefined} type="button" role="tab" id={`${panelId}-tab-${encodeURIComponent(key)}`}
                 draggable onDragStart={event => { setDragging(key); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("application/x-akb-reading-tab", key); }} onDragEnd={() => { setDragging(null); setDropTarget(null); }}
-                aria-selected={selected} aria-controls={selected ? panelId : undefined} aria-description={details} tabIndex={(focused ?? active) === key ? 0 : -1}
+                aria-selected={selected} aria-controls={selected ? panelId : undefined} aria-description={details} aria-haspopup="menu" tabIndex={(focused ?? active) === key ? 0 : -1}
                 className="reading-tab"
                 onMouseDown={event => { if (event.button === 1) event.preventDefault(); }} onAuxClick={event => { if (event.button === 1) { event.preventDefault(); workspace.close(key, active); } }}
                 onFocus={() => setFocused(key)} onKeyDown={event => onKey(event, index)} onClick={() => navigate(tab.href)}>
@@ -92,7 +97,7 @@ export function DocumentTabs({ active, panelId }: { active: string; panelId: str
             </TooltipPortal>
           </Tooltip>
           <button type="button" className="reading-icon-button reading-tab-close" aria-label={`Close ${label}`} aria-description={details} tabIndex={selected ? 0 : -1} onClick={() => workspace.close(key, active)}><X size={14} aria-hidden /></button>
-        </div>;
+        </div></ReadingTabContextMenu>;
       })}
     </div>
     <ReadingTabManager active={active} />

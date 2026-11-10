@@ -200,6 +200,23 @@ height; search and controls stay visible at narrow and short viewport sizes.
 The tab close glyph retains its background-free hover treatment and visible
 keyboard focus. Narrow/coarse-pointer targets retain the existing 44px treatment.
 
+The tab context menu (right-click, long-press or Shift+F10) and list-row menu
+share close, close others, close left/right, close all, side reading and reorder
+actions. The list header's actions use the current tab as their reference.
+Empty scopes are disabled. Menu focus is released before an editor exit guard
+opens; cancelling leaves every tab unchanged. A close affecting the active
+document commits once, only after guarded navigation succeeds. Closing the last
+tab returns to its Vault and focuses the main landmark. Historical navigation
+state cannot replay a consumed close operation.
+
+A compact Undo notice remains available on the destination page. The latest
+close operation keeps an in-memory, access-proof-scoped snapshot independently
+of the 20-item recent history, allowing all 30 tabs to be restored with order,
+active document, reading positions and the closed side pane. Never serialize
+that snapshot or restore it for a changed account/access proof. Undo preserves
+newly opened documents and asks the user to make room if the combined set would
+exceed the tab limit. Existing editor guards retain draft/save/upload protection.
+
 Reading sessions persist per account on this browser: up to 30 open tabs, 20
 recently closed tabs, their order, version, Preview/Raw selection, independent
 reading positions and one side document. Store canonical document URIs and

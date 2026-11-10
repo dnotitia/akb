@@ -2274,7 +2274,14 @@ input:focus-visible + .settings-theme-option { outline: 3px solid var(--color-ri
 .tab-manager-action-menu [data-highlighted] { color: var(--color-link); background: var(--color-surface-selected); outline: none; }
 .tab-manager-action-menu [data-disabled] { opacity: .45; pointer-events: none; }
 .tab-manager-action-menu [role=separator] { height: 1px; margin: .25rem .375rem; background: var(--color-border); }
+.reading-tab-undo { position: fixed; inset-inline-end: 1rem; bottom: calc(1rem + env(safe-area-inset-bottom)); z-index: var(--z-popover); display: flex; align-items: center; gap: .5rem; max-width: calc(100vw - 2rem); padding: .375rem .5rem .375rem .875rem; color: var(--color-foreground); background: var(--color-surface); border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); box-shadow: var(--shadow-md); }
+.reading-tab-undo[hidden] { display: none; }
+.reading-tab-undo[data-reader=true] { bottom: calc(4.25rem + env(safe-area-inset-bottom)); }
+.reading-tab-undo p { font-size: .8125rem; line-height: 1.5; }
+.reading-tab-undo button { flex: none; }
+.reading-tab-undo :focus-visible { outline: 2px solid var(--color-ring); outline-offset: 2px; }
 @media (pointer: coarse), (max-width: 40rem) {
+  .reading-tab-undo button { min-width: 2.75rem; min-height: 2.75rem; }
   .tab-manager .tab-manager-icon, .tab-manager-modes [role=tab], .tab-manager-search input, .tab-manager-footer button, .tab-manager-action-menu [role=menuitem] { min-height: 2.75rem; }
   .tab-manager .tab-manager-icon { width: 2.75rem; height: 2.75rem; }
   .tab-manager-actions { gap: .5rem; }
