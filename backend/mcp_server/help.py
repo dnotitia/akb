@@ -212,6 +212,8 @@ akb_search(query="auth flow", source_uris=[
 
 `akb_search` surfaces documents **and** tables **and** files in one
 ranked list. Use `source_type="document"`, `"table"`, or `"file"` to select a resource kind.
+For documents, `time_range` can restrict creation or last update time. Supply
+`gte` for an inclusive start and/or `lt` for an exclusive end.
 
 ## akb_browse — Tree Navigation
 When you want to **see everything** rather than search:
@@ -900,6 +902,7 @@ Combines vector similarity (meaning) with keyword matching.
 | type | | Existing single type filter, e.g. `note`, `report`, or `decision` |
 | doc_types | | Match documents of any listed type. An empty list adds no restriction. |
 | source_type | | Restrict the resource kind to `document`, `file`, or `table`. |
+| time_range | | Requires `source_type="document"`. Select `field` (`created_at` or `updated_at`) and supply at least one of `gte` (inclusive) or `lt` (exclusive). Use RFC 3339 timestamps with a UTC offset and up to six fractional digits. |
 | archive_scope | | `unarchived`, `archived`, or `all`. An explicit scope overrides `include_archived`. Archived-only searches return documents. |
 | include_archived | | Include archived documents when true (default false). |
 | source_uris | | Restrict candidates to these resource URIs. Omit or pass an empty list for the usual search scope. |
@@ -912,10 +915,15 @@ akb_search(query="deployment process")
 akb_search(query="인증 흐름", vault="eng", type="spec")
 akb_search(query="budget", tags=["finance"], limit=5)
 akb_search(query="release", source_type="document", doc_types=["decision", "report"], archive_scope="all")
+akb_search(query="release", source_type="document", time_range={
+    "field": "updated_at", "gte": "2026-11-10T00:00:00+09:00", "lt": "2026-11-11T00:00:00+09:00"
+})
 ```
 
 Filters intersect with the caller's readable vaults and with each other. For example,
 `type="report"` together with `doc_types=["report", "note"]` selects only reports.
+When a time range is supplied, the response includes the applied `time_range` in UTC,
+even for an empty page. Hits are ranked by relevance.
 
 ## Result Fields
 - `uri`: AKB URI — pass to akb_get / akb_drill_down (docs), akb_get_file (files), akb_sql (tables)

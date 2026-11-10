@@ -32,10 +32,11 @@ ID parameter (`todo_id`, publication `slug`); these are not
 URI-addressable.
 """
 
-from typing import Annotated, Literal, TypedDict
+from datetime import datetime
+from typing import Annotated, Literal, NotRequired, TypedDict
 
 from mcp.types import Tool
-from pydantic import Field, TypeAdapter
+from pydantic import ConfigDict, Field, TypeAdapter, ValidateAs, with_config
 from app.config import settings
 from app.models.document_preconditions import BODY_UPDATE_CONDITION, CONTENT_HASH_PATTERN, REVISION_PATTERN
 
@@ -43,10 +44,32 @@ from app.services import template_registry
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS, MAX_REPLACEMENTS
 from app.services.kg_service import LINK_RELATION_TYPES
-from app.services.search_filters import ArchiveScope
+from app.services.search_filters import ArchiveScope, DocumentTimeField, DocumentTimeRange
+
+
+# Match the precision of PostgreSQL timestamps. Check the offset components
+# before fromisoformat, which otherwise normalizes e.g. +01:60 to +02:00.
+_TimestampText = Annotated[str, Field(
+    pattern=(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+             r"(\.[0-9]{1,6})?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$"),
+    json_schema_extra={"format": "date-time"},
+)]
+_SearchInstant = Annotated[datetime, ValidateAs(_TimestampText, lambda s: datetime.fromisoformat(s.upper()))]
+
+
+@with_config(ConfigDict(extra="forbid", json_schema_extra={"anyOf": [{"required": ["gte"]}, {"required": ["lt"]}]}))
+class _TimeRangeInput(TypedDict):
+    field: DocumentTimeField
+    gte: NotRequired[_SearchInstant]
+    lt: NotRequired[_SearchInstant]
 
 
 class _SearchFilterOptions(TypedDict, total=False):
+    time_range: Annotated[DocumentTimeRange, ValidateAs(_TimeRangeInput, lambda args: DocumentTimeRange(**args)), Field(
+        description="With source_type=document, filter created_at or updated_at. Supply gte (inclusive), "
+        "lt (exclusive), or both as RFC 3339 timestamps with an offset and up to six fractional digits. "
+        "Results retain relevance order. The response echoes the applied bounds in UTC."
+    )]
     doc_types: Annotated[list[str], Field(description=(
         "Match documents of any listed type, intersected with type and the other filters. "
         "An empty list adds no restriction."
@@ -61,6 +84,7 @@ class _SearchFilterOptions(TypedDict, total=False):
 
 
 SEARCH_FILTER_OPTIONS = TypeAdapter(_SearchFilterOptions)
+_SEARCH_FILTER_SCHEMA = SEARCH_FILTER_OPTIONS.json_schema()
 
 
 class _BrowseFilterOptions(TypedDict, total=False):
@@ -511,7 +535,7 @@ TOOLS = [
                 "query": {"type": "string", "description": "Natural language search query"},
                 "vault": {"type": "string", "description": "Limit search to a specific vault"},
                 "collection": {"type": "string", "description": "Limit search to a specific collection"},
-                **SEARCH_FILTER_OPTIONS.json_schema()["properties"],
+                **_SEARCH_FILTER_SCHEMA["properties"],
                 "type": {
                     "type": "string",
                     "description": (
@@ -539,6 +563,9 @@ TOOLS = [
                 },
             },
             "required": ["query"],
+            "$defs": _SEARCH_FILTER_SCHEMA["$defs"],
+            "if": {"required": ["time_range"]},
+            "then": {"required": ["source_type"], "properties": {"source_type": {"const": "document"}}},
         },
     ),
     Tool(

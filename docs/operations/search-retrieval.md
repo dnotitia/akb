@@ -154,15 +154,27 @@ not declare `@pytest.mark.needs_resource`, failing on any skip, so these suites
 cannot skip in both CI jobs.
 For UI and repository checks, follow [CONTRIBUTING.md](../../CONTRIBUTING.md).
 
-## Document time windows in the storage service
+## Document time windows
 
-`SearchService.search` accepts an internal `DocumentTimeRange` with
-`source_type="document"`. MCP and REST discovery do not advertise this input.
-Both endpoints of the range are timezone-aware instants. Supply at least one
-of `gte` (inclusive) and `lt` (exclusive). Two bounds must form a nonempty
-interval. Conversion to UTC preserves the instant, including at day boundaries.
+MCP `akb_search` accepts `time_range` when the request specifies
+`source_type="document"`. Choose `created_at` or `updated_at` and supply at
+least one RFC 3339 timestamp with a UTC offset and up to six fractional digits.
+`gte` includes its instant and `lt` excludes it. With both bounds, `gte` must
+precede `lt`. For example, this searches documents updated on November 10 in Korea:
 
-Use the clocks returned by a **current document read**:
+```json
+{"query":"release","source_type":"document","time_range":{"field":"updated_at","gte":"2026-11-10T00:00:00+09:00","lt":"2026-11-11T00:00:00+09:00"}}
+```
+
+The response echoes the applied `time_range` with UTC bounds, including on a
+zero-match page. Results keep their relevance order. Omitting the filter
+preserves the existing search response. When connecting to an older server,
+check the advertised `akb_search` input schema before requesting a time range.
+The REST search endpoint does not expose this option.
+
+Use the clocks returned by a **current document read**. When copying an
+`akb_get` timestamp into a bound, separate the date and time with `T` and
+preserve the fractional seconds and offset.
 
 | Operation | `created_at` | `updated_at` |
 | --- | --- | --- |
