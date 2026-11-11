@@ -13,6 +13,7 @@ import asyncpg
 import pytest
 
 from app.repositories.events_repo import get_vault_event_bounds, list_vault_events
+from app.services.event_tail_hub import EventTailHub
 from app.services.event_tail_service import EventBounds, EventCursorCodec, EventGapError, validate_event_gap
 
 
@@ -64,6 +65,12 @@ async def _fresh_database():
         await pool.close()
         await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
         await admin.close()
+
+
+async def _listening_hub(pool: asyncpg.Pool) -> EventTailHub:
+    """A LISTEN hub on the test database, not the configured one."""
+    dsn = _database_dsn(await pool.fetchval("SELECT current_database()"))
+    return EventTailHub(lambda: asyncpg.connect(dsn), reconnect_initial_delay=0.05, close_timeout=2.0)
 
 
 async def _make_vault(pool: asyncpg.Pool, name: str) -> uuid.UUID:
@@ -156,7 +163,9 @@ async def test_postgres_tail_stream_preserves_order_filter_checkpoints_and_resum
         async def get_pool():
             return pool
 
+        hub = await _listening_hub(pool)
         monkeypatch.setattr(event_tail_service, "get_pool", get_pool)
+        monkeypatch.setattr(event_tail_service, "get_event_tail_hub", lambda: hub)
         monkeypatch.setattr(
             event_tail_service,
             "check_vault_access",
@@ -200,6 +209,8 @@ async def test_postgres_tail_stream_preserves_order_filter_checkpoints_and_resum
         checkpoint_after_resume = await anext(resumed)
         next_change = await anext(resumed)
         await resumed.aclose()
+        await hub.close()
+        assert hub.subscriber_count == 0
         assert checkpoint_after_resume.startswith("event: checkpoint\n")
         assert next_change.startswith("event: change\n")
         assert codec.decode(next_change.splitlines()[1][4:])[2] == resumed_id

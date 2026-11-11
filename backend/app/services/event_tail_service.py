@@ -8,9 +8,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 import re
+import threading
 from typing import Any, AsyncIterator, Mapping
 from uuid import UUID
+import weakref
 
 from cryptography.hazmat.primitives.ciphers.aead import AESSIV
 from fastapi import Request
@@ -22,11 +25,16 @@ from app.exceptions import AKBError
 from app.models.events import ChangeEventEnvelopeV1, TailCheckpointV1
 from app.repositories.events_repo import get_vault_event_bounds, list_vault_events
 from app.services.access_service import check_vault_access
+from app.services.event_tail_hub import get_event_tail_hub
 
 
-EVENT_CHANNEL = "akb_events"
 EVENT_BATCH_SIZE = 100
 HEARTBEAT_INTERVAL_SECONDS = 15.0
+# Overrides `event_tail_max_streams` from app.yaml; see that setting.
+MAX_STREAMS_ENV_VAR = "AKB_EVENT_TAIL_MAX_STREAMS"
+# Slots free as streams end, which is not predictable; the write lane's
+# saturation answer uses the same delay.
+CAPACITY_RETRY_AFTER_SECONDS = 5
 _CURSOR_PREFIX = "ec1."
 _CURSOR_AAD = b"akb-event-cursor-v1"
 _KIND_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:[._:-][A-Za-z0-9]+)*$")
@@ -49,6 +57,87 @@ class EventGapError(AKBError):
                 "latest_cursor": latest_cursor,
             },
         )
+
+
+class EventTailCapacityError(AKBError):
+    """This process already holds as many open streams as it is allowed."""
+
+    def __init__(self, *, retry_after_secs: int = CAPACITY_RETRY_AFTER_SECONDS):
+        # Surfaced as the HTTP Retry-After header by the AKBError handler.
+        self.retry_after_secs = retry_after_secs
+        super().__init__(
+            "Event tail capacity is exhausted on this server",
+            status_code=503,
+            code="event_tail_capacity",
+            hint="Retry after the Retry-After delay. Close event streams that are no longer read.",
+        )
+
+
+def configured_max_streams() -> int:
+    """The per-process stream cap: AKB_EVENT_TAIL_MAX_STREAMS, else app.yaml.
+
+    A malformed override fails loudly, as the pool-size overrides do, rather
+    than falling back to a cap nobody chose.
+    """
+    raw = os.getenv(MAX_STREAMS_ENV_VAR, "").strip()
+    if not raw:
+        return settings.event_tail_max_streams
+    try:
+        limit = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{MAX_STREAMS_ENV_VAR} must be an integer; got {raw!r}") from None
+    if limit < 1:
+        raise RuntimeError(f"{MAX_STREAMS_ENV_VAR} must be at least 1; got {limit}")
+    return limit
+
+
+class _StreamSlots:
+    """How many event tail streams this process holds open.
+
+    The lock is a threading lock because a slot can be given back from a
+    garbage-collection callback, which runs on whichever thread triggers it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._open = 0
+
+    @property
+    def open(self) -> int:
+        return self._open
+
+    def acquire(self, limit: int) -> _StreamSlot:
+        with self._lock:
+            if self._open >= limit:
+                raise EventTailCapacityError()
+            self._open += 1
+        return _StreamSlot(self)
+
+
+class _StreamSlot:
+    """One admitted stream. Releasing it again is a no-op."""
+
+    __slots__ = ("_slots", "_held")
+
+    def __init__(self, slots: _StreamSlots) -> None:
+        self._slots = slots
+        self._held = True
+
+    def release(self) -> None:
+        slots = self._slots
+        with slots._lock:
+            if not self._held:
+                return
+            self._held = False
+            slots._open -= 1
+
+
+_stream_slots = _StreamSlots()
+
+
+def open_stream_count() -> int:
+    """Event tail streams this process currently holds open."""
+    return _stream_slots.open
 
 
 @dataclass(frozen=True)
@@ -264,47 +353,78 @@ async def open_tail(
     start: str | None,
     kinds: list[str] | None,
 ) -> StreamingResponse:
-    """Preflight and return a streaming response for one authorized Vault."""
-    normalized_kinds = normalize_kind_filter(kinds)
-    codec = EventCursorCodec()
+    """Preflight and return a streaming response for one authorized Vault.
+
+    Admission comes first: a process at its stream cap refuses with 503
+    before the preflight reads the database.
+    """
+    slot = _stream_slots.acquire(configured_max_streams())
+    try:
+        normalized_kinds = normalize_kind_filter(kinds)
+        codec = EventCursorCodec()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            earliest_id, latest_id = await get_vault_event_bounds(conn, vault_id)
+        bounds = EventBounds(earliest_id=earliest_id, latest_id=latest_id)
+        resolved = resolve_start_position(
+            codec,
+            vault_id,
+            normalized_kinds,
+            bounds,
+            last_event_id=last_event_id,
+            cursor=cursor,
+            start=start,
+        )
+        validate_event_gap(
+            codec,
+            vault_id,
+            normalized_kinds,
+            position=resolved,
+            bounds=bounds,
+        )
+        stream = _stream_events(
+            request,
+            user_id=user_id,
+            vault=vault,
+            vault_id=vault_id,
+            kinds=normalized_kinds,
+            position=resolved,
+            codec=codec,
+            slot=slot,
+        )
+        # The generator gives the slot back in its `finally`, but only once it
+        # has started. If the client leaves before the body is first iterated,
+        # it never starts; give the slot back when it is collected instead.
+        weakref.finalize(stream, slot.release)
+        return StreamingResponse(
+            stream,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except BaseException:
+        slot.release()
+        raise
+
+
+async def _read_event_batch(vault_id: UUID | str, *, after_id: int) -> list[dict[str, Any]]:
+    """Read one batch on a pool connection held only for that read.
+
+    A stream must not keep a pooled connection while it waits or while its
+    frames are sent: streams are long-lived, and one held connection each is
+    how a single client could take the whole pool.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        earliest_id, latest_id = await get_vault_event_bounds(conn, vault_id)
-    bounds = EventBounds(earliest_id=earliest_id, latest_id=latest_id)
-    resolved = resolve_start_position(
-        codec,
-        vault_id,
-        normalized_kinds,
-        bounds,
-        last_event_id=last_event_id,
-        cursor=cursor,
-        start=start,
-    )
-    validate_event_gap(
-        codec,
-        vault_id,
-        normalized_kinds,
-        position=resolved,
-        bounds=bounds,
-    )
-    stream = _stream_events(
-        request,
-        user_id=user_id,
-        vault=vault,
-        vault_id=vault_id,
-        kinds=normalized_kinds,
-        position=resolved,
-        codec=codec,
-    )
-    return StreamingResponse(
-        stream,
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+        return await list_vault_events(
+            conn,
+            vault_id,
+            after_id=after_id,
+            limit=EVENT_BATCH_SIZE,
+        )
 
 
 async def _stream_events(
@@ -316,6 +436,7 @@ async def _stream_events(
     kinds: tuple[str, ...],
     position: int,
     codec: EventCursorCodec,
+    slot: _StreamSlot | None = None,
 ) -> AsyncIterator[str]:
     async def still_authorized() -> bool:
         try:
@@ -324,17 +445,16 @@ async def _stream_events(
         except Exception:  # noqa: BLE001 - a revoked stream closes silently
             return False
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        wakeup = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        last_frame_at = loop.time()
-
-        def on_notify(*_args: Any) -> None:
-            wakeup.set()
-
-        await conn.add_listener(EVENT_CHANNEL, on_notify)
+    try:
+        # Wake-ups come from the process-wide LISTEN hub. Rows are read from
+        # the events table by cursor, so a missed wake-up only delays this
+        # stream until its heartbeat re-read.
+        hub = get_event_tail_hub()
+        subscription = hub.subscribe()
         try:
+            wakeup = subscription.wakeup
+            loop = asyncio.get_running_loop()
+            last_frame_at = loop.time()
             current_position = position
             while True:
                 if await request.is_disconnected():
@@ -343,12 +463,7 @@ async def _stream_events(
                     return
 
                 wakeup.clear()
-                rows = await list_vault_events(
-                    conn,
-                    vault_id,
-                    after_id=current_position,
-                    limit=EVENT_BATCH_SIZE,
-                )
+                rows = await _read_event_batch(vault_id, after_id=current_position)
                 if rows:
                     for row in rows:
                         if await request.is_disconnected():
@@ -386,4 +501,7 @@ async def _stream_events(
                     yield format_heartbeat()
                     last_frame_at = loop.time()
         finally:
-            await conn.remove_listener(EVENT_CHANNEL, on_notify)
+            hub.unsubscribe(subscription)
+    finally:
+        if slot is not None:
+            slot.release()

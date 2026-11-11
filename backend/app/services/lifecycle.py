@@ -25,6 +25,7 @@ from app.services import (
     app_rollout_worker,
     delete_worker,
     embed_worker,
+    event_tail_service,
     events_publisher,
     external_git_poller,
     http_pool,
@@ -308,6 +309,13 @@ def stop_runtime_pools() -> None:
 
 def _start_api_local(started: list[str]) -> None:
     """Start sinks whose queues live in the serving process's memory."""
+    # Event tail streams are served here. Resolve the stream cap now so a
+    # malformed AKB_EVENT_TAIL_MAX_STREAMS stops the boot instead of failing
+    # every stream request.
+    logger.info(
+        "event tail streams capped at %d per process",
+        event_tail_service.configured_max_streams(),
+    )
     if settings.audit.enabled:
         audit_log.init()
         if settings.audit.bucket:

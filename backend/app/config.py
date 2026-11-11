@@ -1380,6 +1380,16 @@ class Settings(BaseModel):
     redis_event_stream: str = "akb:events"
     redis_stream_maxlen: int = 100_000  # XADD MAXLEN ~ ceiling
 
+    # Vault Change Event Tail (`GET /api/v1/events/{vault}`): the most SSE
+    # streams one serving process keeps open at once. A waiting stream holds
+    # no database connection, but each wake-up takes one pool checkout for the
+    # access re-check and one for the batch read, one after the other, so the
+    # cap also bounds how many checkouts streams can queue ahead of other
+    # requests. Past it a new stream gets 503 `event_tail_capacity` with
+    # Retry-After. AKB_EVENT_TAIL_MAX_STREAMS overrides this key, the same
+    # deliberate deployment-layer exception as the pool-size overrides.
+    event_tail_max_streams: int = Field(default=256, ge=1)
+
     # Audit log — its own nested section so the surface can grow without
     # littering the flat top level. See AuditSettings above.
     audit: AuditSettings = Field(default_factory=AuditSettings)

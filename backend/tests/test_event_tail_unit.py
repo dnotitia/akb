@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from datetime import datetime, timezone
 import json
 from unittest.mock import AsyncMock, MagicMock
@@ -12,6 +11,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from app.services.event_tail_hub import EventTailSubscription
 from app.services.event_tail_service import (
     EventBounds,
     EventCursorCodec,
@@ -28,15 +28,67 @@ from app.services.event_tail_service import (
 VAULT_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
-def _stream_test_doubles() -> tuple[MagicMock, MagicMock, MagicMock]:
+class _FakeHub:
+    """Stands in for the process-wide LISTEN hub."""
+
+    def __init__(self) -> None:
+        self.subscriptions: list[EventTailSubscription] = []
+        self.unsubscribed: list[EventTailSubscription] = []
+
+    def subscribe(self) -> EventTailSubscription:
+        subscription = EventTailSubscription()
+        self.subscriptions.append(subscription)
+        return subscription
+
+    def unsubscribe(self, subscription: EventTailSubscription) -> None:
+        self.subscriptions.remove(subscription)
+        self.unsubscribed.append(subscription)
+
+    def notify(self) -> None:
+        for subscription in self.subscriptions:
+            subscription.wakeup.set()
+
+
+class _Pool:
+    """A pool double that bounds and counts checked-out connections."""
+
+    def __init__(self, connection: object, *, max_size: int = 30) -> None:
+        self._connection = connection
+        self._available = asyncio.Semaphore(max_size)
+        self.checked_out = 0
+        self.acquisitions = 0
+
+    def acquire(self) -> "_Acquire":
+        return _Acquire(self)
+
+
+class _Acquire:
+    def __init__(self, pool: _Pool) -> None:
+        self._pool = pool
+
+    async def __aenter__(self) -> object:
+        await self._pool._available.acquire()
+        self._pool.checked_out += 1
+        self._pool.acquisitions += 1
+        return self._pool._connection
+
+    async def __aexit__(self, *_exc: object) -> None:
+        self._pool.checked_out -= 1
+        self._pool._available.release()
+
+
+@pytest.fixture
+def hub(monkeypatch) -> _FakeHub:
+    from app.services import event_tail_service
+
+    fake = _FakeHub()
+    monkeypatch.setattr(event_tail_service, "get_event_tail_hub", lambda: fake)
+    return fake
+
+
+def _stream_test_doubles(*, max_size: int = 30) -> tuple[_Pool, MagicMock, MagicMock]:
     connection = MagicMock()
-    connection.add_listener = AsyncMock()
-    connection.remove_listener = AsyncMock()
-    acquire = MagicMock()
-    acquire.__aenter__ = AsyncMock(return_value=connection)
-    acquire.__aexit__ = AsyncMock(return_value=None)
-    pool = MagicMock()
-    pool.acquire.return_value = acquire
+    pool = _Pool(connection, max_size=max_size)
     request = MagicMock()
     request.is_disconnected = AsyncMock(return_value=False)
     return pool, connection, request
@@ -191,7 +243,7 @@ def test_public_envelopes_require_version_and_reject_internal_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(monkeypatch) -> None:
+async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(monkeypatch, hub) -> None:
     from app.services import event_tail_service
 
     rows = [
@@ -214,7 +266,8 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
     ]
     pool, connection, request = _stream_test_doubles()
     monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
-    monkeypatch.setattr(event_tail_service, "list_vault_events", AsyncMock(return_value=rows))
+    list_events = AsyncMock(return_value=rows)
+    monkeypatch.setattr(event_tail_service, "list_vault_events", list_events)
     access = AsyncMock(return_value={"vault_id": VAULT_ID})
     monkeypatch.setattr(event_tail_service, "check_vault_access", access)
 
@@ -228,7 +281,11 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
         codec=EventCursorCodec("cursor-secret"),
     )
     checkpoint = await anext(stream)
+    # The batch was read on a pooled connection that went back before the
+    # first frame was handed out.
+    assert pool.checked_out == 0
     change = await anext(stream)
+    assert pool.checked_out == 0
     await stream.aclose()
 
     assert checkpoint.startswith("event: checkpoint\nid: ec1.")
@@ -243,24 +300,18 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
     assert change_body["payload"] == {"operation": "insert"}
     assert "id" not in change_body
     assert "vault_id" not in change_body
-    connection.remove_listener.assert_awaited_once()
+    assert list_events.await_args.args[0] is connection
+    assert list_events.await_args.kwargs == {"after_id": 9, "limit": event_tail_service.EVENT_BATCH_SIZE}
+    assert hub.subscriptions == []
+    assert len(hub.unsubscribed) == 1
     assert access.await_count >= 2
 
 
 @pytest.mark.asyncio
-async def test_empty_wakeups_do_not_restart_heartbeat_deadline(monkeypatch) -> None:
+async def test_empty_wakeups_do_not_restart_heartbeat_deadline(monkeypatch, hub) -> None:
     from app.services import event_tail_service
 
     pool, connection, request = _stream_test_doubles()
-    listener_ready = asyncio.Event()
-    notify: Callable[[], None] | None = None
-
-    async def add_listener(_channel, callback) -> None:
-        nonlocal notify
-        notify = callback
-        listener_ready.set()
-
-    connection.add_listener = AsyncMock(side_effect=add_listener)
     monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
     list_events = AsyncMock(return_value=[])
     monkeypatch.setattr(event_tail_service, "list_vault_events", list_events)
@@ -285,12 +336,15 @@ async def test_empty_wakeups_do_not_restart_heartbeat_deadline(monkeypatch) -> N
     async def keep_waking() -> None:
         while True:
             await asyncio.sleep(0.005)
-            assert notify is not None
-            notify()
+            hub.notify()
+
+    async def subscribed() -> None:
+        while not hub.subscriptions:
+            await asyncio.sleep(0)
 
     try:
         next_frame = asyncio.create_task(anext(stream))
-        await asyncio.wait_for(listener_ready.wait(), timeout=0.1)
+        await asyncio.wait_for(subscribed(), timeout=0.1)
         notification_task = asyncio.create_task(keep_waking())
         frame = await asyncio.wait_for(next_frame, timeout=0.2)
     finally:
@@ -302,11 +356,15 @@ async def test_empty_wakeups_do_not_restart_heartbeat_deadline(monkeypatch) -> N
 
     assert frame == format_heartbeat()
     assert list_events.await_count > 1
-    connection.remove_listener.assert_awaited_once()
+    # Each empty re-read borrowed a connection and gave it back.
+    assert pool.acquisitions == list_events.await_count
+    assert pool.checked_out == 0
+    assert hub.subscriptions == []
+    assert len(hub.unsubscribed) == 1
 
 
 @pytest.mark.asyncio
-async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatch) -> None:
+async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatch, hub) -> None:
     from app.exceptions import ForbiddenError
     from app.services import event_tail_service
 
@@ -345,3 +403,90 @@ async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatc
     )
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
+    assert hub.subscriptions == []
+    assert pool.checked_out == 0
+
+
+@pytest.mark.asyncio
+async def test_more_waiting_streams_than_pool_connections_leave_the_pool_usable(monkeypatch, hub) -> None:
+    """Every open stream used to keep one pooled connection for its whole life.
+
+    A client that opened a stream per Vault therefore held the entire pool, and
+    an ordinary checkout, the readiness probe's among them, never returned.
+    """
+    from app.services import event_tail_service
+
+    pool, connection, _ = _stream_test_doubles(max_size=2)
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "HEARTBEAT_INTERVAL_SECONDS", 30.0)
+    committed: list[dict] = []
+    reads = 0
+
+    async def list_events(conn, _vault_id, *, after_id: int, limit: int) -> list[dict]:
+        nonlocal reads
+        assert conn is connection
+        reads += 1
+        return [row for row in committed if row["id"] > after_id][:limit]
+
+    async def access(*_args, **_kwargs) -> dict:
+        # The real access re-check borrows a pooled connection as well.
+        async with pool.acquire():
+            return {"vault_id": VAULT_ID}
+
+    monkeypatch.setattr(event_tail_service, "list_vault_events", list_events)
+    monkeypatch.setattr(event_tail_service, "check_vault_access", access)
+    codec = EventCursorCodec("cursor-secret")
+    streams = []
+    for _ in range(5):
+        request = MagicMock()
+        request.is_disconnected = AsyncMock(return_value=False)
+        streams.append(
+            event_tail_service._stream_events(
+                request,
+                user_id="user",
+                vault="vault",
+                vault_id=VAULT_ID,
+                kinds=(),
+                position=0,
+                codec=codec,
+            )
+        )
+    first_frames = [asyncio.create_task(anext(stream)) for stream in streams]
+
+    async def all_parked() -> None:
+        while reads < len(streams) or pool.checked_out:
+            await asyncio.sleep(0.001)
+
+    async def take_the_whole_pool() -> bool:
+        async with pool.acquire(), pool.acquire():
+            return True
+
+    try:
+        await asyncio.wait_for(all_parked(), timeout=1.0)
+        assert len(hub.subscriptions) == len(streams)
+        assert pool.checked_out == 0
+        assert await asyncio.wait_for(take_the_whole_pool(), timeout=1.0)
+
+        committed.append(
+            {
+                "id": 1,
+                "occurred_at": datetime(2026, 8, 28, 8, 0, tzinfo=timezone.utc),
+                "kind": "document.put",
+                "resource_uri": "akb://vault/doc/a.md",
+                "actor_id": "alice",
+                "payload": {},
+            }
+        )
+        hub.notify()
+        frames = await asyncio.wait_for(asyncio.gather(*first_frames), timeout=1.0)
+    finally:
+        for task in first_frames:
+            task.cancel()
+        # A generator can only be closed once its task has let go of it.
+        await asyncio.gather(*first_frames, return_exceptions=True)
+        for stream in streams:
+            await stream.aclose()
+
+    assert all(frame.startswith("event: change\nid: ec1.") for frame in frames)
+    assert pool.checked_out == 0
+    assert hub.subscriptions == []

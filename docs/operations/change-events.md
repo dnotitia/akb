@@ -87,6 +87,17 @@ need a backend that applies Vault access and projects safe fields. The existing
 authenticated `GET /api/v1/events/{vault}` SSE tail reads the same PG outbox with
 reader access checks; its opaque cursor is different from a Redis cursor.
 
+Each server process wakes its open SSE tails from one dedicated PostgreSQL
+`LISTEN` connection outside the request pool. A waiting stream holds no pooled
+connection and borrows one only to re-check access and read a batch. A process
+serves at most `event_tail_max_streams` tails at once (default 256;
+`AKB_EVENT_TAIL_MAX_STREAMS` overrides it). Past that, a new tail gets 503
+`event_tail_capacity` with `Retry-After`; retry later and resume from the last
+cursor. A notification only wakes a tail, which then reads the outbox by
+cursor. If the listener connection drops, open tails keep re-reading on their
+15-second heartbeat until it reconnects, so a missed wake-up delays delivery
+rather than dropping it.
+
 ## Regression verification
 
 `backend/tests/test_native_document_events_postgres.py` exercises the five

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import types
 
+import pytest
+
 
 def _import_lifecycle(monkeypatch, tmp_path):
     from app.config import settings
@@ -181,6 +183,19 @@ def test_api_role_starts_no_durable_queue_consumer(monkeypatch, tmp_path):
     assert "search_degradation_flusher" in started
     assert "embed_worker" not in started
     assert "delete_worker" not in started
+
+
+def test_api_runtime_refuses_a_malformed_event_tail_stream_cap(monkeypatch, tmp_path):
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started: list[str] = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    monkeypatch.setattr(lifecycle, "settings", _settings(external_git_enabled=False))
+    monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS", "many")
+
+    # The boot stops here rather than every stream request failing later.
+    with pytest.raises(RuntimeError, match="AKB_EVENT_TAIL_MAX_STREAMS"):
+        lifecycle.start_api_runtime()
+    assert "tool_usage_maintenance" not in started
 
 
 def test_start_workers_starts_metadata_worker_when_enabled_and_llm(monkeypatch, tmp_path):

@@ -7,6 +7,15 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- Open `GET /api/v1/events/{vault}` SSE tails no longer hold request-pool
+  connections. Each server process wakes them from one dedicated PostgreSQL
+  `LISTEN` connection, and a tail borrows a pooled connection only to re-check
+  access and read a batch. Many open tails can no longer exhaust the pool and
+  fail readiness. A process serves at most `event_tail_max_streams` tails
+  (default 256, overridden by `AKB_EVENT_TAIL_MAX_STREAMS`); past that a new
+  tail gets 503 `event_tail_capacity` with `Retry-After`. Frames, cursors and
+  heartbeats are unchanged.
+
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain
   their existing receipts and policy errors. A pending call observes a grant
