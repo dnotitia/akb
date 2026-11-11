@@ -485,8 +485,9 @@ contain runtime lifecycle logic. On a clean Ubuntu 24.04 host it:
    `/etc/sysctl.d/99-akb-e2e-tcp-mtu-probing.conf` before any network download;
    mode 2 keeps probing proactively enabled for VPN/Docker Hub black-hole
    paths, and failure is a provisioning failure that stops the bootstrap;
-3. installs the Ubuntu archive's `nodejs`/`npm` packages and verifies both
-   executables before any selected stdio profile is validated;
+3. uses the Ubuntu archive's npm to install the repository's pinned Node
+   version, then installs the locked MCP client test dependencies when the
+   selected profile or capability includes stdio;
 4. installs and starts Docker Engine plus Compose v2 idempotently;
 5. installs/verifies `uv` and Python 3.14 under the private runtime root;
 6. runs `uv sync --locked --extra dev --project backend`; and
