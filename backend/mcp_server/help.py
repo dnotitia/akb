@@ -1010,7 +1010,10 @@ akb_grep(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
 
 **Tip:** Run grep WITHOUT replace first to preview matches, then add replace with
 `max_replacements` set high enough for the intended scope.
-Each replaced document gets its own git commit and is re-indexed for search.
+Each changed document gets its own revision. If a write fails, replacement
+stops. Earlier writes remain committed and are listed in `replacements`.
+`details.failed_uri` identifies the document that stopped the batch.
+Bulk replacement cannot edit the vault guide. Its owner can edit it with `akb_update`.
 
 ## Result Structure
 Each result includes `uri`, `vault`, `path`, `title`, and `matches` — a list of
