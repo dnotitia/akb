@@ -103,6 +103,21 @@ def _display_title(frontmatter: dict, path: str) -> str:
     return frontmatter.get("title") or path.rsplit("/", 1)[-1]
 
 
+def _canonical_user_id(value: object) -> uuid.UUID | None:
+    """The user id `value` names, if it is a UUID in PostgreSQL's text form.
+
+    Only that form can equal `users.id::text`, so it is the only form the id
+    lookup may accept and still match exactly what the cast comparison did.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        return None
+    return parsed if str(parsed) == value else None
+
+
 class NativeRevisionUnsupportedSurfaceError(AKBError):
     """A surface is not supported by the PostgreSQL Native backend."""
 
@@ -534,17 +549,29 @@ class NativeDocumentService(DocumentService):
         return None
 
     async def _created_by_name(self, created_by: str | None) -> str | None:
+        """Display name for `created_by`, which holds a user id or a username.
+
+        One predicate, `id::text = $1 OR username = $1`, could use neither the
+        primary key nor the username index, so every document read scanned
+        `users`. Each form now gets its own indexed equality. A username may
+        itself look like a UUID, so a UUID that names no user still falls back
+        to the username lookup. When the two forms would name different users,
+        the id now wins; the combined predicate returned either one.
+        """
         if not created_by:
             return None
         pool = await self._pool()
         async with pool.acquire() as conn:
+            user_id = _canonical_user_id(created_by)
+            if user_id is not None:
+                name = await conn.fetchval(
+                    "SELECT COALESCE(display_name, username) FROM users WHERE id = $1",
+                    user_id,
+                )
+                if name is not None:
+                    return name
             return await conn.fetchval(
-                """
-                SELECT COALESCE(display_name, username)
-                  FROM users
-                 WHERE id::text = $1 OR username = $1
-                 LIMIT 1
-                """,
+                "SELECT COALESCE(display_name, username) FROM users WHERE username = $1",
                 created_by,
             )
 
