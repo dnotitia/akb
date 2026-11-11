@@ -62,11 +62,13 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 from git import Git as _GitPython
 
 from app.exceptions import AKBError
+from app.services.activity_filters import commit_metadata, git_activity_dates, matches_author
 from app.services.external_git_validation import (
     ExternalGitPolicyError,
     ExternalGitTransientError,
@@ -183,6 +185,8 @@ _SPECIAL_FILES = (
 # Re-guard limits for the auth token before it is base64'd into a header. The
 # validator already enforces these; this is defense-in-depth at the exec seam.
 _MAX_TOKEN_LEN = 4096
+_ACTIVITY_METADATA_PAGE_SIZE = 256
+_ACTIVITY_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 _FORBIDDEN_TOKEN_CHARS = ("\r", "\n", "\x00")
 
 
@@ -597,7 +601,12 @@ class ExternalGitRunner:
         import signal
 
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            # _exec uses start_new_session, so the child's PID identifies our
+            # process group. On Darwin, killing a shell's foreground job can
+            # wake the shell long enough to launch its next command while the
+            # group kill is being delivered. Stop the group before killing it.
+            os.killpg(proc.pid, signal.SIGSTOP)
+            os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.kill()
@@ -1173,6 +1182,37 @@ class ExternalGitRunner:
             )
         return entries
 
+    def _activity_oids_by_author(
+        self, bare_path: str | os.PathLike[str], tip: str, *, author: str, max_count: int,
+        dates: list[str], paths: list[str],
+    ) -> list[str]:
+        # Read metadata at the pinned tip. An agent trailer can differ from
+        # the Git author, and only selected commits need their file changes.
+        matches: list[str] = []
+        offset = 0
+        deadline = time.monotonic() + self._settings_now().git_write_timeout_secs
+        while len(matches) < max_count:
+            if time.monotonic() >= deadline:
+                raise ExternalGitTransientError("Mirror activity lookup timed out")
+            page = self._local(bare_path, [
+                "log", f"--max-count={_ACTIVITY_METADATA_PAGE_SIZE}", f"--skip={offset}", "-z", "--format=%H%x00%an%x00%b",
+                *dates, tip, *paths,
+            ], max_output_bytes=_ACTIVITY_MAX_OUTPUT_BYTES)
+            assert isinstance(page, str)
+            fields = page.removesuffix("\0").split("\0") if page else []
+            if len(fields) % 3:
+                raise ExternalGitCommandError("Invalid mirror activity record")
+            for oid, name, body in zip(fields[::3], fields[1::3], fields[2::3], strict=True):
+                if matches_author(author, name, commit_metadata(body).get("agent", name)):
+                    matches.append(_require_oid(oid, what="activity commit"))
+                    if len(matches) == max_count:
+                        return matches
+            count = len(fields) // 3
+            if count < _ACTIVITY_METADATA_PAGE_SIZE:
+                break
+            offset += count
+        return matches
+
     def vault_log_entries(
         self,
         bare_path: str | os.PathLike[str],
@@ -1180,11 +1220,13 @@ class ExternalGitRunner:
         max_count: int,
         since: str | None = None,
         path: str | None = None,
+        author: str | None = None,
+        until: datetime | None = None,
     ) -> list[dict]:
         """Vault commit log (newest first) with per-commit changed files, each as
         ``{hash, author, committed_epoch, subject, body, files:[{path,change}]}``.
-        Empty on any error. ``since`` is a git date operand (bound to ``--since=``
-        so it is never option-parsed); ``path`` is a literal pathspec."""
+        ``path`` is a literal pathspec. Requests with author or until propagate
+        read failures and distinguish an unborn HEAD from a failed lookup."""
         fmt = f"{_RS}%H{_US}%an{_US}%ct{_US}%s{_US}%b{_RS}"
         args = [
             "log",
@@ -1193,17 +1235,43 @@ class ExternalGitRunner:
             "--name-status",
             f"--format={fmt}",
         ]
-        if since:
-            args.append(f"--since={since}")
-        args.append("--")
-        if path:
-            args.append(path)
+        date_options = git_activity_dates(since, until)
+        if date_options is None:
+            return []
+        dates = [f"--{k.replace('_', '-')}={v}" for k, v in date_options.items()]
+        paths = ["--", path] if path else ["--"]
+        ids = None
+        filtered = bool(author) or until is not None
+        if filtered:
+            try:
+                head = self._local(bare_path, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+            except ExternalGitCommandError as exc:
+                if exc.returncode == 1:  # An unborn HEAD has no activity.
+                    return []
+                raise
+            assert isinstance(head, str)
+            tip = _require_oid(head.strip(), what="activity tip")
+            if author:
+                ids = self._activity_oids_by_author(bare_path, tip, author=author, max_count=max_count, dates=dates, paths=paths)
+                if not ids:
+                    return []
+                args.extend(["--no-walk=unsorted", *ids])
+            else:
+                args.extend([*dates, tip])
+        else:
+            args.extend(dates)
+        args.extend(paths)
         try:
-            out = self._local(bare_path, args)
+            out = self._local(bare_path, args, max_output_bytes=_ACTIVITY_MAX_OUTPUT_BYTES if filtered else None)
         except ExternalGitCommandError:
+            if filtered:
+                raise
             return []
         assert isinstance(out, str)
-        return _parse_vault_log(out)
+        entries = _parse_vault_log(out)
+        if ids is not None and [entry["hash"] for entry in entries] != ids:
+            raise ExternalGitCommandError("Could not read the selected mirror activity")
+        return entries
 
     def file_diff_entry(
         self,

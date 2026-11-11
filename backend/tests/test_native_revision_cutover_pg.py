@@ -12,7 +12,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import asyncpg
@@ -2051,6 +2051,10 @@ async def test_committed_cutover_preserves_vault_activity_for_deleted_and_recrea
             path=None,
         )
         assert activity == expected
+        stamp = datetime.fromisoformat(expected[0]["date"])
+        kwargs = {"max_count": 1, "since": stamp.isoformat(), "path": None, "author": expected[0]["agent"]}
+        assert await backend.vault_activity(vault_name, until=stamp, **kwargs) == []
+        assert await backend.vault_activity(vault_name, until=stamp + timedelta(microseconds=1), **kwargs) == expected[:1]
         for path in ("deleted.md", "recreated.md"):
             assert (
                 await backend.vault_activity(

@@ -7,6 +7,11 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- MCP `akb_activity` accepts an exclusive RFC 3339 `until` bound. Author,
+  collection, and time filters now select events before the result limit,
+  including on migrated Native history. `truncated` reports whether another
+  matching event exists.
+
 - MCP `akb_put`, `akb_update`, and `akb_move` accept `title_conflict_policy`.
   The default `allow` preserves duplicate display titles. Use `reject` to
   check for an existing title in the destination collection on creation,
