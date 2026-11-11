@@ -391,7 +391,8 @@ CREATE TABLE IF NOT EXISTS tokens (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash);
+-- token_hash lookups use the UNIQUE constraint's own index. A second plain
+-- index on it (idx_tokens_hash) was dropped by migration 130.
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
 
 -- ============================================================
