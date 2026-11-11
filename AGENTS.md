@@ -155,6 +155,10 @@ Ubuntu host bootstrap are documented in
   - `UserSqlExecutor` (`backend/app/services/user_sql_executor.py`)
     is the sole entry point for user SQL. System admins
     (`users.is_admin=TRUE`) bypass the role switch.
+  - Raw SQL checks the declared Vaults' archive/managed policies in the same
+    transaction as the statement. Policy changes serialize on the parent Vault
+    rows. Restricted queries use PostgreSQL READ ONLY; explicit mutations
+    retain their Vault policy errors.
   - Design: `docs/designs/pg-native-rbac/00-overview.md`.
 - npm package: `akb-mcp` on npmjs.org.
 

@@ -27,9 +27,7 @@ import asyncpg
 from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError, TransientDependencyError, ValidationError
-from app.models.vault_scope import current_token_uuid, current_vault_scope
 from app.repositories import table_data_repo, table_registry_repo
-from app.repositories import vault_write_policy_repo as write_policy_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
 from app.services.index_service import (
@@ -47,7 +45,6 @@ from app.services.user_sql_executor import (
     PermissionDeniedError,
     UniqueViolationError,
     get_user_sql_executor,
-    human_admin_sql_bypass,
 )
 from app.util.errors import (
     err,
@@ -59,8 +56,6 @@ from app.util.errors import (
     UNDEFINED_COLUMN,
     UNDEFINED_TABLE,
     UNIQUE_VIOLATION,
-    VAULT_ARCHIVED,
-    VAULT_WRITE_MANAGED,
 )
 from app.util.text import fuzzy_hint
 
@@ -1987,71 +1982,6 @@ async def execute_sql(
                 "request.jwt.claims is reserved for service-key claim injection.",
                 code=METHOD_NOT_ALLOWED,
             )
-        # Archived vaults are READ-ONLY. PG ACL has no archive concept
-        # (write grants are intentionally preserved so unarchive is
-        # instant), so the write block lives here: a non-read statement
-        # (anything but SELECT/WITH) against ANY archived referenced
-        # vault is refused before it touches PG.
-        if not upper.startswith(("SELECT", "WITH")):
-            archived = await conn.fetch(
-                "SELECT name FROM vaults WHERE name = ANY($1::text[]) "
-                "AND status = 'archived'",
-                vault_names,
-            )
-            if archived:
-                names = ", ".join(sorted(r["name"] for r in archived))
-                return err(
-                    f"Vault '{names}' is archived (read-only); writes via "
-                    f"akb_sql are not allowed. Unarchive the vault first.",
-                    code=VAULT_ARCHIVED,
-                )
-
-            # Vault write-policy dual enforcement (P0 S3): mirrors the
-            # archived-vault block just above. `access_service.
-            # check_vault_access`'s own write-policy guard never fires for
-            # akb_sql — the REST route (tables.py) only ever asks it for
-            # required_role="reader" per referenced vault (read access;
-            # akb_sql's own DML-vs-DDL gate lives here, not there) — so a
-            # MARKED vault has to be re-checked directly against the SQL
-            # about to run. Same allow-conditions as that guard: a granted
-            # token passes, an *unscoped* system admin bypasses (+ the same
-            # loud audit event), everyone else is blocked before the
-            # statement ever reaches PG. `is_admin` is the caller-supplied
-            # flag (already sourced from `users.is_admin` by the REST
-            # route) — reused as-is rather than re-queried, unlike the
-            # access_service guard which has no such flag in scope yet.
-            for vrow in await conn.fetch(
-                "SELECT id, name FROM vaults WHERE name = ANY($1::text[])",
-                vault_names,
-            ):
-                policy = await write_policy_repo.get_policy(vrow["id"], conn=conn)
-                if policy is None:
-                    continue
-                token_id = current_token_uuid()
-                if token_id is not None and await write_policy_repo.is_granted(
-                    vrow["id"], token_id, conn=conn,
-                ):
-                    continue
-                if (current_vault_scope.get() is None
-                        and await human_admin_sql_bypass(conn, user_id, is_admin)):
-                    # A3: bypass, but LOUDLY — same event as the guard.
-                    await emit_event(
-                        conn, "vault.write_policy_admin_bypass",
-                        vault_id=vrow["id"],
-                        actor_id=user_id,
-                        payload={
-                            "managed_by": policy["managed_by"],
-                            "required_role": "writer",
-                            "vault": vrow["name"],
-                        },
-                    )
-                    continue
-                return err(
-                    f"Vault '{vrow['name']}' is write-managed by "
-                    f"{policy['managed_by']}; writes require a granted "
-                    f"service token",
-                    code=VAULT_WRITE_MANAGED,
-                )
 
     try:
         return await get_user_sql_executor().execute(
@@ -2062,6 +1992,7 @@ async def execute_sql(
             is_admin=is_admin,
             vault_names=vault_names,
             read_only=read_only,
+            enforce_vault_write_policy=True,
         )
     except PermissionDeniedError as e:
         # PG ACL denied — the boundary working as designed. Surface
@@ -2084,9 +2015,9 @@ async def execute_sql(
             code=UNIQUE_VIOLATION,
             pg_sqlstate=e.pg_sqlstate,
         )
-    except TransientDependencyError:
-        # A dependency outage is not invalid SQL. In particular, do not
-        # acquire another connection to enrich a failed/time-limited query.
+    except (NotFoundError, TransientDependencyError):
+        # Preserve a Vault disappearing after name resolution and dependency
+        # failures without acquiring another connection for SQL hints.
         raise
     except Exception as e:  # noqa: BLE001 — fall through to enrichment
         msg = str(e)

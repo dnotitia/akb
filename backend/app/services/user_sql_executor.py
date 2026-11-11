@@ -27,11 +27,16 @@ from typing import Any, Optional
 import asyncpg
 
 from app.config import settings
+from app.exceptions import NotFoundError
 from app.models.vault_scope import (
     current_request_jwt_claims,
     current_token_id,
+    current_token_uuid,
     current_vault_scope,
 )
+from app.repositories import vault_write_policy_repo
+from app.repositories.events_repo import emit_event
+from app.util.errors import VAULT_ARCHIVED, VAULT_WRITE_MANAGED, err
 from app.services.role_sync import token_role_name, user_role_name
 
 logger = logging.getLogger("akb.user_sql")
@@ -48,6 +53,47 @@ async def human_admin_sql_bypass(conn, user_id: uuid.UUID | str, is_admin: bool)
         return False
     return bool(await conn.fetchval("""SELECT account_kind='human' AND is_admin AND account_status='active'
         FROM users WHERE id=$1 FOR SHARE""", uuid.UUID(str(user_id))))
+
+
+async def _check_vault_write_policy(
+    conn: asyncpg.Connection, vault_names: list[str], user_id: uuid.UUID | str, *, admin_bypass: bool,
+) -> tuple[dict | None, bool]:
+    """Return a policy error and whether an admin override was recorded.
+
+    Hold each declared Vault against archive, mark and grant changes until
+    the statement transaction finishes.
+    """
+    vaults = await conn.fetch(
+        "SELECT id, name, status FROM vaults WHERE name = ANY($1::text[]) ORDER BY id FOR SHARE",
+        vault_names,
+    )
+    missing = set(vault_names) - {v["name"] for v in vaults}
+    if missing:
+        raise NotFoundError("Vault", min(missing))
+    archived = sorted(v["name"] for v in vaults if v["status"] == "archived")
+    if archived:
+        return err(
+            f"Vault '{', '.join(archived)}' is archived (read-only); writes via "
+            "akb_sql are not allowed. Unarchive the vault first.", code=VAULT_ARCHIVED,
+        ), False
+
+    # Read policy *after* locking. A grant may have changed while we waited
+    # for its writer, which serializes on the parent Vault row.
+    managed = await vault_write_policy_repo.sql_restricted_vaults(
+        conn, [v["id"] for v in vaults], current_token_uuid(),
+    )
+    for policy in managed:
+        if not admin_bypass:
+            return err(
+                f"Vault '{policy['name']}' is write-managed by "
+                f"{policy['managed_by']}; writes require a granted service token",
+                code=VAULT_WRITE_MANAGED,
+            ), False
+        await emit_event(
+            conn, "vault.write_policy_admin_bypass", vault_id=policy["id"], actor_id=str(user_id),
+            payload={"managed_by": policy["managed_by"], "required_role": "writer", "vault": policy["name"]},
+        )
+    return None, bool(managed)
 
 
 # ── Result shaping ────────────────────────────────────────────
@@ -151,6 +197,33 @@ class UniqueViolationError(Exception):
 # ── Executor ──────────────────────────────────────────────────
 
 
+async def _run_statement(conn, sql: str, params: list, fetch: bool, vault_names: list[str]) -> dict:
+    if fetch:
+        rows = await conn.fetch(sql, *params)
+        items = await _coerce_rows_yielding(rows)
+        return {
+            "kind": "table_query",
+            "vaults": vault_names,
+            # dict(...) collapses duplicate column labels the
+            # same way each coerced `items` row does, so columns
+            # and row keys stay consistent for `SELECT id, id`
+            # or cross-vault joins that share a column name.
+            "columns": list(dict(rows[0]).keys()) if rows else [],
+            "items": items,
+            "total": len(rows),
+        }
+    result = await conn.execute(sql, *params)
+    out = {
+        "kind": "table_sql",
+        "vaults": vault_names,
+        "result": result,
+    }
+    affected_rows = _affected_rows_from_command_tag(result)
+    if affected_rows is not None:
+        out["affected_rows"] = affected_rows
+    return out
+
+
 class UserSqlExecutor:
     """Run user-supplied SQL under the caller's PG role.
 
@@ -185,12 +258,14 @@ class UserSqlExecutor:
         is_admin: bool = False,
         vault_names: Optional[list[str]] = None,
         read_only: bool = False,
+        enforce_vault_write_policy: bool = False,
     ) -> dict:
         """Run `sql` under the caller's PG role. Returns a result envelope
         compatible with the existing `akb_sql` contract.
 
         `vault_names` is included in the response envelope for
-        downstream consumers but does NOT gate execution — PG ACL does.
+        downstream consumers. Raw SQL also checks declared Vault write policies;
+        PostgreSQL roles control access to the actual tables.
         """
         should_fetch = (
             sql.strip().upper().startswith(("SELECT", "WITH"))
@@ -202,6 +277,18 @@ class UserSqlExecutor:
                 async with conn.transaction():
                     scope = current_vault_scope.get()
                     token_id = current_token_id.get()
+                    admin_bypass = scope is None and await human_admin_sql_bypass(conn, user_id, is_admin)
+                    audited_override = False
+                    if enforce_vault_write_policy and not (read_only and should_fetch):
+                        denial, audited_override = await _check_vault_write_policy(
+                            conn, vault_names or [], user_id, admin_bypass=admin_bypass,
+                        )
+                        if denial:
+                            if not should_fetch:
+                                return denial
+                            # A row-returning statement can have side effects. Keep
+                            # reads available and let PostgreSQL enforce the policy.
+                            read_only = True
                     if scope is not None and token_id is not None:
                         # Scoped PAT → the narrow per-token role (membership =
                         # owner-ACL ∩ scope). Precedence over is_admin: a
@@ -213,7 +300,7 @@ class UserSqlExecutor:
                         # akb_user_<uid>, which would defeat the scope.
                         role = token_role_name(token_id)
                         await conn.execute(f'SET LOCAL ROLE "{role}"')
-                    elif not await human_admin_sql_bypass(conn, user_id, is_admin):
+                    elif not admin_bypass:
                         role = user_role_name(user_id)
                         # asyncpg passes the role name as an identifier here;
                         # we built it ourselves from a UUID so the only chars
@@ -238,30 +325,16 @@ class UserSqlExecutor:
                     if read_only:
                         await conn.execute("SET TRANSACTION READ ONLY")
 
-                    if should_fetch:
-                        rows = await conn.fetch(sql, *bind_params)
-                        items = await _coerce_rows_yielding(rows)
-                        return {
-                            "kind": "table_query",
-                            "vaults": vault_names or [],
-                            # dict(...) collapses duplicate column labels the
-                            # same way each coerced `items` row does, so columns
-                            # and row keys stay consistent for `SELECT id, id`
-                            # or cross-vault joins that share a column name.
-                            "columns": list(dict(rows[0]).keys()) if rows else [],
-                            "items": items,
-                            "total": len(rows),
-                        }
-                    result = await conn.execute(sql, *bind_params)
-                    out = {
-                        "kind": "table_sql",
-                        "vaults": vault_names or [],
-                        "result": result,
-                    }
-                    affected_rows = _affected_rows_from_command_tag(result)
-                    if affected_rows is not None:
-                        out["affected_rows"] = affected_rows
-                    return out
+                    if not audited_override:
+                        return await _run_statement(conn, sql, bind_params, should_fetch, vault_names or [])
+                    # Keep the override audit event even if PostgreSQL rejects
+                    # the user's statement. Only the statement rolls back.
+                    try:
+                        async with conn.transaction():
+                            return await _run_statement(conn, sql, bind_params, should_fetch, vault_names or [])
+                    except asyncpg.PostgresError as exc:
+                        statement_error = exc
+                raise statement_error
         except asyncpg.exceptions.ReadOnlySQLTransactionError as e:
             raise PermissionDeniedError(str(e), pg_sqlstate="25006") from e
         except asyncpg.exceptions.InsufficientPrivilegeError as e:
