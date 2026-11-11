@@ -16,6 +16,7 @@ from app.db.postgres import close_pool, get_pool, init_db
 from app.config import settings
 from app.process_role import runtime_process_role
 from app.services._backfill import request_stop_all, runner_snapshots
+from app.services.event_tail_hub import close_event_tail_hub
 from app.services import (
     asset_gc_worker,
     account_deletion_worker,
@@ -600,4 +601,7 @@ async def shutdown_storage() -> None:
         from app.services.keycloak_oidc import get_keycloak_oidc
 
         await get_keycloak_oidc().aclose()
+    # The event tail listener holds its own connection outside the pool; close
+    # it first. A no-op in a process that never opened an event stream.
+    await close_event_tail_hub()
     await close_pool()
