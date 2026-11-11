@@ -225,13 +225,21 @@ The topology is deliberately small:
 | Component | Process owner | Endpoint / image | Responsibility |
 | --- | --- | --- | --- |
 | PostgreSQL + pgvector | dependency Compose | `pgvector/pgvector:pg16`, `127.0.0.1:15432` by default | AKB database and vector index |
-| MinIO | dependency Compose | digest-pinned `icr.io/fusion-open/minio/minio` (RELEASE.2025-09-07T16-13-09Z), `127.0.0.1:9000` by default | S3-compatible file storage |
+| MinIO | dependency Compose | digest-pinned `docker.io/dappros/minio` (RELEASE.2025-09-07T16-13-09Z), `127.0.0.1:9000` by default | S3-compatible file storage |
 | embedding stub | Ubuntu host process | `127.0.0.1:8888` | deterministic `/v1/embeddings` responses |
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
 | frontend (`--with-frontend`) | Ubuntu host process | `127.0.0.1:3000` by default | existing Vite SPA and per-run backend proxy |
 | fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and isolated scenario reset |
 | MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated MCP product scenarios through the official Python SDK |
 | curated suite runner | Ubuntu host process | no public listener | curated shell gate and count semantics |
+
+The MinIO mirror is pinned to an index digest, not a mutable release tag. Its
+Linux/amd64 manifest is the same `sha256:a1a8bd4ac40ad7881a245bab97323e18f971e4d4cba2c2007ec1bedd21cbaba2`
+as the previous registry pin. The Linux/arm64 image config is also identical;
+its compressed layer digests differ, while the config retains the upstream
+uncompressed layer identities. This keeps the release and runtime content
+unchanged after the previous registry exhausted its public pull quota. The
+all-in-one build continues to verify both server and client binary checksums.
 
 Only PostgreSQL and MinIO are managed by
 `scripts/ci/dependency-compose.yaml`. The root `docker-compose.yaml`
