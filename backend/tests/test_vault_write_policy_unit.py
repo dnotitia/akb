@@ -12,6 +12,7 @@ and self-skip if unreachable.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -822,15 +823,16 @@ class TestWritePolicyGuard:
 
 
 class TestAkbSqlDualEnforcement:
-    """Task 9 — `akb_sql`'s only `check_vault_access` call (the REST
-    route in ``tables.py``) asks for ``required_role="reader"`` per
-    referenced vault, so the mutating-role guard above never fires for
-    it. ``table_service.execute_sql`` re-checks directly against the
-    same allow-conditions, mirroring the pre-existing archived-vault
-    dual block in the same function.
-    """
+    """Raw SQL evaluates the managed-Vault policy in its execution transaction."""
 
-    async def test_akb_sql_dual_enforcement_blocks_vt_write(self, pool, monkeypatch):
+    @pytest.fixture(autouse=True)
+    def sql_executor(self, pool, monkeypatch):
+        from app.services import table_service
+        from app.services.user_sql_executor import UserSqlExecutor
+
+        monkeypatch.setattr(table_service, "get_user_sql_executor", lambda: UserSqlExecutor(pool))
+
+    async def test_akb_sql_dual_enforcement_blocks_vt_write(self, pool):
         from app.repositories import vault_write_policy_repo as repo
         from app.services import table_service
         from app.util.errors import VAULT_WRITE_MANAGED
@@ -838,11 +840,6 @@ class TestAkbSqlDualEnforcement:
         owner_id = await _create_user(pool)
         vault_id, vault_name = await _create_named_vault(pool, owner_id)
         await repo.set_policy(vault_id, "collector:acme", "admin-user")
-
-        def _poison():
-            raise AssertionError("must not reach the real executor — block happens before execution")
-
-        monkeypatch.setattr(table_service, "get_user_sql_executor", _poison)
 
         with _auth_context(token_id=None, scope=None):
             result = await table_service.execute_sql(
@@ -855,10 +852,8 @@ class TestAkbSqlDualEnforcement:
 
         assert result["code"] == VAULT_WRITE_MANAGED
 
-    async def test_akb_sql_dual_enforcement_admin_bypass(self, pool, monkeypatch):
-        """Admin-bypass twin: an unscoped admin is NOT blocked (the SQL
-        reaches the (stubbed) real executor) and the same loud audit
-        event fires as the access_service guard's A3 branch."""
+    async def test_akb_sql_dual_enforcement_admin_bypass(self, pool):
+        """An unscoped human admin receives a real receipt and an audit event."""
         from app.repositories import vault_write_policy_repo as repo
         from app.services import table_service
 
@@ -867,37 +862,56 @@ class TestAkbSqlDualEnforcement:
         vault_id, vault_name = await _create_named_vault(pool, owner_id)
         await repo.set_policy(vault_id, "collector:acme", "admin-user")
 
-        calls = []
-
-        class _StubExecutor:
-            async def execute(self, **kwargs):
-                calls.append(kwargs)
-                return {"kind": "table_sql", "vaults": [], "result": "UPDATE 0"}
-
-        monkeypatch.setattr(table_service, "get_user_sql_executor", lambda: _StubExecutor())
-
-        with _auth_context(token_id=None, scope=None):  # unscoped admin
-            result = await table_service.execute_sql(
-                vault_names=[vault_name],
-                user_id=str(admin_id),
-                actor_id="tester",
-                sql="UPDATE t SET x = 1",
-                is_admin=True,
-            )
-
-        assert len(calls) == 1  # fell through to the (stubbed) real executor
-        assert "code" not in result
-
+        from app.repositories.table_data_repo import pg_table_name
+        table_name = pg_table_name(vault_name, "items")
         async with pool.acquire() as conn:
-            event = await conn.fetchrow(
-                "SELECT * FROM events WHERE kind = 'vault.write_policy_admin_bypass' "
-                "AND vault_id = $1",
-                vault_id,
-            )
-        assert event is not None
+            await conn.execute(f'CREATE TABLE "{table_name}" (amount int CHECK (amount > 0))')
+            try:
+                await conn.execute(f'INSERT INTO "{table_name}" VALUES (1)')
+                with _auth_context(token_id=None, scope=None):
+                    args = dict(vault_names=[vault_name], user_id=str(admin_id), actor_id="tester", is_admin=True)
+                    result = await table_service.execute_sql(**args, sql=f'UPDATE "{table_name}" SET amount = 2')
+                    assert result["affected_rows"] == 1
+                    failed = await table_service.execute_sql(**args, sql=f'UPDATE "{table_name}" SET amount = 0')
+                    assert failed.get("error")
+                assert await conn.fetchval(f'SELECT amount FROM "{table_name}"') == 2
+                assert await conn.fetchval(
+                    "SELECT count(*) FROM events WHERE kind='vault.write_policy_admin_bypass' AND vault_id=$1",
+                    vault_id,
+                ) == 2
+            finally:
+                await conn.execute(f'DROP TABLE "{table_name}"')
+
+    async def test_pending_sql_observes_committed_grant_revocation(self, pool):
+        from app.repositories import vault_write_policy_repo as repo
+        from app.services import table_service
+
+        owner = await _create_user(pool)
+        vault_id, vault = await _create_named_vault(pool, owner)
+        token = await _create_token(pool, owner)
+        await repo.set_policy(vault_id, "collector:acme", "admin-user")
+        await repo.add_grant(vault_id, token, "admin-user")
+
+        # Hold the same Vault lock as the grant API. Wait for PostgreSQL to
+        # report contention before committing the revocation.
+        with _auth_context(token_id=token):
+            async with asyncio.TaskGroup() as group, pool.acquire() as policy:
+                async with policy.transaction():
+                    await policy.execute("SELECT id FROM vaults WHERE id=$1 FOR UPDATE", vault_id)
+                    await repo.remove_grant(vault_id, token, conn=policy)
+                    request = group.create_task(table_service.execute_sql(
+                        vault_names=[vault], user_id=str(owner), actor_id="writer", sql="UPDATE items SET x=1",
+                    ))
+                    async with pool.acquire() as observer, asyncio.timeout(10):
+                        while not await observer.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                            "WHERE $1::int = ANY(pg_blocking_pids(pid)))", policy.get_server_pid(),
+                        ):
+                            await asyncio.sleep(0.01)
+        assert request.result()["code"] == "vault_write_managed"
 
     async def test_akb_sql_multi_vault_blocks_on_the_second_referenced_vault(
-        self, pool, monkeypatch,
+        self, pool,
     ):
         """The dual-enforcement loop must examine EVERY referenced vault,
         not just the first — an unmarked (harmless) vault listed before a
@@ -913,11 +927,6 @@ class TestAkbSqlDualEnforcement:
         blocked_owner_id = await _create_user(pool)
         blocked_vault_id, blocked_vault_name = await _create_named_vault(pool, blocked_owner_id)
         await repo.set_policy(blocked_vault_id, "collector:acme", "admin-user")
-
-        def _poison():
-            raise AssertionError("must not reach the real executor — blocked before execution")
-
-        monkeypatch.setattr(table_service, "get_user_sql_executor", _poison)
 
         with _auth_context(token_id=None, scope=None):  # no PAT, not admin
             result = await table_service.execute_sql(
