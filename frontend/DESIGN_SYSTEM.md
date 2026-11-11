@@ -235,7 +235,7 @@ background restoration uses at most four concurrent requests. Remove denied or
 missing documents and offer Retry for temporary failures. Logout clears saved
 reading sessions. Storage failure must leave ordinary reading usable.
 
-More → Read side by side, a preview's Keep side by side action, and the
+The common tab menu's Read side by side, a preview's Keep side by side action, and the
 open-document list's side action share one persistent read-only companion pane.
 It survives primary-tab navigation; references and details temporarily cover it.
 At least 56rem of available workspace and 20rem of height are needed for two
