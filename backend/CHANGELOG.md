@@ -7,6 +7,10 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- Native `akb_grep` now enforces the same vault-guide edit policy as Bare Git.
+  A replacement that would change the guide stops with `permission_denied`.
+  The response lists any documents already committed before that point.
+
 - MCP `akb_activity` accepts an exclusive RFC 3339 `until` bound. Author,
   collection, and time filters now select events before the result limit,
   including on migrated Native history. `truncated` reports whether another
