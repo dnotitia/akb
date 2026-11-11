@@ -44,9 +44,8 @@ export default defineConfig({
   ...(mockMode
     ? {
         webServer: {
-          command:
-            "VITE_AKB_TEST_MODE=mock pnpm run dev --host 127.0.0.1 --port 4173 --strictPort",
-          url: baseURL,
+          command: "pnpm run dev:e2e:mock",
+          url: `${baseURL}/__akb_mock__/health`,
           reuseExistingServer: false,
           timeout: 120_000,
         },
