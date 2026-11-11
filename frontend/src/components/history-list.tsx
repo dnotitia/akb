@@ -1,10 +1,10 @@
-import { GitCompareArrows, GitCommitHorizontal } from "lucide-react";
+import { Check, GitCompareArrows } from "lucide-react";
 import type { Ref } from "react";
 
 import type { DocumentHistoryEntry } from "@/lib/api";
 import { sameCommitRef } from "@/lib/commit";
 import { cn, timeAgo } from "@/lib/utils";
-import { TooltipText } from "@/components/ui/tooltip-text";
+import { DocumentIconButton } from "@/components/document-reading-controls";
 
 export type HistoryEntry = DocumentHistoryEntry;
 
@@ -34,7 +34,7 @@ export function HistoryList({
   }
 
   return (
-    <ol className="overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface divide-y divide-border">
+    <ol className="min-w-0 divide-y divide-border">
       {entries.map((entry) => {
         const selected = sameCommitRef(entry.hash, selectedHash);
         const comparing = sameCommitRef(entry.hash, diffHash);
@@ -44,7 +44,7 @@ export function HistoryList({
           <li
             key={entry.hash}
             className={cn(
-              "grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 px-2 py-2 transition-token",
+              "grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-1 py-1.5 transition-token",
               (selected || comparing) && "bg-surface-selected text-surface-selected-foreground",
             )}
           >
@@ -53,47 +53,31 @@ export function HistoryList({
               onClick={() => onSelect?.(entry.hash)}
               disabled={!onSelect}
               aria-pressed={selected && !comparing}
-              aria-label={`View version ${shortHash}: ${entry.message}`}
-              className="min-w-0 rounded-[var(--radius-sm)] px-1 py-0.5 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:opacity-100"
+              aria-label={`View version ${shortHash}: ${entry.message || "Document update"}`}
+              className="min-h-11 min-w-0 rounded-[var(--radius-sm)] px-2 py-1 text-left transition-token hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:cursor-default disabled:opacity-100"
             >
-              <TooltipText tip={entry.message} className="block truncate text-sm font-medium text-foreground">
+              <span className="block text-[.8125rem] leading-snug font-medium text-foreground wrap-anywhere">
                 {entry.message || "Document update"}
-              </TooltipText>
-              <span className="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-foreground-muted">
-                <GitCommitHorizontal className="h-3 w-3 shrink-0" aria-hidden />
-                <code className="shrink-0 font-mono text-link">{shortHash}</code>
-                <span aria-hidden>·</span>
-                <span className="min-w-0 truncate">{author}</span>
-                {entry.date && (
-                  <>
-                    <span aria-hidden>·</span>
-                    <span className="shrink-0 tabular-nums">{timeAgo(entry.date)}</span>
-                  </>
-                )}
+              </span>
+              <span className="mt-1 flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs leading-snug text-foreground-muted">
+                <code className="font-mono text-link">{shortHash}</code>
+                <span className="min-w-0 wrap-anywhere">{author}</span>
+                {entry.date && <time dateTime={entry.date} className="whitespace-nowrap tabular-nums">{timeAgo(entry.date)}</time>}
               </span>
             </button>
 
-            <div className="flex shrink-0 items-center gap-1">
-              {onCompare && (
-                <button
-                  ref={entry.hash === compareFocusHash ? compareFocusRef : undefined}
-                  type="button"
-                  data-document-diff-trigger={entry.hash}
-                  onClick={(event) => onCompare(entry.hash, event.currentTarget)}
-                  aria-pressed={comparing}
-                  aria-label={`View changes in version ${shortHash}`}
-                  className={cn(
-                    "inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-md)] border px-2 text-xs font-medium transition-token focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                    comparing
-                      ? "border-primary bg-primary text-primary-foreground"
-                      : "border-border bg-surface text-foreground-muted hover:border-border-strong hover:bg-surface-hover hover:text-link",
-                  )}
-                >
-                  <GitCompareArrows className="h-3.5 w-3.5" aria-hidden />
-                  Changes
-                </button>
-              )}
-            </div>
+            {onCompare && (
+              <DocumentIconButton
+                ref={entry.hash === compareFocusHash ? compareFocusRef : undefined}
+                data-document-diff-trigger={entry.hash}
+                onClick={(event) => onCompare(entry.hash, event.currentTarget)}
+                aria-pressed={comparing}
+                label={`View changes in version ${shortHash}`}
+                className={cn("size-11 shrink-0 sm:[@media(pointer:fine)]:size-8", comparing && "bg-surface-selected text-link")}
+              >
+                {comparing ? <Check className="h-4 w-4" aria-hidden /> : <GitCompareArrows className="h-4 w-4" aria-hidden />}
+              </DocumentIconButton>
+            )}
           </li>
         );
       })}

@@ -129,7 +129,7 @@ export function AppSidebar({
           <div
             data-slot="workspace-sidebar-heading"
             className={cn(
-              "flex h-10 shrink-0 items-center border-b border-border px-2",
+              "flex h-10 shrink-0 items-center border-b border-border px-2 pointer-coarse:h-12",
               compact ? "justify-center" : "justify-between",
             )}
           >

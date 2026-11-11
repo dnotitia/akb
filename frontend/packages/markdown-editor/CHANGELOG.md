@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep section-toggle widgets attached to their own headings during visual
+  heading-level and anchor changes. Editor-owned heading node views preserve
+  live controls without cloning content or changing serialized Markdown.
+
 - Add a source-isolated before-content viewer slot and per-heading
   level normalization for canonical document-title layouts.
 - Add footnote references and multiline definitions to the shared schema, with

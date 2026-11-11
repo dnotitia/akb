@@ -60,7 +60,7 @@ describe("HistoryList", () => {
       name: /view changes in version bcdefa2/i,
     });
     expect(changes).toHaveAttribute("aria-pressed", "true");
-    expect(changes).toHaveTextContent("Changes");
+    expect(changes.querySelector(".lucide-check")).toBeInTheDocument();
   });
 
   it("renders a clear empty state", () => {

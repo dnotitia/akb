@@ -1,3 +1,4 @@
+import { readingSettings } from "./fixtures/reader-navigation";
 import { expect, test } from "@playwright/test";
 import { readingFixture } from "./fixtures/reading-workspace";
 
@@ -10,8 +11,8 @@ for (const scenario of [{ width: 1440, height: 1000, dark: false }, { width: 144
     await page.goto("/vault/fixture/doc/reading.md");
     const header = page.locator(".reading-studio-header");
     const find = header.getByRole("button", { name: "Find in document", exact: true });
-    const contents = header.getByRole("button", { name: "Table of contents", exact: true });
-    await expect(find).toBeInViewport({ ratio: 1 }); await expect(contents).toBeInViewport({ ratio: 1 });
+    const contents = page.getByRole("button", { name: "Open contents", exact: true });
+    await expect(find).toBeInViewport({ ratio: 1 }); await expect(header.getByRole("button", { name: "Reading settings", exact: true })).toHaveCount(0);
     const actions = header.getByRole("button", { name: "Actions for Reading workflow", exact: true });
     await expect(actions).toBeInViewport({ ratio: 1 });
     expect((await actions.boundingBox())!.y).toBeCloseTo((await find.boundingBox())!.y, 0);
@@ -21,10 +22,9 @@ for (const scenario of [{ width: 1440, height: 1000, dark: false }, { width: 144
     await expect(page.getByRole("heading", { name: "Nested detail", exact: true })).toBeVisible();
     await page.keyboard.press("Escape"); await expect(find).toBeFocused();
     await page.getByRole("button", { name: "Collapse section: Folding area", exact: true }).click();
-    await contents.click();
-    const panel = page.locator('[data-slot="document-context-panel"]');
+    if (await contents.isVisible()) await contents.click();
+    const panel = page.getByRole("navigation", { name: "Document outline", exact: true });
     await panel.getByRole("link", { name: "Nested detail", exact: true }).click();
-    await page.getByRole("button", { name: "Close document panel", exact: true }).click(); await expect(contents).toBeFocused();
     await expect(page.getByRole("heading", { name: "Nested detail", exact: true })).toBeVisible();
     const diagram = page.getByRole("img", { name: "Flow of documents", exact: true });
     await diagram.scrollIntoViewIfNeeded();
@@ -59,8 +59,7 @@ test("reading settings carry into search previews and public documents", async (
   await page.route("**/api/v1/search?**", route => route.fulfill({ json: { query: "reading", total: 1, results: [{ title: "Reading workflow", uri: "akb://fixture/doc/reading.md", vault: "fixture", path: "reading.md", source_type: "document", score: 1 }] } }));
   await page.route("**/api/v1/public/reader-demo*", route => route.fulfill({ json: { resource_type: "document", title: "Published reading", content: body, tags: [], created_by_name: "Reading reviewer", status: "active" } }));
   await page.goto("/vault/fixture/doc/reading.md");
-  await page.getByRole("group", { name: "Document reading tools", exact: true }).getByRole("button", { name: "Actions for Reading workflow", exact: true }).click();
-  await page.getByRole("menuitem", { name: "Reading settings", exact: true }).click();
+  await readingSettings(page);
   await page.getByRole("radio", { name: "Wide", exact: true }).check();
   await page.getByRole("button", { name: "Increase text size", exact: true }).click();
   await page.keyboard.press("Escape");

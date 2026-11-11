@@ -1,16 +1,16 @@
-import { createContext, useContext, type Dispatch, type SetStateAction, type ReactNode } from "react";
+import { createContext, useContext, type Dispatch, type SetStateAction, type ReactNode, type RefObject } from "react";
+
+export interface ReferenceNavigationRequest { id: number; href?: string; referenceKey?: string; scrollTop?: number }
 
 export interface ReadingChrome {
   toolbarHost: HTMLElement | null;
-  referenceControl: ReactNode;
+  references: ReactNode;
+  referencesRequest?: ReferenceNavigationRequest;
   sideControl?: ReactNode;
-  panelControl?: ReactNode;
-  openSideBySide?: () => void;
-  detailsHost: HTMLElement | null;
-  contextHeaderHost: HTMLElement | null;
-  narrow: boolean;
   detailsOpen: boolean;
   setDetailsOpen: Dispatch<SetStateAction<boolean>>;
+  connectionManagerRequest?: number;
+  connectionManagerOpener?: RefObject<HTMLButtonElement | null>;
 }
 
 export const ReadingChromeContext = createContext<ReadingChrome | null>(null);

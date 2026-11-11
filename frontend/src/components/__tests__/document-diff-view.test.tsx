@@ -90,7 +90,9 @@ describe("DocumentDiffView", () => {
     expect(screen.getByRole("row", { name: "Added line 1: New title" })).toBeInTheDocument();
     expect(screen.getByLabelText("2 added lines")).toHaveTextContent("+2 added");
     expect(screen.getByLabelText("2 removed lines")).toHaveTextContent("−2 removed");
-    expect(screen.getByText(/Update guide/)).toHaveTextContent("Update guide · Kim");
+    const metadata = screen.getByRole("group", { name: "Revision metadata" });
+    expect(metadata).toHaveTextContent("Update guide");
+    expect(metadata).toHaveTextContent("Kim");
   });
 
   it("navigates hunks and announces the current change", async () => {

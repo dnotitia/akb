@@ -135,6 +135,10 @@ updates are applied by the package and never become serialized Markdown:
 editable document DOM, so hosts can position them over the displayed image
 without adding text to prose. `renderSectionToggle(section)`, `collapsedSections`
 and `onRevealSections` provide the same presentation-only contract for sections.
+Section controls render in a non-editable `[data-markdown-section-tools]` widget
+inside their heading. Anchor the widget to that heading and reserve its target
+size there; viewport-coordinate overlays can drift over adjacent prose. The
+widget is not part of the document model or Markdown serialization.
 Use `revealMarkdownTarget(element)` before measuring or scrolling to an anchor
 from a separate outline. Text finding also reveals collapsed ancestors. Reading
 decorations are rebuilt for each document, including when replacing a long body

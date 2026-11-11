@@ -43,7 +43,7 @@ export function useDocOutline(md: string, { root, topOffset = 96 }: Options = {}
       frame.current = null;
       const nodes = headings
         .map((h) => root.querySelector<HTMLElement>(`#${cssEscape(h.slug)}`))
-        .filter((el): el is HTMLElement => !!el);
+        .filter((el): el is HTMLElement => !!el && !el.closest("[hidden], [data-reading-section-hidden=true]"));
       if (nodes.length === 0) return;
       let current: HTMLElement | null = nodes[0];
       for (const n of nodes) {
@@ -61,9 +61,11 @@ export function useDocOutline(md: string, { root, topOffset = 96 }: Options = {}
     compute();
     const target: EventTarget = scroller;
     target.addEventListener("scroll", onScroll, { passive: true });
+    root.addEventListener("markdown-reading-presentation", onScroll, true);
     window.addEventListener("resize", onScroll);
     return () => {
       target.removeEventListener("scroll", onScroll);
+      root.removeEventListener("markdown-reading-presentation", onScroll, true);
       window.removeEventListener("resize", onScroll);
       if (frame.current != null) cancelAnimationFrame(frame.current);
     };

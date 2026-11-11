@@ -1,26 +1,26 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import { ReadingChromeContext } from "@/contexts/reading-chrome-context";
+import { ReadingChromeContext, type ReferenceNavigationRequest } from "@/contexts/reading-chrome-context";
 import { DocumentIconButton } from "@/components/document-reading-controls";
 import { ReaderToolsProvider, useReaderTools } from "@/contexts/reader-tools-context";
 import { useReaderPanelLayout } from "@/hooks/use-reader-panel-layout";
 import { ReaderPanelWidthMenu } from "@/components/reader-panel-width-menu";
 import { DocumentTabs } from "@/components/reading-document-tabs";
 import { DocumentFindBar } from "@/components/document-reader-tools";
+import { DocumentReferences } from "@/components/document-references";
 import { DocumentByline } from "@/components/document-byline";
 import { documentAuthorName } from "@/lib/document-author";
 import { Link, useLocation, useParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowDownLeft, ArrowLeft, ArrowUpRight, Check, FileText, List, Columns2, Network, Plus, X } from "lucide-react";
-import { ApiError, getDocument, getRelations, type RelationRow } from "@/lib/api";
+import { ArrowLeft, ArrowUpRight, Check, Columns2, Plus, X } from "lucide-react";
+import { ApiError, getDocument, getRelations } from "@/lib/api";
 import { readWithAccessBoundary } from "@/lib/query-access-boundary";
 import { DocumentUnavailableState } from "@/components/document-unavailable-state";
 import { readingDocumentHref, readingDocumentKey, readingFragment, readingReference, type ReadingDocument } from "@/lib/reading-workspace";
-import { parseUri } from "@/lib/uri";
 import { useReadingWorkspace } from "@/contexts/reading-workspace-context";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
 import { MarkdownRender } from "@/components/markdown-render";
-import { hrefFor, relationIsInVault } from "@/components/relations/relation-row-utils";
+import { relationIsInVault } from "@/components/relations/relation-row-utils";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/alert";
 import { LoadingState } from "@/components/ui/loading-state";
@@ -72,13 +72,26 @@ function ReadingWorkspace({ children }: { children: ReactNode }) {
   const [preview, setPreview] = useState<ReadingDocument | null>(null);
   const [previewHistory, setPreviewHistory] = useState<ReadingDocument[]>([]);
   const [sideHistory, setSideHistory] = useState<ReadingDocument[]>([]);
-  const [contextMode, setContextMode] = useState<"references" | "preview" | "details" | null>(null);
-  const [sheetOpen, setSheetOpen] = useState(false);
+  const [contextMode, setContextMode] = useState<"preview" | null>(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [connectionManagerRequest, setConnectionManagerRequest] = useState(0);
+  const connectionManagerOpener = useRef<HTMLButtonElement>(null);
+  const [referencesRequest, setReferencesRequest] = useState<ReferenceNavigationRequest>();
+  const referencesRequestId = useRef(0);
+  const referenceOrigin = useRef<Omit<ReferenceNavigationRequest, "id"> | undefined>(undefined);
+  const [referenceMode, setReferenceMode] = useState<"map" | "list">("list");
   const [sideSheetOpen, setSideSheetOpen] = useState(false);
   const sideVisible = Boolean(workspace.companion) && contextMode === null;
   const sizing = useReaderPanelLayout(frameRef, sideVisible);
-  const narrow = sizing.narrow;
+  const [narrow, setNarrow] = useState(sizing.narrow);
+  useLayoutEffect(() => {
+    // Preserve a supporting editor and its reference-surface opener on resize.
+    if (!detailsOpen) setNarrow(sizing.narrow);
+  }, [detailsOpen, sizing.narrow]);
   const editing = ["edit", "diff"].includes(params.get("view") ?? "");
+  useEffect(() => {
+    if (editing) { setContextMode(null); setSideSheetOpen(false); setDetailsOpen(false); }
+  }, [editing]);
   const positionKey = active + (params.get("view") === "raw" ? ":raw" : ":rendered");
   useLayoutEffect(() => {
     if (!doc || editing || !active) return;
@@ -101,27 +114,29 @@ function ReadingWorkspace({ children }: { children: ReactNode }) {
   const restoreFocusFrame = useRef<number | null>(null);
   useLayoutEffect(() => () => { if (restoreFocusFrame.current !== null) cancelAnimationFrame(restoreFocusFrame.current); restoreFocusFrame.current = null; }, [location.key]);
   const [toolbarHost, setToolbarHost] = useState<HTMLElement | null>(null);
-  const [detailsHost, setDetailsHost] = useState<HTMLElement | null>(null);
   const [contextHeaderHost, setContextHeaderHost] = useState<HTMLElement | null>(null);
-  const referenceTriggerRef = useRef<HTMLButtonElement>(null);
   const sideTriggerRef = useRef<HTMLButtonElement>(null);
-  const setDetailsOpen = useCallback((next: boolean | ((previous: boolean) => boolean)) => {
-    setPreview(null); setSheetOpen(false); setSideSheetOpen(false);
-    setContextMode(previous => (typeof next === "function" ? next(previous === "details") : next) ? "details" : previous === "details" ? null : previous);
-  }, []);
-  useEffect(() => { setPreview(null); setPreviewHistory([]); setSheetOpen(false); setSideSheetOpen(false); setContextMode(null); }, [location.pathname, checking, revision]);
+  useEffect(() => { setPreview(null); setPreviewHistory([]); setSideSheetOpen(false); setContextMode(null); setDetailsOpen(false); setReferencesRequest(undefined); }, [location.pathname, checking, revision]);
   useEffect(() => { setSideHistory([]); }, [checking, revision, user?.user_id]);
   const lastSideRequest = useRef(workspace.sideRequest);
   useEffect(() => {
     if (lastSideRequest.current === workspace.sideRequest) return;
     lastSideRequest.current = workspace.sideRequest;
-    setPreview(null); setPreviewHistory([]); setSheetOpen(false); setContextMode(null); setSideSheetOpen(sizing.splitNarrow);
+    setPreview(null); setPreviewHistory([]); setContextMode(null); setSideSheetOpen(sizing.splitNarrow);
   }, [workspace.sideRequest, sizing.splitNarrow]);
-  const showReferences = useCallback(() => { setPreview(null); setPreviewHistory([]); setSideSheetOpen(false); setContextMode("references"); setSheetOpen(true); }, []);
+  const showReferences = useCallback(() => {
+    setPreview(null); setPreviewHistory([]); setSideSheetOpen(false); setContextMode(null);
+    setReferencesRequest({ id: ++referencesRequestId.current, ...referenceOrigin.current });
+  }, []);
   const openReference = useCallback((target: ReadingDocument, opener?: HTMLElement) => {
     if (target.vault !== name) return;
-    if (opener) openerRef.current = opener;
-    setContextMode("preview"); setSheetOpen(true); setSideSheetOpen(false);
+    if (opener) {
+      openerRef.current = opener;
+      const source = opener.closest(".document-references");
+      referenceOrigin.current = source ? { href: opener.getAttribute("href") ?? undefined, referenceKey: opener.dataset.referenceKey,
+        scrollTop: source.querySelector(".document-reference-body")?.scrollTop } : undefined;
+    }
+    setContextMode("preview"); setSideSheetOpen(false);
     setPreviewHistory(previous => preview ? [...previous, preview].slice(-20) : []); setPreview(target);
   }, [name, preview]);
   const focusPrimary = () => {
@@ -130,7 +145,8 @@ function ReadingWorkspace({ children }: { children: ReactNode }) {
     primaryRef.current?.querySelector<HTMLElement>("#document-reading-canvas")?.focus({ preventScroll: true });
   };
   const closePreview = useCallback(() => {
-    setPreview(null); setPreviewHistory([]); setContextMode(null); setSheetOpen(false);
+    if (openerRef.current?.closest(".document-references")) { showReferences(); return; }
+    setPreview(null); setPreviewHistory([]); setContextMode(null);
     if (restoreFocusFrame.current !== null) cancelAnimationFrame(restoreFocusFrame.current);
     restoreFocusFrame.current = requestAnimationFrame(() => {
       restoreFocusFrame.current = null;
@@ -139,7 +155,7 @@ function ReadingWorkspace({ children }: { children: ReactNode }) {
       if (opener?.isConnected) opener.focus({ preventScroll: true });
       else primaryRef.current?.querySelector<HTMLElement>("#document-reading-canvas")?.focus({ preventScroll: true });
     });
-  }, []);
+  }, [showReferences]);
   const followLink = (event: MouseEvent<HTMLElement> | KeyboardEvent<HTMLElement>) => {
     if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || checking || editing) return;
     if ("button" in event && event.button !== 0 || "key" in event && event.key !== "Enter") return;
@@ -157,33 +173,20 @@ function ReadingWorkspace({ children }: { children: ReactNode }) {
   const rightMode = dockOpen ? contextMode : !editing && !checking && sideVisible ? "side" : null;
   const constrained = rightMode === "side" ? sizing.splitNarrow : narrow;
   const rightVisible = Boolean(rightMode) && !constrained;
-  const [referenceMode, setReferenceMode] = useState<"map" | "list">("list");
   const panelControl = <ReaderPanelWidthMenu split={rightMode === "side"} onPreset={sizing.preset} onReset={sizing.reset} />;
-  const references = <ReferenceLens vault={name} title={doc?.title || ""} relations={relations} mode={referenceMode} onModeChange={setReferenceMode}
-    loading={relationsQuery.isPending} error={relationsQuery.isError} historical={Boolean(version)} onRetry={() => void relationsQuery.refetch()} onOpen={openReference} />;
-  const referencesHeader = <div className="reading-context-toolbar">
-    <span role="heading" aria-level={2} aria-label="Document references" className="reading-context-label reading-context-label-icon"><Network size={16} aria-hidden /><span className="reading-context-count">{relationsQuery.isSuccess ? relations.length : ""}</span></span>
-    <div className="reading-segment" role="group" aria-label="Reference view">
-      <button type="button" aria-pressed={referenceMode === "map"} aria-label="Reference map" title="Reference map" onClick={() => setReferenceMode("map")}><Network size={14} aria-hidden /></button>
-      <button type="button" aria-pressed={referenceMode === "list"} aria-label="Reference list" title="Reference list" onClick={() => setReferenceMode("list")}><List size={14} aria-hidden /></button>
-    </div>{!narrow && panelControl}
-    <button type="button" className="reading-icon-button" aria-label="Close references" onClick={() => { setContextMode(null); setSheetOpen(false); referenceTriggerRef.current?.focus({ preventScroll: true }); }}><X size={16} aria-hidden /></button>
-  </div>;
-  const referenceControl = !editing && doc && <DocumentIconButton ref={referenceTriggerRef} label={relationsQuery.isSuccess ? `Show document references (${relations.length})` : "Show document references"}
-    className="reading-reference-trigger" aria-expanded={dockOpen && contextMode === "references" && (!narrow || sheetOpen)} onClick={() => {
-      if (contextMode === "references" && (!narrow || sheetOpen)) { setContextMode(null); setSheetOpen(false); } else showReferences();
-    }}><Network size={16} aria-hidden />{relationsQuery.isSuccess && <span aria-hidden className="reading-reference-count">{relations.length}</span>}</DocumentIconButton>;
+  const references = !editing && doc && <DocumentReferences key={active} vault={name} title={doc.title || ""} relations={relations} mode={referenceMode} onModeChange={setReferenceMode}
+    loading={relationsQuery.isPending} error={relationsQuery.isError} historical={Boolean(version)} onRetry={() => void relationsQuery.refetch()} onOpen={openReference}
+    manageRef={connectionManagerOpener} onManage={opener => { connectionManagerOpener.current = opener; setConnectionManagerRequest(value => value + 1); }} />;
   const sideControl = !editing && workspace.companion && <DocumentIconButton ref={sideTriggerRef} label="Open side document" aria-expanded={sideVisible && (!sizing.splitNarrow || sideSheetOpen)} onClick={() => {
-    setContextMode(null); setPreview(null); setSheetOpen(false); setSideSheetOpen(value => sizing.splitNarrow ? !value : false);
+    setContextMode(null); setPreview(null); setSideSheetOpen(value => sizing.splitNarrow ? !value : false);
     if (!sizing.splitNarrow) requestAnimationFrame(() => frameRef.current?.querySelector<HTMLElement>(".reading-side-document .reading-context-label")?.focus({ preventScroll: true }));
   }}><Columns2 size={16} aria-hidden /></DocumentIconButton>;
-  const openSideBySide = () => { if (doc) workspace.openBeside({ vault: name, path: doc.path, title: doc.title || doc.path, version, href: readingDocumentHref(name, doc.path, version ? `?commit=${encodeURIComponent(version)}` : "") }); };
-  const chrome = { toolbarHost, referenceControl, sideControl, panelControl, openSideBySide, detailsHost, contextHeaderHost, narrow, detailsOpen: contextMode === "details", setDetailsOpen };
+  const chrome = { toolbarHost, references, referencesRequest, sideControl, detailsOpen, setDetailsOpen, connectionManagerRequest, connectionManagerOpener };
   return <ReadingChromeContext.Provider value={chrome}>
     <div ref={frameRef} className="reading-studio" data-context={rightVisible ? rightMode : "closed"} data-constrained={constrained} data-resizing={sizing.resizing}
       style={{ "--reading-context-width": `${sizing.width}px` } as React.CSSProperties}>
       <header className="reading-studio-header"><div className="reading-primary-toolbar"><div ref={setToolbarHost} className="reading-toolbar-host" /></div><span className="reading-header-divider" hidden={!rightVisible} aria-hidden />
-        <div ref={setContextHeaderHost} className="reading-context-header-host">{dockOpen && contextMode === "references" && !narrow && referencesHeader}</div>
+        <div ref={setContextHeaderHost} className="reading-context-header-host" />
       </header>
       <div className="reading-studio-body">
         <div ref={primaryRef} id={panelId} role="tabpanel" aria-label="Active document" aria-labelledby={active ? `${panelId}-tab-${encodeURIComponent(active)}` : undefined} className="reading-primary" onClickCapture={followLink} onKeyDownCapture={followLink}>
@@ -194,8 +197,6 @@ function ReadingWorkspace({ children }: { children: ReactNode }) {
         {rightVisible && <div role="separator" tabIndex={0} className="reading-panel-resizer" aria-label={rightMode === "side" ? "Resize side document" : "Resize context panel"}
           aria-orientation="vertical" aria-valuemin={Math.round(sizing.min)} aria-valuemax={Math.round(sizing.max)} aria-valuenow={Math.round(sizing.width)} aria-valuetext={`${Math.round(sizing.width)} pixels wide`}
           title="Drag or use arrow keys to resize · Enter or double-click to reset" {...sizing.handlers} />}
-        {dockOpen && contextMode === "references" && !narrow && <aside className="reading-context-rail" aria-label="Document references">{references}</aside>}
-        <div ref={setDetailsHost} className="reading-details-host" hidden={!dockOpen || contextMode !== "details" || narrow} />
         {contextMode === "preview" && preview && !checking && <ReferencePreview key={`${name}:${revision}`} target={preview} narrow={narrow} headerHost={contextHeaderHost} panelControl={panelControl} canGoBack={previewHistory.length > 0}
           onBack={() => { if (previewHistory.length) { setPreview(previewHistory.at(-1)!); setPreviewHistory(items => items.slice(0, -1)); } else showReferences(); }} onClose={closePreview} onOpen={openReference} onKeepBeside={workspace.openBeside} />}
         {workspace.companion && !checking && !editing && <ReferencePreview key={`side:${user?.user_id}:${revision}`} target={workspace.companion} narrow={sizing.splitNarrow} headerHost={contextHeaderHost} persistent hidden={!sideVisible} modalOpen={sideSheetOpen && sideVisible}
@@ -205,47 +206,9 @@ function ReadingWorkspace({ children }: { children: ReactNode }) {
           onOpen={target => { if (workspace.companion) setSideHistory(items => [...items, workspace.companion!].slice(-20)); workspace.openBeside(target); }} onKeepBeside={workspace.openBeside} />}
       </div>
       <div className="reading-workspace-bottom">{workspace.restoring && <span role="status" className="reading-restore-status">Restoring tabs…</span>}<DocumentTabs active={active} panelId={panelId} /></div>
-      {narrow && doc && contextMode === "references" && <Dialog open={sheetOpen} onOpenChange={open => { setSheetOpen(open); if (!open) referenceTriggerRef.current?.focus({ preventScroll: true }); }}>
-        <DialogContent hideClose className="reading-studio reading-reference-dialog reading-references-dialog" aria-describedby={undefined} onCloseAutoFocus={event => { event.preventDefault(); referenceTriggerRef.current?.focus({ preventScroll: true }); }}>
-          <DialogTitle className="sr-only">Document references</DialogTitle>{referencesHeader}<div className="reading-reference-sheet-scroll">{references}</div>
-        </DialogContent></Dialog>}
+
     </div>
   </ReadingChromeContext.Provider>;
-}
-
-function ReferenceLens({ vault, title, relations, loading, error, historical, mode, onModeChange, onRetry, onOpen }: {
-  vault: string; title: string; relations: RelationRow[]; loading: boolean; error: boolean; historical: boolean;
-  onRetry: () => void; onOpen: (target: ReadingDocument, opener?: HTMLElement) => void;
-  mode: "map" | "list"; onModeChange: (mode: "map" | "list") => void;
-}) {
-  const graph = relations.slice(0, 6);
-  const choose = (event: MouseEvent<HTMLAnchorElement>, row: RelationRow) => {
-    if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-    const target = readingReference(hrefFor(row, vault), window.location.origin);
-    if (!target) return;
-    event.preventDefault(); onOpen(target, event.currentTarget);
-  };
-  return <div className="reading-lens">
-    {historical && <p className="reading-lens-note">References from the latest document.</p>}
-    {loading ? <LoadingState label="Loading references" delayMs={200}><Skeleton className="m-4 h-24" /></LoadingState>
-      : error ? <div className="reading-lens-empty">References could not be loaded.<Button size="sm" variant="ghost" onClick={onRetry}>Try again</Button></div>
-        : !relations.length ? <p className="reading-lens-empty">No connected resources yet. Document links and added relations appear here.</p> : <>
-          {mode === "map" && <div className="reading-reference-map" role="group" aria-label={`Direct connections to ${title}`}>
-            <div className="reading-map-center"><FileText size={14} aria-hidden /><span title={title}>{title}</span></div>
-            <div className="reading-map-neighbors">{graph.map((row, index) => <a key={`${row.uri}:${row.relation}:${row.direction}:${index}`} href={hrefFor(row, vault)} onClick={event => choose(event, row)}
-              aria-label={`${row.direction === "incoming" ? "From" : "To"}: ${row.name || parseUri(row.uri)?.id}. ${row.relation.replaceAll("_", " ")}`}>
-              {row.direction === "incoming" ? <ArrowDownLeft size={13} aria-hidden /> : <ArrowUpRight size={13} aria-hidden />}<span>{row.name || parseUri(row.uri)?.id}</span></a>)}</div>
-          </div>}
-          {mode === "list" && <div className="reading-reference-list">{(["outgoing", "incoming"] as const).map(direction => {
-            const rows = relations.filter(row => row.direction === direction);
-            return !!rows.length && <div key={direction}><p className="reading-caption">{direction === "outgoing" ? "From this document" : "To this document"} · {rows.length}</p>
-              {rows.map((row, index) => <a key={`${row.uri}:${row.relation}:${index}`} href={hrefFor(row, vault)} onClick={event => choose(event, row)} className="reading-reference-row">
-                {direction === "incoming" ? <ArrowDownLeft size={14} aria-hidden /> : <ArrowUpRight size={14} aria-hidden />}<span>{row.name || parseUri(row.uri)?.id}<small>{row.relation.replaceAll("_", " ")} · {row.kind === "implicit" ? "From document" : "Added relation"}</small></span>
-              </a>)}</div>;
-          })}</div>}
-          {mode === "map" && relations.length > graph.length && <button type="button" className="reading-map-more" onClick={() => onModeChange("list")}>Show all {relations.length} connections</button>}
-        </>}
-  </div>;
 }
 
 function ReferencePreview({ target, narrow, headerHost, panelControl, canGoBack, onBack, onClose, onOpen, onKeepBeside, persistent = false, hidden = false, modalOpen = true, onDismiss, returnFocusRef }: {
