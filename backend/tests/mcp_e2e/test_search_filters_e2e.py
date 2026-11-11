@@ -9,6 +9,18 @@ from .test_product_e2e import _call_json, _create_vault
 from .test_publication_okf_e2e import _upload_file
 
 
+def _filter_snapshot(response: dict) -> dict:
+    # Ranking can move while the background index is catching up. Filter
+    # equivalence concerns identities, metadata and the response envelope.
+    return {
+        **response,
+        "results": sorted(
+            ({key: value for key, value in item.items() if key != "score"} for item in response["results"]),
+            key=lambda item: (item["uri"], item["chunk_index"]),
+        ),
+    }
+
+
 async def _seed_search_resources(client: Client, runtime: RuntimeContext, vault: str) -> dict[str, str]:
     resources = {}
     for label, kind, status in [
@@ -60,18 +72,21 @@ async def test_search_filters_intersect_readable_vaults(
     async def search(**filters):
         return await _call_json(secondary_mcp_client.client, runtime_session, "akb_search", {**args, **filters})
 
-    plain = {"query": args["query"]}
+    # Keep this comparison on the fully indexed controls, not the automatically
+    # created Vault guide whose representative chunk may still change.
+    plain = {"query": args["query"], "source_uris": known}
     reader = secondary_mcp_client.client
     default = await _call_json(reader, runtime_session, "akb_search", plain)
     explicit = await _call_json(reader, runtime_session, "akb_search", {**plain, "archive_scope": "unarchived"})
-    assert default == explicit
+    assert _filter_snapshot(default) == _filter_snapshot(explicit)
+    assert uris(default) == set(allowed.values()) - {allowed["archive"]}
     assert not uris(default).intersection(hidden.values())
 
     baseline = await search()
     assert uris(baseline) == set(allowed.values()) - {allowed["archive"]}
-    assert await search(archive_scope="unarchived", doc_types=[]) == baseline
-    assert await search(archive_scope="all") == await search(include_archived=True)
-    assert await search(archive_scope="unarchived", include_archived=True) == baseline
+    assert _filter_snapshot(await search(archive_scope="unarchived", doc_types=[])) == _filter_snapshot(baseline)
+    assert _filter_snapshot(await search(archive_scope="all")) == _filter_snapshot(await search(include_archived=True))
+    assert _filter_snapshot(await search(archive_scope="unarchived", include_archived=True)) == _filter_snapshot(baseline)
 
     for kind in ("file", "table"):
         assert uris(await search(source_type=kind, source_uris=known)) == {allowed[kind]}
