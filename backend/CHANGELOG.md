@@ -7,6 +7,16 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- `GET /health/vault/{name}` reuses each Vault's counts for 30 seconds per
+  API process, so a console polling many Vaults from several tabs no longer
+  repeats the full aggregate on every request. The reader-role check still
+  runs on every request. Concurrent requests for one Vault share one
+  computation, and a failed computation is not reused. Tune or disable it with
+  `vault_health_cache_ttl_secs` (`0` disables) or the
+  `AKB_VAULT_HEALTH_CACHE_TTL_SECS` environment variable. The response shape
+  is unchanged; `search_update_status.observed_at` reports when the reused
+  counts were taken.
+
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain
   their existing receipts and policy errors. A pending call observes a grant

@@ -54,6 +54,11 @@ def parse_git_version(text: str) -> tuple[int, int, int] | None:
 
 NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME = "akb_revision_m1_measurement"
 
+# Upper bound of `vault_health_cache_ttl_secs`. Shared with the
+# AKB_VAULT_HEALTH_CACHE_TTL_SECS override in app/services/health.py so the
+# YAML key and the environment variable enforce one range.
+VAULT_HEALTH_CACHE_TTL_MAX_SECS = 3600.0
+
 _DNS1123_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _NATIVE_RUNTIME_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 # One DNS label of an authoritative email domain: lowercase ASCII
@@ -1304,6 +1309,17 @@ class Settings(BaseModel):
     # embedding API's rate limit or PG pool budget caps it. 1 keeps the
     # legacy single-task behavior; 4-8 is the typical production knob.
     indexing_concurrency: int = 1
+    # Per-vault indexing health (`GET /health/vault/{name}`) is a set of
+    # aggregates over the vault's whole chunk and queue population, so its
+    # cost grows with the vault, and the web console polls it for each of the
+    # user's vaults on a timer, from every open tab. Each API process reuses
+    # one result per vault for this many seconds; concurrent misses share one
+    # computation and a failure is never reused. The reader-role check still
+    # runs on every request. 0 disables the cache. The
+    # AKB_VAULT_HEALTH_CACHE_TTL_SECS env var takes precedence (a
+    # deployment-layer knob, the same class as AKB_PG_POOL_MIN_SIZE/MAX_SIZE);
+    # see app/services/health.py.
+    vault_health_cache_ttl_secs: float = Field(default=30.0, ge=0.0, le=VAULT_HEALTH_CACHE_TTL_MAX_SECS)
 
     # ── Write-lane admission (design/proposal/command-lane-write-path,
     # round-05). Git-committing writes pass a two-stage gate BEFORE

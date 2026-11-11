@@ -265,6 +265,11 @@ The following Git layout and locking apply only to the Bare Git backend:
   Also carries top-level `oldest_pending_enqueued_at` — when the
   indexing queue is non-empty, the enqueue time of its oldest pending
   chunk. Omitted entirely when the queue is empty (never 0 or epoch).
+- `GET /health/vault/{name}` — the per-vault slice, reader role required.
+  The role check runs on every request; the counts are reused per vault
+  for `vault_health_cache_ttl_secs` (default 30 s,
+  `AKB_VAULT_HEALTH_CACHE_TTL_SECS` overrides, `0` disables) in each API
+  process. Concurrent misses share one computation; failures are not reused.
 
 ## Tenant stats (`/stats`, separate port)
 

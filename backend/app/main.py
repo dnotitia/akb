@@ -66,7 +66,7 @@ from app.services import (
 from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 from app.services.external_git_capability import check_external_git_capability
-from app.services.health import vault_health
+from app.services.health import cached_vault_health
 from app.services.lifecycle import (
     init_storage,
     shutdown_storage,
@@ -725,9 +725,14 @@ async def vault_health_route(
     is unauthenticated for k8s probes and uptime monitors), this leaks
     vault existence — anonymous probing would tell an attacker which
     vault names exist. Consistent with the access model from issue #3.
+
+    The counts are reused per vault for `vault_health_cache_ttl_secs`
+    (see `app.services.health.VaultHealthCache`), so they can be that many
+    seconds old. The access check is not: it runs on every request, before
+    the cache is consulted.
     """
     access = await check_vault_access(user.user_id, name, required_role="reader")
     return {
         "vault": name,
-        **(await vault_health(access["vault_id"])),
+        **(await cached_vault_health(access["vault_id"])),
     }

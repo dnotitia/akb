@@ -407,6 +407,11 @@ indexing_batch_size: 16
 # tasks. Default 1 stays single-task for predictable resource use; raise
 # when the embedding API can absorb concurrent requests.
 # indexing_concurrency: 8
+# Per-vault indexing health (GET /health/vault/{name}) is reused per vault for
+# this many seconds in each API process; 0 disables reuse. The reader-role
+# check still runs on every request. AKB_VAULT_HEALTH_CACHE_TTL_SECS overrides
+# this key (the deployment-layer exception, same class as AKB_PG_POOL_*_SIZE).
+# vault_health_cache_ttl_secs: 30
 
 # === BM25 sparse retrieval tuning (driver-neutral) ===
 bm25_k1: 1.5
