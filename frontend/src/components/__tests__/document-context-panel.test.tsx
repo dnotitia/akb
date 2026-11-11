@@ -98,7 +98,9 @@ describe("document information", () => {
     render(<HistoryHarness />);
     expect(finished).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "Finish loading history" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Compare selected revision" })).toHaveFocus());
-    expect(finished).toHaveBeenCalledOnce();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Compare selected revision" })).toHaveFocus();
+      expect(finished).toHaveBeenCalledOnce();
+    });
   });
 });
