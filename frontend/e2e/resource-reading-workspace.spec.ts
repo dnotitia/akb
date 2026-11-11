@@ -2156,16 +2156,22 @@ for (const dark of [false, true]) test(`code blocks follow the automatic reading
   const blocks = flow.locator(":scope > pre");
   await expect(blocks).toHaveCount(2);
   const checkEdges = async () => {
-    const text = (await paragraph.boundingBox())!;
-    for (const block of await blocks.all()) {
-      const box = (await block.boundingBox())!;
-      expect(box.x).toBeCloseTo(text.x, 0);
-      expect(box.width).toBeCloseTo(text.width, 0);
-    }
+    let width = 0;
+    // The navigation rail follows the available frame via ResizeObserver.
+    // Compare one settled layout rather than bounds from opposite sides of it.
+    await expect(async () => {
+      const text = (await paragraph.boundingBox())!;
+      for (const block of await blocks.all()) {
+        const box = (await block.boundingBox())!;
+        expect(box.x).toBeCloseTo(text.x, 0);
+        expect(box.width).toBeCloseTo(text.width, 0);
+      }
+      width = text.width;
+    }).toPass({ timeout: 5_000 });
     expect(await blocks.first().evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
     expect(await blocks.last().evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-    return text.width;
+    return width;
   };
   expect(await checkEdges()).toBe(672);
   const readingBox = (await paragraph.boundingBox())!;
