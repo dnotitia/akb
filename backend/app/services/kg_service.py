@@ -295,6 +295,19 @@ async def delete_resource_edges(conn, resource_uri: str) -> None:
     )
 
 
+async def lock_resource_edges(conn, resource_uri: str) -> None:
+    """Lock every edge that has this resource at either end, in id order.
+
+    A Bare Git delete or move removes or rewrites these edges after its Git
+    commit; it locks them before the Vault's event lock, so it does not wait
+    for them while it holds that lock.
+    """
+    await conn.execute(
+        "SELECT 1 FROM edges WHERE source_uri = $1 OR target_uri = $1 ORDER BY id FOR UPDATE",
+        resource_uri,
+    )
+
+
 async def delete_document_relations(conn, vault_name: str, doc_path: str) -> None:
     """Remove all edges involving a document (by vault name and path)."""
     uri = doc_uri(vault_name, doc_path)

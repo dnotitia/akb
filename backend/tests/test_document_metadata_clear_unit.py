@@ -105,6 +105,7 @@ async def test_metadata_clear_round_trip(monkeypatch, backend, operation):
         monkeypatch.setattr(git_module.asset_service, "claim_document_assets", AsyncMock(return_value=set()))
         monkeypatch.setattr(git_module.asset_service, "sync_document_assets", AsyncMock())
         monkeypatch.setattr(git_module, "emit_event", AsyncMock())
+        monkeypatch.setattr(git_module, "lock_collection_rows", AsyncMock(return_value=set()))
         monkeypatch.setattr(git_module, "lock_vault_events", AsyncMock())
         await service.update("mine", "notes/metadata.md", request)
         saved_raw = storage.raw

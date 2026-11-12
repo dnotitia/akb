@@ -835,6 +835,30 @@ class DocumentRepository:
         return status.endswith(" 1")
 
 
+_LOCK_COLLECTIONS_FOR_UPDATE = (
+    "SELECT id FROM collections WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE"
+)
+_LOCK_COLLECTIONS_FOR_SHARE = (
+    "SELECT id FROM collections WHERE id = ANY($1::uuid[]) ORDER BY id FOR KEY SHARE"
+)
+
+
+async def lock_collection_rows(conn, collection_ids, *, share: bool = False) -> set[uuid.UUID]:
+    """Lock the existing rows among ``collection_ids``, in id order.
+
+    ``FOR NO KEY UPDATE`` suits a write that will change a collection's counts;
+    ``share`` takes ``FOR KEY SHARE`` for one that only needs the collection to
+    stay. Both conflict with the ``FOR UPDATE`` of a collection delete. A Bare
+    Git document write takes these before the Vault's event lock, so it never
+    waits for them while it holds that lock. Returns the ids locked.
+    """
+    ids = sorted({cid for cid in collection_ids if cid is not None})
+    if not ids:
+        return set()
+    query = _LOCK_COLLECTIONS_FOR_SHARE if share else _LOCK_COLLECTIONS_FOR_UPDATE
+    return {row["id"] for row in await conn.fetch(query, ids)}
+
+
 class CollectionRepository:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool

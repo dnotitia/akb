@@ -20,6 +20,8 @@ import pytest
 
 from app.db.transient import transient_error
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
+from app.repositories.document_repo import CollectionRepository
+from app.repositories.events_repo import emit_event
 from app.services.document_service import DocumentService
 from app.services.git_service import GitService
 from app.util.errors import WRITE_BUSY
@@ -118,3 +120,64 @@ async def test_a_busy_vault_fails_each_git_write_before_git_changes(tmp_path):
             "no new event": True,
         }
         assert outcomes == {operation: expected for operation in _OPERATIONS}
+
+
+async def _a_backend_blocked_by(observer, holder) -> int:
+    """The pid of a session waiting for a lock ``holder`` holds."""
+    while True:
+        pid = await observer.fetchval(
+            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) LIMIT 1",
+            holder.get_server_pid(),
+        )
+        if pid is not None:
+            return pid
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("lock_row", ["exists", "missing"])
+async def test_a_put_waits_for_a_collection_create_before_the_event_lock(tmp_path, lock_row):
+    """A put into a collection that a `collection.create` has inserted but not
+    committed waits for that row before it takes the Vault's event lock. The
+    create then inserts its event without waiting, both commit, and Git and
+    the database agree. Taking the event lock first, the put would make the
+    create wait for it (a row) or deadlock with it (no row yet), with the put's
+    Git commit already made."""
+    git = GitService(storage_path=str(tmp_path))
+    service = DocumentService(git=git)
+    async with _fresh_database() as pool:
+        vault = f"git-lock-race-{lock_row}"
+        vault_id = await _make_vault(pool, vault)
+        git.init_vault(vault)
+        if lock_row == "exists":
+            # A committed event: the Vault's lock row exists in either schema.
+            async with pool.acquire() as conn, conn.transaction():
+                await _emit(conn, vault_id, "earlier")
+        else:
+            await pool.execute("DELETE FROM vault_event_order WHERE vault_id = $1", vault_id)
+
+        async with pool.acquire() as creator, pool.acquire() as observer:
+            async with _OpenTransaction(creator) as creating:
+                # `collection.create`: the collection's row, then its event.
+                await CollectionRepository(pool).create_empty(vault_id, "notes", conn=creator)
+                put = asyncio.create_task(service.put(DocumentPutRequest(
+                    vault=vault, collection="notes", title="Raced", content="raced body",
+                )))
+                await asyncio.wait_for(_a_backend_blocked_by(observer, creator), timeout=10)
+                started = time.monotonic()
+                await emit_event(
+                    creator, "collection.create", vault_id=vault_id,
+                    payload={"vault": vault, "path": "notes", "created": True},
+                )
+                event_wait = time.monotonic() - started
+                await creating.commit()
+            doc = await asyncio.wait_for(put, timeout=_EVENT_LOCK_WAIT_SECONDS * 3)
+
+        assert event_wait < 1.0, f"the collection event waited {event_wait:.2f}s"
+        row = await pool.fetchrow("SELECT path, current_commit FROM documents WHERE vault_id = $1", vault_id)
+        assert (row["path"], row["current_commit"]) == (doc.path, git.current_commit(vault))
+        assert "raced body" in git.read_file(vault, doc.path)
+        kinds = [r["kind"] for r in await pool.fetch(
+            "SELECT kind FROM events WHERE vault_id = $1 ORDER BY id", vault_id,
+        )]
+        assert kinds[-2:] == ["collection.create", "document.put"]
+

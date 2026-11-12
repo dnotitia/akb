@@ -1,12 +1,15 @@
-"""Bare Git document writes take the Vault's event lock before their Git write.
+"""Bare Git document writes lock their rows, then the Vault's event lock, then
+write to Git.
 
 A Git commit does not roll back with the database transaction. If the Vault's
 event lock were first taken by the event insert after the commit, a lock wait
 that ran past its deadline would roll the transaction back and leave the
 commit in Git. The writes take the lock first, so a busy Vault fails them
-before Git changes, and the event insert finds the lock already held.
+before Git changes, and the event insert finds the lock already held. The rows
+they change after the commit (collections, edges) are locked before the event
+lock, so they do not wait for another transaction while holding it.
 ``test_document_git_event_lock_postgres.py`` checks the outcome against a real
-database for put, update, edit, move and delete.
+database.
 """
 
 from __future__ import annotations
@@ -41,9 +44,18 @@ def _recorder(calls: list[str], name: str):
     return record
 
 
-async def test_put_takes_the_event_lock_before_its_git_commit(monkeypatch):
+def _collection_locker(calls: list[str]):
+    async def lock(_conn, collection_ids, *, share=False):
+        calls.append("lock_collection_rows")
+        return {cid for cid in collection_ids if cid is not None}
+
+    return lock
+
+
+async def test_put_locks_its_collection_then_the_event_lock_before_its_git_commit(monkeypatch):
     _patch_index_side_effects(monkeypatch)
     calls: list[str] = []
+    monkeypatch.setattr(ds, "lock_collection_rows", _collection_locker(calls))
     monkeypatch.setattr(ds, "lock_vault_events", _recorder(calls, "lock_vault_events"))
     monkeypatch.setattr(ds, "emit_event", _recorder(calls, "emit_event"))
     monkeypatch.setattr(
@@ -69,11 +81,16 @@ async def test_put_takes_the_event_lock_before_its_git_commit(monkeypatch):
         doc_repo=_FakePutDocRepo(), coll_repo=_Collections(), conn=_CONN,
     )
 
-    assert calls == ["publications", "lock_vault_events", "git_commit", "increment_count", "emit_event"]
+    assert calls == [
+        "publications", "lock_collection_rows", "lock_vault_events", "git_commit",
+        "increment_count", "emit_event",
+    ]
 
 
-async def test_delete_takes_the_event_lock_before_its_git_delete(monkeypatch):
+async def test_delete_locks_its_rows_then_the_event_lock_before_its_git_delete(monkeypatch):
     calls: list[str] = []
+    monkeypatch.setattr(ds, "lock_collection_rows", _collection_locker(calls))
+    monkeypatch.setattr(ds, "lock_resource_edges", _recorder(calls, "lock_resource_edges"))
     monkeypatch.setattr(ds, "lock_vault_events", _recorder(calls, "lock_vault_events"))
     monkeypatch.setattr(ds, "emit_event", _recorder(calls, "emit_event"))
     monkeypatch.setattr(ds, "delete_document_chunks", _recorder(calls, "chunks"))
@@ -100,6 +117,7 @@ async def test_delete_takes_the_event_lock_before_its_git_delete(monkeypatch):
     )
 
     assert calls == [
-        "lock_vault_events", "git_delete", "chunks", "relations", "aliases",
-        "delete_with_publications", "decrement_count", "emit_event",
+        "lock_collection_rows", "lock_resource_edges", "lock_vault_events", "git_delete",
+        "chunks", "relations", "aliases", "delete_with_publications", "decrement_count",
+        "emit_event",
     ]

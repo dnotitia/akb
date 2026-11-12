@@ -139,6 +139,7 @@ from app.repositories.document_repo import (
     CollectionRepository,
     DocumentRepository,
     acquire_path_lock,
+    lock_collection_rows,
 )
 from app.repositories.events_repo import emit_event, lock_vault_events
 from app.repositories.vault_files_repo import DocumentAssetOwner
@@ -157,6 +158,7 @@ from app.services.index_service import (
 )
 from app.services.kg_service import (
     delete_document_relations,
+    lock_resource_edges,
     relink_resource_edges,
     store_document_relations,
     validate_new_structured_relation_refs,
@@ -573,6 +575,26 @@ class DocumentService:
                         await acquire_path_lock(lock_conn, vault_id, p)
                     yield lock_conn
 
+    async def _collection_for_write(
+        self, coll_repo, vault_id: uuid.UUID, path: str, conn, *,
+        also_lock: uuid.UUID | None = None,
+    ) -> uuid.UUID:
+        """Get or create the collection at ``path`` and lock its row, together
+        with ``also_lock``, for a write that will change its counts.
+
+        The lock comes before the Vault's event lock and the Git commit. A
+        collection delete that commits between finding the row and locking it
+        leaves nothing to lock; the collection is then created again, before
+        Git changes.
+        """
+        for _ in range(3):
+            collection_id = await coll_repo.get_or_create(vault_id, path, conn=conn)
+            if conn is None:
+                return collection_id
+            if collection_id in await lock_collection_rows(conn, [collection_id, also_lock]):
+                return collection_id
+        raise ConflictError(f"Collection {path!r} was deleted during this write; retry it")
+
     async def _resolve_free_path(
         self, doc_repo, vault_id: uuid.UUID, base_path: str,
         doc_id: uuid.UUID, conn, *, self_id: uuid.UUID | None = None,
@@ -742,8 +764,23 @@ class DocumentService:
             strict=not allow_unavailable_asset_refs,
         )
 
-        # A Git commit does not roll back with this transaction: take the
-        # Vault's event lock first, so a busy Vault fails before Git changes.
+        # Use the *normalized* path so the `collections` row's `path`
+        # matches the document's stored `path`. Passing the raw
+        # `req.collection` here would create rows with leading/trailing
+        # slashes or whitespace, diverging from the doc path under it.
+        # Empty (== vault root) maps to NULL FK, matching the convention
+        # used by file_service / table_service / external_git_service —
+        # never insert a `path=""` phantom collection row.
+        collection_id = (
+            await self._collection_for_write(coll_repo, vault_id, normalized_collection, conn)
+            if normalized_collection
+            else None
+        )
+
+        # A Git commit does not roll back with this transaction. Lock the rows
+        # this write changes later, then the Vault's event lock, so a busy
+        # Vault fails it before Git changes and it holds the event lock only
+        # while it waits for nothing else.
         if conn is not None:
             await lock_vault_events(conn, vault_id)
         commit_msg = f"[put] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: create\nsummary: {req.title}"
@@ -756,18 +793,6 @@ class DocumentService:
         logger.info("Document created: %s (commit: %s)", file_path, commit_hash[:8])
 
         # DB
-        # Use the *normalized* path so the `collections` row's `path`
-        # matches the document's stored `path`. Passing the raw
-        # `req.collection` here would create rows with leading/trailing
-        # slashes or whitespace, diverging from the doc path under it.
-        # Empty (== vault root) maps to NULL FK, matching the convention
-        # used by file_service / table_service / external_git_service —
-        # never insert a `path=""` phantom collection row.
-        collection_id = (
-            await coll_repo.get_or_create(vault_id, normalized_collection, conn=conn)
-            if normalized_collection
-            else None
-        )
         # No `id` key — canonical handle is the akb:// URI built from
         # (vault, path), not a short hash. The `metadata` JSONB column is
         # reserved for internal writers (external-git import, LLM auto-tagging)
@@ -1184,9 +1209,11 @@ class DocumentService:
             previous_markdown=current_body,
         )
 
-        # A Git commit does not roll back with this transaction: take the
-        # Vault's event lock first, so a busy Vault fails before Git changes.
+        # A Git commit does not roll back with this transaction. Keep the
+        # collection from being deleted, then take the Vault's event lock, so a
+        # busy Vault fails the write before Git changes.
         if conn is not None:
+            await lock_collection_rows(conn, [row.get("collection_id")], share=True)
             await lock_vault_events(conn, vault_id)
         message = req.message or f"Update {file_path}"
         commit_msg = f"[update] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: update\nsummary: {message}"
@@ -1394,9 +1421,13 @@ class DocumentService:
             )
 
             new_collection_id = (
-                await coll_repo.get_or_create(vault_id, new_coll, conn=conn)
+                await self._collection_for_write(
+                    coll_repo, vault_id, new_coll, conn, also_lock=old_collection_id,
+                )
                 if new_coll else None
             )
+            if new_collection_id is None:
+                await lock_collection_rows(conn, [old_collection_id])
             now = datetime.now(timezone.utc)
             live_asset_ids = await asset_service.list_live_document_asset_ids(
                 conn, owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
@@ -1406,8 +1437,12 @@ class DocumentService:
                 f"[move] {old_path} -> {new_path}\n\n"
                 f"agent: {agent_id or 'unknown'}\naction: move\nsummary: {summary}"
             )
-            # A Git commit does not roll back with this transaction: take the
-            # Vault's event lock first, so a busy Vault fails before Git changes.
+            # A Git commit does not roll back with this transaction. Lock the
+            # rows this move changes later (both collections above, the edges
+            # here), then the Vault's event lock, so a busy Vault fails it
+            # before Git changes and it holds the event lock only while it
+            # waits for nothing else.
+            await lock_resource_edges(conn, doc_uri(vault, old_path))
             await lock_vault_events(conn, vault_id)
             try:
                 commit_hash = await run_git_write(
@@ -1666,9 +1701,11 @@ class DocumentService:
             previous_markdown=current_body,
         )
 
-        # A Git commit does not roll back with this transaction: take the
-        # Vault's event lock first, so a busy Vault fails before Git changes.
+        # A Git commit does not roll back with this transaction. Keep the
+        # collection from being deleted, then take the Vault's event lock, so a
+        # busy Vault fails the write before Git changes.
         if conn is not None:
+            await lock_collection_rows(conn, [row.get("collection_id")], share=True)
             await lock_vault_events(conn, vault_id)
         msg = message or f"Edit {file_path}"
         commit_msg = f"[edit] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: edit\nsummary: {msg}"
@@ -1781,9 +1818,13 @@ class DocumentService:
         file_path = row["path"]
         collection_id = row["collection_id"]
 
-        # A Git commit does not roll back with this transaction: take the
-        # Vault's event lock first, so a busy Vault fails before Git changes.
+        # A Git commit does not roll back with this transaction. Lock the rows
+        # this delete changes later, then the Vault's event lock, so a busy
+        # Vault fails it before Git changes and it holds the event lock only
+        # while it waits for nothing else.
         if conn is not None:
+            await lock_collection_rows(conn, [collection_id])
+            await lock_resource_edges(conn, doc_uri(vault, file_path))
             await lock_vault_events(conn, vault_id)
         commit_msg = f"[delete] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: delete"
         # Idempotent: if the git file is already gone (crash-recovery
