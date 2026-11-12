@@ -14,11 +14,18 @@ deployment or after a rollback. A TRUNCATE of events records nothing; only
 the test runtime's reset uses one, and it truncates this table and the Vaults
 with it.
 
-This migration installs the trigger and records the backfill boundary, the
-highest event id at that moment, while inserts and deletes on events wait;
-migration 134 then sets the starting marks from the events at or below the
-boundary, without that lock. Nothing here scans events, so the lock lasts as
-long on a large table as on a small one.
+This migration installs the trigger and records the backfill boundary while
+inserts and deletes on events wait; migration 134 then sets the starting
+marks from the events at or below the boundary, without that lock. The
+boundary is the last id the events id sequence had handed out: once the lock
+is granted no write to events is under way, so every committed event has an
+id at or below it and every later event draws a larger one. Nothing here
+reads events, so the lock lasts as long however many rows the table holds,
+live or deleted and not yet cleaned up; reading the highest id from the
+primary key instead walks every dead entry at its end. This needs the ids to
+come from the sequence the column owns, one at a time, which is the column's
+serial default and stays true when a trigger draws them from that sequence
+instead.
 
 Installing needs SHARE ROW EXCLUSIVE on events, which waits for every open
 transaction that wrote an event, and a lock request that waits queues every

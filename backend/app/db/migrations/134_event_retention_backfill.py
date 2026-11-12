@@ -23,10 +23,10 @@ holds up no event insert. It is correct without that lock:
 - A Vault with no mark had no event deleted since the install, so the
   earliest of its events at or below the boundary is still its earliest at
   install time, and its starting mark is the old boundary.
-- Only events at or below the boundary count, the highest id when the
-  trigger was installed. A Vault whose events all came later, such as one
-  that was empty then, gets no mark from here, so a cursor taken while it was
-  empty is not refused.
+- Only events at or below the boundary count, the last id handed out when
+  the trigger was installed. A Vault whose events all came later, such as
+  one that was empty then, gets no mark from here, so a cursor taken while it
+  was empty is not refused.
 - A delete racing this statement is recorded either way. If its trigger
   wrote the Vault's row first, committed or not, the insert here waits for
   it and then does nothing; ON CONFLICT sees the newest committed row even

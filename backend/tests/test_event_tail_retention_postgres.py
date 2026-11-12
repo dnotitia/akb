@@ -506,36 +506,69 @@ async def test_an_install_that_finds_the_trigger_under_its_lock_adds_nothing():
         assert await setup_pool.fetchval("SELECT count(*) FROM event_retention_backfill") == 1
 
 
-async def test_the_install_reads_no_event_rows_under_its_lock():
-    """Migration 133 holds inserts and deletes on events, so it must not scan them.
+async def test_the_install_reads_no_events_under_its_lock_even_when_deleted_rows_await_cleanup():
+    """Migration 133 holds inserts and deletes on events, so it must not read them.
 
-    It used to set the starting marks under that lock with a grouped scan of
-    every event, and with the sweeper off, as when no Redis is configured, the
-    table only grows. The boundary is read from the end of the primary key,
-    and the scan is migration 134's, without the lock.
+    It first set the starting marks under that lock with a grouped scan of
+    every event; then it read the highest id from the end of the primary key,
+    which is quick only when that end holds a live row. After a large delete
+    whose rows no cleanup could remove yet, because an older snapshot still
+    saw them, that read walked every dead entry under the lock. The boundary
+    now comes from the id sequence, and a Vault whose first event comes after
+    the install still gets no mark.
     """
     async with _fresh_database() as setup_pool:
-        vault_id = await _make_vault(setup_pool, "retention-install-scan")
+        database = await setup_pool.fetchval("SELECT current_database()")
+        swept = await _make_vault(setup_pool, "retention-swept-all")
+        later = await _make_vault(setup_pool, "retention-after-sweep")
+        await _as_before_the_migration(setup_pool)
         await setup_pool.execute(
             """
             INSERT INTO events (vault_id, kind, resource_uri, actor_id, payload)
             SELECT $1, 'document.put', 'akb://event-test/document.put', 'alice', '{}'::jsonb
-              FROM generate_series(1, 2000)
+              FROM generate_series(1, 20000)
             """,
-            vault_id,
+            swept,
         )
-        await _as_before_the_migration(setup_pool)
         migration = _load_migration(_MIGRATION)
-        assert migration is not None
-        async with setup_pool.acquire() as conn:
-            async with conn.transaction():
-                await migration.migrate(conn=conn)
-                read = await conn.fetchrow(
-                    "SELECT seq_tup_read, idx_tup_fetch FROM pg_stat_xact_user_tables WHERE relname = 'events'"
+        backfill = _load_migration(_BACKFILL)
+        assert migration is not None and backfill is not None
+        older = await asyncpg.connect(_database_dsn(database))
+        # A connection of its own, so its statistics count the install alone.
+        installing = await asyncpg.connect(_database_dsn(database))
+        try:
+            # An older snapshot still sees the rows deleted next, so no
+            # cleanup can remove them or mark their index entries dead.
+            seeing = older.transaction(isolation="repeatable_read")
+            await seeing.start()
+            assert await older.fetchval("SELECT count(*) FROM events") == 20000
+            await setup_pool.execute("DELETE FROM events WHERE vault_id = $1", swept)
+            async with installing.transaction():
+                started = time.monotonic()
+                await migration.migrate(conn=installing)
+                elapsed = time.monotonic() - started
+                reads = await installing.fetchrow(
+                    """
+                    SELECT seq_scan, idx_scan,
+                           pg_stat_get_xact_tuples_returned('events_pkey'::regclass) AS entries_read
+                      FROM pg_stat_xact_user_tables
+                     WHERE relname = 'events'
+                    """
                 )
+            await seeing.rollback()
+        finally:
+            await older.close()
+            await installing.close()
 
-        assert read["seq_tup_read"] + read["idx_tup_fetch"] <= 1, dict(read)
+        assert (reads["seq_scan"], reads["idx_scan"]) == (0, 0), dict(reads)
+        assert elapsed < 1.0
         assert await _trigger_installed(setup_pool)
+
+        # The first event of a Vault after the install is above the boundary.
+        await _insert_event(setup_pool, later, "document.put", "alice")
+        async with setup_pool.acquire() as conn:
+            await backfill.migrate(conn=conn)
+        assert await _watermarks(setup_pool) == {}
 
 
 async def test_event_writes_go_through_while_the_backfill_runs():

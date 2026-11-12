@@ -8,10 +8,10 @@ CREATE TABLE IF NOT EXISTS event_retention_watermarks (
     deleted_through BIGINT NOT NULL CHECK (deleted_through >= 0)
 );
 
--- The highest event id when the trigger below was installed. Migration 134
--- sets the starting marks from the events at or below it, and deletes the
--- row as it does; every event above it was inserted after the trigger, which
--- records any deletion of it. One row at most.
+-- The last event id handed out when the trigger below was installed.
+-- Migration 134 sets the starting marks from the events at or below it, and
+-- deletes the row as it does; every event above it was inserted after the
+-- trigger, which records any deletion of it. One row at most.
 CREATE TABLE IF NOT EXISTS event_retention_backfill (
     boundary BIGINT NOT NULL CHECK (boundary >= 0)
 );
@@ -35,24 +35,38 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- The trigger and the backfill boundary are installed together, once, while
--- inserts and deletes on events wait: every event at or below the boundary
--- was committed before the trigger existed, and every later one after it.
--- Nothing here scans events: the boundary is read from the end of the
--- primary key, so the lock lasts no longer on a large table. The trigger's
--- presence, checked again under the lock, records that this was done, so
--- running this again records no second boundary. The migration's Python step
--- checks for the trigger before it asks for any lock, and asks with a short
--- lock timeout and retries, so later event inserts do not queue behind a
--- waiting request.
+-- inserts and deletes on events wait. Once that lock is granted no write to
+-- events is under way, so every committed event has an id the id sequence
+-- has already handed out, and every later event draws a larger one: the
+-- boundary is the sequence's last value, the one before its next value when
+-- none has been drawn since it was set. Nothing here reads events, so the
+-- lock lasts as long however many rows, live or deleted and not yet cleaned
+-- up, the table holds. This holds whether the column's default or a trigger
+-- draws the ids, as long as they come from the sequence the column owns, one
+-- at a time (cache 1, the default for the column's serial type). The
+-- trigger's presence, checked again under the lock, records that this was
+-- done, so running this again records no second boundary. The migration's
+-- Python step checks for the trigger before it asks for any lock, and asks
+-- with a short lock timeout and retries, so later event inserts do not queue
+-- behind a waiting request.
 DO $$
+DECLARE
+    id_sequence TEXT := pg_get_serial_sequence('events', 'id');
+    last_drawn BIGINT;
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_trigger
          WHERE tgrelid = 'events'::regclass AND tgname = 'akb_events_record_deletions'
     ) THEN
         LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE;
-        INSERT INTO event_retention_backfill (boundary)
-        SELECT COALESCE(MAX(id), 0) FROM events;
+        IF id_sequence IS NULL THEN
+            RAISE EXCEPTION 'events.id owns no sequence to take the backfill boundary from';
+        END IF;
+        EXECUTE format(
+            'SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM %s',
+            id_sequence
+        ) INTO last_drawn;
+        INSERT INTO event_retention_backfill (boundary) VALUES (GREATEST(last_drawn, 0));
         CREATE TRIGGER akb_events_record_deletions
         AFTER DELETE ON events
         REFERENCING OLD TABLE AS akb_deleted_events
