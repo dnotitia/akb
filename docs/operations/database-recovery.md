@@ -85,16 +85,19 @@ is introduced. Existing DB command and statement deadlines remain 30 seconds.
 Readiness bounds DB pool initialization plus ping together to 2 seconds; when
 cancelled, nothing in that step waits on the server. The soft vector check runs
 as a task that the probe waits on for at most 5 seconds. If it has not finished
-by then, it is reported as `vector_store: degraded:timeout`, cancelled, and
-left to finish its cleanup in the background, because asyncpg can wait without
-limit for the answer to a cancel request. At most one vector check is
-outstanding: while a check that was given up on is still finishing, later
-probes report `degraded:timeout` at once instead of starting another. Such a
-check whose cleanup never finishes keeps that soft label until the process
-restarts; readiness itself is unaffected. One evaluation therefore ends within
-about 7 seconds, inside kubelet's 8-second probe timeout. Callers can wait for
-the shared readiness lock, but they wait for the evaluation already running,
-not for one each. Every
+by then, it is reported as `vector_store: degraded:timeout` and cancelled
+without waiting for its cleanup. It never takes a request-pool connection: when
+the vector store is pgvector on the main database (no `vector_store_dsn`), the
+check runs on the probe's dedicated connection; a store with a database of its
+own checks a connection from its own pool. A pgvector check that is cut off,
+during its query or while returning its connection, terminates that connection
+instead of returning it, because asyncpg can wait without limit for the answer
+to a cancel request and would hold the pool slot meanwhile. At most one vector
+check is outstanding: while one that was given up on is still finishing, later
+probes report `degraded:timeout` at once instead of starting another. One
+evaluation therefore ends within about 7 seconds, inside kubelet's 8-second
+probe timeout. Callers can wait for the shared readiness lock, but they wait for
+the evaluation already running, not for one each. Every
 result, ready or not, answers all callers for one second, and callers that
 arrive while an evaluation runs reuse its result. `/readyz` needs no
 authentication, so this bounds the database work that any number of callers

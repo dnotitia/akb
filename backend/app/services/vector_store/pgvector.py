@@ -835,11 +835,34 @@ class PgvectorStore:
             """
         )
 
-    async def health(self) -> bool:
+    @property
+    def uses_main_pool(self) -> bool:
+        """Whether this store reads the main database through the main pool,
+        having no `vector_store_dsn` of its own."""
+        return self._dsn is None
+
+    async def health(self, conn=None) -> bool:
+        """Whether the store's database answers.
+
+        With `conn`, the check runs on that connection instead of one borrowed
+        from the pool; readiness passes its dedicated connection when this
+        store uses the main pool. A borrowed connection that does not finish
+        the check and its return is terminated rather than returned: asyncpg
+        would hold its pool slot while waiting, without limit, for the answer
+        to a cancel request.
+        """
         try:
-            pool = await self._pool()
-            async with pool.acquire() as conn:
+            if conn is not None:
                 await conn.fetchval("SELECT 1")
+                return True
+            pool = await self._pool()
+            borrowed = await pool.acquire()
+            try:
+                await borrowed.fetchval("SELECT 1")
+                await pool.release(borrowed)
+            except BaseException:
+                _terminate_search_connection(borrowed)
+                raise
             return True
         except Exception:  # noqa: BLE001
             return False

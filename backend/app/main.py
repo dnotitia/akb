@@ -52,6 +52,7 @@ from app.db.postgres import (
     pool_progress_waiter,
     readiness_acquires,
     readiness_ping,
+    with_readiness_connection,
 )
 from app.db.transient import transient_error
 from app.exceptions import AKBError, TransientDependencyError
@@ -769,7 +770,20 @@ async def _vector_store_status() -> str:
 
 
 async def _vector_store_health() -> bool:
-    return await get_vector_store().health()
+    # Imported here, as the factory does, so other drivers never load it.
+    from app.services.vector_store.pgvector import PgvectorStore
+
+    store = get_vector_store()
+    if isinstance(store, PgvectorStore) and store.uses_main_pool:
+        # The store reads the database the probe pings, through the request
+        # pool. Its check runs on the probe's dedicated connection instead, so
+        # the soft check never holds a request-pool connection that readiness
+        # then judges as saturated or wedged.
+        shared = store
+        return await with_readiness_connection(
+            lambda conn: shared.health(conn=conn), timeout=_READY_VECTOR_TIMEOUT_SECONDS,
+        )
+    return await store.health()
 
 
 def _consume_outcome(task: asyncio.Task) -> None:

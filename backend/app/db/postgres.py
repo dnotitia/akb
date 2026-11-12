@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import asyncpg
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -183,10 +183,20 @@ async def readiness_ping(*, timeout: float) -> None:
     Readiness used to borrow a request-pool connection for this ping. When
     requests held every pool connection, the probe queued behind them and
     timed out, so a busy pool read as an unreachable database, and every
-    replica reported that at the same moment. This connection is opened on
-    first use with the pool's DSN, reused by later probes, and replaced
-    after any failure. Connecting and the ping are each bounded by
-    ``timeout``. Raises on failure; the caller decides what that means.
+    replica reported that at the same moment. Connecting and the ping are
+    each bounded by ``timeout``. Raises on failure; the caller decides what
+    that means.
+    """
+    await with_readiness_connection(lambda conn: conn.fetchval("SELECT 1"), timeout=timeout)
+
+
+async def with_readiness_connection[T](use: Callable[[asyncpg.Connection], Awaitable[T]], *, timeout: float) -> T:
+    """Run ``use`` on the readiness probe's dedicated connection.
+
+    The connection is opened on first use with the pool's DSN, reused by later
+    calls, and replaced after any failure. It is never lent to a request, so it
+    stays usable however busy the pool is. Opening it is bounded by
+    ``timeout``, and so is each statement unless the caller bounds it sooner.
     """
     global _readiness_conn
     async with _readiness_lock:
@@ -205,11 +215,11 @@ async def readiness_ping(*, timeout: float) -> None:
                     server_settings={"application_name": READINESS_APPLICATION_NAME},
                 )
                 _readiness_conn = conn
-            await conn.fetchval("SELECT 1")
+            return await use(conn)
         except BaseException:
-            # Includes cancellation by the caller's deadline: a ping cut off
-            # mid-protocol leaves the session in an unknown state. The next
-            # probe opens a fresh connection.
+            # Includes cancellation by the caller's deadline: a statement cut
+            # off mid-protocol leaves the session in an unknown state, and
+            # terminating it waits on nothing. The next call opens a fresh one.
             if conn is not None:
                 if _readiness_conn is conn:
                     _readiness_conn = None

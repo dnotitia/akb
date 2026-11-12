@@ -122,10 +122,15 @@ specifically; the proxy has its own log in
   process. A plain success is still cached for 30 seconds.
 - The soft vector-store check in `/readyz` runs as a task that the probe waits
   on for at most 5 seconds. A check that has not finished by then is reported
-  as `degraded:timeout` and left to finish its cleanup in the background
-  instead of being awaited; asyncpg can wait without limit for the answer to a
-  cancel request, which used to hold the readiness lock and every caller
-  behind it past kubelet's 8-second timeout. At most one check is outstanding.
+  as `degraded:timeout` and cancelled without waiting for its cleanup; asyncpg
+  can wait without limit for the answer to a cancel request, which used to
+  hold the readiness lock and every caller behind it past kubelet's 8-second
+  timeout. At most one check is outstanding. The check no longer takes a
+  request-pool connection, which readiness would then count against the
+  pool: pgvector on the main database is checked on the probe's dedicated
+  connection. pgvector's health check also terminates a borrowed connection
+  that it cannot finish with, at the query or while returning it, instead of
+  holding its pool slot.
 - When the request pool shows nothing that proves it could serve a request (no
   idle connection, room to open one, and no acquire within the grace),
   readiness takes one connection through it within the probe's remaining

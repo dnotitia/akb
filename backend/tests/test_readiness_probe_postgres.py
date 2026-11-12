@@ -137,17 +137,24 @@ class _Relay:
             await self._server.wait_closed()
 
 
-class _SharedPoolVectorStore:
-    """Health-checks like pgvector does on the main database: through the pool."""
+def _pgvector_store(*, dsn: str | None = None):
+    """The pgvector driver. With no DSN of its own, as deployed by default, it
+    reads the main database through the main pool; its health checks are
+    counted on `calls`."""
+    from app.services.vector_store.pgvector import PgvectorStore
 
-    def __init__(self) -> None:
-        self.calls = 0
+    store = PgvectorStore(
+        dsn=dsn, schema="vector_index", dense_dim=8, sparse_shape="posting", get_main_pool=postgres.get_pool,
+    )
+    store.calls = 0
+    checked = store.health
 
-    async def health(self) -> bool:
-        self.calls += 1
-        pool = await postgres.get_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetchval("SELECT 1") == 1
+    async def counted_health(conn=None) -> bool:
+        store.calls += 1
+        return await (checked() if conn is None else checked(conn=conn))
+
+    store.health = counted_health
+    return store
 
 
 @contextlib.asynccontextmanager
@@ -196,7 +203,7 @@ async def _ready_database(
         monkeypatch.setattr(main, "_ready_state", main._ReadyState())
         monkeypatch.setattr(main, "_ready_lock", asyncio.Lock())
         monkeypatch.setattr(main, "_vector_check", None)
-        store = _SharedPoolVectorStore()
+        store = _pgvector_store()
         monkeypatch.setattr(main, "get_vector_store", lambda: store)
         login = {"user": role, "password": password, "pool_size": pool_size}
         pool_address = relay.address if relay is not None else None
@@ -460,7 +467,9 @@ async def test_server_refusing_the_probe_connection_pings_through_an_idle_pool_c
 
     assert first.status_code == 200, first.text
     assert first.json()["detail"]["db"] == "ok:pool_idle"
-    assert first.json()["detail"]["vector_store"] == "ok"
+    # The soft vector check runs on the probe's own connection, which the
+    # server refuses as well; it borrows nothing from the request pool.
+    assert first.json()["detail"]["vector_store"] == "degraded:unavailable"
     # Not cached beyond the floor: the next probe asks the pool again.
     assert second.status_code == 200, second.text
     assert second.json()["cached"] is False
@@ -552,15 +561,63 @@ async def test_probe_behind_a_request_that_is_still_connecting_stays_ready(monke
     assert elapsed < db.main._READY_DB_TIMEOUT_SECONDS
 
 
-async def test_vector_check_stuck_on_a_silent_pool_connection_cannot_hold_readyz(monkeypatch, tmp_path):
-    # The vector check, like pgvector on the main database, borrows the pool's
-    # idle connection. The relay then drops its query and the cancel request
-    # for it, so asyncpg's release of that connection would wait for good.
+def _connections_held(pool: asyncpg.Pool) -> int:
+    return pool.get_size() - pool.get_idle_size()
+
+
+async def _until_nothing_held(pool: asyncpg.Pool) -> None:
+    async with asyncio.timeout(2):
+        while _connections_held(pool):
+            await asyncio.sleep(0.01)
+
+
+async def test_vector_check_never_holds_a_request_pool_connection(monkeypatch, tmp_path):
+    # pgvector on the main database, as deployed by default. The request
+    # pool's only connection goes silent: a check that borrowed it would be
+    # stuck returning it, and the pool would read as wedged. The check runs on
+    # the probe's own connection instead, so the pool stays untouched.
     relay = _Relay()
     await relay.start()
-    stuck = None
     try:
         async with _ready_database(monkeypatch, tmp_path, pool_size=1, relay=relay) as db:
+            main = db.main
+            monkeypatch.setattr(main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+            monkeypatch.setattr(main, "_READY_VECTOR_TIMEOUT_SECONDS", _GRACE)
+            relay.freeze()
+            responses = []
+            for pause in (0.0, _PAST_GRACE):
+                await asyncio.sleep(pause)
+                main._ready_state.ts -= 31  # past the success cache
+                responses.append(await db.client.get("/readyz"))
+                assert db.pool.get_idle_size() == 1
+            main._ready_state.ts -= 31
+            responses.append(await db.client.get("/readyz"))
+    finally:
+        await relay.close()
+
+    assert [response.status_code for response in responses] == [200] * 3, responses[-1].text
+    assert {response.json()["detail"]["vector_store"] for response in responses} == {"ok"}
+    assert db.store.calls == 3
+
+
+async def test_vector_check_stuck_on_its_own_silent_connection_cannot_hold_readyz(monkeypatch, tmp_path):
+    # pgvector with a database of its own borrows from its own pool. That
+    # connection goes silent mid-query: the check is given up within its
+    # budget, eleven callers return within the bound, and the connection is
+    # terminated rather than left waiting to be returned.
+    relay = _Relay()
+    await relay.start()
+    own_pool = None
+    try:
+        async with _ready_database(monkeypatch, tmp_path) as db:
+            main = db.main
+            own_dsn = _settings(db.name, address=relay.address).asyncpg_dsn
+            store = _pgvector_store(dsn=own_dsn)
+            # The test database has no vector extension for the store to set up.
+            own_pool = await asyncpg.create_pool(dsn=own_dsn, min_size=1, max_size=1)
+            store._own_pool = own_pool
+            monkeypatch.setattr(main, "get_vector_store", lambda: store)
+            monkeypatch.setattr(main, "_READY_VECTOR_TIMEOUT_SECONDS", _GRACE)
             relay.freeze()
             bound = 7.5  # inside kubelet's 8-second probe timeout
 
@@ -569,18 +626,48 @@ async def test_vector_check_stuck_on_a_silent_pool_connection_cannot_hold_readyz
                 asyncio.gather(*(db.client.get("/readyz") for _ in range(11))), timeout=bound,
             )
             elapsed = time.monotonic() - started
-            stuck = db.main._vector_check
+            await _until_nothing_held(own_pool)
     finally:
         await relay.close()
-        if stuck is not None:
-            # asyncpg resolves a cancelled query's waiter only when the server
-            # answers it, so that cleanup never finishes; stop waiting on it.
-            stuck.cancel()
-            await asyncio.wait({stuck}, timeout=1)
+        if own_pool is not None:
+            own_pool.terminate()
 
     assert [response.status_code for response in responses] == [200] * 11
     assert {response.json()["detail"]["vector_store"] for response in responses} == {"degraded:timeout"}
-    assert elapsed < db.main._READY_VECTOR_TIMEOUT_SECONDS + 1.0
+    assert elapsed < _GRACE + 1.0
+
+
+async def test_vector_check_cut_off_while_returning_its_connection_leaves_nothing_held(monkeypatch, tmp_path):
+    # The check's query answers, but returning the connection to the store's
+    # own pool never finishes. The check is given up within its budget, and
+    # the connection is terminated rather than left held by that return.
+    never = asyncio.Event()
+
+    async def reset_that_never_finishes(_conn) -> None:
+        await never.wait()
+
+    own_pool = None
+    try:
+        async with _ready_database(monkeypatch, tmp_path) as db:
+            main = db.main
+            own_dsn = _settings(db.name).asyncpg_dsn
+            store = _pgvector_store(dsn=own_dsn)
+            own_pool = await asyncpg.create_pool(
+                dsn=own_dsn, min_size=1, max_size=1, reset=reset_that_never_finishes,
+            )
+            store._own_pool = own_pool
+            monkeypatch.setattr(main, "get_vector_store", lambda: store)
+            monkeypatch.setattr(main, "_READY_VECTOR_TIMEOUT_SECONDS", _GRACE)
+
+            response = await db.client.get("/readyz")
+            await _until_nothing_held(own_pool)
+    finally:
+        never.set()
+        if own_pool is not None:
+            own_pool.terminate()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["detail"]["vector_store"] == "degraded:timeout"
 
 
 async def test_request_acquire_completing_before_the_probe_waits_is_not_lost(ready_db, monkeypatch):

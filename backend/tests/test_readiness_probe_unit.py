@@ -608,6 +608,72 @@ async def test_vector_check_whose_cancel_never_finishes_cannot_hold_readyz(main,
     assert given_up.done()
 
 
+def _pgvector(pool=None, *, dsn=None):
+    from app.services.vector_store.pgvector import PgvectorStore
+
+    return PgvectorStore(
+        dsn=dsn, schema="vector_index", dense_dim=8, sparse_shape="posting",
+        get_main_pool=AsyncMock(return_value=pool),
+    )
+
+
+async def _hang(*_args, **_kwargs):
+    await asyncio.sleep(3600)
+
+
+def test_pgvector_reports_whether_it_reads_through_the_main_pool():
+    assert _pgvector().uses_main_pool is True
+    assert _pgvector(dsn="postgresql://vectors.invalid/akb").uses_main_pool is False
+
+
+async def test_pgvector_health_on_a_given_connection_borrows_nothing():
+    pool = SimpleNamespace(acquire=AsyncMock(side_effect=AssertionError("borrowed from the pool")))
+    conn = SimpleNamespace(fetchval=AsyncMock(return_value=1))
+
+    assert await _pgvector(pool).health(conn=conn) is True
+
+    conn.fetchval.assert_awaited_once_with("SELECT 1")
+    pool.acquire.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stuck_in", ["query", "return"])
+async def test_pgvector_health_cut_off_terminates_the_connection_it_borrowed(stuck_in):
+    conn = SimpleNamespace(
+        fetchval=AsyncMock(side_effect=_hang) if stuck_in == "query" else AsyncMock(return_value=1),
+        terminate=MagicMock(),
+    )
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=conn),
+        release=AsyncMock(side_effect=_hang) if stuck_in == "return" else AsyncMock(),
+    )
+    check = asyncio.create_task(_pgvector(pool).health())
+    await asyncio.sleep(0.01)
+
+    check.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await check
+
+    conn.terminate.assert_called_once()
+
+
+async def test_vector_check_of_a_store_on_the_main_database_runs_on_the_probe_connection(main, probe, monkeypatch):
+    store = _pgvector(probe.pool)
+    dedicated = SimpleNamespace(fetchval=AsyncMock(return_value=1))
+
+    async def on_the_probe_connection(use, *, timeout):
+        return await use(dedicated)
+
+    monkeypatch.setattr(main, "get_vector_store", lambda: store)
+    monkeypatch.setattr(main, "with_readiness_connection", on_the_probe_connection)
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is True
+    assert detail["vector_store"] == "ok"
+    dedicated.fetchval.assert_awaited_once_with("SELECT 1")
+    assert probe.pool.acquire_timeouts == []  # nothing borrowed from the request pool
+
+
 async def test_vector_check_reports_its_outcome(main, probe):
     probe.store.health = AsyncMock(side_effect=ConnectionRefusedError("refused"))
     assert (await main._probe_ready())[1]["vector_store"] == "degraded:unavailable"
