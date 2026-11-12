@@ -258,14 +258,17 @@ The following Git layout and locking apply only to the Bare Git backend:
   The vector store is a **soft** check: a failed ping reports
   `"vector_store": "degraded:..."` in the detail but still returns
   ready (search degrades, everything else keeps working).
-  The DB ping uses a dedicated connection, not the request pool. Readiness
-  takes a pool connection only when the pool shows nothing that proves it
-  could serve (no idle connection, room to open one, no recent acquire by a
-  request or background work), or when the server refuses the dedicated
-  connection. A saturated pool (`size == max`, `idle == 0`) fails readiness
-  only after `readyz_pool_saturation_grace_secs` (default 30) with no
-  completed acquire; one whose connections keep changing hands stays ready.
-  Reported in `detail.pool`; see `docs/operations/database-recovery.md`.
+  The DB ping uses a dedicated connection, not the request pool. The DB
+  check takes a request-pool connection only when the pool shows nothing
+  that proves it could serve (no idle connection, room to open one, no
+  recent acquire by a request or background work), or when the server
+  refuses the dedicated connection. The vector check never does: pgvector on
+  the main database is checked on the dedicated connection, a vector store
+  with a database of its own on its own pool. A saturated pool
+  (`size == max`, `idle == 0`) fails readiness only after
+  `readyz_pool_saturation_grace_secs` (default 30) with no completed acquire;
+  one whose connections keep changing hands stays ready. Reported in
+  `detail.pool`; see `docs/operations/database-recovery.md`.
 - `GET /health` — detailed status for dashboards. Returns
   `vector_store.{reachable, backfill, bm25_vocab_size}`,
   `external_git`, `metadata_backfill`, `events`. Backfill stats come
