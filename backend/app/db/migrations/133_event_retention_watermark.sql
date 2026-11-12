@@ -30,12 +30,16 @@ $$ LANGUAGE plpgsql;
 -- deletes and inserts on events wait: no delete can fall between the two, and
 -- the trigger's presence records that the starting marks were set, so
 -- running this again sets none (a mark set later would claim a deletion that
--- never happened). Deletions before this point left no record. A Vault that
--- still has events starts just below its earliest one, the boundary the tail
--- used until now, so history that may already have been swept is still
--- refused; a Vault with no events starts without a mark, as it had no
--- boundary before. Reads are not blocked. The lock lasts as long as one
--- grouped scan of events, which retention keeps small.
+-- never happened). Deletions before this point left no record, and cannot be
+-- reconstructed. A Vault that still has events starts just below its earliest
+-- one, the boundary the tail used until now, so history that may already have
+-- been swept is still refused; a later event deleted while an earlier one was
+-- kept stays unknown, as it was before. A Vault with no events starts without
+-- a mark, as it had no boundary before. Reads are not blocked. The migration's
+-- Python step takes this lock before running this file, with a short lock
+-- timeout and retries, so later event inserts do not queue behind a waiting
+-- request; once held, it lasts as long as one grouped scan of events, which
+-- retention keeps small.
 DO $$
 BEGIN
     IF NOT EXISTS (

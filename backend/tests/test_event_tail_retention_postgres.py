@@ -11,12 +11,14 @@ the tail refuses only a cursor below that.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
 import uuid
 
 import asyncpg
 import pytest
 
-from app.db.postgres import _load_migration
+from app.db.postgres import _load_migration, _run_one_migration
 from app.services.event_tail_service import EventCursorCodec, EventGapError
 from tests.test_event_tail_budget_postgres import _CURSOR_SECRET, _changes, _make_reader, _positions, _tail
 from tests.test_event_tail_postgres import _database_dsn, _fresh_database, _insert_event, _make_vault, _sweep
@@ -62,6 +64,29 @@ async def _publish_long_ago(pool: asyncpg.Pool, event_ids: list[int]) -> None:
 async def _watermarks(pool: asyncpg.Pool) -> dict[uuid.UUID, int]:
     rows = await pool.fetch("SELECT vault_id, deleted_through FROM event_retention_watermarks")
     return {row["vault_id"]: row["deleted_through"] for row in rows}
+
+
+async def _write_event(conn: asyncpg.Connection, vault_id: uuid.UUID) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO events (vault_id, kind, resource_uri, actor_id, payload)
+        VALUES ($1, 'document.put', 'akb://event-test/document.put', 'alice', '{}'::jsonb)
+        RETURNING id
+        """,
+        vault_id,
+    )
+
+
+async def _waits_for(pool: asyncpg.Pool, waiter: asyncpg.Connection, holder: asyncpg.Connection) -> None:
+    """Return once ``waiter`` waits for a lock that ``holder`` holds."""
+
+    async def poll() -> None:
+        while not await pool.fetchval(
+            "SELECT $2 = ANY(pg_blocking_pids($1))", waiter.get_server_pid(), holder.get_server_pid()
+        ):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), 5)
 
 
 async def test_a_cursor_taken_before_a_vaults_first_event_is_not_refused(monkeypatch):
@@ -195,6 +220,45 @@ async def test_the_watermark_starts_at_the_old_boundary_for_vaults_that_have_eve
         assert await _watermarks(setup_pool) == {with_events: earliest}
 
 
+async def test_a_deletion_before_the_migration_cannot_be_reconstructed(monkeypatch):
+    """The starting mark cannot recover a deletion that left an earlier event in place.
+
+    Of a Vault's two events, the later one alone was deleted before migration
+    133, which left no record of it. The mark starts just below the earlier,
+    kept event, so a cursor at that event resumes with no 410 although it never
+    received the deleted one: the boundary the tail used before had the same
+    limit, and nothing in the database tells the two cases apart.
+    """
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "retention-partial")
+        user_id = await _make_reader(setup_pool, "retention-partial-reader", [vault_id])
+        await _as_before_the_migration(setup_pool)
+        kept = await _insert_event(setup_pool, vault_id, "document.put", "alice")
+        deleted = await _insert_event(setup_pool, vault_id, "document.update", "alice")
+        await setup_pool.execute("DELETE FROM events WHERE id = $1", deleted)
+        migration = _load_migration(_MIGRATION)
+        assert migration is not None
+        async with setup_pool.acquire() as conn:
+            await migration.migrate(conn=conn)
+        assert await _watermarks(setup_pool) == {vault_id: kept - 1}
+
+        later = await _insert_event(setup_pool, vault_id, "document.update", "alice")
+        codec = EventCursorCodec(_CURSOR_SECRET)
+        async with _tail(monkeypatch, setup_pool) as tail:
+            resumed = await tail.open(
+                user_id=user_id,
+                vault="retention-partial",
+                last_event_id=codec.encode(vault_id, (), kept),
+            )
+            try:
+                delivered = await asyncio.wait_for(_changes(resumed, 1), 5)
+            finally:
+                await resumed.aclose()
+
+        # The deleted event is passed over without a 410.
+        assert _positions(delivered) == [later]
+
+
 async def test_applying_the_migration_again_sets_no_starting_mark():
     """Once the trigger records deletions, a starting mark would only claim one that never happened.
 
@@ -286,3 +350,83 @@ async def test_a_delete_during_the_migration_is_recorded_or_waits(first: str):
 
         # Either way the deleted event is below the mark.
         assert await _watermarks(setup_pool) == {vault_id: event_ids[0]}
+
+
+async def test_later_event_writes_go_through_while_the_migration_waits_for_its_lock():
+    """A lock request that waits queues every later event insert, of any Vault, behind it.
+
+    While a long transaction holds an event it wrote, the migration's request
+    for the events lock waits. It used to wait the migration runner's
+    5-second lock timeout on each attempt, and every later insert waited
+    behind it all that time. Each attempt now gives up after 500 ms and holds
+    nothing while it backs off; the migration finishes once the long
+    transaction ends.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        busy = await _make_vault(setup_pool, "retention-lock-busy")
+        other = await _make_vault(setup_pool, "retention-lock-other")
+        await _as_before_the_migration(setup_pool)
+        await setup_pool.execute("DELETE FROM schema_migrations WHERE filename = $1", _MIGRATION)
+        migration = _load_migration(_MIGRATION)
+        assert migration is not None
+        long_writer = await asyncpg.connect(_database_dsn(database))
+        later_writer = await asyncpg.connect(_database_dsn(database))
+        migrator = await asyncpg.connect(_database_dsn(database))
+        applying: asyncio.Task[None] | None = None
+        worst = 0.0
+        try:
+            holding = long_writer.transaction()
+            await holding.start()
+            await _write_event(long_writer, busy)
+            applying = asyncio.create_task(_run_one_migration(migrator, _MIGRATION, migration))
+            await _waits_for(setup_pool, migrator, long_writer)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                started = time.monotonic()
+                await _write_event(later_writer, other)
+                worst = max(worst, time.monotonic() - started)
+                await asyncio.sleep(0.05)
+            # The migration still waits for the long transaction.
+            assert not applying.done()
+            await holding.commit()
+            await asyncio.wait_for(applying, 10)
+        finally:
+            if applying is not None and not applying.done():
+                applying.cancel()
+                with contextlib.suppress(BaseException):
+                    await applying
+            for conn in (long_writer, later_writer, migrator):
+                await conn.close()
+
+        assert worst < 1.0, f"a later event insert waited {worst:.2f}s behind the migration"
+        assert await _trigger_installed(setup_pool)
+        assert await setup_pool.fetchval("SELECT count(*) FROM schema_migrations WHERE filename = $1", _MIGRATION) == 1
+
+
+async def test_the_migration_gives_up_with_an_error_that_names_the_cause(monkeypatch):
+    """A transaction that keeps its event open past every attempt stops the migration, not the writers."""
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        vault_id = await _make_vault(setup_pool, "retention-lock-bound")
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        assert migration is not None
+        monkeypatch.setattr(migration, "ATTEMPTS", 3)
+        monkeypatch.setattr(migration, "FIRST_BACKOFF_SECONDS", 0.05)
+        long_writer = await asyncpg.connect(_database_dsn(database))
+        migrator = await asyncpg.connect(_database_dsn(database))
+        try:
+            holding = long_writer.transaction()
+            await holding.start()
+            await _write_event(long_writer, vault_id)
+            with pytest.raises(RuntimeError, match="could not lock the events table in 3 attempts"):
+                await asyncio.wait_for(migration.migrate(conn=migrator), 10)
+            await holding.rollback()
+        finally:
+            await long_writer.close()
+            await migrator.close()
+
+        # Nothing of the migration stayed behind.
+        assert not await _trigger_installed(setup_pool)
+        assert await _watermarks(setup_pool) == {}

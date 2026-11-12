@@ -139,6 +139,20 @@ event, on an empty Vault, is usually far below that event and is still valid.
 `start=earliest` replays from the first position after which nothing was
 deleted. For a Vault that already had events when migration 133 ran, the mark
 starts just below its earliest retained event, where the boundary was before.
+Deletions before the migration were not recorded and cannot be reconstructed:
+if a Vault had events 10 and 20 and only 20 had been deleted, its mark starts
+at 9, and a cursor at 10 resumes without a 410 although it never received 20,
+as it did with the earlier boundary. A Vault whose events had all been deleted
+starts with no mark.
+
+Migration 133 installs the trigger while inserts and deletes on `events` wait,
+for as long as one grouped scan of the table takes. A request for that lock
+that has to wait would make every later event insert wait behind it, so the
+migration asks with a 500 ms lock timeout and holds nothing while it backs off
+between attempts (0.25 s, doubling to 2 s). A transaction that keeps an event
+it wrote open therefore holds up other event writes for at most about half a
+second at a time. After 40 attempts the migration stops the server's start with
+an error naming the cause; end the long transaction and start the server again.
 
 All tail database work in a process, opening included, shares at most
 `event_tail_db_concurrency` connections. Work beyond that waits for a free
