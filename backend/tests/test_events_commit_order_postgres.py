@@ -31,9 +31,7 @@ pytestmark = pytest.mark.asyncio
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 _MIGRATION = "132_events_commit_order.py"
-# How long a second writer gets to finish while the first one is still open.
-# A blocked writer stays blocked until the first commits, so this only bounds
-# how long the test waits before it looks.
+# A writer that nothing holds back finishes well within this.
 _BLOCK_PROBE_SECONDS = 0.5
 _UNBLOCKED_SECONDS = 10.0
 # The longest an event insert waits for its Vault (`lock_timeout` on the
@@ -147,6 +145,12 @@ async def _undo_migration_132(conn: asyncpg.Connection) -> None:
     await conn.execute("DROP TRIGGER IF EXISTS akb_events_commit_order_trigger ON events")
     await conn.execute("DROP FUNCTION IF EXISTS akb_events_commit_order()")
     await conn.execute("DROP TABLE IF EXISTS vault_event_order")
+    await conn.execute("DROP TABLE IF EXISTS events_row_change_queue")
+    await conn.execute("DROP FUNCTION IF EXISTS akb_events_row_change_flush()")
+    from app.db import postgres as postgres_module
+
+    # Migration 086's row-change function, as it was before 132 replaced it.
+    await postgres_module._load_migration("086_dynamic_table_rows_changed.py").migrate(conn)
     await conn.execute(
         "ALTER TABLE events ALTER COLUMN id SET DEFAULT nextval('events_id_seq'::regclass)",
     )
@@ -158,66 +162,100 @@ async def _next_sequence_value(conn: asyncpg.Connection) -> int:
     return int(row["last_value"]) + (1 if row["is_called"] else 0)
 
 
+async def _waits_for(
+    observer: asyncpg.Connection,
+    task: asyncio.Task,
+    waiter: asyncpg.Connection,
+    holder: asyncpg.Connection,
+) -> bool:
+    """True once ``waiter`` is blocked by ``holder``; False if ``task`` ends first."""
+    while not task.done():
+        if await observer.fetchval(
+            "SELECT $2 = ANY(pg_blocking_pids($1))",
+            waiter.get_server_pid(),
+            holder.get_server_pid(),
+        ):
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
 async def _late_commit_delivery(
     pool: asyncpg.Pool,
     vault_id: uuid.UUID,
-    first: Callable[[asyncpg.Connection], Awaitable[int]],
-    second: Callable[[asyncpg.Connection], Awaitable[int]],
-) -> tuple[list[int], int, int, bool]:
+    first: Callable[[asyncpg.Connection], Awaitable[object]],
+    second: Callable[[asyncpg.Connection], Awaitable[object]],
+) -> tuple[list[int], list[tuple[int, str, str | None]], bool]:
     """Open ``first``, let ``second`` try to commit, read, then commit ``first``.
 
-    Returns what a cursor-following reader delivered, both ids, and whether the
-    second writer was still waiting while the first was open.
+    Returns what a cursor-following reader delivered, the Vault's events the
+    two writers committed as ``(id, kind, marker)`` in id order, and whether
+    PostgreSQL reported the second writer blocked by the first.
     """
     async with (
         pool.acquire() as writer_a,
         pool.acquire() as writer_b,
         pool.acquire() as reader,
+        pool.acquire() as observer,
     ):
+        baseline = await reader.fetchval(
+            "SELECT coalesce(max(id), 0) FROM events WHERE vault_id = $1", vault_id,
+        )
         delivered: list[int] = []
-        cursor = 0
-        second_task: asyncio.Task[int] | None = None
+        cursor = baseline
+        second_task: asyncio.Task | None = None
         try:
             async with _OpenTransaction(writer_a) as first_transaction:
-                first_id = await first(writer_a)
+                await first(writer_a)
                 second_task = asyncio.create_task(_write_and_commit(writer_b, second))
-                done, _ = await asyncio.wait({second_task}, timeout=_BLOCK_PROBE_SECONDS)
-                second_was_waiting = not done
+                second_was_waiting = await asyncio.wait_for(
+                    _waits_for(observer, second_task, writer_b, writer_a),
+                    timeout=_UNBLOCKED_SECONDS,
+                )
                 # A tail polling now sees whatever has committed so far.
                 cursor = await _follow(reader, vault_id, cursor, delivered)
                 await first_transaction.commit()
-            second_id = await asyncio.wait_for(second_task, timeout=_UNBLOCKED_SECONDS)
+            await asyncio.wait_for(second_task, timeout=_UNBLOCKED_SECONDS)
             cursor = await _follow(reader, vault_id, cursor, delivered)
         finally:
             if second_task is not None and not second_task.done():
                 second_task.cancel()
                 with contextlib.suppress(BaseException):
                     await second_task
-        return delivered, first_id, second_id, second_was_waiting
+        committed = [
+            (row["id"], row["kind"], row["marker"])
+            for row in await reader.fetch(
+                "SELECT id, kind, payload->>'marker' AS marker FROM events "
+                "WHERE vault_id = $1 AND id > $2 ORDER BY id",
+                vault_id,
+                baseline,
+            )
+        ]
+        return delivered, committed, second_was_waiting
 
 
 async def test_cursor_reader_receives_an_event_that_commits_after_a_later_one():
     async with _fresh_database() as pool:
         vault_id = await _make_vault(pool, "order-late-commit")
 
-        delivered, first_id, second_id, second_was_waiting = await _late_commit_delivery(
+        delivered, committed, second_was_waiting = await _late_commit_delivery(
             pool,
             vault_id,
             lambda conn: _emit(conn, vault_id, "first"),
             lambda conn: _emit(conn, vault_id, "second"),
         )
 
-        assert sorted(delivered) == sorted([first_id, second_id]), (
-            f"a committed event was never delivered: delivered={delivered}, "
-            f"first={first_id} (inserted first), second={second_id}"
+        assert delivered == [event_id for event_id, _, _ in committed], (
+            f"a committed event was never delivered: delivered={delivered}, committed={committed}"
         )
-        assert delivered == [first_id, second_id]
-        assert first_id < second_id
+        assert [marker for _, _, marker in committed] == ["first", "second"]
         assert second_was_waiting, "the second writer did not wait for the first to commit"
 
 
 @pytest.mark.parametrize("first_writer,second_writer", [("table", "emit"), ("emit", "table")])
 async def test_dynamic_table_trigger_events_follow_commit_order(first_writer, second_writer):
+    """A row-change event is inserted when its transaction commits, so it
+    takes the Vault's turn at commit; either way the tail misses nothing."""
     async with _fresh_database() as pool:
         vault_name = "order-rows-changed"
         vault_id = await _make_vault(pool, vault_name)
@@ -232,39 +270,35 @@ async def test_dynamic_table_trigger_events_follow_commit_order(first_writer, se
                 resource_uri=f"akb://{vault_name}/table/items",
             )
 
-        async def table_write(conn: asyncpg.Connection) -> int:
+        async def table_write(conn: asyncpg.Connection) -> None:
             await conn.execute(f"INSERT INTO {pg_name} (value) VALUES ('row')")
-            return await conn.fetchval(
-                "SELECT max(id) FROM events WHERE vault_id = $1 AND kind = 'table.rows_changed'",
-                vault_id,
-            )
 
         writers = {
             "table": table_write,
             "emit": lambda conn: _emit(conn, vault_id, "emit"),
         }
-        delivered, first_id, second_id, second_was_waiting = await _late_commit_delivery(
+        delivered, committed, second_was_waiting = await _late_commit_delivery(
             pool, vault_id, writers[first_writer], writers[second_writer],
         )
 
-        assert delivered == [first_id, second_id]
-        assert second_was_waiting
-        async with pool.acquire() as conn:
-            kinds = [
-                row["kind"]
-                for row in await conn.fetch(
-                    "SELECT kind FROM events WHERE vault_id = $1 ORDER BY id", vault_id,
-                )
-            ]
-        expected = {"table": "table.rows_changed", "emit": "document.put"}
-        assert kinds == [expected[first_writer], expected[second_writer]]
+        assert delivered == [event_id for event_id, _, _ in committed]
+        kinds = {"table": "table.rows_changed", "emit": "document.put"}
+        # An open table write has not inserted its event yet, so the emitter
+        # goes first; an open emitter makes the table write's commit wait.
+        assert second_was_waiting is (first_writer == "emit")
+        assert [kind for _, kind, _ in committed] == (
+            [kinds[first_writer], kinds[second_writer]]
+            if second_was_waiting
+            else [kinds[second_writer], kinds[first_writer]]
+        )
 
 
 async def test_restricted_sql_role_row_write_follows_commit_order():
     """User SQL runs under a role that cannot touch `events` or its sequence.
 
-    Its row-change event is inserted by the SECURITY DEFINER trigger function,
-    so the ordering trigger draws the id with the definer's privileges.
+    Its row-change event is inserted at commit, still under that role, by the
+    SECURITY DEFINER queue function, so the ordering trigger runs with the
+    definer's privileges.
     """
     role = f"akb_events_order_{uuid.uuid4().hex[:8]}"
     try:
@@ -292,23 +326,19 @@ async def test_restricted_sql_role_row_write_follows_commit_order():
                             "INSERT INTO events (vault_id, kind) VALUES ($1, 'forged')", vault_id,
                         )
 
-            async def restricted_write(conn: asyncpg.Connection) -> int:
+            async def restricted_write(conn: asyncpg.Connection) -> None:
+                # The role stays in effect until commit, as in `akb_sql`.
                 await conn.execute(f'SET LOCAL ROLE "{role}"')
                 await conn.execute(f"INSERT INTO {pg_name} (value) VALUES ('row')")
-                await conn.execute("RESET ROLE")
-                return await conn.fetchval(
-                    "SELECT max(id) FROM events WHERE vault_id = $1 AND kind = 'table.rows_changed'",
-                    vault_id,
-                )
 
-            delivered, first_id, second_id, second_was_waiting = await _late_commit_delivery(
+            delivered, committed, _ = await _late_commit_delivery(
                 pool,
                 vault_id,
+                lambda conn: _emit(conn, vault_id, "first"),
                 restricted_write,
-                lambda conn: _emit(conn, vault_id, "after-restricted"),
             )
-            assert delivered == [first_id, second_id]
-            assert second_was_waiting
+            assert delivered == [event_id for event_id, _, _ in committed]
+            assert [kind for _, kind, _ in committed] == ["document.put", "table.rows_changed"]
             async with pool.acquire() as conn:
                 await conn.execute(f'DROP OWNED BY "{role}"')
     finally:
@@ -551,6 +581,11 @@ async def test_migration_upgrades_a_database_with_existing_events():
                 "WHERE table_name = 'events' AND column_name = 'id'",
             ) is None
 
+            # Dynamic tables' row changes now go through the commit-time queue.
+            assert "events_row_change_queue" in await conn.fetchval(
+                "SELECT pg_get_functiondef('akb_dynamic_table_rows_changed'::regproc)",
+            )
+
             # Running it again changes nothing.
             module = postgres_module._load_migration(_MIGRATION)
             await module.migrate(conn)
@@ -567,12 +602,12 @@ async def test_migration_upgrades_a_database_with_existing_events():
             )
             assert payload == {"marker": "new"}
 
-        delivered, first_id, second_id, second_was_waiting = await _late_commit_delivery(
+        delivered, committed, second_was_waiting = await _late_commit_delivery(
             pool,
             vault_id,
             lambda conn: _emit(conn, vault_id, "after-first"),
             lambda conn: _emit(conn, vault_id, "after-second"),
         )
-        old_vault_ids = [row["id"] for row in existing if row["vault_id"] == vault_id]
-        assert delivered == [*old_vault_ids, new_id, first_id, second_id]
+        assert delivered == [event_id for event_id, _, _ in committed]
+        assert [marker for _, _, marker in committed] == ["after-first", "after-second"]
         assert second_was_waiting

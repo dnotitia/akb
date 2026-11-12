@@ -17,6 +17,11 @@ transactions of one Vault run one at a time from their event insert to their
 commit; services write the event as their last locking statement to keep that
 span short.
 
+Dynamic tables' row-change events (migration 086) are queued by their
+statement trigger and inserted when the transaction commits, after every lock
+the transaction takes; a cascading delete would otherwise hold the Vault's
+lock between cascade levels.
+
 The migration leaves the notification trigger from migration 015 as it is, so
 it applies in either order with a migration that replaces that function.
 """

@@ -134,7 +134,9 @@ async def test_running_override_statement_does_not_block_other_vault_writers():
         assert result["affected_rows"] == 1
         events = await _vault_events(pool, vault_id, baseline)
         assert events[0] == (writer_event, "document.put")
-        assert [kind for _, kind in events[1:]] == ["table.rows_changed", _BYPASS]
+        # The override goes in after the statement; the statement's row-change
+        # event is inserted at commit.
+        assert [kind for _, kind in events[1:]] == [_BYPASS, "table.rows_changed"]
 
 
 async def test_override_waiting_for_a_row_does_not_deadlock_with_its_holder():
@@ -172,8 +174,8 @@ async def test_override_waiting_for_a_row_does_not_deadlock_with_its_holder():
             assert await conn.fetchval(f"SELECT value FROM {pg_name}") == "admin"
         assert [kind for _, kind in await _vault_events(pool, vault_id, baseline)] == [
             "table.rows_changed",  # the holder's write, committed first
-            "table.rows_changed",
             _BYPASS,
+            "table.rows_changed",
         ]
 
 

@@ -126,7 +126,7 @@ async def test_migration_does_not_hold_the_event_lock_while_waiting_for_a_table(
 async def test_enum_rename_in_a_migration_does_not_hold_the_event_lock():
     """An enum value rename rewrites rows, and the table's row-change trigger
     used to insert its event at that UPDATE — mid-migration, before the later
-    operations' DDL. The rename's event is now collected with the others."""
+    operations' DDL. Row-change events are now inserted at commit."""
     async with _fresh_database() as pool:
         vault_id = await _make_vault(pool, _VAULT)
         alpha = await _create_table(
@@ -195,16 +195,17 @@ async def test_enum_rename_in_a_migration_does_not_hold_the_event_lock():
                     baseline,
                 )
             ]
+        # The writer committed first. The migration's own events follow its
+        # last DDL, and the rename's row-change event is inserted at commit.
         assert [(kind, uri) for kind, uri, _, _ in events] == [
             ("table.rows_changed", f"akb://{_VAULT}/table/beta"),
-            ("table.rows_changed", f"akb://{_VAULT}/table/alpha"),
             ("table.alter", f"akb://{_VAULT}/table/alpha"),
             ("table.alter", f"akb://{_VAULT}/table/beta"),
             ("table.migration", f"akb://{_VAULT}"),
+            ("table.rows_changed", f"akb://{_VAULT}/table/alpha"),
         ]
-        # The rename's event matches what the row trigger records.
-        assert events[1][2] is None
-        assert json.loads(events[1][3]) == {"operation": "update"}
+        assert events[-1][2] is None
+        assert json.loads(events[-1][3]) == {"operation": "update"}
 
 
 async def test_standalone_enum_rename_records_the_row_change_like_the_trigger():
@@ -236,8 +237,8 @@ async def test_standalone_enum_rename_records_the_row_change_like_the_trigger():
                 ]
 
         changed = await rename(["todo", "done", "old"], {"draft": "todo"})
-        assert [kind for kind, _ in changed] == ["table.rows_changed", "table.alter"]
-        assert json.loads(changed[0][1]) == {"operation": "update"}
+        assert [kind for kind, _ in changed] == ["table.alter", "table.rows_changed"]
+        assert json.loads(changed[1][1]) == {"operation": "update"}
         # A rename that matches no row changes none, so no row-change event.
         unchanged = await rename(["todo", "done", "retired"], {"old": "retired"})
         assert [kind for kind, _ in unchanged[2:]] == ["table.alter"]

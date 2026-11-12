@@ -27,7 +27,6 @@ from uuid import UUID
 import asyncpg
 
 from app.exceptions import InvalidColumnTypeError, ValidationError
-from app.repositories.events_repo import EventBuffer
 from app.util.text import fuzzy_hint
 
 
@@ -882,24 +881,9 @@ async def alter_column_required(conn, pg_name: str, col_name: str, required: boo
     await conn.execute(f"ALTER TABLE {pg_name} ALTER COLUMN {safe_col} {op}")
 
 
-_ROWS_CHANGED_UPDATE_TRIGGER = "akb_rows_changed_update_trigger"
-
-
 async def rename_enum_values(
     conn, pg_name: str, col_name: str, renames: dict[str, str],
-    *, events: EventBuffer | None = None,
 ) -> None:
-    """Rewrite renamed enum values in place.
-
-    With ``events`` the table's row-change trigger sits out this UPDATE, and
-    the event it would insert is collected into ``events`` instead. The caller
-    inserts it after its last locking statement: an event insert holds the
-    Vault's event lock until commit (migration 132), and an enum change goes
-    on to more DDL. The table is locked ACCESS EXCLUSIVE first — dropping the
-    enum constraint already did — so no other session sees the trigger off.
-    The row triggers that version each row (``updated_at``, ``row_commit``)
-    still run.
-    """
     if not renames:
         return
     safe_col = safe_ident(col_name)
@@ -909,38 +893,11 @@ async def rename_enum_values(
         params.extend([old_value, new_value])
         cases.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
     params.append(list(renames))
-    sql = (
+    await conn.execute(
         f"UPDATE {pg_name} "
         f"SET {safe_col} = CASE {safe_col} {' '.join(cases)} ELSE {safe_col} END "
-        f"WHERE {safe_col} = ANY(${len(params)}::text[])"
-    )
-    if events is None:
-        await conn.execute(sql, *params)
-        return
-    await conn.execute(f"LOCK TABLE {pg_name} IN ACCESS EXCLUSIVE MODE")
-    trigger = await conn.fetchrow(
-        "SELECT tgargs FROM pg_trigger "
-        "WHERE tgrelid = $1::regclass AND tgname = $2 AND tgenabled = 'O'",
-        f"public.{pg_name}",
-        _ROWS_CHANGED_UPDATE_TRIGGER,
-    )
-    if trigger is None:  # no enabled trigger, so no event either way
-        await conn.execute(sql, *params)
-        return
-    await conn.execute(f"ALTER TABLE {pg_name} DISABLE TRIGGER {_ROWS_CHANGED_UPDATE_TRIGGER}")
-    status = await conn.execute(sql, *params)
-    await conn.execute(f"ALTER TABLE {pg_name} ENABLE TRIGGER {_ROWS_CHANGED_UPDATE_TRIGGER}")
-    if status.split()[-1] == "0":
-        return  # the trigger inserts nothing for an UPDATE that changed no row
-    # The same Vault, URI, actor and payload the trigger function records.
-    vault_id, resource_uri = bytes(trigger["tgargs"]).split(b"\0")[:2]
-    actor = await conn.fetchval("SELECT NULLIF(current_setting('akb.actor_id', true), '')")
-    events.add(
-        "table.rows_changed",
-        vault_id=vault_id.decode(),
-        resource_uri=resource_uri.decode(),
-        actor_id=actor,
-        payload={"operation": "update"},
+        f"WHERE {safe_col} = ANY(${len(params)}::text[])",
+        *params,
     )
 
 

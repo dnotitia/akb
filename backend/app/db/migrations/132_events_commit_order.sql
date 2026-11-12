@@ -79,3 +79,75 @@ DROP TRIGGER IF EXISTS akb_events_commit_order_trigger ON public.events;
 CREATE TRIGGER akb_events_commit_order_trigger
     BEFORE INSERT ON public.events
     FOR EACH ROW EXECUTE FUNCTION public.akb_events_commit_order();
+
+-- Row changes of dynamic tables are recorded when their transaction commits.
+-- The statement-level trigger from migration 086 used to insert its
+-- `table.rows_changed` event as each statement ended. A cascading delete
+-- fires the parent statement's trigger before the next cascade level runs,
+-- so the transaction then took the Vault lock above while it still waited
+-- for grandchild rows, and a writer holding such a row and then inserting
+-- its own event deadlocked with it. The trigger now queues the change, and a
+-- deferred constraint trigger inserts the event at commit, after every lock
+-- the transaction takes. Event content is unchanged: one event per
+-- statement that changed rows, with the same Vault, URI, actor and payload.
+CREATE TABLE IF NOT EXISTS public.events_row_change_queue (
+    seq BIGSERIAL PRIMARY KEY,
+    vault_id UUID NOT NULL,
+    resource_uri TEXT NOT NULL,
+    actor_id TEXT,
+    operation TEXT NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION public.akb_events_row_change_flush()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $function$
+BEGIN
+    DELETE FROM public.events_row_change_queue WHERE seq = NEW.seq;
+    INSERT INTO public.events (vault_id, kind, resource_uri, actor_id, payload)
+    VALUES (
+        NEW.vault_id,
+        'table.rows_changed',
+        NEW.resource_uri,
+        NEW.actor_id,
+        jsonb_build_object('operation', NEW.operation)
+    );
+    RETURN NULL;
+END
+$function$;
+
+DROP TRIGGER IF EXISTS akb_events_row_change_flush_trigger ON public.events_row_change_queue;
+CREATE CONSTRAINT TRIGGER akb_events_row_change_flush_trigger
+    AFTER INSERT ON public.events_row_change_queue
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION public.akb_events_row_change_flush();
+
+CREATE OR REPLACE FUNCTION public.akb_dynamic_table_rows_changed()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $function$
+DECLARE
+    actor TEXT;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF NOT EXISTS (SELECT 1 FROM akb_rows_changed_old) THEN
+            RETURN NULL;
+        END IF;
+    ELSIF TG_OP IN ('INSERT', 'UPDATE') THEN
+        IF NOT EXISTS (SELECT 1 FROM akb_rows_changed_new) THEN
+            RETURN NULL;
+        END IF;
+    ELSE
+        RAISE EXCEPTION 'unknown dynamic table row-change operation: %', TG_OP;
+    END IF;
+
+    actor := NULLIF(current_setting('akb.actor_id', true), '');
+    INSERT INTO public.events_row_change_queue (vault_id, resource_uri, actor_id, operation)
+    VALUES (TG_ARGV[0]::uuid, TG_ARGV[1], actor, lower(TG_OP));
+    RETURN NULL;
+END;
+$function$;
