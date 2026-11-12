@@ -29,12 +29,22 @@ class TransientDependencyError(AKBError):
 
     code: str
 
-    def __init__(self, *, code: str, message: str):
+    def __init__(
+        self,
+        *,
+        code: str,
+        message: str,
+        status_code: int = 503,
+        hint: str | None = None,
+        retry_after_secs: int | None = None,
+    ):
+        # Set: surfaced as Retry-After for every method, writes included.
+        self.retry_after_secs = retry_after_secs
         super().__init__(
             message,
-            status_code=503,
+            status_code=status_code,
             code=code,
-            hint=(
+            hint=hint or (
                 "Retry a read after a brief delay. For writes, check the operation's "
                 "result and use its CAS/idempotency contract before retrying; "
                 "completion may be unknown."

@@ -8,7 +8,13 @@ errors as availability faults. The same timeout code includes PostgreSQL's
 import asyncpg
 
 from app.exceptions import TransientDependencyError
-from app.util.errors import OPERATION_TIMEOUT, SERVICE_UNAVAILABLE
+from app.util.errors import OPERATION_TIMEOUT, SERVICE_UNAVAILABLE, WRITE_BUSY
+
+# A lock wait that hit its limit, or a deadlock PostgreSQL broke by rolling
+# this transaction back. Either way the failed transaction wrote nothing, so a
+# retry after a short delay is safe for it. Event inserts bound their wait for
+# the Vault's event lock (migration 132), which raises the first.
+_LOCK_CONTENTION = {"55P03", "40P01"}
 
 
 def transient_error(exc: Exception) -> TransientDependencyError | None:
@@ -31,6 +37,17 @@ def transient_error(exc: Exception) -> TransientDependencyError | None:
     # credentials, or localized text. Protocol/auth/configuration faults are
     # deliberately not folded into this list.
     sqlstate = getattr(exc, "sqlstate", None)
+    if isinstance(exc, asyncpg.PostgresError) and sqlstate in _LOCK_CONTENTION:
+        return TransientDependencyError(
+            code=WRITE_BUSY,
+            message="A concurrent write held a lock this request needed; its transaction was rolled back.",
+            status_code=429,
+            hint=(
+                "Retry after a short delay. The failed transaction wrote nothing; if the "
+                "request made several writes, check which earlier ones completed."
+            ),
+            retry_after_secs=1,
+        )
     unavailable = isinstance(exc, ConnectionError) or (
         isinstance(exc, asyncpg.PostgresError)
         and sqlstate in {

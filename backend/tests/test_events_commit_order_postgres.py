@@ -36,6 +36,9 @@ _MIGRATION = "132_events_commit_order.py"
 # how long the test waits before it looks.
 _BLOCK_PROBE_SECONDS = 0.5
 _UNBLOCKED_SECONDS = 10.0
+# The longest an event insert waits for its Vault (`lock_timeout` on the
+# ordering trigger function, migration 132).
+_EVENT_LOCK_WAIT_SECONDS = 5.0
 
 
 async def _can_connect(dsn: str) -> bool:
@@ -352,6 +355,31 @@ async def test_a_sql_role_cannot_hold_a_vault_event_lock():
                 await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
             finally:
                 await admin.close()
+
+
+async def test_waiting_for_a_busy_vault_is_bounded():
+    """A Vault held past the limit fails the waiting insert with 55P03 instead
+    of keeping its pooled connection until the statement timeout."""
+    async with _fresh_database() as pool:
+        vault_id = await _make_vault(pool, "order-bounded")
+        async with pool.acquire() as holder, pool.acquire() as waiter:
+            async with _OpenTransaction(holder):
+                await _emit(holder, vault_id, "holder")
+                started = time.monotonic()
+                with pytest.raises(asyncpg.LockNotAvailableError):
+                    await asyncio.wait_for(
+                        _write_and_commit(waiter, lambda conn: _emit(conn, vault_id, "waiter")),
+                        timeout=_EVENT_LOCK_WAIT_SECONDS + 3,
+                    )
+                waited = time.monotonic() - started
+            # The failed insert left nothing behind and the Vault is usable.
+            assert await _write_and_commit(waiter, lambda conn: _emit(conn, vault_id, "after")) > 0
+        assert _EVENT_LOCK_WAIT_SECONDS - 0.5 <= waited < _EVENT_LOCK_WAIT_SECONDS + 2
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT count(*) FROM events WHERE vault_id = $1 AND payload->>'marker' = 'waiter'",
+                vault_id,
+            ) == 0
 
 
 async def test_events_of_different_vaults_do_not_wait_for_each_other():

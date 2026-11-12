@@ -210,3 +210,28 @@ async def test_executor_transient_error_bypasses_sql_enrichment(main, monkeypatc
                                         sql="SELECT 1", is_admin=True)
     assert caught.value.code == "service_unavailable"
     assert len(metadata_acquires) == 1  # No second connection for SQL-error hints.
+
+
+@pytest.mark.parametrize("failure", [
+    asyncpg.LockNotAvailableError("private-host/query"),
+    asyncpg.DeadlockDetectedError("private-host/query"),
+])
+def test_lock_contention_is_a_retryable_busy_write(main, failure):
+    """A lock wait past its limit or a broken deadlock rolled the failed
+    transaction back, so even a write may be retried after Retry-After."""
+    app = FastAPI(exception_handlers=dict(main.app.exception_handlers))
+
+    @app.post("/write")
+    async def write():
+        raise failure
+
+    response = TestClient(app, raise_server_exceptions=False).post("/write")
+    assert response.status_code == 429
+    assert response.json()["code"] == "write_busy"
+    assert response.headers["Retry-After"] == "1"
+    assert "private-host" not in response.text
+
+    body = exception_envelope(failure)
+    assert body["code"] == "write_busy"
+    assert body["details"] == {"retry_after_secs": 1}
+    assert "private-host" not in str(body)

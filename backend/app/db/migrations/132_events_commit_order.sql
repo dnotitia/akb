@@ -13,6 +13,12 @@
 -- otherwise hold a Vault's key and stall that Vault's writes. A Vault's row
 -- is created by its first event.
 --
+-- An insert waits at most 5 seconds for the Vault's earlier event-writing
+-- transactions (`lock_timeout` on the trigger function). Past that it fails
+-- with SQLSTATE 55P03 and its transaction rolls back; the API reports a
+-- retryable `write_busy`. A busy Vault therefore cannot hold pooled
+-- connections until the statement timeout.
+--
 -- The trigger draws every id. The column keeps no default, because defaults
 -- are evaluated before BEFORE triggers and a default would spend a second
 -- value on every event; the sequence stays owned by the column. An INSERT
@@ -47,6 +53,7 @@ BEGIN
         CREATE OR REPLACE FUNCTION public.akb_events_commit_order()
         RETURNS trigger
         LANGUAGE plpgsql
+        SET lock_timeout = '5s'
         AS $function$
         BEGIN
             IF NEW.vault_id IS NOT NULL THEN
