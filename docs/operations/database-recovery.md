@@ -146,7 +146,7 @@ database check fails:
 | `size`, `max`, `idle` |Open connections, the pool's limit, and open connections not checked out.|
 | `free` |Earlier name of `idle`, kept for existing readers.|
 | `saturated_for_secs` |Time since the first of the consecutive probes that found the pool saturated; `null` when the last probe found room.|
-| `last_acquire_age_secs` |Seconds since the latest completed acquire; `null` before the first.|
+| `last_acquire_age_secs` |Seconds since the latest completed acquire by a request or background work; `null` before the first. Readiness's own acquires do not count.|
 
 The payload rounds these values to milliseconds; readiness decides on the
 values as measured. The count of completed acquires stays internal, because
@@ -159,7 +159,10 @@ pool has been saturated at every probe for
 has completed within that time. It then reports not ready with `db: ok` and
 the pool figures. That is the leak or stall case, where taking the replica out
 of the Service is wanted. The pool counts completed acquires in its asyncpg
-`setup` hook, which runs on every acquire. A probe that finds an idle
+`setup` hook, which runs on every acquire. Acquires that readiness makes
+itself, for its pool checks and its vector check, are not counted: a check
+that got a connection and then failed must not let the next probe skip
+checking the pool. A probe that finds an idle
 connection, or room to open one, ends the saturation run. While the pool is
 saturated:
 

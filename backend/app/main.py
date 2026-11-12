@@ -45,7 +45,7 @@ from app.api.routes import (
     tables,
 )
 from app.config import settings
-from app.db.postgres import get_pool, pool_progress, readiness_ping
+from app.db.postgres import get_pool, pool_progress, readiness_acquires, readiness_ping
 from app.db.transient import transient_error
 from app.exceptions import AKBError, TransientDependencyError
 from app.logging_redaction import install_secret_redaction
@@ -589,6 +589,14 @@ async def _db_ok_despite_full_server(pool: asyncpg.Pool, budget: asyncio.Timeout
 
 
 async def _probe_ready() -> tuple[bool, dict]:
+    """One readiness evaluation; see `_evaluate_readiness`."""
+    # Every pool acquire this evaluation makes, directly or through the vector
+    # check it starts, is readiness's own and does not count as pool progress.
+    with readiness_acquires():
+        return await _evaluate_readiness()
+
+
+async def _evaluate_readiness() -> tuple[bool, dict]:
     """Readiness check. DB is the only hard dependency — failing DB takes
     every endpoint down. The vector store only powers search/publication
     views and has its own []-on-error fallback, so vector-store slowness

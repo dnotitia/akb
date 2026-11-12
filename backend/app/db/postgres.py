@@ -3,7 +3,9 @@ import logging
 import os
 import time
 import asyncpg
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from app.config import settings
@@ -26,12 +28,29 @@ READINESS_APPLICATION_NAME = "akb-readiness-probe"
 # back, stops it. Readiness tells the two apart by it (see pool_progress).
 _acquires_total = 0
 _last_acquire_at: float | None = None
+# Set while readiness takes pool connections itself, and inherited by the
+# tasks it starts. Those acquires say nothing about whether requests are
+# being served, and one whose connection then fails must not let the next
+# probe skip checking the pool, so they are not counted.
+_readiness_acquiring: ContextVar[bool] = ContextVar("akb_readiness_acquiring", default=False)
+
+
+@contextmanager
+def readiness_acquires() -> Iterator[None]:
+    """Acquires made inside this block do not count as pool progress."""
+    token = _readiness_acquiring.set(True)
+    try:
+        yield
+    finally:
+        _readiness_acquiring.reset(token)
 
 
 async def _count_acquire(_conn) -> None:
     """The request pool's ``setup`` hook. asyncpg awaits it on every acquire,
     just before it hands out the connection. It must stay cheap and must not
     raise: asyncpg closes the connection when ``setup`` fails."""
+    if _readiness_acquiring.get():
+        return
     global _acquires_total, _last_acquire_at
     _acquires_total += 1
     _last_acquire_at = time.monotonic()

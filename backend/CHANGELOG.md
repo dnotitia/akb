@@ -104,8 +104,9 @@ specifically; the proxy has its own log in
   out) whose connections keep changing hands stays ready. Readiness fails only
   when the pool has stayed saturated for `readyz_pool_saturation_grace_secs`
   (default 30) with no acquire completing in that time; the pool counts
-  completed acquires in its `setup` hook. A value of 0 fails readiness at the
-  first saturated probe and is not recommended. `detail.pool` adds `idle`,
+  completed acquires in its `setup` hook, leaving out readiness's own. A value
+  of 0 fails readiness at the first saturated probe and is not recommended.
+  `detail.pool` adds `idle`,
   `saturated_for_secs` and `last_acquire_age_secs` and keeps `free`; it is
   reported whenever the probe obtained the pool, including when the database
   check fails. The acquire count stays internal. While the pool

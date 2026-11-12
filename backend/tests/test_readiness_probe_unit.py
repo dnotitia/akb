@@ -41,6 +41,8 @@ class _Pool:
         # How opening a connection goes when nothing is idle: refused, or stalled.
         self.acquire_error: BaseException | None = None
         self.acquire_delay = 0.0
+        # Awaited on each completed acquire, as asyncpg awaits the pool's hook.
+        self.setup = None
 
     def get_size(self) -> int:
         return self.size
@@ -60,6 +62,8 @@ class _Pool:
             await asyncio.sleep(self.acquire_delay)
         if self.acquire_error is not None:
             raise self.acquire_error
+        if self.setup is not None:
+            await self.setup(self.idle_conn)
         return self.idle_conn
 
     async def release(self, conn, *, timeout=None) -> None:
@@ -812,6 +816,59 @@ async def test_pool_progress_counts_each_completed_acquire(monkeypatch):
     total, age = postgres.pool_progress()
     assert total == 2
     assert age is not None and 0.0 <= age < 1.0
+
+
+async def test_acquires_made_by_readiness_do_not_count_as_progress(monkeypatch):
+    monkeypatch.setattr(postgres, "_acquires_total", 0)
+    monkeypatch.setattr(postgres, "_last_acquire_at", None)
+
+    with postgres.readiness_acquires():
+        await postgres._count_acquire(object())
+        # A task started inside the block inherits the marker.
+        await asyncio.create_task(postgres._count_acquire(object()))
+    assert postgres.pool_progress() == (0, None)
+
+    await postgres._count_acquire(object())
+    assert postgres.pool_progress()[0] == 1
+
+
+@pytest.fixture
+def real_progress(main, probe, monkeypatch):
+    """The real acquire counter behind readiness, its latest acquire long past."""
+    monkeypatch.setattr(main, "pool_progress", postgres.pool_progress)
+    monkeypatch.setattr(postgres, "_acquires_total", 7)
+    monkeypatch.setattr(postgres, "_last_acquire_at", time.monotonic() - 10 * GRACE)
+    probe.pool.setup = postgres._count_acquire
+    return probe
+
+
+async def test_failed_pool_check_leaves_the_pool_unproven_for_the_next_evaluation(main, real_progress):
+    probe = real_progress
+    probe.pool.size, probe.pool.idle = 1, 0
+    probe.pool.idle_conn.fetchval.side_effect = asyncpg.ConnectionDoesNotExistError("gone")
+
+    for attempt in (1, 2):
+        ok, detail = await main._probe_ready()
+        assert ok is False
+        assert detail["db"] == "error:pool_unavailable"
+        # The probe's own acquire is not progress, so the next one checks again.
+        assert len(probe.pool.acquire_timeouts) == attempt
+    assert postgres.pool_progress()[0] == 7
+    assert postgres.pool_progress()[1] >= 10 * GRACE - 1
+
+
+async def test_probe_acquires_do_not_satisfy_the_max_connections_progress_rule(main, real_progress):
+    probe = real_progress
+    probe.ping.side_effect = _SERVER_FULL
+
+    ok, detail = await main._probe_ready()  # pings through the idle connection
+    assert ok is True
+    assert detail["db"] == "ok:pool_idle"
+
+    probe.pool.idle = 0
+    ok, detail = await main._probe_ready()
+    assert ok is False
+    assert detail["db"] == "error:unavailable"
 
 
 async def test_request_pool_counts_acquires_through_its_setup_hook(monkeypatch):
