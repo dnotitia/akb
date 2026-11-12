@@ -29,7 +29,7 @@ from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError, TransientDependencyError, ValidationError
 from app.repositories import table_data_repo, table_registry_repo
 from app.repositories.document_repo import CollectionRepository
-from app.repositories.events_repo import emit_event
+from app.repositories.events_repo import EventBuffer, emit_event
 from app.services.index_service import (
     build_table_chunk, delete_table_chunks, write_source_chunks,
 )
@@ -1304,7 +1304,7 @@ async def alter_table(
     _conn: Any | None = None,
     _defer_index: bool = False,
     _ownership_context: TableOwnershipContext | None = None,
-    _deferred_events: list[tuple[str, dict[str, Any]]] | None = None,
+    _events: EventBuffer | None = None,
 ) -> dict:
     """Apply schema changes to a vault table:
        - add_columns: [{name, type}, ...]
@@ -1319,16 +1319,17 @@ async def alter_table(
     All are optional and combine in one TX. Adding a unique key
     PREFLIGHTS existing rows for duplicates BEFORE any DDL — on a
     violation the whole alter rolls back (physical schema + registry
-    unchanged). Emits `table.alter` as the transaction's last write.
+    unchanged). Emits `table.alter` as the last statement of the alter.
 
     A caller that runs further DDL in the same transaction passes
-    ``_deferred_events`` and emits the collected events after its own last
-    locking statement: the event insert holds the Vault's event lock until
-    commit (migration 132), and later DDL could otherwise wait on a writer
-    that is itself waiting for that lock.
+    ``_events`` and inserts the collected events after its own last locking
+    statement: an event insert holds the Vault's event lock until commit
+    (migration 132), and later DDL could otherwise wait on a writer that is
+    itself waiting for that lock.
     """
     async with _existing_or_pooled_conn(_conn) as conn:
         async with _transaction_if_needed(conn, _conn is None):
+            events = _events if _events is not None else EventBuffer()
             vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))
@@ -1866,11 +1867,12 @@ async def alter_table(
                 )
 
             t_uri = table_uri(vault["name"], table_name, collection=table.get("collection"))
-            alter_event: dict[str, Any] = {
-                "vault_id": vault_id,
-                "resource_uri": t_uri,
-                "actor_id": actor_id,
-                "payload": {
+            events.add(
+                "table.alter",
+                vault_id=vault_id,
+                resource_uri=t_uri,
+                actor_id=actor_id,
+                payload={
                     "vault": vault["name"],
                     "table_name": table_name,
                     "added": added,
@@ -1880,11 +1882,9 @@ async def alter_table(
                     "unique_keys_changed": uk_changed,
                     "indexes_changed": idx_changed,
                 },
-            }
-            if _deferred_events is not None:
-                _deferred_events.append(("table.alter", alter_event))
-            else:
-                await emit_event(conn, "table.alter", **alter_event)
+            )
+            if _events is None:
+                await events.flush(conn)
 
     # Refresh the metadata chunk so search reflects the new schema —
     # otherwise the chunk drifts from the ALTER until the table is dropped.

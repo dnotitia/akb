@@ -17,7 +17,7 @@ from typing import Any, cast
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.repositories import table_registry_repo
-from app.repositories.events_repo import emit_event
+from app.repositories.events_repo import deferred_events
 from app.services.table_service import alter_table, index_table_metadata
 from app.services.uri_service import vault_uri
 from app.util.text import to_nfc_any
@@ -232,7 +232,12 @@ async def apply_table_migration(
     pool = await get_pool()
     changed_tables: dict[str, dict] = {}
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        # Every event of the migration is inserted after its last DDL, in
+        # operation order and then `table.migration`. The first event insert
+        # holds the Vault's event lock until commit (migration 132); a later
+        # ALTER waiting on a writer of its table would otherwise hold that
+        # lock while the writer waits for it.
+        async with conn.transaction(), deferred_events(conn) as events:
             vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))
@@ -269,12 +274,6 @@ async def apply_table_migration(
                 }
 
             results: list[dict[str, Any]] = []
-            # Each operation's `table.alter` event is written after the last
-            # operation's DDL, not between operations. The first event insert
-            # holds the Vault's event lock until commit (migration 132); a later
-            # ALTER waiting on a writer of its table would otherwise hold that
-            # lock while the writer waits for it.
-            alter_events: list[tuple[str, dict[str, Any]]] = []
             for index, op in enumerate(operations, start=1):
                 table_name, kwargs = _migration_op_to_alter_kwargs(op)
                 result = await alter_table(
@@ -283,7 +282,7 @@ async def apply_table_migration(
                     actor_id=actor_id,
                     _conn=conn,
                     _defer_index=True,
-                    _deferred_events=alter_events,
+                    _events=events,
                     **kwargs,
                 )
                 results.append({
@@ -304,10 +303,7 @@ async def apply_table_migration(
                 key,
                 checksum,
             )
-            for kind, event in alter_events:
-                await emit_event(conn, kind, **event)
-            await emit_event(
-                conn,
+            events.add(
                 "table.migration",
                 vault_id=vault_id,
                 resource_uri=vault_uri(vault["name"]),
