@@ -86,9 +86,10 @@ The backend reads exactly two YAML files — `app.yaml` (non-secret) and
 `secret.yaml` (gitignored) — from `./config/` or `/etc/akb/`. **No environment
 variables configure application settings in `app/config.py`.** Deployment-layer
 exceptions include PostgreSQL pool sizing (`AKB_PG_POOL_MIN_SIZE` /
-`AKB_PG_POOL_MAX_SIZE`), the optional stats listener (`AKB_STATS_PORT`), and
-process composition (`AKB_PROCESS_ROLE`, `AKB_TOKENIZER_PROCESSES`). When you
-need a new application setting:
+`AKB_PG_POOL_MAX_SIZE`), the optional stats listener (`AKB_STATS_PORT`), the
+event tail stream cap (`AKB_EVENT_TAIL_MAX_STREAMS`), and process composition
+(`AKB_PROCESS_ROLE`, `AKB_TOKENIZER_PROCESSES`). When you need a new
+application setting:
 
 1. Add the field with a sensible default to `Settings` in
    `backend/app/config.py`.
