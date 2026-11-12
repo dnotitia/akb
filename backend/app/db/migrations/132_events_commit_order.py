@@ -8,14 +8,14 @@ could deliver the larger id, move its cursor past the smaller one, and never
 read the smaller event once it committed.
 
 A ``BEFORE INSERT`` trigger now locks the event's Vault row in
-``vault_event_order`` until the transaction ends and then draws the id. The next event of that Vault draws its id
-only after every earlier one has committed or rolled back, so within a Vault id
-order is commit order. Events without a Vault take no lock. The trigger draws
-every id and the column keeps no default, so an event uses one sequence value;
-an INSERT that names no id, as earlier releases do, still works. Event-writing
-transactions of one Vault run one at a time from their event insert to their
-commit; services write the event as their last locking statement to keep that
-span short.
+``vault_event_order`` until the transaction ends and then draws the id. The
+next event of that Vault draws its id only after every earlier one has
+committed or rolled back, so within a Vault id order is commit order. Events
+without a Vault take no lock. The trigger draws every id and the column keeps
+no default, so an event uses one sequence value; an INSERT that names no id,
+as earlier releases do, still works. Event-writing transactions of one Vault
+run one at a time from their event insert to their commit; services write the
+event as their last locking statement to keep that span short.
 
 Dynamic tables' row-change events (migration 086) are queued by their
 statement trigger and inserted when the transaction commits, after every lock
@@ -24,9 +24,22 @@ lock between cascade levels.
 
 The migration leaves the notification trigger from migration 015 as it is, so
 it applies in either order with a migration that replaces that function.
+
+The changes need ACCESS EXCLUSIVE on ``events``. A lock request that waits
+queues every later event insert behind it, so the migration asks for the lock
+with a short timeout, holds nothing while it backs off, and asks again; it
+gives up with an error after a bounded number of attempts.
 """
 
+import asyncio
 from pathlib import Path
+
+import asyncpg
+
+LOCK_TIMEOUT = "500ms"
+ATTEMPTS = 40
+FIRST_BACKOFF_SECONDS = 0.25
+MAX_BACKOFF_SECONDS = 2.0
 
 
 async def migrate(conn=None):
@@ -37,4 +50,24 @@ async def migrate(conn=None):
         async with pool.acquire() as connection:
             await migrate(connection)
         return
-    await conn.execute(Path(__file__).with_suffix(".sql").read_text())
+    sql = Path(__file__).with_suffix(".sql").read_text()
+    backoff = FIRST_BACKOFF_SECONDS
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            # A savepoint inside the migration runner's transaction: a timed-out
+            # attempt rolls back to it and releases everything it took.
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
+                await conn.execute("LOCK TABLE public.events IN ACCESS EXCLUSIVE MODE")
+                await conn.execute(sql)
+            return
+        except asyncpg.LockNotAvailableError:
+            if attempt == ATTEMPTS:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+    raise RuntimeError(
+        f"migration 132 could not lock the events table in {ATTEMPTS} attempts of "
+        f"{LOCK_TIMEOUT}: a long transaction keeps writing events. End it and start "
+        "the server again."
+    )

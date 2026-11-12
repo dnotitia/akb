@@ -611,3 +611,93 @@ async def test_migration_upgrades_a_database_with_existing_events():
         assert delivered == [event_id for event_id, _, _ in committed]
         assert [marker for _, _, marker in committed] == ["after-first", "after-second"]
         assert second_was_waiting
+
+
+async def _blocked_by(observer: asyncpg.Connection, waiter: asyncpg.Connection, holder: asyncpg.Connection) -> None:
+    async def poll() -> None:
+        while not await observer.fetchval(
+            "SELECT $2 = ANY(pg_blocking_pids($1))", waiter.get_server_pid(), holder.get_server_pid(),
+        ):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), timeout=_UNBLOCKED_SECONDS)
+
+
+async def test_migration_steps_aside_while_a_long_transaction_writes_events():
+    """The migration's lock request must not queue other Vaults' inserts."""
+    async with _fresh_database() as pool:
+        from app.db import postgres as postgres_module
+
+        busy_vault = await _make_vault(pool, "order-migrate-busy")
+        other_vault = await _make_vault(pool, "order-migrate-other")
+        async with pool.acquire() as conn:
+            await _undo_migration_132(conn)
+        module = postgres_module._load_migration(_MIGRATION)
+        worst = 0.0
+        async with (
+            pool.acquire() as long_writer,
+            pool.acquire() as other,
+            pool.acquire() as migrator,
+            pool.acquire() as observer,
+        ):
+            migration: asyncio.Task | None = None
+            try:
+                async with _OpenTransaction(long_writer):
+                    await long_writer.execute(
+                        "INSERT INTO events (vault_id, kind) VALUES ($1, 'long')", busy_vault,
+                    )
+                    migration = asyncio.create_task(
+                        postgres_module._run_one_migration(migrator, _MIGRATION, module),
+                    )
+                    await _blocked_by(observer, migrator, long_writer)
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
+                        started = time.monotonic()
+                        async with other.transaction():
+                            await other.execute(
+                                "INSERT INTO events (vault_id, kind) VALUES ($1, 'other')", other_vault,
+                            )
+                        worst = max(worst, time.monotonic() - started)
+                        await asyncio.sleep(0.05)
+                    assert not migration.done()
+                # The long transaction ended; the next attempt gets the lock.
+                await asyncio.wait_for(migration, timeout=_UNBLOCKED_SECONDS)
+            finally:
+                if migration is not None and not migration.done():
+                    migration.cancel()
+                    with contextlib.suppress(BaseException):
+                        await migration
+
+        assert worst < 1.0, f"another Vault's insert waited {worst:.2f}s behind the migration"
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'events'::regclass "
+                "AND tgname = 'akb_events_commit_order_trigger'",
+            ) == 1
+            assert await conn.fetchval(
+                "SELECT count(*) FROM schema_migrations WHERE filename = $1", _MIGRATION,
+            ) == 1
+
+
+async def test_migration_gives_up_clearly_while_events_keep_being_written(monkeypatch):
+    async with _fresh_database() as pool:
+        from app.db import postgres as postgres_module
+
+        vault_id = await _make_vault(pool, "order-migrate-bound")
+        async with pool.acquire() as conn:
+            await _undo_migration_132(conn)
+        module = postgres_module._load_migration(_MIGRATION)
+        monkeypatch.setattr(module, "ATTEMPTS", 3)
+        monkeypatch.setattr(module, "FIRST_BACKOFF_SECONDS", 0.05)
+        async with pool.acquire() as long_writer, pool.acquire() as migrator:
+            async with _OpenTransaction(long_writer):
+                await long_writer.execute(
+                    "INSERT INTO events (vault_id, kind) VALUES ($1, 'long')", vault_id,
+                )
+                with pytest.raises(RuntimeError, match="could not lock the events table in 3 attempts"):
+                    await asyncio.wait_for(module.migrate(migrator), timeout=_UNBLOCKED_SECONDS)
+            # Nothing of the migration stayed behind.
+            assert await migrator.fetchval(
+                "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'events'::regclass "
+                "AND tgname = 'akb_events_commit_order_trigger'",
+            ) == 0
