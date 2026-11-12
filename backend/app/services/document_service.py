@@ -140,7 +140,7 @@ from app.repositories.document_repo import (
     DocumentRepository,
     acquire_path_lock,
 )
-from app.repositories.events_repo import emit_event
+from app.repositories.events_repo import emit_event, lock_vault_events
 from app.repositories.vault_files_repo import DocumentAssetOwner
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
@@ -742,7 +742,10 @@ class DocumentService:
             strict=not allow_unavailable_asset_refs,
         )
 
-        # Git commit
+        # A Git commit does not roll back with this transaction: take the
+        # Vault's event lock first, so a busy Vault fails before Git changes.
+        if conn is not None:
+            await lock_vault_events(conn, vault_id)
         commit_msg = f"[put] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: create\nsummary: {req.title}"
         commit_hash = await run_git_write(
             self.git.commit_file,
@@ -810,8 +813,8 @@ class DocumentService:
         )
         await coll_repo.increment_count(collection_id, now, conn=conn)
 
-        # Last locking statement: the event insert takes the Vault's event
-        # lock until commit (migration 132), so nothing may wait after it.
+        # The Vault's event lock is already held, taken before the Git
+        # commit, so this insert does not wait for it.
         await emit_event(
             conn, "document.put",
             vault_id=vault_id,
@@ -1181,6 +1184,10 @@ class DocumentService:
             previous_markdown=current_body,
         )
 
+        # A Git commit does not roll back with this transaction: take the
+        # Vault's event lock first, so a busy Vault fails before Git changes.
+        if conn is not None:
+            await lock_vault_events(conn, vault_id)
         message = req.message or f"Update {file_path}"
         commit_msg = f"[update] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: update\nsummary: {message}"
         commit_hash = await run_git_write(
@@ -1399,6 +1406,9 @@ class DocumentService:
                 f"[move] {old_path} -> {new_path}\n\n"
                 f"agent: {agent_id or 'unknown'}\naction: move\nsummary: {summary}"
             )
+            # A Git commit does not roll back with this transaction: take the
+            # Vault's event lock first, so a busy Vault fails before Git changes.
+            await lock_vault_events(conn, vault_id)
             try:
                 commit_hash = await run_git_write(
                     self.git.move_file,
@@ -1656,6 +1666,10 @@ class DocumentService:
             previous_markdown=current_body,
         )
 
+        # A Git commit does not roll back with this transaction: take the
+        # Vault's event lock first, so a busy Vault fails before Git changes.
+        if conn is not None:
+            await lock_vault_events(conn, vault_id)
         msg = message or f"Edit {file_path}"
         commit_msg = f"[edit] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: edit\nsummary: {msg}"
         commit_hash = await run_git_write(
@@ -1767,6 +1781,10 @@ class DocumentService:
         file_path = row["path"]
         collection_id = row["collection_id"]
 
+        # A Git commit does not roll back with this transaction: take the
+        # Vault's event lock first, so a busy Vault fails before Git changes.
+        if conn is not None:
+            await lock_vault_events(conn, vault_id)
         commit_msg = f"[delete] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: delete"
         # Idempotent: if the git file is already gone (crash-recovery
         # state, manual cleanup, etc.) the DB cleanup below still runs.
@@ -1813,9 +1831,8 @@ class DocumentService:
         if collection_id:
             await coll_repo.decrement_count(collection_id, datetime.now(timezone.utc), conn=conn)
 
-        # Last locking statement, as in `_put_locked`: a put holding this
-        # collection row would otherwise wait for the Vault event lock while
-        # this delete waits for the row.
+        # The Vault's event lock is already held, taken before the Git
+        # commit, so this insert does not wait for it.
         await emit_event(
             conn, "document.delete",
             vault_id=vault_id,

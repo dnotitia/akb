@@ -72,6 +72,21 @@ async def emit_event(
     return event_id
 
 
+async def lock_vault_events(conn, vault_id: uuid.UUID | str) -> None:
+    """Take the Vault's event-order lock now, in ``conn``'s transaction.
+
+    A write that does work its transaction cannot undo, such as a bare Git
+    commit, takes the lock before that work: a busy Vault then fails here,
+    before anything changed, instead of at the later event insert. The wait
+    ends after 5 seconds with SQLSTATE 55P03 (``asyncpg.LockNotAvailableError``),
+    which the API reports as a retryable ``write_busy``. The event insert's own
+    trigger finds the lock already held.
+    """
+    await conn.execute(
+        "SELECT public.akb_lock_vault_events($1)", _to_uuid_or_none(vault_id),
+    )
+
+
 class EventBuffer:
     """Events a transaction inserts after its last other locking statement.
 

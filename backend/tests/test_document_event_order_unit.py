@@ -1,10 +1,12 @@
-"""Document writes insert their event as the transaction's last locking statement.
+"""Bare Git document writes take the Vault's event lock before their Git write.
 
-An event insert holds its Vault's event lock until commit (migration 132). A put
-that inserted its event before updating the collection count, or a delete that
-did so before removing the row and decrementing the count, could wait for a
-collection row held by another writer of the Vault that was itself waiting for
-the event lock.
+A Git commit does not roll back with the database transaction. If the Vault's
+event lock were first taken by the event insert after the commit, a lock wait
+that ran past its deadline would roll the transaction back and leave the
+commit in Git. The writes take the lock first, so a busy Vault fails them
+before Git changes, and the event insert finds the lock already held.
+``test_document_git_event_lock_postgres.py`` checks the outcome against a real
+database for put, update, edit, move and delete.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import pytest
 
 import app.repositories.document_repo as document_repo
 import app.services.document_service as ds
+import app.services.publication_service as publication_service
 from app.models.document import DocumentPutRequest
 from app.services.document_service import DocumentService
 from tests.test_document_hash_contract_unit import (
@@ -26,6 +29,10 @@ from tests.test_document_hash_contract_unit import (
 
 pytestmark = pytest.mark.asyncio
 
+# Stands in for the `_path_lock` connection; every statement that would use it
+# is replaced below.
+_CONN = object()
+
 
 def _recorder(calls: list[str], name: str):
     async def record(*_args, **_kwargs):
@@ -34,10 +41,19 @@ def _recorder(calls: list[str], name: str):
     return record
 
 
-async def test_put_inserts_its_event_after_the_collection_count(monkeypatch):
+async def test_put_takes_the_event_lock_before_its_git_commit(monkeypatch):
     _patch_index_side_effects(monkeypatch)
     calls: list[str] = []
+    monkeypatch.setattr(ds, "lock_vault_events", _recorder(calls, "lock_vault_events"))
     monkeypatch.setattr(ds, "emit_event", _recorder(calls, "emit_event"))
+    monkeypatch.setattr(
+        publication_service, "assert_no_orphan_publication_for_document", _recorder(calls, "publications"),
+    )
+
+    class _Git(_CommittingGit):
+        def commit_file(self, **kwargs):
+            calls.append("git_commit")
+            return super().commit_file(**kwargs)
 
     class _Collections:
         async def get_or_create(self, vault_id, path, conn=None):
@@ -45,19 +61,20 @@ async def test_put_inserts_its_event_after_the_collection_count(monkeypatch):
 
         increment_count = staticmethod(_recorder(calls, "increment_count"))
 
-    await DocumentService(git=_CommittingGit("a" * 40))._put_locked(
+    await DocumentService(git=_Git("a" * 40))._put_locked(
         req=DocumentPutRequest(vault="order", collection="notes", title="Order", content="Body"),
         agent_id="tester", vault_id=uuid.uuid4(), doc_id=uuid.uuid4(),
         base_path="notes/order.md", base_slug="order", explicit_slug=True,
         now=datetime.now(timezone.utc), normalized_collection="notes",
-        doc_repo=_FakePutDocRepo(), coll_repo=_Collections(), conn=None,
+        doc_repo=_FakePutDocRepo(), coll_repo=_Collections(), conn=_CONN,
     )
 
-    assert calls == ["increment_count", "emit_event"]
+    assert calls == ["publications", "lock_vault_events", "git_commit", "increment_count", "emit_event"]
 
 
-async def test_delete_inserts_its_event_after_the_row_and_the_collection_count(monkeypatch):
+async def test_delete_takes_the_event_lock_before_its_git_delete(monkeypatch):
     calls: list[str] = []
+    monkeypatch.setattr(ds, "lock_vault_events", _recorder(calls, "lock_vault_events"))
     monkeypatch.setattr(ds, "emit_event", _recorder(calls, "emit_event"))
     monkeypatch.setattr(ds, "delete_document_chunks", _recorder(calls, "chunks"))
     monkeypatch.setattr(ds, "delete_document_relations", _recorder(calls, "relations"))
@@ -65,6 +82,7 @@ async def test_delete_inserts_its_event_after_the_row_and_the_collection_count(m
 
     class _Git:
         def delete_file(self, **_kwargs):
+            calls.append("git_delete")
             return "b" * 40
 
     class _Documents:
@@ -78,7 +96,10 @@ async def test_delete_inserts_its_event_after_the_row_and_the_collection_count(m
     await DocumentService(git=_Git())._delete_locked(
         vault="order", vault_id=uuid.uuid4(),
         row={"id": uuid.uuid4(), "path": "notes/order.md", "collection_id": uuid.uuid4()},
-        agent_id="tester", doc_repo=_Documents(), coll_repo=_Collections(), conn=None,
+        agent_id="tester", doc_repo=_Documents(), coll_repo=_Collections(), conn=_CONN,
     )
 
-    assert calls[-3:] == ["delete_with_publications", "decrement_count", "emit_event"]
+    assert calls == [
+        "lock_vault_events", "git_delete", "chunks", "relations", "aliases",
+        "delete_with_publications", "decrement_count", "emit_event",
+    ]
