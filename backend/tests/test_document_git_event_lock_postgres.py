@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import time
 
+import asyncpg
 import pytest
 
 from app.db.transient import transient_error
@@ -181,3 +182,40 @@ async def test_a_put_waits_for_a_collection_create_before_the_event_lock(tmp_pat
         )]
         assert kinds[-2:] == ["collection.create", "document.put"]
 
+
+async def test_a_lock_timeout_after_the_git_commit_is_not_write_busy(tmp_path):
+    """Only the Vault event lock's own deadline is a retryable `write_busy`.
+    Here a `lock_timeout` set on the database role ends an update while it
+    waits for a chunk row after its Git commit: Git keeps that commit, so the
+    error must not tell the client that nothing was written."""
+    git = GitService(storage_path=str(tmp_path))
+    service = DocumentService(git=git)
+    async with _fresh_database() as pool:
+        vault = "git-lock-role-timeout"
+        vault_id = await _make_vault(pool, vault)
+        git.init_vault(vault)
+        doc = await service.put(DocumentPutRequest(
+            vault=vault, collection="notes", title="First", content="first body",
+        ))
+        head = git.current_commit(vault)
+        database = await pool.fetchval("SELECT current_database()")
+        await pool.execute(f'ALTER ROLE CURRENT_USER IN DATABASE "{database}" SET lock_timeout = \'1s\'')
+        # New sessions take the role's setting.
+        await pool.expire_connections()
+
+        async with pool.acquire() as holder, _OpenTransaction(holder):
+            await holder.execute(
+                "SELECT 1 FROM chunks WHERE source_type = 'document' AND source_id = $1 FOR UPDATE",
+                (await pool.fetchval("SELECT id FROM documents WHERE vault_id = $1", vault_id)),
+            )
+            with pytest.raises(asyncpg.LockNotAvailableError) as failure:
+                await asyncio.wait_for(
+                    service.update(vault, doc.path, DocumentUpdateRequest(
+                        content="changed body", expected_commit=head,
+                    )),
+                    timeout=_EVENT_LOCK_WAIT_SECONDS * 3,
+                )
+        assert failure.value.constraint_name is None
+        assert transient_error(failure.value) is None
+        # The lock wait came after the Git commit.
+        assert git.current_commit(vault) != head
