@@ -79,7 +79,7 @@ is introduced. Existing DB command and statement deadlines remain 30 seconds.
 | Endpoint | Meaning |
 | --- | --- |
 | `/livez` |Process is serving; no dependency access.|
-| `/readyz` |DB ping on a dedicated connection; the request pool is observed, not used. Every result is shared by all callers for 1 second, and a plain success is cached for 30 seconds; vector health is soft.|
+| `/readyz` |DB ping on a dedicated connection. The request pool is observed, and readiness takes one of its connections only when the pool shows nothing that proves it could serve a request (no idle connection, room to open one, and no recent acquire by a request or background work), or when the server refuses the dedicated connection. Every result is shared by all callers for 1 second, and a plain success is cached for 30 seconds; vector health is soft.|
 | `/health` |Detailed operational/queue diagnostics, not a cheap liveness check.|
 
 Readiness bounds DB pool initialization plus ping together to 2 seconds; when
@@ -102,8 +102,10 @@ can cause to about one evaluation per second per process. After that second, a
 failed result is evaluated again on the next call, so recovery shows within
 about a second.
 
-The ping runs on one dedicated connection, not on a request-pool connection;
-the one exception, a server at `max_connections`, is described below. Its
+The ping runs on one dedicated connection, not on a request-pool connection.
+Readiness takes a pool connection in two cases only, both described below: a
+pool that shows nothing that proves it could serve a request, and a server at
+`max_connections` that refuses the dedicated connection. Its
 `application_name` is `akb-readiness-probe`. The first probe opens it and
 later probes reuse it. A failed ping discards it and the next probe opens a new
 one; a probe that finds it closed by the server opens a new one before pinging.
