@@ -313,10 +313,13 @@ class _ChangingHands:
 class _GatedConnect:
     """An asyncpg pool `connect` that opens the real connection, or meets the
     server's refusal, and then holds the outcome until `release()`. The test
-    decides exactly when a connection the pool is opening becomes available."""
+    decides exactly when a connection the pool is opening becomes available.
+    The first `let_through` connections open without waiting. As the pool's
+    `setup` hook, it holds acquires of open connections at the same gate."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, let_through: int = 0) -> None:
         self.parked = 0
+        self._let_through = let_through
         self._gate = asyncio.Event()
 
     async def __call__(self, *args, **kwargs):
@@ -326,9 +329,18 @@ class _GatedConnect:
             self.parked += 1
             await self._gate.wait()
             raise
+        if self._let_through:
+            self._let_through -= 1
+            return conn
         self.parked += 1
         await self._gate.wait()
         return conn
+
+    async def setup(self, conn) -> None:
+        if not self._gate.is_set():
+            self.parked += 1
+            await self._gate.wait()
+        await postgres._count_acquire(conn)
 
     def release(self) -> None:
         self._gate.set()
@@ -339,15 +351,63 @@ class _GatedConnect:
                 await asyncio.sleep(0.005)
 
 
-async def _swap_in_a_gated_pool(db, monkeypatch, gated: _GatedConnect, *, max_size: int) -> asyncpg.Pool:
-    """Replace the fixture's pool with an empty one that opens connections through `gated`."""
+async def _swap_in_a_gated_pool(
+    db, monkeypatch, gated: _GatedConnect, *, max_size: int, min_size: int = 0, setup=None, reset=None,
+) -> asyncpg.Pool:
+    """Replace the fixture's pool with one that opens connections through `gated`.
+
+    It counts acquires as `get_pool`'s does, unless `setup` replaces that hook;
+    `reset` replaces asyncpg's own reset on return.
+    """
     db.pool.terminate()  # its connections would count against the role's limit
     pool = await asyncpg.create_pool(
-        dsn=postgres.settings.asyncpg_dsn, min_size=0, max_size=max_size,
-        connect=gated, setup=postgres._count_acquire,
+        dsn=postgres.settings.asyncpg_dsn, min_size=min_size, max_size=max_size,
+        connect=gated, setup=setup or postgres._count_acquire, reset=reset,
     )
     monkeypatch.setattr(postgres, "_pool", pool)
     return pool
+
+
+# Returning a connection takes this much longer than the server needs, and
+# acquires complete this long before the probe's budget ends: the return
+# outlasts what the budget has left.
+_SLOW_RESET = 0.1
+_JUST_BEFORE_THE_DEADLINE = 0.05
+
+
+async def _slow_reset(conn) -> None:
+    """A pool `reset` hook that does asyncpg's reset after `_SLOW_RESET`."""
+    await asyncio.sleep(_SLOW_RESET)
+    await conn.reset()
+
+
+def _deadline_of_the_pool_check(main, monkeypatch) -> asyncio.Future:
+    """When the probe's budget ends, on the loop's clock, known once the
+    probe turns to the pool."""
+    deadline = asyncio.get_running_loop().create_future()
+    check = main._ping_through_pool
+
+    async def noting_the_deadline(pool, budget, progress_since):
+        if not deadline.done():
+            deadline.set_result(budget.when())
+        return await check(pool, budget, progress_since)
+
+    monkeypatch.setattr(main, "_ping_through_pool", noting_the_deadline)
+    return deadline
+
+
+async def _release_just_before_the_deadline(gated: _GatedConnect, deadline: asyncio.Future, *, parked: int) -> None:
+    """Let the parked acquires complete together just before the probe's budget ends."""
+    await gated.until_parked(parked)
+    when = await asyncio.wait_for(deadline, timeout=5)
+    await asyncio.sleep(max(0.0, when - _JUST_BEFORE_THE_DEADLINE - asyncio.get_running_loop().time()))
+    gated.release()
+
+
+async def _returns_finished(main) -> None:
+    """Let the connection returns the probe left running in the background end."""
+    if main._standing_down:
+        await asyncio.wait(set(main._standing_down), timeout=main._READY_RETURN_TIMEOUT_SECONDS + 1.0)
 
 
 def _past_the_floor(main) -> None:
@@ -896,6 +956,92 @@ async def test_probe_connection_obtained_alongside_a_request_goes_back_to_the_po
     assert response.status_code == 200, response.text
     assert response.json()["detail"]["db"] == "ok"
     assert size_after == 2
+
+
+async def test_proven_pool_stays_ready_when_returning_the_probes_connection_outlasts_the_budget(ready_db, monkeypatch):
+    # The request's connection and the probe's extra one open together just
+    # before the probe's budget ends, and returning the probe's connection
+    # takes longer than the budget has left. The request's acquire has proven
+    # the pool: the verdict does not wait for that return, and the return
+    # still gives the pool its connection back.
+    main = ready_db.main
+    monkeypatch.setattr(main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+    assert (await ready_db.client.get("/readyz")).status_code == 200  # opens the probe connection
+    gated = _GatedConnect()
+    pool = await _swap_in_a_gated_pool(ready_db, monkeypatch, gated, max_size=2, reset=_slow_reset)
+    deadline = _deadline_of_the_pool_check(main, monkeypatch)
+    hold = asyncio.Event()
+    try:
+        await asyncio.sleep(_PAST_GRACE)
+
+        async def serve_a_request() -> None:
+            async with pool.acquire():
+                await hold.wait()
+
+        request = asyncio.create_task(serve_a_request())
+        await gated.until_parked(1)
+        opener = asyncio.create_task(_release_just_before_the_deadline(gated, deadline, parked=2))
+        main._ready_state.ts -= 31  # past the success cache
+        response = await ready_db.client.get("/readyz")
+        await opener
+        assert response.status_code == 200, response.text
+        await _returns_finished(main)
+        size, idle = pool.get_size(), pool.get_idle_size()
+        hold.set()
+        await request
+    finally:
+        hold.set()
+        gated.release()
+        pool.terminate()
+
+    assert response.json()["detail"]["db"] == "ok"
+    assert (size, idle) == (2, 1)  # the probe's connection is back; the request still holds its own
+
+
+async def test_proven_pool_at_max_connections_stays_ready_when_returning_the_probes_connection_outlasts_the_budget(
+    monkeypatch, tmp_path,
+):
+    # The server refuses the probe's own connection, so readiness turns to the
+    # pool's idle connection. A request takes it first, and the probe's acquire
+    # opens another. Both complete just before the probe's budget ends, and
+    # returning the probe's connection takes longer than the budget has left.
+    async with _ready_database(monkeypatch, tmp_path) as db:
+        main = db.main
+        gated = _GatedConnect(let_through=1)  # the pool's idle connection opens at once
+        pool = await _swap_in_a_gated_pool(
+            db, monkeypatch, gated, max_size=2, min_size=1, setup=gated.setup, reset=_slow_reset,
+        )
+        deadline = _deadline_of_the_pool_check(main, monkeypatch)
+        wake_the_request = asyncio.Event()
+        hold = asyncio.Event()
+
+        async def refused(**_kwargs):
+            wake_the_request.set()
+            raise asyncpg.TooManyConnectionsError("sorry, too many clients already")
+
+        async def serve_a_request() -> None:
+            await wake_the_request.wait()
+            async with pool.acquire():
+                await hold.wait()
+
+        monkeypatch.setattr(main, "readiness_ping", refused)
+        request = asyncio.create_task(serve_a_request())
+        opener = asyncio.create_task(_release_just_before_the_deadline(gated, deadline, parked=2))
+        try:
+            response = await db.client.get("/readyz")
+            await opener
+            assert response.status_code == 200, response.text
+            await _returns_finished(main)
+            size, idle = pool.get_size(), pool.get_idle_size()
+        finally:
+            hold.set()
+            wake_the_request.set()
+            gated.release()
+            await request
+            pool.terminate()
+
+    assert response.json()["detail"]["db"] == "ok:pool_progress"
+    assert (size, idle) == (2, 1)
 
 
 async def test_pool_that_can_no_longer_open_connections_is_not_ready(monkeypatch, tmp_path):

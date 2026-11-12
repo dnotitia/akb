@@ -111,8 +111,15 @@ def main(monkeypatch, tmp_path):
     monkeypatch.setattr(application, "_ready_state", application._ReadyState())
     monkeypatch.setattr(application, "_ready_lock", asyncio.Lock())
     monkeypatch.setattr(application, "_vector_check", None)
+    monkeypatch.setattr(application, "_standing_down", set())
     monkeypatch.setattr(application.settings, "readyz_pool_saturation_grace_secs", GRACE)
     return application
+
+
+async def _returns_finished(main) -> None:
+    """Let the connection returns the probe left running in the background end."""
+    if main._standing_down:
+        await asyncio.wait(set(main._standing_down), timeout=1)
 
 
 @pytest.fixture
@@ -504,13 +511,56 @@ async def test_probe_connection_obtained_alongside_a_request_goes_back_to_the_po
     releaser = asyncio.create_task(release_both())
     ok, detail = await main._probe_ready()
     await asyncio.gather(request, releaser)
+    await _returns_finished(main)
 
     assert ok is True, detail
     assert detail["db"] == "ok"
-    (release_timeout,) = probe.pool.release_timeouts
-    assert release_timeout is not None and 0 < release_timeout <= main._READY_DB_TIMEOUT_SECONDS
+    assert probe.pool.release_timeouts == [main._READY_RETURN_TIMEOUT_SECONDS]
     probe.pool.idle_conn.terminate.assert_not_called()
     probe.pool.idle_conn.fetchval.assert_not_awaited()
+
+
+async def test_returning_the_probes_connection_never_holds_up_the_verdict(main, probe, monkeypatch):
+    # The request proves the pool; returning the probe's own connection then
+    # never finishes. The verdict is ready at once, and the return is left to
+    # run in the background rather than cut short.
+    _unproven(probe)
+    both = asyncio.Event()
+
+    async def acquired_with_the_request(*, timeout=None):
+        probe.pool.acquire_timeouts.append(timeout)
+        await both.wait()
+        return probe.pool.idle_conn
+
+    async def request_acquires() -> None:
+        await both.wait()
+        await postgres._count_acquire(object())
+
+    monkeypatch.setattr(postgres, "_acquires_total", 0)
+    monkeypatch.setattr(postgres, "_last_acquire_at", None)
+    monkeypatch.setattr(probe.pool, "acquire", acquired_with_the_request)
+    monkeypatch.setattr(probe.pool, "release", _hang)
+    request = asyncio.get_running_loop().create_task(request_acquires(), context=contextvars.Context())
+
+    async def release_both() -> None:
+        while not probe.pool.acquire_timeouts:
+            await asyncio.sleep(0.005)
+        both.set()
+
+    releaser = asyncio.create_task(release_both())
+    started = time.monotonic()
+    ok, detail = await main._probe_ready()
+    elapsed = time.monotonic() - started
+    await asyncio.gather(request, releaser)
+
+    assert ok is True, detail
+    assert detail["db"] == "ok"
+    assert elapsed < 1.0
+    (returning,) = main._standing_down
+    assert not returning.done()
+    returning.cancel()
+    await asyncio.wait({returning}, timeout=1)
+    probe.pool.idle_conn.terminate.assert_not_called()
 
 
 @pytest.mark.parametrize("evidence", ["idle", "recent_acquire", "saturated"])

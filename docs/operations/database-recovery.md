@@ -134,9 +134,11 @@ the pool cannot open it, readiness reports `db: error:pool_unavailable`, or
 by a request or background work after the probe decided to check the pool
 proves the pool too: it ends the probe's wait, and it wins even when the server
 refuses the probe's own extra connection at the same moment. A connection the
-probe has already obtained by then goes back to the pool within the probe's
-budget instead of being closed, so the pool does not lose a server slot to the
-probe. So a probe queued
+probe has already obtained by then goes back to the pool instead of being
+closed, so the pool does not lose a server slot to the probe. That return runs
+in the background with its own 2-second bound, and the verdict does not wait
+for it: a slow return cannot turn a pool that a request has just proven into a
+failure. So a probe queued
 behind a request whose connection is still opening does not report a working
 pool as broken.
 
@@ -148,7 +150,10 @@ without waiting for a connection:
   2-second step and runs `SELECT 1` on it: `db: ok:pool_idle`. If that ping
   fails, readiness fails. The connection goes back within the same budget. One
   that cannot finish in time is terminated rather than returned, because
-  returning it would wait on a cancel request that may never complete.
+  returning it would wait on a cancel request that may never complete. If a
+  request or background work completes an acquire first, that proves the pool
+  instead (`db: ok:pool_progress`), and a connection the probe obtained
+  meanwhile goes back in the background as described above.
 - Otherwise, if an acquire has completed within
   `readyz_pool_saturation_grace_secs`: `db: ok:pool_progress`.
 

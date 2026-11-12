@@ -141,16 +141,17 @@ specifically; the proxy has its own log in
   request or background work completes after the probe decided to check the
   pool proves the pool and ends the wait, also when the server refuses the
   probe's extra connection at the same moment. A connection the probe already
-  holds by then goes back to the pool within the probe's budget.
+  holds by then goes back to the pool in the background, bounded to 2 seconds
+  of its own; the verdict does not wait for that return.
 - When the server refuses the readiness probe's connection at
   `max_connections`, readiness asks the pool instead. With an idle connection
   it runs `SELECT 1` on that connection within the probe's remaining budget
   and reports `db: ok:pool_idle`; the connection is given back within the same
-  budget or terminated. With none, it reports `db: ok:pool_progress`
-  if an acquire has completed within the grace. Neither result is cached
-  beyond one second. A
-  failed ping on the idle connection, a pool with neither, and every other
-  connection error still fail readiness.
+  budget or terminated. A request that takes the idle connection first proves
+  the pool instead, as `db: ok:pool_progress`. With none, it reports
+  `db: ok:pool_progress` if an acquire has completed within the grace. Neither
+  result is cached beyond one second. A failed ping on the idle connection, a
+  pool with neither, and every other connection error still fail readiness.
 
 ### Search
 

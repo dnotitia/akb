@@ -607,33 +607,49 @@ async def _acquire_unless_another_caller_does(pool: asyncpg.Pool, budget: asynci
             _abandon_acquire(acquiring)
             raise
         if progressed.done() or _progressed_since(progress_since):
-            await _stand_down(pool, acquiring, budget)
+            _stand_down(pool, acquiring)
             return None
         return acquiring.result()
     finally:
         forget_pool_progress_waiter(progressed)
 
 
-async def _stand_down(pool: asyncpg.Pool, acquiring: asyncio.Future, budget: asyncio.Timeout) -> None:
+# How long returning a connection the probe stood down from may take.
+_READY_RETURN_TIMEOUT_SECONDS = 2.0
+# Those returns run detached from the evaluation, held here until they end.
+_standing_down: set[asyncio.Task] = set()
+
+
+def _stand_down(pool: asyncpg.Pool, acquiring: asyncio.Future) -> None:
     """Another caller proved the pool, so the probe needs no connection.
 
-    One the probe already holds goes back to the pool within the rest of the
-    budget: terminating a working connection would cost the pool a server
-    slot that the server, at its connection limit, may not give back. It is
-    terminated only when the budget is gone or the return fails. An acquire
-    still pending is abandoned.
+    The verdict is settled; nothing here may wait. One the probe already holds
+    goes back to the pool in a background task: terminating a working
+    connection would cost the pool a server slot that the server, at its
+    connection limit, may not give back, and waiting for the return could
+    outlast the probe's budget and turn a proven pool into a failure. An
+    acquire still pending is abandoned.
     """
     if not acquiring.done() or acquiring.cancelled() or acquiring.exception() is not None:
         _abandon_acquire(acquiring)
         return
-    conn = acquiring.result()
-    left = _remaining(budget)
-    if left is not None and left <= 0:
-        _terminate_pool_connection(conn)
-        return
+    returning = asyncio.get_running_loop().create_task(
+        _return_to_pool(pool, acquiring.result()), name="readyz-return-connection",
+    )
+    _standing_down.add(returning)
+    returning.add_done_callback(_standing_down.discard)
+
+
+async def _return_to_pool(pool: asyncpg.Pool, conn) -> None:
+    """Return a connection within its own bound.
+
+    asyncpg terminates a connection whose return fails or runs out of time;
+    the terminate here only makes sure of it. A return still running when this
+    task is cancelled is left to asyncpg, never terminated from outside.
+    """
     try:
-        await pool.release(conn, timeout=left)
-    except Exception:  # noqa: BLE001 — the pool is proven either way
+        await pool.release(conn, timeout=_READY_RETURN_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001 — collected here; the verdict does not depend on it
         _terminate_pool_connection(conn)
 
 
