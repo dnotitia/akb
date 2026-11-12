@@ -128,7 +128,8 @@ specifically; the proxy has its own log in
   timeout. At most one check is outstanding. The check no longer takes a
   request-pool connection, which readiness would then count against the
   pool: pgvector on the main database is checked on the probe's dedicated
-  connection. pgvector's health check also terminates a borrowed connection
+  connection, which a failed check discards as a failed ping does. pgvector's
+  health check also terminates a borrowed connection
   that it cannot finish with, at the query or while returning it, instead of
   holding its pool slot.
 - When the request pool shows nothing that proves it could serve a request (no

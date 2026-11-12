@@ -636,6 +636,33 @@ async def test_pgvector_health_on_a_given_connection_borrows_nothing():
     pool.acquire.assert_not_awaited()
 
 
+async def test_pgvector_health_on_a_given_connection_lets_its_errors_reach_the_owner():
+    # The caller owns that connection and must discard it after a failure.
+    conn = SimpleNamespace(fetchval=AsyncMock(side_effect=TimeoutError()))
+
+    with pytest.raises(TimeoutError):
+        await _pgvector().health(conn=conn)
+
+
+async def test_pgvector_health_without_a_connection_still_answers_false():
+    pool = SimpleNamespace(acquire=AsyncMock(side_effect=ConnectionRefusedError("refused")))
+
+    assert await _pgvector(pool).health() is False
+
+
+async def test_vector_check_that_fails_on_the_probe_connection_discards_it(main, probe, connections, monkeypatch):
+    monkeypatch.setattr(main, "get_vector_store", lambda: _pgvector(probe.pool))
+    silent = _Conn(fetchval=AsyncMock(side_effect=TimeoutError()))
+    connections.queue.append(silent)
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is True
+    assert detail["vector_store"] == "degraded:timeout"
+    assert silent.terminated
+    assert postgres._readiness_conn is None  # the next ping opens a fresh one
+
+
 @pytest.mark.parametrize("stuck_in", ["query", "return"])
 async def test_pgvector_health_cut_off_terminates_the_connection_it_borrowed(stuck_in):
     conn = SimpleNamespace(

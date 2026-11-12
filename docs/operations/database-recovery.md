@@ -88,8 +88,9 @@ as a task that the probe waits on for at most 5 seconds. If it has not finished
 by then, it is reported as `vector_store: degraded:timeout` and cancelled
 without waiting for its cleanup. It never takes a request-pool connection: when
 the vector store is pgvector on the main database (no `vector_store_dsn`), the
-check runs on the probe's dedicated connection; a store with a database of its
-own checks a connection from its own pool. A pgvector check that is cut off,
+check runs on the probe's dedicated connection, and a failure there discards
+that connection like a failed ping, so the next probe starts on a fresh one; a
+store with a database of its own checks a connection from its own pool. A pgvector check that is cut off,
 during its query or while returning its connection, terminates that connection
 instead of returning it, because asyncpg can wait without limit for the answer
 to a cancel request and would hold the pool slot meanwhile. At most one vector

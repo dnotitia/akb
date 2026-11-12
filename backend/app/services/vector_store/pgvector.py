@@ -845,16 +845,19 @@ class PgvectorStore:
         """Whether the store's database answers.
 
         With `conn`, the check runs on that connection instead of one borrowed
-        from the pool; readiness passes its dedicated connection when this
-        store uses the main pool. A borrowed connection that does not finish
-        the check and its return is terminated rather than returned: asyncpg
-        would hold its pool slot while waiting, without limit, for the answer
-        to a cancel request.
+        from the pool, and its errors reach the caller: readiness passes its
+        dedicated connection when this store uses the main pool, and must
+        discard that connection when a statement on it fails or is cut off.
+        Without `conn`, failures read as False.
+
+        A borrowed connection that does not finish the check and its return is
+        terminated rather than returned: asyncpg would hold its pool slot while
+        waiting, without limit, for the answer to a cancel request.
         """
+        if conn is not None:
+            await conn.fetchval("SELECT 1")
+            return True
         try:
-            if conn is not None:
-                await conn.fetchval("SELECT 1")
-                return True
             pool = await self._pool()
             borrowed = await pool.acquire()
             try:

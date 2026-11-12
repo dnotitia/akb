@@ -83,16 +83,19 @@ def _settings(
 class _Relay:
     """A TCP relay to PostgreSQL that can go silent, as a stalled network path does.
 
-    Once frozen it passes nothing more in either direction, and a connection it
-    accepts afterwards (such as asyncpg's cancel request) never reaches the
-    server. Every socket stays open until the relay closes.
+    `freeze()` silences every connection made so far in both directions, and
+    holds new ones (such as asyncpg's cancel request) without ever reaching the
+    server. `accept_new()` lets new connections through again; the silenced
+    ones stay silent. Every socket stays open until the relay closes.
     """
 
     def __init__(self) -> None:
         self.address: tuple[str, int] = ("127.0.0.1", 0)
         # How long a new connection takes to reach the server.
         self.connect_delay = 0.0
-        self._frozen = False
+        self._accepted = 0
+        self._silent_below = 0
+        self._holding_new = False
         self._closing = asyncio.Event()
         self._writers: list[asyncio.StreamWriter] = []
         self._server: asyncio.Server | None = None
@@ -102,23 +105,31 @@ class _Relay:
         self.address = ("127.0.0.1", self._server.sockets[0].getsockname()[1])
 
     def freeze(self) -> None:
-        self._frozen = True
+        self._silent_below = self._accepted
+        self._holding_new = True
+
+    def accept_new(self) -> None:
+        self._holding_new = False
 
     async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        number = self._accepted
+        self._accepted += 1
         self._writers.append(writer)
-        if self._frozen:
+        if self._holding_new:
             await self._closing.wait()
             return
         if self.connect_delay:
             await asyncio.sleep(self.connect_delay)
         upstream_reader, upstream_writer = await asyncio.open_connection(*_server())
         self._writers.append(upstream_writer)
-        await asyncio.gather(self._pipe(reader, upstream_writer), self._pipe(upstream_reader, writer))
+        await asyncio.gather(
+            self._pipe(reader, upstream_writer, number), self._pipe(upstream_reader, writer, number),
+        )
 
-    async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, number: int) -> None:
         try:
             while data := await reader.read(65536):
-                if self._frozen:
+                if number < self._silent_below:
                     await self._closing.wait()
                     return
                 writer.write(data)
@@ -165,12 +176,14 @@ async def _ready_database(
     role_connection_limit: int | None = None,
     pool_size: int = _POOL_SIZE,
     relay: _Relay | None = None,
+    probe_relay: _Relay | None = None,
 ):
     """A disposable database, its request pool from `get_pool`, and an HTTP client.
 
     With `role_connection_limit`, the pool and the probe log in as a fresh role
     that the server lets open only that many connections. With `relay`, the
-    pool reaches the server through it while the probe connects directly.
+    pool reaches the server through it; with `probe_relay`, the probe's own
+    connection does. Otherwise each connects directly.
     """
     if not await _can_connect():
         if os.environ.get("REQUIRE_REAL_PG") == "1":
@@ -209,8 +222,8 @@ async def _ready_database(
         pool_address = relay.address if relay is not None else None
         monkeypatch.setattr(postgres, "settings", _settings(name, address=pool_address, **login))
         pool = await postgres.get_pool()
-        # The probe's own connection always goes to the server directly.
-        monkeypatch.setattr(postgres, "settings", _settings(name, **login))
+        probe_address = probe_relay.address if probe_relay is not None else None
+        monkeypatch.setattr(postgres, "settings", _settings(name, address=probe_address, **login))
         client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://akb.test")
         yield SimpleNamespace(main=main, admin=admin, name=name, pool=pool, store=store, client=client)
     finally:
@@ -825,6 +838,39 @@ async def test_pool_that_can_no_longer_open_connections_is_not_ready(monkeypatch
     assert detail["db"] == "error:pool_unavailable"
     assert detail["pool"]["size"] == 0 and detail["pool"]["idle"] == 0
     assert elapsed < db.main._READY_DB_TIMEOUT_SECONDS + 0.5
+
+
+async def test_vector_query_cut_off_on_the_probe_connection_leaves_the_next_ping_a_fresh_one(monkeypatch, tmp_path):
+    # The probe's own connection answers its ping, then goes silent: the
+    # vector check on it times out and the cancel request asyncpg sends for it
+    # never arrives. That connection must be given up, or the next probe's
+    # ping would wait behind the unanswered cancel and fail readiness while
+    # the database and the request pool are fine.
+    relay = _Relay()
+    await relay.start()
+    try:
+        async with _ready_database(monkeypatch, tmp_path, probe_relay=relay) as db:
+            main = db.main
+            observe = main._observe_pool
+
+            def observe_then_silence_the_probe_connection(pool, state):
+                observed = observe(pool, state)
+                relay.freeze()
+                return observed
+
+            monkeypatch.setattr(main, "_observe_pool", observe_then_silence_the_probe_connection)
+            first = await db.client.get("/readyz")
+            monkeypatch.setattr(main, "_observe_pool", observe)
+            relay.accept_new()
+            main._ready_state.ts -= 31  # past the success cache
+            second = await db.client.get("/readyz")
+    finally:
+        await relay.close()
+
+    assert second.status_code == 200, second.text
+    assert second.json()["detail"]["db"] == "ok"
+    assert first.status_code == 200, first.text
+    assert first.json()["detail"]["vector_store"] == "degraded:timeout"
 
 
 async def test_database_gone_is_not_ready_at_once(ready_db):
