@@ -146,7 +146,7 @@ async def test_an_empty_token_reads_nothing(created_by):
     "token",
     [
         "0C37E906-6DB0-48C2-AC5D-576D0797B3F7",
-        "0c37e9066db048c2ac5d576d0797b3f7",
+        "0c37e9066db048c2ac5d576d0797b3f7",  # pragma: allowlist secret
         "{0c37e906-6db0-48c2-ac5d-576d0797b3f7}",
         "urn:uuid:0c37e906-6db0-48c2-ac5d-576d0797b3f7",
     ],
