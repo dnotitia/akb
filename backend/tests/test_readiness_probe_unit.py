@@ -193,8 +193,9 @@ async def test_saturated_pool_within_grace_is_ready_and_skips_the_vector_check(m
         "size": 4, "max": 4, "idle": 0, "free": 0, "saturated_for_secs": 0.0,
         "last_acquire_age_secs": 0.0,
     }
-    # pgvector on the main database borrows from this same pool for its health
-    # check, so running it here would queue behind the saturation.
+    # A saturated result is shared for one second only, so the check would run
+    # every second against a database already under that load, and it cannot
+    # change the verdict.
     assert detail["vector_store"] == "skipped:pool_saturated"
     probe.store.health.assert_not_awaited()
 
