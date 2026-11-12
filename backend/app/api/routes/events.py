@@ -37,7 +37,14 @@ router = APIRouter()
                     },
                 }
             },
-        }
+        },
+        # The account already holds its quota of open streams on this server
+        # (`event_tail_user_quota`). A full server is the 503 every operation
+        # documents (`event_tail_capacity`).
+        429: {
+            "description": "Too Many Requests",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AkbError"}}},
+        },
     },
 )
 async def events_tail(

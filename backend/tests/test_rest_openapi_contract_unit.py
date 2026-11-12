@@ -1024,7 +1024,11 @@ def test_event_tail_openapi_contract_is_authenticated_typed_sse():
     assert operation["operationId"] == "eventsTail"
     assert operation["tags"] == ["events"]
     assert operation["security"] == [{"bearerAuth": []}]
-    assert set(operation["responses"]) >= {"200", "400", "401", "403", "404", "410", "422", "500", "503"}
+    assert set(operation["responses"]) >= {"200", "400", "401", "403", "404", "410", "422", "429", "500", "503"}
+    # An account over its stream quota gets the standard error body with a 429.
+    assert operation["responses"]["429"]["content"] == {
+        "application/json": {"schema": {"$ref": "#/components/schemas/AkbError"}},
+    }
     content = operation["responses"]["200"]["content"]
     assert set(content) == {"text/event-stream"}
     assert content["text/event-stream"]["schema"] == {

@@ -185,15 +185,23 @@ def test_api_role_starts_no_durable_queue_consumer(monkeypatch, tmp_path):
     assert "delete_worker" not in started
 
 
-def test_api_runtime_refuses_a_malformed_event_tail_stream_cap(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "AKB_EVENT_TAIL_MAX_STREAMS",
+        "AKB_EVENT_TAIL_MAX_STREAMS_PER_USER",
+        "AKB_EVENT_TAIL_DB_CONCURRENCY",
+    ],
+)
+def test_api_runtime_refuses_a_malformed_event_tail_limit(monkeypatch, tmp_path, variable):
     lifecycle = _import_lifecycle(monkeypatch, tmp_path)
     started: list[str] = []
     _stub_workers(monkeypatch, lifecycle, started)
     monkeypatch.setattr(lifecycle, "settings", _settings(external_git_enabled=False))
-    monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS", "many")
+    monkeypatch.setenv(variable, "many")
 
     # The boot stops here rather than every stream request failing later.
-    with pytest.raises(RuntimeError, match="AKB_EVENT_TAIL_MAX_STREAMS"):
+    with pytest.raises(RuntimeError, match=f"{variable} must be an integer"):
         lifecycle.start_api_runtime()
     assert "tool_usage_maintenance" not in started
 

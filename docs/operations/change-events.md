@@ -88,15 +88,36 @@ authenticated `GET /api/v1/events/{vault}` SSE tail reads the same PG outbox wit
 reader access checks; its opaque cursor is different from a Redis cursor.
 
 Each server process wakes its open SSE tails from one dedicated PostgreSQL
-`LISTEN` connection outside the request pool. A waiting stream holds no pooled
-connection and borrows one only to re-check access and read a batch. A process
-serves at most `event_tail_max_streams` tails at once (default 256;
-`AKB_EVENT_TAIL_MAX_STREAMS` overrides it). Past that, a new tail gets 503
-`event_tail_capacity` with `Retry-After`; retry later and resume from the last
-cursor. A notification only wakes a tail, which then reads the outbox by
-cursor. If the listener connection drops, open tails keep re-reading on their
-15-second heartbeat until it reconnects, so a missed wake-up delays delivery
-rather than dropping it.
+`LISTEN` connection outside the request pool. A notification only wakes a tail,
+which then reads the outbox by cursor. If the listener connection drops, open
+tails keep re-reading on their 15-second heartbeat until it reconnects, so a
+missed wake-up delays delivery rather than dropping it.
+
+A waiting tail holds no pooled connection. To read, it borrows one for the
+batch and, when the batch has rows, checks the reader's access on that same
+connection before sending any of them. A pass that finds nothing checks
+nothing, except the pass after each heartbeat. A tail that takes longer than
+one second to send a batch is checked again before its next event. A revoked
+reader therefore stops receiving events within about a second, and an idle
+tail closes within one heartbeat. All tail database work in a process shares
+at most `event_tail_db_concurrency` connections; work beyond that waits for a
+free slot without holding a connection, so tail load cannot take the pool that
+other requests and the readiness probe need.
+
+Limits per server process; each environment variable overrides its key:
+
+| Limit | Key (environment variable) | Default | Past the limit |
+| --- | --- | --- | --- |
+| Open tails | `event_tail_max_streams` (`AKB_EVENT_TAIL_MAX_STREAMS`) | 256 | 503 `event_tail_capacity` with `Retry-After`; retry later and resume from the last cursor |
+| Open tails of one account | `event_tail_max_streams_per_user` (`AKB_EVENT_TAIL_MAX_STREAMS_PER_USER`) | 48 | 429 `event_tail_user_quota` with `Retry-After`; close tails the account no longer reads |
+| Pool connections for tail database work | `event_tail_db_concurrency` (`AKB_EVENT_TAIL_DB_CONCURRENCY`) | 6 | the work waits for a free slot |
+
+An account at its quota gets 429 even when the process is also full: retrying
+cannot help it, and the SDK's change channel retries a 5xx but stops on a 4xx.
+`GET /health` reports the process's `event_tail`
+counters: open tails, accounts holding them, the limits above, database slots
+in use and waiting, and whether the listener is connected. It names no
+account or Vault.
 
 ## Regression verification
 

@@ -168,13 +168,13 @@ async def test_stream_reads_a_commit_on_its_heartbeat_while_the_listener_cannot_
             return subscription
 
         reading = 0
-        read_event_batch = event_tail_service._read_event_batch
+        read_pass = event_tail_service._read_pass
 
-        async def tracked_read_event_batch(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        async def tracked_read_pass(**kwargs: Any) -> tuple[list[dict[str, Any]], float | None]:
             nonlocal reading
             reading += 1
             try:
-                return await read_event_batch(*args, **kwargs)
+                return await read_pass(**kwargs)
             finally:
                 reading -= 1
 
@@ -187,7 +187,7 @@ async def test_stream_reads_a_commit_on_its_heartbeat_while_the_listener_cannot_
         monkeypatch.setattr(hub, "subscribe", subscribe_counted)
         monkeypatch.setattr(event_tail_service, "get_pool", get_pool)
         monkeypatch.setattr(event_tail_service, "get_event_tail_hub", lambda: hub)
-        monkeypatch.setattr(event_tail_service, "_read_event_batch", tracked_read_event_batch)
+        monkeypatch.setattr(event_tail_service, "_read_pass", tracked_read_pass)
         monkeypatch.setattr(event_tail_service, "check_vault_access", check_vault_access)
         monkeypatch.setattr(event_tail_service, "HEARTBEAT_INTERVAL_SECONDS", _HEARTBEAT_SECONDS)
         codec = EventCursorCodec("cursor-secret")

@@ -280,6 +280,11 @@ def get_event_tail_hub() -> EventTailHub:
     return _hub
 
 
+def event_tail_hub_connected() -> bool:
+    """Whether the process-wide hub is LISTENing now. Never creates the hub."""
+    return _hub is not None and _hub.connected
+
+
 async def close_event_tail_hub() -> None:
     """Close the process-wide hub and clear the handle, as `close_pool()` does."""
     global _hub

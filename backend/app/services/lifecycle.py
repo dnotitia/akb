@@ -309,12 +309,15 @@ def stop_runtime_pools() -> None:
 
 def _start_api_local(started: list[str]) -> None:
     """Start sinks whose queues live in the serving process's memory."""
-    # Event tail streams are served here. Resolve the stream cap now so a
-    # malformed AKB_EVENT_TAIL_MAX_STREAMS stops the boot instead of failing
+    # Event tail streams are served here. Resolve their limits now so a
+    # malformed AKB_EVENT_TAIL_* override stops the boot instead of failing
     # every stream request.
     logger.info(
-        "event tail streams capped at %d per process",
+        "event tail streams capped at %d per process and %d per account; "
+        "their database work holds at most %d pool connections",
         event_tail_service.configured_max_streams(),
+        event_tail_service.configured_max_streams_per_user(),
+        event_tail_service.configured_db_concurrency(),
     )
     if settings.audit.enabled:
         audit_log.init()

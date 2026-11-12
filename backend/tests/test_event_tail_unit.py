@@ -309,7 +309,10 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
     assert list_events.await_args.kwargs == {"after_id": 9, "limit": event_tail_service.EVENT_BATCH_SIZE}
     assert hub.subscriptions == []
     assert len(hub.unsubscribed) == 1
-    assert access.await_count >= 2
+    # One access check covered the whole batch, on the connection it was read
+    # on; the rows did not each borrow a connection for a check of their own.
+    assert access.await_count == 1
+    assert access.await_args.kwargs["_conn"] is connection
 
 
 @pytest.mark.asyncio
@@ -370,10 +373,11 @@ async def test_empty_wakeups_do_not_restart_heartbeat_deadline(monkeypatch, hub)
 
 @pytest.mark.asyncio
 async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatch, hub) -> None:
+    """The access check runs after the read, so it covers the rows just read."""
     from app.exceptions import ForbiddenError
     from app.services import event_tail_service
 
-    pool, _connection, request = _stream_test_doubles()
+    pool, connection, request = _stream_test_doubles()
     monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
     monkeypatch.setattr(
         event_tail_service,
@@ -391,11 +395,8 @@ async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatc
             ]
         ),
     )
-    monkeypatch.setattr(
-        event_tail_service,
-        "check_vault_access",
-        AsyncMock(side_effect=[{"vault_id": VAULT_ID}, ForbiddenError("revoked")]),
-    )
+    access = AsyncMock(side_effect=ForbiddenError("revoked"))
+    monkeypatch.setattr(event_tail_service, "check_vault_access", access)
 
     stream = event_tail_service._stream_events(
         request,
@@ -410,6 +411,8 @@ async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatc
         await anext(stream)
     assert hub.subscriptions == []
     assert pool.checked_out == 0
+    assert access.await_count == 1
+    assert access.await_args.kwargs["_conn"] is connection
 
 
 @pytest.mark.asyncio
@@ -433,10 +436,10 @@ async def test_more_waiting_streams_than_pool_connections_leave_the_pool_usable(
         reads += 1
         return [row for row in committed if row["id"] > after_id][:limit]
 
-    async def access(*_args, **_kwargs) -> dict:
-        # The real access re-check borrows a pooled connection as well.
-        async with pool.acquire():
-            return {"vault_id": VAULT_ID}
+    async def access(*_args, _conn, **_kwargs) -> dict:
+        # The real access check runs on the connection the batch was read on.
+        assert _conn is connection
+        return {"vault_id": VAULT_ID}
 
     monkeypatch.setattr(event_tail_service, "list_vault_events", list_events)
     monkeypatch.setattr(event_tail_service, "check_vault_access", access)
@@ -497,6 +500,83 @@ async def test_more_waiting_streams_than_pool_connections_leave_the_pool_usable(
     assert hub.subscriptions == []
 
 
+@pytest.mark.asyncio
+async def test_tail_database_work_holds_no_more_connections_than_its_budget(monkeypatch) -> None:
+    from app.services import event_tail_service
+
+    pool, _connection, _ = _stream_test_doubles()
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "_db_budget", None)
+    monkeypatch.setenv("AKB_EVENT_TAIL_DB_CONCURRENCY", "2")
+    finish = asyncio.Event()
+    most_checked_out = 0
+
+    async def borrow() -> None:
+        nonlocal most_checked_out
+        async with event_tail_service._tail_db_connection():
+            most_checked_out = max(most_checked_out, pool.checked_out)
+            await finish.wait()
+
+    def budget() -> tuple[int, int]:
+        snapshot = event_tail_service.stats_snapshot()
+        return snapshot["budget_in_use"], snapshot["budget_waiters"]
+
+    async def settled(expected: tuple[int, int]) -> None:
+        while budget() != expected:
+            await asyncio.sleep(0)
+
+    borrowers = [asyncio.create_task(borrow()) for _ in range(10)]
+    try:
+        await asyncio.wait_for(settled((2, 8)), timeout=1.0)
+        assert pool.checked_out == 2
+        # A borrower that gives up while waiting takes nothing with it.
+        for waiting in borrowers[-3:]:
+            waiting.cancel()
+        await asyncio.wait_for(settled((2, 5)), timeout=1.0)
+        finish.set()
+        await asyncio.gather(*borrowers, return_exceptions=True)
+    finally:
+        finish.set()
+        for task in borrowers:
+            task.cancel()
+        await asyncio.gather(*borrowers, return_exceptions=True)
+
+    assert most_checked_out == 2
+    assert pool.checked_out == 0
+    assert budget() == (0, 0)
+    assert event_tail_service.stats_snapshot()["budget_size"] == 2
+
+
+def test_the_database_budget_belongs_to_the_event_loop_that_uses_it(monkeypatch) -> None:
+    """An asyncio semaphore that has waited on one loop refuses to wait on another.
+
+    Each loop gets a budget of its own, so a process (or a test run) that starts
+    a new loop does not inherit one it can no longer wait on.
+    """
+    from app.services import event_tail_service
+
+    pool, _connection, _ = _stream_test_doubles()
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "_db_budget", None)
+    monkeypatch.setenv("AKB_EVENT_TAIL_DB_CONCURRENCY", "1")
+
+    async def contend() -> Any:
+        async def borrow() -> None:
+            async with event_tail_service._tail_db_connection():
+                await asyncio.sleep(0.01)
+
+        # The second borrower waits, which ties the semaphore to this loop.
+        await asyncio.gather(borrow(), borrow())
+        return event_tail_service._db_budget
+
+    first = asyncio.run(contend())
+    second = asyncio.run(contend())
+
+    assert first is not None and second is not None
+    assert first is not second
+    assert (second.size, second.in_use, second.waiters) == (1, 0, 0)
+
+
 def _on_a_thread_of_its_own(action: Callable[[], Any], *, timeout: float = 5.0) -> Any:
     """Run ``action`` on a new thread and return its result or raise its error.
 
@@ -534,7 +614,25 @@ class _AbandonedBody:
         self.cycle = self
 
 
-def test_a_slot_freed_by_a_collection_the_refusal_starts_does_not_deadlock(monkeypatch) -> None:
+# How each refusal is reached: the stream already admitted, the newcomer
+# refused, and the error class that refuses it. The process cap refuses a
+# second account; the per-account quota refuses the same account again.
+_REFUSALS = {
+    "process-cap": (
+        {"user_id": "first-account", "limit": 1, "per_user_limit": 10},
+        {"user_id": "second-account", "limit": 1, "per_user_limit": 10},
+        "EventTailCapacityError",
+    ),
+    "account-quota": (
+        {"user_id": "one-account", "limit": 10, "per_user_limit": 1},
+        {"user_id": "one-account", "limit": 10, "per_user_limit": 1},
+        "EventTailUserQuotaError",
+    ),
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(_REFUSALS))
+def test_a_slot_freed_by_a_collection_the_refusal_starts_does_not_deadlock(monkeypatch, refusal: str) -> None:
     """A refusal used to build its error while it held the slot lock.
 
     Building an object can start a garbage collection on the same thread. When
@@ -544,19 +642,20 @@ def test_a_slot_freed_by_a_collection_the_refusal_starts_does_not_deadlock(monke
     """
     from app.services import event_tail_service
 
-    capacity_error = event_tail_service.EventTailCapacityError
+    admitted, refused, error_name = _REFUSALS[refusal]
+    refusal_error = getattr(event_tail_service, error_name)
     slots = event_tail_service._StreamSlots()
-    abandoned = slots.acquire(1)
+    abandoned = slots.acquire(**admitted)
     lock_held_while_refusing: list[bool] = []
 
-    class _CollectingCapacityError(capacity_error):
+    class _CollectingRefusal(refusal_error):
         def __init__(self, **kwargs: Any) -> None:
             lock_held_while_refusing.append(slots._lock.locked())
             # The allocation that happens to start a collection.
             gc.collect()
             super().__init__(**kwargs)
 
-    monkeypatch.setattr(event_tail_service, "EventTailCapacityError", _CollectingCapacityError)
+    monkeypatch.setattr(event_tail_service, error_name, _CollectingRefusal)
     collecting = gc.isenabled()
     # Only the collection the refusal starts may free the abandoned body.
     gc.disable()
@@ -567,14 +666,15 @@ def test_a_slot_freed_by_a_collection_the_refusal_starts_does_not_deadlock(monke
         assert finalizer.alive
         assert slots.open == 1
 
-        with pytest.raises(capacity_error):
-            _on_a_thread_of_its_own(lambda: slots.acquire(1))
+        with pytest.raises(refusal_error):
+            _on_a_thread_of_its_own(lambda: slots.acquire(**refused))
     finally:
         if collecting:
             gc.enable()
 
     assert not finalizer.alive
     assert slots.open == 0
+    assert slots.users == 0
     assert lock_held_while_refusing == [False]
 
 
@@ -614,6 +714,23 @@ class _CollectsWhileHeld:
             callback()
 
 
+# A cap of two, reached through the process cap (three accounts) or through
+# one account's quota (the same account three times).
+_FULL_AT_TWO = {
+    "process-cap": (
+        ("first-account", "second-account", "third-account"),
+        {"limit": 2, "per_user_limit": 10},
+        "EventTailCapacityError",
+    ),
+    "account-quota": (
+        ("one-account", "one-account", "one-account"),
+        {"limit": 10, "per_user_limit": 2},
+        "EventTailUserQuotaError",
+    ),
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(_FULL_AT_TWO))
 @pytest.mark.parametrize(
     ("point", "admitted", "still_open"),
     [
@@ -628,20 +745,22 @@ def test_a_slot_freed_on_the_admitting_thread_while_it_holds_the_lock_keeps_the_
     point: str,
     admitted: bool,
     still_open: int,
+    refusal: str,
 ) -> None:
     from app.services import event_tail_service
 
+    (abandoned_user, kept_user, newcomer_user), limits, error_name = _FULL_AT_TWO[refusal]
     slots = event_tail_service._StreamSlots()
-    abandoned = slots.acquire(2)
-    kept = slots.acquire(2)
+    abandoned = slots.acquire(abandoned_user, **limits)
+    kept = slots.acquire(kept_user, **limits)
     monkeypatch.setattr(slots, "_lock", _CollectsWhileHeld(slots._lock, abandoned.release, point=point))
 
     newcomer = None
     if admitted:
-        newcomer = _on_a_thread_of_its_own(lambda: slots.acquire(2))
+        newcomer = _on_a_thread_of_its_own(lambda: slots.acquire(newcomer_user, **limits))
     else:
-        with pytest.raises(event_tail_service.EventTailCapacityError):
-            _on_a_thread_of_its_own(lambda: slots.acquire(2))
+        with pytest.raises(getattr(event_tail_service, error_name)):
+            _on_a_thread_of_its_own(lambda: slots.acquire(newcomer_user, **limits))
 
     assert slots.open == still_open
     # A slot given back twice is counted once.
@@ -651,3 +770,5 @@ def test_a_slot_freed_on_the_admitting_thread_while_it_holds_the_lock_keeps_the_
     if newcomer is not None:
         newcomer.release()
     assert slots.open == 0
+    # An account leaves the per-account count with its last stream.
+    assert slots.users == 0

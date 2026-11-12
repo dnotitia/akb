@@ -16,10 +16,16 @@ db_user: akb
 # keys — the deployment-layer knob for k8s / akb-platform.
 # pg_pool_min_size: 2
 # pg_pool_max_size: 30
-# Most open event tail streams (GET /api/v1/events/{vault}) per server process
-# (optional; default shown). Past it a new stream gets 503 with Retry-After.
-# The env var AKB_EVENT_TAIL_MAX_STREAMS takes precedence over this key.
+# Event tail streams (GET /api/v1/events/{vault}), per server process
+# (optional; defaults shown). The most open streams: past it a new stream gets
+# 503 with Retry-After. The most open streams of one account: past it that
+# account's next stream gets 429. The most pool connections the streams'
+# database work holds at once; keep it well under pg_pool_max_size. The env
+# vars AKB_EVENT_TAIL_MAX_STREAMS, AKB_EVENT_TAIL_MAX_STREAMS_PER_USER and
+# AKB_EVENT_TAIL_DB_CONCURRENCY take precedence over these keys.
 # event_tail_max_streams: 256
+# event_tail_max_streams_per_user: 48
+# event_tail_db_concurrency: 6
 
 # Runtime safety budgets. Each Kiwi child holds its own model in memory, so do
 # not derive this from host CPU count. Kubernetes grants 45 seconds for pod

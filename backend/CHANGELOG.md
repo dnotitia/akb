@@ -9,12 +9,20 @@ specifically; the proxy has its own log in
 
 - Open `GET /api/v1/events/{vault}` SSE tails no longer hold request-pool
   connections. Each server process wakes them from one dedicated PostgreSQL
-  `LISTEN` connection, and a tail borrows a pooled connection only to re-check
-  access and read a batch. Many open tails can no longer exhaust the pool and
-  fail readiness. A process serves at most `event_tail_max_streams` tails
-  (default 256, overridden by `AKB_EVENT_TAIL_MAX_STREAMS`); past that a new
-  tail gets 503 `event_tail_capacity` with `Retry-After`. Frames, cursors and
-  heartbeats are unchanged.
+  `LISTEN` connection. A tail borrows one pooled connection to read a batch
+  and, when the batch has rows, checks access on that same connection; it no
+  longer runs an access query for every event it sends. All tail database work
+  in a process shares at most `event_tail_db_concurrency` connections (default
+  6, overridden by `AKB_EVENT_TAIL_DB_CONCURRENCY`), so many open tails or a
+  burst of events can no longer exhaust the pool and fail readiness. A process
+  serves at most `event_tail_max_streams` tails (default 256,
+  `AKB_EVENT_TAIL_MAX_STREAMS`); past that a new tail gets 503
+  `event_tail_capacity` with `Retry-After`. One account may hold at most
+  `event_tail_max_streams_per_user` of them (default 48,
+  `AKB_EVENT_TAIL_MAX_STREAMS_PER_USER`); past that its next tail gets 429
+  `event_tail_user_quota`, on which the SDK's change channel stops instead of
+  retrying. `GET /health` reports the tail counters under `event_tail`.
+  Frames, cursors and heartbeats are unchanged.
 
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain

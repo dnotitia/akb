@@ -181,12 +181,12 @@ def tail(monkeypatch):
     monkeypatch.setattr(event_tail_service, "list_vault_events", AsyncMock(return_value=[]))
     monkeypatch.setattr(event_tail_service, "HEARTBEAT_INTERVAL_SECONDS", 30.0)
 
-    async def open_stream(*, disconnected: bool = False) -> StreamingResponse:
+    async def open_stream(*, disconnected: bool = False, user_id: str = "user") -> StreamingResponse:
         request = MagicMock()
         request.is_disconnected = AsyncMock(return_value=disconnected)
         return await event_tail_service.open_tail(
             request,
-            user_id="user",
+            user_id=user_id,
             vault="vault",
             vault_id=UUID("11111111-1111-4111-8111-111111111111"),
             last_event_id=None,
@@ -234,6 +234,7 @@ async def test_a_stream_dropped_before_its_body_starts_gives_its_slot_back(tail)
     gc.collect()
 
     assert tail.service.open_stream_count() == 0
+    assert tail.service._stream_slots.users == 0
 
 
 @pytest.mark.asyncio
@@ -251,6 +252,7 @@ async def test_a_cancelled_stream_gives_its_slot_and_subscription_back(tail) -> 
         await reading
 
     assert tail.service.open_stream_count() == 0
+    assert tail.service._stream_slots.users == 0
     assert tail.hub.subscriptions == []
 
 
@@ -292,6 +294,121 @@ async def test_a_failed_preflight_gives_its_slot_back(tail, monkeypatch) -> None
         )
 
     assert tail.service.open_stream_count() == 0
+    assert tail.service._stream_slots.users == 0
+
+
+@pytest.mark.asyncio
+async def test_an_account_past_its_quota_gets_429_while_other_accounts_still_open_streams(tail, monkeypatch) -> None:
+    monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS", "10")
+    monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS_PER_USER", "2")
+
+    kept = [await tail.open(user_id="busy-account") for _ in range(2)]
+    with pytest.raises(tail.service.EventTailUserQuotaError) as exc_info:
+        await tail.open(user_id="busy-account")
+    refusal = exc_info.value
+    assert refusal.status_code == 429
+    assert refusal.code == "event_tail_user_quota"
+    assert refusal.retry_after_secs == 5
+    assert refusal.hint == "Close event streams this account no longer reads."
+    # The refusal took nothing, and another account is not held to this one's quota.
+    assert tail.service.open_stream_count() == 2
+    kept.append(await tail.open(user_id="quiet-account"))
+    assert tail.service.open_stream_count() == 3
+    assert tail.service._stream_slots.users == 2
+    del kept
+
+
+@pytest.mark.asyncio
+async def test_the_process_cap_still_refuses_with_503_below_every_account_quota(tail, monkeypatch) -> None:
+    monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS", "2")
+    monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS_PER_USER", "5")
+
+    kept = [await tail.open(user_id="first-account"), await tail.open(user_id="second-account")]
+    with pytest.raises(tail.service.EventTailCapacityError) as exc_info:
+        await tail.open(user_id="third-account")
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.code == "event_tail_capacity"
+    assert tail.service.open_stream_count() == 2
+    del kept
+
+
+@pytest.mark.asyncio
+async def test_an_account_at_its_quota_on_a_full_server_is_told_to_close_streams(tail, monkeypatch) -> None:
+    """Retrying cannot help an account at its quota, so it gets the 429 even when the server is full."""
+    monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS", "1")
+    monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS_PER_USER", "1")
+
+    kept = await tail.open(user_id="busy-account")
+    with pytest.raises(tail.service.EventTailUserQuotaError):
+        await tail.open(user_id="busy-account")
+    with pytest.raises(tail.service.EventTailCapacityError):
+        await tail.open(user_id="other-account")
+    del kept
+
+
+@pytest.mark.asyncio
+async def test_an_account_gets_its_quota_back_however_its_streams_end(tail, monkeypatch) -> None:
+    monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS_PER_USER", "1")
+    slots = tail.service._stream_slots
+
+    # The client left before the body started: the finalizer gives the slot back.
+    response = await tail.open(user_id="account")
+    assert (slots.open, slots.users) == (1, 1)
+    del response
+    gc.collect()
+    assert (slots.open, slots.users) == (0, 0)
+
+    # The stream was cancelled while it waited.
+    response = await tail.open(user_id="account")
+    reading = asyncio.create_task(anext(response.body_iterator))
+
+    async def parked() -> None:
+        while not tail.hub.subscriptions:
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(parked(), timeout=1.0)
+    reading.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+    assert (slots.open, slots.users) == (0, 0)
+
+    # The preflight refused the cursor.
+    with pytest.raises(tail.service.EventCursorError):
+        await tail.service.open_tail(
+            MagicMock(),
+            user_id="account",
+            vault="vault",
+            vault_id=UUID("11111111-1111-4111-8111-111111111111"),
+            last_event_id=None,
+            cursor="not-a-cursor",
+            start=None,
+            kinds=None,
+        )
+    assert (slots.open, slots.users) == (0, 0)
+
+    # Its whole quota is there again.
+    kept = await tail.open(user_id="account")
+    assert (slots.open, slots.users) == (1, 1)
+    del kept
+
+
+@pytest.mark.asyncio
+async def test_quota_refusal_is_a_final_429_on_the_rest_surface(monkeypatch, tmp_path) -> None:
+    from app.config import settings
+
+    # Importing the app builds services that create the storage root.
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    from app.main import akb_error_handler
+    from app.services.event_tail_service import EventTailUserQuotaError
+
+    response = await akb_error_handler(None, EventTailUserQuotaError())
+
+    # A 4xx: the SDK's change channel stops on it instead of retrying.
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "5"
+    body = json.loads(response.body)
+    assert body["code"] == "event_tail_user_quota"
+    assert body["hint"] == "Close event streams this account no longer reads."
 
 
 @pytest.mark.asyncio
@@ -340,3 +457,53 @@ def test_app_yaml_stream_cap_defaults_to_256_and_must_be_positive() -> None:
     assert Settings(document_revision_backend="bare_git").event_tail_max_streams == 256
     with pytest.raises(ValidationError):
         Settings(document_revision_backend="bare_git", event_tail_max_streams=0)
+
+
+@pytest.mark.parametrize(
+    ("variable", "key", "reader"),
+    [
+        (
+            "AKB_EVENT_TAIL_MAX_STREAMS_PER_USER",
+            "event_tail_max_streams_per_user",
+            "configured_max_streams_per_user",
+        ),
+        ("AKB_EVENT_TAIL_DB_CONCURRENCY", "event_tail_db_concurrency", "configured_db_concurrency"),
+    ],
+)
+def test_account_quota_and_database_budget_come_from_the_environment_then_app_yaml(
+    monkeypatch,
+    variable: str,
+    key: str,
+    reader: str,
+) -> None:
+    from app.config import settings
+    from app.services import event_tail_service
+
+    configured = getattr(event_tail_service, reader)
+    monkeypatch.setattr(settings, key, 7)
+    monkeypatch.delenv(variable, raising=False)
+    assert configured() == 7
+
+    monkeypatch.setenv(variable, " 12 ")
+    assert configured() == 12
+
+    monkeypatch.setenv(variable, "")
+    assert configured() == 7
+
+    for malformed in ("many", "0", "-3", "1.5"):
+        monkeypatch.setenv(variable, malformed)
+        with pytest.raises(RuntimeError, match=variable):
+            configured()
+
+
+def test_app_yaml_account_quota_defaults_to_48_and_database_budget_to_6() -> None:
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    defaults = Settings(document_revision_backend="bare_git")
+    assert defaults.event_tail_max_streams_per_user == 48
+    assert defaults.event_tail_db_concurrency == 6
+    for key in ("event_tail_max_streams_per_user", "event_tail_db_concurrency"):
+        with pytest.raises(ValidationError):
+            Settings(document_revision_backend="bare_git", **{key: 0})

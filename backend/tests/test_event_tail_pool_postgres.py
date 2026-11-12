@@ -58,10 +58,9 @@ async def test_more_open_streams_than_pool_connections_leave_the_pool_usable(mon
             reads += 1
             return await list_vault_events(conn, *args, **kwargs)
 
-        async def check_vault_access(*_args, **_kwargs) -> dict:
-            # The real access re-check also borrows a pooled connection.
-            async with pool.acquire() as conn:
-                await conn.fetchval("SELECT 1")
+        async def check_vault_access(*_args, _conn, **_kwargs) -> dict:
+            # The real access check queries the connection the batch was read on.
+            await _conn.fetchval("SELECT 1")
             return {"vault_id": vault_id}
 
         monkeypatch.setattr(event_tail_service, "get_pool", get_pool)
