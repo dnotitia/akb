@@ -40,8 +40,8 @@ class _FakeHub:
         self.subscriptions: list[EventTailSubscription] = []
         self.unsubscribed: list[EventTailSubscription] = []
 
-    def subscribe(self) -> EventTailSubscription:
-        subscription = EventTailSubscription()
+    def subscribe(self, vault_id: object) -> EventTailSubscription:
+        subscription = EventTailSubscription(str(vault_id))
         self.subscriptions.append(subscription)
         return subscription
 
@@ -309,6 +309,8 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
     assert list_events.await_args.kwargs == {"after_id": 9, "limit": event_tail_service.EVENT_BATCH_SIZE}
     assert hub.subscriptions == []
     assert len(hub.unsubscribed) == 1
+    # The stream asked to be woken for its own Vault's events only.
+    assert hub.unsubscribed[0].vault == str(VAULT_ID)
     # One access check covered the whole batch, on the connection it was read
     # on; the rows did not each borrow a connection for a check of their own.
     assert access.await_count == 1

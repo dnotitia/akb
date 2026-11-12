@@ -421,6 +421,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "127_sso_operation_requests.py",  # human-approved, hash-bound service-key operation requests
         "128_approval_service_bootstrap.py",  # non-secret requester credential lineage
         "129_sso_request_recovery.py",  # permanent requester nonce and stable history paging
+        "131_events_notify_vault.py",  # events NOTIFY names the Vault, so an event wakes only that Vault's tails
     ):
         if filename in applied:
             continue

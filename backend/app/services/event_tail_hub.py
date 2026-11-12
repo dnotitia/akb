@@ -8,8 +8,10 @@ back, while the database itself sat idle.
 
 This module keeps one connection per process, opened outside the request pool,
 that LISTENs on the channel the ``events`` insert trigger notifies. A
-notification carries only the new event's id, not its Vault, so every
-subscriber is woken and re-reads its own Vault from the table by cursor. The
+notification names the new event's Vault and id, and only that Vault's
+subscribers are woken; each re-reads its Vault from the table by cursor. An
+event without a Vault wakes none. A notification that carries only an id, sent
+by a database that has not yet run migration 131, wakes every subscriber. The
 table is the source of truth and a notification is only a hint: a wake-up that
 never arrives delays a stream until its next heartbeat re-read and loses
 nothing. That is why the hub never raises into a stream. A failed or lost
@@ -24,6 +26,7 @@ import contextlib
 import contextvars
 import logging
 from typing import Any
+from uuid import UUID
 
 import asyncpg
 
@@ -31,8 +34,9 @@ from app.config import settings
 
 logger = logging.getLogger("akb.event_tail_hub")
 
-# The channel the `events` AFTER INSERT trigger notifies (migration 015); the
-# payload is the new row's id.
+# The channel the `events` AFTER INSERT trigger notifies (migration 015). Since
+# migration 131 the payload is `<vault_id>:<id>`, with an empty Vault part for
+# an event that has none; before it, the payload was the id alone.
 EVENT_CHANNEL = "akb_events"
 
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -62,17 +66,29 @@ async def _connect_listener() -> asyncpg.Connection:
     )
 
 
+def _vault_key(vault_id: object) -> str:
+    """A Vault id as PostgreSQL writes ``uuid::text``: lowercase and hyphenated."""
+    if isinstance(vault_id, UUID):
+        return str(vault_id)
+    text = str(vault_id)
+    try:
+        return str(UUID(text))
+    except ValueError:
+        return text
+
+
 class EventTailSubscription:
     """One stream's wake-up flag: the hub sets it, the stream clears and awaits it."""
 
-    __slots__ = ("wakeup",)
+    __slots__ = ("vault", "wakeup")
 
-    def __init__(self) -> None:
+    def __init__(self, vault: str) -> None:
+        self.vault = vault
         self.wakeup = asyncio.Event()
 
 
 class EventTailHub:
-    """Fan one LISTEN connection's notifications out to every subscribed stream."""
+    """Fan one LISTEN connection's notifications out to the streams of each event's Vault."""
 
     def __init__(
         self,
@@ -94,11 +110,15 @@ class EventTailHub:
         self._keepalive_interval = keepalive_interval
         self._keepalive_timeout = keepalive_timeout
         self._close_timeout = close_timeout
-        self._subscribers: set[EventTailSubscription] = set()
+        self._subscribers: dict[str, set[EventTailSubscription]] = {}
         self._task: asyncio.Task[None] | None = None
         self._connected = False
         self._closed = False
-        self._wake_pending = False
+        # Wake-ups waiting for the next flush, which a burst shares: every
+        # subscriber, or the subscribers of these Vaults.
+        self._flush_scheduled = False
+        self._wake_everyone = False
+        self._pending_vaults: set[str] = set()
 
     @property
     def connected(self) -> bool:
@@ -107,23 +127,28 @@ class EventTailHub:
 
     @property
     def subscriber_count(self) -> int:
-        return len(self._subscribers)
+        return sum(len(subscriptions) for subscriptions in self._subscribers.values())
 
-    def subscribe(self) -> EventTailSubscription:
-        """Register a wake-up flag, starting the listener on first use.
+    def subscribe(self, vault_id: object) -> EventTailSubscription:
+        """Register a wake-up flag for one Vault's events, starting the listener on first use.
 
         Call from the event loop. A database problem never surfaces here: the
         connection is opened in the background, and until it is up a stream
         still re-reads on its heartbeat.
         """
-        subscription = EventTailSubscription()
-        self._subscribers.add(subscription)
+        subscription = EventTailSubscription(_vault_key(vault_id))
+        self._subscribers.setdefault(subscription.vault, set()).add(subscription)
         self._ensure_running()
         return subscription
 
     def unsubscribe(self, subscription: EventTailSubscription) -> None:
         """Stop waking ``subscription``. Unknown or repeated calls are no-ops."""
-        self._subscribers.discard(subscription)
+        subscriptions = self._subscribers.get(subscription.vault)
+        if subscriptions is None:
+            return
+        subscriptions.discard(subscription)
+        if not subscriptions:
+            del self._subscribers[subscription.vault]
 
     async def close(self) -> None:
         """Stop listening and close the connection. Safe to call more than once.
@@ -141,8 +166,8 @@ class EventTailHub:
             if pending:
                 logger.warning("Event tail listener did not stop within %.1fs", self._close_timeout * 2)
         self._connected = False
-        self._wake_pending = False
-        for subscription in tuple(self._subscribers):
+        self._clear_pending_wakeups()
+        for subscription in self._all_subscriptions():
             subscription.wakeup.set()
 
     def _ensure_running(self) -> None:
@@ -150,8 +175,8 @@ class EventTailHub:
             return
         if self._task is not None and not self._task.done():
             return
-        # A wake-up scheduled on a loop that is gone would never clear the flag.
-        self._wake_pending = False
+        # A wake-up scheduled on a loop that is gone would never clear the flags.
+        self._clear_pending_wakeups()
         # A fresh context: the listener outlives the request that started it and
         # must not carry that request's context variables.
         self._task = asyncio.get_running_loop().create_task(
@@ -253,19 +278,52 @@ class EventTailHub:
                 logger.warning("Event tail listener keepalive failed (%s)", type(exc).__name__)
                 return
 
-    def _on_notify(self, *_args: object) -> None:
-        self._wake_all()
+    def _on_notify(self, _connection: object, _pid: int, _channel: str, payload: str) -> None:
+        vault, separator, _ = payload.partition(":")
+        if not separator:
+            # The id-only payload of a database without migration 131 names no
+            # Vault, so any stream may have something to read.
+            self._wake_all()
+        elif vault:
+            self._wake_vault(vault)
+        # An event without a Vault is in no stream's tail: nothing to wake.
+
+    def _all_subscriptions(self) -> list[EventTailSubscription]:
+        return [subscription for subscriptions in self._subscribers.values() for subscription in subscriptions]
+
+    def _clear_pending_wakeups(self) -> None:
+        self._flush_scheduled = False
+        self._wake_everyone = False
+        self._pending_vaults.clear()
 
     def _wake_all(self) -> None:
         """Schedule one wake-up of every subscriber; a burst shares one pass."""
-        if self._wake_pending:
+        self._wake_everyone = True
+        self._pending_vaults.clear()
+        self._schedule_flush()
+
+    def _wake_vault(self, vault: str) -> None:
+        """Schedule one wake-up of ``vault``'s subscribers; a burst shares one pass."""
+        if self._wake_everyone or vault not in self._subscribers:
             return
-        self._wake_pending = True
+        self._pending_vaults.add(vault)
+        self._schedule_flush()
+
+    def _schedule_flush(self) -> None:
+        if self._flush_scheduled:
+            return
+        self._flush_scheduled = True
         asyncio.get_running_loop().call_soon(self._flush_wakeups)
 
     def _flush_wakeups(self) -> None:
-        self._wake_pending = False
-        for subscription in tuple(self._subscribers):
+        if self._wake_everyone:
+            woken = self._all_subscriptions()
+        else:
+            woken = [
+                subscription for vault in self._pending_vaults for subscription in self._subscribers.get(vault, ())
+            ]
+        self._clear_pending_wakeups()
+        for subscription in woken:
             subscription.wakeup.set()
 
 

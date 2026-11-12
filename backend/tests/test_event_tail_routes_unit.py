@@ -147,10 +147,10 @@ class _Hub:
     def __init__(self) -> None:
         self.subscriptions: list = []
 
-    def subscribe(self):
+    def subscribe(self, vault_id):
         from app.services.event_tail_hub import EventTailSubscription
 
-        subscription = EventTailSubscription()
+        subscription = EventTailSubscription(str(vault_id))
         self.subscriptions.append(subscription)
         return subscription
 

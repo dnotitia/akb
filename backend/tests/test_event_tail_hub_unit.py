@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 import contextvars
+from uuid import UUID
 
 import pytest
 
@@ -21,6 +22,10 @@ from app.services.event_tail_hub import EVENT_CHANNEL, EventTailHub
 pytestmark = pytest.mark.asyncio
 
 _real_sleep = asyncio.sleep
+
+_VAULT_A = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+_VAULT_B = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+_VAULT_C = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 
 
 class _FakeListenConnection:
@@ -127,8 +132,8 @@ async def test_first_subscribe_starts_one_listener_and_a_notification_wakes_ever
     hub = _hub(connector)
     try:
         assert not hub.connected
-        first = hub.subscribe()
-        second = hub.subscribe()
+        first = hub.subscribe(_VAULT_A)
+        second = hub.subscribe(_VAULT_B)
         await _until(lambda: hub.connected)
 
         assert connector.calls == 1
@@ -141,7 +146,9 @@ async def test_first_subscribe_starts_one_listener_and_a_notification_wakes_ever
 
         first.wakeup.clear()
         second.wakeup.clear()
-        connection.notify()
+        # An id-only payload, as a database without migration 131 sends,
+        # names no Vault: every stream is woken.
+        connection.notify("17")
         await _until(lambda: first.wakeup.is_set() and second.wakeup.is_set())
     finally:
         await hub.close()
@@ -151,8 +158,8 @@ async def test_unsubscribed_stream_is_no_longer_woken() -> None:
     connector = _Connector()
     hub = _hub(connector)
     try:
-        kept = hub.subscribe()
-        dropped = hub.subscribe()
+        kept = hub.subscribe(_VAULT_A)
+        dropped = hub.subscribe(_VAULT_A)
         await _until(lambda: hub.connected)
         await _settle()
         kept.wakeup.clear()
@@ -160,12 +167,16 @@ async def test_unsubscribed_stream_is_no_longer_woken() -> None:
 
         hub.unsubscribe(dropped)
         hub.unsubscribe(dropped)  # repeated calls are harmless
-        connector.connections[0].notify()
+        connector.connections[0].notify(f"{_VAULT_A}:17")
         await _until(kept.wakeup.is_set)
         await _settle()
 
         assert not dropped.wakeup.is_set()
         assert hub.subscriber_count == 1
+        # The Vault is forgotten with its last stream.
+        hub.unsubscribe(kept)
+        assert hub.subscriber_count == 0
+        assert hub._subscribers == {}
     finally:
         await hub.close()
 
@@ -174,7 +185,7 @@ async def test_a_burst_of_notifications_is_one_fan_out_pass() -> None:
     connector = _Connector()
     hub = _hub(connector)
     try:
-        subscription = hub.subscribe()
+        subscription = hub.subscribe(_VAULT_A)
         await _until(lambda: hub.connected)
         await _settle()
         subscription.wakeup.clear()
@@ -197,21 +208,116 @@ async def test_a_burst_of_notifications_is_one_fan_out_pass() -> None:
         await hub.close()
 
 
+@pytest.mark.parametrize(
+    ("payload", "woken"),
+    [
+        pytest.param("4242", {"a", "a-again", "b"}, id="id-only-payload-wakes-every-stream"),
+        pytest.param(f"{_VAULT_A}:4242", {"a", "a-again"}, id="vault-payload-wakes-that-vaults-streams"),
+        pytest.param(":4242", set(), id="event-without-a-vault-wakes-none"),
+        pytest.param(f"{_VAULT_C}:4242", set(), id="vault-without-streams-wakes-none"),
+    ],
+)
+async def test_a_notification_wakes_the_streams_of_the_vault_it_names(payload: str, woken: set[str]) -> None:
+    connector = _Connector()
+    hub = _hub(connector)
+    try:
+        subscriptions = {
+            "a": hub.subscribe(_VAULT_A),
+            # The same Vault, written the way a caller might hold it.
+            "a-again": hub.subscribe(str(_VAULT_A).upper()),
+            "b": hub.subscribe(_VAULT_B),
+        }
+        await _until(lambda: hub.connected)
+        await _settle()
+        for subscription in subscriptions.values():
+            subscription.wakeup.clear()
+
+        connector.connections[0].notify(payload)
+        await _settle()
+
+        assert {name for name, subscription in subscriptions.items() if subscription.wakeup.is_set()} == woken
+    finally:
+        await hub.close()
+
+
+async def test_notifications_for_several_vaults_share_one_pass_and_wake_no_other_vault() -> None:
+    connector = _Connector()
+    hub = _hub(connector)
+    try:
+        first = hub.subscribe(_VAULT_A)
+        second = hub.subscribe(_VAULT_B)
+        untouched = hub.subscribe(_VAULT_C)
+        await _until(lambda: hub.connected)
+        await _settle()
+        for subscription in (first, second, untouched):
+            subscription.wakeup.clear()
+        passes = 0
+        flush = hub._flush_wakeups
+
+        def counting_flush() -> None:
+            nonlocal passes
+            passes += 1
+            flush()
+
+        hub._flush_wakeups = counting_flush  # type: ignore[method-assign]
+        for event_id in range(50):
+            connector.connections[0].notify(f"{_VAULT_A if event_id % 2 else _VAULT_B}:{event_id}")
+        await _until(lambda: first.wakeup.is_set() and second.wakeup.is_set())
+        await _settle()
+
+        assert passes == 1
+        assert not untouched.wakeup.is_set()
+    finally:
+        await hub.close()
+
+
+async def test_an_id_only_notification_in_a_burst_wakes_every_stream_in_the_same_pass() -> None:
+    connector = _Connector()
+    hub = _hub(connector)
+    try:
+        subscriptions = [hub.subscribe(vault) for vault in (_VAULT_A, _VAULT_B, _VAULT_C)]
+        await _until(lambda: hub.connected)
+        await _settle()
+        for subscription in subscriptions:
+            subscription.wakeup.clear()
+        passes = 0
+        flush = hub._flush_wakeups
+
+        def counting_flush() -> None:
+            nonlocal passes
+            passes += 1
+            flush()
+
+        hub._flush_wakeups = counting_flush  # type: ignore[method-assign]
+        connection = connector.connections[0]
+        connection.notify(f"{_VAULT_A}:1")
+        connection.notify("2")
+        connection.notify(f"{_VAULT_B}:3")
+        await _until(lambda: all(subscription.wakeup.is_set() for subscription in subscriptions))
+        await _settle()
+
+        assert passes == 1
+    finally:
+        await hub.close()
+
+
 async def test_lost_connection_wakes_subscribers_and_listens_again() -> None:
     first_connection = _FakeListenConnection()
     second_connection = _FakeListenConnection()
     connector = _Connector(first_connection, second_connection)
     hub = _hub(connector, reconnect_initial_delay=0.01, reconnect_max_delay=0.01)
     try:
-        subscription = hub.subscribe()
+        subscription = hub.subscribe(_VAULT_A)
+        other = hub.subscribe(_VAULT_B)
         await _until(lambda: hub.connected)
         await _settle()
         subscription.wakeup.clear()
+        other.wakeup.clear()
 
         first_connection.lose()
-        # The stream is woken to re-read: notifications sent while nothing
-        # listens are gone for good.
-        await _until(subscription.wakeup.is_set)
+        # Every stream, of every Vault, is woken to re-read: notifications
+        # sent while nothing listens are gone for good.
+        await _until(lambda: subscription.wakeup.is_set() and other.wakeup.is_set())
         await _until(lambda: connector.calls == 2 and hub.connected)
         assert len(second_connection.listeners[EVENT_CHANNEL]) == 1
 
@@ -239,7 +345,7 @@ async def test_failed_connects_retry_with_bounded_exponential_backoff(monkeypatc
     )
     hub = _hub(connector, reconnect_initial_delay=0.5, reconnect_max_delay=1.0)
     try:
-        subscription = hub.subscribe()  # never raises, even though connecting fails
+        subscription = hub.subscribe(_VAULT_A)  # never raises, even though connecting fails
         await _until(lambda: hub.connected)
         await _until(subscription.wakeup.is_set)
 
@@ -273,7 +379,7 @@ async def test_a_connection_dropped_right_after_listen_keeps_growing_the_backoff
     connector = _Connector(*dropped)
     hub = _hub(connector, reconnect_initial_delay=0.5, reconnect_max_delay=4.0)
     try:
-        hub.subscribe()
+        hub.subscribe(_VAULT_A)
         await _until(lambda: connector.calls == len(dropped) + 1 and hub.connected)
 
         assert all(connection.closed for connection in dropped)
@@ -288,7 +394,7 @@ async def test_a_connection_that_stayed_up_restarts_the_backoff(monkeypatch) -> 
     connector = _Connector(OSError("connection refused"), OSError("connection refused"), stayed_up)
     hub = _hub(connector, reconnect_initial_delay=0.5, reconnect_max_delay=4.0, reconnect_reset_after=0.05)
     try:
-        hub.subscribe()
+        hub.subscribe(_VAULT_A)
         await _until(lambda: connector.calls == 3 and hub.connected)
         # Held for longer than reconnect_reset_after before it is lost.
         await _real_sleep(0.1)
@@ -306,7 +412,7 @@ async def test_keepalive_failure_drops_a_silent_connection_and_reconnects() -> N
     connector = _Connector(silent, healthy)
     hub = _hub(connector, keepalive_interval=0.01)
     try:
-        hub.subscribe()
+        hub.subscribe(_VAULT_A)
         await _until(lambda: connector.calls == 2 and hub.connected)
 
         assert silent.keepalives >= 1
@@ -320,7 +426,7 @@ async def test_keepalive_failure_drops_a_silent_connection_and_reconnects() -> N
 async def test_close_stops_listening_closes_gracefully_and_wakes_subscribers() -> None:
     connector = _Connector()
     hub = _hub(connector)
-    subscription = hub.subscribe()
+    subscription = hub.subscribe(_VAULT_A)
     await _until(lambda: hub.connected)
     await _settle()
     subscription.wakeup.clear()
@@ -335,7 +441,7 @@ async def test_close_stops_listening_closes_gracefully_and_wakes_subscribers() -
     assert subscription.wakeup.is_set()
 
     # A closed hub never reconnects; a late subscriber relies on its heartbeat.
-    late = hub.subscribe()
+    late = hub.subscribe(_VAULT_A)
     await _settle()
     assert connector.calls == 1
     assert not hub.connected
@@ -366,7 +472,7 @@ async def test_listener_task_does_not_inherit_the_subscribing_request_context() 
     hub = EventTailHub(connect, reconnect_initial_delay=0.0, close_timeout=1.0)
     token = request_scoped.set("request-1")
     try:
-        hub.subscribe()
+        hub.subscribe(_VAULT_A)
         await _until(lambda: hub.connected)
     finally:
         request_scoped.reset(token)
@@ -384,7 +490,7 @@ async def test_close_event_tail_hub_closes_the_process_hub_and_clears_the_handle
     connector = _Connector()
     running = _hub(connector)
     monkeypatch.setattr(event_tail_hub, "_hub", running)
-    running.subscribe()
+    running.subscribe(_VAULT_A)
     await _until(lambda: running.connected)
 
     await event_tail_hub.close_event_tail_hub()

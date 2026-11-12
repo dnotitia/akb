@@ -88,10 +88,14 @@ authenticated `GET /api/v1/events/{vault}` SSE tail reads the same PG outbox wit
 reader access checks; its opaque cursor is different from a Redis cursor.
 
 Each server process wakes its open SSE tails from one dedicated PostgreSQL
-`LISTEN` connection outside the request pool. A notification only wakes a tail,
-which then reads the outbox by cursor. If the listener connection drops, open
-tails keep re-reading on their 15-second heartbeat until it reconnects, so a
-missed wake-up delays delivery rather than dropping it.
+`LISTEN` connection outside the request pool. The `events` insert trigger's
+notification names the event's Vault (`<vault id>:<event id>`, migration 131),
+and only that Vault's tails wake; an event without a Vault wakes none. A
+database that has not yet applied migration 131 sends the event id alone, and
+then every tail wakes. A notification only wakes a tail, which then reads the
+outbox by cursor. If the listener connection drops, open tails keep re-reading
+on their 15-second heartbeat until it reconnects, so a missed wake-up delays
+delivery rather than dropping it.
 
 A waiting tail holds no pooled connection. To read, it borrows one for the
 batch and, when the batch has rows, checks the reader's access on that same

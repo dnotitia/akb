@@ -662,11 +662,11 @@ async def _stream_events(
     of losing access.
     """
     try:
-        # Wake-ups come from the process-wide LISTEN hub. Rows are read from
-        # the events table by cursor, so a missed wake-up only delays this
-        # stream until its heartbeat re-read.
+        # Wake-ups come from the process-wide LISTEN hub, for this Vault's
+        # events only. Rows are read from the events table by cursor, so a
+        # missed wake-up only delays this stream until its heartbeat re-read.
         hub = get_event_tail_hub()
-        subscription = hub.subscribe()
+        subscription = hub.subscribe(vault_id)
         try:
             wakeup = subscription.wakeup
             loop = asyncio.get_running_loop()

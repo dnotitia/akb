@@ -22,6 +22,8 @@ specifically; the proxy has its own log in
   `AKB_EVENT_TAIL_MAX_STREAMS_PER_USER`); past that its next tail gets 429
   `event_tail_user_quota`, on which the SDK's change channel stops instead of
   retrying. `GET /health` reports the tail counters under `event_tail`.
+  Migration 131 makes the `events` trigger's notification name the event's
+  Vault, so an event wakes only that Vault's tails instead of every open tail.
   Frames, cursors and heartbeats are unchanged.
 
 - SQL queries over a declared archived Vault or a managed Vault without write

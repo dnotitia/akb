@@ -111,7 +111,7 @@ async def test_hub_listens_on_its_own_connection_and_recovers_after_the_server_d
         pool_size = pool.get_size()
         hub = EventTailHub(reconnect_initial_delay=0.05, close_timeout=2.0)
         try:
-            subscription = hub.subscribe()
+            subscription = hub.subscribe(vault_id)
             await _until(lambda: hub.connected)
             pids = await _listener_pids(pool, database)
             assert len(pids) == 1
@@ -161,8 +161,8 @@ async def test_stream_reads_a_commit_on_its_heartbeat_while_the_listener_cannot_
         wakeups: list[_CountedWakeup] = []
         subscribe = hub.subscribe
 
-        def subscribe_counted() -> EventTailSubscription:
-            subscription = subscribe()
+        def subscribe_counted(vault: object) -> EventTailSubscription:
+            subscription = subscribe(vault)
             subscription.wakeup = _CountedWakeup()
             wakeups.append(subscription.wakeup)
             return subscription

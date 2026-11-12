@@ -50,6 +50,19 @@ async def _until(predicate: Callable[[], bool], *, timeout: float = 10.0) -> Non
     await asyncio.wait_for(poll(), timeout)
 
 
+async def _settled(tail: _Tail, *, quiet: float = 0.2) -> None:
+    """Wait until no tail read is under way and none has started for ``quiet`` seconds."""
+
+    async def poll() -> None:
+        while True:
+            seen = sum(tail.reads.values())
+            await asyncio.sleep(quiet)
+            if sum(tail.reads.values()) == seen and tail.reading == 0 and tail.tail_pool.held == 0:
+                return
+
+    await asyncio.wait_for(poll(), 10.0)
+
+
 class _Request:
     async def is_disconnected(self) -> bool:
         return False
@@ -275,9 +288,11 @@ async def test_a_burst_across_many_streams_leaves_the_pool_to_other_requests(mon
             probe = asyncio.create_task(_probe(tail.pool, latencies, stop_probing))
             inserted: dict[int, list[int]] = {vault: [] for vault in range(active_vaults)}
             try:
-                # Every stream has subscribed, read its empty Vault, and waits.
+                # Every stream has subscribed, read its empty Vault (again after
+                # the wake-up that establishing LISTEN sends to all), and waits.
                 await _until(lambda: tail.hub.connected and tail.hub.subscriber_count == len(bodies))
-                await _until(lambda: sum(tail.reads.values()) >= len(bodies) and tail.tail_pool.held == 0)
+                await _settled(tail)
+                reads_before_burst = Counter(tail.reads)
 
                 for _ in range(waves):
                     for vault in range(active_vaults):
@@ -313,6 +328,13 @@ async def test_a_burst_across_many_streams_leaves_the_pool_to_other_requests(mon
             # connection or renewed one for a slow reader: none per row, none
             # for a pass that found nothing.
             assert tail.checks == tail.reads_with_rows + tail.rechecks
+            # The events woke only their own Vaults' streams: the streams of
+            # Vaults without events read nothing during the whole burst.
+            idle_vaults_reads = [
+                tail.reads[str(vault_ids[vault])] - reads_before_burst[str(vault_ids[vault])]
+                for vault in range(active_vaults, len(names))
+            ]
+            assert idle_vaults_reads == [0] * idle_vaults
 
 
 async def test_streams_woken_while_the_database_stalls_leave_a_connection_for_requests(monkeypatch):
@@ -473,6 +495,8 @@ async def test_a_stream_without_rows_closes_within_one_heartbeat_of_losing_acces
             closed_after = loop.time() - revoked_at
             after_revocation = [frame for at, frame in frames if at >= revoked_at]
             print(f"\nidle stream closed {closed_after * 1000:.0f}ms after revocation (heartbeat {heartbeat * 1000:.0f}ms)")
-            # At most the heartbeat whose pass found the revocation, then the end.
+            # At most the heartbeat whose pass found the revocation, then the
+            # end: a stream that waited for a second heartbeat would show two.
             assert after_revocation in ([], [format_heartbeat()])
-            assert closed_after < 2 * heartbeat
+            # The clock agrees, with slack for a loaded host.
+            assert closed_after < heartbeat + 1.0
