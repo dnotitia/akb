@@ -54,6 +54,31 @@ async def _count_acquire(_conn) -> None:
     global _acquires_total, _last_acquire_at
     _acquires_total += 1
     _last_acquire_at = time.monotonic()
+    _wake_progress_waiters()
+
+
+# Futures of callers waiting in `next_pool_progress`, each from its own loop.
+_progress_waiters: set[asyncio.Future] = set()
+
+
+def _wake_progress_waiters() -> None:
+    while _progress_waiters:
+        waiter = _progress_waiters.pop()
+        try:
+            if not waiter.done() and not waiter.get_loop().is_closed():
+                waiter.set_result(None)
+        except Exception:  # noqa: BLE001 — the hook must not fail an acquire
+            logger.debug("pool progress waiter could not be woken", exc_info=True)
+
+
+async def next_pool_progress() -> None:
+    """Return once the next acquire that counts as pool progress completes."""
+    waiter = asyncio.get_running_loop().create_future()
+    _progress_waiters.add(waiter)
+    try:
+        await waiter
+    finally:
+        _progress_waiters.discard(waiter)
 
 
 def pool_progress() -> tuple[int, float | None]:

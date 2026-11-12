@@ -355,6 +355,32 @@ async def test_unproven_pool_that_cannot_connect_in_time_is_not_ready_within_the
     assert elapsed < main._READY_DB_TIMEOUT_SECONDS + 0.5
 
 
+async def test_probe_waiting_for_a_connection_stops_when_a_request_gets_one(main, probe, monkeypatch):
+    # A request has taken the last holder and is still opening its connection;
+    # the probe queues behind it. When that request's acquire completes, the
+    # pool has served it: the probe stops waiting instead of timing out.
+    monkeypatch.setattr(postgres, "_acquires_total", 0)
+    monkeypatch.setattr(postgres, "_last_acquire_at", None)
+    _unproven(probe)
+    probe.pool.acquire_delay = 60
+
+    async def request_connects_after(delay: float) -> None:
+        await asyncio.sleep(delay)
+        await postgres._count_acquire(object())  # the pool's hook, for the request
+
+    request = asyncio.create_task(request_connects_after(0.05))
+    started = time.monotonic()
+    ok, detail = await main._probe_ready()
+    elapsed = time.monotonic() - started
+    await request
+
+    assert ok is True, detail
+    assert detail["db"] == "ok"
+    assert elapsed < 1.0
+    probe.pool.idle_conn.fetchval.assert_not_awaited()
+    assert postgres._progress_waiters == set()
+
+
 @pytest.mark.parametrize("evidence", ["idle", "recent_acquire", "saturated"])
 async def test_pool_that_shows_it_works_is_not_borrowed_from(main, probe, evidence):
     _unproven(probe)

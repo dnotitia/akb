@@ -125,7 +125,9 @@ specifically; the proxy has its own log in
   readiness takes one connection through it within the probe's remaining
   budget and runs `SELECT 1`. A pool that cannot open that connection reports
   `db: error:pool_unavailable` or `db: error:pool_timeout` and is not ready,
-  even while the probe's own connection still answers.
+  even while the probe's own connection still answers. An acquire that a
+  request or background work completes while the probe waits proves the pool
+  and ends the wait.
 - When the server refuses the readiness probe's connection at
   `max_connections`, readiness asks the pool instead. With an idle connection
   it runs `SELECT 1` on that connection within the probe's remaining budget

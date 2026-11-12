@@ -45,7 +45,13 @@ from app.api.routes import (
     tables,
 )
 from app.config import settings
-from app.db.postgres import get_pool, pool_progress, readiness_acquires, readiness_ping
+from app.db.postgres import (
+    get_pool,
+    next_pool_progress,
+    pool_progress,
+    readiness_acquires,
+    readiness_ping,
+)
 from app.db.transient import transient_error
 from app.exceptions import AKBError, TransientDependencyError
 from app.logging_redaction import install_secret_redaction
@@ -537,9 +543,14 @@ def _remaining(budget: asyncio.Timeout) -> float | None:
     return None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
 
 
-async def _ping_through_pool(pool: asyncpg.Pool, budget: asyncio.Timeout) -> None:
+async def _ping_through_pool(pool: asyncpg.Pool, budget: asyncio.Timeout) -> bool:
     """Run ``SELECT 1`` on a pool connection, borrowed and given back within
     the rest of the probe's budget. Raises when that does not succeed in time.
+
+    Returns False without a ping when another caller's acquire completes
+    while the probe waits for a connection: the pool has just served someone.
+    A probe queued behind a request whose connection is still opening must
+    not report a working pool as broken.
 
     A connection that cannot finish in time is terminated rather than
     returned. Its query may never answer, nor the cancel request asyncpg
@@ -547,7 +558,9 @@ async def _ping_through_pool(pool: asyncpg.Pool, budget: asyncio.Timeout) -> Non
     again as the acquire was allowed. Terminating frees the pool slot at
     once and drops the pending cancel request.
     """
-    conn = await pool.acquire(timeout=_remaining(budget))
+    conn = await _acquire_unless_another_caller_does(pool, budget)
+    if conn is None:
+        return False
     try:
         await conn.fetchval("SELECT 1")
     except BaseException:
@@ -558,6 +571,41 @@ async def _ping_through_pool(pool: asyncpg.Pool, budget: asyncio.Timeout) -> Non
         _terminate_pool_connection(conn)
         raise TimeoutError
     await pool.release(conn, timeout=left)
+    return True
+
+
+async def _acquire_unless_another_caller_does(pool: asyncpg.Pool, budget: asyncio.Timeout):
+    """The probe's own acquire, or None if another caller's completes first."""
+    acquiring = asyncio.ensure_future(pool.acquire(timeout=_remaining(budget)))
+    progressed = asyncio.ensure_future(next_pool_progress())
+    try:
+        done, _ = await asyncio.wait({acquiring, progressed}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        progressed.cancel()
+        _abandon_acquire(acquiring)
+        raise
+    progressed.cancel()
+    if acquiring in done:
+        return acquiring.result()
+    _abandon_acquire(acquiring)
+    return None
+
+
+def _abandon_acquire(acquiring: asyncio.Future) -> None:
+    """Stop waiting for an acquire without awaiting its cleanup. A connection
+    it still hands over is terminated; its error, if any, is consumed."""
+
+    def drop(finished: asyncio.Future) -> None:
+        if finished.cancelled():
+            return
+        if finished.exception() is None:
+            _terminate_pool_connection(finished.result())
+
+    if acquiring.done():
+        drop(acquiring)
+    else:
+        acquiring.add_done_callback(drop)
+        acquiring.cancel()
 
 
 def _terminate_pool_connection(conn) -> None:
@@ -580,8 +628,9 @@ async def _db_ok_despite_full_server(pool: asyncpg.Pool, budget: asyncio.Timeout
     if pool.is_closing():
         return None
     if pool.get_idle_size() > 0:
-        await _ping_through_pool(pool, budget)
-        return _DB_OK_BY_POOL_IDLE
+        if await _ping_through_pool(pool, budget):
+            return _DB_OK_BY_POOL_IDLE
+        return _DB_OK_BY_POOL_PROGRESS
     _, last_acquire_age = pool_progress()
     if last_acquire_age is not None and last_acquire_age < settings.readyz_pool_saturation_grace_secs:
         return _DB_OK_BY_POOL_PROGRESS

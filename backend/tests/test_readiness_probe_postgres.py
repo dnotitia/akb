@@ -90,6 +90,8 @@ class _Relay:
 
     def __init__(self) -> None:
         self.address: tuple[str, int] = ("127.0.0.1", 0)
+        # How long a new connection takes to reach the server.
+        self.connect_delay = 0.0
         self._frozen = False
         self._closing = asyncio.Event()
         self._writers: list[asyncio.StreamWriter] = []
@@ -107,6 +109,8 @@ class _Relay:
         if self._frozen:
             await self._closing.wait()
             return
+        if self.connect_delay:
+            await asyncio.sleep(self.connect_delay)
         upstream_reader, upstream_writer = await asyncio.open_connection(*_server())
         self._writers.append(upstream_writer)
         await asyncio.gather(self._pipe(reader, upstream_writer), self._pipe(upstream_reader, writer))
@@ -120,7 +124,9 @@ class _Relay:
                 writer.write(data)
                 await writer.drain()
         except (ConnectionError, OSError):
-            return
+            pass
+        # One side has ended (a server-side termination, say): end the other.
+        writer.close()
 
     async def close(self) -> None:
         self._closing.set()
@@ -460,6 +466,49 @@ async def test_idle_pool_connection_that_never_answers_is_given_up_within_the_pr
     # The whole database step, giving the connection up included, stays
     # within its budget instead of waiting on the cancel as long again.
     assert elapsed < db.main._READY_DB_TIMEOUT_SECONDS + 0.5
+
+
+async def test_probe_behind_a_request_that_is_still_connecting_stays_ready(monkeypatch, tmp_path):
+    # The pool's only connection has ended and nothing has acquired for longer
+    # than the grace, so readiness checks the pool. A request has just taken the
+    # only holder and is still opening its connection: the probe queues behind
+    # it. Once the request's connection opens, the pool has served it.
+    relay = _Relay()
+    await relay.start()
+    request = None
+    release = asyncio.Event()
+    try:
+        async with _ready_database(monkeypatch, tmp_path, pool_size=1, relay=relay) as db:
+            monkeypatch.setattr(db.main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+            for row in await db.admin.fetch("SELECT pid FROM pg_stat_activity WHERE datname = $1", db.name):
+                await db.admin.fetchval("SELECT pg_terminate_backend($1)", row["pid"])
+            async with asyncio.timeout(2):
+                while db.pool.get_size() > 0:
+                    await asyncio.sleep(0.01)
+            await asyncio.sleep(_PAST_GRACE)
+            relay.connect_delay = 0.5
+
+            async def serve_a_request() -> None:
+                async with db.pool.acquire() as conn:
+                    await conn.fetchval("SELECT 1")
+                    await release.wait()
+
+            request = asyncio.create_task(serve_a_request())
+            await asyncio.sleep(0.05)
+            assert db.pool.get_size() == 0 and db.pool.get_idle_size() == 0  # still connecting
+
+            started = time.monotonic()
+            response = await db.client.get("/readyz")
+            elapsed = time.monotonic() - started
+            release.set()
+            await request
+    finally:
+        release.set()
+        await relay.close()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["detail"]["db"] == "ok"
+    assert elapsed < db.main._READY_DB_TIMEOUT_SECONDS
 
 
 async def test_pool_that_can_no_longer_open_connections_is_not_ready(monkeypatch, tmp_path):
