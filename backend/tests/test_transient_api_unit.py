@@ -212,13 +212,11 @@ async def test_executor_transient_error_bypasses_sql_enrichment(main, monkeypatc
     assert len(metadata_acquires) == 1  # No second connection for SQL-error hints.
 
 
-@pytest.mark.parametrize("failure", [
-    asyncpg.LockNotAvailableError("private-host/query"),
-    asyncpg.DeadlockDetectedError("private-host/query"),
-])
-def test_lock_contention_is_a_retryable_busy_write(main, failure):
-    """A lock wait past its limit or a broken deadlock rolled the failed
-    transaction back, so even a write may be retried after Retry-After."""
+def test_a_lock_wait_past_its_limit_is_a_retryable_busy_write(main):
+    """A lock wait past its limit rolled the failed transaction back before
+    the request did anything it could not undo, so even a write may be retried
+    after Retry-After."""
+    failure = asyncpg.LockNotAvailableError("private-host/query")
     app = FastAPI(exception_handlers=dict(main.app.exception_handlers))
 
     @app.post("/write")
@@ -235,3 +233,21 @@ def test_lock_contention_is_a_retryable_busy_write(main, failure):
     assert body["code"] == "write_busy"
     assert body["details"] == {"retry_after_secs": 1}
     assert "private-host" not in str(body)
+
+
+def test_a_deadlock_is_not_reported_as_a_write_that_changed_nothing(main):
+    """PostgreSQL can end a transaction with 40P01 after a Bare Git write has
+    committed to Git, so the error is not a retryable `write_busy`."""
+    failure = asyncpg.DeadlockDetectedError("private-host/query")
+    assert transient_error(failure) is None
+
+    app = FastAPI(exception_handlers=dict(main.app.exception_handlers))
+
+    @app.post("/write")
+    async def write():
+        raise failure
+
+    response = TestClient(app, raise_server_exceptions=False).post("/write")
+    assert response.status_code == 500
+    assert "Retry-After" not in response.headers
+    assert "private-host" not in response.text

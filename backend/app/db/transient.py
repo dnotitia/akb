@@ -10,11 +10,14 @@ import asyncpg
 from app.exceptions import TransientDependencyError
 from app.util.errors import OPERATION_TIMEOUT, SERVICE_UNAVAILABLE, WRITE_BUSY
 
-# A lock wait that hit its limit, or a deadlock PostgreSQL broke by rolling
-# this transaction back. Either way the failed transaction wrote nothing, so a
-# retry after a short delay is safe for it. Event inserts bound their wait for
-# the Vault's event lock (migration 132), which raises the first.
-_LOCK_CONTENTION = {"55P03", "40P01"}
+# A lock wait that ran past its limit: `lock_timeout`, or the deadline of a
+# Vault's event lock (migration 132). The waiting statement failed and its
+# transaction rolled back. A write that does work its transaction cannot undo,
+# such as a Bare Git commit, takes the Vault's event lock before that work, so
+# the failed request changed nothing and a retry after a short delay is safe.
+# A deadlock (40P01) is not included: PostgreSQL can end a transaction that way
+# after such work.
+_LOCK_NOT_AVAILABLE = "55P03"
 
 
 def transient_error(exc: Exception) -> TransientDependencyError | None:
@@ -37,7 +40,7 @@ def transient_error(exc: Exception) -> TransientDependencyError | None:
     # credentials, or localized text. Protocol/auth/configuration faults are
     # deliberately not folded into this list.
     sqlstate = getattr(exc, "sqlstate", None)
-    if isinstance(exc, asyncpg.PostgresError) and sqlstate in _LOCK_CONTENTION:
+    if isinstance(exc, asyncpg.PostgresError) and sqlstate == _LOCK_NOT_AVAILABLE:
         return TransientDependencyError(
             code=WRITE_BUSY,
             message="A concurrent write held a lock this request needed; its transaction was rolled back.",
