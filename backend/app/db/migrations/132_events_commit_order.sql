@@ -1,16 +1,17 @@
 -- Within one Vault, assign `events.id` in commit order.
 --
--- The column default draws the id when the row is inserted, but the row
--- becomes visible when its transaction commits. A cursor reader that saw a
--- later id first would move past an earlier id that committed after it. For an
--- event with a Vault, this trigger first takes a transaction-scoped advisory
--- lock for that Vault and then draws the id again. The lock is held until
--- commit or rollback, so the next event of the same Vault draws its id only
--- after every earlier one is visible or gone.
+-- An id drawn when the row is inserted becomes visible only when its
+-- transaction commits. A cursor reader that saw a later id first would move
+-- past an earlier id that committed after it. For an event with a Vault, this
+-- trigger first takes a transaction-scoped advisory lock for that Vault and
+-- only then draws the id. The lock is held until commit or rollback, so the
+-- next event of the same Vault draws its id only after every earlier one is
+-- visible or gone. Events without a Vault take no lock.
 --
--- Column defaults are evaluated before BEFORE triggers, so a Vault event
--- consumes two sequence values and keeps the second. Events without a Vault
--- keep their default id and take no lock.
+-- The trigger draws every id. The column keeps no default, because defaults
+-- are evaluated before BEFORE triggers and a default would spend a second
+-- value on every event; the sequence stays owned by the column. An INSERT
+-- that names no id, as earlier releases do, still gets the trigger's id.
 --
 -- A sequence cache larger than 1 hands each session its own block of values,
 -- so a session could draw a smaller id after another session's larger one.
@@ -43,8 +44,8 @@ BEGIN
                 PERFORM pg_catalog.pg_advisory_xact_lock(
                     pg_catalog.hashtextextended('akb-events:' || NEW.vault_id::text, 0)
                 );
-                NEW.id := pg_catalog.nextval(%L::regclass);
             END IF;
+            NEW.id := pg_catalog.nextval(%L::regclass);
             RETURN NEW;
         END
         $function$
@@ -53,6 +54,8 @@ BEGIN
     );
 END
 $migration$;
+
+ALTER TABLE public.events ALTER COLUMN id DROP DEFAULT;
 
 DROP TRIGGER IF EXISTS akb_events_commit_order_trigger ON public.events;
 CREATE TRIGGER akb_events_commit_order_trigger

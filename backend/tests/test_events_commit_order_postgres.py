@@ -138,6 +138,16 @@ class _OpenTransaction:
             await self._transaction.rollback()
 
 
+async def _undo_migration_132(conn: asyncpg.Connection) -> None:
+    """Return the database to its shape before migration 132."""
+    await conn.execute("DROP TRIGGER IF EXISTS akb_events_commit_order_trigger ON events")
+    await conn.execute("DROP FUNCTION IF EXISTS akb_events_commit_order()")
+    await conn.execute(
+        "ALTER TABLE events ALTER COLUMN id SET DEFAULT nextval('events_id_seq'::regclass)",
+    )
+    await conn.execute("DELETE FROM schema_migrations WHERE filename = $1", _MIGRATION)
+
+
 async def _next_sequence_value(conn: asyncpg.Connection) -> int:
     row = await conn.fetchrow("SELECT last_value, is_called FROM events_id_seq")
     return int(row["last_value"]) + (1 if row["is_called"] else 0)
@@ -351,13 +361,12 @@ async def test_returned_stored_and_notified_ids_are_the_trigger_assigned_id():
         async with pool.acquire() as listener, pool.acquire() as writer:
             await listener.add_listener("akb_events", on_notify)
             try:
-                # Column defaults are evaluated before BEFORE triggers: the
-                # default draws one value and the trigger keeps a second one.
+                # The trigger is the only source of ids: one value per event.
                 next_value = await _next_sequence_value(writer)
                 event_id = await _write_and_commit(
                     writer, lambda conn: _emit(conn, vault_id, "returning"),
                 )
-                assert event_id == next_value + 1
+                assert event_id == next_value
                 assert await writer.fetchval("SELECT last_value FROM events_id_seq") == event_id
                 stored = await writer.fetchval(
                     "SELECT id FROM events WHERE payload->>'marker' = 'returning'",
@@ -366,7 +375,21 @@ async def test_returned_stored_and_notified_ids_are_the_trigger_assigned_id():
                 notified = await asyncio.wait_for(notifications.get(), timeout=_UNBLOCKED_SECONDS)
                 assert notified.rsplit(":", 1)[-1] == str(event_id)
 
-                # An event without a Vault keeps its default id.
+                # So does an event without a Vault, and an INSERT naming no id
+                # (as the previous release's code does) still gets one.
+                async with writer.transaction():
+                    unnamed = await writer.fetchval(
+                        "INSERT INTO events (vault_id, kind) VALUES ($1, 'document.put') RETURNING id",
+                        vault_id,
+                    )
+                assert unnamed == await writer.fetchval("SELECT last_value FROM events_id_seq")
+                assert await writer.fetchval(
+                    "SELECT column_default FROM information_schema.columns "
+                    "WHERE table_name = 'events' AND column_name = 'id'",
+                ) is None
+                assert await writer.fetchval(
+                    "SELECT pg_get_serial_sequence('public.events', 'id')",
+                ) == "public.events_id_seq"
                 next_value = await _next_sequence_value(writer)
                 account_id = await _write_and_commit(
                     writer, lambda conn: _emit(conn, None, "account"),
@@ -417,10 +440,7 @@ async def test_migration_upgrades_a_database_with_existing_events():
 
         vault_id = await _make_vault(pool, "order-upgrade")
         async with pool.acquire() as conn:
-            # Return the database to its shape before this migration.
-            await conn.execute("DROP TRIGGER akb_events_commit_order_trigger ON events")
-            await conn.execute("DROP FUNCTION akb_events_commit_order()")
-            await conn.execute("DELETE FROM schema_migrations WHERE filename = $1", _MIGRATION)
+            await _undo_migration_132(conn)
             notify_before = await conn.fetchval(
                 "SELECT pg_get_functiondef('akb_events_notify'::regproc)",
             )
@@ -460,6 +480,10 @@ async def test_migration_upgrades_a_database_with_existing_events():
             assert await conn.fetchval(
                 "SELECT count(*) FROM schema_migrations WHERE filename = $1", _MIGRATION,
             ) == 1
+            assert await conn.fetchval(
+                "SELECT column_default FROM information_schema.columns "
+                "WHERE table_name = 'events' AND column_name = 'id'",
+            ) is None
 
             # Running it again changes nothing.
             module = postgres_module._load_migration(_MIGRATION)

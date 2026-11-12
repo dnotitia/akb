@@ -13,19 +13,21 @@ specifically; the proxy has its own log in
   of the Vault in commit order. Migration 132 adds a `BEFORE INSERT` trigger on
   `events` that takes a lock for the event's Vault, held until commit, and then
   draws the id; it also sets the id sequence's cache to 1. Events without a
-  Vault are unchanged. The cursor format, `Last-Event-ID` resume and
+  Vault take no lock. The cursor format, `Last-Event-ID` resume and
   `410 event_gap` are unchanged, and the Redis stream still makes no order
   promise. The cost: transactions that write events for the same Vault run one
   at a time from their event insert to their commit, and two of them can
   occasionally deadlock, in which case PostgreSQL rolls one back with `40P01`.
   Writes insert their events after their last other locking statement, which
   keeps both rare; this covers SQL admin overrides, Vault settings changes,
-  table migrations, enum value renames and app rollouts. A Vault event uses two
-  id values, so ids leave gaps. During a rolling deployment the first upgraded
-  process applies the migration, and processes still on the previous release
-  then take the same lock while some of them insert events before other
-  locking statements; until they are replaced, `40P01` is more likely. A
-  data-only restore needs `pg_restore --data-only --disable-triggers`.
+  table migrations, enum value renames and app rollouts. The trigger now assigns
+  every event id, NULL-Vault events included, and `events.id` has no column
+  default; an INSERT that names no id, as earlier releases do, still works.
+  During a rolling deployment the first upgraded process applies the
+  migration, and processes still on the previous release then take the same
+  lock while some of them insert events before other locking statements; until
+  they are replaced, `40P01` is more likely. A data-only restore needs
+  `pg_restore --data-only --disable-triggers`.
 
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain
