@@ -22,9 +22,11 @@ specifically; the proxy has its own log in
   The cost: transactions that write events for the same Vault run one at a
   time from taking the Vault's lock to their commit, so writes insert their
   events after their other locking statements. Bare Git document writes
-  instead lock the rows they change after their Git commit (collection and
-  edges), then the Vault's lock, then commit to Git, so a busy Vault fails
-  them before Git changes; they hold the lock through the Git work. A
+  instead lock their collection, then their document (the order of a
+  recursive collection delete), then the edges they change (an update or edit
+  rewrites its implicit edges here), then the Vault's lock, then commit to
+  Git, so a busy Vault fails them before Git changes; they hold the lock
+  through the Git work. A
   transaction waits at most 5 seconds in total for its Vault, also when the
   Vault's lock row has to be created; every Vault gets its row when it is
   created (and existing Vaults in the migration) and loses it when it is

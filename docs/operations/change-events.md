@@ -113,10 +113,12 @@ run one at a time, each from the moment it takes the Vault's lock to its
 commit. AKB inserts a transaction's events after its other locking statements
 (its row writes, DDL and role changes), so that span is short. Bare Git
 document writes are the exception. A Git commit does not roll back with the
-transaction, so put, update, edit, move and delete first lock the rows they
-change after the commit (their collection, and the edges of a moved or
-deleted document), then take the Vault's lock, and only then commit to Git; a
-busy Vault fails them before Git changes. They hold the Vault's lock through
+transaction, so put, update, edit, move and delete first lock their collection
+and then their document, the order in which a recursive collection delete
+takes them, then the edges a move or delete changes after the commit (an update
+or edit rewrites its document's implicit edges at this point instead of after
+the commit), then take the Vault's lock, and only then commit to Git; a busy
+Vault fails them before Git changes. They hold the Vault's lock through
 the Git work and their remaining database writes up to their commit, and a Git
 command may run for up to 30 seconds (`git_write_timeout_secs`). In a Bare Git
 installation the other writes of a Vault therefore also wait for a document
@@ -233,9 +235,11 @@ when the Vault's lock row has to be created first. The
 settings changes, table migrations (enum value renames included) and app
 rollouts insert their events last, so a writer of the same Vault does not wait
 behind them while they still take other locks; that a Bare Git document write
-on a busy Vault fails before its Git commit, and waits for a concurrent
-collection create before it takes the Vault's lock; and that only the lock's
-own deadline is reported as `write_busy`.
+on a busy Vault fails before its Git commit, waits for a concurrent collection
+create, collection delete or table drop before it takes the Vault's lock, and
+leaves Git and the database in agreement when a role's `lock_timeout` ends it;
+and that only the lock's own deadline is reported as `write_busy`, over REST
+and MCP.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native
