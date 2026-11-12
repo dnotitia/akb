@@ -564,6 +564,55 @@ async def test_returning_the_probes_connection_never_holds_up_the_verdict(main, 
     probe.pool.idle_conn.terminate.assert_not_called()
 
 
+@pytest.mark.parametrize("grace", [0.0, 1.0])
+async def test_connection_the_probe_is_still_returning_does_not_count_as_saturation(main, probe, monkeypatch, grace):
+    # A request's acquire proves the pool and the probe stands down. Its own
+    # connection, still on its way back, is all that keeps the full pool from
+    # showing an idle one. Once that return ends the connection is idle, or
+    # closed to leave room: it does not make the pool saturated, at once or
+    # past the grace. The figures still show it as lent out.
+    monkeypatch.setattr(main.settings, "readyz_pool_saturation_grace_secs", grace)
+    _unproven(probe)
+    both = asyncio.Event()
+
+    async def acquired_with_the_request(*, timeout=None):
+        probe.pool.acquire_timeouts.append(timeout)
+        await both.wait()
+        probe.pool.size, probe.pool.idle = probe.pool.max_size, 0
+        return probe.pool.idle_conn
+
+    async def request_acquires() -> None:
+        await both.wait()
+        probe.progress.acquire()
+        await postgres._count_acquire(object())
+
+    monkeypatch.setattr(postgres, "_acquires_total", 0)
+    monkeypatch.setattr(postgres, "_last_acquire_at", None)
+    monkeypatch.setattr(probe.pool, "acquire", acquired_with_the_request)
+    monkeypatch.setattr(probe.pool, "release", _hang)
+    request = asyncio.get_running_loop().create_task(request_acquires(), context=contextvars.Context())
+
+    async def release_both() -> None:
+        while not probe.pool.acquire_timeouts:
+            await asyncio.sleep(0.005)
+        both.set()
+
+    releaser = asyncio.create_task(release_both())
+    first = await main._probe_ready()
+    await asyncio.gather(request, releaser)
+    probe.clock.now += grace + 0.5
+    second = await main._probe_ready()
+
+    assert [first[0], second[0]] == [True, True], (first[1], second[1])
+    for _, detail in (first, second):
+        assert detail["db"] == "ok"
+        assert (detail["pool"]["size"], detail["pool"]["idle"]) == (probe.pool.max_size, 0)
+        assert detail["pool"]["saturated_for_secs"] is None
+    (returning,) = main._standing_down
+    returning.cancel()
+    await asyncio.wait({returning}, timeout=1)
+
+
 @pytest.mark.parametrize("evidence", ["idle", "recent_acquire", "saturated"])
 async def test_pool_that_shows_it_works_is_not_borrowed_from(main, probe, evidence):
     _unproven(probe)

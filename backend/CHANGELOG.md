@@ -144,7 +144,8 @@ specifically; the proxy has its own log in
   pool proves the pool and ends the wait, also when the server refuses the
   probe's extra connection at the same moment. A connection the probe already
   holds by then goes back to the pool in the background, bounded to 2 seconds
-  of its own; the verdict does not wait for that return.
+  of its own; the verdict does not wait for that return, and until it ends
+  the connection does not count toward saturation.
 - When the server refuses the readiness probe's connection at
   `max_connections`, readiness asks the pool instead. With an idle connection
   it runs `SELECT 1` on that connection within the probe's remaining budget

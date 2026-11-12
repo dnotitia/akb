@@ -140,7 +140,8 @@ probe has already obtained by then goes back to the pool instead of being
 closed, so the pool does not lose a server slot to the probe. That return runs
 in the background with its own 2-second bound, and the verdict does not wait
 for it: a slow return cannot turn a pool that a request has just proven into a
-failure. So a probe queued
+failure. Until the return ends, that connection does not count toward pool
+saturation (below). So a probe queued
 behind a request whose connection is still opening does not report a working
 pool as broken.
 
@@ -166,8 +167,11 @@ connection error fail readiness as before.
 ### Pool saturation
 
 The request pool is saturated when every connection it may open is open and
-checked out (`size == max` and `idle == 0`). Requests then wait for a
-connection, but the database is not down. A client burst saturates every
+checked out (`size == max` and `idle == 0`). A connection the probe is still
+giving back after a request proved the pool does not count: once that return
+ends it is idle, or closed and leaves room to open one. `detail.pool` still
+reports it as checked out. Requests wait for a connection while the pool is
+saturated, but the database is not down. A client burst saturates every
 replica's pool at the same moment. If readiness failed on saturation alone,
 every replica would leave the Service together and the burst would become a
 complete outage.
@@ -180,7 +184,7 @@ database check fails:
 | --- | --- |
 | `size`, `max`, `idle` |Open connections, the pool's limit, and open connections not checked out.|
 | `free` |Earlier name of `idle`, kept for existing readers.|
-| `saturated_for_secs` |Time since the first of the consecutive probes that found the pool saturated; `null` when the last probe found room.|
+| `saturated_for_secs` |Time since the first of the consecutive probes that found the pool saturated; `null` when the last probe did not find it saturated.|
 | `last_acquire_age_secs` |Seconds since the latest completed acquire by a request or background work; `null` before the first. Readiness's own acquires do not count.|
 
 The payload rounds these values to milliseconds; readiness decides on the

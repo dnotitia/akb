@@ -491,12 +491,16 @@ def _observe_pool(pool, state: _ReadyState) -> _PoolObservation:
     """Read the request pool's occupancy without waiting for a connection.
 
     Saturated means every connection the pool may open is open and lent out.
-    The run of saturation is kept on `state` across probes; a probe that finds
-    an idle connection, or room to open one, ends it.
+    A connection the probe is still giving back after standing down
+    (`_stand_down`) does not count toward that: once the return ends it is
+    idle, or closed and leaves room, so it cannot make a pool that a request
+    has just proven look wedged. The reported figures still show it as lent
+    out. The run of saturation is kept on `state` across probes; a probe that
+    finds an idle connection, or room to open one, ends it.
     """
     size, max_size, idle = pool.get_size(), pool.get_max_size(), pool.get_idle_size()
     saturated_for: float | None = None
-    if size >= max_size and idle == 0:
+    if size >= max_size and idle + len(_standing_down) == 0:
         now = time.monotonic()
         if state.pool_saturated_since is None:
             state.pool_saturated_since = now

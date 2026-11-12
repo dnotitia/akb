@@ -218,6 +218,7 @@ async def _ready_database(
         monkeypatch.setattr(main, "_ready_state", main._ReadyState())
         monkeypatch.setattr(main, "_ready_lock", asyncio.Lock())
         monkeypatch.setattr(main, "_vector_check", None)
+        monkeypatch.setattr(main, "_standing_down", set())
         store = _pgvector_store()
         monkeypatch.setattr(main, "get_vector_store", lambda: store)
         login = {"user": role, "password": password, "pool_size": pool_size}
@@ -1089,6 +1090,69 @@ async def test_proven_pool_at_max_connections_stays_ready_when_returning_the_pro
             pool.terminate()
 
     assert response.json()["detail"]["db"] == "ok:pool_progress"
+    assert (size, idle) == (2, 1)
+
+
+@pytest.mark.parametrize("grace", [0.0, 0.5])
+async def test_connection_the_probe_is_still_returning_does_not_count_as_saturation(ready_db, monkeypatch, grace):
+    # The request's connection and the probe's extra one open together and fill
+    # the pool. The request's acquire proves it, and returning the probe's
+    # connection outlasts the grace. Once that return ends the connection is
+    # idle, so neither this probe nor the next one past the grace may read the
+    # pool as wedged because of it. The figures still show it as lent out.
+    main = ready_db.main
+    monkeypatch.setattr(main.settings, "readyz_pool_saturation_grace_secs", grace)
+    assert (await ready_db.client.get("/readyz")).status_code == 200  # opens the probe connection
+    return_may_end = asyncio.Event()
+
+    async def held_reset(conn) -> None:
+        await return_may_end.wait()
+        await conn.reset()
+
+    gated = _GatedConnect()
+    pool = await _swap_in_a_gated_pool(ready_db, monkeypatch, gated, max_size=2, reset=held_reset)
+    hold = asyncio.Event()
+    try:
+        await asyncio.sleep(grace + 0.3)  # no acquire within the grace: the probe checks the pool
+
+        async def serve_a_request() -> None:
+            async with pool.acquire():
+                await hold.wait()
+
+        request = asyncio.create_task(serve_a_request())
+        await gated.until_parked(1)
+
+        async def open_both_together() -> None:
+            await gated.until_parked(2)  # the probe's extra connection is open as well
+            gated.release()
+
+        opener = asyncio.create_task(open_both_together())
+        main._ready_state.ts -= 31  # past the success cache
+        first = await ready_db.client.get("/readyz")
+        await opener
+        assert first.status_code == 200, first.text
+        await asyncio.sleep(grace + 0.1)  # past the grace, with the return still running
+        main._ready_state.ts -= 31
+        second = await ready_db.client.get("/readyz")
+        assert second.status_code == 200, second.text
+        still_returning = len(main._standing_down)
+        return_may_end.set()
+        await _returns_finished(main)
+        size, idle = pool.get_size(), pool.get_idle_size()
+        hold.set()
+        await request
+    finally:
+        hold.set()
+        return_may_end.set()
+        gated.release()
+        pool.terminate()
+
+    for response in (first, second):
+        detail = response.json()["detail"]
+        assert detail["db"] == "ok"
+        assert (detail["pool"]["size"], detail["pool"]["idle"]) == (2, 0)
+        assert detail["pool"]["saturated_for_secs"] is None
+    assert still_returning == 1
     assert (size, idle) == (2, 1)
 
 
