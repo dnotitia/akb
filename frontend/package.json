@@ -9,6 +9,7 @@
   },
   "scripts": {
     "dev": "vite",
+    "dev:e2e:mock": "VITE_AKB_TEST_MODE=mock vite --host 127.0.0.1 --port 4173 --strictPort",
     "storybook": "storybook dev -p 6006",
     "design:check": "node scripts/design-check.mjs",
     "build": "node scripts/design-check.mjs && tsc && vite build",
