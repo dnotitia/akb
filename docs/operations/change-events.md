@@ -81,32 +81,83 @@ arrive during those reads.
 
 Within one Vault, the authenticated SSE tail described below delivers every
 committed event in commit order, and its cursor never skips an event. Event ids
-follow commit order inside a Vault: an insert trigger (migration 132) takes a
-lock for the event's Vault, holds it until the transaction commits or rolls
-back, and only then draws the id. A transaction that commits later therefore
-always carries a larger id than every event of that Vault already visible, and
-reading `id > cursor` cannot pass over one that commits late. The cursor format,
-`Last-Event-ID` resume and `410 event_gap` are unchanged, and cursors issued
-before the migration stay valid. Ids are not contiguous; a gap does not mean a
-missing event. Events without a Vault (account and sign-in events) are not
-ordered this way. The Redis stream has no order guarantee: the publisher claims
-rows in batches and retries failures, so entries can arrive out of id order.
-Recognize a repeat by the envelope `id`.
+follow commit order inside a Vault: an insert trigger (migration 132) locks the
+event's Vault, holds the lock until the transaction commits or rolls back, and
+only then draws the id. A transaction that commits later therefore always
+carries a larger id than every event of that Vault already visible, and reading
+`id > cursor` cannot pass over one that commits late. The trigger assigns every
+event id; `events.id` has no column default. A dynamic table's
+`table.rows_changed` event is inserted when its transaction commits. The cursor
+format, `Last-Event-ID` resume and `410 event_gap` are unchanged, and cursors
+issued before the migration stay valid. Ids are not contiguous; a gap does not
+mean a missing event. Events without a Vault (account and sign-in events) are
+not ordered this way. The Redis stream has no order guarantee: the publisher
+claims rows in batches and retries failures, so entries can arrive out of id
+order. Recognize a repeat by the envelope `id`.
+
+The `410 event_gap` check compares a cursor with the oldest retained event of
+the Vault and treats the Vault's ids as if they were contiguous. Other Vaults'
+events and rolled-back inserts take ids in between, so once retention removes
+the event a client read last, a resume can be refused with `410` although
+nothing was missed; the client restarts from the returned cursor and
+reconciles. This predates the ordering change; a per-Vault deletion watermark
+is planned to replace the check.
 
 This ordering has a cost. Transactions that write events for the same Vault
 run one at a time from their event insert to their commit. AKB inserts a
-transaction's events after its last other locking statement — after the row
-writes, DDL and role changes of the same transaction — so that span is short.
-A transaction that still waited for another lock after its event insert could
-deadlock with one that waits for the Vault; PostgreSQL would roll one of them
-back with error `40P01`. Watch `pg_stat_database.deadlocks`.
+transaction's events after its other locking statements (its row writes, DDL
+and role changes), so that span is short. The Vault's lock is a row lock in
+`vault_event_order`, a table no SQL role is granted, so a statement run through
+`akb_sql` cannot hold it; `akb_sql` also refuses PostgreSQL's advisory lock
+functions. An event insert waits at most 5 seconds for its Vault. Past that,
+and when PostgreSQL breaks a deadlock (`40P01`) by rolling a transaction back,
+the API answers with a retryable `write_busy`: HTTP 429 with `Retry-After: 1`,
+or `retry_after_secs` in the MCP envelope. Watch `pg_stat_database.deadlocks`.
 
-A full `pg_dump` / `pg_restore` creates the insert trigger after it loads the
-data, so restored events keep their ids. A data-only restore into a database
-that already has the trigger must disable triggers, as a superuser:
-`pg_restore --data-only --disable-triggers`. With the trigger active, every
-restored Vault event would receive a new id, and the restore transaction would
-take one lock per Vault until it commits.
+During a rolling deployment the first upgraded process applies migration 132.
+Processes still on the previous release then take the Vault lock too, but some
+of their writes insert the event before other locking statements, so `40P01`
+is more likely until they are replaced. The migration asks for its table lock
+for at most half a second at a time and holds nothing between attempts, so
+event inserts keep flowing while a previous-release transaction is still open;
+after 40 attempts it stops the server's start with an error. Rolling back to an
+earlier image leaves the trigger in place and working, with the earlier
+release's statement order. Do not drop the trigger: without it an INSERT that
+names no id fails, because the column has no default.
+
+A full `pg_dump` / `pg_restore` creates the triggers after it loads the data,
+so restored events keep their ids. A data-only restore into a database that
+already has the schema needs three precautions. Stop writes first: stop the API
+and worker processes, because with triggers disabled an event written during
+the load would get no Vault lock, and with no column default its insert fails.
+Run as a superuser with triggers disabled and in one transaction, so that a
+failed restore rolls back completely, the trigger switch included:
+
+```bash
+pg_restore --data-only --disable-triggers --single-transaction --dbname <database> <dump>
+```
+
+With the triggers active, every restored Vault event would receive a new id and
+the restore would lock every Vault until it commits. After the restore, whether
+it succeeded or failed, and before starting AKB, check the two triggers on
+`events`; the query must return both rows with `enabled = true`:
+
+```sql
+SELECT tgname, tgenabled = 'O' AS enabled
+  FROM pg_trigger
+ WHERE tgrelid = 'public.events'::regclass
+   AND tgname IN ('akb_events_commit_order_trigger', 'akb_events_notify_trigger');
+```
+
+No other trigger may stay disabled either; this query must return no rows:
+
+```sql
+SELECT tgrelid::regclass AS table_name, tgname
+  FROM pg_trigger
+ WHERE tgenabled = 'D';
+```
+
+Re-enable a table it lists with `ALTER TABLE <table_name> ENABLE TRIGGER ALL;`.
 
 For collection events `resource_uri` may be null. Use the Vault identity and
 payload path, or conservatively invalidate the Vault. Relation declarations and

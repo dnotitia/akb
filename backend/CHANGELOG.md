@@ -11,23 +11,32 @@ specifically; the proxy has its own log in
   whose transaction committed after an event with a larger id. Within a Vault,
   event ids now follow commit order, so the tail delivers every committed event
   of the Vault in commit order. Migration 132 adds a `BEFORE INSERT` trigger on
-  `events` that takes a lock for the event's Vault, held until commit, and then
-  draws the id; it also sets the id sequence's cache to 1. Events without a
-  Vault take no lock. The cursor format, `Last-Event-ID` resume and
+  `events` that locks the event's Vault until commit and then assigns the id.
+  `events.id` loses its column default (an INSERT that names no id still
+  works) and its sequence cache is set to 1. Events without a Vault take no
+  lock. A dynamic table's `table.rows_changed` event is now inserted when its
+  transaction commits. The cursor format, `Last-Event-ID` resume and
   `410 event_gap` are unchanged, and the Redis stream still makes no order
-  promise. The cost: transactions that write events for the same Vault run one
-  at a time from their event insert to their commit, and two of them can
-  occasionally deadlock, in which case PostgreSQL rolls one back with `40P01`.
-  Writes insert their events after their last other locking statement, which
-  keeps both rare; this covers SQL admin overrides, Vault settings changes,
-  table migrations, enum value renames and app rollouts. The trigger now assigns
-  every event id, NULL-Vault events included, and `events.id` has no column
-  default; an INSERT that names no id, as earlier releases do, still works.
-  During a rolling deployment the first upgraded process applies the
-  migration, and processes still on the previous release then take the same
-  lock while some of them insert events before other locking statements; until
-  they are replaced, `40P01` is more likely. A data-only restore needs
-  `pg_restore --data-only --disable-triggers`.
+  promise.
+
+  The cost: transactions that write events for the same Vault run one at a
+  time from their event insert to their commit, so writes insert their events
+  after their other locking statements. An insert waits at most 5 seconds for
+  its Vault. A longer wait, or a deadlock (`40P01`) that PostgreSQL broke by
+  rolling a transaction back, now returns a retryable `write_busy` (HTTP 429,
+  `Retry-After: 1`) instead of an internal error. The Vault's lock is a row lock
+  that no SQL role can take, and `akb_sql` refuses PostgreSQL's advisory lock
+  functions.
+
+  The migration takes its table lock in short attempts, so event inserts keep
+  flowing while a transaction of the previous release is open, and stops the
+  start with an error after 40 attempts. During a rolling deployment,
+  processes still on the previous release take the Vault lock too while some
+  insert events before other locking statements, so `40P01` is more likely
+  until they are replaced. An image rollback keeps the trigger. A data-only
+  restore needs writes stopped and `pg_restore --data-only --disable-triggers
+  --single-transaction`; `docs/operations/change-events.md` lists the checks
+  to run afterwards.
 
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain
