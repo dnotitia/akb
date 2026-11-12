@@ -46,9 +46,10 @@ COPY frontend/ ./frontend/
 RUN cd frontend && pnpm run build
 
 # ---------- MinIO server + mc client ----------
-# IBM mirrors the original upstream server digest after the Quay removal.
+# Pin an upstream-content mirror independently of registry availability.
+# Its amd64 platform manifest is unchanged; existing binary hashes still apply.
 # This image includes both minio and mc; no separate client image is needed.
-FROM icr.io/fusion-open/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e AS minio
+FROM docker.io/dappros/minio@sha256:624bad2fe79a8613aa3c5c9b765ebcab365080b8445cf1b05c357cc7753725f0 AS minio
 
 # ---------- final image ----------
 FROM pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b

@@ -168,7 +168,7 @@ def test_every_stack_runs_the_same_minio():
     assert stage, "올인원 MinIO stage가 없다"
     refs.add(stage.group(1))
     assert len(refs) == 1, f"MinIO 참조가 스택마다 다르다: {sorted(refs)}"
-    assert re.fullmatch(r"icr\.io/fusion-open/minio/minio@sha256:[0-9a-f]{64}", refs.pop())
+    assert re.fullmatch(r"docker\.io/dappros/minio@sha256:[0-9a-f]{64}", refs.pop())
     assert "COPY --from=minio /usr/bin/mc /usr/local/bin/mc" in dockerfile
 
 
