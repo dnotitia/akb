@@ -195,6 +195,7 @@ async def _ready_database(
         monkeypatch.setattr(postgres, "_pool", None)
         monkeypatch.setattr(main, "_ready_state", main._ReadyState())
         monkeypatch.setattr(main, "_ready_lock", asyncio.Lock())
+        monkeypatch.setattr(main, "_vector_check", None)
         store = _SharedPoolVectorStore()
         monkeypatch.setattr(main, "get_vector_store", lambda: store)
         login = {"user": role, "password": password, "pool_size": pool_size}
@@ -509,6 +510,37 @@ async def test_probe_behind_a_request_that_is_still_connecting_stays_ready(monke
     assert response.status_code == 200, response.text
     assert response.json()["detail"]["db"] == "ok"
     assert elapsed < db.main._READY_DB_TIMEOUT_SECONDS
+
+
+async def test_vector_check_stuck_on_a_silent_pool_connection_cannot_hold_readyz(monkeypatch, tmp_path):
+    # The vector check, like pgvector on the main database, borrows the pool's
+    # idle connection. The relay then drops its query and the cancel request
+    # for it, so asyncpg's release of that connection would wait for good.
+    relay = _Relay()
+    await relay.start()
+    stuck = None
+    try:
+        async with _ready_database(monkeypatch, tmp_path, pool_size=1, relay=relay) as db:
+            relay.freeze()
+            bound = 7.5  # inside kubelet's 8-second probe timeout
+
+            started = time.monotonic()
+            responses = await asyncio.wait_for(
+                asyncio.gather(*(db.client.get("/readyz") for _ in range(11))), timeout=bound,
+            )
+            elapsed = time.monotonic() - started
+            stuck = db.main._vector_check
+    finally:
+        await relay.close()
+        if stuck is not None:
+            # asyncpg resolves a cancelled query's waiter only when the server
+            # answers it, so that cleanup never finishes; stop waiting on it.
+            stuck.cancel()
+            await asyncio.wait({stuck}, timeout=1)
+
+    assert [response.status_code for response in responses] == [200] * 11
+    assert {response.json()["detail"]["vector_store"] for response in responses} == {"degraded:timeout"}
+    assert elapsed < db.main._READY_VECTOR_TIMEOUT_SECONDS + 1.0
 
 
 async def test_pool_that_can_no_longer_open_connections_is_not_ready(monkeypatch, tmp_path):

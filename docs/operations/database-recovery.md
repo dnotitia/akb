@@ -82,10 +82,19 @@ is introduced. Existing DB command and statement deadlines remain 30 seconds.
 | `/readyz` |DB ping on a dedicated connection; the request pool is observed, not used. Every result is shared by all callers for 1 second, and a plain success is cached for 30 seconds; vector health is soft.|
 | `/health` |Detailed operational/queue diagnostics, not a cheap liveness check.|
 
-Readiness bounds DB pool initialization plus ping together to 2 seconds. The
-vector check retains its 5-second budget. These are probe-step budgets, **not**
-a 2-second whole-endpoint guarantee: callers can wait for the shared readiness
-lock. They wait for the evaluation already running, not for one each. Every
+Readiness bounds DB pool initialization plus ping together to 2 seconds; when
+cancelled, nothing in that step waits on the server. The soft vector check runs
+as a task that the probe waits on for at most 5 seconds. If it has not finished
+by then, it is reported as `vector_store: degraded:timeout`, cancelled, and
+left to finish its cleanup in the background, because asyncpg can wait without
+limit for the answer to a cancel request. At most one vector check is
+outstanding: while a check that was given up on is still finishing, later
+probes report `degraded:timeout` at once instead of starting another. Such a
+check whose cleanup never finishes keeps that soft label until the process
+restarts; readiness itself is unaffected. One evaluation therefore ends within
+about 7 seconds, inside kubelet's 8-second probe timeout. Callers can wait for
+the shared readiness lock, but they wait for the evaluation already running,
+not for one each. Every
 result, ready or not, answers all callers for one second, and callers that
 arrive while an evaluation runs reuse its result. `/readyz` needs no
 authentication, so this bounds the database work that any number of callers

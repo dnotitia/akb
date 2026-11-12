@@ -109,6 +109,7 @@ def main(monkeypatch, tmp_path):
 
     monkeypatch.setattr(application, "_ready_state", application._ReadyState())
     monkeypatch.setattr(application, "_ready_lock", asyncio.Lock())
+    monkeypatch.setattr(application, "_vector_check", None)
     monkeypatch.setattr(application.settings, "readyz_pool_saturation_grace_secs", GRACE)
     return application
 
@@ -470,6 +471,56 @@ async def test_readyz_answers_503_once_saturation_outlasts_the_grace(main, probe
     recovered = await main.readyz()
     assert recovered["status"] == "ready"
     assert recovered["detail"]["pool"]["saturated_for_secs"] is None
+
+
+# ── The soft vector check ───────────────────────────────────────────────────
+
+
+async def test_vector_check_whose_cancel_never_finishes_cannot_hold_readyz(main, probe):
+    # The check hangs, and once cancelled its cleanup waits forever too, as
+    # asyncpg's release can on a pool connection that never answers.
+    cleanup_finishes = asyncio.Event()
+
+    async def health() -> bool:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await cleanup_finishes.wait()
+            raise
+        return True  # pragma: no cover
+
+    probe.store.health = health
+    bound = 7.5  # inside kubelet's 8-second probe timeout
+
+    started = time.monotonic()
+    results = await asyncio.wait_for(asyncio.gather(*(main.readyz() for _ in range(11))), timeout=bound)
+    elapsed = time.monotonic() - started
+
+    assert [result["status"] for result in results] == ["ready"] * 11
+    assert {result["detail"]["vector_store"] for result in results} == {"degraded:timeout"}
+    assert elapsed < main._READY_VECTOR_TIMEOUT_SECONDS + 1.0
+    given_up = main._vector_check
+    assert given_up is not None and not given_up.done()
+
+    # The next evaluation does not start a second check behind the stuck one.
+    probe.clock.now += main._READY_TTL_SECONDS
+    started = time.monotonic()
+    again = await main.readyz()
+    assert again["detail"]["vector_store"] == "degraded:timeout"
+    assert time.monotonic() - started < 1.0
+    assert main._vector_check is given_up
+
+    cleanup_finishes.set()
+    await asyncio.wait({given_up}, timeout=1)
+    assert given_up.done()
+
+
+async def test_vector_check_reports_its_outcome(main, probe):
+    probe.store.health = AsyncMock(side_effect=ConnectionRefusedError("refused"))
+    assert (await main._probe_ready())[1]["vector_store"] == "degraded:unavailable"
+
+    probe.store.health = AsyncMock(return_value=False)
+    assert (await main._probe_ready())[1]["vector_store"] == "degraded:unreachable"
 
 
 # ── Database failures ────────────────────────────────────────────────────────

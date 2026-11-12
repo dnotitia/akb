@@ -120,6 +120,12 @@ specifically; the proxy has its own log in
   saturated pools and pool-vouched results are not cached beyond that, so any
   number of callers now causes about one database evaluation per second per
   process. A plain success is still cached for 30 seconds.
+- The soft vector-store check in `/readyz` runs as a task that the probe waits
+  on for at most 5 seconds. A check that has not finished by then is reported
+  as `degraded:timeout` and left to finish its cleanup in the background
+  instead of being awaited; asyncpg can wait without limit for the answer to a
+  cancel request, which used to hold the readiness lock and every caller
+  behind it past kubelet's 8-second timeout. At most one check is outstanding.
 - When the request pool shows nothing that proves it could serve a request (no
   idle connection, room to open one, and no acquire within the grace),
   readiness takes one connection through it within the probe's remaining

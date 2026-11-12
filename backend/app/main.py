@@ -430,7 +430,15 @@ _READY_TTL_SECONDS = 30.0
 _READY_MIN_INTERVAL_SECONDS = 1.0
 # The database step of one probe: pool initialization (only while there is no
 # pool yet) plus connecting and pinging on the probe's dedicated connection.
+# Nothing in it awaits a server on cancellation (connections are terminated,
+# pending acquires abandoned, returns bounded), so it ends with its budget.
 _READY_DB_TIMEOUT_SECONDS = 2.0
+# How long a probe waits for the soft vector check. The check runs as a task
+# the probe does not cancel-and-await: its cancellation cleanup can wait on a
+# connection that never answers. With the database step, one evaluation, and
+# every caller waiting for it, ends within about 7 seconds, inside kubelet's
+# 8-second probe timeout.
+_READY_VECTOR_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -705,12 +713,47 @@ async def _evaluate_readiness() -> tuple[bool, dict]:
         # for up to its whole budget without changing the verdict.
         detail["vector_store"] = "skipped:pool_saturated"
         return True, detail
-    try:
-        vs_ok = await asyncio.wait_for(get_vector_store().health(), timeout=5.0)
-        detail["vector_store"] = "ok" if vs_ok else "degraded:unreachable"
-    except Exception as e:  # noqa: BLE001
-        detail["vector_store"] = "degraded:timeout" if isinstance(e, TimeoutError) else "degraded:unavailable"
+    detail["vector_store"] = await _vector_store_status()
     return True, detail
+
+
+# The vector check in flight, if any. At most one is outstanding: a probe that
+# finds the previous one still running waits for it, or, once a probe has given
+# up on it, reports the timeout at once instead of starting another.
+_vector_check: asyncio.Task | None = None
+
+
+async def _vector_store_status() -> str:
+    global _vector_check
+    task = _vector_check
+    if task is None or task.done() or task.get_loop() is not asyncio.get_running_loop():
+        task = asyncio.create_task(_vector_store_health(), name="readyz-vector-check")
+        task.add_done_callback(_consume_outcome)
+        _vector_check = task
+    elif task.cancelling():
+        return "degraded:timeout"
+    done, _ = await asyncio.wait({task}, timeout=_READY_VECTOR_TIMEOUT_SECONDS)
+    if not done:
+        # Left to finish its cleanup in the background, however long that takes.
+        task.cancel()
+        return "degraded:timeout"
+    if task.cancelled():
+        return "degraded:timeout"
+    error = task.exception()
+    if error is not None:
+        return "degraded:timeout" if isinstance(error, TimeoutError) else "degraded:unavailable"
+    return "ok" if task.result() else "degraded:unreachable"
+
+
+async def _vector_store_health() -> bool:
+    return await get_vector_store().health()
+
+
+def _consume_outcome(task: asyncio.Task) -> None:
+    # A check the probe gave up on still ends with an outcome; retrieve it so
+    # it is not logged as never retrieved.
+    if not task.cancelled():
+        task.exception()
 
 
 def _ready_response(state: _ReadyState, *, cached: bool):
