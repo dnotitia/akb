@@ -821,10 +821,12 @@ async def test_freshness_is_judged_after_the_frame_is_built(monkeypatch, hub) ->
     assert state["checks"] == 2
 
 
-def test_the_start_checkpoint_goes_first_with_nothing_before_it(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_the_start_checkpoint_goes_first_with_nothing_before_it(monkeypatch) -> None:
     """open_tail builds the start checkpoint; the stream sends it before touching anything.
 
-    Nothing is awaited first, so no heartbeat can precede it.
+    On a check that still covers it, nothing is awaited first, so no heartbeat
+    can precede it.
     """
     from app.services import event_tail_service
 
@@ -832,6 +834,7 @@ def test_the_start_checkpoint_goes_first_with_nothing_before_it(monkeypatch) -> 
         raise AssertionError("touched before the start checkpoint was sent")
 
     monkeypatch.setattr(event_tail_service, "get_event_tail_hub", untouchable)
+    monkeypatch.setattr(event_tail_service, "check_vault_access", untouchable)
     request = MagicMock()
     request.is_disconnected = untouchable
     stream = event_tail_service._stream_events(
@@ -843,10 +846,10 @@ def test_the_start_checkpoint_goes_first_with_nothing_before_it(monkeypatch) -> 
         position=7,
         codec=EventCursorCodec("cursor-secret"),
         start_frame=_checkpoint_at(7),
-        checked_at=0.0,
+        checked_at=asyncio.get_running_loop().time(),
     )
-    # One step of the generator, driven without an event loop: it yields at
-    # once, so nothing was awaited.
+    # One step of the generator, driven by hand: it yields at once, so
+    # nothing was awaited.
     with pytest.raises(StopIteration) as first:
         stream.__anext__().send(None)
     assert first.value.value == _checkpoint_at(7)
@@ -916,6 +919,78 @@ async def test_an_idle_stream_checks_access_right_after_a_heartbeat_sent_during_
     # no further heartbeat went out.
     assert check_times and check_times[0] - heartbeat_at < 0.3
     assert closed_at - heartbeat_at < heartbeat
+
+
+@pytest.mark.asyncio
+async def test_a_heartbeat_during_the_extra_check_calls_for_another(monkeypatch, hub) -> None:
+    """The extra check a heartbeat calls for can itself outlast the next heartbeat.
+
+    The stream used to allow one extra check per wait, so after a heartbeat
+    that went out during the extra check it waited, unchecked, for the next
+    one. Each new heartbeat now calls for its own check.
+    """
+    from app.exceptions import ForbiddenError
+    from app.services import event_tail_service
+
+    pool, _connection, request = _stream_test_doubles()
+    heartbeat = 1.0
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "HEARTBEAT_INTERVAL_SECONDS", heartbeat)
+    loop = asyncio.get_running_loop()
+    reads = 0
+    checks = 0
+    granted = True
+
+    async def first_read_slow(_conn: Any, _vault_id: Any, *, after_id: int, limit: int) -> list[dict[str, Any]]:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            # The first heartbeat goes out during this read.
+            await asyncio.sleep(heartbeat + 0.2)
+        return []
+
+    async def access(*_args: Any, _conn: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal checks
+        checks += 1
+        allowed = granted
+        if checks == 1:
+            # The extra check outlasts the next heartbeat; access was still
+            # there when it looked.
+            await asyncio.sleep(heartbeat + 0.1)
+        if not allowed:
+            raise ForbiddenError("revoked")
+        return {"vault_id": VAULT_ID}
+
+    monkeypatch.setattr(event_tail_service, "list_vault_events", first_read_slow)
+    monkeypatch.setattr(event_tail_service, "check_vault_access", access)
+    stream = event_tail_service._stream_events(
+        request,
+        user_id="user",
+        vault="vault",
+        vault_id=VAULT_ID,
+        kinds=(),
+        position=0,
+        codec=EventCursorCodec("cursor-secret"),
+        start_frame=_checkpoint_at(0),
+        checked_at=loop.time(),
+    )
+    try:
+        assert await anext(stream) == _checkpoint_at(0)
+        # One heartbeat during the first read, one during the extra check.
+        assert await anext(stream) == format_heartbeat()
+        assert await anext(stream) == format_heartbeat()
+        second_heartbeat_at = loop.time()
+        granted = False
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        closed_at = loop.time()
+    finally:
+        await stream.aclose()
+
+    # The second heartbeat called for a check of its own, which found the
+    # revocation before a third heartbeat was due.
+    assert checks == 2
+    assert closed_at - second_heartbeat_at < heartbeat
 
 
 @pytest.mark.asyncio

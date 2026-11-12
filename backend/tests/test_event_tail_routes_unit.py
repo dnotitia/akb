@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import json
 import types
@@ -349,6 +350,71 @@ async def test_an_open_whose_renewed_check_fails_starts_no_stream(tail, monkeypa
 
     assert exc_info.value.status_code == status
     assert checks == 2
+    assert tail.service.open_stream_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("renewal", "checks"), [("granted", 2), ("revoked", 2), ("slow", 3)])
+async def test_a_response_start_that_outlasts_the_check_is_checked_again_before_the_checkpoint(
+    tail, monkeypatch, renewal: str, checks: int
+) -> None:
+    """The server sends the response's start before the body, and that can take a while.
+
+    The stream used to send its prebuilt checkpoint however long it took, so a
+    reader whose access was revoked meanwhile still received one. Now the
+    stream checks again first: a passed check sends the checkpoint, while a
+    revoked reader, or checks that stay slow, end the body with nothing sent.
+    """
+    from app.exceptions import ForbiddenError
+
+    window = 0.05
+    monkeypatch.setattr(tail.service, "_RECHECK_DURING_YIELD_SECONDS", window)
+    calls = 0
+
+    async def access(*_args, _conn, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            if renewal == "revoked":
+                raise ForbiddenError("revoked")
+            if renewal == "slow":
+                await asyncio.sleep(window * 2)
+        return {"vault_id": _VAULT_ID}
+
+    monkeypatch.setattr(tail.service, "check_vault_access", access)
+    response = await tail.open()
+    bodies: list[bytes] = []
+    checkpoint_sent = asyncio.Event()
+
+    async def receive():
+        raise AssertionError("an ASGI 2.4 server reports a disconnect as a failed send")
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            # The response's start outlasts the window the open's check covers.
+            await asyncio.sleep(window * 3)
+        elif message["type"] == "http.response.body":
+            bodies.append(message["body"])
+            if message["body"].startswith(b"event: checkpoint\n"):
+                checkpoint_sent.set()
+
+    responding = asyncio.create_task(response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send))
+    checkpoint = asyncio.create_task(checkpoint_sent.wait())
+    try:
+        # Until the body ends or a checkpoint goes out.
+        await asyncio.wait({responding, checkpoint}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (responding, checkpoint):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    if renewal == "granted":
+        assert bodies and bodies[0].startswith(b"event: checkpoint\n")
+    else:
+        # The body ends without a frame.
+        assert bodies == [b""], f"sent {bodies!r}"
+    assert calls == checks
     assert tail.service.open_stream_count() == 0
 
 

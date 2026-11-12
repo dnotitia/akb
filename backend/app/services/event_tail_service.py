@@ -638,7 +638,8 @@ async def open_tail(
     anything else is sent. If the preflight outlasted the window the check
     covers, access is checked again here; if the checks stay slow, the
     request fails with a retryable 503 `event_tail_unavailable` instead of
-    starting a stream that sends nothing.
+    starting a stream that sends nothing. If sending the response's start
+    outlasts the window, the stream checks again before the checkpoint.
 
     The errors keep the order the route has always given them: 403, or 404
     for an unknown Vault, before 429 for an account at its quota and 503 for
@@ -908,26 +909,46 @@ async def _stream_events(
     The first frame is ``start_frame``, the checkpoint at ``position`` that
     open_tail built on an access check started at ``checked_at`` (loop time),
     so every client holds a cursor to resume from whether or not it brought
-    one. It goes out before anything else, heartbeats included.
+    one. It goes out before anything else, heartbeats included. The server
+    sends the response's start before it runs this stream; if that took long
+    enough for the check to expire, access is checked again first, by
+    _renew_access's rule but with no heartbeat, so a failed check, or
+    _MAX_STALE_ACCESS_CHECKS slow ones, end the stream with nothing sent.
 
     Each pass borrows one pooled connection, within the database budget, to
     read the next batch and, when it found rows, to check access; the
     connection goes back before any frame is sent. A pass that finds nothing
     checks nothing, unless a heartbeat went out since the last check: then it
-    checks, and if the heartbeat went out while the pass ran, access is
-    checked again before the stream waits. A stream that receives no rows
-    therefore closes within one heartbeat of losing access. Heartbeats keep
-    their interval while a pass or a check runs.
+    checks. Each heartbeat that goes out while a pass runs, after its check,
+    calls for one more check before the stream waits. A stream that receives
+    no rows therefore closes within one heartbeat of losing access. Heartbeats
+    keep their interval while a pass or a check runs.
 
     Invariant: no frame other than a heartbeat is yielded unless an access
     check has passed that started no more than _RECHECK_DURING_YIELD_SECONDS
     before the frame is yielded and, for a row's frame, after the row was
     read. Freshness is judged once the frame is built, right before it is
-    sent; _renew_access says what happens when the check has expired. A
-    stream whose access cannot be confirmed ends with no further frame.
+    sent, with nothing awaited in between; _renew_access says what happens
+    when the check has expired. A stream whose access cannot be confirmed
+    ends with no further frame.
     """
     try:
+        loop = asyncio.get_running_loop()
+        clock = _StreamClock(checked_at=checked_at, now=loop.time())
+        # The open's check has not covered a frame yet, so once it has
+        # expired it counts as the first slow check.
+        slow_checks = 0
+        while loop.time() - clock.checked_at > _RECHECK_DURING_YIELD_SECONDS:
+            slow_checks += 1
+            if slow_checks >= _MAX_STALE_ACCESS_CHECKS:
+                return
+            try:
+                clock.checked_at = await _recheck_access(user_id=user_id, vault=vault, vault_id=vault_id)
+            except _AccessLost:
+                return
         yield start_frame
+        clock.last_frame_at = loop.time()
+        clock.check_covered_a_frame = True
         # Wake-ups come from the process-wide LISTEN hub, for this Vault's
         # events only. Rows are read from the events table by cursor, so a
         # missed wake-up only delays this stream until its heartbeat re-read.
@@ -935,12 +956,9 @@ async def _stream_events(
         subscription = hub.subscribe(vault_id)
         try:
             wakeup = subscription.wakeup
-            loop = asyncio.get_running_loop()
-            clock = _StreamClock(checked_at=checked_at, now=loop.time())
-            clock.check_covered_a_frame = True
             current_position = position
-            # Whether the pass just run was the extra one an owed check called for.
-            checked_again = False
+            # The heartbeat the last extra check was made for: one per heartbeat.
+            checked_for_heartbeat = -math.inf
 
             while True:
                 if await request.is_disconnected():
@@ -986,14 +1004,14 @@ async def _stream_events(
                     clock.last_frame_at = loop.time()
                     clock.check_covered_a_frame = True
                 if rows:
-                    checked_again = False
                     continue
-                if clock.check_owed and not checked_again:
+                if clock.check_owed and clock.last_heartbeat_at > checked_for_heartbeat:
                     # A heartbeat went out while this pass ran, after its check
                     # if it made one: check now rather than a heartbeat later.
-                    checked_again = True
+                    # Only a newer heartbeat calls for another, so a database
+                    # slower than the heartbeat interval cannot loop here.
+                    checked_for_heartbeat = clock.last_heartbeat_at
                     continue
-                checked_again = False
 
                 remaining = max(
                     0.0,

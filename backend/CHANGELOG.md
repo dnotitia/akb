@@ -27,9 +27,11 @@ specifically; the proxy has its own log in
   check that opened it and sent before anything else, so a client that brought
   no cursor still has one to resume from; when access cannot be confirmed in
   time to send it, the open fails with a retryable 503
-  `event_tail_unavailable`. Heartbeats also keep their interval while a batch
-  is read, and a heartbeat sent during an empty read is followed by an access
-  check before the tail waits again. A cursor is refused with 410 `event_gap`
+  `event_tail_unavailable`, and when sending the response's start outlasts
+  the check, access is checked again before the checkpoint goes out.
+  Heartbeats also keep their interval while a batch is read, and each
+  heartbeat sent during an empty read is followed by an access check before
+  the tail waits again. A cursor is refused with 410 `event_gap`
   only when an event it never received was deleted: migration 133 adds a
   trigger that records the highest deleted event id per Vault in every
   statement that deletes, whichever release issues it. A cursor taken before a

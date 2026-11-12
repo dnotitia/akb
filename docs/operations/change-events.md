@@ -105,14 +105,21 @@ so a client that brought no cursor holds one from the start; store it like any
 other cursor. If the preflight outlasts the second that check covers, access
 is checked again before the response starts; if the checks stay slow, the open
 fails with a retryable 503 `event_tail_unavailable` rather than starting a
-tail that cannot send its first frame.
+tail that cannot send its first frame. If sending the response's start then
+takes longer than that second, access is checked again before the checkpoint,
+with no heartbeat ahead of it: a revoked reader, or checks that stay slow,
+three in a row, end the response with no frame. That is the one case in which
+a reader who still has access gets an empty 200: it needs a response start
+slower than a second and access checks slower than a second as well. A client
+that brought no cursor then reconnects without one and starts after the newest
+event, so an event committed in between can be missed.
 
 A waiting tail holds no pooled connection. To read, it borrows one for the
 batch and, when the batch has rows, checks the reader's access on that same
 connection before sending any of them. A pass that finds nothing checks
-nothing, unless a heartbeat went out since the last check: then it checks,
-and if the heartbeat went out while the pass ran, access is checked again
-before the tail waits. Before each frame, a check that
+nothing, unless a heartbeat went out since the last check: then it checks.
+Each heartbeat that goes out while a pass runs, after its check, calls for one
+more check before the tail waits. Before each frame, a check that
 started more than a second earlier is repeated, and so is a check that itself
 took longer than that to finish. A tail whose checks keep taking that long,
 the first check of a batch included, ends after three in a row with no further
