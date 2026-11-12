@@ -16,6 +16,7 @@ import contextlib
 import json
 import os
 import random
+import time
 import uuid
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable
@@ -142,6 +143,7 @@ async def _undo_migration_132(conn: asyncpg.Connection) -> None:
     """Return the database to its shape before migration 132."""
     await conn.execute("DROP TRIGGER IF EXISTS akb_events_commit_order_trigger ON events")
     await conn.execute("DROP FUNCTION IF EXISTS akb_events_commit_order()")
+    await conn.execute("DROP TABLE IF EXISTS vault_event_order")
     await conn.execute(
         "ALTER TABLE events ALTER COLUMN id SET DEFAULT nextval('events_id_seq'::regclass)",
     )
@@ -308,6 +310,42 @@ async def test_restricted_sql_role_row_write_follows_commit_order():
                 await conn.execute(f'DROP OWNED BY "{role}"')
     finally:
         # Roles are cluster-wide and outlive the dropped test database.
+        with contextlib.suppress(OSError, asyncpg.PostgresError):
+            admin = await asyncpg.connect(_DSN, timeout=2)
+            try:
+                await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
+            finally:
+                await admin.close()
+
+
+async def test_a_sql_role_cannot_hold_a_vault_event_lock():
+    """Any role may take any advisory lock, so the ordering lock is a row lock
+    on a table no SQL role is granted. A role holding the key an advisory
+    ordering lock would use stalls nothing, and the lock row is out of reach."""
+    role = f"akb_events_order_{uuid.uuid4().hex[:8]}"
+    try:
+        async with _fresh_database() as pool:
+            vault_id = await _make_vault(pool, "order-held-key")
+            async with pool.acquire() as conn:
+                await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
+            async with pool.acquire() as holder, pool.acquire() as writer:
+                async with _OpenTransaction(holder):
+                    await holder.execute(f'SET LOCAL ROLE "{role}"')
+                    await holder.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended('akb-events:' || $1, 0))",
+                        str(vault_id),
+                    )
+                    started = time.monotonic()
+                    await asyncio.wait_for(
+                        _write_and_commit(writer, lambda conn: _emit(conn, vault_id, "while-key-held")),
+                        timeout=_BLOCK_PROBE_SECONDS * 4,
+                    )
+                    waited = time.monotonic() - started
+                    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                        async with holder.transaction():
+                            await holder.execute("SELECT 1 FROM vault_event_order FOR UPDATE")
+            assert waited < _BLOCK_PROBE_SECONDS
+    finally:
         with contextlib.suppress(OSError, asyncpg.PostgresError):
             admin = await asyncpg.connect(_DSN, timeout=2)
             try:

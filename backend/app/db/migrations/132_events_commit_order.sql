@@ -3,10 +3,15 @@
 -- An id drawn when the row is inserted becomes visible only when its
 -- transaction commits. A cursor reader that saw a later id first would move
 -- past an earlier id that committed after it. For an event with a Vault, this
--- trigger first takes a transaction-scoped advisory lock for that Vault and
--- only then draws the id. The lock is held until commit or rollback, so the
--- next event of the same Vault draws its id only after every earlier one is
+-- trigger first locks that Vault's row in `vault_event_order` and only then
+-- draws the id. The row lock is held until commit or rollback, so the next
+-- event of the same Vault draws its id only after every earlier one is
 -- visible or gone. Events without a Vault take no lock.
+--
+-- The lock is a row lock on a table that no SQL role is granted, rather than
+-- an advisory lock: any role may take any advisory lock, so a statement could
+-- otherwise hold a Vault's key and stall that Vault's writes. A Vault's row
+-- is created by its first event.
 --
 -- The trigger draws every id. The column keeps no default, because defaults
 -- are evaluated before BEFORE triggers and a default would spend a second
@@ -16,6 +21,10 @@
 -- A sequence cache larger than 1 hands each session its own block of values,
 -- so a session could draw a smaller id after another session's larger one.
 -- The migration sets the cache to 1 when it is not.
+CREATE TABLE IF NOT EXISTS public.vault_event_order (
+    vault_id UUID PRIMARY KEY
+);
+
 DO $migration$
 DECLARE
     sequence_name text;
@@ -41,9 +50,11 @@ BEGIN
         AS $function$
         BEGIN
             IF NEW.vault_id IS NOT NULL THEN
-                PERFORM pg_catalog.pg_advisory_xact_lock(
-                    pg_catalog.hashtextextended('akb-events:' || NEW.vault_id::text, 0)
-                );
+                INSERT INTO public.vault_event_order (vault_id) VALUES (NEW.vault_id)
+                    ON CONFLICT (vault_id) DO NOTHING;
+                PERFORM 1 FROM public.vault_event_order
+                 WHERE vault_id = NEW.vault_id
+                   FOR UPDATE;
             END IF;
             NEW.id := pg_catalog.nextval(%L::regclass);
             RETURN NEW;

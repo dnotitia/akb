@@ -351,3 +351,41 @@ async def test_user_sql_executor_sets_claims_guc_transaction_local():
         "items": [{"claims": claims_json}],
         "total": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_refuses_advisory_lock_calls_before_executor(monkeypatch):
+    from app.services import table_service
+    from app.util.errors import METHOD_NOT_ALLOWED
+
+    async def fake_pool() -> _Pool:
+        return _Pool(_Conn())
+
+    class _Executor:
+        async def execute(self, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("an advisory lock call reached the SQL executor")
+
+    monkeypatch.setattr(table_service, "get_pool", fake_pool)
+    monkeypatch.setattr(
+        table_service.table_data_repo,
+        "build_table_name_map",
+        lambda _conn, _vaults: _async_return({}),
+    )
+    monkeypatch.setattr(
+        table_service.table_data_repo,
+        "rewrite_table_names",
+        lambda sql, _table_map: sql,
+    )
+    monkeypatch.setattr(table_service, "get_user_sql_executor", lambda: _Executor())
+
+    result = await table_service.execute_sql(
+        vault_names=["demo"],
+        user_id="11111111-1111-1111-1111-111111111111",
+        actor_id="reader",
+        sql="SELECT pg_catalog.pg_advisory_xact_lock(hashtextextended('akb-events:demo', 0))",
+        is_admin=False,
+        read_only=True,
+    )
+
+    assert result["code"] == METHOD_NOT_ALLOWED
+    assert "Advisory lock functions" in result["error"]

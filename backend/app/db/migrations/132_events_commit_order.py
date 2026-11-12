@@ -7,8 +7,8 @@ for the same Vault and the one with the larger id committed first, a reader
 could deliver the larger id, move its cursor past the smaller one, and never
 read the smaller event once it committed.
 
-A ``BEFORE INSERT`` trigger now takes a transaction-scoped advisory lock for the
-event's Vault and then draws the id. The next event of that Vault draws its id
+A ``BEFORE INSERT`` trigger now locks the event's Vault row in
+``vault_event_order`` until the transaction ends and then draws the id. The next event of that Vault draws its id
 only after every earlier one has committed or rolled back, so within a Vault id
 order is commit order. Events without a Vault take no lock. The trigger draws
 every id and the column keeps no default, so an event uses one sequence value;

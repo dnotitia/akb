@@ -64,6 +64,7 @@ from app.util.text import fuzzy_hint
 # `table_data_repo`.
 from app.repositories.table_data_repo import (  # noqa: F401
     build_table_name_map,
+    contains_advisory_lock_call,
     contains_pg_settings_identifier,
     contains_set_config_call,
     contains_unicode_escaped_identifier,
@@ -1991,6 +1992,12 @@ async def execute_sql(
             return err(
                 "pg_settings is not available via akb_sql because "
                 "request.jwt.claims is reserved for service-key claim injection.",
+                code=METHOD_NOT_ALLOWED,
+            )
+        if contains_advisory_lock_call(rewritten):
+            return err(
+                "Advisory lock functions are not available via akb_sql; the "
+                "backend uses advisory locks to order its own writes.",
                 code=METHOD_NOT_ALLOWED,
             )
 
