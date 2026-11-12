@@ -42,6 +42,11 @@ _RECONNECT_INITIAL_DELAY_SECONDS = 0.5
 _RECONNECT_MAX_DELAY_SECONDS = 30.0
 _KEEPALIVE_INTERVAL_SECONDS = 30.0
 _KEEPALIVE_TIMEOUT_SECONDS = 5.0
+# A loss restarts the reconnect backoff only if LISTEN had been held this
+# long: one keepalive interval. A connection lost sooner counts as one more
+# failed attempt, so a server that drops each new connection right after
+# LISTEN is retried at growing intervals rather than every initial delay.
+_RECONNECT_RESET_AFTER_SECONDS = _KEEPALIVE_INTERVAL_SECONDS
 _CLOSE_TIMEOUT_SECONDS = 5.0
 
 ListenerConnect = Callable[[], Awaitable[Any]]
@@ -76,6 +81,7 @@ class EventTailHub:
         channel: str = EVENT_CHANNEL,
         reconnect_initial_delay: float = _RECONNECT_INITIAL_DELAY_SECONDS,
         reconnect_max_delay: float = _RECONNECT_MAX_DELAY_SECONDS,
+        reconnect_reset_after: float = _RECONNECT_RESET_AFTER_SECONDS,
         keepalive_interval: float = _KEEPALIVE_INTERVAL_SECONDS,
         keepalive_timeout: float = _KEEPALIVE_TIMEOUT_SECONDS,
         close_timeout: float = _CLOSE_TIMEOUT_SECONDS,
@@ -84,6 +90,7 @@ class EventTailHub:
         self._channel = channel
         self._reconnect_initial_delay = reconnect_initial_delay
         self._reconnect_max_delay = reconnect_max_delay
+        self._reconnect_reset_after = reconnect_reset_after
         self._keepalive_interval = keepalive_interval
         self._keepalive_timeout = keepalive_timeout
         self._close_timeout = close_timeout
@@ -157,7 +164,7 @@ class EventTailHub:
         delay = self._reconnect_initial_delay
         while not self._closed:
             try:
-                await self._listen()
+                held = await self._listen()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - a listener failure must never reach a stream
@@ -174,23 +181,33 @@ class EventTailHub:
             else:
                 if self._closed:
                     return
-                # It was up: the next failure starts from the bottom of the backoff.
-                delay = self._reconnect_initial_delay
-                logger.warning("Event tail listener connection lost; reconnecting in %.1fs", delay)
-                wait = delay
+                if held >= self._reconnect_reset_after:
+                    # It stayed up: the next failure starts from the bottom of the backoff.
+                    delay = self._reconnect_initial_delay
+                    wait = delay
+                else:
+                    # Lost soon after LISTEN: one more failed attempt.
+                    wait = delay
+                    delay = min(delay * 2, self._reconnect_max_delay)
+                logger.warning(
+                    "Event tail listener connection lost after %.1fs; reconnecting in %.1fs",
+                    held,
+                    wait,
+                )
             # Notifications sent while nothing listened are gone. Wake every
             # stream so it re-reads by cursor now, not at its next heartbeat.
             self._wake_all()
             await asyncio.sleep(wait)
 
-    async def _listen(self) -> None:
+    async def _listen(self) -> float:
         """Hold one connection until it is lost or the hub closes.
 
-        Raises only while establishing it; once LISTEN succeeds, a loss or a
-        failed keepalive returns normally.
+        Raises only while establishing it. Once LISTEN succeeds, a loss or a
+        failed keepalive returns normally, with how long LISTEN was held.
         """
         connection = await self._connect()
         lost = asyncio.Event()
+        loop = asyncio.get_running_loop()
 
         def on_terminate(_connection: object) -> None:
             # Only this connection's own flag: asyncpg delivers the callback a
@@ -201,10 +218,12 @@ class EventTailHub:
             connection.add_termination_listener(on_terminate)
             await connection.add_listener(self._channel, self._on_notify)
             self._connected = True
+            listening_since = loop.time()
             logger.info("Event tail listener connected")
             # Anything committed before LISTEN took effect notified nobody.
             self._wake_all()
             await self._watch(connection, lost)
+            return loop.time() - listening_since
         finally:
             self._connected = False
             if not connection.is_closed():

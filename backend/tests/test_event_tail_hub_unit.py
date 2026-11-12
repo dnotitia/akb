@@ -24,10 +24,12 @@ _real_sleep = asyncio.sleep
 
 
 class _FakeListenConnection:
-    def __init__(self, *, fail_keepalive: bool = False) -> None:
+    def __init__(self, *, fail_keepalive: bool = False, drop_after_listen: bool = False) -> None:
         self.listeners: dict[str, list[Callable[..., object]]] = {}
         self.termination_listeners: list[Callable[[object], object]] = []
         self.fail_keepalive = fail_keepalive
+        # The server accepts LISTEN and then drops the connection at once.
+        self.drop_after_listen = drop_after_listen
         self.closed = False
         self.close_calls = 0
         self.terminate_calls = 0
@@ -38,6 +40,8 @@ class _FakeListenConnection:
 
     async def add_listener(self, channel: str, callback: Callable[..., object]) -> None:
         self.listeners.setdefault(channel, []).append(callback)
+        if self.drop_after_listen:
+            self.lose()
 
     async def fetchval(self, query: str, *, timeout: float | None = None) -> int:
         assert query == "SELECT 1"
@@ -241,6 +245,57 @@ async def test_failed_connects_retry_with_bounded_exponential_backoff(monkeypatc
 
         assert connector.calls == 4
         assert sleeps == [0.5, 1.0, 1.0]
+    finally:
+        await hub.close()
+
+
+def _record_sleeps(monkeypatch) -> list[float]:
+    """Record the hub's reconnect delays instead of waiting them out."""
+    sleeps: list[float] = []
+
+    async def recording_sleep(delay: float, result: object = None) -> object:
+        sleeps.append(delay)
+        await _real_sleep(0)
+        return result
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+    return sleeps
+
+
+async def test_a_connection_dropped_right_after_listen_keeps_growing_the_backoff(monkeypatch) -> None:
+    """Every loss used to restart the backoff, however briefly LISTEN was held.
+
+    A server that accepted LISTEN and dropped the connection at once was then
+    reconnected to, with a warning and every stream woken, every half second.
+    """
+    sleeps = _record_sleeps(monkeypatch)
+    dropped = [_FakeListenConnection(drop_after_listen=True) for _ in range(5)]
+    connector = _Connector(*dropped)
+    hub = _hub(connector, reconnect_initial_delay=0.5, reconnect_max_delay=4.0)
+    try:
+        hub.subscribe()
+        await _until(lambda: connector.calls == len(dropped) + 1 and hub.connected)
+
+        assert all(connection.closed for connection in dropped)
+        assert sleeps == [0.5, 1.0, 2.0, 4.0, 4.0]
+    finally:
+        await hub.close()
+
+
+async def test_a_connection_that_stayed_up_restarts_the_backoff(monkeypatch) -> None:
+    sleeps = _record_sleeps(monkeypatch)
+    stayed_up = _FakeListenConnection()
+    connector = _Connector(OSError("connection refused"), OSError("connection refused"), stayed_up)
+    hub = _hub(connector, reconnect_initial_delay=0.5, reconnect_max_delay=4.0, reconnect_reset_after=0.05)
+    try:
+        hub.subscribe()
+        await _until(lambda: connector.calls == 3 and hub.connected)
+        # Held for longer than reconnect_reset_after before it is lost.
+        await _real_sleep(0.1)
+        stayed_up.lose()
+        await _until(lambda: connector.calls == 4 and hub.connected)
+
+        assert sleeps == [0.5, 1.0, 0.5]
     finally:
         await hub.close()
 
