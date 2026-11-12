@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from contextlib import asynccontextmanager, suppress
 from unittest.mock import AsyncMock
 
 import asyncpg
+import httpx
 import pytest
+from fastapi import FastAPI, Request
 
 from app.config import settings
 from app.exceptions import (
@@ -22,12 +25,13 @@ from app.exceptions import (
 pytestmark = pytest.mark.asyncio
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 _ISSUER = "https://id.example.com/realms/akb"
+_LOCK_TEST_TIMEOUT = 10
 
 
 @pytest.fixture
 async def pool(monkeypatch):
     try:
-        pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=3)
+        pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=5)
     except Exception:
         pytest.skip("Postgres unreachable at AKB_TEST_DSN")
 
@@ -53,6 +57,22 @@ async def pool(monkeypatch):
     await pool.close()
 
 
+@pytest.fixture
+async def bearer_client(pool, monkeypatch):
+    from app.api.routes import access, auth
+    from app.services import access_service
+
+    async def _get_pool():
+        return pool
+
+    monkeypatch.setattr(access_service, "get_pool", _get_pool)
+    app = FastAPI()
+    app.include_router(auth.router, prefix="/api/v1")
+    app.include_router(access.router, prefix="/api/v1")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://akb.example") as client:
+        yield client
+
+
 def _claims(subject: str, email: str | None = None) -> dict:
     claims = {
         "iss": _ISSUER,
@@ -64,12 +84,39 @@ def _claims(subject: str, email: str | None = None) -> dict:
     return claims
 
 
+def _stub_verified_bearers(monkeypatch, claims_by_token, *, barrier: asyncio.Barrier | None = None):
+    from app.services import auth_service
+    from app.services.auth_verifier_profiles import KEYCLOAK_ACCESS_V1, VerifiedPrincipal
+
+    async def verify(token, route_profile):
+        assert route_profile in {"api", "mcp"}
+        claims = claims_by_token[token]
+        if barrier is not None:
+            await barrier.wait()
+        return VerifiedPrincipal(
+            profile_id=KEYCLOAK_ACCESS_V1,
+            issuer=claims["iss"],
+            subject=claims["sub"],
+            credential_type="access_token",
+            claims={**claims, "scope": "openid profile email akb:vault:read"},
+            audience=f"https://akb.example/{route_profile}",
+        )
+
+    monkeypatch.setattr(auth_service, "verify_keycloak_access_v1", verify)
+    monkeypatch.setattr(settings, "auth_mode", "sso")
+
+
+def _bearer_headers(subject: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {subject}"}
+
+
 async def _insert_bound_user(
     pool,
     *,
     subject: str,
     email: str,
     status: str = "active",
+    is_admin: bool = False,
 ) -> uuid.UUID:
     user_id = uuid.uuid4()
     async with pool.acquire() as conn:
@@ -77,14 +124,15 @@ async def _insert_bound_user(
             """
             INSERT INTO users (
                 id, username, email, password_hash, auth_provider,
-                account_status, account_kind
-            ) VALUES ($1, $2, $3, $4, 'keycloak', $5, 'human')
+                account_status, account_kind, is_admin
+            ) VALUES ($1, $2, $3, $4, 'keycloak', $5, 'human', $6)
             """,
             user_id,
             f"wsg-{uuid.uuid4().hex[:12]}",
             email,
             "!keycloak-sso:no-local-login!",
             status,
+            is_admin,
         )
         await conn.execute(
             """
@@ -127,7 +175,7 @@ async def test_exact_subject_binding_preserves_user_id_across_email_change(pool,
     monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
 
     resolved = await _resolve_or_provision_keycloak_user(
-        _claims("email-change", new_email)
+        _claims("email-change", new_email), sync_profile=True,
     )
 
     assert resolved["user_id"] == user_id
@@ -177,7 +225,7 @@ async def test_bound_identity_sanitizes_upstream_display_name_without_blocking_l
     claims = _claims(subject)
     claims["name"] = "  Alice\n" + ("A" * 120)
 
-    resolved = await _resolve_or_provision_keycloak_user(claims)
+    resolved = await _resolve_or_provision_keycloak_user(claims, sync_profile=True)
 
     assert resolved["user_id"] == user_id
     assert len(resolved["display_name"]) == 100
@@ -250,13 +298,13 @@ async def test_concurrent_open_mode_creation_of_same_subject_is_idempotent(
     release_first_lookup = asyncio.Event()
     first_pid = None
 
-    async def pause_first_lookup(conn, issuer, subject):
+    async def pause_first_lookup(conn, issuer, subject, *, lock_user=False):
         nonlocal first_pid
-        if first_pid is None:
+        if first_pid is None and not lock_user:
             first_pid = conn.get_server_pid()
             first_lookup_started.set()
             await release_first_lookup.wait()
-        return await original_lookup(conn, issuer, subject)
+        return await original_lookup(conn, issuer, subject, lock_user=lock_user)
 
     monkeypatch.setattr(auth_service, "_bound_external_user", pause_first_lookup)
     claims = _claims("concurrent-jit", email)
@@ -642,34 +690,199 @@ async def test_disabled_mode_rejects_even_a_bound_external_identity(pool, monkey
         await _resolve_or_provision_keycloak_user(_claims("disabled-mode"))
 
 
-async def test_exact_identity_resolution_waits_for_suspension_and_denies(pool, monkeypatch):
-    from app.services.auth_service import _resolve_or_provision_keycloak_user
-
-    user_id = await _insert_bound_user(
-        pool,
-        subject="suspension-race",
-        email=f"wsg-suspension-race-{uuid.uuid4().hex[:8]}@example.com",
+async def _profile_rows(pool, *user_ids):
+    return await pool.fetch(
+        """
+        SELECT u.id, u.email, u.display_name, u.updated_at,
+               u.xmin::text AS user_version, u.ctid::text AS user_tuple,
+               e.email_snapshot, e.last_seen_at,
+               e.xmin::text AS binding_version, e.ctid::text AS binding_tuple
+          FROM users u
+          JOIN external_identities e ON e.user_id = u.id
+         WHERE u.id = ANY($1::uuid[])
+         ORDER BY u.id
+        """,
+        user_ids,
     )
-    monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
 
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.fetchrow(
-                "SELECT id FROM users WHERE id = $1 FOR UPDATE",
-                user_id,
-            )
-            await conn.execute(
-                "UPDATE users SET account_status = 'suspended' WHERE id = $1",
-                user_id,
-            )
-            resolve_task = asyncio.create_task(
-                _resolve_or_provision_keycloak_user(_claims("suspension-race"))
-            )
-            await asyncio.sleep(0.05)
-            assert not resolve_task.done()
 
-    with pytest.raises(AccountSuspendedError):
-        await resolve_task
+async def test_bound_bearers_share_user_lock_without_advisory_locks_or_profile_writes(
+    pool, bearer_client, monkeypatch,
+):
+    from app.api.deps import require_delegated_actor
+    from app.services.auth_service import AuthenticatedUser, _resolve_or_provision_keycloak_user
+    from app.services.role_authority import role_authority_transaction
+    from mcp_server.http_app import MCPApp
+
+    suffix = uuid.uuid4().hex[:8]
+    first, second = f"parallel-first-{suffix}", f"parallel-second-{suffix}"
+    first_email, second_email = f"wsg-{first}@example.com", f"wsg-{second}@example.com"
+    first_id = await _insert_bound_user(pool, subject=first, email=first_email)
+    second_id = await _insert_bound_user(pool, subject=second, email=second_email)
+    claims = {
+        first: {**_claims(first, second_email), "name": "Changed first name"},
+        second: {**_claims(second, f"wsg-{second}-changed@example.com"), "name": "Changed second name"},
+    }
+    monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only")
+    _stub_verified_bearers(monkeypatch, claims, barrier=asyncio.Barrier(3))
+    before = await _profile_rows(pool, first_id, second_id)
+
+    service_user = AuthenticatedUser(
+        user_id=str(uuid.uuid4()),
+        username="fixture-service",
+        email="fixture-service@example.com",
+        display_name=None,
+        is_admin=False,
+        auth_method="pat",
+        account_kind="service",
+        token_id=str(uuid.uuid4()),
+        key_class="service",
+    )
+    delegated_request = Request({
+        "type": "http",
+        "headers": [(b"x-akb-delegated-authorization", f"Bearer {second}".encode())],
+    })
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=MCPApp()), base_url="https://akb.example",
+    ) as mcp_client:
+        async with pool.acquire() as holder, role_authority_transaction(holder):
+            for subject in claims:
+                await holder.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"external-identity:{len(_ISSUER)}:{_ISSUER}{subject}",
+                )
+            # Same-user authentication must be compatible with a shared user lock.
+            await holder.fetchval("SELECT id FROM users WHERE id = $1 FOR SHARE", first_id)
+            async with asyncio.timeout(_LOCK_TEST_TIMEOUT), asyncio.TaskGroup() as tasks:
+                rest = tasks.create_task(bearer_client.get("/api/v1/auth/me", headers=_bearer_headers(first)))
+                mcp = tasks.create_task(mcp_client.delete("/mcp", headers=_bearer_headers(first)))
+                delegated = tasks.create_task(require_delegated_actor(delegated_request, service_user))
+
+    assert rest.result().status_code == 200
+    assert rest.result().json()["user_id"] == str(first_id)
+    assert rest.result().json()["email"] == first_email
+    assert mcp.result().status_code == 200
+    assert mcp.result().json() == {"terminated": True}
+    assert delegated.result().user.user_id == str(second_id)
+    assert delegated.result().user.email == second_email
+    # Compare tuple versions as well as values so even a no-op UPDATE fails.
+    assert await _profile_rows(pool, first_id, second_id) == before
+
+    with pytest.raises(ExternalIdentityConflictError):
+        await _resolve_or_provision_keycloak_user(claims[first], sync_profile=True)
+    assert await _profile_rows(pool, first_id, second_id) == before
+
+
+async def _wait_for_user_row_blocker(observer, writer_pid):
+    while True:
+        wait_event = await observer.fetchval(
+            """
+            SELECT wait_event FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND wait_event_type = 'Lock'
+               AND $1::int = ANY(pg_blocking_pids(pid))
+            """,
+            writer_pid,
+        )
+        if wait_event is not None:
+            assert wait_event in {"transactionid", "tuple"}
+            return
+        await asyncio.sleep(0.01)
+
+
+class _RollBackGovernanceChange(Exception):
+    pass
+
+
+@pytest.mark.parametrize("commit", [True, False], ids=["commit", "rollback"])
+@pytest.mark.parametrize(("mutation", "committed_status"), [("suspend", 401), ("demote", 403)])
+async def test_bound_bearer_waits_for_same_user_governance_change(
+    pool, bearer_client, monkeypatch, commit, mutation, committed_status,
+):
+    from app.services import account_service
+    from app.services.role_authority import role_authority_transaction
+
+    suffix = uuid.uuid4().hex[:8]
+    subject, other = f"governance-target-{suffix}", f"governance-other-{suffix}"
+    user_id = await _insert_bound_user(pool, subject=subject, email=f"wsg-{subject}@example.com", is_admin=True)
+    other_id = await _insert_bound_user(pool, subject=other, email=f"wsg-{other}@example.com")
+    _stub_verified_bearers(monkeypatch, {subject: _claims(subject), other: _claims(other)})
+
+    writer_pid = asyncio.get_running_loop().create_future()
+    release_writer = asyncio.Event()
+
+    async def _get_pool():
+        return pool
+
+    @asynccontextmanager
+    async def pause_before_governance_commit(conn):
+        async with role_authority_transaction(conn):
+            yield
+            if not writer_pid.done():
+                writer_pid.set_result(conn.get_server_pid())
+                await release_writer.wait()
+                if not commit:
+                    raise _RollBackGovernanceChange
+
+    monkeypatch.setattr(account_service, "get_pool", _get_pool)
+    monkeypatch.setattr(account_service, "role_authority_transaction", pause_before_governance_commit)
+
+    async def change_account():
+        actor_id = f"wsg-governance-admin-{suffix}"
+        with suppress(_RollBackGovernanceChange):
+            if mutation == "suspend":
+                await account_service.suspend_user(str(user_id), actor_id=actor_id)
+            else:
+                await account_service.set_user_admin(str(user_id), is_admin=False, actor_id=actor_id)
+
+    async with asyncio.timeout(_LOCK_TEST_TIMEOUT), asyncio.TaskGroup() as tasks:
+        tasks.create_task(change_account())
+        pid = await writer_pid
+        headers = _bearer_headers(subject)
+        if mutation == "demote" and commit:
+            request = bearer_client.put(
+                f"/api/v1/admin/users/{user_id}/role", headers=headers, json={"is_admin": True},
+            )
+        else:
+            request = bearer_client.get("/api/v1/admin/users", headers=headers)
+        pending = tasks.create_task(request)
+        async with pool.acquire() as observer:
+            await _wait_for_user_row_blocker(observer, pid)
+        unrelated = await bearer_client.get("/api/v1/auth/me", headers=_bearer_headers(other))
+        assert unrelated.status_code == 200
+        assert unrelated.json()["user_id"] == str(other_id)
+        assert not pending.done()
+        release_writer.set()
+
+    response = pending.result()
+    assert response.status_code == (committed_status if commit else 200)
+    if response.status_code == 200:
+        assert any(user["id"] == str(user_id) and user["is_admin"] for user in response.json()["users"])
+    elif response.status_code == 403:
+        assert response.json() == {"detail": "Admin only"}
+        profile = await bearer_client.get("/api/v1/auth/me", headers=_bearer_headers(subject))
+        assert profile.status_code == 200
+        assert profile.json()["is_admin"] is False
+
+
+async def test_bound_bearer_checks_binding_again_after_waiting_for_user_row(pool, bearer_client, monkeypatch):
+    from app.services.role_authority import role_authority_transaction
+
+    subject = f"deleted-binding-{uuid.uuid4().hex[:8]}"
+    user_id = await _insert_bound_user(pool, subject=subject, email=f"wsg-{subject}@example.com")
+    _stub_verified_bearers(monkeypatch, {subject: _claims(subject)})
+
+    async with asyncio.timeout(_LOCK_TEST_TIMEOUT), asyncio.TaskGroup() as tasks:
+        async with pool.acquire() as writer, pool.acquire() as observer:
+            async with role_authority_transaction(writer):
+                await writer.fetchval("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE", user_id)
+                await writer.execute("DELETE FROM external_identities WHERE user_id = $1", user_id)
+                pending = tasks.create_task(bearer_client.get("/api/v1/auth/me", headers=_bearer_headers(subject)))
+                await _wait_for_user_row_blocker(observer, writer.get_server_pid())
+
+    assert pending.result().status_code == 401
+    assert await pool.fetchval("SELECT account_status FROM users WHERE id = $1", user_id) == "active"
+    assert await pool.fetchval("SELECT id FROM external_identities WHERE user_id = $1", user_id) is None
 
 
 async def test_external_identity_profile_snapshot_is_not_locally_editable(pool):

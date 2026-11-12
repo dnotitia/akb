@@ -508,9 +508,8 @@ def _resolved_external_user(row, *, newly_provisioned: bool) -> dict:
     }
 
 
-async def _bound_external_user(conn, issuer: str, subject: str):
-    return await conn.fetchrow(
-        """
+async def _bound_external_user(conn, issuer: str, subject: str, *, lock_user: bool = False):
+    query = """
         SELECT u.id, u.username, u.email, u.display_name, u.is_admin,
                u.tokens_revoked_before, u.auth_provider,
                u.account_status, u.account_kind,
@@ -518,10 +517,31 @@ async def _bound_external_user(conn, issuer: str, subject: str):
           FROM external_identities e
           JOIN users u ON u.id = e.user_id
          WHERE e.issuer = $1 AND e.subject = $2
-        """,
-        issuer,
-        subject,
-    )
+        """
+    if lock_user:
+        query += " FOR SHARE OF u"
+    return await conn.fetchrow(query, issuer, subject)
+
+
+async def _read_bound_external_user(conn, issuer: str, subject: str):
+    async with conn.transaction(isolation="read_committed"):
+        bound = await _bound_external_user(conn, issuer, subject, lock_user=True)
+        if bound is None:
+            return None
+        # The user row lock waits for account changes. The joined identity
+        # may still come from before that wait. Binding changes for an existing
+        # user lock its row, so check the exact binding in a fresh snapshot
+        # while the user row is held, without taking an identity row lock.
+        binding_exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM external_identities
+                 WHERE issuer = $1 AND subject = $2 AND id = $3 AND user_id = $4
+            )
+            """,
+            issuer, subject, bound["external_identity_id"], bound["id"],
+        )
+        return bound if binding_exists else None
 
 
 async def _refresh_bound_external_user(conn, row, claims: dict):
@@ -733,14 +753,16 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
     return _resolved_external_user(row, newly_provisioned=False)
 
 
-async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: str | None = None) -> dict:
+async def _resolve_or_provision_keycloak_user(
+    claims: dict, *, provider_alias: str | None = None, sync_profile: bool = False,
+) -> dict:
     """Resolve exact issuer/subject, adopt or create on authority, or refuse.
 
     Email and username are collision checks only — except on the one path
     the operator explicitly opened: a browser login through a provider
     declared authoritative for the address's domain (``provider_alias``
-    names the provider the flow selected and verified; ``None`` is the
-    non-browser projection paths, which stay on today's behaviour).
+    names the provider the flow selected and verified). The callback opts
+    into profile synchronization; bound bearer requests use the stored profile.
     ``invite_only`` therefore accepts an exact prebound identity, an
     authority adopt, or an authority provision; ``open`` additionally keeps
     its fresh-account JIT, whose collision branch adopts on authority
@@ -752,6 +774,12 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        if not sync_profile:
+            bound = await _read_bound_external_user(conn, issuer, subject)
+            if bound is not None:
+                _assert_active_human(bound)
+                return _resolved_external_user(bound, newly_provisioned=False)
+
         # Share the exact-identity lock with administrative/periodic approval.
         # Authority logins additionally serialize on the claimed address so
         # different subjects cannot adopt the same account concurrently.
@@ -775,15 +803,18 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
                 )
             bound = await _bound_external_user(conn, issuer, subject)
             if bound is not None:
-                refreshed = await _refresh_bound_external_user(conn, bound, claims)
-                return _resolved_external_user(refreshed, newly_provisioned=False)
+                if sync_profile:
+                    bound = await _refresh_bound_external_user(conn, bound, claims)
+                else:
+                    _assert_active_human(bound)
+                return _resolved_external_user(bound, newly_provisioned=False)
 
             try:
                 # Roll back any partial account mutation on refusal, but keep
                 # the admission note in the outer transaction with the lock.
                 async with conn.transaction():
                     return await _resolve_unbound_keycloak_user(
-                        conn, issuer, subject, claims, pre_email, pre_domain
+                        conn, issuer, subject, claims, pre_email, pre_domain, sync_profile=sync_profile,
                     )
             except (
                 MembershipRequiredError,
@@ -801,7 +832,8 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
 
 
 async def _resolve_unbound_keycloak_user(
-    conn, issuer: str, subject: str, claims: dict, email: str, domain: str | None
+    conn, issuer: str, subject: str, claims: dict, email: str, domain: str | None,
+    *, sync_profile: bool,
 ) -> dict:
     """Resolve an unbound identity while the caller holds its transaction lock."""
     if email and domain is not None:
@@ -898,13 +930,16 @@ async def _resolve_unbound_keycloak_user(
         # record lands.
         bound = await _bound_external_user(conn, issuer, subject)
         if bound is not None:
-            refreshed = await _refresh_bound_external_user(conn, bound, claims)
+            if sync_profile:
+                bound = await _refresh_bound_external_user(conn, bound, claims)
+            else:
+                _assert_active_human(bound)
             await conn.execute(
                 "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
                 issuer,
                 subject,
             )
-            return _resolved_external_user(refreshed, newly_provisioned=False)
+            return _resolved_external_user(bound, newly_provisioned=False)
         if domain is not None:
             adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain or "")
             if adopted is not None:
@@ -951,21 +986,22 @@ class ProjectionOutcome:
 async def _project_keycloak_principal(
     principal: VerifiedPrincipal,
     *,
-    provider_alias: str | None = None,
+    provider_alias: str | None,
+    sync_profile: bool,
 ) -> ProjectionOutcome:
     """Project a completely verified OIDC identity onto the AKB account path.
 
     ``provider_alias`` is the provider the browser flow selected and
-    verified (``None`` on the bearer paths, which pass none and therefore
-    stay on today's behaviour). It is the only key the authority-domain
-    decision reads — never a claim reinterpreted at this layer.
+    verified. It is the only key the authority-domain decision reads.
     """
     claims = dict(principal.claims)
     try:
         issuer, subject = _external_identity_key(claims)
         if (issuer, subject) != (principal.issuer, principal.subject):
             return ProjectionOutcome(None, "identity_claims_inconsistent")
-        resolved = await _resolve_or_provision_keycloak_user(claims, provider_alias=provider_alias)
+        resolved = await _resolve_or_provision_keycloak_user(
+            claims, provider_alias=provider_alias, sync_profile=sync_profile,
+        )
     except AKBError as e:
         logging.getLogger("akb.auth").info("Keycloak access token: account projection rejected (%s)", e)
         return ProjectionOutcome(None, getattr(e, "code", None))
@@ -1031,7 +1067,6 @@ async def project_verified_principal(
     principal: VerifiedPrincipal,
     *,
     for_credential_change: bool = False,
-    provider_alias: str | None = None,
 ) -> AuthenticatedUser | None:
     """Common verified-human boundary before existing AKB authorization.
 
@@ -1041,14 +1076,10 @@ async def project_verified_principal(
     fail-closed: a future caller of this boundary is gated unless it
     deliberately asks not to be.
 
-    ``provider_alias`` carries the browser flow's verified provider into
-    the keycloak projection only. ``None`` (the default every bearer path
-    keeps) disables the authority-domain decision entirely.
     """
     outcome = await project_verified_principal_with_reason(
         principal,
         for_credential_change=for_credential_change,
-        provider_alias=provider_alias,
     )
     return outcome.user
 
@@ -1058,6 +1089,7 @@ async def project_verified_principal_with_reason(
     *,
     for_credential_change: bool = False,
     provider_alias: str | None = None,
+    sync_profile: bool = False,
 ) -> ProjectionOutcome:
     """The same boundary, carrying the reason when it refuses.
 
@@ -1074,7 +1106,9 @@ async def project_verified_principal_with_reason(
             )
         )
     if principal.profile_id == KEYCLOAK_ACCESS_V1:
-        return await _project_keycloak_principal(principal, provider_alias=provider_alias)
+        return await _project_keycloak_principal(
+            principal, provider_alias=provider_alias, sync_profile=sync_profile,
+        )
     if principal.profile_id == KEYCLOAK_SERVICE_AUTHORITY_V1:
         return ProjectionOutcome(
             await _project_service_authority_principal(principal)
