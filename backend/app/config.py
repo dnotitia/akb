@@ -525,6 +525,15 @@ class Settings(BaseModel):
     # over these keys (the one deliberate env exception; module docstring).
     pg_pool_min_size: int = 2
     pg_pool_max_size: int = 30
+    # /readyz keeps reporting ready while the main pool is saturated (every
+    # connection it may open is open and lent out) until every probe has found
+    # it saturated for this many seconds. Past that, readiness fails: that is
+    # the leak or stall case. A client burst saturates every replica's pool at
+    # the same moment, so failing on saturation alone would take every replica
+    # out of the Service at once while the database is fine. 0 fails readiness
+    # at the first saturated probe and brings that outage back; it is not
+    # recommended.
+    readyz_pool_saturation_grace_secs: float = Field(default=30.0, ge=0.0)
 
     # Runtime safety budgets. Kiwi keeps a large model resident in every child,
     # so an implicit CPU-count-sized pool can exhaust a 4 GiB pod as workers

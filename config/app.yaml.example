@@ -16,6 +16,11 @@ db_user: akb
 # keys — the deployment-layer knob for k8s / akb-platform.
 # pg_pool_min_size: 2
 # pg_pool_max_size: 30
+# /readyz stays ready while that pool is saturated (every connection open and
+# checked out) for up to this many seconds, then reports not ready. Optional;
+# default shown. 0 fails readiness at the first saturated probe, so one client
+# burst takes every replica out of the Service at once; not recommended.
+# readyz_pool_saturation_grace_secs: 30
 
 # Runtime safety budgets. Each Kiwi child holds its own model in memory, so do
 # not derive this from host CPU count. Kubernetes grants 45 seconds for pod

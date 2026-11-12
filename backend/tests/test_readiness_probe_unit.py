@@ -1,0 +1,429 @@
+"""Readiness must not turn a saturated request pool into an outage.
+
+Every replica sees the same client burst at the same moment. Readiness used to
+ping the database with a connection borrowed from the request pool, so a pool
+that requests had fully checked out timed the probe out on every replica at
+once and left the Service with no endpoints while the database was fine. The
+ping now runs on a dedicated connection and the pool is only observed: it
+fails readiness after it has stayed saturated for a grace period.
+
+These tests need no database; `test_readiness_probe_postgres.py` proves the
+same behaviour against a real one.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import socket
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import asyncpg
+import pytest
+
+from app.config import Settings
+from app.db import postgres
+
+GRACE = 30.0
+
+
+class _Pool:
+    """Just the occupancy reads readiness uses; it never borrows a connection."""
+
+    def __init__(self, size: int, max_size: int, idle: int) -> None:
+        self.size, self.max_size, self.idle = size, max_size, idle
+
+    def get_size(self) -> int:
+        return self.size
+
+    def get_max_size(self) -> int:
+        return self.max_size
+
+    def get_idle_size(self) -> int:
+        return self.idle
+
+    async def fetchval(self, *_args):  # pragma: no cover — a failure if ever reached
+        raise AssertionError("readiness must not borrow a request-pool connection")
+
+
+class _Clock:
+    """Stands in for `time` inside app.main only; the event loop keeps its clock."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def main(monkeypatch, tmp_path):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    from app import main as application
+
+    monkeypatch.setattr(application, "_ready_state", application._ReadyState())
+    monkeypatch.setattr(application, "_ready_lock", asyncio.Lock())
+    monkeypatch.setattr(application.settings, "readyz_pool_saturation_grace_secs", GRACE)
+    return application
+
+
+@pytest.fixture
+def probe(main, monkeypatch):
+    """A probe whose ping succeeds, over a pool the test controls, on a fake clock."""
+    pool = _Pool(size=2, max_size=4, idle=1)
+    ping = AsyncMock(return_value=None)
+    store = SimpleNamespace(health=AsyncMock(return_value=True))
+    clock = _Clock()
+    monkeypatch.setattr(main, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(main, "readiness_ping", ping)
+    monkeypatch.setattr(main, "get_vector_store", lambda: store)
+    monkeypatch.setattr(main, "time", clock)
+    return SimpleNamespace(pool=pool, ping=ping, store=store, clock=clock)
+
+
+def _saturate(pool: _Pool) -> None:
+    pool.size, pool.idle = pool.max_size, 0
+
+
+# ── Setting ──────────────────────────────────────────────────────────────────
+
+
+def test_saturation_grace_defaults_to_thirty_seconds_and_rejects_negative():
+    assert Settings(document_revision_backend="bare_git").readyz_pool_saturation_grace_secs == 30.0
+    strict = Settings(document_revision_backend="bare_git", readyz_pool_saturation_grace_secs=0)
+    assert strict.readyz_pool_saturation_grace_secs == 0.0
+    with pytest.raises(ValueError):
+        Settings(document_revision_backend="bare_git", readyz_pool_saturation_grace_secs=-1)
+
+
+# ── Pool observation and the grace ───────────────────────────────────────────
+
+
+async def test_pool_with_room_is_ready_and_reports_occupancy(main, probe):
+    ok, detail = await main._probe_ready()
+
+    assert ok is True
+    assert detail["db"] == "ok"
+    assert detail["pool"] == {"size": 2, "max": 4, "idle": 1, "free": 1, "saturated_for_secs": None}
+    assert detail["vector_store"] == "ok"
+    probe.ping.assert_awaited_once()
+
+
+async def test_full_pool_that_can_still_grow_is_not_saturated(main, probe):
+    probe.pool.size, probe.pool.idle = 3, 0  # every open connection lent, room for one more
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is True
+    assert detail["pool"]["saturated_for_secs"] is None
+
+
+async def test_saturated_pool_within_grace_is_ready_and_skips_the_vector_check(main, probe):
+    _saturate(probe.pool)
+
+    ok, detail = await main._probe_ready()
+    assert ok is True
+    assert detail["db"] == "ok"
+    assert detail["pool"] == {"size": 4, "max": 4, "idle": 0, "free": 0, "saturated_for_secs": 0.0}
+    # pgvector on the main database borrows from this same pool for its health
+    # check, so running it here would queue behind the saturation.
+    assert detail["vector_store"] == "skipped:pool_saturated"
+    probe.store.health.assert_not_awaited()
+
+    probe.clock.now += GRACE - 0.5
+    ok, detail = await main._probe_ready()
+    assert ok is True
+    assert detail["pool"]["saturated_for_secs"] == GRACE - 0.5
+
+
+async def test_saturation_that_lasts_the_grace_fails_readiness(main, probe):
+    _saturate(probe.pool)
+    assert (await main._probe_ready())[0] is True
+
+    probe.clock.now += GRACE
+    ok, detail = await main._probe_ready()
+
+    assert ok is False
+    assert detail["db"] == "ok"
+    assert detail["pool"]["saturated_for_secs"] == GRACE
+    assert "vector_store" not in detail
+    probe.store.health.assert_not_awaited()
+
+
+async def test_a_probe_that_finds_room_ends_the_saturation_run(main, probe):
+    _saturate(probe.pool)
+    await main._probe_ready()
+    probe.clock.now += GRACE - 1
+
+    probe.pool.idle = 1
+    ok, detail = await main._probe_ready()
+    assert ok is True
+    assert detail["pool"]["saturated_for_secs"] is None
+    assert main._ready_state.pool_saturated_since is None
+
+    # Saturated again: the earlier run does not count towards the grace.
+    probe.clock.now += 5
+    _saturate(probe.pool)
+    ok, detail = await main._probe_ready()
+    assert ok is True
+    assert detail["pool"]["saturated_for_secs"] == 0.0
+
+
+async def test_zero_grace_fails_at_the_first_saturated_probe(main, probe, monkeypatch):
+    monkeypatch.setattr(main.settings, "readyz_pool_saturation_grace_secs", 0.0)
+    _saturate(probe.pool)
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is False
+    assert detail["pool"]["saturated_for_secs"] == 0.0
+
+
+# ── /readyz cache ────────────────────────────────────────────────────────────
+
+
+async def test_ready_result_with_room_is_cached(main, probe):
+    assert (await main.readyz())["cached"] is False
+    assert (await main.readyz())["cached"] is True
+    probe.ping.assert_awaited_once()
+
+
+async def test_ready_result_during_saturation_is_never_cached(main, probe):
+    _saturate(probe.pool)
+
+    first = await main.readyz()
+    second = await main.readyz()
+
+    assert first["cached"] is False and second["cached"] is False
+    assert probe.ping.await_count == 2
+
+
+async def test_readyz_answers_503_once_saturation_outlasts_the_grace(main, probe):
+    _saturate(probe.pool)
+    assert (await main.readyz())["status"] == "ready"
+
+    probe.clock.now += GRACE + 1
+    with pytest.raises(main.HTTPException) as caught:
+        await main.readyz()
+    assert caught.value.status_code == 503
+    assert caught.value.detail["status"] == "not_ready"
+    assert caught.value.detail["detail"]["pool"]["saturated_for_secs"] == GRACE + 1
+
+    probe.pool.idle = 1  # the pool drains; failures are not cached
+    recovered = await main.readyz()
+    assert recovered["status"] == "ready"
+    assert recovered["detail"]["pool"]["saturated_for_secs"] is None
+
+
+# ── Database failures ────────────────────────────────────────────────────────
+
+
+async def test_ping_failure_is_not_ready_and_still_reports_the_pool(main, probe):
+    probe.ping.side_effect = ConnectionRefusedError("private-host:5432")
+    _saturate(probe.pool)
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is False
+    assert detail["db"] == "error:unavailable"
+    assert detail["pool"]["idle"] == 0
+    assert "private-host" not in str(detail)
+    probe.store.health.assert_not_awaited()
+
+
+async def test_hung_ping_is_cut_off_inside_the_probe_budget(main, probe):
+    cancelled = asyncio.Event()
+
+    async def hung(**_kwargs):
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cancelled.set()
+
+    probe.ping.side_effect = hung
+
+    ok, detail = await asyncio.wait_for(main._probe_ready(), timeout=3)
+
+    assert ok is False
+    assert detail["db"] == "error:timeout"
+    assert cancelled.is_set()
+
+
+def _closed_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def _settings_at(port: int) -> Settings:
+    return Settings(
+        document_revision_backend="bare_git",
+        db_host="127.0.0.1",
+        db_port=port,
+        db_user="akb",
+        db_password="fixture-password",  # pragma: allowlist secret
+    )
+
+
+@pytest.fixture
+async def real_ping(main, monkeypatch):
+    """The real `readiness_ping`, against a database address the test chooses."""
+    monkeypatch.setattr(main, "get_pool", AsyncMock(return_value=_Pool(size=1, max_size=4, idle=1)))
+    yield monkeypatch
+    await postgres.close_readiness_connection()
+
+
+async def test_unreachable_database_is_not_ready_at_once(main, real_ping):
+    real_ping.setattr(postgres, "settings", _settings_at(_closed_port()))
+
+    started = time.monotonic()
+    ok, detail = await main._probe_ready()
+
+    assert ok is False
+    assert detail["db"] == "error:unavailable"
+    assert time.monotonic() - started < 1.0
+    assert "127.0.0.1" not in str(detail) and "fixture-password" not in str(detail)
+
+
+async def test_silent_database_is_not_ready_within_the_probe_budget(main, real_ping):
+    async def silent(reader, writer):
+        try:
+            await reader.read()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    real_ping.setattr(postgres, "settings", _settings_at(port))
+    try:
+        started = time.monotonic()
+        ok, detail = await main._probe_ready()
+        elapsed = time.monotonic() - started
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert ok is False
+    assert detail["db"] == "error:timeout"
+    assert elapsed < main._READY_DB_TIMEOUT_SECONDS + 1.0
+
+
+# ── The dedicated probe connection ───────────────────────────────────────────
+
+
+class _Conn:
+    def __init__(self, fetchval=None) -> None:
+        self.closed = False
+        self.terminated = False
+        self.fetchval = fetchval or AsyncMock(return_value=1)
+
+    def is_closed(self) -> bool:
+        return self.closed or self.terminated
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    async def close(self, *, timeout=None) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def connections(monkeypatch):
+    """Replace asyncpg.connect; record each call and hand out queued connections."""
+    calls: list[dict] = []
+    queue: list[_Conn] = []
+    made: list[_Conn] = []
+
+    async def connect(**kwargs):
+        calls.append(kwargs)
+        conn = queue.pop(0) if queue else _Conn()
+        made.append(conn)
+        return conn
+
+    monkeypatch.setattr(postgres.asyncpg, "connect", connect)
+    monkeypatch.setattr(postgres, "_readiness_conn", None)
+    return SimpleNamespace(calls=calls, queue=queue, made=made)
+
+
+async def test_probe_connection_uses_the_pool_dsn_and_the_probe_budget(connections):
+    await postgres.readiness_ping(timeout=2.0)
+    await postgres.readiness_ping(timeout=2.0)
+
+    assert len(connections.calls) == 1, "the connection is reused across probes"
+    (call,) = connections.calls
+    assert call["dsn"] == postgres.settings.asyncpg_dsn
+    assert call["timeout"] == 2.0
+    assert call["command_timeout"] == 2.0
+    assert call["server_settings"] == {"application_name": "akb-readiness-probe"}
+    assert connections.made[0].fetchval.await_count == 2
+
+
+async def test_failed_ping_discards_the_connection_and_the_next_probe_reopens(connections):
+    broken = _Conn(fetchval=AsyncMock(side_effect=asyncpg.ConnectionDoesNotExistError("gone")))
+    connections.queue.append(broken)
+
+    with pytest.raises(asyncpg.ConnectionDoesNotExistError):
+        await postgres.readiness_ping(timeout=2.0)
+    assert broken.terminated
+    assert postgres._readiness_conn is None
+
+    await postgres.readiness_ping(timeout=2.0)
+    assert len(connections.calls) == 2
+    assert postgres._readiness_conn is connections.made[1]
+
+
+async def test_connection_the_server_closed_is_replaced_without_a_failed_probe(connections):
+    await postgres.readiness_ping(timeout=2.0)
+    connections.made[0].closed = True  # e.g. ended by a server restart while idle
+
+    await postgres.readiness_ping(timeout=2.0)
+
+    assert len(connections.calls) == 2
+    assert connections.made[1].fetchval.await_count == 1
+
+
+async def test_ping_cut_off_by_the_deadline_discards_the_connection(connections):
+    async def hang(*_args):
+        await asyncio.sleep(60)
+
+    stuck = _Conn(fetchval=AsyncMock(side_effect=hang))
+    connections.queue.append(stuck)
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.05):
+            await postgres.readiness_ping(timeout=2.0)
+
+    assert stuck.terminated
+    assert postgres._readiness_conn is None
+
+
+async def test_close_readiness_connection_closes_and_forgets_it(connections):
+    await postgres.readiness_ping(timeout=2.0)
+    conn = connections.made[0]
+
+    await postgres.close_readiness_connection()
+
+    assert conn.closed
+    assert postgres._readiness_conn is None
+    await postgres.close_readiness_connection()  # nothing open: a no-op
+
+
+async def test_shutdown_closes_the_probe_connection_before_the_pool(monkeypatch):
+    from app.services import lifecycle
+
+    order: list[str] = []
+
+    async def record(name: str) -> None:
+        order.append(name)
+
+    monkeypatch.setattr(lifecycle.settings, "keycloak_enabled", False)
+    monkeypatch.setattr(lifecycle.http_pool, "close_client", lambda: record("http_client"))
+    monkeypatch.setattr(lifecycle, "close_readiness_connection", lambda: record("readiness_connection"))
+    monkeypatch.setattr(lifecycle, "close_pool", lambda: record("pool"))
+
+    await lifecycle.shutdown_storage()
+
+    assert order == ["http_client", "readiness_connection", "pool"]

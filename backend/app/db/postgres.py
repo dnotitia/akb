@@ -12,6 +12,13 @@ logger = logging.getLogger(__name__)
 _pool: asyncpg.Pool | None = None
 _MIGRATION_LOCK_KEY = 0x414B425F4D494752  # ``AKB_MIGR``
 
+# The readiness probe's own connection (see `readiness_ping`). It is never
+# lent to a request, so it stays usable however busy the pool is.
+_readiness_conn: asyncpg.Connection | None = None
+_readiness_lock = asyncio.Lock()
+# Names the probe's session in pg_stat_activity, apart from request traffic.
+READINESS_APPLICATION_NAME = "akb-readiness-probe"
+
 
 def _pool_sizes() -> tuple[int, int]:
     """Resolve main-pool sizing: env > app.yaml > defaults.
@@ -85,6 +92,70 @@ async def close_pool() -> None:
     if _pool is not None:
         pool, _pool = _pool, None
         await pool.close()
+
+
+async def readiness_ping(*, timeout: float) -> None:
+    """Run ``SELECT 1`` on the readiness probe's dedicated connection.
+
+    Readiness used to borrow a request-pool connection for this ping. When
+    requests held every pool connection, the probe queued behind them and
+    timed out, so a busy pool read as an unreachable database, and every
+    replica reported that at the same moment. This connection is opened on
+    first use with the pool's DSN, reused by later probes, and replaced
+    after any failure. Connecting and the ping are each bounded by
+    ``timeout``. Raises on failure; the caller decides what that means.
+    """
+    global _readiness_conn
+    async with _readiness_lock:
+        conn = _readiness_conn
+        if conn is not None and conn.is_closed():
+            # The server ended the session while it sat idle (a restart, an
+            # administrator, an idle-session limit): open a new one now rather
+            # than reporting the stale handle as an outage.
+            _readiness_conn = conn = None
+        try:
+            if conn is None:
+                conn = await asyncpg.connect(
+                    dsn=settings.asyncpg_dsn,
+                    timeout=timeout,
+                    command_timeout=timeout,
+                    server_settings={"application_name": READINESS_APPLICATION_NAME},
+                )
+                _readiness_conn = conn
+            await conn.fetchval("SELECT 1")
+        except BaseException:
+            # Includes cancellation by the caller's deadline: a ping cut off
+            # mid-protocol leaves the session in an unknown state. The next
+            # probe opens a fresh connection.
+            if conn is not None:
+                if _readiness_conn is conn:
+                    _readiness_conn = None
+                _terminate_quietly(conn)
+            raise
+
+
+def _terminate_quietly(conn: asyncpg.Connection) -> None:
+    try:
+        conn.terminate()
+    except Exception:  # noqa: BLE001 — the connection is being discarded either way
+        logger.debug("readiness probe connection could not be terminated", exc_info=True)
+
+
+async def close_readiness_connection(timeout: float = 2.0) -> None:
+    """Close the readiness probe's connection, if one is open.
+
+    The handle is cleared before the await, for the same reason as in
+    ``close_pool``. A connection that does not close within ``timeout`` is
+    aborted; shutdown is not held up by it.
+    """
+    global _readiness_conn
+    conn, _readiness_conn = _readiness_conn, None
+    if conn is None or conn.is_closed():
+        return
+    try:
+        await conn.close(timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 — asyncpg has already aborted it
+        logger.warning("readiness probe connection did not close cleanly: %s", type(exc).__name__)
 
 
 @asynccontextmanager

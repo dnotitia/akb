@@ -95,6 +95,19 @@ specifically; the proxy has its own log in
 - Bound readiness DB initialization and ping together, preserve the successful
   30-second readiness cache and soft vector-store check, and omit connection
   details from public probe errors. See `docs/operations/database-recovery.md`.
+- A briefly saturated request pool no longer makes every replica fail
+  `/readyz` at once. The readiness ping runs on a dedicated connection
+  (`application_name` `akb-readiness-probe`) instead of borrowing from the
+  pool, so a pool that clients have fully checked out no longer times the
+  probe out while the database is fine. Each API process holds one more
+  PostgreSQL connection. A pool that stays saturated (every connection open
+  and checked out) for `readyz_pool_saturation_grace_secs` (default 30) still
+  fails readiness. A value of 0 fails it at the first saturated probe and is
+  not recommended. `detail.pool` adds `idle` and `saturated_for_secs`, keeps
+  `free`, and is also reported when the database check fails. While the pool
+  is saturated, a ready result is not cached and the soft vector check is
+  skipped as `skipped:pool_saturated`. See
+  `docs/operations/database-recovery.md`.
 
 ### Search
 

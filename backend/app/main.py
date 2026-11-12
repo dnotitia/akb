@@ -45,7 +45,7 @@ from app.api.routes import (
     tables,
 )
 from app.config import settings
-from app.db.postgres import get_pool
+from app.db.postgres import get_pool, readiness_ping
 from app.db.transient import transient_error
 from app.exceptions import AKBError, TransientDependencyError
 from app.logging_redaction import install_secret_redaction
@@ -416,6 +416,9 @@ async def livez():
 
 
 _READY_TTL_SECONDS = 30.0
+# The database step of one probe: pool initialization (only while there is no
+# pool yet) plus connecting and pinging on the probe's dedicated connection.
+_READY_DB_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass
@@ -423,10 +426,45 @@ class _ReadyState:
     ts: float = 0.0
     ok: bool = False
     detail: dict | None = None
+    # Monotonic time of the first probe in the current unbroken run of probes
+    # that found the request pool saturated; None once a probe finds room.
+    pool_saturated_since: float | None = None
 
 
 _ready_state = _ReadyState()
 _ready_lock = asyncio.Lock()
+
+
+def _observe_pool(pool, state: _ReadyState) -> dict:
+    """Read the request pool's occupancy without waiting for a connection.
+
+    Saturated means every connection the pool may open is open and lent out.
+    The run of saturation is kept on `state` across probes; a probe that finds
+    an idle connection, or room to open one, ends it.
+    """
+    size, max_size, idle = pool.get_size(), pool.get_max_size(), pool.get_idle_size()
+    saturated_for: float | None = None
+    if size >= max_size and idle == 0:
+        now = time.monotonic()
+        if state.pool_saturated_since is None:
+            state.pool_saturated_since = now
+        saturated_for = round(max(0.0, now - state.pool_saturated_since), 3)
+    else:
+        state.pool_saturated_since = None
+    return {
+        "size": size,
+        "max": max_size,
+        "idle": idle,
+        # The earlier name of `idle`, kept for existing readers.
+        "free": idle,
+        # None while the pool has room, which is not "saturated for 0 s".
+        "saturated_for_secs": saturated_for,
+    }
+
+
+def _pool_saturated_for(detail: dict | None) -> float | None:
+    pool = detail.get("pool") if isinstance(detail, dict) else None
+    return pool.get("saturated_for_secs") if isinstance(pool, dict) else None
 
 
 async def _probe_ready() -> tuple[bool, dict]:
@@ -436,26 +474,41 @@ async def _probe_ready() -> tuple[bool, dict]:
     is reported but does NOT fail readiness; otherwise a transient blip
     on the configured driver would pull the pod from the Service and
     break login/auth/CRUD for ~30s.
+
+    The DB ping runs on a dedicated connection, and the request pool is only
+    observed. A pool that clients have fully checked out is not a database
+    failure, and a client burst saturates every replica's pool at the same
+    moment: failing readiness on it would leave the Service with no endpoints
+    while the database is fine. Saturation fails readiness only once it has
+    lasted `readyz_pool_saturation_grace_secs` at every probe.
     """
     detail: dict = {
         "document_revision_backend": selected_document_revision_backend(),
     }
+    pool: asyncpg.Pool | None = None
     try:
         # Initialization/reconnection is part of the same probe budget.
-        async with asyncio.timeout(2.0):
+        async with asyncio.timeout(_READY_DB_TIMEOUT_SECONDS):
+            # An existing pool is returned at once; nothing is borrowed from it.
             pool = await get_pool()
-            await pool.fetchval("SELECT 1")
+            await readiness_ping(timeout=_READY_DB_TIMEOUT_SECONDS)
         detail["db"] = "ok"
-        # Pool stats help diagnose leaks: if free→0 while size→max we are
-        # exhausting the pool and slow callers are holding connections.
-        detail["pool"] = {
-            "size": pool.get_size(),
-            "free": pool.get_idle_size(),
-            "max": pool.get_max_size(),
-        }
     except Exception as e:  # noqa: BLE001 — no connection strings in a public probe
         detail["db"] = "error:timeout" if isinstance(e, TimeoutError) else "error:unavailable"
+    if pool is not None:
+        # Pool stats help diagnose leaks and bursts, on a failed probe too.
+        detail["pool"] = _observe_pool(pool, _ready_state)
+    if detail["db"] != "ok":
         return False, detail
+    saturated_for = _pool_saturated_for(detail)
+    if saturated_for is not None:
+        if saturated_for >= settings.readyz_pool_saturation_grace_secs:
+            return False, detail
+        # The soft vector check may borrow from this same pool (pgvector on
+        # the main database does), so it would wait behind the saturation
+        # for up to its whole budget without changing the verdict.
+        detail["vector_store"] = "skipped:pool_saturated"
+        return True, detail
     try:
         vs_ok = await asyncio.wait_for(get_vector_store().health(), timeout=5.0)
         detail["vector_store"] = "ok" if vs_ok else "degraded:unreachable"
@@ -480,7 +533,14 @@ def _cache_fresh(state: _ReadyState) -> bool:
     # immediately so recovery is reflected in /readyz on the very next
     # call — a 30s stale-failure cache pulls the pod from the Service for
     # twice the actual outage window.
-    return state.detail is not None and state.ok and (time.monotonic() - state.ts) < _READY_TTL_SECONDS
+    # Nor a success that saw a saturated pool: the grace is measured across
+    # probes, so each probe during saturation has to look at the pool again.
+    return (
+        state.detail is not None
+        and state.ok
+        and _pool_saturated_for(state.detail) is None
+        and (time.monotonic() - state.ts) < _READY_TTL_SECONDS
+    )
 
 
 @app.get("/readyz")
