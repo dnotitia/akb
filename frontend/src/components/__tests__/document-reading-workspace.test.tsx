@@ -28,13 +28,13 @@ function Primary({ blocked }: { blocked: boolean }) {
   const { id } = useParams();
   const location = useLocation();
   useResourceNavigationGuard(blocked ? () => false : null);
-  return <>{chrome?.toolbarHost && createPortal(chrome.referenceControl, chrome.toolbarHost)}<output data-testid="location">{location.pathname}</output><div id="document-reading-canvas" tabIndex={-1}>
+  return <>{chrome?.toolbarHost && createPortal(<span>Reader tools</span>, chrome.toolbarHost)}<output data-testid="location">{location.pathname}</output><div id="document-reading-canvas" tabIndex={-1}>
     Primary {id}<a href="/vault/alpha/doc/b.md">Reference B</a><a href="/vault/alpha/doc/c.md">Reference C</a>
     <a href="https://example.org/doc">External source</a><a>Inert model name</a>
     <a href="/vault/alpha/doc/b.md" target="_blank" data-markdown-reference-runtime-url="/vault/alpha/doc/b.md">Resolved reference</a>
     <a href="/vault/alpha/doc/b.md" download>Download reference</a>
     <a href="/vault/alpha/doc/b.md?commit=older">Historical reference</a>
-  </div></>;
+  </div>{chrome?.references}</>;
 }
 function setup({ blocked = false, revision = 0, client = new QueryClient({ defaultOptions: { queries: { retry: false } } }) } = {}) {
   const renderTree = (nextRevision: number) => <QueryClientProvider client={client}><MemoryRouter initialEntries={["/vault/alpha/doc/a.md"]}>
@@ -81,36 +81,28 @@ describe("Reading Studio", () => {
     expect(pane.querySelector("time")).toBeNull();
   });
 
-  it("keeps references keyboard accessible without a visible label or graph navigation", async () => {
-    const user = userEvent.setup(); setup();
-    const trigger = await screen.findByRole("button", { name: /^Show document references/ });
-    await waitFor(() => expect(trigger).toHaveAccessibleName("Show document references (1)"));
-    expect(trigger).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByRole("complementary", { name: "Document references" })).not.toBeInTheDocument();
+  it("keeps references alongside document navigation without a duplicate header toggle", async () => {
+    setup();
+    const references = await screen.findByRole("region", { name: "Document references" });
+    await waitFor(() => expect(within(references).getByRole("status", { name: "1 connection" })).toHaveTextContent("1"));
+    expect(screen.queryByRole("button", { name: /^Show document references/ })).not.toBeInTheDocument();
+    expect(within(references).getByRole("button", { name: "Connection details" })).toBeVisible();
     expect(screen.queryByRole("link", { name: "Explore all connections" })).not.toBeInTheDocument();
-    trigger.focus(); await user.keyboard("{Enter}");
-    expect(await screen.findByRole("complementary", { name: "Document references" })).toBeInTheDocument();
-    expect(trigger).toHaveAttribute("aria-expanded", "true");
-    await user.click(screen.getByRole("button", { name: "Close references" }));
-    expect(trigger).toHaveFocus();
   });
 
-  it("shows a confirmed zero reference count without opening the panel", async () => {
+  it("shows a confirmed zero reference count in the navigation section", async () => {
     vi.mocked(getRelations).mockResolvedValue({ uri: "akb://alpha/doc/a.md", relations: [] });
     setup();
-    const trigger = await screen.findByRole("button", { name: /^Show document references/ });
-    await waitFor(() => expect(trigger).toHaveAccessibleName("Show document references (0)"));
-    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    const references = await screen.findByRole("region", { name: "Document references" });
+    await waitFor(() => expect(within(references).getByRole("status", { name: "0 connections" })).toHaveTextContent("0"));
   });
 
   it("does not present a failed reference request as a zero count", async () => {
     vi.mocked(getRelations).mockRejectedValue(new Error("Unavailable"));
-    const user = userEvent.setup(); setup();
-    const trigger = await screen.findByRole("button", { name: /^Show document references/ });
-    await user.click(trigger);
-    await screen.findByText("References could not be loaded.");
-    expect(trigger.querySelector(".reading-reference-count")).toBeNull();
-    expect(trigger).toHaveAccessibleName("Show document references");
+    setup();
+    const references = await screen.findByRole("region", { name: "Document references" });
+    await within(references).findByText("References could not be loaded.");
+    expect(references.querySelector(".document-reference-count")).toBeNull();
   });
 
   it("previews without replacing or scrolling the main document, and only keeps explicit tabs", async () => {

@@ -1,3 +1,4 @@
+import { readingSettings } from "./fixtures/reader-navigation";
 import { expect, test } from "@playwright/test";
 import { readingFixture as fixture } from "./fixtures/reading-workspace";
 
@@ -12,9 +13,8 @@ for (const width of [1440, 390]) {
     const canvas = page.locator("#document-reading-canvas");
     await expect(canvas.getByRole("heading", { name: "Reading workflow", exact: true })).toBeVisible();
     await expect(canvas.getByRole("heading", { name: "Code example", level: 2, exact: true })).toBeVisible();
-    const more = page.getByRole("group", { name: "Document reading tools", exact: true }).getByRole("button", { name: "Actions for Reading workflow", exact: true });
-    await more.click();
-    await page.getByRole("menuitem", { name: "Reading settings", exact: true }).click();
+    const settingsTrigger = page.getByRole("group", { name: "Document reading tools", exact: true }).getByRole("button", { name: "Actions for Reading workflow", exact: true });
+    await readingSettings(page);
     const settings = page.getByRole("dialog", { name: "Reading settings", exact: true });
     await expect(settings).toBeVisible();
     await settings.getByRole("radio", { name: "Wide", exact: true }).check();
@@ -23,7 +23,7 @@ for (const width of [1440, 390]) {
     await expect(canvas.getByRole("button", { name: "Expand code block 1" })).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath("reading-settings.png") });
     await page.keyboard.press("Escape");
-    await expect(more).toBeFocused();
+    await expect(settingsTrigger).toBeFocused();
     const findButton = page.getByRole("button", { name: "Find in document", exact: true });
     await findButton.click();
     const find = page.getByRole("searchbox", { name: "Find text in document", exact: true });
@@ -48,15 +48,16 @@ for (const width of [1440, 390]) {
     await page.keyboard.press("Escape");
     await expect(findButton).toBeFocused();
     await expect(canvas.locator(".markdown-reading-match")).toHaveCount(0);
-    await more.click();
-    await page.getByRole("menuitem", { name: "Document details", exact: true }).click();
+    const contents = page.getByRole("button", { name: "Open contents", exact: true });
+    if (await contents.isVisible()) await contents.click();
     const outline = page.getByRole("navigation", { name: "Document outline", exact: true });
     await expect(outline).toBeVisible();
     await outline.getByRole("searchbox", { name: "Find a section", exact: true }).fill("Nested");
     await expect(outline.getByRole("link", { name: "Reading workflow", exact: true })).toBeVisible();
     await expect(outline.getByRole("link", { name: "Code example", exact: true })).toBeVisible();
     await expect(outline.getByRole("link", { name: "Final notes", exact: true })).toHaveCount(0);
-    await page.getByRole("button", { name: "Close document panel", exact: true }).click();
+    const closeContents = page.getByRole("button", { name: "Close contents", exact: true });
+    if (await closeContents.isVisible()) await closeContents.click();
     const enlarge = canvas.getByRole("button", { name: "Enlarge image: Reading diagram", exact: true });
     await expect(enlarge).toBeEnabled();
     await enlarge.click();

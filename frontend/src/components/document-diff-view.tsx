@@ -28,8 +28,9 @@ import {
   type DocumentDiffLine,
   type ParsedDocumentDiff,
 } from "@/lib/document-diff";
-import { cn, timeAgo } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { DocumentIconButton, DocumentTimestamp } from "@/components/document-reading-controls";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -117,7 +118,8 @@ export default function DocumentDiffView({
   const response = diffQuery.data;
   const additions = response?.additions ?? parsed?.additions ?? 0;
   const deletions = response?.deletions ?? parsed?.deletions ?? 0;
-  const hunkCount = response?.hunks ?? hunks.length;
+  const baseLabel = response?.type === "added" ? "First version" : baseShort;
+  const revisionAuthor = targetEntry?.author_name || targetEntry?.author;
 
   function goToHunk(nextIndex: number) {
     if (!hunks.length) return;
@@ -152,108 +154,69 @@ export default function DocumentDiffView({
   return (
     <section
       aria-labelledby="document-diff-heading"
-      className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-sm"
+      className="@container/diff flex min-h-0 flex-1 flex-col overflow-hidden bg-surface"
     >
-      <header className="flex shrink-0 flex-wrap items-start justify-between gap-3 border-b border-border bg-surface px-4 py-3 sm:px-5">
-        <div className="flex min-w-0 items-start gap-3">
-          <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-border bg-surface-selected text-surface-selected-foreground">
-            <GitCompareArrows className="h-4 w-4" aria-hidden />
-          </span>
-          <div className="min-w-0">
-            <h2 id="document-diff-heading" className="font-display text-sm font-semibold text-foreground sm:text-base">
-              Changes in <code className="font-mono text-sm">{targetShort}</code>
-            </h2>
-            <p className="mt-0.5 truncate text-xs text-foreground-muted">
-              {targetEntry?.message || "Document revision"}
-              {targetEntry && (
-                <>
-                  <span aria-hidden> · </span>
-                  {targetEntry.author_name || targetEntry.author}
-                  {targetEntry.date && (
-                    <>
-                      <span aria-hidden> · </span>
-                      {timeAgo(targetEntry.date)}
-                    </>
-                  )}
-                </>
-              )}
-            </p>
+      <header data-slot="document-diff-header" className="flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b border-border bg-surface px-3 py-1.5 sm:px-4">
+        <div className="flex min-w-0 flex-[1_1_19rem] flex-wrap items-center gap-x-3 gap-y-1">
+          <h2 id="document-diff-heading" aria-label={`Changes from ${baseLabel} to ${targetShort}`}
+            className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs font-semibold text-foreground">
+            <GitCompareArrows className="h-4 w-4 shrink-0 text-link" aria-hidden />
+            <span className={baseRevision && response?.type !== "added" ? "font-mono" : undefined}>{baseLabel}</span>
+            <ArrowRight className="h-3.5 w-3.5 shrink-0 text-foreground-muted" aria-hidden />
+            <code className="rounded-[var(--radius-sm)] bg-surface-selected px-1.5 py-0.5 font-mono text-surface-selected-foreground">{targetShort}</code>
+          </h2>
+          {targetEntry && <div role="group" aria-label="Revision metadata" className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-foreground-muted">
+            {targetEntry.message && <span className="sr-only min-w-0 max-w-64 font-medium text-foreground @[34rem]/diff:not-sr-only @[34rem]/diff:truncate" title={targetEntry.message}>{targetEntry.message}</span>}
+            {revisionAuthor && <span className="min-w-0 max-w-40 truncate" title={revisionAuthor}>{revisionAuthor}</span>}
+            <DocumentTimestamp value={targetEntry.date} label="Version saved" compact showLabel={false} />
+          </div>}
+        </div>
+        <div className="flex w-full min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-0.5 @[34rem]/diff:w-auto">
+          <div className="flex items-center gap-2 text-xs tabular-nums">
+            {diffQuery.isPending ? (
+              <span className="text-foreground-muted">Loading change…</span>
+            ) : parsed ? (
+              <>
+                <span className="inline-flex items-center gap-1 font-medium text-success" aria-label={`${additions} added lines`}>
+                  <span aria-hidden>+</span>{additions}<span className="sr-only"> added</span>
+                </span>
+                <span className="inline-flex items-center gap-1 font-medium text-destructive" aria-label={`${deletions} removed lines`}>
+                  <span aria-hidden>−</span>{deletions}<span className="sr-only"> removed</span>
+                </span>
+              </>
+            ) : null}
           </div>
-        </div>
-        <div
-          aria-label={`Comparing ${response?.type === "added" ? "the first version" : baseShort} with ${targetShort}`}
-          className="flex min-w-0 items-center gap-2 text-xs text-foreground-muted"
-        >
-          <code className="max-w-40 truncate rounded-[var(--radius-sm)] bg-surface-2 px-2 py-1 font-mono text-foreground">
-            {response?.type === "added" ? "First version" : baseShort}
-          </code>
-          <ArrowRight className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          <code className="rounded-[var(--radius-sm)] bg-surface-selected px-2 py-1 font-mono text-surface-selected-foreground">
-            {targetShort}
-          </code>
-        </div>
-      </header>
-
-      <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-b border-border bg-surface-2 px-3 py-1.5">
-        <div className="mr-auto flex items-center gap-3 text-xs tabular-nums">
-          {diffQuery.isPending ? (
-            <span className="text-foreground-muted">Loading change…</span>
-          ) : parsed ? (
-            <>
-              <span className="inline-flex items-center gap-1 font-medium text-success" aria-label={`${additions} added lines`}>
-                <span aria-hidden>+</span>{additions} added
-              </span>
-              <span className="inline-flex items-center gap-1 font-medium text-destructive" aria-label={`${deletions} removed lines`}>
-                <span aria-hidden>−</span>{deletions} removed
-              </span>
-              <span className="hidden text-foreground-muted sm:inline">
-                {hunkCount} {hunkCount === 1 ? "change" : "changes"}
-              </span>
-            </>
-          ) : (
-            <span className="text-foreground-muted">Revision comparison</span>
-          )}
-        </div>
-
-        <div className="flex items-center gap-1" aria-label="Change navigation">
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={() => goToHunk(activeHunk - 1)}
-            disabled={!hunks.length || activeHunk === 0}
-            aria-label={`Previous change${hunks.length ? `. Change ${activeHunk + 1} of ${hunks.length}` : ""}`}
-          >
-            <ArrowUp className="h-3.5 w-3.5" aria-hidden />
-            <span className="hidden md:inline">Previous</span>
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={() => goToHunk(activeHunk + 1)}
-            disabled={!hunks.length || activeHunk >= hunks.length - 1}
-            aria-label={`Next change${hunks.length ? `. Change ${activeHunk + 1} of ${hunks.length}` : ""}`}
-          >
-            <ArrowDown className="h-3.5 w-3.5" aria-hidden />
-            <span className="hidden md:inline">Next</span>
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => void copyPatch()}
-            disabled={!response?.diff}
-            aria-label={copied ? "Patch copied" : "Copy patch"}
-          >
-            {copied ? <Check className="h-3.5 w-3.5 text-success" aria-hidden /> : <Copy className="h-3.5 w-3.5" aria-hidden />}
-            <span className="hidden sm:inline">{copied ? "Copied" : "Copy patch"}</span>
-          </Button>
+          <div role="group" className="ml-auto flex items-center gap-1" aria-label="Change navigation">
+            <DocumentIconButton
+              className="size-11 sm:[@media(pointer:fine)]:size-8"
+              onClick={() => goToHunk(activeHunk - 1)}
+              disabled={!hunks.length || activeHunk === 0}
+              label={`Previous change${hunks.length ? `. Change ${activeHunk + 1} of ${hunks.length}` : ""}`}
+            >
+              <ArrowUp className="h-3.5 w-3.5" aria-hidden />
+            </DocumentIconButton>
+            <DocumentIconButton
+              className="size-11 sm:[@media(pointer:fine)]:size-8"
+              onClick={() => goToHunk(activeHunk + 1)}
+              disabled={!hunks.length || activeHunk >= hunks.length - 1}
+              label={`Next change${hunks.length ? `. Change ${activeHunk + 1} of ${hunks.length}` : ""}`}
+            >
+              <ArrowDown className="h-3.5 w-3.5" aria-hidden />
+            </DocumentIconButton>
+            <DocumentIconButton
+              className="size-11 sm:[@media(pointer:fine)]:size-8"
+              onClick={() => void copyPatch()}
+              disabled={!response?.diff}
+              label={copied ? "Patch copied" : "Copy patch"}
+            >
+              {copied ? <Check className="h-3.5 w-3.5 text-success" aria-hidden /> : <Copy className="h-3.5 w-3.5" aria-hidden />}
+            </DocumentIconButton>
+          </div>
         </div>
         <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
           {hunks.length ? `Change ${activeHunk + 1} of ${hunks.length}` : ""}
         </span>
-      </div>
+      </header>
 
       {diffQuery.isPending ? (
         <DiffLoading />

@@ -43,7 +43,9 @@ describe("MarkdownRender layout", () => {
     expect(code).toHaveAttribute("tabindex", "0");
     expect(code.querySelector(".hljs-keyword")).toHaveTextContent("const");
 
-    const checkboxes = within(screen.getByRole("textbox")).getAllByRole("checkbox");
+    const viewer = screen.getByRole("document", { name: "Document body" });
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    const checkboxes = within(viewer).getAllByRole("checkbox");
     expect(checkboxes).toHaveLength(2);
     expect(checkboxes[0]).toHaveAccessibleName(/Parent task/i);
     expect(checkboxes[1]).toBeChecked();

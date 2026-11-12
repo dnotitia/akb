@@ -13,7 +13,6 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { ReaderMermaid } from "@/components/reader-mermaid";
 import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
-import { useReaderSectionControls } from "@/hooks/use-reader-section-controls";
 import "katex/dist/katex.min.css";
 import {
   createAkbMarkdownAdapters,
@@ -102,13 +101,12 @@ export function MarkdownRender({
   const overrides = useMemo(() => codeState.body === body ? codeState.overrides : {}, [body, codeState]);
   const [sectionState, setSectionState] = useState<{ body: string; collapsed: number[] }>({ body, collapsed: [] });
   const rootRef = useRef<HTMLDivElement>(null);
-  const sectionPositions = useReaderSectionControls(rootRef, body);
   const collapsedSections = useMemo(() => sectionState.body === body
     ? sectionState.collapsed.filter(index => !usesLeadingTitle || index !== 0) : [], [body, sectionState, usesLeadingTitle]);
-  const renderSectionToggle = useCallback((section: Parameters<NonNullable<MarkdownViewerReadingOptions["renderSectionToggle"]>>[0]) => usesLeadingTitle && section.index === 0 ? null : <button type="button" className="reader-section-toggle" style={sectionPositions[section.index]} aria-label={`${section.collapsed ? "Expand" : "Collapse"} section: ${section.title}`} aria-expanded={!section.collapsed} title={section.collapsed ? "Expand section" : "Collapse section"} onClick={() => setSectionState(previous => {
+  const renderSectionToggle = useCallback((section: Parameters<NonNullable<MarkdownViewerReadingOptions["renderSectionToggle"]>>[0]) => usesLeadingTitle && section.index === 0 ? null : <button type="button" className="reader-section-toggle" aria-label={`${section.collapsed ? "Expand" : "Collapse"} section: ${section.title}`} aria-expanded={!section.collapsed} title={section.collapsed ? "Expand section" : "Collapse section"} onClick={() => setSectionState(previous => {
     const before = previous.body === body ? previous.collapsed : [];
     return { body, collapsed: section.collapsed ? before.filter(index => index !== section.index) : [...before, section.index] };
-  })}>{section.collapsed ? <ChevronRight size={15} aria-hidden /> : <ChevronDown size={15} aria-hidden />}</button>, [body, sectionPositions, usesLeadingTitle]);
+  })}>{section.collapsed ? <ChevronRight size={15} aria-hidden /> : <ChevronDown size={15} aria-hidden />}</button>, [body, usesLeadingTitle]);
   const onRevealSections = useCallback((indices: readonly number[]) => setSectionState(previous => {
     if (previous.body !== body || !previous.collapsed.some(index => indices.includes(index))) return previous;
     return { body, collapsed: previous.collapsed.filter(index => !indices.includes(index)) };
@@ -232,7 +230,7 @@ export function MarkdownRender({
         reading={readingTools ? reading : undefined}
         style={{ "--document-reading-measure": preferences.width === "compact" ? "36rem" : preferences.width === "wide" ? "64rem" : "var(--reader-standard-measure, 52rem)", "--reader-font-size": `${preferences.fontSize / 16}rem` } as CSSProperties}
         markdown={body}
-        contentAttributes={contentLabel ? { role: "document", "aria-label": contentLabel } : undefined}
+        contentAttributes={{ role: "document", "aria-label": contentLabel || "Document body" }}
         beforeContent={separateTitle ? adornment : undefined}
         afterLeadingHeading={separateTitle ? undefined : adornment}
         className={cn(

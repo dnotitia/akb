@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { DocumentOutline } from "@/components/doc-outline";
@@ -21,6 +21,15 @@ function Harness({ md, href = "/vault/fixture/doc/reading.md" }: { md: string; h
 const md = "# Intro\n\n## Details\n\n### 기술 스택\n";
 
 describe("DocumentOutline", () => {
+  it("keeps the active section on visible ancestors after a body section folds", async () => {
+    const { container } = render(<Harness md={md} />);
+    await waitFor(() => expect(screen.getByRole("link", { name: "기술 스택" })).toHaveAttribute("aria-current", "location"));
+    container.querySelector<HTMLElement>("#기술-스택")!.hidden = true;
+    fireEvent(container.querySelector("article")!, new Event("markdown-reading-presentation"));
+    await waitFor(() => expect(screen.getByRole("link", { name: "Details" })).toHaveAttribute("aria-current", "location"));
+    expect(screen.getByRole("link", { name: "기술 스택" })).not.toHaveAttribute("aria-current");
+    cleanup();
+  });
   it("renders one link per parsed heading", () => {
     render(<Harness md={md} />);
     expect(screen.getByRole("link", { name: "Intro" })).toHaveAttribute("href", "#intro");
@@ -54,6 +63,7 @@ describe("DocumentOutline", () => {
     await user.click(screen.getByRole("button", { name: "Collapse Details" }));
     expect(screen.queryByRole("link", { name: "기술 스택" })).toBeNull();
     await user.type(screen.getByRole("searchbox", { name: "Find a section" }), "기술");
+    expect(screen.getByRole("button", { name: "Expand all" })).toBeDisabled();
     expect(screen.getByRole("link", { name: "Intro" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Details" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "기술 스택" })).toBeInTheDocument();
@@ -61,6 +71,13 @@ describe("DocumentOutline", () => {
     expect(screen.queryByRole("link", { name: "기술 스택" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Expand all" }));
     expect(screen.getByRole("link", { name: "기술 스택" })).toBeInTheDocument();
+    cleanup();
+  });
+
+  it("omits hierarchy controls when all headings are peers", () => {
+    render(<Harness md={"## Intro\n\n## Details\n\n## 기술 스택\n"} />);
+    expect(screen.queryByRole("button", { name: /^(Expand|Collapse) all$/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "Find a section" })).toBeInTheDocument();
     cleanup();
   });
 

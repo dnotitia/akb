@@ -127,22 +127,27 @@ owner is stated once, and the description has its own full-width row.
 
 Document pages use the Reading Studio layout with the shared AKB surface,
 text and teal interaction tokens in both themes. Bottom document tabs own navigation and per-view
-reading positions. A continuous command header spans the document and context columns. Direct
-relations open in an unframed right rail when the actual workspace is at least
-50rem wide and 20rem tall;
-otherwise the labelled reference icon opens a sheet. The panel starts closed on
-entry and document-tab navigation. The icon shows the confirmed relation count,
-including zero; loading/error never implies a zero. Its visible word label is omitted;
-its accessible name, count description, tooltip and expanded state remain. The primary toolbar follows
-Preview/Raw → Find → Contents → references + count → saved side document (when present) → Copy → Edit → More. Edit is icon-only.
-More has one Document details entry containing the outline and Properties,
-plus copy fallbacks and lifecycle actions; the document rail has no whole-graph exploration action.
+reading positions. A continuous command header spans the document and preview columns.
+The primary toolbar follows Preview/Raw → Find → saved side document (when present)
+→ Copy → Edit → More. Edit is icon-only. More contains Reading settings, clipboard
+fallbacks and document commands; it has no duplicate Contents or reference toggle.
+Contents and References share one right navigation rail. The outline comes first;
+a separated References section immediately below shows the confirmed connection
+count, incoming/outgoing links, map/list views and Connection details. Reserve
+reachable space for both sections when either list is long, with independent
+bounded scroll rather than pushing references below the viewport. Loading/errors
+never imply a zero count. Narrow frames use the same sections in one Contents
+sheet. Clicking a reference closes that navigation sheet before previewing it.
+Preview Back returns to the reference list and restores its invoking link; Close
+returns to the source link or navigation as appropriate. Details sits beside the
+byline and opens Properties / Version history tabs independently of navigation.
 Author, update time and
 draft/archive state sit under the document title on the reading measure. Internal document
 references open a read-only right pane (a modal sheet in narrow workspaces),
-with a separate Back history and explicit Keep in tabs action. Reference lists,
-previews and document details share one context column; map/list are exclusive
-views. The header keeps its baseline while that column changes. Search previews
+with a separate Back history and explicit Keep in tabs action. References remain below Contents; previews occupy a separate read-only context
+column. Map/list are exclusive views. Details
+uses a separate stable dialog and does not replace that column. The header
+keeps its baseline while that column changes. Search previews
 retain their existing route-backed modal and draft navigation guards.
 Unavailable documents keep that frame and a generic document header. A centered,
 padded state explains access denial, missing links or transient failures without
@@ -164,8 +169,8 @@ reference panes use H2. Filename and path renaming do not belong in Rename.
 Full-page Preview and Raw share a centered 42rem reading measure; route-backed
 search previews retain their existing 52rem measure.
 
-Find in document and Table of contents have direct icon buttons in the reader
-command row, with names, tooltips and expanded states. More owns Reading settings
+Find in document has a direct icon button in the reader command row. Contents
+and References share the right navigation rail or its narrow-screen sheet. More owns Reading settings
 and less frequent document actions. Reader preferences offer compact/standard/wide
 measures, body text size, table fit and initially collapsed code. These
 non-content preferences persist locally; document search terms remain in memory.
@@ -176,8 +181,10 @@ document search, with bounded counts, next/previous navigation and focus return.
 Code language, line count, copy and fold controls live in a small block header;
 widgets and search highlights never become authored Markdown. Images offer a
 keyboard-accessible enlargement action with Fit, original size and zoom controls.
-The outline supports section-name filtering, ancestor context, hierarchy folding
-and section-link copying. Tab drag reordering has left/right move buttons in the
+The outline keeps section-name search and a tooltip-labelled fold-all icon in one
+compact toolbar, without a separate action row. Omit fold-all for flat outlines;
+search retains ancestor context and temporarily disables hierarchy folding.
+Section-link copying stays on the corresponding row. Tab drag reordering has left/right move buttons in the
 open-document list; open and recently closed documents use separate list modes.
 Heading controls fold only their own section, keeping nested folds independent.
 Finding text or following an anchor opens the required ancestors before scrolling.
@@ -228,7 +235,7 @@ background restoration uses at most four concurrent requests. Remove denied or
 missing documents and offer Retry for temporary failures. Logout clears saved
 reading sessions. Storage failure must leave ordinary reading usable.
 
-More → Read side by side, a preview's Keep side by side action, and the
+The common tab menu's Read side by side, a preview's Keep side by side action, and the
 open-document list's side action share one persistent read-only companion pane.
 It survives primary-tab navigation; references and details temporarily cover it.
 At least 56rem of available workspace and 20rem of height are needed for two
@@ -660,11 +667,11 @@ an `sr-only` summary, never the only signal.
   reveals the Vault directory sidebar, focusing its search on desktop and
   narrow screens. Keep it distinct from the title's contextual parent action;
   preserve native modified links and unsaved-change confirmation.
-  On Document routes, the Collection management row matches the document
-  command row: 48px for a fine pointer, 64px for a coarse pointer. Their
-  bottom hairlines meet without changing the 56px identity/title row. Other
-  routes retain the normal management density. A narrow or multiline reader
-  may grow naturally instead of clipping metadata to force alignment.
+  The workspace rail, Collection management row and reader command row share
+  a 40px fine-pointer / 48px coarse-pointer baseline. Entering a document must
+  not change navigation height. Their bottom hairlines meet below the 56px
+  identity/title row. A narrow or multiline reader may grow naturally instead
+  of clipping controls or text to force alignment.
   Both identity rows keep one icon-only ChevronsLeft collapse button at the
   right edge. The named row starts with the human Vault name and chevron as one
   switcher button. Collapse belongs inside the panel it controls. The page-title
@@ -1486,10 +1493,10 @@ an `sr-only` summary, never the only signal.
   Accessible radio names and checked state always identify the active mode.
   Fine-pointer controls use 28px targets and 14px glyphs from 41rem of command
   space, matching the minimum inline Vault canvas; narrower or coarse-pointer
-  controls retain 44px targets and 16px glyphs. The command row has a 48px
-  baseline (64px on coarse pointers), including its bottom hairline. Use 6px
-  vertical padding and a 20px horizontal chrome inset, matching the app title
-  row. Author and Last edited keep a quiet 12px scale with 12px between facts.
+  controls retain 44px targets and 16px glyphs. The command row has a 40px
+  baseline (48px on coarse pointers), including its bottom hairline. Use 3px
+  vertical padding on fine pointers and 1px on coarse pointers. Use a 20px
+  horizontal chrome inset, matching the app title row. Author and Last edited keep a quiet 12px scale with 12px between facts.
   Below
   40rem, the byline/status form a quiet second line so the full toolbar fits 320px.
   Author uses the API's resolved creator name, with a human-readable legacy
@@ -1516,7 +1523,7 @@ an `sr-only` summary, never the only signal.
   timezone on hover/focus. Historical/diff views instead use Version saved
   from the matching history entry, never the current metadata timestamp.
   Copy document link, Copy markdown, Publish / Public link, Watch, Pin and
-  Version history live in overflow before location/lifecycle actions. Publication
+  management commands live in overflow before location/lifecycle actions. Publication
   still opens options before any public write and preserves permission reasons.
   Keep publication and clipboard fallback controllers mounted when menus close.
   Failed clipboard access offers manual copying and returns to the invoking
@@ -1538,20 +1545,32 @@ an `sr-only` summary, never the only signal.
   Target the actual `.ProseMirror` / `.tableWrapper` DOM. Images retain aspect
   and natural size and shrink within the reading measure without stretching.
   Toolbar and canvas share `surface` without outer cards or duplicate title bands.
-  Full-page readers open the single Document details entry from More into the
-  shared context column, replacing references or a reference preview. Search
-  previews retain their labelled details icon. It contains On this page followed by native Properties,
-  Version history and Related documents disclosures. Only the expanded section
-  mounts its interactive content. Overflow Version history opens that disclosure
-  and focuses its heading. With at least 48rem of actual reading width and
-  20rem of height, the 19rem pane docks beside the article and remains open while
-  reading. Otherwise it is a modal right sheet, max 24rem, with focus containment.
-  Close/Escape returns focus to the toolbar trigger. Child dialogs retain their
-  drafts and opener focus across resizing; defer presentation changes until the
-  child dialog closes. Following an outline link keeps the pane open and only
-  scrolls the document canvas, preserving route and link focus. Raw/diff explain
-  why headings are unavailable. Editing hides the pane. Full timestamps, size,
-  author and tags live in Properties; omit duplicate Summary and technical URI rows.
+  Reading navigation, information and management have separate locations.
+  Contents is always visible in a 13.5rem right rail when the actual primary
+  reading frame is at least 50rem wide and 20rem tall, independent of viewport
+  width or an open reference pane. Smaller frames use a single right-aligned
+  Contents strip above the article and a modal right sheet. Mount only one
+  outline, preserve canvas scroll, reveal folded ancestors when following a
+  heading, and return focus to the trigger on dismissal or the heading on selection.
+  Preview/Raw and Find are direct toolbar controls; Reading settings opens from
+  More and returns focus to that menu trigger. Raw explains
+  how to return to Preview for heading navigation; edit and diff hide Contents.
+  Details is a quiet labelled action beside Author / Last edited / Draft. Its
+  stable dialog contains mutually exclusive Properties and Version history tabs
+  with manual keyboard activation. It never changes into a docked pane on resize.
+  Properties presents identity/location, provenance/times, classification, then
+  size/revision. History wraps messages and author names beside a fixed comparison
+  target. Close/Escape returns to the invoking control. Supporting editors preserve
+  drafts and restore their own opener. Connections are managed from Connection
+  details in the reference rail, on their own surface; no outline or history is
+  mixed into it. More contains commands, not duplicate reading/information entry
+  points. Reading settings is a preference command in More. Full timestamps,
+  size, author and tags live in Properties; omit duplicate
+  Summary and technical URI rows. Section-fold controls live in noneditable
+  heading widgets with a reserved 24px fine / 44px coarse target; never position
+  them over prose using measured viewport coordinates. Heading presentation uses
+  editor-owned node views so live controls survive level/anchor changes without
+  changing Markdown source. Ordinary prose and bullet-gap clicks never fold sections.
   Publication management uses its own verified writer-or-higher policy, rejects
   read-only Vaults and historical/diff views, and preserves exact server errors.
   Existing links use a Public link label, not a claim of live availability:
@@ -1585,8 +1604,8 @@ an `sr-only` summary, never the only signal.
   Create and Edit use `DocumentAuthoringLayout` and `DocumentDetailsFields`.
   At 52rem of available container width, details occupy an independently
   scrolling 18rem right rail (20rem at 72rem); narrower workspaces stack them
-  below the body with a Document details focus shortcut. Read-mode context
-  stays floating. Existing Collection is read-only; Move remains separate.
+  below the body with a Document details focus shortcut. Read mode uses the
+  separate Contents rail and Details dialog described above. Existing Collection is read-only; Move remains separate.
   Edit owns title, body and details as one revision-checked document form. One
   Save changes patches only edited fields; local drafts include both original
   and edited metadata, and older text-only drafts remain recoverable. Its title field sits
