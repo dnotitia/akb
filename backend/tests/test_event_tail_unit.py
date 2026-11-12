@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import datetime, timezone
+import gc
 import json
+import threading
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
+import weakref
 
 import pytest
 from pydantic import ValidationError
@@ -490,3 +495,159 @@ async def test_more_waiting_streams_than_pool_connections_leave_the_pool_usable(
     assert all(frame.startswith("event: change\nid: ec1.") for frame in frames)
     assert pool.checked_out == 0
     assert hub.subscriptions == []
+
+
+def _on_a_thread_of_its_own(action: Callable[[], Any], *, timeout: float = 5.0) -> Any:
+    """Run ``action`` on a new thread and return its result or raise its error.
+
+    A thread that waits on a lock it already holds never returns. On a daemon
+    thread of its own, that deadlock fails the test after ``timeout`` instead
+    of hanging the run.
+    """
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["result"] = action()
+        except BaseException as exc:  # noqa: BLE001 - handed back to the test's thread
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, name="event-tail-slot-probe", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        pytest.fail(f"stream slot accounting deadlocked: the thread was still blocked after {timeout}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("result")
+
+
+class _AbandonedBody:
+    """Stands in for the body of a stream whose client left before it started.
+
+    It is in a reference cycle, so only the garbage collector frees it, and the
+    ``weakref.finalize`` that open_tail registers then gives its slot back from
+    inside that collection.
+    """
+
+    def __init__(self) -> None:
+        self.cycle = self
+
+
+def test_a_slot_freed_by_a_collection_the_refusal_starts_does_not_deadlock(monkeypatch) -> None:
+    """A refusal used to build its error while it held the slot lock.
+
+    Building an object can start a garbage collection on the same thread. When
+    that collection finalizes a stream whose client left, the finalizer gives
+    the slot back through the same lock, and the thread waits on itself, with
+    the event loop it runs.
+    """
+    from app.services import event_tail_service
+
+    capacity_error = event_tail_service.EventTailCapacityError
+    slots = event_tail_service._StreamSlots()
+    abandoned = slots.acquire(1)
+    lock_held_while_refusing: list[bool] = []
+
+    class _CollectingCapacityError(capacity_error):
+        def __init__(self, **kwargs: Any) -> None:
+            lock_held_while_refusing.append(slots._lock.locked())
+            # The allocation that happens to start a collection.
+            gc.collect()
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(event_tail_service, "EventTailCapacityError", _CollectingCapacityError)
+    collecting = gc.isenabled()
+    # Only the collection the refusal starts may free the abandoned body.
+    gc.disable()
+    try:
+        body = _AbandonedBody()
+        finalizer = weakref.finalize(body, abandoned.release)
+        del body
+        assert finalizer.alive
+        assert slots.open == 1
+
+        with pytest.raises(capacity_error):
+            _on_a_thread_of_its_own(lambda: slots.acquire(1))
+    finally:
+        if collecting:
+            gc.enable()
+
+    assert not finalizer.alive
+    assert slots.open == 0
+    assert lock_held_while_refusing == [False]
+
+
+class _CollectsWhileHeld:
+    """The slots' own lock, with a collection run on the thread that holds it.
+
+    CPython runs a collection that is due when a call returns, so one can start
+    right after ``acquire`` has taken its lock; a later edit could add a call
+    anywhere before the lock is let go. ``callback`` runs once, at ``point``.
+    """
+
+    def __init__(self, lock: Any, callback: Callable[[], object], *, point: str) -> None:
+        self._lock = lock
+        self._callback: Callable[[], object] | None = callback
+        self._point = point
+
+    def __enter__(self) -> _CollectsWhileHeld:
+        self._lock.acquire()
+        if self._point == "taken":
+            try:
+                self._fire()
+            except BaseException:
+                self._lock.release()
+                raise
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        try:
+            if self._point == "letting-go":
+                self._fire()
+        finally:
+            self._lock.release()
+
+    def _fire(self) -> None:
+        callback, self._callback = self._callback, None
+        if callback is not None:
+            callback()
+
+
+@pytest.mark.parametrize(
+    ("point", "admitted", "still_open"),
+    [
+        # Freed before the count is read: the newcomer takes the freed slot.
+        pytest.param("taken", True, 2, id="freed-right-after-the-lock-is-taken"),
+        # Freed after the newcomer was refused: one stream is left open.
+        pytest.param("letting-go", False, 1, id="freed-just-before-the-lock-is-let-go"),
+    ],
+)
+def test_a_slot_freed_on_the_admitting_thread_while_it_holds_the_lock_keeps_the_count(
+    monkeypatch,
+    point: str,
+    admitted: bool,
+    still_open: int,
+) -> None:
+    from app.services import event_tail_service
+
+    slots = event_tail_service._StreamSlots()
+    abandoned = slots.acquire(2)
+    kept = slots.acquire(2)
+    monkeypatch.setattr(slots, "_lock", _CollectsWhileHeld(slots._lock, abandoned.release, point=point))
+
+    newcomer = None
+    if admitted:
+        newcomer = _on_a_thread_of_its_own(lambda: slots.acquire(2))
+    else:
+        with pytest.raises(event_tail_service.EventTailCapacityError):
+            _on_a_thread_of_its_own(lambda: slots.acquire(2))
+
+    assert slots.open == still_open
+    # A slot given back twice is counted once.
+    abandoned.release()
+    assert slots.open == still_open
+    kept.release()
+    if newcomer is not None:
+        newcomer.release()
+    assert slots.open == 0

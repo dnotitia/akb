@@ -94,12 +94,22 @@ def configured_max_streams() -> int:
 class _StreamSlots:
     """How many event tail streams this process holds open.
 
-    The lock is a threading lock because a slot can be given back from a
-    garbage-collection callback, which runs on whichever thread triggers it.
+    A slot can be given back from a garbage-collection callback: the
+    ``weakref.finalize`` that open_tail registers for a body that never
+    started. A collection runs on whichever thread is running when it falls
+    due, and CPython can run one as soon as a call returns, the call that takes
+    this lock included. With a plain lock, a slot given back there would wait
+    on its own thread, and the event loop with it. So the lock is re-entrant,
+    and acquire builds nothing while it holds it: a refusal's error is raised
+    after the lock is let go.
+
+    Re-entry cannot corrupt the count. The code under the lock makes no calls,
+    so a callback can run there only right after the lock is taken, before the
+    count is read.
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._open = 0
 
     @property
@@ -108,9 +118,11 @@ class _StreamSlots:
 
     def acquire(self, limit: int) -> _StreamSlot:
         with self._lock:
-            if self._open >= limit:
-                raise EventTailCapacityError()
-            self._open += 1
+            admitted = self._open < limit
+            if admitted:
+                self._open += 1
+        if not admitted:
+            raise EventTailCapacityError()
         return _StreamSlot(self)
 
 
