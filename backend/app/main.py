@@ -46,9 +46,10 @@ from app.api.routes import (
 )
 from app.config import settings
 from app.db.postgres import (
+    forget_pool_progress_waiter,
     get_pool,
-    next_pool_progress,
     pool_progress,
+    pool_progress_waiter,
     readiness_acquires,
     readiness_ping,
 )
@@ -551,14 +552,15 @@ def _remaining(budget: asyncio.Timeout) -> float | None:
     return None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
 
 
-async def _ping_through_pool(pool: asyncpg.Pool, budget: asyncio.Timeout) -> bool:
+async def _ping_through_pool(pool: asyncpg.Pool, budget: asyncio.Timeout, progress_since: int) -> bool:
     """Run ``SELECT 1`` on a pool connection, borrowed and given back within
     the rest of the probe's budget. Raises when that does not succeed in time.
 
-    Returns False without a ping when another caller's acquire completes
-    while the probe waits for a connection: the pool has just served someone.
-    A probe queued behind a request whose connection is still opening must
-    not report a working pool as broken.
+    Returns False without a ping when another caller's acquire has completed
+    since `progress_since`, the count read before the probe decided to check
+    the pool: the pool has just served someone. A probe queued behind a
+    request whose connection is still opening must not report a working pool
+    as broken.
 
     A connection that cannot finish in time is terminated rather than
     returned. Its query may never answer, nor the cancel request asyncpg
@@ -566,7 +568,7 @@ async def _ping_through_pool(pool: asyncpg.Pool, budget: asyncio.Timeout) -> boo
     again as the acquire was allowed. Terminating frees the pool slot at
     once and drops the pending cancel request.
     """
-    conn = await _acquire_unless_another_caller_does(pool, budget)
+    conn = await _acquire_unless_another_caller_does(pool, budget, progress_since)
     if conn is None:
         return False
     try:
@@ -582,21 +584,37 @@ async def _ping_through_pool(pool: asyncpg.Pool, budget: asyncio.Timeout) -> boo
     return True
 
 
-async def _acquire_unless_another_caller_does(pool: asyncpg.Pool, budget: asyncio.Timeout):
-    """The probe's own acquire, or None if another caller's completes first."""
-    acquiring = asyncio.ensure_future(pool.acquire(timeout=_remaining(budget)))
-    progressed = asyncio.ensure_future(next_pool_progress())
+async def _acquire_unless_another_caller_does(pool: asyncpg.Pool, budget: asyncio.Timeout, progress_since: int):
+    """The probe's own acquire, or None once another caller's acquire has
+    completed since `progress_since`.
+
+    The progress waiter is registered before anything else can run, and the
+    count is read again right after, so an acquire that completes in between
+    is not missed. When another caller's acquire and the probe's own both
+    end, the other caller's wins whatever happened to the probe's: the pool
+    has served someone, even if the server refused the probe's extra
+    connection.
+    """
+    progressed = pool_progress_waiter()
     try:
-        done, _ = await asyncio.wait({acquiring, progressed}, return_when=asyncio.FIRST_COMPLETED)
-    except BaseException:
-        progressed.cancel()
-        _abandon_acquire(acquiring)
-        raise
-    progressed.cancel()
-    if acquiring in done:
+        if _progressed_since(progress_since):
+            return None
+        acquiring = asyncio.ensure_future(pool.acquire(timeout=_remaining(budget)))
+        try:
+            await asyncio.wait({acquiring, progressed}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            _abandon_acquire(acquiring)
+            raise
+        if progressed.done() or _progressed_since(progress_since):
+            _abandon_acquire(acquiring)
+            return None
         return acquiring.result()
-    _abandon_acquire(acquiring)
-    return None
+    finally:
+        forget_pool_progress_waiter(progressed)
+
+
+def _progressed_since(count: int) -> bool:
+    return pool_progress()[0] != count
 
 
 def _abandon_acquire(acquiring: asyncio.Future) -> None:
@@ -628,15 +646,16 @@ async def _db_ok_despite_full_server(pool: asyncpg.Pool, budget: asyncio.Timeout
     probe's connection, or None when it cannot. A failing ping raises.
 
     An idle connection is borrowed for the rest of the probe's budget only.
-    Nothing runs between the idle check and asyncpg taking a holder from its
-    queue, so the probe never waits behind a saturated pool. If the holder it
-    takes has lost its connection, asyncpg reconnects, the full server refuses
-    that too, and readiness fails.
+    If another caller takes it first, that caller's completed acquire proves
+    the pool instead, so the probe does not wait behind it. If the holder the
+    probe takes has lost its connection, asyncpg reconnects, the full server
+    refuses that too, and readiness fails.
     """
     if pool.is_closing():
         return None
+    progress_since = pool_progress()[0]
     if pool.get_idle_size() > 0:
-        if await _ping_through_pool(pool, budget):
+        if await _ping_through_pool(pool, budget, progress_since):
             return _DB_OK_BY_POOL_IDLE
         return _DB_OK_BY_POOL_PROGRESS
     _, last_acquire_age = pool_progress()
@@ -692,9 +711,13 @@ async def _evaluate_readiness() -> tuple[bool, dict]:
                 if vouched is None:
                     raise
                 detail["db"] = vouched
-            if detail["db"] == "ok" and _pool_unproven(pool):
-                stage = "pool"
-                await _ping_through_pool(pool, budget)
+            if detail["db"] == "ok":
+                # Counted before deciding, so an acquire that completes from
+                # here on proves the pool rather than slipping past the probe.
+                progress_since = pool_progress()[0]
+                if _pool_unproven(pool):
+                    stage = "pool"
+                    await _ping_through_pool(pool, budget, progress_since)
     except Exception as e:  # noqa: BLE001 — no connection strings in a public probe
         failure = "timeout" if isinstance(e, TimeoutError) else "unavailable"
         detail["db"] = f"error:{failure}" if stage == "db" else f"error:pool_{failure}"

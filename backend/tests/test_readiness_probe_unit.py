@@ -14,6 +14,7 @@ same behaviour against a real one.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import socket
 import time
 from types import SimpleNamespace
@@ -382,6 +383,98 @@ async def test_probe_waiting_for_a_connection_stops_when_a_request_gets_one(main
     assert postgres._progress_waiters == set()
 
 
+def _counts_as_a_request(main) -> asyncio.Task:
+    """A request's acquire completing through the pool's hook, outside the
+    readiness context, as soon as the probe next yields."""
+    return asyncio.get_running_loop().create_task(
+        postgres._count_acquire(object()), context=contextvars.Context(),
+    )
+
+
+async def test_request_acquire_that_completes_before_the_probe_waits_is_not_lost(main, probe, monkeypatch):
+    # The request's acquire completes after the probe decided to check the
+    # pool but before the probe's own acquire or wait ever ran.
+    monkeypatch.setattr(postgres, "_acquires_total", 0)
+    monkeypatch.setattr(postgres, "_last_acquire_at", time.monotonic() - 10 * GRACE)
+    monkeypatch.setattr(main, "pool_progress", postgres.pool_progress)
+    probe.pool.size, probe.pool.idle = 1, 0
+    probe.pool.acquire_delay = 60
+    request = []
+    real_unproven = main._pool_unproven
+
+    def unproven_and_a_request_completes(pool):
+        unproven = real_unproven(pool)
+        request.append(_counts_as_a_request(main))
+        return unproven
+
+    monkeypatch.setattr(main, "_pool_unproven", unproven_and_a_request_completes)
+
+    started = time.monotonic()
+    ok, detail = await main._probe_ready()
+    elapsed = time.monotonic() - started
+    await asyncio.gather(*request)
+
+    assert ok is True, detail
+    assert detail["db"] == "ok"
+    assert elapsed < 1.0
+    assert postgres._progress_waiters == set()
+
+
+async def test_progress_counted_between_the_decision_and_the_wait_is_not_lost(main, probe, monkeypatch):
+    # An acquire completes between the count the probe took and the moment it
+    # registers to wait: the second read of the count catches it.
+    _unproven(probe)
+    probe.pool.acquire_delay = 60
+    real_unproven = main._pool_unproven
+
+    def unproven_after_a_request_acquired(pool):
+        unproven = real_unproven(pool)
+        probe.progress.acquire()
+        return unproven
+
+    monkeypatch.setattr(main, "_pool_unproven", unproven_after_a_request_acquired)
+
+    ok, detail = await asyncio.wait_for(main._probe_ready(), timeout=1.0)
+
+    assert ok is True, detail
+    assert detail["db"] == "ok"
+    assert probe.pool.acquire_timeouts == []
+
+
+async def test_request_progress_wins_when_the_probes_extra_connection_is_refused_at_once(main, probe, monkeypatch):
+    # The request's connection opens and the server refuses the probe's extra
+    # one in the same moment: both are done when the probe looks.
+    _unproven(probe)
+    both = asyncio.Event()
+    refused = asyncpg.TooManyConnectionsError("sorry, too many clients already")
+
+    async def refused_with_the_request(*, timeout=None):
+        await both.wait()
+        raise refused
+
+    async def request_acquires() -> None:
+        await both.wait()
+        await postgres._count_acquire(object())
+
+    monkeypatch.setattr(postgres, "_acquires_total", 0)
+    monkeypatch.setattr(postgres, "_last_acquire_at", None)
+    monkeypatch.setattr(probe.pool, "acquire", refused_with_the_request)
+    request = asyncio.get_running_loop().create_task(request_acquires(), context=contextvars.Context())
+
+    async def release_both() -> None:
+        while not postgres._progress_waiters:
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.01)  # the probe's acquire is parked as well
+        both.set()
+
+    releaser = asyncio.create_task(release_both())
+    ok, detail = await main._probe_ready()
+    await asyncio.gather(request, releaser)
+
+    assert ok is True, detail
+    assert detail["db"] == "ok"
+
+
 @pytest.mark.parametrize("evidence", ["idle", "recent_acquire", "saturated"])
 async def test_pool_that_shows_it_works_is_not_borrowed_from(main, probe, evidence):
     _unproven(probe)
@@ -612,7 +705,7 @@ async def test_pool_ping_that_uses_up_the_budget_gives_the_connection_up(main):
     budget = SimpleNamespace(when=lambda: next(deadlines))
 
     with pytest.raises(TimeoutError):
-        await main._ping_through_pool(pool, budget)
+        await main._ping_through_pool(pool, budget, postgres.pool_progress()[0])
 
     pool.idle_conn.fetchval.assert_awaited_once_with("SELECT 1")
     pool.idle_conn.terminate.assert_called_once()

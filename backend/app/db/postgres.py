@@ -57,7 +57,7 @@ async def _count_acquire(_conn) -> None:
     _wake_progress_waiters()
 
 
-# Futures of callers waiting in `next_pool_progress`, each from its own loop.
+# Futures from `pool_progress_waiter`, each from its own loop.
 _progress_waiters: set[asyncio.Future] = set()
 
 
@@ -71,14 +71,22 @@ def _wake_progress_waiters() -> None:
             logger.debug("pool progress waiter could not be woken", exc_info=True)
 
 
-async def next_pool_progress() -> None:
-    """Return once the next acquire that counts as pool progress completes."""
+def pool_progress_waiter() -> asyncio.Future:
+    """A future that the next acquire counted as pool progress resolves.
+
+    It is registered before this returns, so no such acquire that completes
+    after the call is missed. Hand it to `forget_pool_progress_waiter` when
+    done with it.
+    """
     waiter = asyncio.get_running_loop().create_future()
     _progress_waiters.add(waiter)
-    try:
-        await waiter
-    finally:
-        _progress_waiters.discard(waiter)
+    return waiter
+
+
+def forget_pool_progress_waiter(waiter: asyncio.Future) -> None:
+    _progress_waiters.discard(waiter)
+    if not waiter.done():
+        waiter.cancel()
 
 
 def pool_progress() -> tuple[int, float | None]:

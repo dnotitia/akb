@@ -288,6 +288,46 @@ class _ChangingHands:
         await asyncio.gather(*self._tasks)
 
 
+class _GatedConnect:
+    """An asyncpg pool `connect` that opens the real connection, or meets the
+    server's refusal, and then holds the outcome until `release()`. The test
+    decides exactly when a connection the pool is opening becomes available."""
+
+    def __init__(self) -> None:
+        self.parked = 0
+        self._gate = asyncio.Event()
+
+    async def __call__(self, *args, **kwargs):
+        try:
+            conn = await asyncpg.connect(*args, **kwargs)
+        except Exception:
+            self.parked += 1
+            await self._gate.wait()
+            raise
+        self.parked += 1
+        await self._gate.wait()
+        return conn
+
+    def release(self) -> None:
+        self._gate.set()
+
+    async def until_parked(self, count: int) -> None:
+        async with asyncio.timeout(5):
+            while self.parked < count:
+                await asyncio.sleep(0.005)
+
+
+async def _swap_in_a_gated_pool(db, monkeypatch, gated: _GatedConnect, *, max_size: int) -> asyncpg.Pool:
+    """Replace the fixture's pool with an empty one that opens connections through `gated`."""
+    db.pool.terminate()  # its connections would count against the role's limit
+    pool = await asyncpg.create_pool(
+        dsn=postgres.settings.asyncpg_dsn, min_size=0, max_size=max_size,
+        connect=gated, setup=postgres._count_acquire,
+    )
+    monkeypatch.setattr(postgres, "_pool", pool)
+    return pool
+
+
 def _past_the_floor(main) -> None:
     """Age the last result past the floor during which every caller shares it."""
     main._ready_state.ts -= main._READY_MIN_INTERVAL_SECONDS
@@ -541,6 +581,129 @@ async def test_vector_check_stuck_on_a_silent_pool_connection_cannot_hold_readyz
     assert [response.status_code for response in responses] == [200] * 11
     assert {response.json()["detail"]["vector_store"] for response in responses} == {"degraded:timeout"}
     assert elapsed < db.main._READY_VECTOR_TIMEOUT_SECONDS + 1.0
+
+
+async def test_request_acquire_completing_before_the_probe_waits_is_not_lost(ready_db, monkeypatch):
+    # The pool's only holder is still opening a request's connection when the
+    # probe decides to check the pool. That connection becomes available the
+    # moment the probe decides, so the request's acquire completes before the
+    # probe has queued for a connection or registered to wait for progress.
+    main = ready_db.main
+    monkeypatch.setattr(main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+    assert (await ready_db.client.get("/readyz")).status_code == 200  # opens the probe connection
+    gated = _GatedConnect()
+    pool = await _swap_in_a_gated_pool(ready_db, monkeypatch, gated, max_size=1)
+    hold = asyncio.Event()
+    try:
+        await asyncio.sleep(_PAST_GRACE)
+
+        async def serve_a_request() -> None:
+            async with pool.acquire():
+                await hold.wait()
+
+        request = asyncio.create_task(serve_a_request())
+        await gated.until_parked(1)
+        real_unproven = main._pool_unproven
+
+        def unproven_as_the_request_connects(checked_pool):
+            unproven = real_unproven(checked_pool)
+            gated.release()
+            return unproven
+
+        monkeypatch.setattr(main, "_pool_unproven", unproven_as_the_request_connects)
+        main._ready_state.ts -= 31  # past the success cache
+        started = time.monotonic()
+        response = await ready_db.client.get("/readyz")
+        elapsed = time.monotonic() - started
+        hold.set()
+        await request
+    finally:
+        hold.set()
+        gated.release()
+        pool.terminate()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["detail"]["db"] == "ok"
+    assert elapsed < main._READY_DB_TIMEOUT_SECONDS
+
+
+async def test_request_taking_the_idle_connection_first_proves_the_pool_at_max_connections(monkeypatch, tmp_path):
+    # The server refuses the probe's connection, and readiness turns to the
+    # pool's idle connection. A request waiting to run takes it first and
+    # keeps it; its completed acquire proves the pool.
+    async with _ready_database(monkeypatch, tmp_path, role_connection_limit=1, pool_size=1) as db:
+        main = db.main
+        wake_the_request = asyncio.Event()
+        hold = asyncio.Event()
+        real_ping = main.readiness_ping
+
+        async def refused_then_the_request_runs(**kwargs):
+            try:
+                await real_ping(**kwargs)
+            except asyncpg.TooManyConnectionsError:
+                wake_the_request.set()
+                raise
+
+        async def serve_a_request() -> None:
+            await wake_the_request.wait()
+            async with db.pool.acquire():
+                await hold.wait()
+
+        monkeypatch.setattr(main, "readiness_ping", refused_then_the_request_runs)
+        request = asyncio.create_task(serve_a_request())
+        try:
+            started = time.monotonic()
+            response = await db.client.get("/readyz")
+            elapsed = time.monotonic() - started
+        finally:
+            hold.set()
+            wake_the_request.set()
+            await request
+
+    assert response.status_code == 200, response.text
+    assert response.json()["detail"]["db"] == "ok:pool_progress"
+    assert elapsed < main._READY_DB_TIMEOUT_SECONDS
+
+
+async def test_request_progress_wins_over_the_refusal_of_the_probes_extra_connection(monkeypatch, tmp_path):
+    # The request's connection opens and the server refuses the probe's extra
+    # one; both outcomes reach the pool together.
+    async with _ready_database(monkeypatch, tmp_path, role_connection_limit=_POOL_SIZE + 1) as db:
+        main = db.main
+        monkeypatch.setattr(main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+        assert (await db.client.get("/readyz")).status_code == 200  # opens the probe connection
+        gated = _GatedConnect()
+        pool = await _swap_in_a_gated_pool(db, monkeypatch, gated, max_size=2)
+        hold = asyncio.Event()
+        try:
+            # Room for the probe's connection and one request's, no more.
+            await db.admin.execute(f'ALTER ROLE "{db.name}" CONNECTION LIMIT 2')
+            await asyncio.sleep(_PAST_GRACE)
+
+            async def serve_a_request() -> None:
+                async with pool.acquire():
+                    await hold.wait()
+
+            request = asyncio.create_task(serve_a_request())
+            await gated.until_parked(1)
+
+            async def release_both_outcomes() -> None:
+                await gated.until_parked(2)  # the probe's extra connection was refused
+                gated.release()
+
+            releaser = asyncio.create_task(release_both_outcomes())
+            main._ready_state.ts -= 31  # past the success cache
+            response = await db.client.get("/readyz")
+            await releaser
+            hold.set()
+            await request
+        finally:
+            hold.set()
+            gated.release()
+            pool.terminate()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["detail"]["db"] == "ok"
 
 
 async def test_pool_that_can_no_longer_open_connections_is_not_ready(monkeypatch, tmp_path):

@@ -121,10 +121,12 @@ working. So when the pool shows nothing that proves it could serve a request
 `readyz_pool_saturation_grace_secs`), the probe also takes one connection
 through the pool within the rest of its 2-second step and runs `SELECT 1`. If
 the pool cannot open it, readiness reports `db: error:pool_unavailable`, or
-`db: error:pool_timeout` when it does not answer in time. While the probe waits
-for that connection, an acquire completed by a request or background work
-proves the pool too and ends the wait, so a probe queued behind a request whose
-connection is still opening does not report a working pool as broken.
+`db: error:pool_timeout` when it does not answer in time. An acquire completed
+by a request or background work after the probe decided to check the pool
+proves the pool too: it ends the probe's wait, and it wins even when the server
+refuses the probe's own extra connection at the same moment. So a probe queued
+behind a request whose connection is still opening does not report a working
+pool as broken.
 
 A server at `max_connections` refuses that connection with SQLSTATE `53300`
 while the pool's open connections keep working. Readiness then asks the pool,
