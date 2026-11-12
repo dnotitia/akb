@@ -7,6 +7,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 import gc
 import json
+import sys
 import threading
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -502,6 +503,118 @@ async def test_more_waiting_streams_than_pool_connections_leave_the_pool_usable(
     assert hub.subscriptions == []
 
 
+def _row(event_id: int) -> dict[str, Any]:
+    return {
+        "id": event_id,
+        "occurred_at": datetime(2026, 8, 28, 8, 0, tzinfo=timezone.utc),
+        "kind": "document.put",
+        "resource_uri": None,
+        "actor_id": "alice",
+        "payload": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_slow_recheck_during_which_access_was_revoked_sends_no_further_row(monkeypatch, hub) -> None:
+    """A check covers rows from when it started, for a second.
+
+    One that took longer has expired by the time it returns, and the access
+    it saw may have been revoked while it ran, so it is run again before the
+    next row goes out. The re-check used to be trusted however long it took.
+    """
+    from app.exceptions import ForbiddenError
+    from app.services import event_tail_service
+
+    pool, _connection, request = _stream_test_doubles()
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "list_vault_events", AsyncMock(return_value=[_row(1), _row(2), _row(3)]))
+    window = event_tail_service._RECHECK_DURING_YIELD_SECONDS
+    granted = True
+    slow_checks = 0
+    checks = 0
+
+    async def access(*_args: Any, _conn: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal granted, slow_checks, checks
+        checks += 1
+        seen = granted
+        if slow_checks:
+            slow_checks -= 1
+            # The queries saw access still granted; it is revoked while the
+            # rest of the check, longer than the window, runs.
+            granted = False
+            await asyncio.sleep(window + 0.2)
+        if not seen:
+            raise ForbiddenError("revoked")
+        return {"vault_id": VAULT_ID}
+
+    monkeypatch.setattr(event_tail_service, "check_vault_access", access)
+    stream = event_tail_service._stream_events(
+        request,
+        user_id="user",
+        vault="vault",
+        vault_id=VAULT_ID,
+        kinds=(),
+        position=0,
+        codec=EventCursorCodec("cursor-secret"),
+    )
+    try:
+        assert (await anext(stream)).startswith("event: change\n")
+        slow_checks = 1
+        # A reader slower than the window: the next row needs a new check.
+        await asyncio.sleep(window + 0.1)
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+    finally:
+        await stream.aclose()
+
+    # The pass's check, the slow re-check, and the one that saw the revocation.
+    assert checks == 3
+    assert pool.checked_out == 0
+
+
+@pytest.mark.asyncio
+async def test_a_stream_whose_checks_keep_outlasting_the_window_ends(monkeypatch, hub) -> None:
+    """Each expired check is repeated, but not forever: the stream ends, and its client resumes by cursor."""
+    from app.services import event_tail_service
+
+    pool, _connection, request = _stream_test_doubles()
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "list_vault_events", AsyncMock(return_value=[_row(1), _row(2)]))
+    monkeypatch.setattr(event_tail_service, "_RECHECK_DURING_YIELD_SECONDS", 0.2)
+    slow = False
+    checks = 0
+
+    async def access(*_args: Any, _conn: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal checks
+        checks += 1
+        if slow:
+            await asyncio.sleep(0.3)
+        return {"vault_id": VAULT_ID}
+
+    monkeypatch.setattr(event_tail_service, "check_vault_access", access)
+    stream = event_tail_service._stream_events(
+        request,
+        user_id="user",
+        vault="vault",
+        vault_id=VAULT_ID,
+        kinds=(),
+        position=0,
+        codec=EventCursorCodec("cursor-secret"),
+    )
+    try:
+        assert (await anext(stream)).startswith("event: change\n")
+        slow = True
+        await asyncio.sleep(0.3)
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+    finally:
+        await stream.aclose()
+
+    assert event_tail_service._MAX_STALE_ACCESS_CHECKS == 3
+    # The pass's check, then three re-checks that each took too long.
+    assert checks == 1 + event_tail_service._MAX_STALE_ACCESS_CHECKS
+
+
 @pytest.mark.asyncio
 async def test_tail_database_work_holds_no_more_connections_than_its_budget(monkeypatch) -> None:
     from app.services import event_tail_service
@@ -663,7 +776,8 @@ def test_a_slot_freed_by_a_collection_the_refusal_starts_does_not_deadlock(monke
     gc.disable()
     try:
         body = _AbandonedBody()
-        finalizer = weakref.finalize(body, abandoned.release)
+        # What open_tail registers for a body whose client left before it started.
+        finalizer = weakref.finalize(body, abandoned.abandon)
         del body
         assert finalizer.alive
         assert slots.open == 1
@@ -678,6 +792,61 @@ def test_a_slot_freed_by_a_collection_the_refusal_starts_does_not_deadlock(monke
     assert slots.open == 0
     assert slots.users == 0
     assert lock_held_while_refusing == [False]
+
+
+def test_a_finalizer_run_between_reading_and_writing_an_account_count_leaves_it_exact() -> None:
+    """A trace function runs Python between two lines, and a collection can run with it.
+
+    A debugger or profiler installs one. A finalizer that gave a slot back
+    there, after acquire had read the account's count and before it wrote it,
+    used to change the count underneath it: the stale write then undid the
+    release, the account stayed counted for a stream it no longer had, and it
+    was later refused with a 429 below its quota.
+    """
+    from app.services import event_tail_service
+
+    slots = event_tail_service._StreamSlots()
+    limits = {"limit": 10, "per_user_limit": 3}
+    abandoned = slots.acquire("account", **limits)
+    kept = slots.acquire("account", **limits)
+    body = _AbandonedBody()
+    # What open_tail registers for a body whose client left before it started.
+    finalizer = weakref.finalize(body, abandoned.abandon)
+    del body
+    acquire_code = event_tail_service._StreamSlots.acquire.__code__
+    fired: list[str] = []
+
+    def trace_lines(frame: Any, event: str, _arg: Any) -> Any:
+        # The first line after the count was read: run what a collection
+        # starting there would run.
+        if event == "line" and not fired and "held" in frame.f_locals:
+            fired.append("finalizer")
+            finalizer()
+        return trace_lines
+
+    def trace_calls(frame: Any, _event: str, _arg: Any) -> Any:
+        return trace_lines if frame.f_code is acquire_code else None
+
+    previous = sys.gettrace()
+    sys.settrace(trace_calls)
+    try:
+        newcomer = slots.acquire("account", **limits)
+    finally:
+        sys.settrace(previous)
+
+    assert fired == ["finalizer"]
+    assert not finalizer.alive
+    # Exactly the kept stream and the newcomer.
+    assert (slots.open, slots.users) == (2, 1)
+    assert slots._per_user == {"account": 2}
+    kept.release()
+    newcomer.release()
+    assert (slots.open, slots.users) == (0, 0)
+    # The whole quota is the account's again: no 429 below it.
+    again = [slots.acquire("account", **limits) for _ in range(3)]
+    for slot in again:
+        slot.release()
+    assert (slots.open, slots.users) == (0, 0)
 
 
 class _CollectsWhileHeld:
@@ -732,6 +901,7 @@ _FULL_AT_TWO = {
 }
 
 
+@pytest.mark.parametrize("giving_back", ["finalizer", "direct-release"])
 @pytest.mark.parametrize("refusal", sorted(_FULL_AT_TWO))
 @pytest.mark.parametrize(
     ("point", "admitted", "still_open"),
@@ -748,6 +918,7 @@ def test_a_slot_freed_on_the_admitting_thread_while_it_holds_the_lock_keeps_the_
     admitted: bool,
     still_open: int,
     refusal: str,
+    giving_back: str,
 ) -> None:
     from app.services import event_tail_service
 
@@ -755,7 +926,10 @@ def test_a_slot_freed_on_the_admitting_thread_while_it_holds_the_lock_keeps_the_
     slots = event_tail_service._StreamSlots()
     abandoned = slots.acquire(abandoned_user, **limits)
     kept = slots.acquire(kept_user, **limits)
-    monkeypatch.setattr(slots, "_lock", _CollectsWhileHeld(slots._lock, abandoned.release, point=point))
+    # A finalizer only queues the slot; ordinary code may still release
+    # directly, and the lock lets it in.
+    callback = abandoned.abandon if giving_back == "finalizer" else abandoned.release
+    monkeypatch.setattr(slots, "_lock", _CollectsWhileHeld(slots._lock, callback, point=point))
 
     newcomer = None
     if admitted:

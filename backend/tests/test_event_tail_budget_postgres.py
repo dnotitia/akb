@@ -69,10 +69,15 @@ class _Request:
 
 
 class _TailPool:
-    """The request pool as event tail code sees it, counting the connections it holds."""
+    """The request pool as event tail code sees it, counting the connections it holds.
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    ``hold`` keeps each connection that long after it is lent, as slower
+    queries would, so that concurrent borrowers overlap.
+    """
+
+    def __init__(self, pool: asyncpg.Pool, *, hold: float = 0.0) -> None:
         self._pool = pool
+        self.hold = hold
         self.held = 0
         self.most_held = 0
 
@@ -89,6 +94,8 @@ class _TailAcquire:
         connection = await self._inner.__aenter__()
         self._owner.held += 1
         self._owner.most_held = max(self._owner.most_held, self._owner.held)
+        if self._owner.hold:
+            await asyncio.sleep(self._owner.hold)
         return connection
 
     async def __aexit__(self, *exc_info: Any) -> Any:
@@ -109,12 +116,11 @@ class _Tail:
         self.checks = 0
         self.rechecks = 0
 
-    async def open(self, *, user_id: str, vault: str, vault_id: uuid.UUID, start: str | None = None) -> Any:
+    async def open(self, *, user_id: str, vault: str, start: str | None = None) -> Any:
         response = await event_tail_service.open_tail(
             _Request(),  # type: ignore[arg-type]
             user_id=user_id,
             vault=vault,
-            vault_id=vault_id,
             last_event_id=None,
             cursor=None,
             start=start,
@@ -131,6 +137,7 @@ async def _tail(
     pool_size: int = _POOL_SIZE,
     budget: int = _BUDGET,
     heartbeat: float = 60.0,
+    hold: float = 0.0,
 ) -> AsyncIterator[_Tail]:
     """Point the event tail at a small pool of its own on the test database.
 
@@ -140,7 +147,7 @@ async def _tail(
     """
     database = await setup_pool.fetchval("SELECT current_database()")
     pool = await asyncpg.create_pool(_database_dsn(database), min_size=0, max_size=pool_size)
-    tail_pool = _TailPool(pool)
+    tail_pool = _TailPool(pool, hold=hold)
     hub = await _listening_hub(setup_pool)
     tail = _Tail(pool, tail_pool, hub)
 
@@ -274,9 +281,12 @@ async def test_a_burst_across_many_streams_leaves_the_pool_to_other_requests(mon
             stream_vaults: list[int] = []
             for index in range(len(names) * streams_per_vault):
                 vault = index % len(names)
-                bodies.append(await tail.open(user_id=users[index % readers], vault=names[vault], vault_id=vault_ids[vault]))
+                bodies.append(await tail.open(user_id=users[index % readers], vault=names[vault]))
                 stream_vaults.append(vault)
             assert len(bodies) >= 32
+            # open_tail checked each stream's access once, before reading anything.
+            assert tail.checks == len(bodies)
+            checks_at_open = tail.checks
             expected = [events_per_vault if vault < active_vaults else 0 for vault in stream_vaults]
             consumers = [
                 asyncio.create_task(_changes(body, count)) for body, count in zip(bodies, expected) if count
@@ -327,7 +337,7 @@ async def test_a_burst_across_many_streams_leaves_the_pool_to_other_requests(mon
             # Every check either covered a batch it followed on the same
             # connection or renewed one for a slow reader: none per row, none
             # for a pass that found nothing.
-            assert tail.checks == tail.reads_with_rows + tail.rechecks
+            assert tail.checks - checks_at_open == tail.reads_with_rows + tail.rechecks
             # The events woke only their own Vaults' streams: the streams of
             # Vaults without events read nothing during the whole burst.
             idle_vaults_reads = [
@@ -362,7 +372,7 @@ async def test_streams_woken_while_the_database_stalls_leave_a_connection_for_re
 
             monkeypatch.setattr(event_tail_service, "list_vault_events", stalling_read)
             bodies = [
-                await tail.open(user_id=users[index % len(users)], vault="event-stall", vault_id=vault_id)
+                await tail.open(user_id=users[index % len(users)], vault="event-stall")
                 for index in range(streams)
             ]
             consumers = [asyncio.create_task(_changes(body, 1)) for body in bodies]
@@ -421,11 +431,12 @@ async def test_access_revoked_between_the_read_and_the_check_sends_none_of_the_r
                 return rows
 
             monkeypatch.setattr(event_tail_service, "list_vault_events", read_then_revoke)
-            body = await tail.open(user_id=user_id, vault="event-revoke-read", vault_id=vault_id, start="earliest")
+            body = await tail.open(user_id=user_id, vault="event-revoke-read", start="earliest")
             frames = [frame async for frame in body]
 
             assert frames == []
-            assert tail.checks == 1
+            # open_tail's check, before the revocation, and the pass's, after it.
+            assert tail.checks == 2
             assert tail.tail_pool.held == 0
 
 
@@ -436,13 +447,14 @@ async def test_a_slow_reader_is_checked_again_before_its_next_row(monkeypatch):
         event_ids = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(3)]
         async with _tail(monkeypatch, setup_pool) as tail:
             # A reader that keeps up is sent the whole batch on one check.
-            body = await tail.open(user_id=user_id, vault="event-revoke-slow", vault_id=vault_id, start="earliest")
+            body = await tail.open(user_id=user_id, vault="event-revoke-slow", start="earliest")
             assert _positions([await anext(body) for _ in event_ids]) == event_ids
             await body.aclose()
-            assert tail.checks == 1
+            # open_tail's check, then one for the whole batch.
+            assert tail.checks == 2
 
             tail.checks = 0
-            body = await tail.open(user_id=user_id, vault="event-revoke-slow", vault_id=vault_id, start="earliest")
+            body = await tail.open(user_id=user_id, vault="event-revoke-slow", start="earliest")
             first = await anext(body)
             await _revoke(setup_pool, vault_id, user_id)
             # Slower than the window one check covers: the next row waits for a new check.
@@ -451,7 +463,8 @@ async def test_a_slow_reader_is_checked_again_before_its_next_row(monkeypatch):
 
             assert _positions([first]) == event_ids[:1]
             assert rest == []
-            assert tail.checks == 2
+            # open_tail's, the batch's, and the one before the second row.
+            assert tail.checks == 3
             assert event_tail_service._RECHECK_DURING_YIELD_SECONDS == 1.0
 
 
@@ -462,7 +475,8 @@ async def test_a_stream_without_rows_closes_within_one_heartbeat_of_losing_acces
         user_id = await _make_reader(setup_pool, "revoke-idle-reader", [vault_id])
         async with _tail(monkeypatch, setup_pool, heartbeat=heartbeat) as tail:
             loop = asyncio.get_running_loop()
-            body = await tail.open(user_id=user_id, vault="event-revoke-idle", vault_id=vault_id)
+            body = await tail.open(user_id=user_id, vault="event-revoke-idle")
+            checks_at_open = tail.checks
             frames: list[tuple[float, str]] = []
 
             async def read_all() -> None:
@@ -481,7 +495,7 @@ async def test_a_stream_without_rows_closes_within_one_heartbeat_of_losing_acces
                     await setup_pool.execute("SELECT pg_notify('akb_events', '0')")
                     await _until(lambda: tail.reads[str(vault_id)] > reads and tail.reading == 0)
                 heartbeats_before = sum(1 for _, frame in frames if frame == format_heartbeat())
-                assert tail.checks <= heartbeats_before
+                assert tail.checks - checks_at_open <= heartbeats_before
 
                 revoked_at = loop.time()
                 await _revoke(setup_pool, vault_id, user_id)
@@ -500,3 +514,142 @@ async def test_a_stream_without_rows_closes_within_one_heartbeat_of_losing_acces
             assert after_revocation in ([], [format_heartbeat()])
             # The clock agrees, with slack for a loaded host.
             assert closed_after < heartbeat + 1.0
+
+
+async def test_a_borrower_cancelled_while_its_connection_returns_keeps_the_budget_slot(monkeypatch):
+    """asyncpg returns a connection to its pool in a shielded task.
+
+    A borrower cancelled while it waited for that return, as a stream is again
+    and again once its client has left, used to give its budget slot back at
+    once. Another stream could then borrow a connection while the first was
+    still on its way back, and tail work held more connections than its budget.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        returning = asyncio.Event()
+        finish_returning = asyncio.Event()
+        slow_returns = 0
+
+        async def slow_reset(_connection: Any) -> None:
+            # asyncpg runs this inside its shielded return.
+            nonlocal slow_returns
+            if slow_returns:
+                slow_returns -= 1
+                returning.set()
+                await finish_returning.wait()
+
+        pool = await asyncpg.create_pool(_database_dsn(database), min_size=0, max_size=3, reset=slow_reset)
+
+        async def get_pool() -> asyncpg.Pool:
+            return pool
+
+        monkeypatch.setattr(event_tail_service, "get_pool", get_pool)
+        monkeypatch.setenv("AKB_EVENT_TAIL_DB_CONCURRENCY", "1")
+        monkeypatch.setattr(event_tail_service, "_db_budget", None, raising=False)
+
+        def busy() -> int:
+            # A connection on its way back is not idle yet.
+            return pool.get_size() - pool.get_idle_size()
+
+        holding = asyncio.Event()
+        most_busy = 0
+
+        async def first_borrower() -> None:
+            async with event_tail_service._tail_db_connection() as conn:
+                await conn.fetchval("SELECT 1")
+                holding.set()
+                await asyncio.sleep(3600)
+
+        async def second_borrower() -> None:
+            nonlocal most_busy
+            async with event_tail_service._tail_db_connection() as conn:
+                most_busy = max(most_busy, busy())
+                await conn.fetchval("SELECT 1")
+
+        first = asyncio.create_task(first_borrower())
+        second: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(holding.wait(), 5)
+            slow_returns = 1
+            # The client left: the borrower's cleanup starts the return ...
+            first.cancel()
+            await asyncio.wait_for(returning.wait(), 5)
+            # ... and the borrower is cancelled again while it waits for it.
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            assert busy() == 1
+
+            second = asyncio.create_task(second_borrower())
+            await asyncio.sleep(0.2)
+            # The returning connection still holds the only slot.
+            assert not second.done(), "a second connection was lent while the first was still returning"
+            assert event_tail_service.stats_snapshot()["budget_waiters"] == 1
+
+            finish_returning.set()
+            await asyncio.wait_for(second, 5)
+        finally:
+            finish_returning.set()
+            for task in (first, second):
+                if task is not None:
+                    task.cancel()
+            await asyncio.gather(*(task for task in (first, second) if task is not None), return_exceptions=True)
+            await pool.close()
+
+        assert most_busy == 1
+
+
+class _Caller:
+    def __init__(self, user_id: str) -> None:
+        self.user_id = user_id
+
+
+async def test_a_reconnect_storm_holds_no_more_connections_than_the_budget(monkeypatch):
+    """A request to open a stream used to check access on a connection of its own.
+
+    That check ran in the route, before admission and outside the database
+    budget, so a burst of reconnects, as after a restart, could take every
+    connection in the pool. It now runs in open_tail, within the budget, and
+    the errors keep their order: no access before a full process.
+    """
+    from app.api.routes import events
+    from app.exceptions import AKBError
+
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "event-storm")
+        readers = [await _make_reader(setup_pool, f"storm-reader-{index}", [vault_id]) for index in range(4)]
+        outsider = await _make_reader(setup_pool, "storm-outsider", [])
+        # Each connection is held a little longer than its queries need, so
+        # the burst's borrowers overlap.
+        async with _tail(monkeypatch, setup_pool, hold=0.02) as tail:
+            monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS", "8")
+            # The readers come first, so the first eight requests are the ones
+            # admitted; the outsider asks when the process is already full.
+            callers = [readers[index % len(readers)] for index in range(32)] + [outsider] * 8
+
+            async def reconnect(user_id: str) -> tuple[int, Any]:
+                try:
+                    response = await events.events_tail(
+                        "event-storm",
+                        _Request(),  # type: ignore[arg-type]
+                        cursor=None,
+                        start=None,
+                        kind=None,
+                        last_event_id=None,
+                        user=_Caller(user_id),  # type: ignore[arg-type]
+                    )
+                except AKBError as exc:
+                    return exc.status_code, None
+                return 200, response
+
+            outcomes = await asyncio.gather(*(reconnect(user_id) for user_id in callers))
+            for _, response in outcomes:
+                if response is not None:
+                    await response.body_iterator.aclose()
+
+        print(f"\nreconnect storm: most tail connections held at once: {tail.tail_pool.most_held}")
+        assert tail.tail_pool.most_held <= _BUDGET
+        statuses = [status for status, _ in outcomes]
+        assert statuses[:8] == [200] * 8
+        assert statuses[8:32] == [503] * 24
+        # Told it has no access, which it does not retry, rather than to retry later.
+        assert statuses[32:] == [403] * 8

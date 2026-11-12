@@ -97,19 +97,28 @@ outbox by cursor. If the listener connection drops, open tails keep re-reading
 on their 15-second heartbeat until it reconnects, so a missed wake-up delays
 delivery rather than dropping it.
 
-A waiting tail holds no pooled connection. To read, it borrows one for the
-batch and, when the batch has rows, checks the reader's access on that same
-connection before sending any of them. A pass that finds nothing checks
-nothing, except the pass after each heartbeat. A tail that takes longer than
-one second to send a batch is checked again before its next event. A revoked
-reader therefore stops receiving events within about a second, and an idle
-tail closes within one heartbeat. All tail database work in a process shares
-at most `event_tail_db_concurrency` connections; work beyond that waits for a
-free slot without holding a connection, so tail load cannot take the pool that
-other requests and the readiness probe need. At startup a server process logs
-a warning when its pool size (`pg_pool_max_size`, or `AKB_PG_POOL_MAX_SIZE`)
-less `event_tail_db_concurrency` and `write_lane_concurrency` leaves fewer
-than four connections for everything else.
+Opening a tail first decides admission, which reads nothing. It then checks
+the caller's access and reads the Vault's retained range on one connection,
+before any event is read. A waiting tail holds no pooled connection. To read,
+it borrows one for the batch and, when the batch has rows, checks the reader's
+access on that same connection before sending any of them. A pass that finds
+nothing checks nothing, except the pass after each heartbeat. Before each
+event, a check that started more than a second earlier is repeated, and so is
+a check that itself took longer than that to finish; a tail whose checks keep
+taking that long ends after three in a row, and its client resumes from its
+cursor. A revoked reader therefore stops receiving events within about a
+second, and an idle tail closes within one heartbeat.
+
+All tail database work in a process, opening included, shares at most
+`event_tail_db_concurrency` connections. Work beyond that waits for a free
+slot without holding a connection, and a slot is free again only once its
+connection is back in the pool, even when the stream that used it was
+cancelled. Tail load, a burst of reconnects included, therefore cannot take
+the pool that other requests and the readiness probe need. At startup a server
+process logs a warning when its pool size (`pg_pool_max_size`, or
+`AKB_PG_POOL_MAX_SIZE`) less `event_tail_db_concurrency` and
+`write_lane_concurrency` leaves fewer than four connections for everything
+else.
 
 Limits per server process; each environment variable overrides its key:
 
@@ -119,12 +128,15 @@ Limits per server process; each environment variable overrides its key:
 | Open tails of one account | `event_tail_max_streams_per_user` (`AKB_EVENT_TAIL_MAX_STREAMS_PER_USER`) | 48 | 429 `event_tail_user_quota` with `Retry-After`; close tails the account no longer reads |
 | Pool connections for tail database work | `event_tail_db_concurrency` (`AKB_EVENT_TAIL_DB_CONCURRENCY`) | 6 | the work waits for a free slot |
 
-An account at its quota gets 429 even when the process is also full: retrying
-cannot help it, and the SDK's change channel retries a 5xx but stops on a 4xx.
-`GET /health` reports the process's `event_tail`
-counters: open tails, accounts holding them, the limits above, database slots
-in use and waiting, and whether the listener is connected. It names no
-account or Vault.
+A new tail's errors come in this order: 403, or 404 for an unknown Vault; then
+429 for an account at its quota and 503 for a full process; then 400 for an
+invalid kind or cursor, and 410 for a cursor older than the retained tail. A
+caller without access is told so even when it would also be refused for
+capacity, and an account at its quota gets 429 even when the process is also
+full: retrying cannot help either, and the SDK's change channel retries a 5xx
+but stops on a 4xx. `GET /health` reports the process's `event_tail` counters:
+open tails, accounts holding them, the limits above, database slots in use and
+waiting, and whether the listener is connected. It names no account or Vault.
 
 ## Regression verification
 

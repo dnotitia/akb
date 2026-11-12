@@ -10,7 +10,6 @@ from starlette.responses import StreamingResponse
 from app.api.deps import get_current_user
 from app.exceptions import AKBError
 from app.services import event_tail_service
-from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 
 
@@ -67,14 +66,14 @@ async def events_tail(
     user: AuthenticatedUser = Depends(get_current_user),
 ) -> StreamingResponse:
     """Open a reader-gated stream whose source of truth is PostgreSQL."""
-    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    # open_tail checks reader access before any event query, on a connection
+    # within the event tail's database budget, so reconnects cannot take more
+    # of the pool than that budget.
     try:
         return await event_tail_service.open_tail(
-            # The access check intentionally precedes all event queries.
             request=request,
             user_id=user.user_id,
             vault=vault,
-            vault_id=access["vault_id"],
             last_event_id=last_event_id,
             cursor=cursor,
             start=start,

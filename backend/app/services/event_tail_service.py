@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,9 +41,14 @@ from app.services.event_tail_hub import event_tail_hub_connected, get_event_tail
 EVENT_BATCH_SIZE = 100
 HEARTBEAT_INTERVAL_SECONDS = 15.0
 # While a stream sends a batch, a passed access check covers the rows that
-# follow it for this long. A reader slower than that is checked again before
-# its next row, so it stops receiving rows about this long after losing access.
+# follow it for this long from when it started. A reader slower than that is
+# checked again before its next row, so it stops receiving rows about this
+# long after losing access.
 _RECHECK_DURING_YIELD_SECONDS = 1.0
+# A check that took longer than that window has expired by the time it
+# returns. After this many such checks in a row the stream ends; its client
+# reconnects and resumes from its cursor.
+_MAX_STALE_ACCESS_CHECKS = 3
 # Each overrides the app.yaml key of the same name; see those settings.
 MAX_STREAMS_ENV_VAR = "AKB_EVENT_TAIL_MAX_STREAMS"
 MAX_STREAMS_PER_USER_ENV_VAR = "AKB_EVENT_TAIL_MAX_STREAMS_PER_USER"
@@ -144,36 +150,43 @@ def configured_db_concurrency() -> int:
 class _StreamSlots:
     """How many event tail streams this process holds open, in all and per account.
 
-    A slot can be given back from a garbage-collection callback: the
-    ``weakref.finalize`` that open_tail registers for a body that never
-    started. A collection runs on whichever thread is running when it falls
-    due, and CPython can run one as soon as a call returns, the call that takes
-    this lock included. With a plain lock, a slot given back there would wait
-    on its own thread, and the event loop with it. So the lock is re-entrant,
-    and acquire builds nothing while it holds it: a refusal's error is raised
-    after the lock is let go.
+    A stream whose client leaves before its body starts is given back by the
+    ``weakref.finalize`` that open_tail registers, from inside whatever garbage
+    collection frees the body. A collection runs on whichever thread is
+    running when it falls due, at almost any point: as soon as a call returns,
+    the call that takes this lock included, or between two lines when a trace
+    function (a debugger, a profiler) runs. A slot given back there must not
+    wait for the lock its own thread may hold, and must not change a count
+    that the code it interrupted has read and is about to write.
 
-    Re-entry cannot corrupt the counts. The code under the lock makes no calls,
-    so a callback can run there only right after the lock is taken, before any
-    count is read. That includes the per-account counts: they are read and
-    written with subscripts on a dict keyed by ``str``, whose hashing and
-    comparison run no Python code, and an account is removed from the dict when
-    its last stream ends.
+    So the finalizer only appends the slot to ``_abandoned``. A deque's append
+    takes no lock and runs no Python code. Every acquire, release and count
+    first gives back the queued slots under the lock, so the counts change
+    only in code that holds the lock, and nothing interrupting that code
+    changes them. The lock stays re-entrant, although nothing relies on that
+    any more, and acquire builds nothing while it holds it: a refusal's error
+    is raised after the lock is let go.
     """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._open = 0
         self._per_user: dict[str, int] = {}
+        # Slots that finalizers gave back and no count reflects yet.
+        self._abandoned: collections.deque[_StreamSlot] = collections.deque()
 
     @property
     def open(self) -> int:
-        return self._open
+        with self._lock:
+            self._settle_abandoned()
+            return self._open
 
     @property
     def users(self) -> int:
         """Accounts holding at least one open stream."""
-        return len(self._per_user)
+        with self._lock:
+            self._settle_abandoned()
+            return len(self._per_user)
 
     def acquire(self, user_id: str, *, limit: int, per_user_limit: int) -> _StreamSlot:
         """Admit one stream for ``user_id``, or refuse it.
@@ -183,11 +196,10 @@ class _StreamSlots:
         frees up.
         """
         user = str(user_id)
-        per_user = self._per_user
-        # The verdict is a plain int (0 admitted, 1 process full, 2 account at
-        # its quota) so that deciding it makes no call.
+        # 0 admitted, 1 process full, 2 account at its quota.
         with self._lock:
-            held = per_user[user] if user in per_user else 0
+            self._settle_abandoned()
+            held = self._per_user.get(user, 0)
             if held >= per_user_limit:
                 verdict = 2
             elif self._open >= limit:
@@ -195,16 +207,22 @@ class _StreamSlots:
             else:
                 verdict = 0
                 self._open += 1
-                per_user[user] = held + 1
+                self._per_user[user] = held + 1
         if verdict == 2:
             raise EventTailUserQuotaError()
         if verdict == 1:
             raise EventTailCapacityError()
         return _StreamSlot(self, user)
 
+    def _settle_abandoned(self) -> None:
+        """Give back the slots finalizers queued. Call with the lock held."""
+        abandoned = self._abandoned
+        while abandoned:
+            abandoned.popleft()._give_back()
+
 
 class _StreamSlot:
-    """One admitted stream. Releasing it again is a no-op."""
+    """One admitted stream. Giving it back more than once counts once."""
 
     __slots__ = ("_slots", "_user", "_held")
 
@@ -214,19 +232,28 @@ class _StreamSlot:
         self._held = True
 
     def release(self) -> None:
+        """Give the slot back now. Call from ordinary code, not a finalizer."""
         slots = self._slots
-        user = self._user
-        per_user = slots._per_user
         with slots._lock:
-            if not self._held:
-                return
-            self._held = False
-            slots._open -= 1
-            held = per_user[user] - 1
-            if held:
-                per_user[user] = held
-            else:
-                del per_user[user]
+            slots._settle_abandoned()
+            self._give_back()
+
+    def abandon(self) -> None:
+        """Queue the slot to be given back; safe from a finalizer on any thread."""
+        self._slots._abandoned.append(self)
+
+    def _give_back(self) -> None:
+        """Uncount the slot unless it already was. Call with the lock held."""
+        if not self._held:
+            return
+        self._held = False
+        slots = self._slots
+        slots._open -= 1
+        held = slots._per_user[self._user] - 1
+        if held:
+            slots._per_user[self._user] = held
+        else:
+            del slots._per_user[self._user]
 
 
 _stream_slots = _StreamSlots()
@@ -257,6 +284,10 @@ class _DbBudget:
         self.in_use = 0
         self.waiters = 0
 
+    def give_back(self) -> None:
+        self.in_use -= 1
+        self.semaphore.release()
+
 
 _db_budget: _DbBudget | None = None
 
@@ -275,9 +306,13 @@ def _current_db_budget() -> _DbBudget:
 async def _tail_db_connection() -> AsyncIterator[Any]:
     """Borrow one pool connection within the event tail's database budget.
 
-    Waiting for a slot holds nothing, and a slot is held only until the
-    connection goes back, so event tail work never holds more pool
-    connections than the budget, however many streams are woken at once.
+    Waiting for a slot holds nothing. A slot is given back only once its
+    connection is back in the pool. asyncpg returns a connection in a shielded
+    task, which goes on when the borrower is cancelled while it waits for
+    that return, as a stream is when its client leaves. The slot is therefore
+    given back when that return finishes, not when the borrower's cleanup
+    runs. Event tail work never holds more pool connections than the budget,
+    however many streams are woken or cancelled at once.
     """
     budget = _current_db_budget()
     budget.waiters += 1
@@ -286,13 +321,21 @@ async def _tail_db_connection() -> AsyncIterator[Any]:
     finally:
         budget.waiters -= 1
     budget.in_use += 1
+    returning: asyncio.Future[Any] | None = None
     try:
         pool = await get_pool()
-        async with pool.acquire() as conn:
+        checkout = pool.acquire()
+        conn = await checkout.__aenter__()
+        try:
             yield conn
+        finally:
+            # asyncpg's checkout ignores the exception it is told about.
+            returning = asyncio.ensure_future(checkout.__aexit__(None, None, None))
+            returning.add_done_callback(lambda _returned: budget.give_back())
+            await asyncio.shield(returning)
     finally:
-        budget.in_use -= 1
-        budget.semaphore.release()
+        if returning is None:
+            budget.give_back()
 
 
 def stats_snapshot() -> dict[str, int | bool]:
@@ -521,28 +564,44 @@ async def open_tail(
     *,
     user_id: str,
     vault: str,
-    vault_id: UUID | str,
     last_event_id: str | None,
     cursor: str | None,
     start: str | None,
     kinds: list[str] | None,
 ) -> StreamingResponse:
-    """Preflight and return a streaming response for one authorized Vault.
+    """Check access, preflight, and return a streaming response for one Vault.
 
-    Admission comes first: an account at its quota is refused with 429, and a
-    process at its stream cap with 503, before the preflight reads the
-    database.
+    Admission is decided first and reads nothing. Then one connection, within
+    the database budget, serves the access check and, after it, the read of
+    the Vault's retained range, so a burst of reconnects holds no more
+    connections than the budget. The access check comes before any event
+    query.
+
+    The errors keep the order the route has always given them: 403, or 404
+    for an unknown Vault, before 429 for an account at its quota and 503 for
+    a full process; then 400 for an invalid kind or cursor, and 410 for a
+    cursor older than the retained tail. A refused request is therefore still
+    checked, within the budget, so a client without access is told so, and
+    stops, rather than told to retry.
     """
-    slot = _stream_slots.acquire(
-        user_id,
-        limit=configured_max_streams(),
-        per_user_limit=configured_max_streams_per_user(),
-    )
     try:
-        normalized_kinds = normalize_kind_filter(kinds)
-        codec = EventCursorCodec()
+        slot = _stream_slots.acquire(
+            user_id,
+            limit=configured_max_streams(),
+            per_user_limit=configured_max_streams_per_user(),
+        )
+    except (EventTailUserQuotaError, EventTailCapacityError):
+        # A caller without access hears that first, and does not retry it.
         async with _tail_db_connection() as conn:
+            await check_vault_access(user_id, vault, required_role="reader", _conn=conn)
+        raise
+    try:
+        async with _tail_db_connection() as conn:
+            access = await check_vault_access(user_id, vault, required_role="reader", _conn=conn)
+            normalized_kinds = normalize_kind_filter(kinds)
+            vault_id = access["vault_id"]
             earliest_id, latest_id = await get_vault_event_bounds(conn, vault_id)
+        codec = EventCursorCodec()
         bounds = EventBounds(earliest_id=earliest_id, latest_id=latest_id)
         resolved = resolve_start_position(
             codec,
@@ -573,7 +632,7 @@ async def open_tail(
         # The generator gives the slot back in its `finally`, but only once it
         # has started. If the client leaves before the body is first iterated,
         # it never starts; give the slot back when it is collected instead.
-        weakref.finalize(stream, slot.release)
+        weakref.finalize(stream, slot.abandon)
         return StreamingResponse(
             stream,
             media_type="text/event-stream",
@@ -636,6 +695,24 @@ async def _recheck_access(*, user_id: str, vault: str, vault_id: UUID | str) -> 
     return checked_at
 
 
+async def _fresh_access_check(*, user_id: str, vault: str, vault_id: UUID | str) -> float:
+    """Check access until a check covers the next row; returns when that check started.
+
+    A check covers rows for _RECHECK_DURING_YIELD_SECONDS from when it started.
+    One that took longer, in its queries or in giving its connection back, has
+    expired when it returns, and access may have been revoked while it ran, so
+    it is run again. After _MAX_STALE_ACCESS_CHECKS expired checks in a row,
+    raises _AccessLost: the stream ends quietly and its client resumes from
+    its cursor. A failed check raises _AccessLost too.
+    """
+    loop = asyncio.get_running_loop()
+    for _ in range(_MAX_STALE_ACCESS_CHECKS):
+        checked_at = await _recheck_access(user_id=user_id, vault=vault, vault_id=vault_id)
+        if loop.time() - checked_at <= _RECHECK_DURING_YIELD_SECONDS:
+            return checked_at
+    raise _AccessLost
+
+
 async def _stream_events(
     request: Request,
     *,
@@ -655,11 +732,14 @@ async def _stream_events(
     checks nothing, except the pass right after a heartbeat, so a stream that
     receives no rows still closes within one heartbeat of losing access.
 
-    Invariant: no row is yielded unless an access check that started after the
-    row was read has passed. While a batch is sent, a check that started more
-    than _RECHECK_DURING_YIELD_SECONDS earlier is repeated before the next row,
-    so a reader slower than that stops receiving rows within about that long
-    of losing access.
+    Invariant: no row is yielded unless an access check has passed that
+    started after the row was read and no more than
+    _RECHECK_DURING_YIELD_SECONDS before the row is yielded. Before each row
+    whose last check is older than that, the stream checks again until a check
+    is that recent; after _MAX_STALE_ACCESS_CHECKS slow checks in a row it
+    ends, and its client resumes from its cursor. A reader slower than the
+    window therefore stops receiving rows within about that long of losing
+    access.
     """
     try:
         # Wake-ups come from the process-wide LISTEN hub, for this Vault's
@@ -701,7 +781,7 @@ async def _stream_events(
                             return
                         if loop.time() - checked_at > _RECHECK_DURING_YIELD_SECONDS:
                             try:
-                                checked_at = await _recheck_access(
+                                checked_at = await _fresh_access_check(
                                     user_id=user_id,
                                     vault=vault,
                                     vault_id=vault_id,

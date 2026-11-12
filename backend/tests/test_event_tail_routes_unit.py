@@ -18,12 +18,11 @@ class _User:
 
 
 @pytest.mark.asyncio
-async def test_route_authorizes_before_opening_the_event_stream(monkeypatch) -> None:
+async def test_route_leaves_the_access_check_to_open_tail(monkeypatch) -> None:
+    """The route borrows no connection of its own: open_tail checks access within its budget."""
     from app.api.routes import events
 
-    access = AsyncMock(return_value={"vault_id": UUID("11111111-1111-4111-8111-111111111111")})
     opened = AsyncMock(return_value=StreamingResponse(iter(()), media_type="text/event-stream"))
-    monkeypatch.setattr(events, "check_vault_access", access)
     monkeypatch.setattr(events.event_tail_service, "open_tail", opened)
 
     request = MagicMock()
@@ -38,12 +37,11 @@ async def test_route_authorizes_before_opening_the_event_stream(monkeypatch) -> 
     )
 
     assert result is opened.return_value
-    access.assert_awaited_once_with(_User.user_id, "vault", required_role="reader")
+    assert not hasattr(events, "check_vault_access")
     opened.assert_awaited_once_with(
         request=request,
         user_id=_User.user_id,
         vault="vault",
-        vault_id=UUID("11111111-1111-4111-8111-111111111111"),
         last_event_id=None,
         cursor=None,
         start=None,
@@ -56,11 +54,6 @@ async def test_invalid_cursor_is_the_standard_400_error(monkeypatch) -> None:
     from app.api.routes import events
     from app.services.event_tail_service import EventCursorError
 
-    monkeypatch.setattr(
-        events,
-        "check_vault_access",
-        AsyncMock(return_value={"vault_id": UUID("11111111-1111-4111-8111-111111111111")}),
-    )
     monkeypatch.setattr(
         events.event_tail_service,
         "open_tail",
@@ -108,6 +101,11 @@ async def test_open_tail_preflights_retention_gap_before_returning_stream(monkey
         return _Pool()
 
     monkeypatch.setattr(event_tail_service, "get_pool", get_pool)
+    monkeypatch.setattr(
+        event_tail_service,
+        "check_vault_access",
+        AsyncMock(return_value={"vault_id": UUID("11111111-1111-4111-8111-111111111111")}),
+    )
     codec = event_tail_service.EventCursorCodec("cursor-secret")
 
     with pytest.raises(event_tail_service.EventGapError) as exc_info:
@@ -115,7 +113,6 @@ async def test_open_tail_preflights_retention_gap_before_returning_stream(monkey
             MagicMock(),
             user_id="user",
             vault="vault",
-            vault_id=UUID("11111111-1111-4111-8111-111111111111"),
             last_event_id=None,
             cursor=codec.encode(UUID("11111111-1111-4111-8111-111111111111"), (), 8),
             start=None,
@@ -188,7 +185,6 @@ def tail(monkeypatch):
             request,
             user_id=user_id,
             vault="vault",
-            vault_id=UUID("11111111-1111-4111-8111-111111111111"),
             last_event_id=None,
             cursor=None,
             start=None,
@@ -196,6 +192,78 @@ def tail(monkeypatch):
         )
 
     return types.SimpleNamespace(service=event_tail_service, hub=hub, open=open_stream)
+
+
+_VAULT_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
+@pytest.mark.asyncio
+async def test_open_tail_checks_access_before_the_bounds_read_on_one_budgeted_connection(tail, monkeypatch) -> None:
+    calls: list[tuple[str, object]] = []
+    pools: list[_BoundsPool] = []
+
+    class _RecordingPool(_BoundsPool):
+        async def fetchrow(self, *args):
+            calls.append(("bounds", self))
+            return await super().fetchrow(*args)
+
+    async def get_pool():
+        pool = _RecordingPool()
+        pools.append(pool)
+        return pool
+
+    async def access(_user_id, _vault, *, required_role, _conn):
+        assert required_role == "reader"
+        calls.append(("access", _conn))
+        return {"vault_id": _VAULT_ID}
+
+    monkeypatch.setattr(tail.service, "get_pool", get_pool)
+    monkeypatch.setattr(tail.service, "check_vault_access", access)
+
+    response = await tail.open()
+
+    # Access first, then the Vault's range, both on the one connection the
+    # budget lent; nothing else was borrowed.
+    assert [name for name, _ in calls] == ["access", "bounds"]
+    assert calls[0][1] is calls[1][1] is pools[0]
+    assert len(pools) == 1
+    del response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refused_by", ["process-cap", "account-quota"])
+@pytest.mark.parametrize(("denial", "status"), [("forbidden", 403), ("unknown-vault", 404)])
+async def test_a_caller_without_access_hears_so_before_any_capacity_refusal(
+    tail,
+    monkeypatch,
+    refused_by: str,
+    denial: str,
+    status: int,
+) -> None:
+    """The route always answered 403 or 404 before 429 or 503, and still does.
+
+    A refused request is checked too, within the budget, so a client that has
+    no access is told that, which it does not retry, rather than a 503 it would.
+    """
+    from app.exceptions import AKBError, ForbiddenError, NotFoundError
+
+    if refused_by == "process-cap":
+        monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS", "1")
+        kept = await tail.open(user_id="other-account")
+    else:
+        monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS_PER_USER", "1")
+        kept = await tail.open(user_id="account")
+    access = tail.service.check_vault_access
+    access.side_effect = ForbiddenError("no access") if denial == "forbidden" else NotFoundError("Vault", "vault")
+
+    with pytest.raises(AKBError) as exc_info:
+        await tail.open(user_id="account")
+
+    assert exc_info.value.status_code == status
+    # The refused request was checked on a budgeted connection and took no slot.
+    assert access.await_args.kwargs["_conn"] is not None
+    assert tail.service.open_stream_count() == 1
+    del kept
 
 
 @pytest.mark.asyncio
@@ -275,7 +343,6 @@ async def test_a_failed_preflight_gives_its_slot_back(tail, monkeypatch) -> None
             MagicMock(),
             user_id="user",
             vault="vault",
-            vault_id=UUID("11111111-1111-4111-8111-111111111111"),
             last_event_id=None,
             cursor=codec.encode(UUID("11111111-1111-4111-8111-111111111111"), (), 8),
             start=None,
@@ -286,7 +353,6 @@ async def test_a_failed_preflight_gives_its_slot_back(tail, monkeypatch) -> None
             MagicMock(),
             user_id="user",
             vault="vault",
-            vault_id=UUID("11111111-1111-4111-8111-111111111111"),
             last_event_id=None,
             cursor=None,
             start=None,
@@ -378,7 +444,6 @@ async def test_an_account_gets_its_quota_back_however_its_streams_end(tail, monk
             MagicMock(),
             user_id="account",
             vault="vault",
-            vault_id=UUID("11111111-1111-4111-8111-111111111111"),
             last_event_id=None,
             cursor="not-a-cursor",
             start=None,
