@@ -99,6 +99,32 @@ def _terminate_search_connection(conn) -> None:
         pass
 
 
+async def _return_health_connection(pool: asyncpg.Pool, conn) -> None:
+    """Return the health check's connection, bounded by `_HEALTH_RETURN_TIMEOUT_SECS`.
+
+    A cancellation neither cuts the return short nor ends the check before it.
+    asyncpg keeps returning the connection after a cancellation, so the check
+    keeps running until the return ends and reports the cancellation only
+    then: whoever cancelled the check still sees it holding a pool slot, and
+    does not start another check that would borrow a second one meanwhile.
+    """
+    returning = asyncio.create_task(pool.release(conn, timeout=_HEALTH_RETURN_TIMEOUT_SECS))
+    try:
+        await asyncio.wait({returning})
+    except asyncio.CancelledError:
+        returning.add_done_callback(_retrieve_return_outcome)
+        await asyncio.wait({returning})
+        raise
+    returning.result()
+
+
+def _retrieve_return_outcome(returning: asyncio.Task) -> None:
+    # The cancelled check reports its cancellation. A failed return has already
+    # had asyncpg terminate the connection; its error is retrieved here.
+    if not returning.cancelled():
+        returning.exception()
+
+
 async def _stop_search_tasks(tasks, connections, *, cleanup_deadline: float, terminated: set[str]) -> None:
     """Wait for cancellation/reset, then discard connections that cannot settle.
 
@@ -860,7 +886,9 @@ class PgvectorStore:
         returning the connection after a cancellation and terminates it itself
         if the return outlasts the bound. Terminating it from here mid-return
         would free the slot for another caller while that return still runs,
-        and the return would then release the other caller's connection.
+        and the return would then release the other caller's connection. A
+        check cancelled mid-return keeps running until the return ends
+        (`_return_health_connection`).
         """
         if conn is not None:
             await conn.fetchval("SELECT 1")
@@ -873,7 +901,7 @@ class PgvectorStore:
             except BaseException:
                 _terminate_search_connection(borrowed)
                 raise
-            await pool.release(borrowed, timeout=_HEALTH_RETURN_TIMEOUT_SECS)
+            await _return_health_connection(pool, borrowed)
             return True
         except Exception:  # noqa: BLE001
             return False

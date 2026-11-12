@@ -131,7 +131,9 @@ specifically; the proxy has its own log in
   connection, which a failed check discards as a failed ping does. pgvector's
   health check also terminates a borrowed connection whose query fails or is
   cut off, instead of holding its pool slot, and bounds the return of one
-  whose query answered.
+  whose query answered. A check given up on during that return stays
+  outstanding until the return ends, so the next probe does not start a
+  second one.
 - When the request pool shows nothing that proves it could serve a request (no
   idle connection, room to open one, and no acquire within the grace),
   readiness takes one connection through it within the probe's remaining

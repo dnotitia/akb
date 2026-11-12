@@ -783,7 +783,8 @@ async def _evaluate_readiness() -> tuple[bool, dict]:
 
 # The vector check in flight, if any. At most one is outstanding: a probe that
 # finds the previous one still running waits for it, or, once a probe has given
-# up on it, reports the timeout at once instead of starting another.
+# up on it, reports the timeout at once instead of starting another. A check
+# given up on while returning its connection runs until that return ends.
 _vector_check: asyncio.Task | None = None
 
 

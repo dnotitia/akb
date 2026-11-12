@@ -767,20 +767,39 @@ async def test_pgvector_health_cut_off_mid_query_terminates_the_connection_it_bo
 
 async def test_pgvector_health_cut_off_while_returning_leaves_the_bounded_return_to_the_pool():
     # Terminating mid-return could free the slot for another caller while the
-    # return still runs; the return is bounded instead.
+    # return still runs; the return is bounded instead. The check keeps running
+    # until the return ends, so whoever cancelled it can see it still holds a
+    # pool slot.
     from app.services.vector_store import pgvector
 
+    returned = asyncio.Event()
+
+    async def release(*_args, **_kwargs) -> None:
+        await returned.wait()
+
     conn = SimpleNamespace(fetchval=AsyncMock(return_value=1), terminate=MagicMock())
-    pool = SimpleNamespace(acquire=AsyncMock(return_value=conn), release=AsyncMock(side_effect=_hang))
+    pool = SimpleNamespace(acquire=AsyncMock(return_value=conn), release=AsyncMock(side_effect=release))
     check = asyncio.create_task(_pgvector(pool).health())
     await asyncio.sleep(0.01)
 
     check.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await check
+    await asyncio.sleep(0.05)
+    assert not check.done()
 
+    returned.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(check, timeout=1)
     conn.terminate.assert_not_called()
     pool.release.assert_awaited_once_with(conn, timeout=pgvector._HEALTH_RETURN_TIMEOUT_SECS)
+
+
+async def test_pgvector_health_whose_return_fails_answers_false():
+    # asyncpg has terminated the connection by the time its return fails.
+    conn = SimpleNamespace(fetchval=AsyncMock(return_value=1), terminate=MagicMock())
+    pool = SimpleNamespace(acquire=AsyncMock(return_value=conn), release=AsyncMock(side_effect=TimeoutError()))
+
+    assert await _pgvector(pool).health() is False
+    conn.terminate.assert_not_called()
 
 
 async def test_vector_check_of_a_store_on_the_main_database_runs_on_the_probe_connection(main, probe, monkeypatch):

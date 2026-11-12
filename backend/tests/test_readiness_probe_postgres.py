@@ -793,6 +793,54 @@ async def test_cut_off_vector_check_never_returns_a_later_borrowers_connection(m
     assert answer == 1
 
 
+async def test_next_probe_borrows_nothing_while_a_given_up_vector_check_is_still_returning(monkeypatch, tmp_path):
+    # pgvector with a database of its own. The check's query answers, then
+    # returning its connection waits on a slow reset, and readiness gives the
+    # check up meanwhile. Until that return ends, the next probe reports the
+    # timeout at once instead of starting a second check on another connection.
+    reset_may_finish = asyncio.Event()
+
+    async def slow_reset(conn) -> None:
+        await reset_may_finish.wait()
+        await conn.reset()
+
+    own_pool = None
+    try:
+        async with _ready_database(monkeypatch, tmp_path) as db:
+            main = db.main
+            own_dsn = _settings(db.name).asyncpg_dsn
+            store = _pgvector_store(dsn=own_dsn)
+            own_pool = await asyncpg.create_pool(dsn=own_dsn, min_size=1, max_size=2, reset=slow_reset)
+            store._own_pool = own_pool
+            monkeypatch.setattr(main, "get_vector_store", lambda: store)
+            monkeypatch.setattr(main, "_READY_VECTOR_TIMEOUT_SECONDS", _GRACE)
+
+            started = time.monotonic()
+            first = await db.client.get("/readyz")
+            first_elapsed = time.monotonic() - started
+            main._ready_state.ts -= 31  # past the success cache
+            started = time.monotonic()
+            second = await db.client.get("/readyz")
+            second_elapsed = time.monotonic() - started
+            calls, held = store.calls, _connections_held(own_pool)
+            reset_may_finish.set()
+            given_up = main._vector_check
+            await asyncio.wait({given_up}, timeout=_HEALTH_RETURN_BOUND + 1.0)
+            await _until_nothing_held(own_pool)
+    finally:
+        reset_may_finish.set()
+        if own_pool is not None:
+            own_pool.terminate()
+
+    assert first.status_code == 200, first.text
+    assert first.json()["detail"]["vector_store"] == "degraded:timeout"
+    assert first_elapsed < _GRACE + 1.0
+    assert second.status_code == 200, second.text
+    assert second.json()["detail"]["vector_store"] == "degraded:timeout"
+    assert (calls, held) == (1, 1)
+    assert second_elapsed < 1.0
+
+
 async def test_request_acquire_completing_before_the_probe_waits_is_not_lost(ready_db, monkeypatch):
     # The pool's only holder is still opening a request's connection when the
     # probe decides to check the pool. That connection becomes available the

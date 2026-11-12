@@ -98,7 +98,9 @@ answered, returning the connection is bounded to 2 seconds rather than cut
 short: asyncpg finishes the return or terminates the connection itself, so the
 slot never goes to another caller while that return still runs. At most one vector
 check is outstanding: while one that was given up on is still finishing, later
-probes report `degraded:timeout` at once instead of starting another. One
+probes report `degraded:timeout` at once instead of starting another. A check
+given up on while returning its connection is still finishing until that
+return ends, so it never holds a second connection of its pool. One
 evaluation therefore ends within about 7 seconds, inside kubelet's 8-second
 probe timeout. Callers can wait for the shared readiness lock, but they wait for
 the evaluation already running, not for one each. Every
