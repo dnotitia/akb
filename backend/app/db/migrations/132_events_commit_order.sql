@@ -10,19 +10,25 @@
 --
 -- The lock is a row lock on a table that no SQL role is granted, rather than
 -- an advisory lock: any role may take any advisory lock, so a statement could
--- otherwise hold a Vault's key and stall that Vault's writes. A Vault's row
--- is created by its first event.
+-- otherwise hold a Vault's key and stall that Vault's writes. Every Vault has
+-- its row from the start: a trigger on `vaults` inserts the row with the Vault
+-- and deletes it with the Vault, and the migration inserts the rows of the
+-- Vaults that exist. An event of a Vault that has no row, such as one deleted
+-- meanwhile, inserts the row.
 --
--- An insert waits at most 5 seconds in total for the Vault's earlier
--- event-writing transactions. `akb_lock_vault_events` polls the row with
--- `FOR UPDATE SKIP LOCKED` against one deadline; `lock_timeout` would apply
--- to each lock wait separately, and a waiter queued behind another waiter
--- waits twice. Past the deadline it fails with SQLSTATE 55P03 and its
--- transaction rolls back; the API reports a retryable `write_busy`. Polling
--- gives up first-come order among waiters, and a lock cycle through the Vault
--- row ends at the deadline rather than by deadlock detection. The function is
--- also called before a bare Git write commits to Git, so the lock is held
--- before the commit; the trigger then finds it already held.
+-- A transaction waits at most 5 seconds in total for a Vault's lock.
+-- `akb_lock_vault_events` polls the row with `FOR UPDATE SKIP LOCKED` against
+-- one deadline. When there is no row it inserts one, waiting at most 20
+-- milliseconds at a time for a concurrent inserter and checking the deadline
+-- between attempts: `lock_timeout` applies to each lock wait on its own, and
+-- one statement can wait more than once. A lock taken after the deadline
+-- counts as not taken. Past the deadline the function fails with SQLSTATE
+-- 55P03 and the constraint name `akb_event_lock_timeout`; that error alone is
+-- reported by the API as a retryable `write_busy`, and its transaction rolls
+-- back. Polling gives up first-come order among waiters, and a lock cycle
+-- through a Vault's row ends at the deadline rather than by deadlock detection.
+-- A Bare Git write calls the function before it commits to Git, so the lock is
+-- held before the commit; the trigger then finds it already held.
 --
 -- The trigger draws every id. The column keeps no default, because defaults
 -- are evaluated before BEFORE triggers and a default would spend a second
@@ -36,37 +42,76 @@ CREATE TABLE IF NOT EXISTS public.vault_event_order (
     vault_id UUID PRIMARY KEY
 );
 
+CREATE OR REPLACE FUNCTION public.akb_vault_event_order_row()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $function$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO public.vault_event_order (vault_id) VALUES (NEW.id)
+            ON CONFLICT (vault_id) DO NOTHING;
+    ELSE
+        DELETE FROM public.vault_event_order WHERE vault_id = OLD.id;
+    END IF;
+    RETURN NULL;
+END
+$function$;
+
+DROP TRIGGER IF EXISTS akb_vault_event_order_trigger ON public.vaults;
+CREATE TRIGGER akb_vault_event_order_trigger
+    AFTER INSERT OR DELETE ON public.vaults
+    FOR EACH ROW EXECUTE FUNCTION public.akb_vault_event_order_row();
+
+-- After the trigger: creating it waits for Vault inserts in progress and holds
+-- new ones off until the migration commits, so this reads every Vault.
+INSERT INTO public.vault_event_order (vault_id)
+SELECT id FROM public.vaults
+ON CONFLICT (vault_id) DO NOTHING;
+
 CREATE OR REPLACE FUNCTION public.akb_lock_vault_events(target UUID)
 RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, public
--- Bounds the one wait outside the polling loop: a concurrent first event of
--- the same Vault that inserted the row and has not committed yet.
+-- The insert below shortens it per attempt; this clause restores the
+-- caller's value when the function returns.
 SET lock_timeout = '5s'
 AS $function$
 DECLARE
     deadline timestamptz := clock_timestamp() + interval '5 seconds';
     pause float8 := 0.002;
+    acquired boolean;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM public.vault_event_order WHERE vault_id = target) THEN
-        INSERT INTO public.vault_event_order (vault_id) VALUES (target)
-            ON CONFLICT (vault_id) DO NOTHING;
-    END IF;
     LOOP
-        -- A row this transaction already locked is not skipped.
+        -- A row this transaction already locked or inserted is not skipped.
         PERFORM 1 FROM public.vault_event_order
          WHERE vault_id = target
            FOR UPDATE SKIP LOCKED;
-        IF FOUND THEN
-            RETURN;
+        acquired := FOUND;
+        EXIT WHEN acquired OR clock_timestamp() >= deadline;
+        IF EXISTS (SELECT 1 FROM public.vault_event_order WHERE vault_id = target) THEN
+            PERFORM pg_sleep(pause);
+            pause := least(pause * 2, 0.02);
+        ELSE
+            -- No committed row: insert it. Another transaction that inserted it
+            -- and has not ended is waited for at most 20 ms per attempt.
+            PERFORM set_config(
+                'lock_timeout',
+                greatest(1, least(20, ceil(extract(epoch FROM deadline - clock_timestamp()) * 1000)))::int || 'ms',
+                true
+            );
+            BEGIN
+                INSERT INTO public.vault_event_order (vault_id) VALUES (target)
+                    ON CONFLICT (vault_id) DO NOTHING;
+            EXCEPTION WHEN lock_not_available THEN
+                NULL;
+            END;
         END IF;
-        IF clock_timestamp() >= deadline THEN
-            RAISE EXCEPTION 'events of Vault % have been locked by another transaction for 5 seconds', target
-                USING ERRCODE = 'lock_not_available';
-        END IF;
-        PERFORM pg_sleep(pause);
-        pause := least(pause * 2, 0.02);
     END LOOP;
+    IF NOT acquired OR clock_timestamp() > deadline THEN
+        RAISE EXCEPTION 'events of Vault % have been locked by another transaction for 5 seconds', target
+            USING ERRCODE = 'lock_not_available', CONSTRAINT = 'akb_event_lock_timeout';
+    END IF;
 END
 $function$;
 

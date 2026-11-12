@@ -144,6 +144,9 @@ async def _undo_migration_132(conn: asyncpg.Connection) -> None:
     """Return the database to its shape before migration 132."""
     await conn.execute("DROP TRIGGER IF EXISTS akb_events_commit_order_trigger ON events")
     await conn.execute("DROP FUNCTION IF EXISTS akb_events_commit_order()")
+    await conn.execute("DROP FUNCTION IF EXISTS akb_lock_vault_events(uuid)")
+    await conn.execute("DROP TRIGGER IF EXISTS akb_vault_event_order_trigger ON vaults")
+    await conn.execute("DROP FUNCTION IF EXISTS akb_vault_event_order_row()")
     await conn.execute("DROP TABLE IF EXISTS vault_event_order")
     await conn.execute("DROP TABLE IF EXISTS events_row_change_queue")
     await conn.execute("DROP FUNCTION IF EXISTS akb_events_row_change_flush()")
@@ -456,6 +459,98 @@ async def test_a_waiter_behind_another_waiter_gives_up_at_the_same_deadline():
         )
 
 
+async def test_a_vault_has_its_lock_row_from_creation_to_deletion():
+    async with _fresh_database() as pool:
+        vault_id = await _make_vault(pool, "order-row-lifecycle")
+        assert await pool.fetchval(
+            "SELECT count(*) FROM vault_event_order WHERE vault_id = $1", vault_id,
+        ) == 1
+        await pool.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+        assert await pool.fetchval(
+            "SELECT count(*) FROM vault_event_order WHERE vault_id = $1", vault_id,
+        ) == 0
+
+
+async def _emit_and_hold(
+    conn: asyncpg.Connection, vault_id: uuid.UUID, marker: str, release: asyncio.Event,
+) -> tuple[str, float]:
+    """Emit in a transaction that stays open until ``release``; report how it
+    ended and the seconds until the emit returned or failed."""
+    started = time.monotonic()
+    try:
+        async with conn.transaction():
+            await _emit(conn, vault_id, marker)
+            took = time.monotonic() - started
+            await release.wait()
+        return "committed", took
+    except asyncpg.LockNotAvailableError as exc:
+        return f"gave up ({exc.constraint_name})", time.monotonic() - started
+
+
+async def _without_lock_row(pool: asyncpg.Pool, name: str) -> uuid.UUID:
+    """A Vault whose lock row is missing, as for a Vault deleted meanwhile."""
+    vault_id = await _make_vault(pool, name)
+    await pool.execute("DELETE FROM vault_event_order WHERE vault_id = $1", vault_id)
+    return vault_id
+
+
+async def test_creating_a_missing_lock_row_waits_within_the_same_deadline():
+    """The first inserter of a missing row rolls back, a second waiter inserts
+    the row and holds it, and the third waiter still gives up 5 seconds after
+    it started. A per-wait `lock_timeout` would let it wait 5 more seconds for
+    the second one."""
+    async with _fresh_database() as pool:
+        vault_id = await _without_lock_row(pool, "order-first-row")
+        release = asyncio.Event()
+        async with (
+            pool.acquire() as first,
+            pool.acquire() as second,
+            pool.acquire() as third,
+        ):
+            async with _OpenTransaction(first):
+                await _emit(first, vault_id, "first")
+                waiters = [
+                    asyncio.create_task(_emit_and_hold(conn, vault_id, marker, release))
+                    for conn, marker in ((second, "second"), (third, "third"))
+                ]
+                await asyncio.sleep(3)
+            # `first` rolled back; one waiter inserts the row and holds it.
+            try:
+                done, _ = await asyncio.wait(
+                    waiters, timeout=_EVENT_LOCK_WAIT_SECONDS * 3, return_when=asyncio.FIRST_COMPLETED,
+                )
+                assert done, "neither waiter finished"
+                gave_up = done.pop().result()
+            finally:
+                release.set()
+            outcomes = sorted([await waiter for waiter in waiters])
+        assert gave_up[1] <= _EVENT_LOCK_WAIT_SECONDS + 0.5, f"the third waiter waited {gave_up[1]:.2f}s"
+        assert gave_up[0] == "gave up (akb_event_lock_timeout)"
+        assert [outcome for outcome, _ in outcomes] == ["committed", "gave up (akb_event_lock_timeout)"]
+
+
+async def test_releasing_a_savepoint_does_not_extend_the_wait_for_a_missing_row():
+    """A waiter for a row inserted in a savepoint waits for the savepoint and,
+    once it is released, for the transaction; the two waits share one
+    deadline."""
+    async with _fresh_database() as pool:
+        vault_id = await _without_lock_row(pool, "order-savepoint-row")
+        release = asyncio.Event()
+        async with pool.acquire() as holder, pool.acquire() as waiter:
+            async with _OpenTransaction(holder):
+                async with holder.transaction():
+                    await _emit(holder, vault_id, "in a savepoint")
+                    waiting = asyncio.create_task(_emit_and_hold(waiter, vault_id, "waiter", release))
+                    await asyncio.sleep(3)
+                # The savepoint is released; the row belongs to the open transaction.
+                try:
+                    outcome, waited = await asyncio.wait_for(waiting, timeout=_EVENT_LOCK_WAIT_SECONDS * 3)
+                finally:
+                    release.set()
+        assert waited <= _EVENT_LOCK_WAIT_SECONDS + 0.5, f"the waiter waited {waited:.2f}s"
+        assert outcome == "gave up (akb_event_lock_timeout)"
+
+
 async def test_events_of_different_vaults_do_not_wait_for_each_other():
     async with _fresh_database() as pool:
         first_vault = await _make_vault(pool, "order-vault-a")
@@ -624,6 +719,11 @@ async def test_migration_upgrades_a_database_with_existing_events():
                 "SELECT column_default FROM information_schema.columns "
                 "WHERE table_name = 'events' AND column_name = 'id'",
             ) is None
+            # Every existing Vault has its lock row.
+            assert await conn.fetchval(
+                "SELECT count(*) FROM vaults v "
+                "WHERE NOT EXISTS (SELECT 1 FROM vault_event_order o WHERE o.vault_id = v.id)",
+            ) == 0
 
             # Dynamic tables' row changes now go through the commit-time queue.
             assert "events_row_change_queue" in await conn.fetchval(
