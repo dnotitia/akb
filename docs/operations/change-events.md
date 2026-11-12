@@ -118,7 +118,10 @@ and then their document, the order in which a recursive collection delete
 takes them, then the edges a move or delete changes after the commit (an update
 or edit rewrites its document's implicit edges at this point instead of after
 the commit), then take the Vault's lock, and only then commit to Git; a busy
-Vault fails them before Git changes. They hold the Vault's lock through
+Vault fails them before Git changes. Every transaction that locks several
+collections, a move or a recursive collection delete, locks them in id order.
+A write that finds its document moved after locking it rolls back to a
+savepoint, releasing the collection and the document, before it tries again. They hold the Vault's lock through
 the Git work and their remaining database writes up to their commit, and a Git
 command may run for up to 30 seconds (`git_write_timeout_secs`). In a Bare Git
 installation the other writes of a Vault therefore also wait for a document
@@ -236,10 +239,11 @@ settings changes, table migrations (enum value renames included) and app
 rollouts insert their events last, so a writer of the same Vault does not wait
 behind them while they still take other locks; that a Bare Git document write
 on a busy Vault fails before its Git commit, waits for a concurrent collection
-create, collection delete or table drop before it takes the Vault's lock, and
-leaves Git and the database in agreement when a role's `lock_timeout` ends it;
-and that only the lock's own deadline is reported as `write_busy`, over REST
-and MCP.
+create, collection delete or table drop before it takes the Vault's lock, takes
+collections in the same order as a recursive collection delete, and leaves Git
+and the database in agreement when a role's `lock_timeout` ends it; and that
+only the lock's own deadline is reported as `write_busy`, over REST and MCP,
+also when it fails a dynamic-table write at commit.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native

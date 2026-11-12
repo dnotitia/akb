@@ -26,7 +26,9 @@ specifically; the proxy has its own log in
   recursive collection delete), then the edges they change (an update or edit
   rewrites its implicit edges here), then the Vault's lock, then commit to
   Git, so a busy Vault fails them before Git changes; they hold the lock
-  through the Git work. A
+  through the Git work. Moves and recursive collection deletes lock several
+  collections in id order, and a write whose document moved meanwhile
+  retries from a released savepoint. A
   transaction waits at most 5 seconds in total for its Vault, also when the
   Vault's lock row has to be created; every Vault gets its row when it is
   created (and existing Vaults in the migration) and loses it when it is
