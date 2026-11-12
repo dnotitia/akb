@@ -100,33 +100,35 @@ delivery rather than dropping it.
 Opening a tail first decides admission, which reads nothing. It then checks
 the caller's access and reads the Vault's retained range on one connection,
 before any event is read. The tail's first frame is a checkpoint at its
-starting position, built on that access check and sent before anything else,
-so a client that brought no cursor holds one from the start; store it like any
-other cursor. If the preflight outlasts the second that check covers, access
-is checked again before the response starts; if the checks stay slow, the open
-fails with a retryable 503 `event_tail_unavailable` rather than starting a
-tail that cannot send its first frame. If sending the response's start then
-takes longer than that second, access is checked again before the checkpoint,
-with no heartbeat ahead of it: a revoked reader, or checks that stay slow,
-three in a row, end the response with no frame. That is the one case in which
-a reader who still has access gets an empty 200: it needs a response start
-slower than a second and access checks slower than a second as well. A client
-that brought no cursor then reconnects without one and starts after the newest
-event, so an event committed in between can be missed.
+starting position, built on that access check, so a client that brought no
+cursor holds one from the start; store it like any other cursor. The
+checkpoint is part of the response to the authorized open request: it carries
+no event, only the position the server computed while that check held, so,
+like any response computed under authorization and delivered afterwards, it
+is sent first however long the server takes to start the response, and it is
+not checked again. If the preflight outlasts the second the check covers,
+access is checked again before the response starts; if the checks stay slow,
+the open fails with a retryable 503 `event_tail_unavailable`. A started tail
+therefore never ends without its checkpoint.
 
-A waiting tail holds no pooled connection. To read, it borrows one for the
-batch and, when the batch has rows, checks the reader's access on that same
-connection before sending any of them. A pass that finds nothing checks
-nothing, unless a heartbeat went out since the last check: then it checks.
-Each heartbeat that goes out while a pass runs, after its check, calls for one
-more check before the tail waits. Before each frame, a check that
-started more than a second earlier is repeated, and so is a check that itself
-took longer than that to finish. A tail whose checks keep taking that long,
-the first check of a batch included, ends after three in a row with no further
-frame, and its client resumes from the last cursor it received. Heartbeats
-keep their 15-second interval while a batch is read or access is checked. A
-revoked reader stops receiving events within about a second and gets no
-further frame, and an idle tail closes within one heartbeat.
+Revocation is enforced from the first event on. A waiting tail holds no pooled
+connection. To read, it borrows one for the batch and, when the batch has
+rows, checks the reader's access on that same connection before sending any
+of them, so a reader revoked while the response started gets the checkpoint
+and no event. A pass that finds nothing checks nothing, unless a heartbeat
+went out since the last check: then it checks. Each heartbeat that goes out
+while a pass runs, after its check, calls for one more check before the tail
+waits. Before each frame, a check that started more than a second earlier is
+repeated, and so is a check that itself took longer than that to finish. A
+check that a transient database fault, such as a lost connection, keeps from
+being made shows nothing about access and counts the same way. A tail whose
+checks keep taking that long or failing, the first check of a batch included,
+ends after three in a row with no further frame, and its client resumes from
+the last cursor it received, its start checkpoint at least. An idle tail whose
+check fails tries again after the next heartbeat. Heartbeats keep their
+15-second interval while a batch is read or access is checked. A revoked
+reader stops receiving events within about a second and gets no further
+frame, and an idle tail closes within one heartbeat.
 
 A cursor is refused with 410 `event_gap` only when an event it never received
 was deleted. A trigger on `events` records, per Vault, the highest event id

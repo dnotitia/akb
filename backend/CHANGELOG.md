@@ -21,14 +21,15 @@ specifically; the proxy has its own log in
   no longer exhaust the pool and fail readiness; a caller without access still
   gets 403 or 404 before any capacity error. An access check that took longer
   than a second is repeated before the next event, with heartbeats in the
-  meantime. A tail whose checks keep taking that long ends after three in a
-  row, the first check of a batch included, with no further frame. Every tail
-  now starts with a checkpoint at its starting position, built on the access
-  check that opened it and sent before anything else, so a client that brought
-  no cursor still has one to resume from; when access cannot be confirmed in
-  time to send it, the open fails with a retryable 503
-  `event_tail_unavailable`, and when sending the response's start outlasts
-  the check, access is checked again before the checkpoint goes out.
+  meantime. A tail whose checks keep taking that long, or keep failing on a
+  transient database fault, ends after three in a row, the first check of a
+  batch included, with no further frame. Every tail now starts with a
+  checkpoint at its starting position, part of the response to the authorized
+  open: built on the access check that opened it and sent before anything
+  else, so a client that brought no cursor still has one to resume from. When
+  access cannot be confirmed in time to build it, the open fails with a
+  retryable 503 `event_tail_unavailable`; once the response has started, the
+  checkpoint is always sent, and access is enforced from the first event on.
   Heartbeats also keep their interval while a batch is read, and each
   heartbeat sent during an empty read is followed by an access check before
   the tail waits again. A cursor is refused with 410 `event_gap` only when an

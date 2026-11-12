@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import datetime, timezone
 import gc
 import json
 import types
@@ -354,37 +355,59 @@ async def test_an_open_whose_renewed_check_fails_starts_no_stream(tail, monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("renewal", "checks"), [("granted", 2), ("revoked", 2), ("slow", 3)])
-async def test_a_response_start_that_outlasts_the_check_is_checked_again_before_the_checkpoint(
-    tail, monkeypatch, renewal: str, checks: int
+@pytest.mark.parametrize(("later_check", "checks"), [("granted", 2), ("revoked", 2), ("unreachable", 4)])
+async def test_the_checkpoint_goes_first_however_long_the_response_start_takes(
+    tail, monkeypatch, later_check: str, checks: int
 ) -> None:
-    """The server sends the response's start before the body, and that can take a while.
+    """The start checkpoint is part of the response to the authorized open.
 
-    The stream used to send its prebuilt checkpoint however long it took, so a
-    reader whose access was revoked meanwhile still received one. Now the
-    stream checks again first: a passed check sends the checkpoint, while a
-    revoked reader, or checks that stay slow, end the body with nothing sent.
+    It carries no event, only the position the open computed under its
+    check, so it goes out first however long the server takes to send the
+    response's start. Access is checked before the first event: a reader
+    revoked meanwhile gets the checkpoint and no event, and when a database
+    fault keeps three checks in a row from being made the body ends before
+    the event. The stream used to check again before the checkpoint after a
+    slow start, and a check that failed or stayed slow ended the body with
+    no frame, leaving a client that brought no cursor without one.
     """
     from app.exceptions import ForbiddenError
 
     window = 0.05
     monkeypatch.setattr(tail.service, "_RECHECK_DURING_YIELD_SECONDS", window)
     calls = 0
+    reads = 0
 
     async def access(*_args, _conn, **_kwargs):
         nonlocal calls
         calls += 1
         if calls > 1:
-            if renewal == "revoked":
+            if later_check == "revoked":
                 raise ForbiddenError("revoked")
-            if renewal == "slow":
-                await asyncio.sleep(window * 2)
+            if later_check == "unreachable":
+                raise ConnectionResetError("connection reset by peer")
         return {"vault_id": _VAULT_ID}
 
+    async def one_event(_conn, _vault_id, *, after_id, limit):
+        nonlocal reads
+        reads += 1
+        if reads > 1:
+            return []
+        return [
+            {
+                "id": after_id + 1,
+                "occurred_at": datetime(2026, 8, 28, 8, 0, tzinfo=timezone.utc),
+                "kind": "document.put",
+                "resource_uri": None,
+                "actor_id": "alice",
+                "payload": {},
+            }
+        ]
+
     monkeypatch.setattr(tail.service, "check_vault_access", access)
+    monkeypatch.setattr(tail.service, "list_vault_events", one_event)
     response = await tail.open()
     bodies: list[bytes] = []
-    checkpoint_sent = asyncio.Event()
+    event_sent = asyncio.Event()
 
     async def receive():
         raise AssertionError("an ASGI 2.4 server reports a disconnect as a failed send")
@@ -395,25 +418,26 @@ async def test_a_response_start_that_outlasts_the_check_is_checked_again_before_
             await asyncio.sleep(window * 3)
         elif message["type"] == "http.response.body":
             bodies.append(message["body"])
-            if message["body"].startswith(b"event: checkpoint\n"):
-                checkpoint_sent.set()
+            if message["body"].startswith(b"event: change\n"):
+                event_sent.set()
 
     responding = asyncio.create_task(response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send))
-    checkpoint = asyncio.create_task(checkpoint_sent.wait())
+    event = asyncio.create_task(event_sent.wait())
     try:
-        # Until the body ends or a checkpoint goes out.
-        await asyncio.wait({responding, checkpoint}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
+        # Until the body ends or an event goes out.
+        await asyncio.wait({responding, event}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        for task in (responding, checkpoint):
+        for task in (responding, event):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    if renewal == "granted":
-        assert bodies and bodies[0].startswith(b"event: checkpoint\n")
+    assert bodies and bodies[0].startswith(b"event: checkpoint\n"), f"sent {bodies!r}"
+    if later_check == "granted":
+        assert bodies[1].startswith(b"event: change\n")
     else:
-        # The body ends without a frame.
-        assert bodies == [b""], f"sent {bodies!r}"
+        # No event reached the reader: the body ended after the checkpoint.
+        assert bodies[1:] == [b""], f"sent {bodies!r}"
     assert calls == checks
     assert tail.service.open_stream_count() == 0
 

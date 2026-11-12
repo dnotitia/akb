@@ -32,6 +32,7 @@ from starlette.responses import StreamingResponse
 
 from app.config import settings
 from app.db.postgres import get_pool
+from app.db.transient import transient_error
 from app.exceptions import AKBError
 from app.models.events import ChangeEventEnvelopeV1, TailCheckpointV1
 from app.repositories.events_repo import get_vault_event_bounds, list_vault_events
@@ -635,11 +636,12 @@ async def open_tail(
 
     The stream's first frame, a checkpoint at its start position, is built
     here, on that access check, so every client holds a cursor before
-    anything else is sent. If the preflight outlasted the window the check
-    covers, access is checked again here; if the checks stay slow, the
-    request fails with a retryable 503 `event_tail_unavailable` instead of
-    starting a stream that sends nothing. If sending the response's start
-    outlasts the window, the stream checks again before the checkpoint.
+    anything else is sent. It is part of the response to this authorized
+    request: it carries no event, only the position computed under the
+    check, and goes out first however long the response takes to start. If
+    the preflight outlasted the window the check covers, access is checked
+    again here; if the checks stay slow, the request fails with a retryable
+    503 `event_tail_unavailable`.
 
     The errors keep the order the route has always given them: 403, or 404
     for an unknown Vault, before 429 for an account at its quota and 503 for
@@ -720,6 +722,19 @@ class _AccessLost(Exception):
     """The stream's reader may no longer read its Vault; the stream ends quietly."""
 
 
+class _CheckFailed(Exception):
+    """An access check could not be made, as when the database connection was lost.
+
+    It shows nothing either way about access, so it counts as a slow check:
+    retried before a frame, up to _MAX_STALE_ACCESS_CHECKS in a row. ``rows``
+    are the rows its pass read, still to be sent.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[dict[str, Any]] = []
+
+
 async def _confirm_start(checked_at: float, *, user_id: str, vault: str, vault_id: UUID | str) -> float:
     """Keep an access check covering the start checkpoint; returns when that check started.
 
@@ -745,10 +760,17 @@ async def _confirm_start(checked_at: float, *, user_id: str, vault: str, vault_i
 
 
 async def _require_access(conn: Any, *, user_id: str, vault: str, vault_id: UUID | str) -> None:
-    """Check reader access on ``conn``, raising _AccessLost if it is gone."""
+    """Check reader access on ``conn``.
+
+    Raises _AccessLost when access is gone, and _CheckFailed when a transient
+    database fault kept the check from being made. Any other error counts as
+    access lost: the stream ends rather than send on a check it cannot read.
+    """
     try:
         access = await check_vault_access(user_id, vault, required_role="reader", _conn=conn)
     except Exception as exc:  # noqa: BLE001 - a revoked stream closes silently
+        if transient_error(exc) is not None:
+            raise _CheckFailed from exc
         raise _AccessLost from exc
     # A Vault deleted and created again under the same name is another Vault.
     if str(access.get("vault_id")) != str(vault_id):
@@ -768,15 +790,20 @@ async def _read_pass(
     The check runs after the read, so it covers every row read, and only when
     the batch has rows or ``check_when_empty`` asks for it: an empty pass costs
     one query. Returns the rows and the loop time the check started, or None
-    when no check ran; raises _AccessLost when the check fails. The connection
-    is back in the pool before the caller sends anything.
+    when no check ran; raises _AccessLost when access is gone, and _CheckFailed,
+    carrying the rows, when the check could not be made. The connection is
+    back in the pool before the caller sends anything.
     """
     async with _tail_db_connection() as conn:
         rows = await list_vault_events(conn, vault_id, after_id=after_id, limit=EVENT_BATCH_SIZE)
         if not rows and not check_when_empty:
             return rows, None
         checked_at = asyncio.get_running_loop().time()
-        await _require_access(conn, user_id=user_id, vault=vault, vault_id=vault_id)
+        try:
+            await _require_access(conn, user_id=user_id, vault=vault, vault_id=vault_id)
+        except _CheckFailed as failed:
+            failed.rows = rows
+            raise
     return rows, checked_at
 
 
@@ -870,10 +897,10 @@ async def _renew_access(
 
     Call when the current check started more than _RECHECK_DURING_YIELD_SECONDS
     ago. A check that expired before it covered a frame was itself slow, and so
-    is each re-check that outlasts the window. After _MAX_STALE_ACCESS_CHECKS
-    slow checks in a row, or when a check fails, raises _AccessLost: the stream
-    ends with no further frame, and its client resumes from the last cursor it
-    received, its start checkpoint at least.
+    is each re-check that outlasts the window or could not be made. After
+    _MAX_STALE_ACCESS_CHECKS slow checks in a row, or when access is gone,
+    raises _AccessLost: the stream ends with no further frame, and its client
+    resumes from the last cursor it received, its start checkpoint at least.
     """
     loop = asyncio.get_running_loop()
     slow_checks = 0 if clock.check_covered_a_frame else 1
@@ -883,7 +910,11 @@ async def _renew_access(
         async with contextlib.aclosing(_heartbeats_while(recheck, clock)) as heartbeats:
             async for heartbeat in heartbeats:
                 yield heartbeat
-        clock.checked_at = recheck.result()
+        try:
+            clock.checked_at = recheck.result()
+        except _CheckFailed:
+            slow_checks += 1
+            continue
         clock.check_covered_a_frame = False
         if loop.time() - clock.checked_at <= _RECHECK_DURING_YIELD_SECONDS:
             return
@@ -909,46 +940,35 @@ async def _stream_events(
     The first frame is ``start_frame``, the checkpoint at ``position`` that
     open_tail built on an access check started at ``checked_at`` (loop time),
     so every client holds a cursor to resume from whether or not it brought
-    one. It goes out before anything else, heartbeats included. The server
-    sends the response's start before it runs this stream; if that took long
-    enough for the check to expire, access is checked again first, by
-    _renew_access's rule but with no heartbeat, so a failed check, or
-    _MAX_STALE_ACCESS_CHECKS slow ones, end the stream with nothing sent.
+    one. It is part of the response to the authorized open request: it
+    carries no event, only the position computed under that check, so it
+    goes out first, before anything is awaited and however long the
+    response's start took, with no further check.
 
     Each pass borrows one pooled connection, within the database budget, to
     read the next batch and, when it found rows, to check access; the
-    connection goes back before any frame is sent. A pass that finds nothing
-    checks nothing, unless a heartbeat went out since the last check: then it
-    checks. Each heartbeat that goes out while a pass runs, after its check,
-    calls for one more check before the stream waits. A stream that receives
-    no rows therefore closes within one heartbeat of losing access. Heartbeats
-    keep their interval while a pass or a check runs.
+    connection goes back before any frame is sent. Every row is therefore
+    sent on a check made after it was read, so a reader whose access was
+    revoked while the response started gets the checkpoint and no event. A
+    pass that finds nothing checks nothing, unless a heartbeat went out since
+    the last check: then it checks. Each heartbeat that goes out while a pass
+    runs, after its check, calls for one more check before the stream waits.
+    A stream that receives no rows therefore closes within one heartbeat of
+    losing access. Heartbeats keep their interval while a pass or a check
+    runs. A check that a transient database fault keeps from being made counts
+    as a slow check before the rows it should cover; an idle stream makes it
+    again after the next heartbeat.
 
-    Invariant: no frame other than a heartbeat is yielded unless an access
-    check has passed that started no more than _RECHECK_DURING_YIELD_SECONDS
-    before the frame is yielded and, for a row's frame, after the row was
-    read. Freshness is judged once the frame is built, right before it is
-    sent, with nothing awaited in between; _renew_access says what happens
-    when the check has expired. A stream whose access cannot be confirmed
-    ends with no further frame.
+    Invariant: no frame other than a heartbeat or the start checkpoint is
+    yielded unless an access check has passed that started no more than
+    _RECHECK_DURING_YIELD_SECONDS before the frame is yielded and after the
+    frame's row was read. Freshness is judged once the frame is built, right
+    before it is sent; _renew_access says what happens when the check has
+    expired. A stream whose access cannot be confirmed ends with no further
+    frame.
     """
     try:
-        loop = asyncio.get_running_loop()
-        clock = _StreamClock(checked_at=checked_at, now=loop.time())
-        # The open's check has not covered a frame yet, so once it has
-        # expired it counts as the first slow check.
-        slow_checks = 0
-        while loop.time() - clock.checked_at > _RECHECK_DURING_YIELD_SECONDS:
-            slow_checks += 1
-            if slow_checks >= _MAX_STALE_ACCESS_CHECKS:
-                return
-            try:
-                clock.checked_at = await _recheck_access(user_id=user_id, vault=vault, vault_id=vault_id)
-            except _AccessLost:
-                return
         yield start_frame
-        clock.last_frame_at = loop.time()
-        clock.check_covered_a_frame = True
         # Wake-ups come from the process-wide LISTEN hub, for this Vault's
         # events only. Rows are read from the events table by cursor, so a
         # missed wake-up only delays this stream until its heartbeat re-read.
@@ -956,6 +976,9 @@ async def _stream_events(
         subscription = hub.subscribe(vault_id)
         try:
             wakeup = subscription.wakeup
+            loop = asyncio.get_running_loop()
+            clock = _StreamClock(checked_at=checked_at, now=loop.time())
+            clock.check_covered_a_frame = True
             current_position = position
             # The heartbeat the last extra check was made for: one per heartbeat.
             checked_for_heartbeat = -math.inf
@@ -982,6 +1005,13 @@ async def _stream_events(
                     rows, pass_checked_at = read.result()
                 except _AccessLost:
                     return
+                except _CheckFailed as failed:
+                    rows, pass_checked_at = failed.rows, None
+                    if rows:
+                        # No check covers these rows. Each is renewed before it
+                        # is sent, this failure counting as the first slow check.
+                        clock.checked_at = -math.inf
+                        clock.check_covered_a_frame = False
                 if pass_checked_at is not None:
                     clock.checked_at = pass_checked_at
                     clock.check_covered_a_frame = False

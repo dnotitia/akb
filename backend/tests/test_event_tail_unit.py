@@ -659,6 +659,75 @@ async def test_a_slow_recheck_during_which_access_was_revoked_sends_no_further_r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failures", [1, 3])
+async def test_a_check_a_database_fault_kept_from_being_made_counts_as_a_slow_one(
+    monkeypatch, hub, failures: int
+) -> None:
+    """A lost connection during the check of a row's pass shows nothing about access.
+
+    It used to count as access lost: the stream ended at once and the row
+    waited for a reconnect. It now counts as a slow check, so the row goes
+    out once a check passes, and after three checks that could not be made
+    the stream ends before the row. Its client still holds the start
+    checkpoint, and resuming from it delivers the row.
+    """
+    from app.services import event_tail_service
+
+    pool, _connection, request = _stream_test_doubles()
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    checks = 0
+
+    async def one_row(_conn: Any, _vault_id: Any, *, after_id: int, limit: int) -> list[dict[str, Any]]:
+        return [_row(5)] if after_id < 5 else []
+
+    async def access(*_args: Any, _conn: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal checks
+        checks += 1
+        if checks <= failures:
+            raise ConnectionResetError("connection reset by peer")
+        return {"vault_id": VAULT_ID}
+
+    monkeypatch.setattr(event_tail_service, "list_vault_events", one_row)
+    monkeypatch.setattr(event_tail_service, "check_vault_access", access)
+
+    def open_stream() -> AsyncIterator[str]:
+        return event_tail_service._stream_events(
+            request,
+            user_id="user",
+            vault="vault",
+            vault_id=VAULT_ID,
+            kinds=(),
+            position=4,
+            codec=EventCursorCodec("cursor-secret"),
+            start_frame=_checkpoint_at(4),
+            checked_at=asyncio.get_running_loop().time(),
+        )
+
+    stream = open_stream()
+    try:
+        assert await anext(stream) == _checkpoint_at(4)
+        if failures < event_tail_service._MAX_STALE_ACCESS_CHECKS:
+            # The row goes out on the first check that passes.
+            assert (await anext(stream)).startswith("event: change\n")
+        else:
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+    finally:
+        await stream.aclose()
+    assert checks == min(failures + 1, event_tail_service._MAX_STALE_ACCESS_CHECKS)
+
+    if failures >= event_tail_service._MAX_STALE_ACCESS_CHECKS:
+        # The client resumes from the start checkpoint it holds.
+        resumed = open_stream()
+        try:
+            assert await anext(resumed) == _checkpoint_at(4)
+            assert (await anext(resumed)).startswith("event: change\n")
+        finally:
+            await resumed.aclose()
+    assert pool.checked_out == 0
+
+
+@pytest.mark.asyncio
 async def test_a_stream_whose_checks_keep_outlasting_the_window_ends(monkeypatch, hub) -> None:
     """Each expired check is repeated, but not forever: the stream ends with no further frame.
 
@@ -825,8 +894,9 @@ async def test_freshness_is_judged_after_the_frame_is_built(monkeypatch, hub) ->
 async def test_the_start_checkpoint_goes_first_with_nothing_before_it(monkeypatch) -> None:
     """open_tail builds the start checkpoint; the stream sends it before touching anything.
 
-    On a check that still covers it, nothing is awaited first, so no heartbeat
-    can precede it.
+    It is part of the response to the authorized open, so it goes out first
+    however long ago the open's check started: nothing is checked or awaited
+    before it, and no heartbeat can precede it.
     """
     from app.services import event_tail_service
 
@@ -846,7 +916,8 @@ async def test_the_start_checkpoint_goes_first_with_nothing_before_it(monkeypatc
         position=7,
         codec=EventCursorCodec("cursor-secret"),
         start_frame=_checkpoint_at(7),
-        checked_at=asyncio.get_running_loop().time(),
+        # The open's check expired long ago, as when the response's start was slow.
+        checked_at=asyncio.get_running_loop().time() - 60,
     )
     # One step of the generator, driven by hand: it yields at once, so
     # nothing was awaited.
