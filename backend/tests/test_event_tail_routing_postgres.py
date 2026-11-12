@@ -135,6 +135,7 @@ async def test_an_event_wakes_only_the_streams_of_its_vault(monkeypatch):
                 kinds=(),
                 position=0,
                 codec=codec,
+                start_frame=event_tail_service._checkpoint_frame(codec.encode(vault_ids[index % len(names)], (), 0)),
                 checked_at=asyncio.get_running_loop().time(),
             )
             for index in range(2 * len(names))

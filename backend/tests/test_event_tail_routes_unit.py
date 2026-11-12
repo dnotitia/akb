@@ -284,6 +284,132 @@ async def test_a_caller_without_access_hears_so_before_any_capacity_refusal(
 
 
 @pytest.mark.asyncio
+async def test_an_open_whose_access_checks_stay_slow_is_a_retryable_503(tail, monkeypatch) -> None:
+    """A stream that could not send its start checkpoint used to answer 200 with an empty body.
+
+    Its client, holding no cursor, reconnected without one and started after
+    the newest event, so an event committed meanwhile was skipped. Now open_tail
+    checks again; checks that stay slow refuse the open with a 503 the client
+    retries.
+    """
+    window = 0.05
+    monkeypatch.setattr(tail.service, "_RECHECK_DURING_YIELD_SECONDS", window)
+    checks = 0
+
+    async def slow_access(*_args, _conn, **_kwargs):
+        nonlocal checks
+        checks += 1
+        await asyncio.sleep(window * 2)
+        return {"vault_id": _VAULT_ID}
+
+    monkeypatch.setattr(tail.service, "check_vault_access", slow_access)
+
+    with pytest.raises(tail.service.EventTailUnavailableError) as exc_info:
+        await tail.open()
+
+    refusal = exc_info.value
+    assert refusal.status_code == 503
+    assert refusal.code == "event_tail_unavailable"
+    assert refusal.retry_after_secs == 1
+    # The open's check and two more: three slow checks, then the refusal.
+    assert checks == tail.service._MAX_STALE_ACCESS_CHECKS == 3
+    assert tail.service.open_stream_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("renewal", "status"), [("revoked", 403), ("vault-replaced", 503)])
+async def test_an_open_whose_renewed_check_fails_starts_no_stream(tail, monkeypatch, renewal: str, status: int) -> None:
+    """The open's check expired during the preflight, and the renewed check fails.
+
+    Access gone is the 403 it has always been. A Vault deleted and created
+    again under the same name meanwhile is a 503: the retry opens on the new
+    Vault. Either way nothing is sent and no slot is held.
+    """
+    from app.exceptions import AKBError, ForbiddenError
+
+    window = 0.05
+    monkeypatch.setattr(tail.service, "_RECHECK_DURING_YIELD_SECONDS", window)
+    checks = 0
+
+    async def renewed_access(*_args, _conn, **_kwargs):
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            # The open's own check outlasts the window it covers.
+            await asyncio.sleep(window * 2)
+            return {"vault_id": _VAULT_ID}
+        if renewal == "revoked":
+            raise ForbiddenError("revoked")
+        return {"vault_id": UUID("22222222-2222-4222-8222-222222222222")}
+
+    monkeypatch.setattr(tail.service, "check_vault_access", renewed_access)
+
+    with pytest.raises(AKBError) as exc_info:
+        await tail.open()
+
+    assert exc_info.value.status_code == status
+    assert checks == 2
+    assert tail.service.open_stream_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_the_start_checkpoint_comes_before_any_heartbeat_when_the_budget_is_busy(tail, monkeypatch) -> None:
+    """The open's check expired while the preflight ran, and the database budget was busy.
+
+    The new check used to run after the response had started, so heartbeats
+    went out while it waited for the budget, ahead of the start checkpoint.
+    open_tail now makes it before responding.
+    """
+    window = 0.1
+    monkeypatch.setattr(tail.service, "_RECHECK_DURING_YIELD_SECONDS", window)
+    monkeypatch.setattr(tail.service, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setenv("AKB_EVENT_TAIL_DB_CONCURRENCY", "1")
+    monkeypatch.setattr(tail.service, "_db_budget", None)
+    release = asyncio.Event()
+    holding = asyncio.Event()
+    checks = 0
+
+    class _SlowBoundsPool(_BoundsPool):
+        async def fetchrow(self, *args):
+            # The preflight outlasts the window the open's check covers.
+            await asyncio.sleep(window * 2)
+            return await super().fetchrow(*args)
+
+    async def get_pool():
+        return _SlowBoundsPool()
+
+    async def counting_access(*_args, **_kwargs):
+        nonlocal checks
+        checks += 1
+        return {"vault_id": _VAULT_ID}
+
+    async def busy_borrower() -> None:
+        async with tail.service._tail_db_connection():
+            holding.set()
+            await release.wait()
+
+    monkeypatch.setattr(tail.service, "get_pool", get_pool)
+    monkeypatch.setattr(tail.service, "check_vault_access", counting_access)
+    opening = asyncio.create_task(tail.open())
+    # Once the preflight is under way, another borrower queues for the slot.
+    borrower = asyncio.create_task(busy_borrower())
+    await asyncio.wait_for(holding.wait(), timeout=2)
+    # It holds the budget for several heartbeat intervals.
+    await asyncio.sleep(0.25)
+    assert not opening.done()
+    release.set()
+    response = await asyncio.wait_for(opening, timeout=2)
+    await borrower
+    try:
+        first = await anext(response.body_iterator)
+    finally:
+        await response.body_iterator.aclose()
+
+    assert first.startswith("event: checkpoint\n")
+    assert checks == 2
+
+
+@pytest.mark.asyncio
 async def test_open_tail_refuses_a_stream_past_the_cap_and_admits_again_once_one_ends(tail, monkeypatch) -> None:
     monkeypatch.setenv("AKB_EVENT_TAIL_MAX_STREAMS", "2")
 
@@ -298,7 +424,9 @@ async def test_open_tail_refuses_a_stream_past_the_cap_and_admits_again_once_one
     assert exc_info.value.retry_after_secs == 5
     assert tail.service.open_stream_count() == 2
 
-    # The client went away: the stream ends and gives its slot back.
+    # The client went away: after its start checkpoint the stream ends and
+    # gives its slot back.
+    assert (await anext(ending.body_iterator)).startswith("event: checkpoint\n")
     with pytest.raises(StopAsyncIteration):
         await anext(ending.body_iterator)
     assert tail.service.open_stream_count() == 1

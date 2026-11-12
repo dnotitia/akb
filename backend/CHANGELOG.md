@@ -23,14 +23,18 @@ specifically; the proxy has its own log in
   than a second is repeated before the next event, with heartbeats in the
   meantime. A tail whose checks keep taking that long ends after three in a
   row, the first check of a batch included, with no further frame. Every tail
-  now starts with a checkpoint at its starting position, sent on the access
-  check that opened it, so a client that brought no cursor still has one to
-  resume from. Heartbeats also keep their interval while a batch is read. A
-  cursor is refused with 410 `event_gap` only when an event it never received
-  was deleted: migration 133 adds a trigger that records the highest deleted
-  event id per Vault in every statement that deletes, whichever release
-  issues it. A cursor taken before a Vault's first event, which other Vaults'
-  events usually leave far below it, is no longer refused.
+  now starts with a checkpoint at its starting position, built on the access
+  check that opened it and sent before anything else, so a client that brought
+  no cursor still has one to resume from; when access cannot be confirmed in
+  time to send it, the open fails with a retryable 503
+  `event_tail_unavailable`. Heartbeats also keep their interval while a batch
+  is read, and a heartbeat sent during an empty read is followed by an access
+  check before the tail waits again. A cursor is refused with 410 `event_gap`
+  only when an event it never received was deleted: migration 133 adds a
+  trigger that records the highest deleted event id per Vault in every
+  statement that deletes, whichever release issues it. A cursor taken before a
+  Vault's first event, which other Vaults' events usually leave far below it,
+  is no longer refused.
   A process serves at most `event_tail_max_streams` tails (default 256,
   `AKB_EVENT_TAIL_MAX_STREAMS`); past that a new tail gets 503
   `event_tail_capacity` with `Retry-After`. One account may hold at most

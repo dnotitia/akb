@@ -194,6 +194,9 @@ async def test_postgres_tail_stream_preserves_order_filter_checkpoints_and_resum
             kinds=("table.rows_changed",),
             position=first_id - 1,
             codec=codec,
+            start_frame=event_tail_service._checkpoint_frame(
+                codec.encode(vault_id, ("table.rows_changed",), first_id - 1)
+            ),
             checked_at=asyncio.get_running_loop().time(),
         )
         start_frame = await anext(stream)
@@ -224,6 +227,9 @@ async def test_postgres_tail_stream_preserves_order_filter_checkpoints_and_resum
             kinds=("table.rows_changed",),
             position=selected_id,
             codec=codec,
+            start_frame=event_tail_service._checkpoint_frame(
+                codec.encode(vault_id, ("table.rows_changed",), selected_id)
+            ),
             checked_at=asyncio.get_running_loop().time(),
         )
         resumed_start = await anext(resumed)

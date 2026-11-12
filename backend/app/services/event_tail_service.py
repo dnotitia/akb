@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -116,6 +117,24 @@ class EventTailUserQuotaError(AKBError):
             status_code=429,
             code="event_tail_user_quota",
             hint="Close event streams this account no longer reads.",
+        )
+
+
+class EventTailUnavailableError(AKBError):
+    """Access could not be confirmed in time to start a stream.
+
+    The access checks kept outlasting the window they cover, as on a slow
+    database. A 5xx: the SDK's change channel retries it.
+    """
+
+    def __init__(self, *, retry_after_secs: int = 1):
+        # Surfaced as the HTTP Retry-After header by the AKBError handler.
+        self.retry_after_secs = retry_after_secs
+        super().__init__(
+            "Event tail access could not be confirmed in time",
+            status_code=503,
+            code="event_tail_unavailable",
+            hint="Retry after the Retry-After delay.",
         )
 
 
@@ -614,10 +633,17 @@ async def open_tail(
     connections than the budget. The access check comes before any event
     query.
 
+    The stream's first frame, a checkpoint at its start position, is built
+    here, on that access check, so every client holds a cursor before
+    anything else is sent. If the preflight outlasted the window the check
+    covers, access is checked again here; if the checks stay slow, the
+    request fails with a retryable 503 `event_tail_unavailable` instead of
+    starting a stream that sends nothing.
+
     The errors keep the order the route has always given them: 403, or 404
     for an unknown Vault, before 429 for an account at its quota and 503 for
     a full process; then 400 for an invalid kind or cursor, and 410 for a
-    cursor older than the retained tail. A refused request is therefore still
+    cursor that missed a deleted event. A refused request is therefore still
     checked, within the budget, so a client without access is told so, and
     stops, rather than told to retry.
     """
@@ -657,6 +683,8 @@ async def open_tail(
             position=resolved,
             bounds=bounds,
         )
+        start_frame = _checkpoint_frame(codec.encode(vault_id, normalized_kinds, resolved))
+        checked_at = await _confirm_start(checked_at, user_id=user_id, vault=vault, vault_id=vault_id)
         stream = _stream_events(
             request,
             user_id=user_id,
@@ -665,6 +693,7 @@ async def open_tail(
             kinds=normalized_kinds,
             position=resolved,
             codec=codec,
+            start_frame=start_frame,
             checked_at=checked_at,
             slot=slot,
         )
@@ -688,6 +717,30 @@ async def open_tail(
 
 class _AccessLost(Exception):
     """The stream's reader may no longer read its Vault; the stream ends quietly."""
+
+
+async def _confirm_start(checked_at: float, *, user_id: str, vault: str, vault_id: UUID | str) -> float:
+    """Keep an access check covering the start checkpoint; returns when that check started.
+
+    open_tail's check, started at ``checked_at`` (loop time), covers the start
+    checkpoint for _RECHECK_DURING_YIELD_SECONDS. If the preflight outlasted
+    that, access is checked again, up to _MAX_STALE_ACCESS_CHECKS slow checks in
+    all, the expired one included. A failed check raises its own error (403,
+    404). Checks that stay slow, or a Vault replaced meanwhile, raise
+    EventTailUnavailableError, which the client retries.
+    """
+    loop = asyncio.get_running_loop()
+    if loop.time() - checked_at <= _RECHECK_DURING_YIELD_SECONDS:
+        return checked_at
+    for _ in range(_MAX_STALE_ACCESS_CHECKS - 1):
+        async with _tail_db_connection() as conn:
+            checked_at = loop.time()
+            access = await check_vault_access(user_id, vault, required_role="reader", _conn=conn)
+        if str(access.get("vault_id")) != str(vault_id):
+            raise EventTailUnavailableError()
+        if loop.time() - checked_at <= _RECHECK_DURING_YIELD_SECONDS:
+            return checked_at
+    raise EventTailUnavailableError()
 
 
 async def _require_access(conn: Any, *, user_id: str, vault: str, vault_id: UUID | str) -> None:
@@ -763,17 +816,25 @@ def _row_frame(
 class _StreamClock:
     """The times a stream's access checks and heartbeats are measured from."""
 
-    __slots__ = ("checked_at", "check_covered_a_frame", "check_when_empty", "last_frame_at")
+    __slots__ = ("checked_at", "check_covered_a_frame", "last_frame_at", "last_heartbeat_at")
 
     def __init__(self, *, checked_at: float, now: float) -> None:
         # When the last passed access check started, and whether a frame has
         # been sent on it since.
         self.checked_at = checked_at
         self.check_covered_a_frame = False
-        # When the last frame, a heartbeat included, was sent.
+        # When the last frame, a heartbeat included, was sent, and the last heartbeat.
         self.last_frame_at = now
-        # Set by a heartbeat: the next pass checks access even if it finds nothing.
-        self.check_when_empty = False
+        self.last_heartbeat_at = -math.inf
+
+    @property
+    def check_owed(self) -> bool:
+        """Whether a heartbeat went out after the last access check started.
+
+        A stream that receives no rows checks nothing on its own, so after each
+        heartbeat it owes a check, even when the batch it reads is empty.
+        """
+        return self.checked_at < self.last_heartbeat_at
 
 
 async def _heartbeats_while(task: asyncio.Future[Any], clock: _StreamClock) -> AsyncGenerator[str, None]:
@@ -791,8 +852,7 @@ async def _heartbeats_while(task: asyncio.Future[Any], clock: _StreamClock) -> A
                 await asyncio.wait({task}, timeout=due_in)
                 continue
             yield format_heartbeat()
-            clock.last_frame_at = loop.time()
-            clock.check_when_empty = True
+            clock.last_frame_at = clock.last_heartbeat_at = loop.time()
     finally:
         if not task.done():
             task.cancel()
@@ -839,21 +899,25 @@ async def _stream_events(
     kinds: tuple[str, ...],
     position: int,
     codec: EventCursorCodec,
+    start_frame: str,
     checked_at: float,
     slot: _StreamSlot | None = None,
 ) -> AsyncIterator[str]:
     """Send ``vault_id``'s events after ``position`` until the client leaves or loses access.
 
-    The first frame is a checkpoint at ``position``, sent on the access check
-    open_tail started at ``checked_at`` (loop time), so every client holds a
-    cursor to resume from whether or not it brought one.
+    The first frame is ``start_frame``, the checkpoint at ``position`` that
+    open_tail built on an access check started at ``checked_at`` (loop time),
+    so every client holds a cursor to resume from whether or not it brought
+    one. It goes out before anything else, heartbeats included.
 
     Each pass borrows one pooled connection, within the database budget, to
     read the next batch and, when it found rows, to check access; the
     connection goes back before any frame is sent. A pass that finds nothing
-    checks nothing, except the pass after a heartbeat, so a stream that
-    receives no rows still closes within one heartbeat of losing access.
-    Heartbeats keep their interval while a pass or a check runs.
+    checks nothing, unless a heartbeat went out since the last check: then it
+    checks, and if the heartbeat went out while the pass ran, access is
+    checked again before the stream waits. A stream that receives no rows
+    therefore closes within one heartbeat of losing access. Heartbeats keep
+    their interval while a pass or a check runs.
 
     Invariant: no frame other than a heartbeat is yielded unless an access
     check has passed that started no more than _RECHECK_DURING_YIELD_SECONDS
@@ -863,6 +927,7 @@ async def _stream_events(
     stream whose access cannot be confirmed ends with no further frame.
     """
     try:
+        yield start_frame
         # Wake-ups come from the process-wide LISTEN hub, for this Vault's
         # events only. Rows are read from the events table by cursor, so a
         # missed wake-up only delays this stream until its heartbeat re-read.
@@ -872,23 +937,10 @@ async def _stream_events(
             wakeup = subscription.wakeup
             loop = asyncio.get_running_loop()
             clock = _StreamClock(checked_at=checked_at, now=loop.time())
-            current_position = position
-
-            if await request.is_disconnected():
-                return
-            start_frame = _checkpoint_frame(codec.encode(vault_id, kinds, position))
-            if loop.time() - clock.checked_at > _RECHECK_DURING_YIELD_SECONDS:
-                try:
-                    async with contextlib.aclosing(
-                        _renew_access(clock, user_id=user_id, vault=vault, vault_id=vault_id)
-                    ) as heartbeats:
-                        async for heartbeat in heartbeats:
-                            yield heartbeat
-                except _AccessLost:
-                    return
-            yield start_frame
-            clock.last_frame_at = loop.time()
             clock.check_covered_a_frame = True
+            current_position = position
+            # Whether the pass just run was the extra one an owed check called for.
+            checked_again = False
 
             while True:
                 if await request.is_disconnected():
@@ -901,7 +953,7 @@ async def _stream_events(
                         vault=vault,
                         vault_id=vault_id,
                         after_id=current_position,
-                        check_when_empty=clock.check_when_empty,
+                        check_when_empty=clock.check_owed,
                     )
                 )
                 read.add_done_callback(_outcome_seen)
@@ -915,7 +967,6 @@ async def _stream_events(
                 if pass_checked_at is not None:
                     clock.checked_at = pass_checked_at
                     clock.check_covered_a_frame = False
-                    clock.check_when_empty = False
 
                 for row in rows:
                     if await request.is_disconnected():
@@ -935,7 +986,14 @@ async def _stream_events(
                     clock.last_frame_at = loop.time()
                     clock.check_covered_a_frame = True
                 if rows:
+                    checked_again = False
                     continue
+                if clock.check_owed and not checked_again:
+                    # A heartbeat went out while this pass ran, after its check
+                    # if it made one: check now rather than a heartbeat later.
+                    checked_again = True
+                    continue
+                checked_again = False
 
                 remaining = max(
                     0.0,
@@ -945,10 +1003,8 @@ async def _stream_events(
                     await asyncio.wait_for(wakeup.wait(), timeout=remaining)
                 except TimeoutError:
                     yield format_heartbeat()
-                    clock.last_frame_at = loop.time()
-                    # A stream with no new rows checks nothing on its own, so
-                    # the pass after each heartbeat checks access regardless.
-                    clock.check_when_empty = True
+                    # The pass after it owes a check, even if it finds nothing.
+                    clock.last_frame_at = clock.last_heartbeat_at = loop.time()
         finally:
             hub.unsubscribe(subscription)
     finally:

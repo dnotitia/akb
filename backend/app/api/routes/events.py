@@ -38,8 +38,9 @@ router = APIRouter()
             },
         },
         # The account already holds its quota of open streams on this server
-        # (`event_tail_user_quota`). A full server is the 503 every operation
-        # documents (`event_tail_capacity`).
+        # (`event_tail_user_quota`). A full server (`event_tail_capacity`), and
+        # access that could not be confirmed in time to start a stream
+        # (`event_tail_unavailable`), are the 503 every operation documents.
         429: {
             "description": "Too Many Requests",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AkbError"}}},

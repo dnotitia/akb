@@ -78,6 +78,7 @@ async def test_more_open_streams_than_pool_connections_leave_the_pool_usable(mon
                 kinds=(),
                 position=0,
                 codec=codec,
+                start_frame=event_tail_service._checkpoint_frame(codec.encode(vault_id, (), 0)),
                 checked_at=asyncio.get_running_loop().time(),
             )
             for _ in range(_STREAMS)

@@ -347,6 +347,7 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
         kinds=("table.rows_changed",),
         position=9,
         codec=EventCursorCodec("cursor-secret"),
+        start_frame=_checkpoint_at(9, kinds=("table.rows_changed",)),
         checked_at=asyncio.get_running_loop().time(),
     )
     # Where the stream starts, before anything is read.
@@ -409,6 +410,7 @@ async def test_empty_wakeups_do_not_restart_heartbeat_deadline(monkeypatch, hub)
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        start_frame=_checkpoint_at(0),
         checked_at=asyncio.get_running_loop().time(),
     )
     notification_task: asyncio.Task[None] | None = None
@@ -483,6 +485,7 @@ async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatc
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        start_frame=_checkpoint_at(0),
         checked_at=asyncio.get_running_loop().time(),
     )
     assert await anext(stream) == _checkpoint_at(0)
@@ -536,6 +539,7 @@ async def test_more_waiting_streams_than_pool_connections_leave_the_pool_usable(
                 kinds=(),
                 position=0,
                 codec=codec,
+                start_frame=_checkpoint_at(0),
                 checked_at=asyncio.get_running_loop().time(),
             )
         )
@@ -635,6 +639,7 @@ async def test_a_slow_recheck_during_which_access_was_revoked_sends_no_further_r
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        start_frame=_checkpoint_at(0),
         checked_at=asyncio.get_running_loop().time(),
     )
     try:
@@ -684,6 +689,7 @@ async def test_a_stream_whose_checks_keep_outlasting_the_window_ends(monkeypatch
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        start_frame=_checkpoint_at(0),
         checked_at=asyncio.get_running_loop().time(),
     )
     try:
@@ -730,6 +736,7 @@ def _slow_check_stream(monkeypatch, *, rows: list[dict[str, Any]]) -> tuple[Any,
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        start_frame=_checkpoint_at(0),
         checked_at=asyncio.get_running_loop().time(),
     )
     return event_tail_service, stream, state
@@ -814,19 +821,19 @@ async def test_freshness_is_judged_after_the_frame_is_built(monkeypatch, hub) ->
     assert state["checks"] == 2
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("granted", [True, False])
-async def test_the_start_checkpoint_waits_for_a_fresh_check(monkeypatch, hub, granted: bool) -> None:
-    """The start checkpoint is a frame like any other: sent only on a check that still covers it."""
-    from app.exceptions import ForbiddenError
+def test_the_start_checkpoint_goes_first_with_nothing_before_it(monkeypatch) -> None:
+    """open_tail builds the start checkpoint; the stream sends it before touching anything.
+
+    Nothing is awaited first, so no heartbeat can precede it.
+    """
     from app.services import event_tail_service
 
-    pool, _connection, request = _stream_test_doubles()
-    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
-    monkeypatch.setattr(event_tail_service, "list_vault_events", AsyncMock(return_value=[]))
-    access = AsyncMock(return_value={"vault_id": VAULT_ID}) if granted else AsyncMock(side_effect=ForbiddenError("revoked"))
-    monkeypatch.setattr(event_tail_service, "check_vault_access", access)
-    loop = asyncio.get_running_loop()
+    def untouchable(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("touched before the start checkpoint was sent")
+
+    monkeypatch.setattr(event_tail_service, "get_event_tail_hub", untouchable)
+    request = MagicMock()
+    request.is_disconnected = untouchable
     stream = event_tail_service._stream_events(
         request,
         user_id="user",
@@ -835,20 +842,80 @@ async def test_the_start_checkpoint_waits_for_a_fresh_check(monkeypatch, hub, gr
         kinds=(),
         position=7,
         codec=EventCursorCodec("cursor-secret"),
-        # open_tail's check started long enough ago to have expired.
-        checked_at=loop.time() - 5,
+        start_frame=_checkpoint_at(7),
+        checked_at=0.0,
+    )
+    # One step of the generator, driven without an event loop: it yields at
+    # once, so nothing was awaited.
+    with pytest.raises(StopIteration) as first:
+        stream.__anext__().send(None)
+    assert first.value.value == _checkpoint_at(7)
+    with pytest.raises(StopIteration):
+        stream.aclose().send(None)
+
+
+@pytest.mark.asyncio
+async def test_an_idle_stream_checks_access_right_after_a_heartbeat_sent_during_a_long_read(monkeypatch, hub) -> None:
+    """A heartbeat that goes out while a read runs owes a check, even when the read finds nothing.
+
+    The check used to wait for the next heartbeat, so a stream that lost
+    access while it read stayed open, and sent another heartbeat, a heartbeat
+    longer than it should.
+    """
+    from app.exceptions import ForbiddenError
+    from app.services import event_tail_service
+
+    pool, _connection, request = _stream_test_doubles()
+    heartbeat = 0.4
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "HEARTBEAT_INTERVAL_SECONDS", heartbeat)
+    loop = asyncio.get_running_loop()
+    reads = 0
+    granted = True
+    check_times: list[float] = []
+
+    async def first_read_slow(_conn: Any, _vault_id: Any, *, after_id: int, limit: int) -> list[dict[str, Any]]:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            await asyncio.sleep(heartbeat + 0.15)
+        return []
+
+    async def access(*_args: Any, _conn: Any, **_kwargs: Any) -> dict[str, Any]:
+        check_times.append(loop.time())
+        if not granted:
+            raise ForbiddenError("revoked")
+        return {"vault_id": VAULT_ID}
+
+    monkeypatch.setattr(event_tail_service, "list_vault_events", first_read_slow)
+    monkeypatch.setattr(event_tail_service, "check_vault_access", access)
+    stream = event_tail_service._stream_events(
+        request,
+        user_id="user",
+        vault="vault",
+        vault_id=VAULT_ID,
+        kinds=(),
+        position=0,
+        codec=EventCursorCodec("cursor-secret"),
+        start_frame=_checkpoint_at(0),
+        checked_at=loop.time(),
     )
     try:
-        if granted:
-            assert await anext(stream) == _checkpoint_at(7)
-        else:
-            with pytest.raises(StopAsyncIteration):
-                await anext(stream)
+        assert await anext(stream) == _checkpoint_at(0)
+        # The first read is still running when its heartbeat falls due.
+        assert await anext(stream) == format_heartbeat()
+        heartbeat_at = loop.time()
+        granted = False
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        closed_at = loop.time()
     finally:
         await stream.aclose()
 
-    # It was checked again before anything was sent.
-    assert access.await_count == 1
+    # The check ran as soon as the empty read ended, not a heartbeat later, and
+    # no further heartbeat went out.
+    assert check_times and check_times[0] - heartbeat_at < 0.3
+    assert closed_at - heartbeat_at < heartbeat
 
 
 @pytest.mark.asyncio
@@ -877,6 +944,7 @@ async def test_heartbeats_keep_flowing_while_a_slow_pass_runs(monkeypatch, hub) 
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        start_frame=_checkpoint_at(0),
         checked_at=loop.time(),
     )
     arrivals: list[tuple[float, str]] = []

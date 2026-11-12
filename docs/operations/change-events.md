@@ -100,13 +100,19 @@ delivery rather than dropping it.
 Opening a tail first decides admission, which reads nothing. It then checks
 the caller's access and reads the Vault's retained range on one connection,
 before any event is read. The tail's first frame is a checkpoint at its
-starting position, sent on that access check, so a client that brought no
-cursor holds one from the start; store it like any other cursor.
+starting position, built on that access check and sent before anything else,
+so a client that brought no cursor holds one from the start; store it like any
+other cursor. If the preflight outlasts the second that check covers, access
+is checked again before the response starts; if the checks stay slow, the open
+fails with a retryable 503 `event_tail_unavailable` rather than starting a
+tail that cannot send its first frame.
 
 A waiting tail holds no pooled connection. To read, it borrows one for the
 batch and, when the batch has rows, checks the reader's access on that same
 connection before sending any of them. A pass that finds nothing checks
-nothing, except the pass after each heartbeat. Before each frame, a check that
+nothing, unless a heartbeat went out since the last check: then it checks,
+and if the heartbeat went out while the pass ran, access is checked again
+before the tail waits. Before each frame, a check that
 started more than a second earlier is repeated, and so is a check that itself
 took longer than that to finish. A tail whose checks keep taking that long,
 the first check of a batch included, ends after three in a row with no further
@@ -150,7 +156,9 @@ Limits per server process; each environment variable overrides its key:
 
 A new tail's errors come in this order: 403, or 404 for an unknown Vault; then
 429 for an account at its quota and 503 for a full process; then 400 for an
-invalid kind or cursor, and 410 for a cursor that missed a deleted event. A
+invalid kind or cursor, and 410 for a cursor that missed a deleted event; and
+503 `event_tail_unavailable`, with `Retry-After`, when access could not be
+confirmed in time to start. A
 caller without access is told so even when it would also be refused for
 capacity, and an account at its quota gets 429 even when the process is also
 full: retrying cannot help either, and the SDK's change channel retries a 5xx
