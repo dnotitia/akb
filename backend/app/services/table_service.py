@@ -1304,6 +1304,7 @@ async def alter_table(
     _conn: Any | None = None,
     _defer_index: bool = False,
     _ownership_context: TableOwnershipContext | None = None,
+    _deferred_events: list[tuple[str, dict[str, Any]]] | None = None,
 ) -> dict:
     """Apply schema changes to a vault table:
        - add_columns: [{name, type}, ...]
@@ -1318,7 +1319,13 @@ async def alter_table(
     All are optional and combine in one TX. Adding a unique key
     PREFLIGHTS existing rows for duplicates BEFORE any DDL — on a
     violation the whole alter rolls back (physical schema + registry
-    unchanged). Emits `table.alter` after the writes commit.
+    unchanged). Emits `table.alter` as the transaction's last write.
+
+    A caller that runs further DDL in the same transaction passes
+    ``_deferred_events`` and emits the collected events after its own last
+    locking statement: the event insert holds the Vault's event lock until
+    commit (migration 132), and later DDL could otherwise wait on a writer
+    that is itself waiting for that lock.
     """
     async with _existing_or_pooled_conn(_conn) as conn:
         async with _transaction_if_needed(conn, _conn is None):
@@ -1859,12 +1866,11 @@ async def alter_table(
                 )
 
             t_uri = table_uri(vault["name"], table_name, collection=table.get("collection"))
-            await emit_event(
-                conn, "table.alter",
-                vault_id=vault_id,
-                resource_uri=t_uri,
-                actor_id=actor_id,
-                payload={
+            alter_event: dict[str, Any] = {
+                "vault_id": vault_id,
+                "resource_uri": t_uri,
+                "actor_id": actor_id,
+                "payload": {
                     "vault": vault["name"],
                     "table_name": table_name,
                     "added": added,
@@ -1874,7 +1880,11 @@ async def alter_table(
                     "unique_keys_changed": uk_changed,
                     "indexes_changed": idx_changed,
                 },
-            )
+            }
+            if _deferred_events is not None:
+                _deferred_events.append(("table.alter", alter_event))
+            else:
+                await emit_event(conn, "table.alter", **alter_event)
 
     # Refresh the metadata chunk so search reflects the new schema —
     # otherwise the chunk drifts from the ALTER until the table is dropped.

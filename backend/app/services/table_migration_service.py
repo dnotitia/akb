@@ -269,6 +269,12 @@ async def apply_table_migration(
                 }
 
             results: list[dict[str, Any]] = []
+            # Each operation's `table.alter` event is written after the last
+            # operation's DDL, not between operations. The first event insert
+            # holds the Vault's event lock until commit (migration 132); a later
+            # ALTER waiting on a writer of its table would otherwise hold that
+            # lock while the writer waits for it.
+            alter_events: list[tuple[str, dict[str, Any]]] = []
             for index, op in enumerate(operations, start=1):
                 table_name, kwargs = _migration_op_to_alter_kwargs(op)
                 result = await alter_table(
@@ -277,6 +283,7 @@ async def apply_table_migration(
                     actor_id=actor_id,
                     _conn=conn,
                     _defer_index=True,
+                    _deferred_events=alter_events,
                     **kwargs,
                 )
                 results.append({
@@ -297,6 +304,8 @@ async def apply_table_migration(
                 key,
                 checksum,
             )
+            for kind, event in alter_events:
+                await emit_event(conn, kind, **event)
             await emit_event(
                 conn,
                 "table.migration",
