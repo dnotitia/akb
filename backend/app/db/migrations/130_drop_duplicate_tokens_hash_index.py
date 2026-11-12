@@ -10,8 +10,12 @@ installations created from now on never have it.
 The runner applies each migration in one transaction with its ledger row, and
 DROP INDEX CONCURRENTLY cannot run inside a transaction block, so this is a
 plain DROP INDEX. It takes an ACCESS EXCLUSIVE lock on `tokens` for as long
-as the drop takes, which for a table of one row per issued token is brief;
-the runner's lock_timeout bounds the wait to acquire it.
+as the drop takes, which for a table of one row per issued token is brief.
+Getting the lock can take longer: the DROP waits behind any transaction that
+holds a lock on `tokens`, and PAT authentication, which updates `tokens`,
+queues behind the waiting DROP, so PAT requests may stall briefly. The
+runner's 5-second lock_timeout ends each wait and the runner retries the
+migration.
 
 Idempotent: IF EXISTS makes a re-run, or a database that never had the index,
 a no-op.

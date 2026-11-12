@@ -9,11 +9,15 @@ Lookup order (first hit wins):
 The split exists so that `app.yaml` is safe to commit/share (no
 secrets) and `secret.yaml` stays out of source control. Both files
 are flat YAML mappings using the same keys as the Settings model
-below — no environment variables are read, with one deliberate
-exception: the AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE pool-sizing
-overrides read in app/db/postgres.py, a deployment-layer knob so
-k8s operators and the akb-platform control plane can tune the pool
-per deployment without re-rendering config files.
+below — no environment variables are read here. The deliberate
+exceptions are deployment-layer overrides, read where they apply so
+k8s operators and the akb-platform control plane can tune a deployment
+without re-rendering config files. CONTRIBUTING.md (Configuration)
+lists them; where one replaces a key below, the variable wins. For
+example, AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE replace the pool
+sizes and are read in app/db/postgres.py, and
+AKB_VAULT_HEALTH_CACHE_TTL_SECS replaces vault_health_cache_ttl_secs
+and is read once, when app/services/health.py is imported.
 """
 
 import ipaddress
@@ -527,7 +531,7 @@ class Settings(BaseModel):
     # max_connections is 100 and the pgvector driver holds its own pool of
     # up to 8 — while giving concurrent write bursts more headroom. The
     # AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE env vars take precedence
-    # over these keys (the one deliberate env exception; module docstring).
+    # over these keys (a deliberate env exception; module docstring).
     pg_pool_min_size: int = 2
     pg_pool_max_size: int = 30
 

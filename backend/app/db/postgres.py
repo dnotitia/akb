@@ -16,7 +16,7 @@ _MIGRATION_LOCK_KEY = 0x414B425F4D494752  # ``AKB_MIGR``
 def _pool_sizes() -> tuple[int, int]:
     """Resolve main-pool sizing: env > app.yaml > defaults.
 
-    AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE are the one deliberate
+    AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE are a deliberate
     env-var exception to the YAML-only config rule (see app.config): the
     akb-platform operator and k8s operators tune pool size per deployment
     without re-rendering config files. Invalid values fail startup loudly
