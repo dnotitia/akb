@@ -6,8 +6,9 @@ event lock were first taken by the event insert after the commit, a lock wait
 that ran past its deadline would roll the transaction back and leave the
 commit in Git. The writes take the lock first, so a busy Vault fails them
 before Git changes, and the event insert finds the lock already held. The rows
-they change after the commit (collections, edges) are locked before the event
-lock, so they do not wait for another transaction while holding it.
+they change after the commit (collections, edges) are locked, and an update's
+implicit edges rewritten, before the event lock, so they do not wait for
+another transaction while holding it.
 ``test_document_git_event_lock_postgres.py`` checks the outcome against a real
 database.
 """
@@ -22,7 +23,7 @@ import pytest
 import app.repositories.document_repo as document_repo
 import app.services.document_service as ds
 import app.services.publication_service as publication_service
-from app.models.document import DocumentPutRequest
+from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.services.document_service import DocumentService
 from tests.test_document_hash_contract_unit import (
     _CommittingGit,
@@ -123,3 +124,32 @@ async def test_delete_locks_its_rows_then_the_event_lock_before_its_git_delete(m
         "emit_event",
     ]
 
+
+async def test_update_rewrites_its_edges_before_the_event_lock(monkeypatch):
+    _patch_index_side_effects(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(ds, "store_document_relations", _recorder(calls, "relations"))
+    monkeypatch.setattr(ds, "lock_vault_events", _recorder(calls, "lock_vault_events"))
+    async def write_chunks(*_args, **_kwargs):
+        calls.append("chunks")
+        return 1
+
+    monkeypatch.setattr(ds, "write_source_chunks", write_chunks)
+    monkeypatch.setattr(ds, "emit_event", _recorder(calls, "emit_event"))
+
+    class _Git(_CommittingGit):
+        def commit_file(self, **kwargs):
+            calls.append("git_commit")
+            return super().commit_file(**kwargs)
+
+    row = {
+        "id": uuid.uuid4(), "path": "notes/order.md", "title": "Order", "doc_type": "note",
+        "status": "draft", "summary": None, "current_commit": "c" * 40, "tags": [],
+    }
+    await DocumentService(git=_Git("d" * 40, initial_raw="---\ntitle: Order\n---\nOld body"))._update_locked(
+        req=DocumentUpdateRequest(content="New body", expected_commit="c" * 40),
+        agent_id="tester", vault="order", vault_id=uuid.uuid4(),
+        doc_repo=_FakePutDocRepo(row), row=row, conn=_CONN,
+    )
+
+    assert calls == ["relations", "lock_vault_events", "git_commit", "chunks", "emit_event"]

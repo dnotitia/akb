@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import uuid
 
 import asyncpg
 import pytest
@@ -278,3 +279,82 @@ async def test_a_metadata_update_and_a_collection_delete_lock_in_one_order(tmp_p
         assert await pool.fetchval("SELECT count(*) FROM documents WHERE vault_id = $1", vault_id) == 0
         assert git.read_file(vault, doc.path) is None
 
+
+async def _document_linking_a_table(pool, service, git, vault: str) -> tuple:
+    vault_id = await _make_vault(pool, vault)
+    git.init_vault(vault)
+    await pool.execute(
+        "INSERT INTO vault_tables (id, vault_id, name, description, columns, unique_keys, indexes) "
+        "VALUES ($1, $2, 'metrics', '', '[]'::jsonb, '[]'::jsonb, '[]'::jsonb)",
+        uuid.uuid4(), vault_id,
+    )
+    table = f"akb://{vault}/table/metrics"
+    doc = await service.put(DocumentPutRequest(
+        vault=vault, collection="notes", title="Report", content=f"See [metrics]({table}).",
+    ))
+    assert await pool.fetchval("SELECT count(*) FROM edges WHERE target_uri = $1", table) == 1
+    return vault_id, doc, table
+
+
+async def _drop_table_edges(conn, table: str) -> None:
+    """`table.drop`'s statements before its event."""
+    await conn.execute("DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1", table)
+
+
+async def test_an_update_rewrites_its_edges_before_the_event_lock(tmp_path):
+    """A table drop that deleted a document's edge to the table and is about
+    to insert its event, and an update of that document's body: the update
+    waits for the edge before it takes the Vault's event lock, so the drop's
+    event does not wait for the update and both finish."""
+    git = GitService(storage_path=str(tmp_path))
+    service = DocumentService(git=git)
+    async with _fresh_database() as pool:
+        vault = "git-lock-edges"
+        vault_id, doc, table = await _document_linking_a_table(pool, service, git, vault)
+        async with pool.acquire() as dropper, pool.acquire() as observer:
+            async with _OpenTransaction(dropper) as dropping:
+                await _drop_table_edges(dropper, table)
+                updating = asyncio.create_task(service.update(vault, doc.path, DocumentUpdateRequest(
+                    content="A new body.", expected_commit=doc.current_commit,
+                )))
+                await asyncio.wait_for(_a_backend_blocked_by(observer, dropper), timeout=10)
+                started = time.monotonic()
+                await emit_event(dropper, "table.drop", vault_id=vault_id, resource_uri=table,
+                                 payload={"vault": vault, "table_name": "metrics"})
+                event_wait = time.monotonic() - started
+                await dropping.commit()
+            updated = await asyncio.wait_for(updating, timeout=_EVENT_LOCK_WAIT_SECONDS * 3)
+        assert event_wait < 1.0, f"the table drop's event waited {event_wait:.2f}s"
+        row = await pool.fetchrow("SELECT current_commit FROM documents WHERE vault_id = $1", vault_id)
+        assert row["current_commit"] == updated.current_commit == git.current_commit(vault)
+
+
+async def test_a_lock_timeout_on_an_edge_ends_an_update_before_its_git_commit(tmp_path):
+    """With a short `lock_timeout` on the database role, an update that has to
+    wait for an edge longer than that fails, and fails before its Git commit:
+    Git and the database still agree."""
+    git = GitService(storage_path=str(tmp_path))
+    service = DocumentService(git=git)
+    async with _fresh_database() as pool:
+        vault = "git-lock-edges-timeout"
+        vault_id, doc, table = await _document_linking_a_table(pool, service, git, vault)
+        head = git.current_commit(vault)
+        database = await pool.fetchval("SELECT current_database()")
+        await pool.execute(f'ALTER ROLE CURRENT_USER IN DATABASE "{database}" SET lock_timeout = \'1s\'')
+        await pool.expire_connections()
+        async with pool.acquire() as dropper, pool.acquire() as observer:
+            async with _OpenTransaction(dropper) as dropping:
+                await _drop_table_edges(dropper, table)
+                updating = asyncio.create_task(service.update(vault, doc.path, DocumentUpdateRequest(
+                    content="A new body.", expected_commit=doc.current_commit,
+                )))
+                await asyncio.wait_for(_a_backend_blocked_by(observer, dropper), timeout=10)
+                with pytest.raises(asyncpg.LockNotAvailableError):
+                    await asyncio.wait_for(updating, timeout=_EVENT_LOCK_WAIT_SECONDS * 3)
+                await emit_event(dropper, "table.drop", vault_id=vault_id, resource_uri=table,
+                                 payload={"vault": vault, "table_name": "metrics"})
+                await dropping.commit()
+        assert git.current_commit(vault) == head
+        assert await pool.fetchval(
+            "SELECT current_commit FROM documents WHERE vault_id = $1", vault_id,
+        ) == head

@@ -1233,6 +1233,20 @@ class DocumentService:
             previous_markdown=current_body,
         )
 
+        # The document's implicit edges are rewritten before the Vault's event
+        # lock: the rewrite needs nothing from the Git commit, and any edge or
+        # insert it has to wait for is then waited for without holding that
+        # lock and before Git changes.
+        if req.content is not None or req.depends_on is not None or req.related_to is not None:
+            depends = current_fm.get("depends_on", []) or []
+            related = current_fm.get("related_to", []) or []
+            implements = current_fm.get("implements", []) or []
+            await store_document_relations(
+                conn, vault_id, vault, file_path,
+                depends, related, implements,
+                new_body,
+            )
+
         # A Git commit does not roll back with this transaction: take the
         # Vault's event lock first, so a busy Vault fails the write before Git
         # changes. The collection and document rows are already locked.
@@ -1284,16 +1298,6 @@ class DocumentService:
                 conn, "document", str(pg_doc_id),
                 vault_id=vault_id,
                 chunks=chunks,
-            )
-
-        if req.content is not None or req.depends_on is not None or req.related_to is not None:
-            depends = current_fm.get("depends_on", []) or []
-            related = current_fm.get("related_to", []) or []
-            implements = current_fm.get("implements", []) or []
-            await store_document_relations(
-                conn, vault_id, vault, file_path,
-                depends, related, implements,
-                new_body,
             )
 
         await emit_event(
@@ -1736,6 +1740,17 @@ class DocumentService:
             previous_markdown=current_body,
         )
 
+        # The document's implicit edges are rewritten before the Vault's event
+        # lock, as in `_update_locked`.
+        depends = current_fm.get("depends_on", []) or []
+        related = current_fm.get("related_to", []) or []
+        implements = current_fm.get("implements", []) or []
+        await store_document_relations(
+            conn, vault_id, vault, file_path,
+            depends, related, implements,
+            new_body,
+        )
+
         # A Git commit does not roll back with this transaction: take the
         # Vault's event lock first, so a busy Vault fails the write before Git
         # changes. The collection and document rows are already locked.
@@ -1775,9 +1790,6 @@ class DocumentService:
             doc_type=row["doc_type"],
         )
         chunks = chunk_markdown(new_body, metadata_header=meta_header)
-        depends = current_fm.get("depends_on", []) or []
-        related = current_fm.get("related_to", []) or []
-        implements = current_fm.get("implements", []) or []
 
         # chunks + relations + event run on the lock connection's existing
         # transaction (opened in `_path_lock`) so a crash between them can't
@@ -1787,11 +1799,6 @@ class DocumentService:
             conn, "document", str(pg_doc_id),
             vault_id=vault_id,
             chunks=chunks,
-        )
-        await store_document_relations(
-            conn, vault_id, vault, file_path,
-            depends, related, implements,
-            new_body,
         )
         await emit_event(
             conn, "document.update",
