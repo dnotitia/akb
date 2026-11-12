@@ -867,3 +867,36 @@ async def test_the_backfill_waits_for_no_vault_it_sets_no_mark_for():
             await holding.close()
 
         assert await _watermarks(setup_pool) == {target: first - 1}
+
+
+async def test_a_sweep_beside_a_vault_delete_succeeds(monkeypatch):
+    """The deletion trigger's marks must not name a Vault whose delete committed meanwhile.
+
+    The trigger read the Vault from its statement's snapshot, and the mark's
+    foreign key check failed once the Vault's delete committed: the whole
+    sweep rolled back, every other Vault's events included, and the sweeper
+    tries again only after its interval.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        doomed = await _make_vault(setup_pool, "retention-sweep-doomed")
+        kept = await _make_vault(setup_pool, "retention-sweep-kept")
+        doomed_ids = [await _insert_event(setup_pool, doomed, "document.put", "alice") for _ in range(2)]
+        kept_ids = [await _insert_event(setup_pool, kept, "document.put", "alice") for _ in range(2)]
+        await _publish_long_ago(setup_pool, doomed_ids + kept_ids)
+        deleting = await asyncpg.connect(_database_dsn(database))
+        try:
+            deletion = deleting.transaction()
+            await deletion.start()
+            await deleting.execute("DELETE FROM vaults WHERE id = $1", doomed)
+            sweeping = asyncio.create_task(_sweep(monkeypatch, setup_pool))
+            await asyncio.sleep(0.3)
+            # The sweep waits for the Vault's delete.
+            assert not sweeping.done()
+            await deletion.commit()
+            assert await asyncio.wait_for(sweeping, 5) == 4
+        finally:
+            await deleting.close()
+
+        assert await setup_pool.fetchval("SELECT count(*) FROM events") == 0
+        assert await _watermarks(setup_pool) == {kept: kept_ids[-1]}

@@ -134,8 +134,11 @@ A cursor is refused with 410 `event_gap` only when an event it never received
 was deleted. A trigger on `events` records, per Vault, the highest event id
 deleted, in every statement that deletes, whichever code issues it: this
 release's sweeper, an earlier release's during a rolling deployment or after a
-rollback, or an operator (migration 133). A cursor below that mark is refused,
-and the refusal's `earliest_cursor` resumes at it.
+rollback, or an operator (migration 133). It locks the Vaults it records
+marks for, so a delete of events beside a Vault delete waits for it and
+records nothing for the Vault removed, rather than failing and taking the
+rest of the sweep with it. A cursor below that mark is refused, and the
+refusal's `earliest_cursor` resumes at it.
 Event ids are shared by every Vault, so a cursor taken before a Vault's first
 event, on an empty Vault, is usually far below that event and is still valid.
 `start=earliest` replays from the first position after which nothing was

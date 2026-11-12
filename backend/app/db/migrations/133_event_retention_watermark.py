@@ -10,9 +10,11 @@ refused only when it is below it.
 A statement trigger on events raises the mark in every statement that
 deletes, so deletions are recorded whichever code issues them, including the
 sweeper of an earlier release that runs beside this one during a rolling
-deployment or after a rollback. A TRUNCATE of events records nothing; only
-the test runtime's reset uses one, and it truncates this table and the Vaults
-with it.
+deployment or after a rollback. It reads the Vaults it records marks for FOR
+KEY SHARE, so a delete beside a Vault delete waits for it and records nothing
+for a Vault removed, instead of failing the mark's foreign key check. A
+TRUNCATE of events records nothing; only the test runtime's reset uses one,
+and it truncates this table and the Vaults with it.
 
 This migration installs the trigger and records the backfill boundary while
 inserts and deletes on events wait; migration 134 then sets the starting

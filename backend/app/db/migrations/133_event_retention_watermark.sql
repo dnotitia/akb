@@ -19,15 +19,30 @@ CREATE TABLE IF NOT EXISTS event_retention_backfill (
 -- Every delete from events raises the mark of each Vault it touched, in the
 -- deleting statement, whichever code issues it: this release's sweeper, an
 -- earlier release's during a rolling deployment or after a rollback, or an
--- operator. Events of a Vault that no longer exists record nothing.
+-- operator. Events of a Vault that no longer exists record nothing. The
+-- Vaults a delete touched are read FOR KEY SHARE, which keeps each from
+-- being deleted until the delete commits: a Vault delete under way is waited
+-- for, and a Vault it removed records nothing. Read from the statement's
+-- snapshot alone, such a Vault failed the mark's foreign key check, and the
+-- whole delete with it, the sweep of every other Vault's events included.
 CREATE OR REPLACE FUNCTION akb_events_record_deletions()
 RETURNS TRIGGER AS $$
 BEGIN
+    WITH deleted AS (
+        SELECT d.vault_id, MAX(d.id) AS deleted_through
+          FROM akb_deleted_events d
+         WHERE d.vault_id IS NOT NULL
+         GROUP BY d.vault_id
+    ), live AS (
+        SELECT v.id
+          FROM vaults v
+         WHERE v.id IN (SELECT vault_id FROM deleted)
+           FOR KEY SHARE
+    )
     INSERT INTO event_retention_watermarks AS w (vault_id, deleted_through)
-    SELECT d.vault_id, MAX(d.id)
-      FROM akb_deleted_events d
-      JOIN vaults v ON v.id = d.vault_id
-     GROUP BY d.vault_id
+    SELECT deleted.vault_id, deleted.deleted_through
+      FROM deleted
+      JOIN live ON live.id = deleted.vault_id
     ON CONFLICT (vault_id) DO UPDATE
        SET deleted_through = GREATEST(w.deleted_through, EXCLUDED.deleted_through);
     RETURN NULL;
