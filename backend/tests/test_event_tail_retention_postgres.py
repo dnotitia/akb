@@ -742,3 +742,42 @@ async def test_the_backfill_keeps_a_mark_the_trigger_recorded_since_the_install(
                 await resumed.aclose()
         assert second > first + 1
         assert _positions(delivered) == [second]
+
+
+async def test_the_backfill_skips_a_vault_whose_delete_is_under_way():
+    """A Vault deleted while migration 134 runs gets no mark, and the migration succeeds.
+
+    The backfill read the Vault from its own snapshot, and the mark's foreign
+    key check then found it gone once the delete committed: the migration
+    failed, and the server's start with it.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        kept = await _make_vault(setup_pool, "retention-kept-vault")
+        doomed = await _make_vault(setup_pool, "retention-deleted-vault")
+        kept_first = await _insert_event(setup_pool, kept, "document.put", "alice")
+        await _insert_event(setup_pool, doomed, "document.put", "alice")
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        backfill = _load_migration(_BACKFILL)
+        assert migration is not None and backfill is not None
+        async with setup_pool.acquire() as conn:
+            async with conn.transaction():
+                await migration.migrate(conn=conn)
+        deleting = await asyncpg.connect(_database_dsn(database))
+        backfilling = await asyncpg.connect(_database_dsn(database))
+        try:
+            deletion = deleting.transaction()
+            await deletion.start()
+            await deleting.execute("DELETE FROM vaults WHERE id = $1", doomed)
+            applying = asyncio.create_task(backfill.migrate(conn=backfilling))
+            # The backfill waits for the Vault's delete.
+            await _waits_for(setup_pool, backfilling, deleting)
+            await deletion.commit()
+            await asyncio.wait_for(applying, 5)
+        finally:
+            await deleting.close()
+            await backfilling.close()
+
+        assert await _watermarks(setup_pool) == {kept: kept_first - 1}
+        assert await setup_pool.fetchval("SELECT count(*) FROM event_retention_backfill") == 0
