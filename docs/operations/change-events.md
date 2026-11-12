@@ -161,8 +161,9 @@ since the install, and it is exact, while a starting mark taken from the
 events left would claim the ids between them, which other Vaults' events use,
 as deleted. A delete that races the backfill is still recorded. A Vault whose
 events all came after the trigger gets no starting mark, and neither does a
-Vault deleted while migration 134 runs: it waits for a Vault delete under way
-and skips the Vault it removed. When the trigger is already in place,
+Vault deleted while migration 134 runs: it locks only the Vaults it sets
+marks for, waits for a delete of one under way, and skips the Vault it
+removed. When the trigger is already in place,
 migration 133 asks for no lock at all. A request for the lock that has to wait
 would make every later event insert wait behind it, so the migration asks
 with a 500 ms lock timeout and holds nothing while it backs off between

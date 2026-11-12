@@ -5,21 +5,29 @@
 -- statement, so running this again sets nothing. It holds no lock on events
 -- that stops writes.
 --
--- The Vaults are read FOR KEY SHARE, which keeps each one from being deleted
--- until this commits: a Vault delete under way is waited for, and a Vault it
--- removed is skipped, so no mark names a Vault that is gone. Read from this
--- statement's snapshot alone, such a Vault failed the mark's foreign key
--- check, and the migration with it.
+-- The marks are computed first, without locks. Then only the Vaults they
+-- name are read FOR KEY SHARE, which keeps each from being deleted until
+-- this commits: a delete of one under way is waited for, and a Vault it
+-- removed is skipped, so no mark names a Vault that is gone. A Vault with
+-- no mark to set is not locked, so a long transaction on it holds up
+-- nothing here.
 WITH pending AS (
     DELETE FROM event_retention_backfill
     RETURNING boundary
+), earliest AS (
+    SELECT e.vault_id, MIN(e.id) - 1 AS deleted_through
+      FROM events e
+     WHERE e.id <= (SELECT MAX(boundary) FROM pending)
+       AND e.vault_id IS NOT NULL
+     GROUP BY e.vault_id
 ), live AS (
-    SELECT id FROM vaults FOR KEY SHARE
+    SELECT v.id
+      FROM vaults v
+     WHERE v.id IN (SELECT vault_id FROM earliest)
+       FOR KEY SHARE
 )
 INSERT INTO event_retention_watermarks (vault_id, deleted_through)
-SELECT e.vault_id, MIN(e.id) - 1
-  FROM events e
-  JOIN live v ON v.id = e.vault_id
- WHERE e.id <= (SELECT MAX(boundary) FROM pending)
- GROUP BY e.vault_id
+SELECT earliest.vault_id, earliest.deleted_through
+  FROM earliest
+  JOIN live ON live.id = earliest.vault_id
 ON CONFLICT (vault_id) DO NOTHING;

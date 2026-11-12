@@ -833,3 +833,37 @@ async def test_ids_a_session_drew_ahead_before_the_install_land_above_the_bounda
         assert await _watermarks(setup_pool) == {}
         cache = await setup_pool.fetchval("SELECT seqcache FROM pg_sequence WHERE seqrelid = 'events_id_seq'::regclass")
         assert cache == 1
+
+
+async def test_the_backfill_waits_for_no_vault_it_sets_no_mark_for():
+    """Migration 134 locks only the Vaults it sets marks for.
+
+    It used to lock every Vault, so a long transaction on another Vault's
+    row, such as a delete, held up the backfill, and with it the server's
+    start.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        target = await _make_vault(setup_pool, "retention-backfill-target")
+        bystander = await _make_vault(setup_pool, "retention-backfill-bystander")
+        first = await _insert_event(setup_pool, target, "document.put", "alice")
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        backfill = _load_migration(_BACKFILL)
+        assert migration is not None and backfill is not None
+        async with setup_pool.acquire() as conn:
+            async with conn.transaction():
+                await migration.migrate(conn=conn)
+        holding = await asyncpg.connect(_database_dsn(database))
+        try:
+            # A delete of a Vault with no events holds its row.
+            deletion = holding.transaction()
+            await deletion.start()
+            await holding.execute("DELETE FROM vaults WHERE id = $1", bystander)
+            async with setup_pool.acquire() as conn:
+                await asyncio.wait_for(backfill.migrate(conn=conn), 2)
+            await deletion.rollback()
+        finally:
+            await holding.close()
+
+        assert await _watermarks(setup_pool) == {target: first - 1}
