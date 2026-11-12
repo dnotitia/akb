@@ -18,9 +18,14 @@ specifically; the proxy has its own log in
   promise. The cost: transactions that write events for the same Vault run one
   at a time from their event insert to their commit, and two of them can
   occasionally deadlock, in which case PostgreSQL rolls one back with `40P01`.
-  Writes insert their event as the last locking statement of the transaction
-  where they can, which keeps both rare. A Vault event uses two id values, so
-  ids leave gaps.
+  Writes insert their events after their last other locking statement, which
+  keeps both rare; this covers SQL admin overrides, Vault settings changes,
+  table migrations, enum value renames and app rollouts. A Vault event uses two
+  id values, so ids leave gaps. During a rolling deployment the first upgraded
+  process applies the migration, and processes still on the previous release
+  then take the same lock while some of them insert events before other
+  locking statements; until they are replaced, `40P01` is more likely. A
+  data-only restore needs `pg_restore --data-only --disable-triggers`.
 
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain

@@ -94,11 +94,19 @@ rows in batches and retries failures, so entries can arrive out of id order.
 Recognize a repeat by the envelope `id`.
 
 This ordering has a cost. Transactions that write events for the same Vault
-run one at a time from their event insert to their commit. AKB writes the
-event as the last locking statement of a transaction, so that span is short. A
-transaction that still waits for another lock after its event insert can
-deadlock with one that waits for the Vault; PostgreSQL then rolls one of them
+run one at a time from their event insert to their commit. AKB inserts a
+transaction's events after its last other locking statement — after the row
+writes, DDL and role changes of the same transaction — so that span is short.
+A transaction that still waited for another lock after its event insert could
+deadlock with one that waits for the Vault; PostgreSQL would roll one of them
 back with error `40P01`. Watch `pg_stat_database.deadlocks`.
+
+A full `pg_dump` / `pg_restore` creates the insert trigger after it loads the
+data, so restored events keep their ids. A data-only restore into a database
+that already has the trigger must disable triggers, as a superuser:
+`pg_restore --data-only --disable-triggers`. With the trigger active, every
+restored Vault event would receive a new id, and the restore transaction would
+take one lock per Vault until it commits.
 
 For collection events `resource_uri` may be null. Use the Vault identity and
 payload path, or conservatively invalidate the Vault. Relation declarations and
@@ -121,7 +129,10 @@ text/binary transitions. `test_events_commit_order_postgres.py` keeps one
 event-writing transaction open while a second writer of the same Vault tries
 to commit first, through `emit_event` and through the dynamic-table row
 trigger, and checks that a reader following the cursor receives both events in
-commit order.
+commit order. The `test_*_event_lock_postgres.py` suites check that SQL admin
+overrides, Vault settings changes, table migrations (enum value renames
+included) and app rollouts insert their events last, so a writer of the same
+Vault neither waits behind them nor deadlocks with them.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native
