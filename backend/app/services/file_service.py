@@ -949,6 +949,19 @@ class FileService:
                         await _cancel_s3_delete(conn, candidate_cleanup_id)
                         await _enqueue_s3_delete(conn, locked["s3_key"])
                         await _enqueue_s3_delete(conn, staging_key)
+                        await enqueue_native_file_projection(
+                            conn,
+                            file_id=fid,
+                            namespace_id=vault_id,
+                            collection=locked["collection"],
+                            name=locked["name"],
+                            mime_type=mime_type,
+                            content_hash=server_content_hash,
+                            byte_size=size_bytes,
+                            s3_key=final_key,
+                            actor=actor_id,
+                        )
+                        # Last locking statement (Vault event lock, migration 132).
                         await emit_event(
                             conn,
                             "file.update",
@@ -973,18 +986,6 @@ class FileService:
                                 "previous_version": previous_version,
                                 **_delegated_actor_event_fields(delegated_actor),
                             },
-                        )
-                        await enqueue_native_file_projection(
-                            conn,
-                            file_id=fid,
-                            namespace_id=vault_id,
-                            collection=locked["collection"],
-                            name=locked["name"],
-                            mime_type=mime_type,
-                            content_hash=server_content_hash,
-                            byte_size=size_bytes,
-                            s3_key=final_key,
-                            actor=actor_id,
                         )
                         result_row = {
                             **locked,
@@ -1181,6 +1182,12 @@ class FileService:
         size_bytes, server_content_hash = row["size_bytes"], row["content_hash"]
         etag, storage_version = row["etag"], row["storage_version"]
         vault_name = vault_row["name"] if vault_row else None
+        await enqueue_native_file_projection(
+            conn, file_id=fid, namespace_id=vault_id, collection=row["collection"],
+            name=row["name"], mime_type=row["mime_type"], content_hash=server_content_hash,
+            byte_size=size_bytes, s3_key=row["s3_key"], actor=actor_id,
+        )
+        # Last locking statement (Vault event lock, migration 132).
         await emit_event(
             conn, "file.put", vault_id=vault_id,
             resource_uri=file_uri(vault_name, file_id, collection=row["collection"]) if vault_name else None,
@@ -1192,11 +1199,6 @@ class FileService:
                 "etag": etag, "storage_version": storage_version,
                 **_delegated_actor_event_fields(delegated_actor),
             },
-        )
-        await enqueue_native_file_projection(
-            conn, file_id=fid, namespace_id=vault_id, collection=row["collection"],
-            name=row["name"], mime_type=row["mime_type"], content_hash=server_content_hash,
-            byte_size=size_bytes, s3_key=row["s3_key"], actor=actor_id,
         )
 
     async def cancel_upload(self, vault_id: uuid.UUID, file_id: str, *, actor_id: str) -> dict:
@@ -1530,7 +1532,16 @@ class FileService:
                 await delete_file_chunks(conn, file_id)
 
                 await _enqueue_s3_delete(conn, row["s3_key"])
+                await enqueue_native_file_projection_delete(
+                    conn,
+                    file_id=fid,
+                    namespace_id=vault_id,
+                    collection=row["collection"],
+                    name=row["name"],
+                    actor=actor_id,
+                )
 
+                # Last locking statement (Vault event lock, migration 132).
                 await emit_event(
                     conn, "file.delete",
                     vault_id=vault_id,
@@ -1546,14 +1557,6 @@ class FileService:
                         "s3_key": row["s3_key"],
                         "size_bytes": row["size_bytes"],
                     },
-                )
-                await enqueue_native_file_projection_delete(
-                    conn,
-                    file_id=fid,
-                    namespace_id=vault_id,
-                    collection=row["collection"],
-                    name=row["name"],
-                    actor=actor_id,
                 )
 
         logger.info("Deleted file %s (s3://%s/%s)", file_id, self._bucket, row["s3_key"])

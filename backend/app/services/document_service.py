@@ -808,6 +808,10 @@ class DocumentService:
             req.depends_on, req.related_to, [],
             req.content,
         )
+        await coll_repo.increment_count(collection_id, now, conn=conn)
+
+        # Last locking statement: the event insert takes the Vault's event
+        # lock until commit (migration 132), so nothing may wait after it.
         await emit_event(
             conn, "document.put",
             vault_id=vault_id,
@@ -824,8 +828,6 @@ class DocumentService:
                 "collection": normalized_collection,
             },
         )
-
-        await coll_repo.increment_count(collection_id, now, conn=conn)
 
         return DocumentPutResponse(
             uri=doc_uri(req.vault, file_path),
@@ -1792,17 +1794,6 @@ class DocumentService:
         # resolves to itself, not a tombstone).
         from app.repositories.document_repo import drop_aliases_for_resource
         await drop_aliases_for_resource(conn, vault_id, "document", pg_doc_id)
-        await emit_event(
-            conn, "document.delete",
-            vault_id=vault_id,
-            resource_uri=doc_uri(vault, file_path),
-            actor_id=agent_id,
-            payload={
-                "vault": vault,
-                "path": file_path,
-                "resource_id": str(pg_doc_id),
-            },
-        )
         # The row delete and the publication cascade are ONE call. That
         # cascade used to be an inline DELETE here (between migrations 022
         # and 058 publications had no `document_id`, so nothing cascaded),
@@ -1821,6 +1812,21 @@ class DocumentService:
 
         if collection_id:
             await coll_repo.decrement_count(collection_id, datetime.now(timezone.utc), conn=conn)
+
+        # Last locking statement, as in `_put_locked`: a put holding this
+        # collection row would otherwise wait for the Vault event lock while
+        # this delete waits for the row.
+        await emit_event(
+            conn, "document.delete",
+            vault_id=vault_id,
+            resource_uri=doc_uri(vault, file_path),
+            actor_id=agent_id,
+            payload={
+                "vault": vault,
+                "path": file_path,
+                "resource_id": str(pg_doc_id),
+            },
+        )
 
         logger.info("Document deleted: %s", file_path)
         return True

@@ -637,10 +637,12 @@ async def grant_access(
                 conn, vault["id"], target["id"], role,
                 source_key=source_key, granted_by=granter_uid, revision=revision,
             )
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
             # "the writer basis was recorded" and "this user is now a writer"
             # are different facts once bases can coexist, and only both
             # effective roles separate them. A subscriber that reads `role`
-            # alone would act on a change that did not happen.
+            # alone would act on a change that did not happen. The event is
+            # the last locking statement (Vault event lock, migration 132).
             await emit_event(
                 conn, "access.grant",
                 vault_id=vault["id"],
@@ -660,7 +662,6 @@ async def grant_access(
                     "applied": outcome.applied,
                 },
             )
-            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
 
     logger.info("Granted %s role to %s on vault %s", role, resolved_username, vault_name)
     return {
@@ -751,8 +752,10 @@ async def revoke_access(
                     conn, vault["id"], target["id"],
                     source_key=source_key, revision=revision,
                 )
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
             # `source_key: null` means every basis went — an administrator
             # removing the person, not a rule withdrawing its own reason.
+            # The event is the last locking statement (Vault event lock).
             await emit_event(
                 conn, "access.revoke",
                 vault_id=vault["id"],
@@ -771,7 +774,6 @@ async def revoke_access(
                     "applied": outcome.applied,
                 },
             )
-            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
 
     logger.info("Revoked access for %s on vault %s", resolved_username, vault_name)
     return {
@@ -1307,6 +1309,9 @@ async def transfer_ownership(
                 source_key=DIRECT_SOURCE_KEY, granted_by=new_owner["id"],
             )
             await remove_all_contributions(conn, vault["id"], new_owner["id"])
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], new_owner["id"])
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], vault["owner_id"])
+            # Last locking statement (Vault event lock, migration 132).
             await emit_event(
                 conn, "access.transfer_ownership",
                 vault_id=vault["id"],
@@ -1319,8 +1324,6 @@ async def transfer_ownership(
                     "to_user_id": str(new_owner["id"]),
                 },
             )
-            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], new_owner["id"])
-            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], vault["owner_id"])
 
     logger.info("Transferred ownership of %s to %s", vault_name, resolved_username)
     return {

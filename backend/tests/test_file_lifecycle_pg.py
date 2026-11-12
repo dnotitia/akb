@@ -389,13 +389,19 @@ async def test_failed_inspection_only_cleans_failed_pending_upload(
 async def test_confirmation_event_failure_rolls_back_transition(pool, vault_id, service, objects, monkeypatch):
     _, fid, _ = await seed(pool, vault_id, objects, state="pending")
     monkeypatch.setattr(fs, "emit_event", AsyncMock(side_effect=RuntimeError("event write failed")))
+    # The event is the transaction's last write, so the projection intent is
+    # written before it — inside the transaction the failed event rolls back.
+    projection_in_transaction: list[bool] = []
+    fs.enqueue_native_file_projection.side_effect = (
+        lambda conn, **_kw: projection_in_transaction.append(conn.is_in_transaction())
+    )
     with pytest.raises(RuntimeError, match="event write failed"):
         await service.confirm_upload(vault_id, str(fid), actor_id="tester")
     async with pool.acquire() as conn:
         row = await vault_files_repo.find_by_id(conn, vault_id, fid)
     assert row["upload_state"] == "pending"
     assert row["content_hash"] is None
-    fs.enqueue_native_file_projection.assert_not_awaited()
+    assert projection_in_transaction == [True]
     fs.index_file_metadata.assert_not_awaited()
 
 
