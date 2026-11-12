@@ -701,16 +701,9 @@ async def test_vector_check_that_fails_on_the_probe_connection_discards_it(main,
     assert postgres._readiness_conn is None  # the next ping opens a fresh one
 
 
-@pytest.mark.parametrize("stuck_in", ["query", "return"])
-async def test_pgvector_health_cut_off_terminates_the_connection_it_borrowed(stuck_in):
-    conn = SimpleNamespace(
-        fetchval=AsyncMock(side_effect=_hang) if stuck_in == "query" else AsyncMock(return_value=1),
-        terminate=MagicMock(),
-    )
-    pool = SimpleNamespace(
-        acquire=AsyncMock(return_value=conn),
-        release=AsyncMock(side_effect=_hang) if stuck_in == "return" else AsyncMock(),
-    )
+async def test_pgvector_health_cut_off_mid_query_terminates_the_connection_it_borrowed():
+    conn = SimpleNamespace(fetchval=AsyncMock(side_effect=_hang), terminate=MagicMock())
+    pool = SimpleNamespace(acquire=AsyncMock(return_value=conn), release=AsyncMock())
     check = asyncio.create_task(_pgvector(pool).health())
     await asyncio.sleep(0.01)
 
@@ -719,6 +712,25 @@ async def test_pgvector_health_cut_off_terminates_the_connection_it_borrowed(stu
         await check
 
     conn.terminate.assert_called_once()
+    pool.release.assert_not_awaited()
+
+
+async def test_pgvector_health_cut_off_while_returning_leaves_the_bounded_return_to_the_pool():
+    # Terminating mid-return could free the slot for another caller while the
+    # return still runs; the return is bounded instead.
+    from app.services.vector_store import pgvector
+
+    conn = SimpleNamespace(fetchval=AsyncMock(return_value=1), terminate=MagicMock())
+    pool = SimpleNamespace(acquire=AsyncMock(return_value=conn), release=AsyncMock(side_effect=_hang))
+    check = asyncio.create_task(_pgvector(pool).health())
+    await asyncio.sleep(0.01)
+
+    check.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await check
+
+    conn.terminate.assert_not_called()
+    pool.release.assert_awaited_once_with(conn, timeout=pgvector._HEALTH_RETURN_TIMEOUT_SECS)
 
 
 async def test_vector_check_of_a_store_on_the_main_database_runs_on_the_probe_connection(main, probe, monkeypatch):

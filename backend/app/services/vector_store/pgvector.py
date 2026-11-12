@@ -86,6 +86,9 @@ _VCHORD_MAX_MATERIALISED_ROWS = 10_000
 _SEARCH_CLEANUP_RESERVE_SECS = 0.1
 _SEARCH_PAYLOAD_RESERVE_SECS = 0.2
 _SEARCH_TERMINATE_GRACE_SECS = 0.01
+# How long returning the health check's connection may take before asyncpg
+# terminates it instead. A return normally needs one round trip.
+_HEALTH_RETURN_TIMEOUT_SECS = 2.0
 
 
 def _terminate_search_connection(conn) -> None:
@@ -850,9 +853,14 @@ class PgvectorStore:
         discard that connection when a statement on it fails or is cut off.
         Without `conn`, failures read as False.
 
-        A borrowed connection that does not finish the check and its return is
-        terminated rather than returned: asyncpg would hold its pool slot while
-        waiting, without limit, for the answer to a cancel request.
+        A borrowed connection whose query fails or is cut off is terminated
+        rather than returned: asyncpg would hold its pool slot while waiting,
+        without limit, for the answer to a cancel request. After a query that
+        answered, the return is bounded instead of cut short: asyncpg keeps
+        returning the connection after a cancellation and terminates it itself
+        if the return outlasts the bound. Terminating it from here mid-return
+        would free the slot for another caller while that return still runs,
+        and the return would then release the other caller's connection.
         """
         if conn is not None:
             await conn.fetchval("SELECT 1")
@@ -862,10 +870,10 @@ class PgvectorStore:
             borrowed = await pool.acquire()
             try:
                 await borrowed.fetchval("SELECT 1")
-                await pool.release(borrowed)
             except BaseException:
                 _terminate_search_connection(borrowed)
                 raise
+            await pool.release(borrowed, timeout=_HEALTH_RETURN_TIMEOUT_SECS)
             return True
         except Exception:  # noqa: BLE001
             return False

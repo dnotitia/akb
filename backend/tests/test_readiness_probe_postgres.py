@@ -42,6 +42,8 @@ _POOL_SIZE = 2
 # the real clock, so these tests do not fake time.
 _GRACE = 1.0
 _PAST_GRACE = _GRACE + 0.3
+# pgvector bounds returning its health check's connection by this much.
+_HEALTH_RETURN_BOUND = 2.0
 
 
 async def _can_connect() -> bool:
@@ -578,8 +580,8 @@ def _connections_held(pool: asyncpg.Pool) -> int:
     return pool.get_size() - pool.get_idle_size()
 
 
-async def _until_nothing_held(pool: asyncpg.Pool) -> None:
-    async with asyncio.timeout(2):
+async def _until_nothing_held(pool: asyncpg.Pool, within: float = 2.0) -> None:
+    async with asyncio.timeout(within):
         while _connections_held(pool):
             await asyncio.sleep(0.01)
 
@@ -653,7 +655,8 @@ async def test_vector_check_stuck_on_its_own_silent_connection_cannot_hold_ready
 async def test_vector_check_cut_off_while_returning_its_connection_leaves_nothing_held(monkeypatch, tmp_path):
     # The check's query answers, but returning the connection to the store's
     # own pool never finishes. The check is given up within its budget, and
-    # the connection is terminated rather than left held by that return.
+    # the return is bounded: once it outlasts the bound, asyncpg terminates the
+    # connection rather than leaving it held.
     never = asyncio.Event()
 
     async def reset_that_never_finishes(_conn) -> None:
@@ -673,7 +676,7 @@ async def test_vector_check_cut_off_while_returning_its_connection_leaves_nothin
             monkeypatch.setattr(main, "_READY_VECTOR_TIMEOUT_SECONDS", _GRACE)
 
             response = await db.client.get("/readyz")
-            await _until_nothing_held(own_pool)
+            await _until_nothing_held(own_pool, within=_HEALTH_RETURN_BOUND + 2.0)
     finally:
         never.set()
         if own_pool is not None:
@@ -681,6 +684,53 @@ async def test_vector_check_cut_off_while_returning_its_connection_leaves_nothin
 
     assert response.status_code == 200, response.text
     assert response.json()["detail"]["vector_store"] == "degraded:timeout"
+
+
+async def test_cut_off_vector_check_never_returns_a_later_borrowers_connection(monkeypatch, tmp_path):
+    # Returning the check's connection waits on a slow reset, and readiness
+    # gives the check up meanwhile. Another caller borrowing from the store's
+    # pool must get a connection that stays its own once that return ends.
+    reset_may_finish = asyncio.Event()
+
+    async def slow_reset(_conn) -> None:
+        await reset_may_finish.wait()
+
+    own_pool = None
+    try:
+        async with _ready_database(monkeypatch, tmp_path) as db:
+            main = db.main
+            own_dsn = _settings(db.name).asyncpg_dsn
+            store = _pgvector_store(dsn=own_dsn)
+            own_pool = await asyncpg.create_pool(dsn=own_dsn, min_size=1, max_size=1, reset=slow_reset)
+            store._own_pool = own_pool
+            monkeypatch.setattr(main, "get_vector_store", lambda: store)
+            monkeypatch.setattr(main, "_READY_VECTOR_TIMEOUT_SECONDS", _GRACE)
+
+            response = await db.client.get("/readyz")
+            borrowed = asyncio.Event()
+            query_now = asyncio.Event()
+
+            async def borrow_then_query():
+                async with own_pool.acquire() as conn:
+                    borrowed.set()
+                    await query_now.wait()
+                    return await conn.fetchval("SELECT 1")
+
+            borrower = asyncio.create_task(borrow_then_query())
+            await asyncio.sleep(0.1)
+            reset_may_finish.set()  # the earlier return finishes now
+            await asyncio.wait_for(borrowed.wait(), timeout=3)
+            await asyncio.sleep(0.1)  # whatever the earlier return still does, it has done
+            query_now.set()
+            answer = await asyncio.wait_for(borrower, timeout=3)
+    finally:
+        reset_may_finish.set()
+        if own_pool is not None:
+            own_pool.terminate()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["detail"]["vector_store"] == "degraded:timeout"
+    assert answer == 1
 
 
 async def test_request_acquire_completing_before_the_probe_waits_is_not_lost(ready_db, monkeypatch):

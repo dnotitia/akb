@@ -129,9 +129,9 @@ specifically; the proxy has its own log in
   request-pool connection, which readiness would then count against the
   pool: pgvector on the main database is checked on the probe's dedicated
   connection, which a failed check discards as a failed ping does. pgvector's
-  health check also terminates a borrowed connection
-  that it cannot finish with, at the query or while returning it, instead of
-  holding its pool slot.
+  health check also terminates a borrowed connection whose query fails or is
+  cut off, instead of holding its pool slot, and bounds the return of one
+  whose query answered.
 - When the request pool shows nothing that proves it could serve a request (no
   idle connection, room to open one, and no acquire within the grace),
   readiness takes one connection through it within the probe's remaining

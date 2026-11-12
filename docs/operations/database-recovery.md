@@ -90,10 +90,13 @@ without waiting for its cleanup. It never takes a request-pool connection: when
 the vector store is pgvector on the main database (no `vector_store_dsn`), the
 check runs on the probe's dedicated connection, and a failure there discards
 that connection like a failed ping, so the next probe starts on a fresh one; a
-store with a database of its own checks a connection from its own pool. A pgvector check that is cut off,
-during its query or while returning its connection, terminates that connection
+store with a database of its own checks a connection from its own pool. A
+pgvector check whose query fails or is cut off terminates that connection
 instead of returning it, because asyncpg can wait without limit for the answer
-to a cancel request and would hold the pool slot meanwhile. At most one vector
+to a cancel request and would hold the pool slot meanwhile. After a query that
+answered, returning the connection is bounded to 2 seconds rather than cut
+short: asyncpg finishes the return or terminates the connection itself, so the
+slot never goes to another caller while that return still runs. At most one vector
 check is outstanding: while one that was given up on is still finishing, later
 probes report `degraded:timeout` at once instead of starting another. One
 evaluation therefore ends within about 7 seconds, inside kubelet's 8-second
