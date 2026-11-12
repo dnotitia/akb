@@ -49,8 +49,14 @@ later event insert, of any Vault, behind it. So the migration first looks for
 the trigger and, when it is there, does nothing and asks for no lock.
 Otherwise it asks for the lock with a short timeout inside a savepoint, holds
 nothing while it backs off, and asks again; after a bounded number of attempts
-it stops with an error that names the cause. Under the lock the SQL looks for
-the trigger again, in case another session installed it meanwhile.
+it stops with an error that names the table it could not lock. The trigger on
+vaults needs SHARE ROW EXCLUSIVE on vaults as well. Waiting for that while
+holding the events lock would hold up every event write, and a transaction
+that changed a Vault and then writes its event, as a change of public access
+does, would wait for this while this waited for it; so once the events lock
+is held, the vaults lock is taken at once or the attempt rolls back and backs
+off like any other. Under the locks the SQL looks for the trigger again, in
+case another session installed it meanwhile.
 """
 
 import asyncio
@@ -62,6 +68,12 @@ LOCK_TIMEOUT = "500ms"
 ATTEMPTS = 40
 FIRST_BACKOFF_SECONDS = 0.25
 MAX_BACKOFF_SECONDS = 2.0
+# What keeps each lock the install needs from being granted, for its error.
+_BUSY = {
+    "events table": "a long transaction keeps writing events",
+    "vaults table": "a long transaction keeps a Vault changed",
+    "events id sequence": "a long transaction keeps the events id sequence in use",
+}
 TRIGGER_INSTALLED = """
     SELECT EXISTS (
         SELECT 1 FROM pg_trigger
@@ -82,13 +94,18 @@ async def migrate(conn=None):
         return
     sql = Path(__file__).with_suffix(".sql").read_text()
     backoff = FIRST_BACKOFF_SECONDS
+    blocked_on = "events table"
     for attempt in range(1, ATTEMPTS + 1):
         try:
             # A savepoint inside the migration runner's transaction: a timed-out
             # attempt rolls back to it and releases everything it took.
             async with conn.transaction():
                 await conn.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
+                blocked_on = "events table"
                 await conn.execute("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE")
+                blocked_on = "vaults table"
+                await conn.execute("LOCK TABLE vaults IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+                blocked_on = "events id sequence"
                 await conn.execute(sql)
             return
         except asyncpg.LockNotAvailableError:
@@ -97,7 +114,6 @@ async def migrate(conn=None):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
     raise RuntimeError(
-        f"migration 133 could not lock the events table in {ATTEMPTS} attempts of "
-        f"{LOCK_TIMEOUT}: a long transaction keeps writing events. End it and start "
-        "the server again."
+        f"migration 133 could not lock the {blocked_on} in {ATTEMPTS} attempts: "
+        f"{_BUSY[blocked_on]}. End it and start the server again."
     )

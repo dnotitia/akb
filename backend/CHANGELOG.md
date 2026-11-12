@@ -37,7 +37,8 @@ specifically; the proxy has its own log in
   records the highest deleted event id per Vault in every statement that
   deletes, whichever release issues it. It asks for its lock on `events` with
   a 500 ms timeout and backs off between attempts, so a long transaction that
-  wrote an event does not hold up other event writes during the upgrade, and
+  wrote an event does not hold up other event writes during the upgrade; it
+  takes the lock on `vaults` its other trigger needs only when it is free; and
   it reads no events under that lock: migration 134 sets the starting marks
   afterwards, without it. Recording a deletion reads and locks no Vault, so
   it never waits for a Vault's delete or cleanup; a Vault's delete removes its

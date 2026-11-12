@@ -1076,3 +1076,87 @@ async def test_a_vault_delete_and_a_sweep_take_marks_in_the_same_order():
                     await task
 
         assert await _watermarks(setup_pool) == {}
+
+
+async def test_an_open_vault_change_does_not_make_event_writes_wait_for_the_install(monkeypatch):
+    """While a Vault change is open, migration 133 must not hold the events lock waiting for vaults.
+
+    The trigger on vaults needs a lock there that an open change of a Vault
+    holds. The install waited for it with the events lock in hand, so every
+    event write, of any Vault, waited behind the install until its lock
+    timeout ended the attempt, on every attempt; a change of public access,
+    which writes its event after changing the Vault, waited for the install
+    while the install waited for it. The vaults lock is now taken at once or
+    the attempt rolls back.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        changed = await _make_vault(setup_pool, "retention-vault-change")
+        other = await _make_vault(setup_pool, "retention-vault-other")
+        await _as_before_the_migration(setup_pool)
+        await setup_pool.execute("DELETE FROM schema_migrations WHERE filename = $1", _MIGRATION)
+        migration = _load_migration(_MIGRATION)
+        assert migration is not None
+        monkeypatch.setattr(migration, "FIRST_BACKOFF_SECONDS", 0.05)
+        monkeypatch.setattr(migration, "MAX_BACKOFF_SECONDS", 0.1)
+        changing = await asyncpg.connect(_database_dsn(database))
+        writer = await asyncpg.connect(_database_dsn(database))
+        migrator = await asyncpg.connect(_database_dsn(database))
+        applying: asyncio.Task[None] | None = None
+        worst = 0.0
+        try:
+            change = changing.transaction()
+            await change.start()
+            await changing.execute("UPDATE vaults SET public_access = public_access WHERE id = $1", changed)
+            applying = asyncio.create_task(_run_one_migration(migrator, _MIGRATION, migration))
+            # Another Vault's event writes go on while the install keeps trying.
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                started = time.monotonic()
+                await _write_event(writer, other)
+                worst = max(worst, time.monotonic() - started)
+                await asyncio.sleep(0.02)
+            # So does the changed Vault's own event, written before its change commits.
+            started = time.monotonic()
+            await _write_event(changing, changed)
+            worst = max(worst, time.monotonic() - started)
+            # The install still waits for the Vault change to end.
+            assert not applying.done()
+            await change.commit()
+            await asyncio.wait_for(applying, 10)
+        finally:
+            if applying is not None and not applying.done():
+                applying.cancel()
+                with contextlib.suppress(BaseException):
+                    await applying
+            for conn in (changing, writer, migrator):
+                await conn.close()
+
+        assert worst < 0.25, f"an event write waited {worst:.2f}s for the install"
+        assert await _trigger_installed(setup_pool)
+
+
+async def test_the_install_names_the_vaults_table_when_a_vault_change_keeps_it_from_its_lock(monkeypatch):
+    """When the lock it cannot get is the vaults one, the error says so."""
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        vault_id = await _make_vault(setup_pool, "retention-vault-busy")
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        assert migration is not None
+        monkeypatch.setattr(migration, "ATTEMPTS", 3)
+        monkeypatch.setattr(migration, "FIRST_BACKOFF_SECONDS", 0.05)
+        changing = await asyncpg.connect(_database_dsn(database))
+        migrator = await asyncpg.connect(_database_dsn(database))
+        try:
+            change = changing.transaction()
+            await change.start()
+            await changing.execute("UPDATE vaults SET public_access = public_access WHERE id = $1", vault_id)
+            with pytest.raises(RuntimeError, match="could not lock the vaults table in 3 attempts"):
+                await asyncio.wait_for(migration.migrate(conn=migrator), 10)
+            await change.rollback()
+        finally:
+            await changing.close()
+            await migrator.close()
+
+        assert not await _trigger_installed(setup_pool)

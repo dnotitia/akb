@@ -175,8 +175,11 @@ would make every later event insert wait behind it, so the migration asks
 with a 500 ms lock timeout and holds nothing while it backs off between
 attempts (0.25 s, doubling to 2 s). A transaction that keeps an event it wrote
 open therefore holds up other event writes for at most about half a second at
-a time. After 40 attempts the migration stops the server's start with an error
-naming the cause; end the long transaction and start the server again.
+a time. The trigger it adds on `vaults` needs a lock there as well; once the
+migration holds the events lock it takes that one at once or backs off, so an
+open change of a Vault never makes event writes wait for the migration. After
+40 attempts the migration stops the server's start with an error naming the
+table it could not lock; end the long transaction and start the server again.
 
 All tail database work in a process, opening included, shares at most
 `event_tail_db_concurrency` connections. Work beyond that waits for a free
