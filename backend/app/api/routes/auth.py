@@ -628,7 +628,9 @@ async def keycloak_callback(
             return _sso_sign_in_failed()
     # State grants the choice; both signed tokens prove which one was used.
     # Admission and authoritative-domain policy must use that actual provider.
-    outcome = await project_verified_principal_with_reason(principal, provider_alias=actual_alias)
+    outcome = await project_verified_principal_with_reason(
+        principal, provider_alias=actual_alias, sync_profile=True,
+    )
     user = outcome.user
     if user is None:
         # The one place the reason is repeated, and only for the refusal the
