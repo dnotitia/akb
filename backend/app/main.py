@@ -435,7 +435,37 @@ _ready_state = _ReadyState()
 _ready_lock = asyncio.Lock()
 
 
-def _observe_pool(pool, state: _ReadyState) -> dict:
+@dataclass
+class _PoolObservation:
+    """One reading of the request pool. The verdict uses these values as
+    measured; only the public payload rounds them."""
+
+    size: int
+    max_size: int
+    idle: int
+    # None while the pool has room, which is not "saturated for 0 s".
+    saturated_for: float | None
+    # Whether the connections still change hands: a saturated pool that keeps
+    # completing acquires is busy, one that has stopped is wedged.
+    last_acquire_age: float | None
+
+    def payload(self) -> dict:
+        return {
+            "size": self.size,
+            "max": self.max_size,
+            "idle": self.idle,
+            # The earlier name of `idle`, kept for existing readers.
+            "free": self.idle,
+            "saturated_for_secs": _rounded(self.saturated_for),
+            "last_acquire_age_secs": _rounded(self.last_acquire_age),
+        }
+
+
+def _rounded(seconds: float | None) -> float | None:
+    return None if seconds is None else round(seconds, 3)
+
+
+def _observe_pool(pool, state: _ReadyState) -> _PoolObservation:
     """Read the request pool's occupancy without waiting for a connection.
 
     Saturated means every connection the pool may open is open and lent out.
@@ -448,23 +478,12 @@ def _observe_pool(pool, state: _ReadyState) -> dict:
         now = time.monotonic()
         if state.pool_saturated_since is None:
             state.pool_saturated_since = now
-        saturated_for = round(max(0.0, now - state.pool_saturated_since), 3)
+        saturated_for = max(0.0, now - state.pool_saturated_since)
     else:
         state.pool_saturated_since = None
-    acquires_total, last_acquire_age = pool_progress()
-    return {
-        "size": size,
-        "max": max_size,
-        "idle": idle,
-        # The earlier name of `idle`, kept for existing readers.
-        "free": idle,
-        # None while the pool has room, which is not "saturated for 0 s".
-        "saturated_for_secs": saturated_for,
-        # Whether the connections still change hands: a saturated pool that
-        # keeps completing acquires is busy, one that has stopped is wedged.
-        "acquires_total": acquires_total,
-        "last_acquire_age_secs": None if last_acquire_age is None else round(last_acquire_age, 3),
-    }
+    # The acquire count itself stays internal: the payload is public.
+    _, last_acquire_age = pool_progress()
+    return _PoolObservation(size, max_size, idle, saturated_for, last_acquire_age)
 
 
 def _pool_saturated_for(detail: dict | None) -> float | None:
@@ -472,18 +491,16 @@ def _pool_saturated_for(detail: dict | None) -> float | None:
     return pool.get("saturated_for_secs") if isinstance(pool, dict) else None
 
 
-def _pool_wedged(pool_detail: dict, grace: float) -> bool:
+def _pool_wedged(observed: _PoolObservation, grace: float) -> bool:
     """Saturated for the whole grace, with no acquire completed within it.
 
     A saturated pool whose connections keep changing hands stays ready however
     long it is saturated. With no acquire recorded at all (a pool built
     without the counting hook), the saturation run decides alone.
     """
-    saturated_for = pool_detail.get("saturated_for_secs")
-    if saturated_for is None or saturated_for < grace:
+    if observed.saturated_for is None or observed.saturated_for < grace:
         return False
-    last_acquire_age = pool_detail.get("last_acquire_age_secs")
-    return last_acquire_age is None or last_acquire_age >= grace
+    return observed.last_acquire_age is None or observed.last_acquire_age >= grace
 
 
 # A server at max_connections refuses the probe's own connection while the
@@ -557,14 +574,15 @@ async def _probe_ready() -> tuple[bool, dict]:
                 detail["db"] = vouched
     except Exception as e:  # noqa: BLE001 — no connection strings in a public probe
         detail["db"] = "error:timeout" if isinstance(e, TimeoutError) else "error:unavailable"
+    observed: _PoolObservation | None = None
     if pool is not None:
+        observed = _observe_pool(pool, _ready_state)
         # Pool stats help diagnose leaks and bursts, on a failed probe too.
-        detail["pool"] = _observe_pool(pool, _ready_state)
+        detail["pool"] = observed.payload()
     if detail["db"] not in _DB_READY:
         return False, detail
-    saturated_for = _pool_saturated_for(detail)
-    if saturated_for is not None:
-        if _pool_wedged(detail["pool"], settings.readyz_pool_saturation_grace_secs):
+    if observed is not None and observed.saturated_for is not None:
+        if _pool_wedged(observed, settings.readyz_pool_saturation_grace_secs):
             return False, detail
         # The soft vector check may borrow from this same pool (pgvector on
         # the main database does), so it would wait behind the saturation

@@ -247,7 +247,8 @@ async def test_saturated_pool_whose_connections_keep_changing_hands_stays_200(re
             pool = response.json()["detail"]["pool"]
             assert pool["size"] == pool["max"] and pool["idle"] == 0
             assert pool["last_acquire_age_secs"] < _GRACE
-            totals.append(pool["acquires_total"])
+            assert "acquires_total" not in pool  # the count stays internal
+            totals.append(postgres.pool_progress()[0])
     finally:
         await hands.stop()
 

@@ -145,7 +145,7 @@ async def test_pool_with_room_is_ready_and_reports_occupancy(main, probe):
     assert detail["db"] == "ok"
     assert detail["pool"] == {
         "size": 2, "max": 4, "idle": 1, "free": 1, "saturated_for_secs": None,
-        "acquires_total": 1, "last_acquire_age_secs": 0.0,
+        "last_acquire_age_secs": 0.0,
     }
     assert detail["vector_store"] == "ok"
     probe.ping.assert_awaited_once()
@@ -168,7 +168,7 @@ async def test_saturated_pool_within_grace_is_ready_and_skips_the_vector_check(m
     assert detail["db"] == "ok"
     assert detail["pool"] == {
         "size": 4, "max": 4, "idle": 0, "free": 0, "saturated_for_secs": 0.0,
-        "acquires_total": 1, "last_acquire_age_secs": 0.0,
+        "last_acquire_age_secs": 0.0,
     }
     # pgvector on the main database borrows from this same pool for its health
     # check, so running it here would queue behind the saturation.
@@ -207,7 +207,7 @@ async def test_saturated_pool_that_keeps_completing_acquires_stays_ready(main, p
         assert ok is True, detail
         assert detail["pool"]["last_acquire_age_secs"] == 0.0
     assert detail["pool"]["saturated_for_secs"] == 4 * GRACE
-    assert detail["pool"]["acquires_total"] == 5
+    assert probe.progress.total == 5
 
     # Once the connections stop changing hands, the grace runs out.
     probe.clock.now += GRACE
@@ -245,6 +245,41 @@ async def test_a_probe_that_finds_room_ends_the_saturation_run(main, probe):
     ok, detail = await main._probe_ready()
     assert ok is True
     assert detail["pool"]["saturated_for_secs"] == 0.0
+
+
+async def test_values_just_below_the_grace_are_judged_unrounded(main, probe):
+    # Both measures round to 30.0 in the payload, but neither has reached the
+    # grace: the verdict must not round.
+    _saturate(probe.pool)
+    assert (await main._probe_ready())[0] is True
+
+    probe.clock.now += GRACE - 0.0004  # no acquire since the start either
+
+    ok, detail = await main._probe_ready()
+    assert ok is True, detail
+    assert detail["pool"]["saturated_for_secs"] == GRACE
+    assert detail["pool"]["last_acquire_age_secs"] == GRACE
+
+
+async def test_acquire_just_inside_the_grace_keeps_a_long_saturated_pool_ready(main, probe):
+    _saturate(probe.pool)
+    assert (await main._probe_ready())[0] is True
+    probe.clock.now += 2 * GRACE
+    probe.progress.last_at = probe.clock.now - (GRACE - 0.0004)
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is True, detail
+    assert detail["pool"]["saturated_for_secs"] == 2 * GRACE
+    assert detail["pool"]["last_acquire_age_secs"] == GRACE  # rounded for display only
+
+
+async def test_public_payload_keeps_the_acquire_count_internal(main, probe):
+    ok, detail = await main._probe_ready()
+
+    assert ok is True
+    assert "acquires_total" not in detail["pool"]
+    assert probe.progress.total == 1
 
 
 async def test_zero_grace_fails_at_the_first_saturated_probe(main, probe, monkeypatch):

@@ -106,8 +106,9 @@ specifically; the proxy has its own log in
   (default 30) with no acquire completing in that time; the pool counts
   completed acquires in its `setup` hook. A value of 0 fails readiness at the
   first saturated probe and is not recommended. `detail.pool` adds `idle`,
-  `saturated_for_secs`, `acquires_total` and `last_acquire_age_secs`, keeps
-  `free`, and is also reported when the database check fails. While the pool
+  `saturated_for_secs` and `last_acquire_age_secs` and keeps `free`; it is
+  reported whenever the probe obtained the pool, including when the database
+  check fails. The acquire count stays internal. While the pool
   is saturated, a ready result is not cached and the soft vector check is
   skipped as `skipped:pool_saturated`. See
   `docs/operations/database-recovery.md`.

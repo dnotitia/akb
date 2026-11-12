@@ -120,15 +120,19 @@ every replica would leave the Service together and the burst would become a
 complete outage.
 
 Each probe reads the pool's occupancy without waiting for a connection and
-reports it in `detail.pool`:
+reports it in `detail.pool` whenever it obtained the pool, including when the
+database check fails:
 
 | Field | Meaning |
 | --- | --- |
 | `size`, `max`, `idle` |Open connections, the pool's limit, and open connections not checked out.|
 | `free` |Earlier name of `idle`, kept for existing readers.|
 | `saturated_for_secs` |Time since the first of the consecutive probes that found the pool saturated; `null` when the last probe found room.|
-| `acquires_total` |Acquires the pool has completed since the process started.|
 | `last_acquire_age_secs` |Seconds since the latest completed acquire; `null` before the first.|
+
+The payload rounds these values to milliseconds; readiness decides on the
+values as measured. The count of completed acquires stays internal, because
+`/readyz` is public.
 
 A saturated pool whose connections keep changing hands is busy, not wedged,
 and stays ready however long it is saturated. Readiness fails only when the
