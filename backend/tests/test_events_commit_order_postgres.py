@@ -168,13 +168,21 @@ async def _waits_for(
     waiter: asyncpg.Connection,
     holder: asyncpg.Connection,
 ) -> bool:
-    """True once ``waiter`` is blocked by ``holder``; False if ``task`` ends first."""
+    """True once ``waiter`` waits for ``holder``; False if ``task`` ends first.
+
+    A waiter is either blocked on a lock ``holder`` holds, or sleeping in the
+    Vault lock's poll (`akb_lock_vault_events`), which takes no lock-manager
+    wait and is the only sleep in these sessions.
+    """
     while not task.done():
-        if await observer.fetchval(
-            "SELECT $2 = ANY(pg_blocking_pids($1))",
+        state = await observer.fetchrow(
+            "SELECT $2 = ANY(pg_blocking_pids($1)) AS blocked, "
+            "coalesce(wait_event = 'PgSleep', false) AS polling "
+            "FROM pg_stat_activity WHERE pid = $1",
             waiter.get_server_pid(),
             holder.get_server_pid(),
-        ):
+        )
+        if state is not None and (state["blocked"] or state["polling"]):
             return True
         await asyncio.sleep(0.01)
     return False
@@ -410,6 +418,42 @@ async def test_waiting_for_a_busy_vault_is_bounded():
                 "SELECT count(*) FROM events WHERE vault_id = $1 AND payload->>'marker' = 'waiter'",
                 vault_id,
             ) == 0
+
+
+async def test_a_waiter_behind_another_waiter_gives_up_at_the_same_deadline():
+    """The bound is one deadline per insert. A per-lock timeout would let a
+    waiter queued behind another waiter wait once for that waiter and again for
+    the holder."""
+    async with _fresh_database() as pool:
+        vault_id = await _make_vault(pool, "order-deadline")
+        # The Vault's lock row exists, as it does after its first event; the
+        # waiters then queue on the row itself, the second behind the first.
+        async with pool.acquire() as conn:
+            await _write_and_commit(conn, lambda c: _emit(c, vault_id, "earlier"))
+
+        async def wait(conn: asyncpg.Connection, marker: str) -> float:
+            started = time.monotonic()
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                await _write_and_commit(conn, lambda c: _emit(c, vault_id, marker))
+            return time.monotonic() - started
+
+        async with (
+            pool.acquire() as holder,
+            pool.acquire() as first,
+            pool.acquire() as second,
+        ):
+            async with _OpenTransaction(holder):
+                await _emit(holder, vault_id, "holder")
+                first_wait = asyncio.create_task(wait(first, "first"))
+                await asyncio.sleep(0.2)
+                second_wait = await asyncio.wait_for(
+                    wait(second, "second"), timeout=_EVENT_LOCK_WAIT_SECONDS * 3,
+                )
+                first_waited = await asyncio.wait_for(first_wait, timeout=_UNBLOCKED_SECONDS)
+        assert first_waited <= _EVENT_LOCK_WAIT_SECONDS + 0.5
+        assert second_wait <= _EVENT_LOCK_WAIT_SECONDS + 0.5, (
+            f"the second waiter waited {second_wait:.2f}s"
+        )
 
 
 async def test_events_of_different_vaults_do_not_wait_for_each_other():

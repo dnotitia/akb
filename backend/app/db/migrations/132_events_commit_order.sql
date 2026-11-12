@@ -13,11 +13,16 @@
 -- otherwise hold a Vault's key and stall that Vault's writes. A Vault's row
 -- is created by its first event.
 --
--- An insert waits at most 5 seconds for the Vault's earlier event-writing
--- transactions (`lock_timeout` on the trigger function). Past that it fails
--- with SQLSTATE 55P03 and its transaction rolls back; the API reports a
--- retryable `write_busy`. A busy Vault therefore cannot hold pooled
--- connections until the statement timeout.
+-- An insert waits at most 5 seconds in total for the Vault's earlier
+-- event-writing transactions. `akb_lock_vault_events` polls the row with
+-- `FOR UPDATE SKIP LOCKED` against one deadline; `lock_timeout` would apply
+-- to each lock wait separately, and a waiter queued behind another waiter
+-- waits twice. Past the deadline it fails with SQLSTATE 55P03 and its
+-- transaction rolls back; the API reports a retryable `write_busy`. Polling
+-- gives up first-come order among waiters, and a lock cycle through the Vault
+-- row ends at the deadline rather than by deadlock detection. The function is
+-- also called before a bare Git write commits to Git, so the lock is held
+-- before the commit; the trigger then finds it already held.
 --
 -- The trigger draws every id. The column keeps no default, because defaults
 -- are evaluated before BEFORE triggers and a default would spend a second
@@ -30,6 +35,40 @@
 CREATE TABLE IF NOT EXISTS public.vault_event_order (
     vault_id UUID PRIMARY KEY
 );
+
+CREATE OR REPLACE FUNCTION public.akb_lock_vault_events(target UUID)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+-- Bounds the one wait outside the polling loop: a concurrent first event of
+-- the same Vault that inserted the row and has not committed yet.
+SET lock_timeout = '5s'
+AS $function$
+DECLARE
+    deadline timestamptz := clock_timestamp() + interval '5 seconds';
+    pause float8 := 0.002;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM public.vault_event_order WHERE vault_id = target) THEN
+        INSERT INTO public.vault_event_order (vault_id) VALUES (target)
+            ON CONFLICT (vault_id) DO NOTHING;
+    END IF;
+    LOOP
+        -- A row this transaction already locked is not skipped.
+        PERFORM 1 FROM public.vault_event_order
+         WHERE vault_id = target
+           FOR UPDATE SKIP LOCKED;
+        IF FOUND THEN
+            RETURN;
+        END IF;
+        IF clock_timestamp() >= deadline THEN
+            RAISE EXCEPTION 'events of Vault % have been locked by another transaction for 5 seconds', target
+                USING ERRCODE = 'lock_not_available';
+        END IF;
+        PERFORM pg_sleep(pause);
+        pause := least(pause * 2, 0.02);
+    END LOOP;
+END
+$function$;
 
 DO $migration$
 DECLARE
@@ -53,15 +92,10 @@ BEGIN
         CREATE OR REPLACE FUNCTION public.akb_events_commit_order()
         RETURNS trigger
         LANGUAGE plpgsql
-        SET lock_timeout = '5s'
         AS $function$
         BEGIN
             IF NEW.vault_id IS NOT NULL THEN
-                INSERT INTO public.vault_event_order (vault_id) VALUES (NEW.vault_id)
-                    ON CONFLICT (vault_id) DO NOTHING;
-                PERFORM 1 FROM public.vault_event_order
-                 WHERE vault_id = NEW.vault_id
-                   FOR UPDATE;
+                PERFORM public.akb_lock_vault_events(NEW.vault_id);
             END IF;
             NEW.id := pg_catalog.nextval(%L::regclass);
             RETURN NEW;
