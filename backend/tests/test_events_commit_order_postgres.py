@@ -34,8 +34,8 @@ _MIGRATION = "132_events_commit_order.py"
 # A writer that nothing holds back finishes well within this.
 _BLOCK_PROBE_SECONDS = 0.5
 _UNBLOCKED_SECONDS = 10.0
-# The longest an event insert waits for its Vault (`lock_timeout` on the
-# ordering trigger function, migration 132).
+# The longest a transaction waits for its Vault's event lock (the deadline in
+# `akb_lock_vault_events`, migration 132).
 _EVENT_LOCK_WAIT_SECONDS = 5.0
 
 
@@ -655,6 +655,29 @@ async def test_migration_upgrades_a_database_with_existing_events():
         assert delivered == [event_id for event_id, _, _ in committed]
         assert [marker for _, _, marker in committed] == ["after-first", "after-second"]
         assert second_was_waiting
+
+
+async def test_ids_a_session_cached_before_the_migration_are_not_drawn_after_it():
+    """With a sequence cache above 1 a session reserves a block of ids at its
+    first draw, and could later draw an id below one another session drew in
+    between. The migration sets the cache to 1. PostgreSQL then gives the
+    sequence new storage, and a session that still holds a block drops it at
+    its next draw instead of using it."""
+    async with _fresh_database() as pool:
+        from app.db import postgres as postgres_module
+
+        vault_id = await _make_vault(pool, "order-cached-block")
+        async with pool.acquire() as conn:
+            await _undo_migration_132(conn)
+            await conn.execute("ALTER SEQUENCE events_id_seq CACHE 20")
+        async with pool.acquire() as early, pool.acquire() as late:
+            # `early` draws before the migration, as a previous-release
+            # process does, and keeps the rest of its block.
+            before = await _emit(early, vault_id, "early, before the migration")
+            await postgres_module._apply_migrations()
+            after = await _emit(late, vault_id, "late, after the migration")
+            again = await _emit(early, vault_id, "early, after the migration")
+        assert before < after < again
 
 
 async def _blocked_by(observer: asyncpg.Connection, waiter: asyncpg.Connection, holder: asyncpg.Connection) -> None:
