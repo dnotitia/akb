@@ -20,9 +20,11 @@ import asyncpg
 import pytest
 
 from app.db.transient import transient_error
+from app.exceptions import NotFoundError
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
+from app.services.collection_service import CollectionService
 from app.services.document_service import DocumentService
 from app.services.git_service import GitService
 from app.util.errors import WRITE_BUSY
@@ -219,3 +221,60 @@ async def test_a_lock_timeout_after_the_git_commit_is_not_write_busy(tmp_path):
         assert transient_error(failure.value) is None
         # The lock wait came after the Git commit.
         assert git.current_commit(vault) != head
+
+
+async def _blocked_backends(observer) -> set[int]:
+    """Sessions of this database that wait for a lock another session holds."""
+    rows = await observer.fetch(
+        "SELECT pid FROM pg_stat_activity "
+        "WHERE datname = current_database() AND cardinality(pg_blocking_pids(pid)) > 0",
+    )
+    return {row["pid"] for row in rows}
+
+
+async def _until_blocked(observer, count: int) -> None:
+    while len(await _blocked_backends(observer)) < count:
+        await asyncio.sleep(0.01)
+
+
+async def test_a_metadata_update_and_a_collection_delete_lock_in_one_order(tmp_path):
+    """A recursive collection delete locks the collection and then the
+    documents in it. An update that held its document while it asked for the
+    collection deadlocked with it. Here the delete queues for the collection
+    first and the update second; the update must not hold the document while
+    it waits."""
+    git = GitService(storage_path=str(tmp_path))
+    documents = DocumentService(git=git)
+    collections = CollectionService(git=git)
+    async with _fresh_database() as pool:
+        vault = "git-lock-collection-delete"
+        vault_id = await _make_vault(pool, vault)
+        git.init_vault(vault)
+        doc = await documents.put(DocumentPutRequest(
+            vault=vault, collection="notes", title="First", content="first body",
+        ))
+        collection_id = await pool.fetchval(
+            "SELECT id FROM collections WHERE vault_id = $1 AND path = 'notes'", vault_id,
+        )
+        async with pool.acquire() as gate, pool.acquire() as observer:
+            async with _OpenTransaction(gate):
+                await gate.execute("SELECT 1 FROM collections WHERE id = $1 FOR UPDATE", collection_id)
+                deleting = asyncio.create_task(collections.delete(
+                    vault=vault, path="notes", recursive=True, agent_id="tester",
+                ))
+                await asyncio.wait_for(_until_blocked(observer, 1), timeout=10)
+                updating = asyncio.create_task(documents.update(
+                    vault, doc.path, DocumentUpdateRequest(title="Renamed"),
+                ))
+                await asyncio.wait_for(_until_blocked(observer, 2), timeout=10)
+            # The gate is gone; the delete gets the collection first.
+            deleted, updated = await asyncio.wait_for(
+                asyncio.gather(deleting, updating, return_exceptions=True),
+                timeout=_EVENT_LOCK_WAIT_SECONDS * 4,
+            )
+        assert not isinstance(deleted, BaseException), repr(deleted)
+        # The collection delete removed the document before the update could lock it.
+        assert isinstance(updated, NotFoundError), repr(updated)
+        assert await pool.fetchval("SELECT count(*) FROM documents WHERE vault_id = $1", vault_id) == 0
+        assert git.read_file(vault, doc.path) is None
+

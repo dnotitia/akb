@@ -82,7 +82,7 @@ async def test_put_locks_its_collection_then_the_event_lock_before_its_git_commi
     )
 
     assert calls == [
-        "publications", "lock_collection_rows", "lock_vault_events", "git_commit",
+        "lock_collection_rows", "publications", "lock_vault_events", "git_commit",
         "increment_count", "emit_event",
     ]
 
@@ -116,8 +116,10 @@ async def test_delete_locks_its_rows_then_the_event_lock_before_its_git_delete(m
         agent_id="tester", doc_repo=_Documents(), coll_repo=_Collections(), conn=_CONN,
     )
 
+    # The collection and document rows are locked by `delete()` before this.
     assert calls == [
-        "lock_collection_rows", "lock_resource_edges", "lock_vault_events", "git_delete",
+        "lock_resource_edges", "lock_vault_events", "git_delete",
         "chunks", "relations", "aliases", "delete_with_publications", "decrement_count",
         "emit_event",
     ]
+
