@@ -727,12 +727,14 @@ class _CheckFailed(Exception):
 
     It shows nothing either way about access, so it counts as a slow check:
     retried before a frame, up to _MAX_STALE_ACCESS_CHECKS in a row. ``rows``
-    are the rows its pass read, still to be sent.
+    are the rows its pass read, still to be sent, and ``attempted_at`` the
+    loop time the check started.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.rows: list[dict[str, Any]] = []
+        self.attempted_at = -math.inf
 
 
 async def _confirm_start(checked_at: float, *, user_id: str, vault: str, vault_id: UUID | str) -> float:
@@ -803,6 +805,7 @@ async def _read_pass(
             await _require_access(conn, user_id=user_id, vault=vault, vault_id=vault_id)
         except _CheckFailed as failed:
             failed.rows = rows
+            failed.attempted_at = checked_at
             raise
     return rows, checked_at
 
@@ -811,7 +814,11 @@ async def _recheck_access(*, user_id: str, vault: str, vault_id: UUID | str) -> 
     """Check access again on a borrowed connection; returns the loop time it started."""
     async with _tail_db_connection() as conn:
         checked_at = asyncio.get_running_loop().time()
-        await _require_access(conn, user_id=user_id, vault=vault, vault_id=vault_id)
+        try:
+            await _require_access(conn, user_id=user_id, vault=vault, vault_id=vault_id)
+        except _CheckFailed as failed:
+            failed.attempted_at = checked_at
+            raise
     return checked_at
 
 
@@ -844,25 +851,30 @@ def _row_frame(
 class _StreamClock:
     """The times a stream's access checks and heartbeats are measured from."""
 
-    __slots__ = ("checked_at", "check_covered_a_frame", "last_frame_at", "last_heartbeat_at")
+    __slots__ = ("attempted_at", "checked_at", "check_covered_a_frame", "last_frame_at", "last_heartbeat_at")
 
     def __init__(self, *, checked_at: float, now: float) -> None:
         # When the last passed access check started, and whether a frame has
-        # been sent on it since.
+        # been sent on it since. Only a passed check covers rows.
         self.checked_at = checked_at
         self.check_covered_a_frame = False
+        # When the last check started, passed or not: one that a database
+        # fault kept from being made was still attempted.
+        self.attempted_at = checked_at
         # When the last frame, a heartbeat included, was sent, and the last heartbeat.
         self.last_frame_at = now
         self.last_heartbeat_at = -math.inf
 
     @property
     def check_owed(self) -> bool:
-        """Whether a heartbeat went out after the last access check started.
+        """Whether a heartbeat went out after the last access check was attempted.
 
         A stream that receives no rows checks nothing on its own, so after each
-        heartbeat it owes a check, even when the batch it reads is empty.
+        heartbeat it owes one check, even when the batch it reads is empty. A
+        check that could not be made settles that heartbeat's: it is tried
+        again after the next heartbeat, not at once.
         """
-        return self.checked_at < self.last_heartbeat_at
+        return self.attempted_at < self.last_heartbeat_at
 
 
 async def _heartbeats_while(task: asyncio.Future[Any], clock: _StreamClock) -> AsyncGenerator[str, None]:
@@ -912,9 +924,11 @@ async def _renew_access(
                 yield heartbeat
         try:
             clock.checked_at = recheck.result()
-        except _CheckFailed:
+        except _CheckFailed as failed:
+            clock.attempted_at = failed.attempted_at
             slow_checks += 1
             continue
+        clock.attempted_at = clock.checked_at
         clock.check_covered_a_frame = False
         if loop.time() - clock.checked_at <= _RECHECK_DURING_YIELD_SECONDS:
             return
@@ -980,8 +994,6 @@ async def _stream_events(
             clock = _StreamClock(checked_at=checked_at, now=loop.time())
             clock.check_covered_a_frame = True
             current_position = position
-            # The heartbeat the last extra check was made for: one per heartbeat.
-            checked_for_heartbeat = -math.inf
 
             while True:
                 if await request.is_disconnected():
@@ -1007,13 +1019,14 @@ async def _stream_events(
                     return
                 except _CheckFailed as failed:
                     rows, pass_checked_at = failed.rows, None
+                    clock.attempted_at = failed.attempted_at
                     if rows:
                         # No check covers these rows. Each is renewed before it
                         # is sent, this failure counting as the first slow check.
                         clock.checked_at = -math.inf
                         clock.check_covered_a_frame = False
                 if pass_checked_at is not None:
-                    clock.checked_at = pass_checked_at
+                    clock.checked_at = clock.attempted_at = pass_checked_at
                     clock.check_covered_a_frame = False
 
                 for row in rows:
@@ -1035,12 +1048,13 @@ async def _stream_events(
                     clock.check_covered_a_frame = True
                 if rows:
                     continue
-                if clock.check_owed and clock.last_heartbeat_at > checked_for_heartbeat:
-                    # A heartbeat went out while this pass ran, after its check
-                    # if it made one: check now rather than a heartbeat later.
-                    # Only a newer heartbeat calls for another, so a database
-                    # slower than the heartbeat interval cannot loop here.
-                    checked_for_heartbeat = clock.last_heartbeat_at
+                if clock.check_owed:
+                    # A heartbeat went out while this pass ran, after the last
+                    # check was attempted: check now rather than a heartbeat
+                    # later. Each attempt settles the heartbeats before it,
+                    # passed or not, so there is one per heartbeat, and a
+                    # database slower than the heartbeat interval or failing
+                    # cannot loop here.
                     continue
 
                 remaining = max(

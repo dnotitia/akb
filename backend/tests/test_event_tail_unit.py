@@ -1065,6 +1065,56 @@ async def test_a_heartbeat_during_the_extra_check_calls_for_another(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_an_idle_check_a_database_fault_prevents_is_tried_once_per_heartbeat(monkeypatch, hub) -> None:
+    """A failed idle check waits for the next heartbeat.
+
+    It shows nothing about access, so it is made again, but not at once: the
+    stream used to run another pass straight after the failure, two checks
+    for every heartbeat.
+    """
+    from app.services import event_tail_service
+
+    pool, _connection, request = _stream_test_doubles()
+    heartbeat = 0.3
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "HEARTBEAT_INTERVAL_SECONDS", heartbeat)
+    monkeypatch.setattr(event_tail_service, "list_vault_events", AsyncMock(return_value=[]))
+    loop = asyncio.get_running_loop()
+    attempts: list[float] = []
+
+    async def unreachable(*_args: Any, _conn: Any, **_kwargs: Any) -> dict[str, Any]:
+        attempts.append(loop.time())
+        raise ConnectionResetError("connection reset by peer")
+
+    monkeypatch.setattr(event_tail_service, "check_vault_access", unreachable)
+    stream = event_tail_service._stream_events(
+        request,
+        user_id="user",
+        vault="vault",
+        vault_id=VAULT_ID,
+        kinds=(),
+        position=0,
+        codec=EventCursorCodec("cursor-secret"),
+        start_frame=_checkpoint_at(0),
+        checked_at=loop.time(),
+    )
+    heartbeats: list[float] = []
+    try:
+        assert await anext(stream) == _checkpoint_at(0)
+        for _ in range(4):
+            assert await anext(stream) == format_heartbeat()
+            heartbeats.append(loop.time())
+    finally:
+        await stream.aclose()
+
+    # Nothing before the first heartbeat, then one attempt after each.
+    assert all(at >= heartbeats[0] for at in attempts)
+    for earlier, later in zip(heartbeats, heartbeats[1:]):
+        assert len([at for at in attempts if earlier <= at < later]) == 1, (attempts, heartbeats)
+    assert pool.checked_out == 0
+
+
+@pytest.mark.asyncio
 async def test_heartbeats_keep_flowing_while_a_slow_pass_runs(monkeypatch, hub) -> None:
     """A batch read or its check can take longer than a heartbeat interval; the heartbeat does not wait."""
     from app.services import event_tail_service
