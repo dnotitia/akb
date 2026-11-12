@@ -475,6 +475,44 @@ async def test_request_progress_wins_when_the_probes_extra_connection_is_refused
     assert detail["db"] == "ok"
 
 
+async def test_probe_connection_obtained_alongside_a_request_goes_back_to_the_pool(main, probe, monkeypatch):
+    # Both the request's acquire and the probe's own succeed together; the
+    # request's proves the pool, and the probe's working connection is
+    # returned, not thrown away.
+    _unproven(probe)
+    both = asyncio.Event()
+
+    async def acquired_with_the_request(*, timeout=None):
+        probe.pool.acquire_timeouts.append(timeout)
+        await both.wait()
+        return probe.pool.idle_conn
+
+    async def request_acquires() -> None:
+        await both.wait()
+        await postgres._count_acquire(object())
+
+    monkeypatch.setattr(postgres, "_acquires_total", 0)
+    monkeypatch.setattr(postgres, "_last_acquire_at", None)
+    monkeypatch.setattr(probe.pool, "acquire", acquired_with_the_request)
+    request = asyncio.get_running_loop().create_task(request_acquires(), context=contextvars.Context())
+
+    async def release_both() -> None:
+        while not probe.pool.acquire_timeouts:
+            await asyncio.sleep(0.005)
+        both.set()
+
+    releaser = asyncio.create_task(release_both())
+    ok, detail = await main._probe_ready()
+    await asyncio.gather(request, releaser)
+
+    assert ok is True, detail
+    assert detail["db"] == "ok"
+    (release_timeout,) = probe.pool.release_timeouts
+    assert release_timeout is not None and 0 < release_timeout <= main._READY_DB_TIMEOUT_SECONDS
+    probe.pool.idle_conn.terminate.assert_not_called()
+    probe.pool.idle_conn.fetchval.assert_not_awaited()
+
+
 @pytest.mark.parametrize("evidence", ["idle", "recent_acquire", "saturated"])
 async def test_pool_that_shows_it_works_is_not_borrowed_from(main, probe, evidence):
     _unproven(probe)

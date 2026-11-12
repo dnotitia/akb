@@ -130,7 +130,10 @@ the pool cannot open it, readiness reports `db: error:pool_unavailable`, or
 `db: error:pool_timeout` when it does not answer in time. An acquire completed
 by a request or background work after the probe decided to check the pool
 proves the pool too: it ends the probe's wait, and it wins even when the server
-refuses the probe's own extra connection at the same moment. So a probe queued
+refuses the probe's own extra connection at the same moment. A connection the
+probe has already obtained by then goes back to the pool within the probe's
+budget instead of being closed, so the pool does not lose a server slot to the
+probe. So a probe queued
 behind a request whose connection is still opening does not report a working
 pool as broken.
 

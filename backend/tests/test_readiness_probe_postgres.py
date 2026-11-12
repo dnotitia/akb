@@ -806,6 +806,48 @@ async def test_request_progress_wins_over_the_refusal_of_the_probes_extra_connec
     assert response.json()["detail"]["db"] == "ok"
 
 
+async def test_probe_connection_obtained_alongside_a_request_goes_back_to_the_pool(monkeypatch, tmp_path):
+    # At the role's connection limit, the request's connection and the probe's
+    # extra one both open together. The request's acquire proves the pool; the
+    # probe's working connection is returned to it, so the pool keeps both.
+    async with _ready_database(monkeypatch, tmp_path, role_connection_limit=_POOL_SIZE + 1) as db:
+        main = db.main
+        monkeypatch.setattr(main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+        assert (await db.client.get("/readyz")).status_code == 200  # opens the probe connection
+        gated = _GatedConnect()
+        pool = await _swap_in_a_gated_pool(db, monkeypatch, gated, max_size=2)
+        hold = asyncio.Event()
+        try:
+            await asyncio.sleep(_PAST_GRACE)
+
+            async def serve_a_request() -> None:
+                async with pool.acquire():
+                    await hold.wait()
+
+            request = asyncio.create_task(serve_a_request())
+            await gated.until_parked(1)
+
+            async def open_both_together() -> None:
+                await gated.until_parked(2)  # the probe's extra connection is open as well
+                gated.release()
+
+            opener = asyncio.create_task(open_both_together())
+            main._ready_state.ts -= 31  # past the success cache
+            response = await db.client.get("/readyz")
+            await opener
+            size_after = pool.get_size()
+            hold.set()
+            await request
+        finally:
+            hold.set()
+            gated.release()
+            pool.terminate()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["detail"]["db"] == "ok"
+    assert size_after == 2
+
+
 async def test_pool_that_can_no_longer_open_connections_is_not_ready(monkeypatch, tmp_path):
     # The probe's own connection is opened first. Then the pool's connections
     # end, and the server lets the role keep only that one: requests could not

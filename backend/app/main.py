@@ -607,11 +607,34 @@ async def _acquire_unless_another_caller_does(pool: asyncpg.Pool, budget: asynci
             _abandon_acquire(acquiring)
             raise
         if progressed.done() or _progressed_since(progress_since):
-            _abandon_acquire(acquiring)
+            await _stand_down(pool, acquiring, budget)
             return None
         return acquiring.result()
     finally:
         forget_pool_progress_waiter(progressed)
+
+
+async def _stand_down(pool: asyncpg.Pool, acquiring: asyncio.Future, budget: asyncio.Timeout) -> None:
+    """Another caller proved the pool, so the probe needs no connection.
+
+    One the probe already holds goes back to the pool within the rest of the
+    budget: terminating a working connection would cost the pool a server
+    slot that the server, at its connection limit, may not give back. It is
+    terminated only when the budget is gone or the return fails. An acquire
+    still pending is abandoned.
+    """
+    if not acquiring.done() or acquiring.cancelled() or acquiring.exception() is not None:
+        _abandon_acquire(acquiring)
+        return
+    conn = acquiring.result()
+    left = _remaining(budget)
+    if left is not None and left <= 0:
+        _terminate_pool_connection(conn)
+        return
+    try:
+        await pool.release(conn, timeout=left)
+    except Exception:  # noqa: BLE001 — the pool is proven either way
+        _terminate_pool_connection(conn)
 
 
 def _progressed_since(count: int) -> bool:

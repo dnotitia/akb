@@ -140,7 +140,8 @@ specifically; the proxy has its own log in
   even while the probe's own connection still answers. An acquire that a
   request or background work completes after the probe decided to check the
   pool proves the pool and ends the wait, also when the server refuses the
-  probe's extra connection at the same moment.
+  probe's extra connection at the same moment. A connection the probe already
+  holds by then goes back to the pool within the probe's budget.
 - When the server refuses the readiness probe's connection at
   `max_connections`, readiness asks the pool instead. With an idle connection
   it runs `SELECT 1` on that connection within the probe's remaining budget
