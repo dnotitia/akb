@@ -11,26 +11,36 @@ This runs in its own transaction, after migration 133's has committed, and
 reads events without the lock that stops writes, so its scan, however long,
 holds up no event insert. It is correct without that lock:
 
-- Every deletion committed after migration 133 is recorded by the trigger,
-  in the deleting statement, as a mark at least as high as the deleted id.
-- The marks here come only from events at or below the boundary, the highest
-  id when the trigger was installed. A Vault whose events all came later,
-  such as one that was empty then, gets no mark from here, so a cursor taken
-  while it was empty is not refused.
-- Each mark is just below the earliest such event this statement still sees.
-  A delete committed before its snapshot raised the trigger's mark already,
-  and the events it removed are not seen. A delete committed after the
-  snapshot has its mark merged either way: if its trigger wrote the row
-  first, ON CONFLICT reads the newest committed row and GREATEST keeps the
-  higher mark; if this statement wrote the row first, the trigger waits for
-  it to commit and applies GREATEST itself.
+- Every mark that exists when this runs was written by the trigger, in a
+  delete committed after the install, and is exact: the highest id of the
+  Vault deleted since. Such a mark is already at or above the starting mark
+  the Vault would get. Every event of the Vault deleted since the install was
+  at or above its earliest event at install time, because the events present
+  then were and every later one is above the boundary. So the mark is left
+  alone (ON CONFLICT DO NOTHING): raising it to just below the earliest event
+  left would claim the ids between, which other Vaults' events use, as
+  deleted, and refuse a cursor that missed nothing.
+- A Vault with no mark had no event deleted since the install, so the
+  earliest of its events at or below the boundary is still its earliest at
+  install time, and its starting mark is the old boundary.
+- Only events at or below the boundary count, the highest id when the
+  trigger was installed. A Vault whose events all came later, such as one
+  that was empty then, gets no mark from here, so a cursor taken while it was
+  empty is not refused.
+- A delete racing this statement is recorded either way. If its trigger
+  wrote the Vault's row first, committed or not, the insert here waits for
+  it and then does nothing; ON CONFLICT sees the newest committed row even
+  when this statement's snapshot does not. If this statement wrote the row
+  first, the trigger waits for it to commit and raises it with GREATEST to the
+  deleted id, which is above the starting mark: the deleted event was at or
+  above the earliest one this statement saw.
 
-So no mark is ever lowered, every event deleted after migration 133 is at or
-below its Vault's mark, and an earlier deletion is covered as far as the
-boundary the tail used before. The boundary row is deleted in the same
-statement, so running this again sets nothing: a second run would put a mark
-just below whatever events later deletions had left, and claim deletions that
-never happened.
+So every event deleted after migration 133 is at or below its Vault's mark,
+no mark claims a deletion that did not happen since the install, and an
+earlier deletion is covered as far as the boundary the tail used before. The
+boundary row is deleted in the same statement, so running this again sets
+nothing: a second run would put a mark just below whatever events later
+deletions had left, and claim deletions that never happened.
 """
 
 from pathlib import Path

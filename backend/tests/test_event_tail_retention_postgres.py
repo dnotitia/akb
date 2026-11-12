@@ -574,11 +574,13 @@ async def test_event_writes_go_through_while_the_backfill_runs():
 
 @pytest.mark.parametrize("first", ["delete", "backfill"])
 async def test_a_delete_racing_the_backfill_is_recorded_and_no_lower_mark_replaces_it(first: str):
-    """Migration 134 runs beside deletes, and its marks must merge with the trigger's.
+    """Migration 134 runs beside deletes, and its marks must not undo the trigger's.
 
-    Whichever writes the Vault's mark first, the other waits for it and keeps
-    the higher of the two: the delete stays recorded, and the starting mark,
-    just below the earliest event the backfill saw, does not lower it.
+    Whichever writes the Vault's mark first, the other waits for it. If the
+    trigger was first, the backfill leaves its mark alone; if the backfill
+    was, the trigger raises the starting mark to the deleted id. Either way
+    the delete stays recorded, and the starting mark, just below the
+    earliest event the backfill saw, does not lower it.
     """
     async with _fresh_database() as setup_pool:
         database = await setup_pool.fetchval("SELECT current_database()")
@@ -660,3 +662,50 @@ async def test_the_backfill_gives_no_mark_to_a_vault_whose_events_all_came_after
             finally:
                 await resumed.aclose()
         assert _positions(delivered) == [first_newer]
+
+
+async def test_the_backfill_keeps_a_mark_the_trigger_recorded_since_the_install(monkeypatch):
+    """A Vault's ids interleave with other Vaults', so its next event can be far above a deleted one.
+
+    Its first event was deleted between the two migrations, and the trigger
+    recorded exactly that. The backfill used to raise the mark to just below
+    the earliest event left, over ids that other Vaults' events use, and a
+    cursor at the deleted event, which missed nothing, was refused.
+    """
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "retention-interleaved")
+        user_id = await _make_reader(setup_pool, "retention-interleaved-reader", [vault_id])
+        # Events of a Vault that no longer exists take the ids in between, and
+        # get no mark of their own.
+        gone = uuid.uuid4()
+        first = await _insert_event(setup_pool, vault_id, "document.put", "alice")
+        for _ in range(5):
+            await _insert_event(setup_pool, gone, "document.put", "alice")
+        second = await _insert_event(setup_pool, vault_id, "document.update", "alice")
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        backfill = _load_migration(_BACKFILL)
+        assert migration is not None and backfill is not None
+        async with setup_pool.acquire() as conn:
+            async with conn.transaction():
+                await migration.migrate(conn=conn)
+        # Between the two migrations the first event is deleted, and the trigger records it.
+        await setup_pool.execute("DELETE FROM events WHERE id = $1", first)
+        assert await _watermarks(setup_pool) == {vault_id: first}
+        async with setup_pool.acquire() as conn:
+            await backfill.migrate(conn=conn)
+
+        assert await _watermarks(setup_pool) == {vault_id: first}
+        codec = EventCursorCodec(_CURSOR_SECRET)
+        async with _tail(monkeypatch, setup_pool) as tail:
+            resumed = await tail.open(
+                user_id=user_id,
+                vault="retention-interleaved",
+                last_event_id=codec.encode(vault_id, (), first),
+            )
+            try:
+                delivered = await asyncio.wait_for(_changes(resumed, 1), 5)
+            finally:
+                await resumed.aclose()
+        assert second > first + 1
+        assert _positions(delivered) == [second]

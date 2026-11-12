@@ -151,10 +151,13 @@ Migration 133 installs the trigger, and records the highest event id at that
 moment, while inserts and deletes on `events` wait. It reads no events, so
 that wait does not grow with the table, which keeps growing when the sweeper
 does not run, as without Redis. Migration 134 then sets the starting marks
-from the events up to that id, in its own transaction and without that lock:
-writes go on while it scans, a delete that races it is still recorded, and
-neither lowers the other's mark. A Vault whose events all came after the
-trigger gets no starting mark. When the trigger is already in place,
+from the events up to that id, in its own transaction and without that lock,
+so writes go on while it scans. A Vault that already has a mark keeps it:
+only the trigger can have written one since the install, and it is exact,
+while a starting mark taken from the events left would claim the ids between
+them, which other Vaults' events use, as deleted. A delete that races the
+backfill is still recorded. A Vault whose events all came after the trigger
+gets no starting mark. When the trigger is already in place,
 migration 133 asks for no lock at all. A request for the lock that has to wait
 would make every later event insert wait behind it, so the migration asks
 with a 500 ms lock timeout and holds nothing while it backs off between
