@@ -96,6 +96,13 @@ Connecting and the ping both stay inside the 2-second step. Each API process
 therefore holds one PostgreSQL connection beyond its pool. An unreachable
 database still fails readiness at once.
 
+A server at `max_connections` refuses that connection with SQLSTATE `53300`
+while the pool's open connections keep working. If the pool is open and an
+acquire has completed within `readyz_pool_saturation_grace_secs`, readiness
+reports `db: ok:pool_progress` and stays ready; that result is not cached.
+Without such an acquire, and for every other connection error, readiness
+fails as before.
+
 ### Pool saturation
 
 The request pool is saturated when every connection it may open is open and
@@ -113,12 +120,19 @@ reports it in `detail.pool`:
 | `size`, `max`, `idle` |Open connections, the pool's limit, and open connections not checked out.|
 | `free` |Earlier name of `idle`, kept for existing readers.|
 | `saturated_for_secs` |Time since the first of the consecutive probes that found the pool saturated; `null` when the last probe found room.|
+| `acquires_total` |Acquires the pool has completed since the process started.|
+| `last_acquire_age_secs` |Seconds since the latest completed acquire; `null` before the first.|
 
-Readiness stays ready until saturation has lasted
-`readyz_pool_saturation_grace_secs` (default 30 seconds). It then reports not
-ready with `db: ok` and the pool figures. That is the leak or stall case, where
-taking the replica out of the Service is wanted. A probe that finds an idle
-connection, or room to open one, ends the run. While the pool is saturated:
+A saturated pool whose connections keep changing hands is busy, not wedged,
+and stays ready however long it is saturated. Readiness fails only when the
+pool has been saturated at every probe for
+`readyz_pool_saturation_grace_secs` (default 30 seconds) **and** no acquire
+has completed within that time. It then reports not ready with `db: ok` and
+the pool figures. That is the leak or stall case, where taking the replica out
+of the Service is wanted. The pool counts completed acquires in its asyncpg
+`setup` hook, which runs on every acquire. A probe that finds an idle
+connection, or room to open one, ends the saturation run. While the pool is
+saturated:
 
 - A ready result is not cached, so each probe looks at the pool again.
 - The soft vector check is skipped and reported as
@@ -126,12 +140,13 @@ connection, or room to open one, ends the run. While the pool is saturated:
   database borrows from the same pool, so the check would wait for its whole
   budget without changing the verdict.
 
-Probes see the pool only when they run, so a pool that had room between two
-saturated probes still counts as saturated throughout. With the shipped probe
-settings (every 15 seconds, three failures), a replica whose pool stays
-saturated leaves the Service about `grace + 30` seconds after the first probe
-that sees the saturation. A grace of 0 fails readiness at the first saturated
-probe and brings back the outage described above; it is not recommended.
+Probes see the pool's occupancy only when they run, so a pool that had room
+between two saturated probes still counts as saturated throughout; the acquire
+count is exact. With the shipped probe settings (every 15 seconds, three
+failures), a replica whose pool stays wedged leaves the Service about
+`grace + 30` seconds after the first probe that sees the saturation. A grace of
+0 fails readiness at the first saturated probe and brings back the outage
+described above; it is not recommended.
 
 A cached ready 200 can overlap a 503 from a data request during a new DB outage.
 Even a fresh `SELECT 1` cannot prove an unrelated data query will succeed. Do not
@@ -145,14 +160,18 @@ soft vector degradation labels rather than raw exception representations.
 no write replay, SQL-enrichment bypass, false-zero prevention, readiness TTL,
 soft vector failure, recovery and the DB initialization deadline.
 
-`backend/tests/test_readiness_probe_unit.py` pins the saturation grace, the
-pool fields, the cache rule, the dedicated connection's settings and
-replacement, and the shutdown order. `backend/tests/test_readiness_probe_postgres.py`
-holds every connection of a real pool from other tasks. It checks that
-`/readyz` stays 200 within the probe budget and turns 503 past the grace. It
-also checks that readiness fails at once when the database is gone, that a
-terminated probe connection is reopened, and that shutdown closes it. It reads
-the same `AKB_TEST_DSN` and `REQUIRE_REAL_PG` variables as the suite below.
+`backend/tests/test_readiness_probe_unit.py` pins the busy and wedged verdicts,
+the `max_connections` rule, the pool fields, the cache rule, the acquire
+counter and its hook, the dedicated connection's settings and replacement, and
+the shutdown order. `backend/tests/test_readiness_probe_postgres.py` saturates
+a real pool built by `get_pool`. It checks that `/readyz` stays 200 within the
+probe budget, and past the grace while more tasks than connections keep taking
+turns. It turns 503 once the holders never let go. A role at its connection
+limit makes the server refuse the probe connection, which stays 200 while the
+pool progresses. The suite also checks that readiness fails at once when the
+database is gone, that a terminated probe connection is reopened, and that
+shutdown closes it. It reads the same `AKB_TEST_DSN` and `REQUIRE_REAL_PG`
+variables as the suite below.
 
 `backend/tests/test_read_disconnect_unit.py` covers the actual main route's
 awaited cleanup, normal/error task termination, exclusions, unusual GET bodies,

@@ -33,6 +33,7 @@ class _Pool:
 
     def __init__(self, size: int, max_size: int, idle: int) -> None:
         self.size, self.max_size, self.idle = size, max_size, idle
+        self.closing = False
 
     def get_size(self) -> int:
         return self.size
@@ -42,6 +43,9 @@ class _Pool:
 
     def get_idle_size(self) -> int:
         return self.idle
+
+    def is_closing(self) -> bool:
+        return self.closing
 
     async def fetchval(self, *_args):  # pragma: no cover — a failure if ever reached
         raise AssertionError("readiness must not borrow a request-pool connection")
@@ -55,6 +59,22 @@ class _Clock:
 
     def monotonic(self) -> float:
         return self.now
+
+
+class _Progress:
+    """Stands in for `pool_progress`, on the same fake clock as readiness."""
+
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+        self.total = 0
+        self.last_at: float | None = None
+
+    def acquire(self) -> None:
+        self.total += 1
+        self.last_at = self.clock.now
+
+    def read(self) -> tuple[int, float | None]:
+        return self.total, None if self.last_at is None else self.clock.now - self.last_at
 
 
 @pytest.fixture
@@ -72,16 +92,23 @@ def main(monkeypatch, tmp_path):
 
 @pytest.fixture
 def probe(main, monkeypatch):
-    """A probe whose ping succeeds, over a pool the test controls, on a fake clock."""
+    """A probe whose ping succeeds, over a pool the test controls, on a fake clock.
+
+    One acquire completes at the start; after that the pool makes progress
+    only when a test calls `progress.acquire()`.
+    """
     pool = _Pool(size=2, max_size=4, idle=1)
     ping = AsyncMock(return_value=None)
     store = SimpleNamespace(health=AsyncMock(return_value=True))
     clock = _Clock()
+    progress = _Progress(clock)
+    progress.acquire()
     monkeypatch.setattr(main, "get_pool", AsyncMock(return_value=pool))
     monkeypatch.setattr(main, "readiness_ping", ping)
     monkeypatch.setattr(main, "get_vector_store", lambda: store)
     monkeypatch.setattr(main, "time", clock)
-    return SimpleNamespace(pool=pool, ping=ping, store=store, clock=clock)
+    monkeypatch.setattr(main, "pool_progress", progress.read)
+    return SimpleNamespace(pool=pool, ping=ping, store=store, clock=clock, progress=progress)
 
 
 def _saturate(pool: _Pool) -> None:
@@ -107,7 +134,10 @@ async def test_pool_with_room_is_ready_and_reports_occupancy(main, probe):
 
     assert ok is True
     assert detail["db"] == "ok"
-    assert detail["pool"] == {"size": 2, "max": 4, "idle": 1, "free": 1, "saturated_for_secs": None}
+    assert detail["pool"] == {
+        "size": 2, "max": 4, "idle": 1, "free": 1, "saturated_for_secs": None,
+        "acquires_total": 1, "last_acquire_age_secs": 0.0,
+    }
     assert detail["vector_store"] == "ok"
     probe.ping.assert_awaited_once()
 
@@ -127,7 +157,10 @@ async def test_saturated_pool_within_grace_is_ready_and_skips_the_vector_check(m
     ok, detail = await main._probe_ready()
     assert ok is True
     assert detail["db"] == "ok"
-    assert detail["pool"] == {"size": 4, "max": 4, "idle": 0, "free": 0, "saturated_for_secs": 0.0}
+    assert detail["pool"] == {
+        "size": 4, "max": 4, "idle": 0, "free": 0, "saturated_for_secs": 0.0,
+        "acquires_total": 1, "last_acquire_age_secs": 0.0,
+    }
     # pgvector on the main database borrows from this same pool for its health
     # check, so running it here would queue behind the saturation.
     assert detail["vector_store"] == "skipped:pool_saturated"
@@ -139,7 +172,43 @@ async def test_saturated_pool_within_grace_is_ready_and_skips_the_vector_check(m
     assert detail["pool"]["saturated_for_secs"] == GRACE - 0.5
 
 
-async def test_saturation_that_lasts_the_grace_fails_readiness(main, probe):
+async def test_saturation_that_lasts_the_grace_without_progress_fails_readiness(main, probe):
+    _saturate(probe.pool)
+    assert (await main._probe_ready())[0] is True
+
+    probe.clock.now += GRACE  # no acquire completes: the holders never let go
+    ok, detail = await main._probe_ready()
+
+    assert ok is False
+    assert detail["db"] == "ok"
+    assert detail["pool"]["saturated_for_secs"] == GRACE
+    assert detail["pool"]["last_acquire_age_secs"] == GRACE
+    assert "vector_store" not in detail
+    probe.store.health.assert_not_awaited()
+
+
+async def test_saturated_pool_that_keeps_completing_acquires_stays_ready(main, probe):
+    """Busy, not wedged: every connection is lent out, but they change hands."""
+    _saturate(probe.pool)
+    assert (await main._probe_ready())[0] is True
+    for _ in range(4):
+        probe.clock.now += GRACE
+        probe.progress.acquire()
+        ok, detail = await main._probe_ready()
+        assert ok is True, detail
+        assert detail["pool"]["last_acquire_age_secs"] == 0.0
+    assert detail["pool"]["saturated_for_secs"] == 4 * GRACE
+    assert detail["pool"]["acquires_total"] == 5
+
+    # Once the connections stop changing hands, the grace runs out.
+    probe.clock.now += GRACE
+    ok, detail = await main._probe_ready()
+    assert ok is False
+    assert detail["pool"]["last_acquire_age_secs"] == GRACE
+
+
+async def test_without_a_recorded_acquire_the_saturation_run_decides_alone(main, probe):
+    probe.progress.last_at = None  # a pool built without the counting hook
     _saturate(probe.pool)
     assert (await main._probe_ready())[0] is True
 
@@ -147,10 +216,7 @@ async def test_saturation_that_lasts_the_grace_fails_readiness(main, probe):
     ok, detail = await main._probe_ready()
 
     assert ok is False
-    assert detail["db"] == "ok"
-    assert detail["pool"]["saturated_for_secs"] == GRACE
-    assert "vector_store" not in detail
-    probe.store.health.assert_not_awaited()
+    assert detail["pool"]["last_acquire_age_secs"] is None
 
 
 async def test_a_probe_that_finds_room_ends_the_saturation_run(main, probe):
@@ -232,6 +298,78 @@ async def test_ping_failure_is_not_ready_and_still_reports_the_pool(main, probe)
     assert detail["pool"]["idle"] == 0
     assert "private-host" not in str(detail)
     probe.store.health.assert_not_awaited()
+
+
+_SERVER_FULL = asyncpg.TooManyConnectionsError("sorry, too many clients already")
+
+
+async def test_server_at_max_connections_with_recent_pool_progress_is_ready(main, probe):
+    probe.ping.side_effect = _SERVER_FULL
+    probe.clock.now += GRACE - 1  # the latest acquire completed GRACE - 1 seconds ago
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is True
+    assert detail["db"] == "ok:pool_progress"
+    assert detail["vector_store"] == "ok"
+
+
+async def test_ready_on_pool_progress_is_not_cached(main, probe):
+    probe.ping.side_effect = _SERVER_FULL
+
+    first = await main.readyz()
+    second = await main.readyz()
+
+    assert first["detail"]["db"] == second["detail"]["db"] == "ok:pool_progress"
+    assert first["cached"] is False and second["cached"] is False
+    assert probe.ping.await_count == 2
+
+
+async def test_server_at_max_connections_without_recent_progress_is_not_ready(main, probe):
+    probe.ping.side_effect = _SERVER_FULL
+    probe.clock.now += GRACE
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is False
+    assert detail["db"] == "error:unavailable"
+    probe.store.health.assert_not_awaited()
+
+
+async def test_server_at_max_connections_without_any_recorded_acquire_is_not_ready(main, probe):
+    probe.progress.last_at = None
+    probe.ping.side_effect = _SERVER_FULL
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is False
+    assert detail["db"] == "error:unavailable"
+
+
+async def test_closing_pool_does_not_vouch_for_the_database(main, probe):
+    probe.pool.closing = True
+    probe.ping.side_effect = _SERVER_FULL
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is False
+    assert detail["db"] == "error:unavailable"
+
+
+@pytest.mark.parametrize("failure", [
+    ConnectionRefusedError("refused"),
+    OSError("unreachable"),
+    asyncpg.InvalidPasswordError("authentication failed"),
+    asyncpg.InvalidCatalogNameError("database does not exist"),
+    asyncpg.CannotConnectNowError("the database system is starting up"),
+])
+async def test_other_connect_errors_stay_not_ready_despite_pool_progress(main, probe, failure):
+    probe.ping.side_effect = failure  # the latest acquire is 0 s old
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is False
+    assert detail["db"] == "error:unavailable"
 
 
 async def test_hung_ping_is_cut_off_inside_the_probe_budget(main, probe):
@@ -409,6 +547,42 @@ async def test_close_readiness_connection_closes_and_forgets_it(connections):
     assert conn.closed
     assert postgres._readiness_conn is None
     await postgres.close_readiness_connection()  # nothing open: a no-op
+
+
+# ── Pool progress ────────────────────────────────────────────────────────────
+
+
+async def test_pool_progress_counts_each_completed_acquire(monkeypatch):
+    monkeypatch.setattr(postgres, "_acquires_total", 0)
+    monkeypatch.setattr(postgres, "_last_acquire_at", None)
+    assert postgres.pool_progress() == (0, None)
+
+    await postgres._count_acquire(object())
+    await postgres._count_acquire(object())
+
+    total, age = postgres.pool_progress()
+    assert total == 2
+    assert age is not None and 0.0 <= age < 1.0
+
+
+async def test_request_pool_counts_acquires_through_its_setup_hook(monkeypatch):
+    created: list[dict] = []
+
+    async def create_pool(**kwargs):
+        created.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(postgres.asyncpg, "create_pool", create_pool)
+    monkeypatch.setattr(postgres, "_pool", None)
+    monkeypatch.delenv("AKB_PG_POOL_MIN_SIZE", raising=False)
+    monkeypatch.delenv("AKB_PG_POOL_MAX_SIZE", raising=False)
+
+    await postgres.get_pool()
+
+    (kwargs,) = created
+    assert kwargs["setup"] is postgres._count_acquire
+    # Nothing else hooks this pool's connections; the counter replaces nothing.
+    assert "init" not in kwargs and "reset" not in kwargs
 
 
 async def test_shutdown_closes_the_probe_connection_before_the_pool(monkeypatch):

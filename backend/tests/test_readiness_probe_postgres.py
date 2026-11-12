@@ -4,11 +4,14 @@ A client burst can check out every connection in the request pool on every
 replica at once. Readiness used to queue its `SELECT 1` behind that, time out
 after two seconds and answer 503 on every replica together, which left the
 Service with no endpoints while the database was fine. Here the pool is
-really saturated, the probe connection is really terminated, and the
-database really disappears.
+really saturated, its connections really keep changing hands or really stay
+held, the probe connection is really terminated or refused, and the database
+really disappears.
 
-Each test owns a disposable database. Set AKB_TEST_DSN to a test-cluster
-admin DSN; with REQUIRE_REAL_PG=1 an unreachable server is a failure.
+The pool is built by `get_pool`, as in production, so it carries the hook
+that counts completed acquires. Each test owns a disposable database. Set
+AKB_TEST_DSN to a test-cluster admin DSN; with REQUIRE_REAL_PG=1 an
+unreachable server is a failure.
 """
 
 from __future__ import annotations
@@ -35,6 +38,10 @@ _ADMIN_DSN = os.environ.get(
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
 _POOL_SIZE = 2
+# Short enough to wait out in real time: the progress signal is measured on
+# the real clock, so these tests do not fake time.
+_GRACE = 1.0
+_PAST_GRACE = _GRACE + 0.3
 
 
 async def _can_connect() -> bool:
@@ -46,15 +53,17 @@ async def _can_connect() -> bool:
     return True
 
 
-def _settings(name: str) -> Settings:
+def _settings(name: str, *, user: str | None = None, password: str | None = None) -> Settings:
     parsed = urlsplit(_ADMIN_DSN)
     return Settings(
         document_revision_backend="bare_git",
         db_host=parsed.hostname or "localhost",
         db_port=parsed.port or 5432,
         db_name=name,
-        db_user=unquote(parsed.username or "akb"),
-        db_password=unquote(parsed.password or ""),
+        db_user=user or unquote(parsed.username or "akb"),
+        db_password=password if password is not None else unquote(parsed.password or ""),
+        pg_pool_min_size=_POOL_SIZE,
+        pg_pool_max_size=_POOL_SIZE,
     )
 
 
@@ -71,8 +80,13 @@ class _SharedPoolVectorStore:
             return await conn.fetchval("SELECT 1") == 1
 
 
-@pytest.fixture
-async def ready_db(monkeypatch, tmp_path):
+@contextlib.asynccontextmanager
+async def _ready_database(monkeypatch, tmp_path, *, role_connection_limit: int | None = None):
+    """A disposable database, its request pool from `get_pool`, and an HTTP client.
+
+    With `role_connection_limit`, the pool and the probe log in as a fresh role
+    that the server lets open only that many connections.
+    """
     if not await _can_connect():
         if os.environ.get("REQUIRE_REAL_PG") == "1":
             pytest.fail(f"Required PostgreSQL is not reachable at {_ADMIN_DSN}")
@@ -85,29 +99,47 @@ async def ready_db(monkeypatch, tmp_path):
 
     admin = await asyncpg.connect(_ADMIN_DSN)
     name = f"akb_readyz_{uuid.uuid4().hex[:12]}"
+    role = password = None
+    pool = client = None
     await admin.execute(f'CREATE DATABASE "{name}"')
-    configured = _settings(name)
-    pool = await asyncpg.create_pool(dsn=configured.asyncpg_dsn, min_size=_POOL_SIZE, max_size=_POOL_SIZE)
-    store = _SharedPoolVectorStore()
-    monkeypatch.setattr(postgres, "settings", configured)
-    monkeypatch.setattr(postgres, "_pool", pool)
-    monkeypatch.setattr(main, "_ready_state", main._ReadyState())
-    monkeypatch.setattr(main, "_ready_lock", asyncio.Lock())
-    monkeypatch.setattr(main, "get_vector_store", lambda: store)
-    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://akb.test")
     try:
+        if role_connection_limit is not None:
+            role, password = name, uuid.uuid4().hex
+            await admin.execute(
+                f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}' CONNECTION LIMIT {role_connection_limit}"
+            )
+        monkeypatch.delenv("AKB_PG_POOL_MIN_SIZE", raising=False)
+        monkeypatch.delenv("AKB_PG_POOL_MAX_SIZE", raising=False)
+        monkeypatch.setattr(postgres, "settings", _settings(name, user=role, password=password))
+        monkeypatch.setattr(postgres, "_pool", None)
+        monkeypatch.setattr(main, "_ready_state", main._ReadyState())
+        monkeypatch.setattr(main, "_ready_lock", asyncio.Lock())
+        store = _SharedPoolVectorStore()
+        monkeypatch.setattr(main, "get_vector_store", lambda: store)
+        pool = await postgres.get_pool()
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://akb.test")
         yield SimpleNamespace(main=main, admin=admin, name=name, pool=pool, store=store, client=client)
     finally:
-        await client.aclose()
+        if client is not None:
+            await client.aclose()
         await postgres.close_readiness_connection()
-        pool.terminate()
+        if pool is not None:
+            pool.terminate()
         await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        if role is not None:
+            await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
         await admin.close()
+
+
+@pytest.fixture
+async def ready_db(monkeypatch, tmp_path):
+    async with _ready_database(monkeypatch, tmp_path) as db:
+        yield db
 
 
 @contextlib.asynccontextmanager
 async def _every_connection_checked_out(pool: asyncpg.Pool):
-    """Other tasks hold every connection the pool may open, as a client burst does."""
+    """Other tasks hold every connection the pool may open and never let go."""
     release = asyncio.Event()
     holding = 0
 
@@ -128,6 +160,45 @@ async def _every_connection_checked_out(pool: asyncpg.Pool):
     finally:
         release.set()
         await asyncio.gather(*tasks)
+
+
+class _ChangingHands:
+    """More tasks than connections take turns with every connection, briefly
+    each, as a busy replica's requests do: all slots stay busy and acquires
+    keep completing. `pause()` lets each holder keep its connection, so a
+    probe observes the pool saturated rather than mid-handover."""
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self.pool = pool
+        self.holding = 0
+        self._running = asyncio.Event()
+        self._running.set()
+        self._stopping = False
+        self._tasks = [asyncio.create_task(self._turns()) for _ in range(2 * pool.get_max_size())]
+
+    async def _turns(self) -> None:
+        while not self._stopping:
+            async with self.pool.acquire():
+                self.holding += 1
+                try:
+                    await asyncio.sleep(0.005)
+                    await self._running.wait()
+                finally:
+                    self.holding -= 1
+
+    async def pause(self) -> None:
+        self._running.clear()
+        async with asyncio.timeout(5):
+            while not (self.holding == self.pool.get_max_size() and self.pool.get_idle_size() == 0):
+                await asyncio.sleep(0.005)
+
+    def resume(self) -> None:
+        self._running.set()
+
+    async def stop(self) -> None:
+        self._stopping = True
+        self._running.set()
+        await asyncio.gather(*self._tasks)
 
 
 async def _probe_backend_pid(db) -> int | None:
@@ -156,33 +227,71 @@ async def test_saturated_pool_keeps_readyz_200_within_the_probe_budget(ready_db)
     assert ready_db.store.calls == 0
 
 
-async def test_saturation_past_the_grace_answers_503_and_recovers(ready_db, monkeypatch):
-    main = ready_db.main
-    grace = main.settings.readyz_pool_saturation_grace_secs
-    clock = SimpleNamespace(now=1000.0)
-    monkeypatch.setattr(main, "time", SimpleNamespace(monotonic=lambda: clock.now))
+async def test_saturated_pool_whose_connections_keep_changing_hands_stays_200(ready_db, monkeypatch):
+    monkeypatch.setattr(ready_db.main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+    hands = _ChangingHands(ready_db.pool)
+    try:
+        await hands.pause()
+        assert (await ready_db.client.get("/readyz")).status_code == 200
+        totals = []
+        for _ in range(3):
+            hands.resume()
+            await asyncio.sleep(_PAST_GRACE)
+            await hands.pause()
+            response = await ready_db.client.get("/readyz")
+            assert response.status_code == 200, response.text
+            pool = response.json()["detail"]["pool"]
+            assert pool["size"] == pool["max"] and pool["idle"] == 0
+            assert pool["last_acquire_age_secs"] < _GRACE
+            totals.append(pool["acquires_total"])
+    finally:
+        await hands.stop()
+
+    # Saturated at every probe for three graces, and ready throughout,
+    # because the connections kept changing hands in between.
+    assert pool["saturated_for_secs"] >= 3 * _GRACE
+    assert totals == sorted(set(totals))
+
+
+async def test_saturated_pool_whose_holders_never_let_go_answers_503_and_recovers(ready_db, monkeypatch):
+    monkeypatch.setattr(ready_db.main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
 
     async with _every_connection_checked_out(ready_db.pool):
         first = await ready_db.client.get("/readyz")
-        clock.now += grace - 1
-        within = await ready_db.client.get("/readyz")
-        clock.now += 2
+        await asyncio.sleep(_PAST_GRACE)
         past = await ready_db.client.get("/readyz")
 
     assert first.status_code == 200, first.text
-    assert within.status_code == 200, within.text
-    assert within.json()["detail"]["pool"]["saturated_for_secs"] == grace - 1
     assert past.status_code == 503, past.text
     body = past.json()["detail"]
     assert body["status"] == "not_ready"
     assert body["detail"]["db"] == "ok"
-    assert body["detail"]["pool"]["saturated_for_secs"] == grace + 1
+    assert body["detail"]["pool"]["saturated_for_secs"] >= _GRACE
+    assert body["detail"]["pool"]["last_acquire_age_secs"] >= _GRACE
 
     # Released: the very next probe is ready again (failures are not cached).
     recovered = await ready_db.client.get("/readyz")
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["detail"]["pool"]["saturated_for_secs"] is None
     assert recovered.json()["detail"]["vector_store"] == "ok"
+
+
+async def test_server_refusing_the_probe_connection_is_ready_while_the_pool_progresses(monkeypatch, tmp_path):
+    # The role may open only the pool's own connections, so the server refuses
+    # the probe's with "too many connections" while the pool keeps working.
+    async with _ready_database(monkeypatch, tmp_path, role_connection_limit=_POOL_SIZE) as db:
+        monkeypatch.setattr(db.main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+        assert await db.pool.fetchval("SELECT 1") == 1  # an acquire completes
+
+        progressing = await db.client.get("/readyz")
+        await asyncio.sleep(_PAST_GRACE)  # nothing acquires any more
+        stalled = await db.client.get("/readyz")
+
+    assert progressing.status_code == 200, progressing.text
+    assert progressing.json()["detail"]["db"] == "ok:pool_progress"
+    assert progressing.json()["cached"] is False
+    assert stalled.status_code == 503, stalled.text
+    assert stalled.json()["detail"]["detail"]["db"] == "error:unavailable"
 
 
 async def test_database_gone_is_not_ready_at_once(ready_db):

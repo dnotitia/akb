@@ -258,8 +258,9 @@ The following Git layout and locking apply only to the Bare Git backend:
   `"vector_store": "degraded:..."` in the detail but still returns
   ready (search degrades, everything else keeps working).
   The DB ping uses a dedicated connection, never the request pool. A
-  saturated pool (`size == max`, `idle == 0`) stays ready for
-  `readyz_pool_saturation_grace_secs` (default 30) and is reported in
+  saturated pool (`size == max`, `idle == 0`) fails readiness only after
+  `readyz_pool_saturation_grace_secs` (default 30) with no completed acquire;
+  one whose connections keep changing hands stays ready. Reported in
   `detail.pool`; see `docs/operations/database-recovery.md`.
 - `GET /health` — detailed status for dashboards. Returns
   `vector_store.{reachable, backfill, bm25_vocab_size}`,

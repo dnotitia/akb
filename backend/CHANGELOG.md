@@ -100,14 +100,22 @@ specifically; the proxy has its own log in
   (`application_name` `akb-readiness-probe`) instead of borrowing from the
   pool, so a pool that clients have fully checked out no longer times the
   probe out while the database is fine. Each API process holds one more
-  PostgreSQL connection. A pool that stays saturated (every connection open
-  and checked out) for `readyz_pool_saturation_grace_secs` (default 30) still
-  fails readiness. A value of 0 fails it at the first saturated probe and is
-  not recommended. `detail.pool` adds `idle` and `saturated_for_secs`, keeps
+  PostgreSQL connection. A saturated pool (every connection open and checked
+  out) whose connections keep changing hands stays ready. Readiness fails only
+  when the pool has stayed saturated for `readyz_pool_saturation_grace_secs`
+  (default 30) with no acquire completing in that time; the pool counts
+  completed acquires in its `setup` hook. A value of 0 fails readiness at the
+  first saturated probe and is not recommended. `detail.pool` adds `idle`,
+  `saturated_for_secs`, `acquires_total` and `last_acquire_age_secs`, keeps
   `free`, and is also reported when the database check fails. While the pool
   is saturated, a ready result is not cached and the soft vector check is
   skipped as `skipped:pool_saturated`. See
   `docs/operations/database-recovery.md`.
+- When the server refuses the readiness probe's connection at
+  `max_connections`, readiness stays ready with `db: ok:pool_progress` if the
+  pool is open and has completed an acquire within the grace. Such a result
+  is not cached. Without recent progress, and for every other connection
+  error, readiness still fails.
 
 ### Search
 

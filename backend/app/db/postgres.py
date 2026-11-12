@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 import asyncpg
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +19,33 @@ _readiness_conn: asyncpg.Connection | None = None
 _readiness_lock = asyncio.Lock()
 # Names the probe's session in pg_stat_activity, apart from request traffic.
 READINESS_APPLICATION_NAME = "akb-readiness-probe"
+
+# Completed acquires of the request pool, counted by its `setup` hook (see
+# get_pool). A busy pool keeps handing its connections to the next caller and
+# this keeps moving; a wedged pool, whose holders never give a connection
+# back, stops it. Readiness tells the two apart by it (see pool_progress).
+_acquires_total = 0
+_last_acquire_at: float | None = None
+
+
+async def _count_acquire(_conn) -> None:
+    """The request pool's ``setup`` hook. asyncpg awaits it on every acquire,
+    just before it hands out the connection. It must stay cheap and must not
+    raise: asyncpg closes the connection when ``setup`` fails."""
+    global _acquires_total, _last_acquire_at
+    _acquires_total += 1
+    _last_acquire_at = time.monotonic()
+
+
+def pool_progress() -> tuple[int, float | None]:
+    """Completed request-pool acquires so far, and seconds since the latest.
+
+    The age is None until the first acquire. A pool built without the hook
+    never moves either value.
+    """
+    if _last_acquire_at is None:
+        return _acquires_total, None
+    return _acquires_total, max(0.0, time.monotonic() - _last_acquire_at)
 
 
 def _pool_sizes() -> tuple[int, int]:
@@ -70,6 +98,9 @@ async def get_pool() -> asyncpg.Pool:
                         "statement_timeout": "30000",
                         "idle_in_transaction_session_timeout": "60000",
                     },
+                    # Counts completed acquires for readiness. This pool has no
+                    # other setup hook; chain into this one if one is added.
+                    setup=_count_acquire,
                 )
                 break
             except ConnectionRefusedError, OSError:

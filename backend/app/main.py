@@ -45,7 +45,7 @@ from app.api.routes import (
     tables,
 )
 from app.config import settings
-from app.db.postgres import get_pool, readiness_ping
+from app.db.postgres import get_pool, pool_progress, readiness_ping
 from app.db.transient import transient_error
 from app.exceptions import AKBError, TransientDependencyError
 from app.logging_redaction import install_secret_redaction
@@ -451,6 +451,7 @@ def _observe_pool(pool, state: _ReadyState) -> dict:
         saturated_for = round(max(0.0, now - state.pool_saturated_since), 3)
     else:
         state.pool_saturated_since = None
+    acquires_total, last_acquire_age = pool_progress()
     return {
         "size": size,
         "max": max_size,
@@ -459,12 +460,49 @@ def _observe_pool(pool, state: _ReadyState) -> dict:
         "free": idle,
         # None while the pool has room, which is not "saturated for 0 s".
         "saturated_for_secs": saturated_for,
+        # Whether the connections still change hands: a saturated pool that
+        # keeps completing acquires is busy, one that has stopped is wedged.
+        "acquires_total": acquires_total,
+        "last_acquire_age_secs": None if last_acquire_age is None else round(last_acquire_age, 3),
     }
 
 
 def _pool_saturated_for(detail: dict | None) -> float | None:
     pool = detail.get("pool") if isinstance(detail, dict) else None
     return pool.get("saturated_for_secs") if isinstance(pool, dict) else None
+
+
+def _pool_wedged(pool_detail: dict, grace: float) -> bool:
+    """Saturated for the whole grace, with no acquire completed within it.
+
+    A saturated pool whose connections keep changing hands stays ready however
+    long it is saturated. With no acquire recorded at all (a pool built
+    without the counting hook), the saturation run decides alone.
+    """
+    saturated_for = pool_detail.get("saturated_for_secs")
+    if saturated_for is None or saturated_for < grace:
+        return False
+    last_acquire_age = pool_detail.get("last_acquire_age_secs")
+    return last_acquire_age is None or last_acquire_age >= grace
+
+
+# A server at max_connections refuses the probe's own connection while the
+# pool's open connections keep working. Acquires completed within the grace
+# show the database still answers this process, so readiness holds with this
+# label instead of "ok".
+_DB_OK_BY_POOL_PROGRESS = "ok:pool_progress"
+
+
+def _db_failure_label(exc: Exception, pool) -> str:
+    if (
+        isinstance(exc, asyncpg.TooManyConnectionsError)
+        and pool is not None
+        and not pool.is_closing()
+    ):
+        _, last_acquire_age = pool_progress()
+        if last_acquire_age is not None and last_acquire_age < settings.readyz_pool_saturation_grace_secs:
+            return _DB_OK_BY_POOL_PROGRESS
+    return "error:timeout" if isinstance(exc, TimeoutError) else "error:unavailable"
 
 
 async def _probe_ready() -> tuple[bool, dict]:
@@ -480,7 +518,8 @@ async def _probe_ready() -> tuple[bool, dict]:
     failure, and a client burst saturates every replica's pool at the same
     moment: failing readiness on it would leave the Service with no endpoints
     while the database is fine. Saturation fails readiness only once it has
-    lasted `readyz_pool_saturation_grace_secs` at every probe.
+    lasted `readyz_pool_saturation_grace_secs` at every probe and no acquire
+    has completed within that time: the pool is wedged, not busy.
     """
     detail: dict = {
         "document_revision_backend": selected_document_revision_backend(),
@@ -494,15 +533,15 @@ async def _probe_ready() -> tuple[bool, dict]:
             await readiness_ping(timeout=_READY_DB_TIMEOUT_SECONDS)
         detail["db"] = "ok"
     except Exception as e:  # noqa: BLE001 — no connection strings in a public probe
-        detail["db"] = "error:timeout" if isinstance(e, TimeoutError) else "error:unavailable"
+        detail["db"] = _db_failure_label(e, pool)
     if pool is not None:
         # Pool stats help diagnose leaks and bursts, on a failed probe too.
         detail["pool"] = _observe_pool(pool, _ready_state)
-    if detail["db"] != "ok":
+    if detail["db"] not in ("ok", _DB_OK_BY_POOL_PROGRESS):
         return False, detail
     saturated_for = _pool_saturated_for(detail)
     if saturated_for is not None:
-        if saturated_for >= settings.readyz_pool_saturation_grace_secs:
+        if _pool_wedged(detail["pool"], settings.readyz_pool_saturation_grace_secs):
             return False, detail
         # The soft vector check may borrow from this same pool (pgvector on
         # the main database does), so it would wait behind the saturation
@@ -535,9 +574,12 @@ def _cache_fresh(state: _ReadyState) -> bool:
     # twice the actual outage window.
     # Nor a success that saw a saturated pool: the grace is measured across
     # probes, so each probe during saturation has to look at the pool again.
+    # Nor one that rested on pool progress instead of a ping: that holds only
+    # for the grace after the latest acquire.
     return (
         state.detail is not None
         and state.ok
+        and state.detail.get("db") == "ok"
         and _pool_saturated_for(state.detail) is None
         and (time.monotonic() - state.ts) < _READY_TTL_SECONDS
     )
