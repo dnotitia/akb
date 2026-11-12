@@ -20,21 +20,25 @@ specifically; the proxy has its own log in
   promise.
 
   The cost: transactions that write events for the same Vault run one at a
-  time from their event insert to their commit, so writes insert their events
-  after their other locking statements. An insert waits at most 5 seconds for
-  its Vault. A longer wait, or a deadlock (`40P01`) that PostgreSQL broke by
-  rolling a transaction back, now returns a retryable `write_busy` (HTTP 429,
-  `Retry-After: 1`) instead of an internal error. The Vault's lock is a row lock
-  that no SQL role can take, and `akb_sql` refuses PostgreSQL's advisory lock
-  functions.
+  time from taking the Vault's lock to their commit, so writes insert their
+  events after their other locking statements. Bare Git document writes take
+  the lock before their Git commit instead, so a busy Vault fails them before
+  Git changes. A transaction waits at most 5 seconds in total for its Vault;
+  past that it fails with a retryable `write_busy` (HTTP 429,
+  `Retry-After: 1`) instead of an internal error. A deadlock (`40P01`) stays
+  an internal error. The Vault's lock is a row lock that no SQL role can
+  take, and `akb_sql` refuses PostgreSQL's advisory lock functions. Waiting
+  transactions keep their database connections for up to 5 seconds; the
+  number of waiters is not bounded.
 
   The migration takes its table lock in short attempts, so event inserts keep
   flowing while a transaction of the previous release is open, and stops the
   start with an error after 40 attempts. During a rolling deployment,
-  processes still on the previous release take the Vault lock too while some
-  insert events before other locking statements, so `40P01` is more likely
-  until they are replaced. An image rollback keeps the trigger. A data-only
-  restore needs writes stopped and `pg_restore --data-only --disable-triggers
+  processes still on the previous release take the Vault lock too, their Bare
+  Git document writes only after the Git commit, so until they are replaced
+  a busy Vault can leave such a commit in Git and not in the database. An
+  image rollback keeps the trigger and that exposure. A data-only restore
+  needs writes stopped and `pg_restore --data-only --disable-triggers
   --single-transaction`; `docs/operations/change-events.md` lists the checks
   to run afterwards.
 

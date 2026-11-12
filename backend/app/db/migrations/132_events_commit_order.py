@@ -14,8 +14,10 @@ committed or rolled back, so within a Vault id order is commit order. Events
 without a Vault take no lock. The trigger draws every id and the column keeps
 no default, so an event uses one sequence value; an INSERT that names no id,
 as earlier releases do, still works. Event-writing transactions of one Vault
-run one at a time from their event insert to their commit; services write the
-event as their last locking statement to keep that span short.
+run one at a time from taking the lock to their commit. Services insert the
+event as their last locking statement to keep that span short; Bare Git
+document writes take the lock (``akb_lock_vault_events``) before their Git
+commit, because the commit does not roll back with the transaction.
 
 Dynamic tables' row-change events (migration 086) are queued by their
 statement trigger and inserted when the transaction commits, after every lock

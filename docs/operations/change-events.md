@@ -86,7 +86,12 @@ event's Vault, holds the lock until the transaction commits or rolls back, and
 only then draws the id. A transaction that commits later therefore always
 carries a larger id than every event of that Vault already visible, and reading
 `id > cursor` cannot pass over one that commits late. The trigger assigns every
-event id; `events.id` has no column default. A dynamic table's
+event id; `events.id` has no column default. The migration also sets the id
+sequence's cache to 1 if it was larger: with a cache, each session draws from
+its own block of ids and could draw a smaller id after another session's larger
+one. PostgreSQL gives the sequence new storage when the cache changes, and a
+session that cached a block before the migration drops it at its next draw, so
+no id cached earlier is used afterwards. A dynamic table's
 `table.rows_changed` event is inserted when its transaction commits. The cursor
 format, `Last-Event-ID` resume and `410 event_gap` are unchanged, and cursors
 issued before the migration stay valid. Ids are not contiguous; a gap does not
@@ -104,26 +109,58 @@ reconciles. This predates the ordering change; a per-Vault deletion watermark
 is planned to replace the check.
 
 This ordering has a cost. Transactions that write events for the same Vault
-run one at a time from their event insert to their commit. AKB inserts a
-transaction's events after its other locking statements (its row writes, DDL
-and role changes), so that span is short. The Vault's lock is a row lock in
-`vault_event_order`, a table no SQL role is granted, so a statement run through
-`akb_sql` cannot hold it; `akb_sql` also refuses PostgreSQL's advisory lock
-functions. An event insert waits at most 5 seconds for its Vault. Past that,
-and when PostgreSQL breaks a deadlock (`40P01`) by rolling a transaction back,
-the API answers with a retryable `write_busy`: HTTP 429 with `Retry-After: 1`,
-or `retry_after_secs` in the MCP envelope. Watch `pg_stat_database.deadlocks`.
+run one at a time, each from the moment it takes the Vault's lock to its
+commit. AKB inserts a transaction's events after its other locking statements
+(its row writes, DDL and role changes), so that span is short. Bare Git
+document writes are the exception. A Git commit does not roll back with the
+transaction, so put, update, edit, move and delete take the lock before their
+Git commit and hold it through it; a busy Vault then fails them before Git
+changes. In a Bare Git installation the other writes of a Vault therefore also
+wait for the Git commit of a document write in progress. The Vault's lock is a
+row lock in `vault_event_order`, a table no SQL role is granted, so a statement
+run through `akb_sql` cannot hold it; `akb_sql` also refuses PostgreSQL's
+advisory lock functions.
+
+A transaction waits at most 5 seconds in total for its Vault's lock, however
+many others wait with it: it polls the lock against one deadline instead of
+queueing for it. Waiters are therefore not served in arrival order, and a lock
+cycle through the Vault's lock (the holder waits for a row that a waiter holds)
+ends at the waiter's deadline, not through PostgreSQL's deadlock detection.
+Past the deadline the waiting transaction fails with SQLSTATE `55P03` and rolls
+back, and the API answers with a retryable `write_busy`: HTTP 429 with
+`Retry-After: 1`, or `retry_after_secs` in the MCP envelope. A deadlock
+(`40P01`) between other locks remains an internal error, because it can end a
+Bare Git write after its Git commit.
+
+A waiting transaction keeps its database connection while it waits. Waiters
+accumulate when a holder's commit stalls, or when one Vault receives more
+event-writing transactions than it can commit one at a time; for up to 5
+seconds each they hold connections that other Vaults' requests and the
+readiness check also need. AKB does not bound the number of waiters. A holder
+keeps the lock only from its event insert, or from a Bare Git write's lock
+before its Git commit, until its commit, so a holder that stalls past the
+deadline has a stalled commit, which blocks its Vault's writes in any case.
+Bounding the waiters needs admission control in front of the connection pool
+on every event-writing path, as the write lane provides for Bare Git document
+writes. That is left to a separate change, together with a readiness check
+that does not depend on the shared pool.
 
 During a rolling deployment the first upgraded process applies migration 132.
 Processes still on the previous release then take the Vault lock too, but some
-of their writes insert the event before other locking statements, so `40P01`
-is more likely until they are replaced. The migration asks for its table lock
+of their writes insert the event before other locking statements, and their
+Bare Git document writes reach the lock only after their Git commit. Until they
+are replaced, a writer that waits for a row such a write holds fails with
+`write_busy` at its deadline, and a previous-release document write that waits
+for a busy Vault past the deadline fails after its Git commit, leaving that
+commit in Git but not in the database. The migration asks for its table lock
 for at most half a second at a time and holds nothing between attempts, so
 event inserts keep flowing while a previous-release transaction is still open;
 after 40 attempts it stops the server's start with an error. Rolling back to an
 earlier image leaves the trigger in place and working, with the earlier
-release's statement order. Do not drop the trigger: without it an INSERT that
-names no id fails, because the column has no default.
+release's statement order and the same exposure for its Bare Git document
+writes, so upgrade again rather than run an earlier release for long. Do not
+drop the trigger: without it an INSERT that names no id fails, because the
+column has no default.
 
 A full `pg_dump` / `pg_restore` creates the triggers after it loads the data,
 so restored events keep their ids. A data-only restore into a database that
@@ -180,10 +217,15 @@ text/binary transitions. `test_events_commit_order_postgres.py` keeps one
 event-writing transaction open while a second writer of the same Vault tries
 to commit first, through `emit_event` and through the dynamic-table row
 trigger, and checks that a reader following the cursor receives both events in
-commit order. The `test_*_event_lock_postgres.py` suites check that SQL admin
-overrides, Vault settings changes, table migrations (enum value renames
-included) and app rollouts insert their events last, so a writer of the same
-Vault neither waits behind them nor deadlocks with them.
+commit order, and that the wait for a busy Vault ends at one deadline. The
+`test_*_event_lock_postgres.py` suites check that SQL admin overrides, Vault
+settings changes, table migrations (enum value renames included) and app
+rollouts insert their events last, so a writer of the same Vault does not wait
+behind them while they still take other locks, and that a Bare Git document
+write on a busy Vault fails before its Git commit.
+`test_sql_scanner_postgres.py` runs generated statements against PostgreSQL
+and checks that `akb_sql`'s statement checks see exactly the function calls and
+statement separators that PostgreSQL runs.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native
