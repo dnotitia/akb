@@ -220,6 +220,17 @@ need a backend that applies Vault access and projects safe fields. The existing
 authenticated `GET /api/v1/events/{vault}` SSE tail reads the same PG outbox with
 reader access checks; its opaque cursor is different from a Redis cursor.
 
+Known limits that predate the ordering change:
+
+- A recursive collection delete does not see a sub-collection that another
+  transaction creates under its prefix and commits only after the delete
+  read and locked the collections; that sub-collection can remain, while
+  documents created in it are deleted with the rest.
+- On the Native authority a recursive collection delete commits each
+  document's delete in its own transaction. If it fails partway, for any
+  reason including a `write_busy` from the Vault's event lock, the documents
+  deleted before the failure stay deleted; run the delete again.
+
 ## Regression verification
 
 `backend/tests/test_native_document_events_postgres.py` exercises the five
