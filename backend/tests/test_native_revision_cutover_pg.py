@@ -110,6 +110,8 @@ async def _fresh_schema(*, cutover_migrations: bool = True):
             "060_native_revision_migration_bridge.py",
             "061_native_revision_authority.py",
             "105_bridge_body_digest.py",
+            # Bare Git document writes take the Vault's event lock it defines.
+            "132_events_commit_order.py",
         ]
         if cutover_migrations:
             filenames.extend(
