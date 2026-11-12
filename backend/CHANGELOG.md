@@ -115,7 +115,8 @@ specifically; the proxy has its own log in
 - When the server refuses the readiness probe's connection at
   `max_connections`, readiness asks the pool instead. With an idle connection
   it runs `SELECT 1` on that connection within the probe's remaining budget
-  and reports `db: ok:pool_idle`. With none, it reports `db: ok:pool_progress`
+  and reports `db: ok:pool_idle`; the connection is given back within the same
+  budget or terminated. With none, it reports `db: ok:pool_progress`
   if an acquire has completed within the grace. Neither result is cached. A
   failed ping on the idle connection, a pool with neither, and every other
   connection error still fail readiness.

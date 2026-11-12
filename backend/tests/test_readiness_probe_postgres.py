@@ -53,18 +53,82 @@ async def _can_connect() -> bool:
     return True
 
 
-def _settings(name: str, *, user: str | None = None, password: str | None = None) -> Settings:
+def _server() -> tuple[str, int]:
     parsed = urlsplit(_ADMIN_DSN)
+    return parsed.hostname or "localhost", parsed.port or 5432
+
+
+def _settings(
+    name: str,
+    *,
+    user: str | None = None,
+    password: str | None = None,
+    pool_size: int = _POOL_SIZE,
+    address: tuple[str, int] | None = None,
+) -> Settings:
+    parsed = urlsplit(_ADMIN_DSN)
+    host, port = address or _server()
     return Settings(
         document_revision_backend="bare_git",
-        db_host=parsed.hostname or "localhost",
-        db_port=parsed.port or 5432,
+        db_host=host,
+        db_port=port,
         db_name=name,
         db_user=user or unquote(parsed.username or "akb"),
         db_password=password if password is not None else unquote(parsed.password or ""),
-        pg_pool_min_size=_POOL_SIZE,
-        pg_pool_max_size=_POOL_SIZE,
+        pg_pool_min_size=pool_size,
+        pg_pool_max_size=pool_size,
     )
+
+
+class _Relay:
+    """A TCP relay to PostgreSQL that can go silent, as a stalled network path does.
+
+    Once frozen it passes nothing more in either direction, and a connection it
+    accepts afterwards (such as asyncpg's cancel request) never reaches the
+    server. Every socket stays open until the relay closes.
+    """
+
+    def __init__(self) -> None:
+        self.address: tuple[str, int] = ("127.0.0.1", 0)
+        self._frozen = False
+        self._closing = asyncio.Event()
+        self._writers: list[asyncio.StreamWriter] = []
+        self._server: asyncio.Server | None = None
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(self._accept, "127.0.0.1", 0)
+        self.address = ("127.0.0.1", self._server.sockets[0].getsockname()[1])
+
+    def freeze(self) -> None:
+        self._frozen = True
+
+    async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._writers.append(writer)
+        if self._frozen:
+            await self._closing.wait()
+            return
+        upstream_reader, upstream_writer = await asyncio.open_connection(*_server())
+        self._writers.append(upstream_writer)
+        await asyncio.gather(self._pipe(reader, upstream_writer), self._pipe(upstream_reader, writer))
+
+    async def _pipe(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while data := await reader.read(65536):
+                if self._frozen:
+                    await self._closing.wait()
+                    return
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, OSError):
+            return
+
+    async def close(self) -> None:
+        self._closing.set()
+        for writer in self._writers:
+            writer.close()
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
 
 
 class _SharedPoolVectorStore:
@@ -81,11 +145,19 @@ class _SharedPoolVectorStore:
 
 
 @contextlib.asynccontextmanager
-async def _ready_database(monkeypatch, tmp_path, *, role_connection_limit: int | None = None):
+async def _ready_database(
+    monkeypatch,
+    tmp_path,
+    *,
+    role_connection_limit: int | None = None,
+    pool_size: int = _POOL_SIZE,
+    relay: _Relay | None = None,
+):
     """A disposable database, its request pool from `get_pool`, and an HTTP client.
 
     With `role_connection_limit`, the pool and the probe log in as a fresh role
-    that the server lets open only that many connections.
+    that the server lets open only that many connections. With `relay`, the
+    pool reaches the server through it while the probe connects directly.
     """
     if not await _can_connect():
         if os.environ.get("REQUIRE_REAL_PG") == "1":
@@ -114,13 +186,17 @@ async def _ready_database(monkeypatch, tmp_path, *, role_connection_limit: int |
             )
         monkeypatch.delenv("AKB_PG_POOL_MIN_SIZE", raising=False)
         monkeypatch.delenv("AKB_PG_POOL_MAX_SIZE", raising=False)
-        monkeypatch.setattr(postgres, "settings", _settings(name, user=role, password=password))
         monkeypatch.setattr(postgres, "_pool", None)
         monkeypatch.setattr(main, "_ready_state", main._ReadyState())
         monkeypatch.setattr(main, "_ready_lock", asyncio.Lock())
         store = _SharedPoolVectorStore()
         monkeypatch.setattr(main, "get_vector_store", lambda: store)
+        login = {"user": role, "password": password, "pool_size": pool_size}
+        pool_address = relay.address if relay is not None else None
+        monkeypatch.setattr(postgres, "settings", _settings(name, address=pool_address, **login))
         pool = await postgres.get_pool()
+        # The probe's own connection always goes to the server directly.
+        monkeypatch.setattr(postgres, "settings", _settings(name, **login))
         client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://akb.test")
         yield SimpleNamespace(main=main, admin=admin, name=name, pool=pool, store=store, client=client)
     finally:
@@ -320,6 +396,32 @@ async def test_server_refusing_the_probe_connection_with_every_connection_held_r
     assert progressing.json()["cached"] is False
     assert stalled.status_code == 503, stalled.text
     assert stalled.json()["detail"]["detail"]["db"] == "error:unavailable"
+
+
+async def test_idle_pool_connection_that_never_answers_is_given_up_within_the_probe_budget(monkeypatch, tmp_path):
+    # The pool's one connection uses the role's one slot, so the server refuses
+    # the probe's own connection and readiness pings through the pool. The
+    # relay then drops that ping, and the cancel request asyncpg sends for it.
+    relay = _Relay()
+    await relay.start()
+    try:
+        async with _ready_database(
+            monkeypatch, tmp_path, role_connection_limit=1, pool_size=1, relay=relay,
+        ) as db:
+            assert db.pool.get_idle_size() == 1
+            relay.freeze()
+
+            started = time.monotonic()
+            response = await db.client.get("/readyz")
+            elapsed = time.monotonic() - started
+    finally:
+        await relay.close()
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["detail"]["db"] == "error:timeout"
+    # The whole database step, giving the connection up included, stays
+    # within its budget instead of waiting on the cancel as long again.
+    assert elapsed < db.main._READY_DB_TIMEOUT_SECONDS + 0.5
 
 
 async def test_database_gone_is_not_ready_at_once(ready_db):

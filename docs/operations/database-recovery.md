@@ -103,7 +103,9 @@ without waiting for a connection:
 
 - If the pool has an idle connection, the probe borrows it for the rest of its
   2-second step and runs `SELECT 1` on it: `db: ok:pool_idle`. If that ping
-  fails, readiness fails.
+  fails, readiness fails. The connection goes back within the same budget. One
+  that cannot finish in time is terminated rather than returned, because
+  returning it would wait on a cancel request that may never complete.
 - Otherwise, if an acquire has completed within
   `readyz_pool_saturation_grace_secs`: `db: ok:pool_progress`.
 

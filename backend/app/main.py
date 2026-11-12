@@ -512,6 +512,41 @@ _DB_OK_BY_POOL_PROGRESS = "ok:pool_progress"
 _DB_READY = ("ok", _DB_OK_BY_POOL_IDLE, _DB_OK_BY_POOL_PROGRESS)
 
 
+def _remaining(budget: asyncio.Timeout) -> float | None:
+    deadline = budget.when()
+    return None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
+
+
+async def _ping_through_pool(pool: asyncpg.Pool, budget: asyncio.Timeout) -> None:
+    """Run ``SELECT 1`` on a pool connection, borrowed and given back within
+    the rest of the probe's budget. Raises when that does not succeed in time.
+
+    A connection that cannot finish in time is terminated rather than
+    returned. Its query may never answer, nor the cancel request asyncpg
+    sends for it, and returning it would wait for that cancel for as long
+    again as the acquire was allowed. Terminating frees the pool slot at
+    once and drops the pending cancel request.
+    """
+    conn = await pool.acquire(timeout=_remaining(budget))
+    try:
+        await conn.fetchval("SELECT 1")
+    except BaseException:
+        _terminate_pool_connection(conn)
+        raise
+    left = _remaining(budget)
+    if left is not None and left <= 0:
+        _terminate_pool_connection(conn)
+        raise TimeoutError
+    await pool.release(conn, timeout=left)
+
+
+def _terminate_pool_connection(conn) -> None:
+    try:
+        conn.terminate()
+    except Exception:  # noqa: BLE001 — the connection is given up either way
+        logger.debug("readiness could not terminate a pool connection", exc_info=True)
+
+
 async def _db_ok_despite_full_server(pool: asyncpg.Pool, budget: asyncio.Timeout) -> str | None:
     """How the pool vouches for the database after the server refused the
     probe's connection, or None when it cannot. A failing ping raises.
@@ -525,10 +560,7 @@ async def _db_ok_despite_full_server(pool: asyncpg.Pool, budget: asyncio.Timeout
     if pool.is_closing():
         return None
     if pool.get_idle_size() > 0:
-        deadline = budget.when()
-        remaining = None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
-        async with pool.acquire(timeout=remaining) as conn:
-            await conn.fetchval("SELECT 1")
+        await _ping_through_pool(pool, budget)
         return _DB_OK_BY_POOL_IDLE
     _, last_acquire_age = pool_progress()
     if last_acquire_age is not None and last_acquire_age < settings.readyz_pool_saturation_grace_secs:

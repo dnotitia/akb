@@ -14,11 +14,10 @@ same behaviour against a real one.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import socket
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import asyncpg
 import pytest
@@ -36,8 +35,9 @@ class _Pool:
     def __init__(self, size: int, max_size: int, idle: int) -> None:
         self.size, self.max_size, self.idle = size, max_size, idle
         self.closing = False
-        self.idle_conn = SimpleNamespace(fetchval=AsyncMock(return_value=1))
+        self.idle_conn = SimpleNamespace(fetchval=AsyncMock(return_value=1), terminate=MagicMock())
         self.acquire_timeouts: list[float | None] = []
+        self.release_timeouts: list[float | None] = []
 
     def get_size(self) -> int:
         return self.size
@@ -51,10 +51,13 @@ class _Pool:
     def is_closing(self) -> bool:
         return self.closing
 
-    @contextlib.asynccontextmanager
     async def acquire(self, *, timeout=None):
         self.acquire_timeouts.append(timeout)
-        yield self.idle_conn
+        return self.idle_conn
+
+    async def release(self, conn, *, timeout=None) -> None:
+        assert conn is self.idle_conn
+        self.release_timeouts.append(timeout)
 
     async def fetchval(self, *_args):  # pragma: no cover — a failure if ever reached
         raise AssertionError("readiness must not borrow a request-pool connection")
@@ -356,9 +359,12 @@ async def test_server_at_max_connections_pings_through_an_idle_pool_connection(m
     assert ok is True
     assert detail["db"] == "ok:pool_idle"
     probe.pool.idle_conn.fetchval.assert_awaited_once_with("SELECT 1")
-    # Borrowed for the rest of the probe's database budget, no longer.
-    (timeout,) = probe.pool.acquire_timeouts
-    assert timeout is not None and 0 < timeout <= main._READY_DB_TIMEOUT_SECONDS
+    # Borrowed and given back within the rest of the probe's budget, no longer.
+    (acquire_timeout,) = probe.pool.acquire_timeouts
+    (release_timeout,) = probe.pool.release_timeouts
+    assert acquire_timeout is not None and 0 < acquire_timeout <= main._READY_DB_TIMEOUT_SECONDS
+    assert release_timeout is not None and 0 < release_timeout <= acquire_timeout
+    probe.pool.idle_conn.terminate.assert_not_called()
     assert detail["vector_store"] == "ok"
 
 
@@ -382,6 +388,9 @@ async def test_failed_ping_on_the_idle_pool_connection_is_not_ready(main, probe)
     # Recent progress does not override a ping that failed on the pool itself.
     assert ok is False
     assert detail["db"] == "error:unavailable"
+    # Given up rather than returned: returning it could wait on a cancel.
+    probe.pool.idle_conn.terminate.assert_called_once()
+    assert probe.pool.release_timeouts == []
 
 
 async def test_hung_ping_on_the_idle_pool_connection_is_cut_off_inside_the_probe_budget(main, probe):
@@ -391,10 +400,30 @@ async def test_hung_ping_on_the_idle_pool_connection_is_cut_off_inside_the_probe
     probe.ping.side_effect = _SERVER_FULL
     probe.pool.idle_conn.fetchval.side_effect = hang
 
+    started = time.monotonic()
     ok, detail = await asyncio.wait_for(main._probe_ready(), timeout=3)
+    elapsed = time.monotonic() - started
 
     assert ok is False
     assert detail["db"] == "error:timeout"
+    assert elapsed < main._READY_DB_TIMEOUT_SECONDS + 0.5
+    probe.pool.idle_conn.terminate.assert_called_once()
+    assert probe.pool.release_timeouts == []
+
+
+async def test_pool_ping_that_uses_up_the_budget_gives_the_connection_up(main):
+    pool = _Pool(size=1, max_size=1, idle=1)
+    loop = asyncio.get_running_loop()
+    # The ping answers, but only once the probe's budget is already gone.
+    deadlines = iter([loop.time() + 1.0, loop.time() - 0.1])
+    budget = SimpleNamespace(when=lambda: next(deadlines))
+
+    with pytest.raises(TimeoutError):
+        await main._ping_through_pool(pool, budget)
+
+    pool.idle_conn.fetchval.assert_awaited_once_with("SELECT 1")
+    pool.idle_conn.terminate.assert_called_once()
+    assert pool.release_timeouts == []
 
 
 def _no_idle(pool: _Pool) -> None:
