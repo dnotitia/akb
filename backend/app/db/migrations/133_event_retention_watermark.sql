@@ -3,8 +3,16 @@
 -- cursor at or above it missed nothing, however far below the Vault's first
 -- retained event it is: event ids are shared by every Vault, so other Vaults'
 -- events advance them too.
+--
+-- There is no foreign key to vaults, and nothing that writes a mark reads or
+-- locks a Vault. Recording a deletion while it holds the deleted event rows
+-- then never waits for a Vault row, which a Vault cleanup that locks the
+-- Vault before it deletes the same events would otherwise turn into a
+-- deadlock. Vault ids are never reused, so a mark left for a Vault that no
+-- longer exists, as when its leftover events are swept after it is deleted,
+-- is inert; a Vault's delete removes the mark it has by then (below).
 CREATE TABLE IF NOT EXISTS event_retention_watermarks (
-    vault_id UUID PRIMARY KEY REFERENCES vaults(id) ON DELETE CASCADE,
+    vault_id UUID PRIMARY KEY,
     deleted_through BIGINT NOT NULL CHECK (deleted_through >= 0)
 );
 
@@ -19,32 +27,37 @@ CREATE TABLE IF NOT EXISTS event_retention_backfill (
 -- Every delete from events raises the mark of each Vault it touched, in the
 -- deleting statement, whichever code issues it: this release's sweeper, an
 -- earlier release's during a rolling deployment or after a rollback, or an
--- operator. Events of a Vault that no longer exists record nothing. The
--- Vaults a delete touched are read FOR KEY SHARE, which keeps each from
--- being deleted until the delete commits: a Vault delete under way is waited
--- for, and a Vault it removed records nothing. Read from the statement's
--- snapshot alone, such a Vault failed the mark's foreign key check, and the
--- whole delete with it, the sweep of every other Vault's events included.
+-- operator. It touches no other table. Marks are written in Vault id order,
+-- as migration 134 writes them, so two statements that write the same marks
+-- take their row locks in the same order.
 CREATE OR REPLACE FUNCTION akb_events_record_deletions()
 RETURNS TRIGGER AS $$
 BEGIN
-    WITH deleted AS (
-        SELECT d.vault_id, MAX(d.id) AS deleted_through
-          FROM akb_deleted_events d
-         WHERE d.vault_id IS NOT NULL
-         GROUP BY d.vault_id
-    ), live AS (
-        SELECT v.id
-          FROM vaults v
-         WHERE v.id IN (SELECT vault_id FROM deleted)
-           FOR KEY SHARE
-    )
     INSERT INTO event_retention_watermarks AS w (vault_id, deleted_through)
-    SELECT deleted.vault_id, deleted.deleted_through
-      FROM deleted
-      JOIN live ON live.id = deleted.vault_id
+    SELECT d.vault_id, MAX(d.id)
+      FROM akb_deleted_events d
+     WHERE d.vault_id IS NOT NULL
+     GROUP BY d.vault_id
+     ORDER BY d.vault_id
     ON CONFLICT (vault_id) DO UPDATE
        SET deleted_through = GREATEST(w.deleted_through, EXCLUDED.deleted_through);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- A Vault's delete removes its mark, in the deleting statement. Lock order:
+-- every statement that writes a mark holds the event rows it deleted first
+-- and then the mark row (an events delete, the sweeper's included, then its
+-- trigger's write), and a Vault delete takes its Vault row and then the mark
+-- row, after any event rows its code deleted first. Nothing that holds a
+-- mark row waits for an event row or a Vault row, so no wait can close a
+-- cycle.
+CREATE OR REPLACE FUNCTION akb_vaults_drop_retention_marks()
+RETURNS TRIGGER AS $$
+BEGIN
+    DELETE FROM event_retention_watermarks w
+     USING akb_deleted_vaults d
+     WHERE w.vault_id = d.id;
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
@@ -96,5 +109,9 @@ BEGIN
         AFTER DELETE ON events
         REFERENCING OLD TABLE AS akb_deleted_events
         FOR EACH STATEMENT EXECUTE FUNCTION akb_events_record_deletions();
+        CREATE OR REPLACE TRIGGER akb_vaults_drop_retention_marks
+        AFTER DELETE ON vaults
+        REFERENCING OLD TABLE AS akb_deleted_vaults
+        FOR EACH STATEMENT EXECUTE FUNCTION akb_vaults_drop_retention_marks();
     END IF;
 END $$;

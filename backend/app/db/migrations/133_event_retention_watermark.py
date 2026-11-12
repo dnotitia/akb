@@ -10,11 +10,23 @@ refused only when it is below it.
 A statement trigger on events raises the mark in every statement that
 deletes, so deletions are recorded whichever code issues them, including the
 sweeper of an earlier release that runs beside this one during a rolling
-deployment or after a rollback. It reads the Vaults it records marks for FOR
-KEY SHARE, so a delete beside a Vault delete waits for it and records nothing
-for a Vault removed, instead of failing the mark's foreign key check. A
-TRUNCATE of events records nothing; only the test runtime's reset uses one,
-and it truncates this table and the Vaults with it.
+deployment or after a rollback. A TRUNCATE of events records nothing; only
+the test runtime's reset uses one, and it truncates this table and the Vaults
+with it.
+
+The marks have no foreign key to vaults, and nothing that writes one reads or
+locks a Vault. A delete of events holds the deleted rows when its trigger
+writes the marks; had it then waited for a Vault row, as a foreign key check
+or a lock on the Vault does, a Vault cleanup that locks the Vault before it
+deletes the same events would deadlock with it. Vault ids are never reused,
+so a mark for a Vault that no longer exists, as when its leftover events are
+swept after it is deleted, is inert. A trigger on vaults removes a Vault's
+mark in the statement that deletes the Vault. Lock order, which leaves no
+cycle: a statement that writes marks holds its deleted event rows first and
+then the mark rows, which it takes in Vault id order, as migration 134 does;
+a Vault delete holds its Vault row, and any event rows its code deleted
+before, and then the mark row. Nothing that holds a mark row waits for an
+event row or a Vault row.
 
 This migration installs the trigger and records the backfill boundary while
 inserts and deletes on events wait; migration 134 then sets the starting

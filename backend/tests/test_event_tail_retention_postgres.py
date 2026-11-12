@@ -43,6 +43,7 @@ _EARLIER_SWEEP = """
 async def _as_before_the_migration(pool: asyncpg.Pool) -> None:
     """Remove what migrations 133 and 134 installed and set, keeping their tables."""
     await pool.execute("DROP TRIGGER IF EXISTS akb_events_record_deletions ON events")
+    await pool.execute("DROP TRIGGER IF EXISTS akb_vaults_drop_retention_marks ON vaults")
     await pool.execute("DELETE FROM event_retention_watermarks")
     await pool.execute("DELETE FROM event_retention_backfill")
 
@@ -165,9 +166,11 @@ async def test_a_delete_records_the_watermark_in_its_own_statement(monkeypatch):
         assert await _watermarks(setup_pool) == {vault_id: first[-1]}
 
         later = [await _insert_event(setup_pool, vault_id, "document.update", "alice") for _ in range(2)]
-        # An event with no Vault and one whose Vault is gone are swept, and record nothing.
+        # An event with no Vault records nothing. One whose Vault is gone records
+        # an inert mark: Vault ids are never reused.
         vaultless = await _insert_event(setup_pool, None, "system.note", "alice")
-        orphaned = await _insert_event(setup_pool, uuid.uuid4(), "document.put", "alice")
+        gone = uuid.uuid4()
+        orphaned = await _insert_event(setup_pool, gone, "document.put", "alice")
         await _publish_long_ago(setup_pool, later + [vaultless, orphaned])
 
         holder = await asyncpg.connect(_database_dsn(database))
@@ -191,10 +194,10 @@ async def test_a_delete_records_the_watermark_in_its_own_statement(monkeypatch):
             await holder.close()
 
         assert await setup_pool.fetchval("SELECT count(*) FROM events") == 0
-        assert await _watermarks(setup_pool) == {vault_id: later[-1]}
-        # The row goes with its Vault.
+        assert await _watermarks(setup_pool) == {vault_id: later[-1], gone: orphaned}
+        # The Vault's delete takes its row with it.
         await setup_pool.execute("DELETE FROM vaults WHERE id = $1", vault_id)
-        assert await _watermarks(setup_pool) == {}
+        assert await _watermarks(setup_pool) == {gone: orphaned}
 
 
 async def test_the_watermark_starts_at_the_old_boundary_for_vaults_that_have_events(monkeypatch):
@@ -202,14 +205,16 @@ async def test_the_watermark_starts_at_the_old_boundary_for_vaults_that_have_eve
 
     A Vault that still has events starts just below its earliest one, where
     the tail drew the line before, so history that may already have been swept
-    is still refused. A Vault with no events, and events of a Vault that no
-    longer exists, get no row.
+    is still refused. A Vault with no events gets no row. Events of a Vault
+    that no longer exists get an inert one: nothing reads it, as Vault ids
+    are never reused.
     """
     async with _fresh_database() as setup_pool:
         with_events = await _make_vault(setup_pool, "retention-backfill")
         await _make_vault(setup_pool, "retention-backfill-empty")
         gone = uuid.uuid4()
-        for _ in range(5):
+        gone_first = await _insert_event(setup_pool, gone, "document.put", "alice")
+        for _ in range(4):
             await _insert_event(setup_pool, gone, "document.put", "alice")
         earliest = await _insert_event(setup_pool, with_events, "document.put", "alice")
         await _insert_event(setup_pool, with_events, "document.update", "alice")
@@ -217,7 +222,7 @@ async def test_the_watermark_starts_at_the_old_boundary_for_vaults_that_have_eve
 
         async with setup_pool.acquire() as conn:
             await _install_and_backfill(conn)
-        assert await _watermarks(setup_pool) == {with_events: earliest - 1}
+        assert await _watermarks(setup_pool) == {with_events: earliest - 1, gone: gone_first - 1}
         assert await _trigger_installed(setup_pool)
 
         # Applying them again keeps a mark raised since.
@@ -226,7 +231,7 @@ async def test_the_watermark_starts_at_the_old_boundary_for_vaults_that_have_eve
         )
         async with setup_pool.acquire() as conn:
             await _install_and_backfill(conn)
-        assert await _watermarks(setup_pool) == {with_events: earliest}
+        assert await _watermarks(setup_pool) == {with_events: earliest, gone: gone_first - 1}
 
 
 async def test_a_deletion_before_the_migration_cannot_be_reconstructed(monkeypatch):
@@ -728,7 +733,7 @@ async def test_the_backfill_keeps_a_mark_the_trigger_recorded_since_the_install(
         async with setup_pool.acquire() as conn:
             await backfill.migrate(conn=conn)
 
-        assert await _watermarks(setup_pool) == {vault_id: first}
+        assert (await _watermarks(setup_pool))[vault_id] == first
         codec = EventCursorCodec(_CURSOR_SECRET)
         async with _tail(monkeypatch, setup_pool) as tail:
             resumed = await tail.open(
@@ -744,19 +749,17 @@ async def test_the_backfill_keeps_a_mark_the_trigger_recorded_since_the_install(
         assert _positions(delivered) == [second]
 
 
-async def test_the_backfill_skips_a_vault_whose_delete_is_under_way():
-    """A Vault deleted while migration 134 runs gets no mark, and the migration succeeds.
+async def test_the_backfill_takes_no_vault_lock():
+    """Migration 134 neither reads nor locks a Vault, so no transaction on one holds it up.
 
-    The backfill read the Vault from its own snapshot, and the mark's foreign
-    key check then found it gone once the delete committed: the migration
-    failed, and the server's start with it.
+    It locked the Vaults it set marks for, so a delete of one of them that was
+    still open held up the backfill, and with it the server's start. A mark
+    it sets for a Vault deleted meanwhile is inert.
     """
     async with _fresh_database() as setup_pool:
         database = await setup_pool.fetchval("SELECT current_database()")
-        kept = await _make_vault(setup_pool, "retention-kept-vault")
-        doomed = await _make_vault(setup_pool, "retention-deleted-vault")
-        kept_first = await _insert_event(setup_pool, kept, "document.put", "alice")
-        await _insert_event(setup_pool, doomed, "document.put", "alice")
+        target = await _make_vault(setup_pool, "retention-locked-target")
+        first = await _insert_event(setup_pool, target, "document.put", "alice")
         await _as_before_the_migration(setup_pool)
         migration = _load_migration(_MIGRATION)
         backfill = _load_migration(_BACKFILL)
@@ -764,22 +767,19 @@ async def test_the_backfill_skips_a_vault_whose_delete_is_under_way():
         async with setup_pool.acquire() as conn:
             async with conn.transaction():
                 await migration.migrate(conn=conn)
-        deleting = await asyncpg.connect(_database_dsn(database))
-        backfilling = await asyncpg.connect(_database_dsn(database))
+        holding = await asyncpg.connect(_database_dsn(database))
         try:
-            deletion = deleting.transaction()
+            # A delete of the very Vault the backfill sets a mark for, held open.
+            deletion = holding.transaction()
             await deletion.start()
-            await deleting.execute("DELETE FROM vaults WHERE id = $1", doomed)
-            applying = asyncio.create_task(backfill.migrate(conn=backfilling))
-            # The backfill waits for the Vault's delete.
-            await _waits_for(setup_pool, backfilling, deleting)
-            await deletion.commit()
-            await asyncio.wait_for(applying, 5)
+            await holding.execute("DELETE FROM vaults WHERE id = $1", target)
+            async with setup_pool.acquire() as conn:
+                await asyncio.wait_for(backfill.migrate(conn=conn), 2)
+            await deletion.rollback()
         finally:
-            await deleting.close()
-            await backfilling.close()
+            await holding.close()
 
-        assert await _watermarks(setup_pool) == {kept: kept_first - 1}
+        assert await _watermarks(setup_pool) == {target: first - 1}
         assert await setup_pool.fetchval("SELECT count(*) FROM event_retention_backfill") == 0
 
 
@@ -830,7 +830,7 @@ async def test_ids_a_session_drew_ahead_before_the_install_land_above_the_bounda
             finally:
                 await resumed.aclose()
         assert _positions(delivered) == [later]
-        assert await _watermarks(setup_pool) == {}
+        assert vault_id not in await _watermarks(setup_pool)
         cache = await setup_pool.fetchval("SELECT seqcache FROM pg_sequence WHERE seqrelid = 'events_id_seq'::regclass")
         assert cache == 1
 
@@ -869,18 +869,126 @@ async def test_the_backfill_waits_for_no_vault_it_sets_no_mark_for():
         assert await _watermarks(setup_pool) == {target: first - 1}
 
 
-async def test_a_sweep_beside_a_vault_delete_succeeds(monkeypatch):
-    """The deletion trigger's marks must not name a Vault whose delete committed meanwhile.
+async def _done_or_waiting(
+    pool: asyncpg.Pool, task: asyncio.Future, waiter: asyncpg.Connection, holder: asyncpg.Connection
+) -> None:
+    """Return once ``task`` is done or ``waiter`` waits for a lock that ``holder`` holds."""
 
-    The trigger read the Vault from its statement's snapshot, and the mark's
-    foreign key check failed once the Vault's delete committed: the whole
-    sweep rolled back, every other Vault's events included, and the sweeper
-    tries again only after its interval.
+    async def poll() -> None:
+        while not task.done() and not await pool.fetchval(
+            "SELECT $2 = ANY(pg_blocking_pids($1))", waiter.get_server_pid(), holder.get_server_pid()
+        ):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), 5)
+
+
+async def test_a_vault_cleanup_and_a_delete_of_its_events_do_not_deadlock():
+    """A Vault cleanup locks its Vault and then deletes the Vault's events.
+
+    The failed create's cleanup does so. A plain delete of the same events
+    beside it, an operator's or an earlier release's, held the deleted rows
+    while its trigger waited for the Vault row, and the cleanup then waited
+    for those rows: PostgreSQL broke the deadlock by failing one of the two.
+    Recording a deletion now waits for no Vault row.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        vault_id = await _make_vault(setup_pool, "retention-cleanup")
+        for _ in range(3):
+            await _insert_event(setup_pool, vault_id, "document.put", "alice")
+        cleanup = await asyncpg.connect(_database_dsn(database))
+        operator = await asyncpg.connect(_database_dsn(database))
+        tasks: list[asyncio.Future] = []
+        try:
+            cleaning = cleanup.transaction()
+            await cleaning.start()
+            await cleanup.fetchval("SELECT 1 FROM vaults WHERE id = $1 FOR UPDATE", vault_id)
+            deleting = operator.transaction()
+            await deleting.start()
+            operator_delete = asyncio.ensure_future(
+                operator.execute("DELETE FROM events WHERE vault_id = $1", vault_id)
+            )
+            tasks.append(operator_delete)
+            await _done_or_waiting(setup_pool, operator_delete, operator, cleanup)
+            cleanup_delete = asyncio.ensure_future(cleanup.execute("DELETE FROM events WHERE vault_id = $1", vault_id))
+            tasks.append(cleanup_delete)
+            # The cleanup waits for the rows the operator's delete holds.
+            await _waits_for(setup_pool, cleanup, operator)
+            if operator_delete.done() and operator_delete.exception() is None:
+                await deleting.commit()
+            done, _ = await asyncio.wait(tasks, timeout=5, return_when=asyncio.FIRST_EXCEPTION)
+            failures = [task.exception() for task in done if task.exception() is not None]
+            assert not failures, failures
+            assert operator_delete.done() and cleanup_delete.done()
+            await cleanup.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+            await cleaning.commit()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await cleanup.close()
+            await operator.close()
+            for task in tasks:
+                with contextlib.suppress(BaseException):
+                    await task
+
+        assert await setup_pool.fetchval("SELECT count(*) FROM events") == 0
+        # The operator's delete recorded a mark, and the Vault's delete took it.
+        assert await _watermarks(setup_pool) == {}
+
+
+async def test_a_vault_delete_beside_a_sweep_takes_the_mark_the_sweep_raises(monkeypatch):
+    """The sweep and a Vault delete both succeed, and the Vault's mark goes with it.
+
+    The sweep raises the Vault's mark without waiting for the Vault; the
+    Vault's delete waits for that mark's row and removes it once the sweep
+    commits. A mark a sweep inserts for the first time beside the delete, or
+    after it, is left behind, and is inert.
     """
     async with _fresh_database() as setup_pool:
         database = await setup_pool.fetchval("SELECT current_database()")
         doomed = await _make_vault(setup_pool, "retention-sweep-doomed")
         kept = await _make_vault(setup_pool, "retention-sweep-kept")
+        doomed_ids = [await _insert_event(setup_pool, doomed, "document.put", "alice") for _ in range(2)]
+        kept_ids = [await _insert_event(setup_pool, kept, "document.put", "alice") for _ in range(2)]
+        # The Vault has a mark already: its first event was deleted earlier.
+        await setup_pool.execute("DELETE FROM events WHERE id = $1", doomed_ids[0])
+        assert await _watermarks(setup_pool) == {doomed: doomed_ids[0]}
+        await _publish_long_ago(setup_pool, doomed_ids[1:] + kept_ids)
+        sweeping = await asyncpg.connect(_database_dsn(database))
+        deleting = await asyncpg.connect(_database_dsn(database))
+        try:
+            # The sweeper's delete, still open: the marks are written, not committed.
+            sweep = sweeping.transaction()
+            await sweep.start()
+            assert await sweeping.fetchval(_EARLIER_SWEEP) == 3
+            deletion = deleting.transaction()
+            await deletion.start()
+            removing = asyncio.ensure_future(deleting.execute("DELETE FROM vaults WHERE id = $1", doomed))
+            # The Vault's delete waits for the mark the sweep wrote.
+            await _waits_for(setup_pool, deleting, sweeping)
+            await sweep.commit()
+            await asyncio.wait_for(removing, 5)
+            await deletion.commit()
+        finally:
+            await sweeping.close()
+            await deleting.close()
+
+        assert await setup_pool.fetchval("SELECT count(*) FROM events") == 0
+        assert await _watermarks(setup_pool) == {kept: kept_ids[-1]}
+
+
+async def test_a_sweep_waits_for_no_vault_delete(monkeypatch):
+    """The sweep takes no Vault lock, so a Vault delete still open holds it up no longer.
+
+    Its mark for the Vault being deleted is left behind if the delete commits
+    first, and is inert, as Vault ids are never reused.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        doomed = await _make_vault(setup_pool, "retention-sweep-first-doomed")
+        kept = await _make_vault(setup_pool, "retention-sweep-first-kept")
         doomed_ids = [await _insert_event(setup_pool, doomed, "document.put", "alice") for _ in range(2)]
         kept_ids = [await _insert_event(setup_pool, kept, "document.put", "alice") for _ in range(2)]
         await _publish_long_ago(setup_pool, doomed_ids + kept_ids)
@@ -889,14 +997,10 @@ async def test_a_sweep_beside_a_vault_delete_succeeds(monkeypatch):
             deletion = deleting.transaction()
             await deletion.start()
             await deleting.execute("DELETE FROM vaults WHERE id = $1", doomed)
-            sweeping = asyncio.create_task(_sweep(monkeypatch, setup_pool))
-            await asyncio.sleep(0.3)
-            # The sweep waits for the Vault's delete.
-            assert not sweeping.done()
+            assert await asyncio.wait_for(_sweep(monkeypatch, setup_pool), 2) == 4
             await deletion.commit()
-            assert await asyncio.wait_for(sweeping, 5) == 4
         finally:
             await deleting.close()
 
         assert await setup_pool.fetchval("SELECT count(*) FROM events") == 0
-        assert await _watermarks(setup_pool) == {kept: kept_ids[-1]}
+        assert (await _watermarks(setup_pool))[kept] == kept_ids[-1]

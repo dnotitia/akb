@@ -27,16 +27,12 @@ holds up no event insert. It is correct without that lock:
   the trigger was installed. A Vault whose events all came later, such as
   one that was empty then, gets no mark from here, so a cursor taken while it
   was empty is not refused.
-- A Vault deleted meanwhile gets no mark. The marks are computed first,
-  without locks, and then the Vaults they name, and only those, are read
-  FOR KEY SHARE in the same statement: a delete under way is waited for, and
-  a Vault it removed is not returned, while a delete that starts later waits
-  for this to commit and then takes the mark with the Vault, by cascade.
-  Read from the statement's snapshot alone, a Vault whose delete committed
-  after the snapshot failed the mark's foreign key check, and the migration
-  with it, which stopped the server's start. A Vault with no mark to set is
-  not locked, so a long transaction on its row, such as a delete, holds up
-  nothing here.
+- No Vault is read or locked. The marks have no foreign key to vaults, so a
+  Vault deleted meanwhile cannot fail this statement, and no transaction on
+  a Vault row, a delete included, holds it up. A mark it sets for a Vault
+  that is gone, or whose events outlived it, is inert, as Vault ids are
+  never reused; a Vault deleted after this commits takes its mark with it,
+  through the trigger on vaults.
 - A delete racing this statement is recorded either way. If its trigger
   wrote the Vault's row first, committed or not, the insert here waits for
   it and then does nothing; ON CONFLICT sees the newest committed row even

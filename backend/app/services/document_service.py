@@ -2547,8 +2547,8 @@ class DocumentService:
                     # (events has no vault FK cascade) — leaving them would
                     # feed consumers an event for a vault this rollback is
                     # about to erase. The delete trigger records a retention
-                    # watermark for the vault, which goes with the vault row,
-                    # by cascade.
+                    # watermark for the vault, which the vault's own delete
+                    # trigger removes below.
                     await conn.execute("DELETE FROM events WHERE vault_id = $1", vault_id)
                     await conn.execute("DELETE FROM edges WHERE vault_id = $1", vault_id)
                     await delete_vault_chunks(conn, vault_id)

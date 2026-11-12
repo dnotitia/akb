@@ -134,11 +134,14 @@ A cursor is refused with 410 `event_gap` only when an event it never received
 was deleted. A trigger on `events` records, per Vault, the highest event id
 deleted, in every statement that deletes, whichever code issues it: this
 release's sweeper, an earlier release's during a rolling deployment or after a
-rollback, or an operator (migration 133). It locks the Vaults it records
-marks for, so a delete of events beside a Vault delete waits for it and
-records nothing for the Vault removed, rather than failing and taking the
-rest of the sweep with it. A cursor below that mark is refused, and the
-refusal's `earliest_cursor` resumes at it.
+rollback, or an operator (migration 133). The marks have no foreign key to
+Vaults, and nothing that writes one reads or locks a Vault, so a delete of
+events never waits for a Vault and cannot deadlock with a Vault cleanup that
+locks the Vault before it deletes the same events. A Vault's delete removes
+the mark it has through a trigger on `vaults`. A mark written for a Vault
+after its delete, as when its leftover events are swept later, stays behind
+and is inert: Vault ids are never reused. A cursor below that mark is
+refused, and the refusal's `earliest_cursor` resumes at it.
 Event ids are shared by every Vault, so a cursor taken before a Vault's first
 event, on an empty Vault, is usually far below that event and is still valid.
 `start=earliest` replays from the first position after which nothing was
@@ -163,11 +166,9 @@ that already has a mark keeps it: only the trigger can have written one
 since the install, and it is exact, while a starting mark taken from the
 events left would claim the ids between them, which other Vaults' events use,
 as deleted. A delete that races the backfill is still recorded. A Vault whose
-events all came after the trigger gets no starting mark, and neither does a
-Vault deleted while migration 134 runs: it locks only the Vaults it sets
-marks for, waits for a delete of one under way, and skips the Vault it
-removed. When the trigger is already in place,
-migration 133 asks for no lock at all. A request for the lock that has to wait
+events all came after the trigger gets no starting mark. Migration 134 reads
+and locks no Vault, so no transaction on a Vault holds it up. When the
+trigger is already in place, migration 133 asks for no lock at all. A request for the lock that has to wait
 would make every later event insert wait behind it, so the migration asks
 with a 500 ms lock timeout and holds nothing while it backs off between
 attempts (0.25 s, doubling to 2 s). A transaction that keeps an event it wrote
