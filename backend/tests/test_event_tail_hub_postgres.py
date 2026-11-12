@@ -230,8 +230,10 @@ async def test_stream_reads_a_commit_on_its_heartbeat_while_the_listener_cannot_
             event_id = await _insert_event(pool, vault_id, "document.put", "alice")
 
             # The stream's next heartbeat re-read starts at most one interval
-            # after the commit; the second interval is slack for the read.
-            done, _ = await asyncio.wait({reader}, timeout=2 * _HEARTBEAT_SECONDS)
+            # after the commit. The rest of the allowance is slack for a loaded
+            # event loop or a slow read; nothing else can deliver the row, so a
+            # longer wait cannot let a stream that ignores its heartbeat pass.
+            done, _ = await asyncio.wait({reader}, timeout=6 * _HEARTBEAT_SECONDS)
             assert reader in done, "a row committed while the listener was down never reached the stream"
             reader.result()
             # Nothing woke the stream, and the hub is still without a connection.
