@@ -50,11 +50,19 @@ $$ LANGUAGE plpgsql;
 -- and then the mark row (an events delete, the sweeper's included, then its
 -- trigger's write), and a Vault delete takes its Vault row and then the mark
 -- row, after any event rows its code deleted first. Nothing that holds a
--- mark row waits for an event row or a Vault row, so no wait can close a
--- cycle.
+-- mark row waits for an event row or a Vault row. Among mark rows, every
+-- statement takes them in Vault id order: the deletion trigger and migration
+-- 134 write them in that order, and this locks them in that order before it
+-- deletes them, whatever order the deleted Vaults or the marks are stored
+-- in. So no wait can close a cycle.
 CREATE OR REPLACE FUNCTION akb_vaults_drop_retention_marks()
 RETURNS TRIGGER AS $$
 BEGIN
+    PERFORM 1
+       FROM event_retention_watermarks w
+      WHERE w.vault_id IN (SELECT d.id FROM akb_deleted_vaults d)
+      ORDER BY w.vault_id
+        FOR UPDATE;
     DELETE FROM event_retention_watermarks w
      USING akb_deleted_vaults d
      WHERE w.vault_id = d.id;

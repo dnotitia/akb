@@ -1004,3 +1004,75 @@ async def test_a_sweep_waits_for_no_vault_delete(monkeypatch):
 
         assert await setup_pool.fetchval("SELECT count(*) FROM events") == 0
         assert (await _watermarks(setup_pool))[kept] == kept_ids[-1]
+
+
+async def test_a_vault_delete_and_a_sweep_take_marks_in_the_same_order():
+    """Writers of marks must take their rows in one order, or two of them can deadlock.
+
+    The sweep's trigger raises marks in Vault id order, A before B. The Vault
+    delete trigger deleted them in whatever order its plan met them; here
+    that is B first, because B's Vault and mark are stored before A's and
+    the Vaults are deleted by a filter no index serves, so both the deleted
+    Vaults and the marks come in stored order. A session holding A's mark
+    FOR KEY SHARE stops the Vault delete between its two marks while it
+    holds B's, yet lets the sweep's update of A through. The sweep then
+    waited for B, and once the session ended the delete waited for A:
+    PostgreSQL failed one of them with a deadlock. The delete trigger now
+    locks the marks in Vault id order before it deletes them.
+    """
+    vault_a = uuid.UUID("00000000-0000-4000-8000-00000000000a")
+    vault_b = uuid.UUID("00000000-0000-4000-8000-00000000000b")
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        # B's Vault, events and mark are stored before A's.
+        for vault_id, name in ((vault_b, "retention-order-b"), (vault_a, "retention-order-a")):
+            await setup_pool.execute(
+                "INSERT INTO vaults (id, name, git_path) VALUES ($1, $2, $3)", vault_id, name, f"/tmp/{name}.git"
+            )
+        b_events = [await _insert_event(setup_pool, vault_b, "document.put", "alice") for _ in range(2)]
+        a_events = [await _insert_event(setup_pool, vault_a, "document.put", "alice") for _ in range(2)]
+        await setup_pool.execute("DELETE FROM events WHERE id = $1", b_events[0])
+        await setup_pool.execute("DELETE FROM events WHERE id = $1", a_events[0])
+        assert await _watermarks(setup_pool) == {vault_b: b_events[0], vault_a: a_events[0]}
+        await _publish_long_ago(setup_pool, [a_events[1], b_events[1]])
+        holder = await asyncpg.connect(_database_dsn(database))
+        deleting = await asyncpg.connect(_database_dsn(database))
+        sweeping = await asyncpg.connect(_database_dsn(database))
+        tasks: list[asyncio.Future] = []
+        try:
+            holding = holder.transaction()
+            await holding.start()
+            await holder.fetchval("SELECT 1 FROM event_retention_watermarks WHERE vault_id = $1 FOR KEY SHARE", vault_a)
+            deletion = deleting.transaction()
+            await deletion.start()
+            removing = asyncio.ensure_future(
+                deleting.execute("DELETE FROM vaults WHERE git_path LIKE '/tmp/retention-order-%'")
+            )
+            tasks.append(removing)
+            # The Vault delete waits at A's mark.
+            await _waits_for(setup_pool, deleting, holder)
+            sweep = sweeping.transaction()
+            await sweep.start()
+            raising = asyncio.ensure_future(sweeping.fetchval(_EARLIER_SWEEP))
+            tasks.append(raising)
+            await _done_or_waiting(setup_pool, raising, sweeping, deleting)
+            await holding.commit()
+            if raising.done() and raising.exception() is None:
+                await sweep.commit()
+            done, _ = await asyncio.wait(tasks, timeout=5, return_when=asyncio.FIRST_EXCEPTION)
+            failures = [task.exception() for task in done if task.exception() is not None]
+            assert not failures, failures
+            assert removing.done() and raising.done()
+            assert raising.result() == 2
+            await deletion.commit()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            for conn in (holder, deleting, sweeping):
+                await conn.close()
+            for task in tasks:
+                with contextlib.suppress(BaseException):
+                    await task
+
+        assert await _watermarks(setup_pool) == {}

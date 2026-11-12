@@ -138,7 +138,9 @@ rollback, or an operator (migration 133). The marks have no foreign key to
 Vaults, and nothing that writes one reads or locks a Vault, so a delete of
 events never waits for a Vault and cannot deadlock with a Vault cleanup that
 locks the Vault before it deletes the same events. A Vault's delete removes
-the mark it has through a trigger on `vaults`. A mark written for a Vault
+the mark it has through a trigger on `vaults`, which locks marks in Vault id
+order, as every writer of marks takes them, so two of them cannot deadlock
+over marks either. A mark written for a Vault
 after its delete, as when its leftover events are swept later, stays behind
 and is inert: Vault ids are never reused. A cursor below that mark is
 refused, and the refusal's `earliest_cursor` resumes at it.
