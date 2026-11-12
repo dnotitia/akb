@@ -42,8 +42,13 @@ $$ LANGUAGE plpgsql;
 -- none has been drawn since it was set. Nothing here reads events, so the
 -- lock lasts as long however many rows, live or deleted and not yet cleaned
 -- up, the table holds. This holds whether the column's default or a trigger
--- draws the ids, as long as they come from the sequence the column owns, one
--- at a time (cache 1, the default for the column's serial type). The
+-- draws the ids, as long as they come from the sequence the column owns. A
+-- sequence cache above 1 would break it: each session draws a block of ids
+-- ahead, and later hands out the rest of its block, ids at or below the
+-- sequence's last value. So the cache is set to 1 here first, under the lock,
+-- before the boundary is read. That rewrites the sequence, and every session
+-- drops what is left of its block at its next draw and draws above the
+-- boundary; none can draw before then, as no write to events can start. The
 -- trigger's presence, checked again under the lock, records that this was
 -- done, so running this again records no second boundary. The migration's
 -- Python step checks for the trigger before it asks for any lock, and asks
@@ -52,6 +57,7 @@ $$ LANGUAGE plpgsql;
 DO $$
 DECLARE
     id_sequence TEXT := pg_get_serial_sequence('events', 'id');
+    id_cache BIGINT;
     last_drawn BIGINT;
 BEGIN
     IF NOT EXISTS (
@@ -61,6 +67,10 @@ BEGIN
         LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE;
         IF id_sequence IS NULL THEN
             RAISE EXCEPTION 'events.id owns no sequence to take the backfill boundary from';
+        END IF;
+        SELECT seqcache INTO id_cache FROM pg_sequence WHERE seqrelid = id_sequence::regclass;
+        IF id_cache <> 1 THEN
+            EXECUTE format('ALTER SEQUENCE %s CACHE 1', id_sequence);
         END IF;
         EXECUTE format(
             'SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM %s',

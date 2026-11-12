@@ -781,3 +781,55 @@ async def test_the_backfill_skips_a_vault_whose_delete_is_under_way():
 
         assert await _watermarks(setup_pool) == {kept: kept_first - 1}
         assert await setup_pool.fetchval("SELECT count(*) FROM event_retention_backfill") == 0
+
+
+async def test_ids_a_session_drew_ahead_before_the_install_land_above_the_boundary(monkeypatch):
+    """With a sequence cache above 1, a session holds ids it drew ahead and has not used.
+
+    Ids it handed out after the install were at or below the boundary, so the
+    backfill counted them as events from before it. A Vault whose first event
+    had been deleted before the install got a mark below its next event, and
+    a cursor at the deleted event, which missed nothing, was refused. The
+    install now sets the cache to 1, which makes the session drop the rest of
+    its block, and its next id lands above the boundary.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        vault_id = await _make_vault(setup_pool, "retention-cached-ids")
+        user_id = await _make_reader(setup_pool, "retention-cached-reader", [vault_id])
+        await _as_before_the_migration(setup_pool)
+        await setup_pool.execute("ALTER SEQUENCE events_id_seq CACHE 5")
+        migration = _load_migration(_MIGRATION)
+        backfill = _load_migration(_BACKFILL)
+        assert migration is not None and backfill is not None
+        holder = await asyncpg.connect(_database_dsn(database))
+        try:
+            # The session draws a block of five ids with its first event.
+            first = await _write_event(holder, vault_id)
+            await _write_event(holder, uuid.uuid4())
+            # The Vault's first event is deleted before the install records anything.
+            await setup_pool.execute("DELETE FROM events WHERE id = $1", first)
+            async with setup_pool.acquire() as conn:
+                async with conn.transaction():
+                    await migration.migrate(conn=conn)
+            later = await _write_event(holder, vault_id)
+        finally:
+            await holder.close()
+        async with setup_pool.acquire() as conn:
+            await backfill.migrate(conn=conn)
+
+        codec = EventCursorCodec(_CURSOR_SECRET)
+        async with _tail(monkeypatch, setup_pool) as tail:
+            resumed = await tail.open(
+                user_id=user_id,
+                vault="retention-cached-ids",
+                last_event_id=codec.encode(vault_id, (), first),
+            )
+            try:
+                delivered = await asyncio.wait_for(_changes(resumed, 1), 5)
+            finally:
+                await resumed.aclose()
+        assert _positions(delivered) == [later]
+        assert await _watermarks(setup_pool) == {}
+        cache = await setup_pool.fetchval("SELECT seqcache FROM pg_sequence WHERE seqrelid = 'events_id_seq'::regclass")
+        assert cache == 1

@@ -23,9 +23,11 @@ id at or below it and every later event draws a larger one. Nothing here
 reads events, so the lock lasts as long however many rows the table holds,
 live or deleted and not yet cleaned up; reading the highest id from the
 primary key instead walks every dead entry at its end. This needs the ids to
-come from the sequence the column owns, one at a time, which is the column's
-serial default and stays true when a trigger draws them from that sequence
-instead.
+come from the sequence the column owns, by its default or by a trigger. A
+sequence cache above 1 lets a session hand out, after the install, ids it
+drew ahead before it, at or below the boundary; so under the same lock the
+install sets the cache to 1 first, which makes every session drop the rest of
+its block at its next draw, and then reads the boundary. The cache stays 1.
 
 Installing needs SHARE ROW EXCLUSIVE on events, which waits for every open
 transaction that wrote an event, and a lock request that waits queues every

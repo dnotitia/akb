@@ -149,7 +149,9 @@ starts with no mark.
 
 Migration 133 installs the trigger, and records the last id the events id
 sequence had handed out at that moment, while inserts and deletes on
-`events` wait. It reads no events, so that wait does not depend on how many
+`events` wait. If the sequence's cache is above 1 it sets it to 1 first, so
+that no session can later hand out an id it drew ahead before the install;
+the cache stays 1. It reads no events, so that wait does not depend on how many
 rows the table holds, live or deleted and not yet cleaned up; the table keeps
 growing when the sweeper does not run, as without Redis. Migration 134 then
 sets the starting marks from the events up to that id, in its own
