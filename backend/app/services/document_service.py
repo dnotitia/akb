@@ -137,6 +137,7 @@ from app.models.document import (
 )
 from app.repositories.document_repo import (
     CollectionRepository,
+    CollectionVanishedError,
     DocumentRepository,
     acquire_path_lock,
     lock_collection_rows,
@@ -625,17 +626,21 @@ class DocumentService:
         with ``also_lock``, for a write that will change its counts.
 
         The lock comes before the Vault's event lock and the Git commit. A
-        collection delete that commits between finding the row and locking it
-        leaves nothing to lock. A put holds no other collection lock here, so
-        it creates the collection again and retries in place. A move
-        (``also_lock`` given) then already holds its source collection, and
-        asking for the recreated destination, whose id may sort below the
-        source's, would break the id order of collection locks; it raises
-        ``_StaleRead`` instead, so the move's savepoint releases every
-        collection lock before it reads again.
+        collection delete that commits between finding the row and locking it,
+        or between get_or_create's insert and its read, leaves nothing to lock.
+        A put holds no other collection lock here, so it creates the
+        collection again and retries in place. A move (``also_lock`` given)
+        may then already hold its source collection, and asking for the
+        recreated destination, whose id may sort below the source's, would
+        break the id order of collection locks; it raises ``_StaleRead``
+        instead, so the move's savepoint releases every collection lock before
+        it reads again.
         """
         for _ in range(1 if also_lock is not None else 3):
-            collection_id = await coll_repo.get_or_create(vault_id, path, conn=conn)
+            try:
+                collection_id = await coll_repo.get_or_create(vault_id, path, conn=conn)
+            except CollectionVanishedError:
+                continue
             if conn is None:
                 return collection_id
             if collection_id in await lock_collection_rows(conn, [collection_id, also_lock]):

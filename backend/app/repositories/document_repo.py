@@ -865,6 +865,12 @@ async def lock_collection_rows(
     return {row["id"] for row in await conn.fetch(_LOCK_COLLECTIONS[strength], ids)}
 
 
+class CollectionVanishedError(RuntimeError):
+    """``get_or_create`` found the collection when its insert was skipped, but
+    a concurrent delete committed before it could read the row. Nothing was
+    written; a caller can read again and retry."""
+
+
 class CollectionRepository:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
@@ -890,7 +896,7 @@ class CollectionRepository:
                 vault_id, path,
             )
             if existing is None:
-                raise RuntimeError(
+                raise CollectionVanishedError(
                     f"collection {path!r} could not be created or found "
                     f"in vault {vault_id} (concurrent delete?)"
                 )

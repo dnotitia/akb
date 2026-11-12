@@ -591,3 +591,98 @@ async def test_a_move_whose_destination_is_recreated_releases_its_source_first(t
         # The delete removed the document before the move could lock it.
         assert isinstance(moved, NotFoundError), repr(moved)
         assert await pool.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", vault_id) == 0
+
+
+@pytest.mark.parametrize("operation", ["put", "rename"])
+async def test_a_collection_deleted_inside_get_or_create_is_read_again(tmp_path, monkeypatch, operation):
+    """`get_or_create` inserts with ON CONFLICT DO NOTHING and then reads the
+    existing row. A recursive delete that commits between the two leaves
+    nothing to read. The write must read again rather than fail with an
+    internal error: a put creates the collection anew, and a rename within
+    the collection finds its document deleted."""
+    git = GitService(storage_path=str(tmp_path))
+    documents = DocumentService(git=git)
+    collections = CollectionService(git=git)
+    async with _fresh_database() as pool:
+        vault = f"git-lock-vanished-{operation}"
+        vault_id = await _make_vault(pool, vault)
+        git.init_vault(vault)
+        notes = uuid.uuid4()
+        await pool.execute(
+            "INSERT INTO collections (id, vault_id, path, name) VALUES ($1, $2, 'notes', 'notes')",
+            notes, vault_id,
+        )
+        doc = None
+        if operation == "rename":
+            doc = await documents.put(DocumentPutRequest(
+                vault=vault, collection="notes", title="Renamed", content="body",
+            ))
+
+        # Hold the write between get_or_create's insert and its read.
+        at_read = asyncio.Event()
+        release_read = asyncio.Event()
+        get_or_create = CollectionRepository.get_or_create
+        paused = False
+
+        class _PausingConn:
+            def __init__(self, conn):
+                self._conn = conn
+                self._fetchrows = 0
+
+            async def fetchrow(self, *args, **kwargs):
+                self._fetchrows += 1
+                if self._fetchrows == 2:
+                    at_read.set()
+                    await release_read.wait()
+                return await self._conn.fetchrow(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        async def pausing_get_or_create(self, vault_id, path, conn=None):
+            nonlocal paused
+            if not paused and path == "notes" and conn is not None:
+                paused = True
+                conn = _PausingConn(conn)
+            return await get_or_create(self, vault_id, path, conn=conn)
+
+        monkeypatch.setattr(CollectionRepository, "get_or_create", pausing_get_or_create)
+
+        if operation == "put":
+            writing = asyncio.create_task(documents.put(DocumentPutRequest(
+                vault=vault, collection="notes", title="Second", content="second body",
+            )))
+        else:
+            writing = asyncio.create_task(documents.move(vault, doc.path, slug="renamed-again"))
+        deleting: asyncio.Task | None = None
+        try:
+            await asyncio.wait_for(at_read.wait(), timeout=10)
+            # A recursive delete of the collection commits now. Its Git
+            # cleanup afterwards waits for the write's lane.
+            deleting = asyncio.create_task(collections.delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester",
+            ))
+            while await pool.fetchval("SELECT count(*) FROM collections WHERE id = $1", notes):
+                await asyncio.sleep(0.01)
+            release_read.set()
+            written = await asyncio.wait_for(
+                asyncio.gather(writing, return_exceptions=True), timeout=_EVENT_LOCK_WAIT_SECONDS * 3,
+            )
+            await asyncio.wait_for(deleting, timeout=_EVENT_LOCK_WAIT_SECONDS * 3)
+        finally:
+            release_read.set()
+            for task in (writing, deleting):
+                if task is not None and not task.done():
+                    task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await task
+        outcome = written[0]
+        if operation == "put":
+            assert not isinstance(outcome, BaseException), repr(outcome)
+            collection_id = await pool.fetchval(
+                "SELECT collection_id FROM documents WHERE vault_id = $1 AND path = $2", vault_id, outcome.path,
+            )
+            assert collection_id is not None and collection_id != notes
+        else:
+            # The delete removed the document before the rename could lock it.
+            assert isinstance(outcome, NotFoundError), repr(outcome)
