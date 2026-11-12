@@ -755,9 +755,10 @@ async def _evaluate_readiness() -> tuple[bool, dict]:
     if observed is not None and observed.saturated_for is not None:
         if _pool_wedged(observed, settings.readyz_pool_saturation_grace_secs):
             return False, detail
-        # The soft vector check may borrow from this same pool (pgvector on
-        # the main database does), so it would wait behind the saturation
-        # for up to its whole budget without changing the verdict.
+        # A saturated result is shared for one second only, so a probe can run
+        # every second while the pool stays saturated. The soft vector check
+        # is skipped then: it cannot change the verdict, and it would add a
+        # statement per second to a database already under that load.
         detail["vector_store"] = "skipped:pool_saturated"
         return True, detail
     detail["vector_store"] = await _vector_store_status()

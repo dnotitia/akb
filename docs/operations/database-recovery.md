@@ -197,9 +197,9 @@ saturated:
 - A ready result is shared only for the one-second floor, so each probe after
   that looks at the pool again.
 - The soft vector check is skipped and reported as
-  `vector_store: skipped:pool_saturated`. The pgvector driver on the main
-  database borrows from the same pool, so the check would wait for its whole
-  budget without changing the verdict.
+  `vector_store: skipped:pool_saturated`. It cannot change the verdict, and
+  since each probe after the floor evaluates again, it would add a statement
+  every second to a database already under that load.
 
 Probes see the pool's occupancy only when they run, so a pool that had room
 between two saturated probes still counts as saturated throughout; the acquire
