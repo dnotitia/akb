@@ -25,7 +25,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
+from app import config as app_config
 from app.config import VAULT_HEALTH_CACHE_TTL_MAX_SECS, settings
 from app.exceptions import ForbiddenError
 from app.services import (
@@ -547,11 +549,37 @@ def test_environment_override_wins(monkeypatch, raw, expected):
     assert health.configured_vault_health_cache_ttl() == expected
 
 
-@pytest.mark.parametrize("raw", ["thirty", "-1", "nan", "inf", str(VAULT_HEALTH_CACHE_TTL_MAX_SECS + 1)])
+@pytest.mark.parametrize(
+    "raw",
+    ["thirty", "-1", "nan", "inf", str(VAULT_HEALTH_CACHE_TTL_MAX_SECS + 1), "true", "false"],
+)
 def test_malformed_environment_override_fails_loudly(monkeypatch, raw):
     monkeypatch.setenv(health.VAULT_HEALTH_CACHE_TTL_ENV, raw)
     with pytest.raises(RuntimeError, match=health.VAULT_HEALTH_CACHE_TTL_ENV):
         health.configured_vault_health_cache_ttl()
+
+
+def _load_app_yaml_ttl(monkeypatch, tmp_path, raw: str) -> app_config.Settings:
+    """Load Settings the way startup does, from an app.yaml holding `raw` verbatim."""
+    (tmp_path / "app.yaml").write_text(
+        f"auth_mode: local\ndocument_revision_backend: bare_git\nvault_health_cache_ttl_secs: {raw}\n"
+    )
+    monkeypatch.setattr(app_config, "_CONFIG_CANDIDATES", [tmp_path])
+    return app_config._load_settings()
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("0", 0.0), ("1", 1.0), ("7.5", 7.5), ("3600", 3600.0)])
+def test_a_yaml_ttl_is_a_number_of_seconds(monkeypatch, tmp_path, raw, expected):
+    assert _load_app_yaml_ttl(monkeypatch, tmp_path, raw).vault_health_cache_ttl_secs == expected
+
+
+@pytest.mark.parametrize("raw", ["true", "false", "on", "off"])
+def test_a_yaml_boolean_is_refused_like_the_environment_refuses_it(monkeypatch, tmp_path, raw):
+    """YAML reads these words as booleans, which a float field would take as 1 and 0."""
+    with pytest.raises(ValidationError) as refused:
+        _load_app_yaml_ttl(monkeypatch, tmp_path, raw)
+    assert "vault_health_cache_ttl_secs" in str(refused.value)
+    assert "boolean" in str(refused.value)
 
 
 _BACKEND = Path(__file__).resolve().parents[1]

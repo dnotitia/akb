@@ -25,7 +25,7 @@ from typing import Literal, cast
 from urllib.parse import quote, urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from app.services.sparse_shapes import SparseShape, SparseShapeDecision, SparseShapeSetting
 
@@ -1321,6 +1321,16 @@ class Settings(BaseModel):
     # deployment-layer knob, the same class as AKB_PG_POOL_MIN_SIZE/MAX_SIZE);
     # see app/services/health.py.
     vault_health_cache_ttl_secs: float = Field(default=30.0, ge=0.0, le=VAULT_HEALTH_CACHE_TTL_MAX_SECS)
+
+    @field_validator("vault_health_cache_ttl_secs", mode="before")
+    @classmethod
+    def refuse_boolean_vault_health_cache_ttl(cls, value: object) -> object:
+        # YAML reads true/false (and on/off, yes/no) as booleans, which a float
+        # field takes as 1 and 0, so `false` would quietly turn the cache off.
+        # The AKB_VAULT_HEALTH_CACHE_TTL_SECS override refuses the same words.
+        if isinstance(value, bool):
+            raise ValueError("vault_health_cache_ttl_secs must be a number of seconds, not a boolean")
+        return value
 
     # ── Write-lane admission (design/proposal/command-lane-write-path,
     # round-05). Git-committing writes pass a two-stage gate BEFORE
