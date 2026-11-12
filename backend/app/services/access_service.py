@@ -306,10 +306,11 @@ async def check_vault_access(
 ) -> dict:
     """Authorize `user_id` on `vault_name`, then RECORD that authorization.
 
-    A caller that runs the check on its own transaction (`_conn`) passes
-    `_events` and inserts it after its last locking statement: an admin
-    override is recorded as an event, and an event insert holds the Vault's
-    event lock until commit (migration 132).
+    A caller that runs a mutating check on its own transaction (`_conn`)
+    passes `_events` and inserts it after its last locking statement: an
+    admin override is recorded as an event, and an event insert holds the
+    Vault's event lock until commit (migration 132). A check that records
+    nothing, such as a reader check, needs no buffer.
 
     Thin wrapper over `_check_vault_access_impl` purely so the contextvar is
     set at ONE place: the implementation has six distinct success returns
@@ -321,8 +322,6 @@ async def check_vault_access(
 
     See `_authorized_vault` for who consumes this and why.
     """
-    if _conn is not None and _events is None:
-        raise ValueError("check_vault_access on a caller's transaction must collect its events")
     connection_args = {"_conn": _conn, "_events": _events} if _conn is not None else {}
     result = await _check_vault_access_impl(
         user_id, vault_name, required_role,
@@ -439,7 +438,12 @@ async def _check_vault_access_impl(
                     }
                 if await _is_unscoped_system_admin(uid, conn):
                     # A3: bypass, but LOUDLY — never a silent escape hatch.
-                    # On a caller's transaction the event waits for its end.
+                    # On a caller's transaction the event waits for its end,
+                    # so that caller must have handed over its buffer.
+                    if _conn is not None and _events is None:
+                        raise ValueError(
+                            "an admin override on a caller's transaction needs its event buffer"
+                        )
                     override = EventBuffer() if _events is None else _events
                     override.add(
                         "vault.write_policy_admin_bypass",

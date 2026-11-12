@@ -19,6 +19,7 @@ import asyncpg
 import pytest
 
 from app.repositories import vault_write_policy_repo
+from app.repositories.events_repo import EventBuffer
 from app.services import access_service
 from tests.test_events_commit_order_postgres import (
     _UNBLOCKED_SECONDS,
@@ -111,3 +112,67 @@ async def test_admin_override_on_vault_settings_does_not_deadlock_a_vault_writer
             expected.append("vault.public_access")
         assert [kind for _, kind in events] == expected
         assert events[0][0] == writer_event
+
+
+async def test_reader_check_on_a_callers_transaction_needs_no_event_buffer():
+    """A check that cannot record an override runs without a buffer."""
+    async with _fresh_database() as pool:
+        name = "settings-reader"
+        vault_id = await _make_vault(pool, name)
+        reader_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (id, username, email, password_hash) VALUES ($1, $2, $3, '!fixture!')",
+                reader_id,
+                f"{name}-reader",
+                f"{name}-reader@example.com",
+            )
+            await conn.execute(
+                "INSERT INTO vault_access (vault_id, user_id, role, granted_by) VALUES ($1, $2, 'reader', $2)",
+                vault_id,
+                reader_id,
+            )
+            await vault_write_policy_repo.set_policy(vault_id, "collector:test", "tester", conn=conn)
+            async with conn.transaction():
+                access = await access_service.check_vault_access(
+                    str(reader_id), name, required_role="reader", _conn=conn,
+                )
+        assert access["vault_id"] == vault_id
+        assert access["role"] == "reader"
+
+
+async def test_admin_override_on_a_callers_transaction_requires_its_event_buffer():
+    async with _fresh_database() as pool:
+        name = "settings-buffer"
+        vault_id = await _make_vault(pool, name)
+        admin_id = uuid.uuid4()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users (id, username, email, password_hash, is_admin) "
+                "VALUES ($1, $2, $3, '!fixture!', TRUE)",
+                admin_id,
+                f"{name}-admin",
+                f"{name}-admin@example.com",
+            )
+            await vault_write_policy_repo.set_policy(vault_id, "collector:test", "tester", conn=conn)
+
+            with pytest.raises(ValueError, match="event buffer"):
+                async with conn.transaction():
+                    await access_service.check_vault_access(
+                        str(admin_id), name, required_role="writer", _conn=conn,
+                    )
+
+            events = EventBuffer()
+            async with conn.transaction():
+                access = await access_service.check_vault_access(
+                    str(admin_id), name, required_role="writer", _conn=conn, _events=events,
+                )
+                # Collected for the caller to insert last, not inserted yet.
+                assert len(events) == 1
+                assert await conn.fetchval("SELECT count(*) FROM events WHERE vault_id = $1", vault_id) == 0
+                await events.flush(conn)
+            assert access["role_source"] == "write_policy_admin_bypass"
+            assert await conn.fetchval(
+                "SELECT count(*) FROM events WHERE vault_id = $1 AND kind = 'vault.write_policy_admin_bypass'",
+                vault_id,
+            ) == 1
