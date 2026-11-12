@@ -79,14 +79,19 @@ is introduced. Existing DB command and statement deadlines remain 30 seconds.
 | Endpoint | Meaning |
 | --- | --- |
 | `/livez` |Process is serving; no dependency access.|
-| `/readyz` |DB ping on a dedicated connection; the request pool is observed, not used. Successful result cached for 30 seconds unless the pool was saturated; vector health is soft.|
+| `/readyz` |DB ping on a dedicated connection; the request pool is observed, not used. Every result is shared by all callers for 1 second, and a plain success is cached for 30 seconds; vector health is soft.|
 | `/health` |Detailed operational/queue diagnostics, not a cheap liveness check.|
 
 Readiness bounds DB pool initialization plus ping together to 2 seconds. The
 vector check retains its 5-second budget. These are probe-step budgets, **not**
 a 2-second whole-endpoint guarantee: callers can wait for the shared readiness
-lock. Concurrent failed probes can therefore queue. Failed readiness results
-are not cache-fresh, allowing an immediate new probe after recovery.
+lock. They wait for the evaluation already running, not for one each. Every
+result, ready or not, answers all callers for one second, and callers that
+arrive while an evaluation runs reuse its result. `/readyz` needs no
+authentication, so this bounds the database work that any number of callers
+can cause to about one evaluation per second per process. After that second, a
+failed result is evaluated again on the next call, so recovery shows within
+about a second.
 
 The ping runs on one dedicated connection, not on a request-pool connection;
 the one exception, a server at `max_connections`, is described below. Its
@@ -119,7 +124,8 @@ without waiting for a connection:
 - Otherwise, if an acquire has completed within
   `readyz_pool_saturation_grace_secs`: `db: ok:pool_progress`.
 
-Neither result is cached. A closing pool, a pool with neither, and every other
+Neither result is cached beyond the one-second floor. A closing pool, a pool
+with neither, and every other
 connection error fail readiness as before.
 
 ### Pool saturation
@@ -157,7 +163,8 @@ of the Service is wanted. The pool counts completed acquires in its asyncpg
 connection, or room to open one, ends the saturation run. While the pool is
 saturated:
 
-- A ready result is not cached, so each probe looks at the pool again.
+- A ready result is shared only for the one-second floor, so each probe after
+  that looks at the pool again.
 - The soft vector check is skipped and reported as
   `vector_store: skipped:pool_saturated`. The pgvector driver on the main
   database borrows from the same pool, so the check would wait for its whole

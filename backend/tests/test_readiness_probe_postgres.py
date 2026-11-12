@@ -281,6 +281,11 @@ class _ChangingHands:
         await asyncio.gather(*self._tasks)
 
 
+def _past_the_floor(main) -> None:
+    """Age the last result past the floor during which every caller shares it."""
+    main._ready_state.ts -= main._READY_MIN_INTERVAL_SECONDS
+
+
 async def _probe_backend_pid(db) -> int | None:
     return await db.admin.fetchval(
         "SELECT pid FROM pg_stat_activity WHERE datname = $1 AND application_name = $2",
@@ -305,6 +310,24 @@ async def test_saturated_pool_keeps_readyz_200_within_the_probe_budget(ready_db)
     # The soft vector check would borrow from the same saturated pool.
     assert detail["vector_store"] == "skipped:pool_saturated"
     assert ready_db.store.calls == 0
+
+
+async def test_fifty_concurrent_callers_during_saturation_share_one_evaluation(ready_db, monkeypatch):
+    main = ready_db.main
+    evaluations = 0
+    probe_ready = main._probe_ready
+
+    async def counted():
+        nonlocal evaluations
+        evaluations += 1
+        return await probe_ready()
+
+    monkeypatch.setattr(main, "_probe_ready", counted)
+    async with _every_connection_checked_out(ready_db.pool):
+        responses = await asyncio.gather(*(ready_db.client.get("/readyz") for _ in range(50)))
+
+    assert [response.status_code for response in responses] == [200] * 50
+    assert evaluations == 1
 
 
 async def test_saturated_pool_whose_connections_keep_changing_hands_stays_200(ready_db, monkeypatch):
@@ -350,7 +373,9 @@ async def test_saturated_pool_whose_holders_never_let_go_answers_503_and_recover
     assert body["detail"]["pool"]["saturated_for_secs"] >= _GRACE
     assert body["detail"]["pool"]["last_acquire_age_secs"] >= _GRACE
 
-    # Released: the very next probe is ready again (failures are not cached).
+    # Released: once the failure's one-second floor has passed, the next probe
+    # is ready again.
+    _past_the_floor(ready_db.main)
     recovered = await ready_db.client.get("/readyz")
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["detail"]["pool"]["saturated_for_secs"] is None
@@ -371,12 +396,13 @@ async def test_server_refusing_the_probe_connection_pings_through_an_idle_pool_c
         assert last_acquire_age is None or last_acquire_age >= _GRACE
 
         first = await db.client.get("/readyz")
+        _past_the_floor(db.main)
         second = await db.client.get("/readyz")
 
     assert first.status_code == 200, first.text
     assert first.json()["detail"]["db"] == "ok:pool_idle"
     assert first.json()["detail"]["vector_store"] == "ok"
-    # Never cached: the next probe asks the pool again.
+    # Not cached beyond the floor: the next probe asks the pool again.
     assert second.status_code == 200, second.text
     assert second.json()["cached"] is False
 

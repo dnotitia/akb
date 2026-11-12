@@ -109,9 +109,16 @@ specifically; the proxy has its own log in
   `saturated_for_secs` and `last_acquire_age_secs` and keeps `free`; it is
   reported whenever the probe obtained the pool, including when the database
   check fails. The acquire count stays internal. While the pool
-  is saturated, a ready result is not cached and the soft vector check is
+  is saturated, a ready result is shared only for one second and the soft
+  vector check is
   skipped as `skipped:pool_saturated`. See
   `docs/operations/database-recovery.md`.
+- Every `/readyz` result, ready or not, now answers all callers for one
+  second, and callers that arrive while an evaluation runs wait for it and
+  reuse its result. The endpoint needs no authentication, and failures,
+  saturated pools and pool-vouched results are not cached beyond that, so any
+  number of callers now causes about one database evaluation per second per
+  process. A plain success is still cached for 30 seconds.
 - When the request pool shows nothing that proves it could serve a request (no
   idle connection, room to open one, and no acquire within the grace),
   readiness takes one connection through it within the probe's remaining
@@ -123,7 +130,8 @@ specifically; the proxy has its own log in
   it runs `SELECT 1` on that connection within the probe's remaining budget
   and reports `db: ok:pool_idle`; the connection is given back within the same
   budget or terminated. With none, it reports `db: ok:pool_progress`
-  if an acquire has completed within the grace. Neither result is cached. A
+  if an acquire has completed within the grace. Neither result is cached
+  beyond one second. A
   failed ping on the idle connection, a pool with neither, and every other
   connection error still fail readiness.
 

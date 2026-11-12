@@ -377,13 +377,50 @@ async def test_ready_result_with_room_is_cached(main, probe):
     probe.ping.assert_awaited_once()
 
 
-async def test_ready_result_during_saturation_is_never_cached(main, probe):
+def _past_the_floor(main, probe) -> None:
+    probe.clock.now += main._READY_MIN_INTERVAL_SECONDS
+
+
+async def test_ready_result_during_saturation_is_shared_only_for_the_floor(main, probe):
     _saturate(probe.pool)
 
     first = await main.readyz()
     second = await main.readyz()
+    _past_the_floor(main, probe)
+    third = await main.readyz()
 
-    assert first["cached"] is False and second["cached"] is False
+    assert first["cached"] is False
+    assert second["cached"] is True
+    assert third["cached"] is False
+    assert probe.ping.await_count == 2
+
+
+async def test_concurrent_callers_share_one_evaluation(main, probe):
+    # /readyz needs no authentication: a crowd of callers during saturation,
+    # when nothing is cached for long, must still cost one evaluation.
+    async def slow_ping(**_kwargs):
+        await asyncio.sleep(0.05)
+
+    probe.ping.side_effect = slow_ping
+    _saturate(probe.pool)
+
+    results = await asyncio.gather(*(main.readyz() for _ in range(50)))
+
+    assert probe.ping.await_count == 1
+    assert all(result["status"] == "ready" for result in results)
+    assert sum(result["cached"] for result in results) == 49
+
+
+async def test_failure_is_shared_for_the_floor_then_probed_again(main, probe):
+    probe.ping.side_effect = ConnectionRefusedError("refused")
+    for _ in range(2):
+        with pytest.raises(main.HTTPException):
+            await main.readyz()
+    assert probe.ping.await_count == 1
+
+    probe.ping.side_effect = None
+    _past_the_floor(main, probe)
+    assert (await main.readyz())["status"] == "ready"
     assert probe.ping.await_count == 2
 
 
@@ -398,7 +435,8 @@ async def test_readyz_answers_503_once_saturation_outlasts_the_grace(main, probe
     assert caught.value.detail["status"] == "not_ready"
     assert caught.value.detail["detail"]["pool"]["saturated_for_secs"] == GRACE + 1
 
-    probe.pool.idle = 1  # the pool drains; failures are not cached
+    probe.pool.idle = 1  # the pool drains; a failure is shared only for the floor
+    _past_the_floor(main, probe)
     recovered = await main.readyz()
     assert recovered["status"] == "ready"
     assert recovered["detail"]["pool"]["saturated_for_secs"] is None
@@ -441,10 +479,11 @@ async def test_server_at_max_connections_pings_through_an_idle_pool_connection(m
     assert detail["vector_store"] == "ok"
 
 
-async def test_ready_on_an_idle_pool_connection_is_not_cached(main, probe):
+async def test_ready_on_an_idle_pool_connection_is_shared_only_for_the_floor(main, probe):
     probe.ping.side_effect = _SERVER_FULL
 
     first = await main.readyz()
+    _past_the_floor(main, probe)
     second = await main.readyz()
 
     assert first["detail"]["db"] == second["detail"]["db"] == "ok:pool_idle"
@@ -516,11 +555,12 @@ async def test_server_at_max_connections_without_an_idle_connection_relies_on_re
     assert detail["vector_store"] == "ok"
 
 
-async def test_ready_on_pool_progress_is_not_cached(main, probe):
+async def test_ready_on_pool_progress_is_shared_only_for_the_floor(main, probe):
     _no_idle(probe.pool)
     probe.ping.side_effect = _SERVER_FULL
 
     first = await main.readyz()
+    _past_the_floor(main, probe)
     second = await main.readyz()
 
     assert first["detail"]["db"] == second["detail"]["db"] == "ok:pool_progress"

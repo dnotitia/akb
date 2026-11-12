@@ -416,6 +416,12 @@ async def livez():
 
 
 _READY_TTL_SECONDS = 30.0
+# Every result, ready or not, answers every caller for at least this long.
+# /readyz needs no authentication, and many of its results are not cached
+# beyond this (failures, a saturated pool, a pool vouching for the database);
+# the floor bounds the database work of any number of callers to about one
+# evaluation per interval per process.
+_READY_MIN_INTERVAL_SECONDS = 1.0
 # The database step of one probe: pool initialization (only while there is no
 # pool yet) plus connecting and pinging on the probe's dedicated connection.
 _READY_DB_TIMEOUT_SECONDS = 2.0
@@ -662,20 +668,26 @@ def _ready_response(state: _ReadyState, *, cached: bool):
 
 
 def _cache_fresh(state: _ReadyState) -> bool:
-    # Only cache successes. If a previous probe failed, we want to retry
-    # immediately so recovery is reflected in /readyz on the very next
-    # call — a 30s stale-failure cache pulls the pod from the Service for
-    # twice the actual outage window.
+    if state.detail is None:
+        return False
+    age = time.monotonic() - state.ts
+    # Any result is shared for the floor. Callers queued on the lock while an
+    # evaluation runs then reuse it instead of each starting their own.
+    if age < _READY_MIN_INTERVAL_SECONDS:
+        return True
+    # Beyond the floor, only cache successes. If a previous probe failed, we
+    # want to retry promptly so recovery is reflected in /readyz — a 30s
+    # stale-failure cache pulls the pod from the Service for twice the actual
+    # outage window.
     # Nor a success that saw a saturated pool: the grace is measured across
     # probes, so each probe during saturation has to look at the pool again.
     # Nor one the pool vouched for instead of the probe's own connection: an
     # idle connection or recent acquires prove the database only for now.
     return (
-        state.detail is not None
-        and state.ok
+        state.ok
         and state.detail.get("db") == "ok"
         and _pool_saturated_for(state.detail) is None
-        and (time.monotonic() - state.ts) < _READY_TTL_SECONDS
+        and age < _READY_TTL_SECONDS
     )
 
 

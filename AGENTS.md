@@ -253,7 +253,8 @@ The following Git layout and locking apply only to the Bare Git backend:
 ## Health Endpoints
 
 - `GET /livez` — return 200 immediately (liveness). No deps.
-- `GET /readyz` — DB ping + vector-store ping, 30s TTL-cached on success.
+- `GET /readyz` — DB ping + vector-store ping, 30s TTL-cached on success;
+  every result is shared by all callers for 1 s (one evaluation at a time).
   The vector store is a **soft** check: a failed ping reports
   `"vector_store": "degraded:..."` in the detail but still returns
   ready (search degrades, everything else keeps working).
