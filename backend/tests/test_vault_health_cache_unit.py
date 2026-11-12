@@ -612,21 +612,30 @@ async def two_requests():
 
 
 asyncio.run(two_requests())
-print(json.dumps({"computations": computations}))
+print(json.dumps({"computations": computations, "ttl": health._vault_health_cache._ttl}))
 """
 
 
 @pytest.mark.parametrize(
-    ("yaml_ttl", "env_ttl", "computations"),
+    ("yaml_ttl", "env_ttl", "computations", "ttl"),
     [
-        (None, None, 1),
-        (0, None, 2),
-        (0, "30", 1),
-        (30, "0", 2),
+        (None, None, 1, 30.0),
+        (0, None, 2, 0.0),
+        (0, "30", 1, 30.0),
+        (30, "0", 2, 0.0),
+        (7, None, 1, 7.0),
+        (7, "5", 1, 5.0),
     ],
-    ids=["default-reuses", "yaml-zero-disables", "env-wins-and-reuses", "env-zero-disables"],
+    ids=[
+        "default-reuses",
+        "yaml-zero-disables",
+        "env-wins-and-reuses",
+        "env-zero-disables",
+        "yaml-value-is-the-ttl",
+        "env-value-is-the-ttl",
+    ],
 )
-def test_a_fresh_process_builds_its_cache_from_the_configured_ttl(tmp_path, yaml_ttl, env_ttl, computations):
+def test_a_fresh_process_builds_its_cache_from_the_configured_ttl(tmp_path, yaml_ttl, env_ttl, computations, ttl):
     """The module-level cache a real process serves through, not an instance a test swapped in."""
     config = tmp_path / "config"
     config.mkdir()
@@ -650,7 +659,7 @@ def test_a_fresh_process_builds_its_cache_from_the_configured_ttl(tmp_path, yaml
     )
 
     assert probe.returncode == 0, probe.stderr
-    assert json.loads(probe.stdout.splitlines()[-1]) == {"computations": computations}
+    assert json.loads(probe.stdout.splitlines()[-1]) == {"computations": computations, "ttl": ttl}
 
 
 @pytest.fixture

@@ -71,11 +71,17 @@ async def test_a_user_id_is_resolved_by_primary_key_alone():
     assert [value for _, value in pool.conn.queries] == [user_id]
 
 
-async def test_an_id_without_a_display_name_resolves_to_the_username():
+@pytest.mark.parametrize(
+    ("display_name", "expected"),
+    [(None, "alice"), ("", "")],
+    ids=["null-display-name", "empty-display-name"],
+)
+async def test_an_id_without_a_display_name_resolves_to_the_username(display_name, expected):
+    """COALESCE falls back to the username only for NULL; an empty name is a found user too."""
     user_id = uuid.uuid4()
-    service, pool = _service((user_id, "alice", None))
+    service, pool = _service((user_id, "alice", display_name))
 
-    assert await service._created_by_name(str(user_id)) == "alice"
+    assert await service._created_by_name(str(user_id)) == expected
     assert pool.conn.queries == [(_BY_ID, user_id)]
 
 
