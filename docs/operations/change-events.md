@@ -79,6 +79,27 @@ Do not increment counts from event numbers or assume the stream is a permanent
 history. Capture a starting cursor before initial reads and replay changes that
 arrive during those reads.
 
+Within one Vault, the authenticated SSE tail described below delivers every
+committed event in commit order, and its cursor never skips an event. Event ids
+follow commit order inside a Vault: an insert trigger (migration 132) takes a
+lock for the event's Vault, holds it until the transaction commits or rolls
+back, and only then draws the id. A transaction that commits later therefore
+always carries a larger id than every event of that Vault already visible, and
+reading `id > cursor` cannot pass over one that commits late. The cursor format,
+`Last-Event-ID` resume and `410 event_gap` are unchanged, and cursors issued
+before the migration stay valid. Ids are not contiguous; a gap does not mean a
+missing event. Events without a Vault (account and sign-in events) are not
+ordered this way. The Redis stream has no order guarantee: the publisher claims
+rows in batches and retries failures, so entries can arrive out of id order.
+Recognize a repeat by the envelope `id`.
+
+This ordering has a cost. Transactions that write events for the same Vault
+run one at a time from their event insert to their commit. AKB writes the
+event as the last locking statement of a transaction, so that span is short. A
+transaction that still waits for another lock after its event insert can
+deadlock with one that waits for the Vault; PostgreSQL then rolls one of them
+back with error `40P01`. Watch `pg_stat_database.deadlocks`.
+
 For collection events `resource_uri` may be null. Use the Vault identity and
 payload path, or conservatively invalidate the Vault. Relation declarations and
 actual policy execution causation are separate from resource mutation events.
@@ -96,7 +117,11 @@ With `AKB_TEST_REDIS_URL`, it also delivers them through the real publisher to
 an isolated Redis stream. `test_notification_native_postgres.py` preserves inbox
 behavior without duplicate notifications. `test_native_file_projection_pg.py`
 verifies ordinary File events are not duplicated by projection retries or
-text/binary transitions.
+text/binary transitions. `test_events_commit_order_postgres.py` keeps one
+event-writing transaction open while a second writer of the same Vault tries
+to commit first, through `emit_event` and through the dynamic-table row
+trigger, and checks that a reader following the cursor receives both events in
+commit order.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native

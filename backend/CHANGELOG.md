@@ -7,6 +7,21 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- The SSE event tail (`GET /api/v1/events/{vault}`) no longer skips an event
+  whose transaction committed after an event with a larger id. Within a Vault,
+  event ids now follow commit order, so the tail delivers every committed event
+  of the Vault in commit order. Migration 132 adds a `BEFORE INSERT` trigger on
+  `events` that takes a lock for the event's Vault, held until commit, and then
+  draws the id; it also sets the id sequence's cache to 1. Events without a
+  Vault are unchanged. The cursor format, `Last-Event-ID` resume and
+  `410 event_gap` are unchanged, and the Redis stream still makes no order
+  promise. The cost: transactions that write events for the same Vault run one
+  at a time from their event insert to their commit, and two of them can
+  occasionally deadlock, in which case PostgreSQL rolls one back with `40P01`.
+  Writes insert their event as the last locking statement of the transaction
+  where they can, which keeps both rare. A Vault event uses two id values, so
+  ids leave gaps.
+
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain
   their existing receipts and policy errors. A pending call observes a grant
