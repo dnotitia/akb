@@ -555,13 +555,19 @@ class NativeDocumentService(DocumentService):
         primary key nor the username index, so every document read scanned
         `users`. Each form now gets its own indexed equality. A username may
         itself look like a UUID, so a UUID that names no user still falls back
-        to the username lookup. When the two forms would name different users,
-        the id now wins; the combined predicate returned either one.
+        to the username lookup.
         """
         if not created_by:
             return None
         pool = await self._pool()
         async with pool.acquire() as conn:
+            # Precedence: the id, then the username. When a UUID-shaped
+            # username equals another user's id, the old predicate's LIMIT 1
+            # had no ORDER BY, so either user could come back; there is no
+            # established answer to keep. The id wins because the server
+            # assigns it and nobody chooses it, so a username cannot change
+            # the author shown for documents recorded under an existing
+            # account's id.
             user_id = _canonical_user_id(created_by)
             if user_id is not None:
                 name = await conn.fetchval(

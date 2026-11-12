@@ -269,7 +269,8 @@ The following Git layout and locking apply only to the Bare Git backend:
   The role check runs on every request; the counts are reused per vault
   for `vault_health_cache_ttl_secs` (default 30 s,
   `AKB_VAULT_HEALTH_CACHE_TTL_SECS` overrides, `0` disables) in each API
-  process. Concurrent misses share one computation; failures are not reused.
+  process. Concurrent misses share one computation; failures, and responses
+  missing a part that failed, are not reused.
 
 ## Tenant stats (`/stats`, separate port)
 

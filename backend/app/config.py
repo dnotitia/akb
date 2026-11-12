@@ -1314,7 +1314,8 @@ class Settings(BaseModel):
     # cost grows with the vault, and the web console polls it for each of the
     # user's vaults on a timer, from every open tab. Each API process reuses
     # one result per vault for this many seconds; concurrent misses share one
-    # computation and a failure is never reused. The reader-role check still
+    # computation, and neither a failure nor a result missing a part that
+    # failed is reused. The reader-role check still
     # runs on every request. 0 disables the cache. The
     # AKB_VAULT_HEALTH_CACHE_TTL_SECS env var takes precedence (a
     # deployment-layer knob, the same class as AKB_PG_POOL_MIN_SIZE/MAX_SIZE);

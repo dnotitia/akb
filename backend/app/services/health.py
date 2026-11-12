@@ -39,7 +39,7 @@ VAULT_HEALTH_CACHE_TTL_ENV = "AKB_VAULT_HEALTH_CACHE_TTL_SECS"
 VAULT_HEALTH_CACHE_MAX_ENTRIES = 1024
 
 
-async def vault_health(vault_id: uuid.UUID) -> dict:
+async def _compose_vault_health(vault_id: uuid.UUID) -> tuple[dict, bool]:
     """Return per-vault pending counts. Sequential awaits — the queries
     are sub-millisecond on indexed columns; gather() saves ~1-2ms but
     adds task-scheduling overhead.
@@ -47,7 +47,13 @@ async def vault_health(vault_id: uuid.UUID) -> dict:
     `native_derived` is the vault-scoped answer to the question the global
     counters can only raise: it reports the derived-index intents this vault
     gave up on, so an operator who sees a non-zero `abandoned` on `/health`
-    can find where the loss is without reading an internal queue table."""
+    can find where the loss is without reading an internal queue table.
+
+    Also returns whether the response is complete. The current-Head counts
+    and the `search_update_status` interpretation are optional: when either
+    fails, the request is still answered without it, but that answer is
+    incomplete and `VaultHealthCache` does not keep it. A queue that reports
+    `status: degraded` is a complete observation, not an incomplete one."""
     backfill = await embed_worker.pending_stats(vault_id)
     metadata = await metadata_worker.pending_stats(vault_id)
     projection = await native_file_projection.pending_stats(vault_id)
@@ -58,12 +64,14 @@ async def vault_health(vault_id: uuid.UUID) -> dict:
         "native_file_projection": projection,
         "native_derived": derived,
     }
+    complete = True
     try:
         current_heads = await native_derived_worker.current_head_stats(vault_id)
     except Exception as exc:  # noqa: BLE001
         # Never substitute historical outcomes while claiming current-Head scope.
         logger.warning("Current search preparation observation unavailable (%s)", type(exc).__name__)
         current_heads = None
+        complete = False
     try:
         result["search_update_status"] = search_update_status.build(
             backfill, metadata, projection, current_heads,
@@ -71,6 +79,13 @@ async def vault_health(vault_id: uuid.UUID) -> dict:
     except Exception as exc:  # noqa: BLE001
         # This additive interpretation must not break successful legacy reads.
         logger.warning("Search update interpretation unavailable (%s)", type(exc).__name__)
+        complete = False
+    return result, complete
+
+
+async def vault_health(vault_id: uuid.UUID) -> dict:
+    """`_compose_vault_health`'s response alone, uncached, whether complete or not."""
+    result, _complete = await _compose_vault_health(vault_id)
     return result
 
 
@@ -118,8 +133,10 @@ class VaultHealthCache:
       It runs as its own task, so a caller that goes away (a client
       disconnect, a timeout) does not cancel it for the callers still
       waiting.
-    - Only results are stored. A failure reaches the callers waiting on that
-      computation, and the next request computes afresh.
+    - Only complete results are stored. `compute` returns a result and
+      whether it may be kept. A failure, or a result missing a part that
+      failed (see `_compose_vault_health`), reaches the callers waiting on
+      that computation, and the next request computes afresh.
     - Each caller gets its own copy, as it did before the cache existed, so a
       caller that edits its response cannot change anyone else's.
     - Bounded. Every entry gets the same TTL, so insertion order is expiry
@@ -148,10 +165,11 @@ class VaultHealthCache:
         return len(self._entries)
 
     async def get(
-        self, vault_id: uuid.UUID, compute: Callable[[uuid.UUID], Awaitable[dict]],
+        self, vault_id: uuid.UUID, compute: Callable[[uuid.UUID], Awaitable[tuple[dict, bool]]],
     ) -> dict:
         if self._ttl <= 0:
-            return await compute(vault_id)
+            value, _cacheable = await compute(vault_id)
+            return value
         entry = self._entries.get(vault_id)
         if entry is not None and self._clock() < entry[0]:
             return copy.deepcopy(entry[1])
@@ -166,11 +184,12 @@ class VaultHealthCache:
         return copy.deepcopy(await asyncio.shield(task))
 
     async def _compute_and_store(
-        self, vault_id: uuid.UUID, compute: Callable[[uuid.UUID], Awaitable[dict]],
+        self, vault_id: uuid.UUID, compute: Callable[[uuid.UUID], Awaitable[tuple[dict, bool]]],
     ) -> dict:
         try:
-            value = await compute(vault_id)
-            self._store(vault_id, value)
+            value, cacheable = await compute(vault_id)
+            if cacheable:
+                self._store(vault_id, value)
             return value
         finally:
             if self._inflight.get(vault_id) is asyncio.current_task():
@@ -199,4 +218,4 @@ async def cached_vault_health(vault_id: uuid.UUID) -> dict:
     The caller must have authorized the requester for this vault first; the
     cache is shared by every reader of the vault and checks nothing itself.
     """
-    return await _vault_health_cache.get(vault_id, vault_health)
+    return await _vault_health_cache.get(vault_id, _compose_vault_health)
