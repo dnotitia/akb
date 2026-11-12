@@ -30,7 +30,10 @@ def _fixture(monkeypatch, *, native: bool, legacy: bool = False):
     async def transaction(*, isolation=None):
         assert isolation in (None, "read_committed")
         yield conn
-        events.append("commit")
+        # The delete's own transaction sets its isolation; a savepoint inside
+        # it (the collection lock attempt) does not and is not a commit.
+        if isolation is not None:
+            events.append("commit")
 
     @asynccontextmanager
     async def acquire():

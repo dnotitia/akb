@@ -592,7 +592,10 @@ class DocumentService:
             current = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
             if not current:
                 raise NotFoundError("Document", doc_ref)
-            await lock_collection_rows(conn, [current.get("collection_id")], share=share_collection)
+            await lock_collection_rows(
+                conn, [current.get("collection_id")],
+                strength="key share" if share_collection else "no key update",
+            )
             row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref, for_update=True)
             if not row:
                 raise NotFoundError("Document", doc_ref)

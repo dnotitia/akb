@@ -18,7 +18,11 @@ from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
-from app.repositories.document_repo import CollectionRepository, DocumentRepository
+from app.repositories.document_repo import (
+    CollectionRepository,
+    DocumentRepository,
+    lock_collection_rows,
+)
 from app.repositories.events_repo import emit_event
 from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
 from app.services.git_service import GitService
@@ -98,6 +102,10 @@ def _normalize_path(path: str) -> str:
         return normalize_collection_path(path, allow_empty=False)
     except ValueError as exc:
         raise InvalidPathError(str(exc)) from exc
+
+
+class _CollectionsChanged(Exception):
+    """A collection appeared under the prefix between reading and locking it."""
 
 
 class CollectionService:
@@ -281,27 +289,47 @@ class CollectionService:
                 if not await lock_vault_for_child_write(conn, vault_id):
                     raise ConflictError("Vault was deleted during collection deletion")
                 # ── Lock + snapshot under prefix ────────────────
-                # Target row may or may not exist (nested-parent
-                # case). FOR UPDATE on a missing row is a no-op; we
-                # only lock if the row is there.
-                target_row = await conn.fetchrow(
-                    "SELECT id FROM collections "
-                    "WHERE vault_id = $1 AND path = $2 FOR UPDATE",
-                    vault_id, norm,
-                )
-
-                # Sub-collection rows (strictly under `norm/`). We lock
-                # them with a separate `FOR UPDATE` listing so a racing
-                # `akb_put` can't slip a doc under one of them between
-                # our snapshot and our cleanup.
-                sub_rows_locked = await conn.fetch(
+                # The target row (absent in the nested-parent case) and every
+                # sub-collection row strictly under `norm/` are locked
+                # together, in id order like every other multi-collection
+                # lock (lock_collection_rows): a document move between two of
+                # them locks them in that order, and a parent-first order here
+                # would deadlock with it. Locked rows keep a racing `akb_put`
+                # from slipping a doc under one of them between our snapshot
+                # and our cleanup. The set is read without a lock first; if it
+                # grew before the lock, the attempt's savepoint is rolled
+                # back, releasing its locks, and the set is read again, so the
+                # locks are still taken in one id-ordered pass.
+                under_prefix = (
                     "SELECT id, path FROM collections "
-                    "WHERE vault_id = $1 AND path LIKE $2 ESCAPE '\\' "
-                    "ORDER BY path, id FOR UPDATE",
-                    vault_id,
-                    CollectionRepository._like_escape(norm.rstrip("/")) + "/%",
+                    "WHERE vault_id = $1 AND (path = $2 OR path LIKE $3 ESCAPE '\\')"
                 )
-                sub_rows = [dict(r) for r in sub_rows_locked]
+                prefix_pattern = CollectionRepository._like_escape(norm.rstrip("/")) + "/%"
+                for _ in range(3):
+                    try:
+                        async with conn.transaction():
+                            candidates = await conn.fetch(under_prefix, vault_id, norm, prefix_pattern)
+                            locked = await lock_collection_rows(
+                                conn, [r["id"] for r in candidates], strength="update",
+                            )
+                            current = await conn.fetch(under_prefix, vault_id, norm, prefix_pattern)
+                            if not {r["id"] for r in current} <= locked:
+                                raise _CollectionsChanged
+                    except _CollectionsChanged:
+                        continue
+                    break
+                else:
+                    raise ConflictError(
+                        f"Collections under {norm!r} kept changing during the delete; retry it"
+                    )
+                target_row = next(
+                    (dict(r) for r in candidates if r["path"] == norm and r["id"] in locked),
+                    None,
+                )
+                sub_rows = sorted(
+                    (dict(r) for r in candidates if r["path"] != norm and r["id"] in locked),
+                    key=lambda r: (r["path"], r["id"]),
+                )
 
                 docs = await coll_repo.list_docs_under(vault_id, norm, conn=conn)
                 if native_authority:

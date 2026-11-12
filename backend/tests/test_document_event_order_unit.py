@@ -46,7 +46,7 @@ def _recorder(calls: list[str], name: str):
 
 
 def _collection_locker(calls: list[str]):
-    async def lock(_conn, collection_ids, *, share=False):
+    async def lock(_conn, collection_ids, **_kwargs):
         calls.append("lock_collection_rows")
         return {cid for cid in collection_ids if cid is not None}
 

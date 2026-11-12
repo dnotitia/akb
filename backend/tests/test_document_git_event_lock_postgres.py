@@ -358,3 +358,80 @@ async def test_a_lock_timeout_on_an_edge_ends_an_update_before_its_git_commit(tm
         assert await pool.fetchval(
             "SELECT current_commit FROM documents WHERE vault_id = $1", vault_id,
         ) == head
+
+
+async def test_a_move_and_a_recursive_collection_delete_lock_collections_in_one_order(tmp_path):
+    """Moving a document from a collection into its sub-collection locks both
+    collections in id order. A recursive delete of the parent locked the
+    parent and then its sub-collections, so with the parent's id above the
+    child's each held a collection the other waited for. Both now lock in id
+    order."""
+    git = GitService(storage_path=str(tmp_path))
+    documents = DocumentService(git=git)
+    collections = CollectionService(git=git)
+    async with _fresh_database() as pool:
+        vault = "git-lock-move-delete"
+        vault_id = await _make_vault(pool, vault)
+        git.init_vault(vault)
+        parent_id = uuid.UUID("ffffffff-ffff-4fff-bfff-ffffffffffff")
+        child_id = uuid.UUID("00000000-0000-4000-8000-000000000001")
+        await pool.execute(
+            "INSERT INTO collections (id, vault_id, path, name) "
+            "VALUES ($1, $2, 'p', 'p'), ($3, $2, 'p/sub', 'sub')",
+            parent_id, vault_id, child_id,
+        )
+        doc = await documents.put(DocumentPutRequest(
+            vault=vault, collection="p", title="Moved", content="moved body",
+        ))
+        async with pool.acquire() as gate, pool.acquire() as observer:
+            async with _OpenTransaction(gate):
+                await gate.execute("SELECT 1 FROM collections WHERE id = $1 FOR UPDATE", parent_id)
+                deleting = asyncio.create_task(collections.delete(
+                    vault=vault, path="p", recursive=True, agent_id="tester",
+                ))
+                await asyncio.wait_for(_until_blocked(observer, 1), timeout=10)
+                moving = asyncio.create_task(documents.move(vault, doc.path, collection="p/sub"))
+                await asyncio.wait_for(_until_blocked(observer, 2), timeout=10)
+            # The gate is gone; the delete gets the parent collection first.
+            deleted, moved = await asyncio.wait_for(
+                asyncio.gather(deleting, moving, return_exceptions=True),
+                timeout=_EVENT_LOCK_WAIT_SECONDS * 4,
+            )
+        assert not isinstance(deleted, BaseException), repr(deleted)
+        # The delete removed the document before the move could lock it.
+        assert isinstance(moved, NotFoundError), repr(moved)
+        assert await pool.fetchval("SELECT count(*) FROM documents WHERE vault_id = $1", vault_id) == 0
+        assert git.read_file(vault, doc.path) is None
+
+
+async def test_a_recursive_delete_also_deletes_a_sub_collection_created_before_its_lock(tmp_path):
+    """The delete reads the collections under its prefix, then locks them. A
+    sub-collection created in between is found when it reads the set again
+    after locking; it starts over from a fresh read and deletes that one too."""
+    git = GitService(storage_path=str(tmp_path))
+    collections = CollectionService(git=git)
+    async with _fresh_database() as pool:
+        vault = "git-lock-new-sub"
+        vault_id = await _make_vault(pool, vault)
+        git.init_vault(vault)
+        old_sub = uuid.uuid4()
+        await pool.execute(
+            "INSERT INTO collections (id, vault_id, path, name) "
+            "VALUES ($1, $2, 'p', 'p'), ($3, $2, 'p/old', 'old')",
+            uuid.uuid4(), vault_id, old_sub,
+        )
+        async with pool.acquire() as gate, pool.acquire() as observer:
+            async with _OpenTransaction(gate):
+                # Holds the delete at its lock on `p/old`, after it read the set.
+                await gate.execute("SELECT 1 FROM collections WHERE id = $1 FOR NO KEY UPDATE", old_sub)
+                deleting = asyncio.create_task(collections.delete(
+                    vault=vault, path="p", recursive=True, agent_id="tester",
+                ))
+                await asyncio.wait_for(_until_blocked(observer, 1), timeout=10)
+                await pool.execute(
+                    "INSERT INTO collections (id, vault_id, path, name) VALUES ($1, $2, 'p/new', 'new')",
+                    uuid.uuid4(), vault_id,
+                )
+            result = await asyncio.wait_for(deleting, timeout=_EVENT_LOCK_WAIT_SECONDS * 3)
+        assert result["deleted_sub_collections"] == 2
+        assert await pool.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", vault_id) == 0

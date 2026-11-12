@@ -835,28 +835,34 @@ class DocumentRepository:
         return status.endswith(" 1")
 
 
-_LOCK_COLLECTIONS_FOR_UPDATE = (
-    "SELECT id FROM collections WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE"
-)
-_LOCK_COLLECTIONS_FOR_SHARE = (
-    "SELECT id FROM collections WHERE id = ANY($1::uuid[]) ORDER BY id FOR KEY SHARE"
-)
+# Every transaction that locks more than one collection row locks them in id
+# order, through this one helper, so two of them cannot each hold a row the
+# other waits for.
+_LOCK_COLLECTIONS = {
+    "key share": "SELECT id FROM collections WHERE id = ANY($1::uuid[]) ORDER BY id FOR KEY SHARE",
+    "no key update": (
+        "SELECT id FROM collections WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE"
+    ),
+    "update": "SELECT id FROM collections WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+}
 
 
-async def lock_collection_rows(conn, collection_ids, *, share: bool = False) -> set[uuid.UUID]:
+async def lock_collection_rows(
+    conn, collection_ids, *, strength: str = "no key update",
+) -> set[uuid.UUID]:
     """Lock the existing rows among ``collection_ids``, in id order.
 
-    ``FOR NO KEY UPDATE`` suits a write that will change a collection's counts;
-    ``share`` takes ``FOR KEY SHARE`` for one that only needs the collection to
-    stay. Both conflict with the ``FOR UPDATE`` of a collection delete. A Bare
-    Git document write takes these before the Vault's event lock, so it never
-    waits for them while it holds that lock. Returns the ids locked.
+    ``"no key update"`` suits a write that will change a collection's counts,
+    ``"key share"`` one that only needs the collection to stay, and
+    ``"update"`` a collection delete; the first two conflict with the last.
+    A Bare Git document write takes its collections before its document and
+    before the Vault's event lock. Returns the ids locked: a row deleted
+    meanwhile is not among them.
     """
     ids = sorted({cid for cid in collection_ids if cid is not None})
     if not ids:
         return set()
-    query = _LOCK_COLLECTIONS_FOR_SHARE if share else _LOCK_COLLECTIONS_FOR_UPDATE
-    return {row["id"] for row in await conn.fetch(query, ids)}
+    return {row["id"] for row in await conn.fetch(_LOCK_COLLECTIONS[strength], ids)}
 
 
 class CollectionRepository:
