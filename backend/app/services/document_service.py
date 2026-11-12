@@ -413,8 +413,9 @@ def validate_vault_name(name: str) -> None:
         )
 
 
-class _DocumentMoved(Exception):
-    """The document changed path or collection between its read and its lock."""
+class _StaleRead(Exception):
+    """What a lock attempt read without a lock changed before it was locked:
+    the document's path or collection, or a move's destination collection."""
 
 
 class DocumentService:
@@ -610,9 +611,9 @@ class DocumentService:
                     if (row.get("id"), row.get("collection_id")) != (
                         current.get("id"), current.get("collection_id")
                     ):
-                        raise _DocumentMoved
+                        raise _StaleRead
                     return row
-            except _DocumentMoved:
+            except _StaleRead:
                 continue
         raise ConflictError(f"Document {doc_ref} changed collection during this write; retry it")
 
@@ -625,15 +626,22 @@ class DocumentService:
 
         The lock comes before the Vault's event lock and the Git commit. A
         collection delete that commits between finding the row and locking it
-        leaves nothing to lock; the collection is then created again, before
-        Git changes.
+        leaves nothing to lock. A put holds no other collection lock here, so
+        it creates the collection again and retries in place. A move
+        (``also_lock`` given) then already holds its source collection, and
+        asking for the recreated destination, whose id may sort below the
+        source's, would break the id order of collection locks; it raises
+        ``_StaleRead`` instead, so the move's savepoint releases every
+        collection lock before it reads again.
         """
-        for _ in range(3):
+        for _ in range(1 if also_lock is not None else 3):
             collection_id = await coll_repo.get_or_create(vault_id, path, conn=conn)
             if conn is None:
                 return collection_id
             if collection_id in await lock_collection_rows(conn, [collection_id, also_lock]):
                 return collection_id
+        if also_lock is not None:
+            raise _StaleRead
         raise ConflictError(f"Collection {path!r} was deleted during this write; retry it")
 
     async def _resolve_free_path(
@@ -1427,8 +1435,8 @@ class DocumentService:
                         if (row.get("id"), row["path"], row.get("collection_id")) != (
                             current.get("id"), current["path"], current.get("collection_id")
                         ):
-                            raise _DocumentMoved
-                except _DocumentMoved:
+                            raise _StaleRead
+                except _StaleRead:
                     continue
                 break
             else:

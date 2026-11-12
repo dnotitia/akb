@@ -499,3 +499,95 @@ async def test_a_retry_after_a_collection_change_does_not_hold_the_document(tmp_
                     locking.cancel()
                     with contextlib.suppress(BaseException):
                         await locking
+
+
+async def test_a_move_whose_destination_is_recreated_releases_its_source_first(tmp_path, monkeypatch):
+    """A move locks its source `p` (S) and its destination `p/sub` (D), in id
+    order. The destination is deleted while the move waits for it and then
+    recreated with an id D' below S. The move must give up S before it asks
+    for D': a recursive delete of `p` takes D' and then waits for S, so a move
+    holding S while it asked for D' would deadlock with it."""
+    source = uuid.UUID("55555555-5555-4555-8555-555555555555")
+    destination = uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    recreated = uuid.UUID("11111111-1111-4111-8111-111111111111")
+    git = GitService(storage_path=str(tmp_path))
+    documents = DocumentService(git=git)
+    collections = CollectionService(git=git)
+    async with _fresh_database() as pool:
+        vault = "git-lock-recreated"
+        vault_id = await _make_vault(pool, vault)
+        git.init_vault(vault)
+        await pool.execute(
+            "INSERT INTO collections (id, vault_id, path, name) "
+            "VALUES ($1, $2, 'p', 'p'), ($3, $2, 'p/sub', 'sub')",
+            source, vault_id, destination,
+        )
+        doc = await documents.put(DocumentPutRequest(
+            vault=vault, collection="p", title="Moved", content="moved body",
+        ))
+
+        # Hold the move at its second collection lock, the one that asks for D'.
+        import app.services.document_service as document_service_module
+
+        lock_rows = document_service_module.lock_collection_rows
+        calls = 0
+        at_second_lock = asyncio.Event()
+        release_second_lock = asyncio.Event()
+
+        async def paced(conn, collection_ids, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                at_second_lock.set()
+                await release_second_lock.wait()
+            return await lock_rows(conn, collection_ids, **kwargs)
+
+        monkeypatch.setattr(document_service_module, "lock_collection_rows", paced)
+
+        async with pool.acquire() as deleter, pool.acquire() as observer:
+            moving: asyncio.Task | None = None
+            deleting: asyncio.Task | None = None
+            try:
+                async with _OpenTransaction(deleter) as deleting_sub:
+                    await deleter.execute("SELECT 1 FROM collections WHERE id = $1 FOR UPDATE", destination)
+                    moving = asyncio.create_task(documents.move(vault, doc.path, collection="p/sub"))
+                    # The move holds S and waits for D.
+                    await asyncio.wait_for(_a_backend_blocked_by(observer, deleter), timeout=10)
+                    # D goes, and `p/sub` comes back as D' below S, in one commit.
+                    await deleter.execute("DELETE FROM collections WHERE id = $1", destination)
+                    await deleter.execute(
+                        "INSERT INTO collections (id, vault_id, path, name) VALUES ($1, $2, 'p/sub', 'sub')",
+                        recreated, vault_id,
+                    )
+                    await deleting_sub.commit()
+                await asyncio.wait_for(at_second_lock.wait(), timeout=10)
+                # A recursive delete of `p` takes D' and then S. It either waits
+                # for S or commits; its Git cleanup afterwards waits for the
+                # move's write lane.
+                deleting = asyncio.create_task(collections.delete(
+                    vault=vault, path="p", recursive=True, agent_id="tester",
+                ))
+
+                async def committed_or_blocked() -> None:
+                    while not await _blocked_backends(observer) and await observer.fetchval(
+                        "SELECT count(*) FROM collections WHERE vault_id = $1", vault_id,
+                    ):
+                        await asyncio.sleep(0.01)
+
+                await asyncio.wait_for(committed_or_blocked(), timeout=10)
+                release_second_lock.set()
+                deleted, moved = await asyncio.wait_for(
+                    asyncio.gather(deleting, moving, return_exceptions=True),
+                    timeout=_EVENT_LOCK_WAIT_SECONDS * 4,
+                )
+            finally:
+                release_second_lock.set()
+                for task in (moving, deleting):
+                    if task is not None and not task.done():
+                        task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await task
+        assert not isinstance(deleted, BaseException), repr(deleted)
+        # The delete removed the document before the move could lock it.
+        assert isinstance(moved, NotFoundError), repr(moved)
+        assert await pool.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", vault_id) == 0

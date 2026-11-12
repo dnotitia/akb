@@ -120,8 +120,9 @@ or edit rewrites its document's implicit edges at this point instead of after
 the commit), then take the Vault's lock, and only then commit to Git; a busy
 Vault fails them before Git changes. Every transaction that locks several
 collections, a move or a recursive collection delete, locks them in id order.
-A write that finds its document moved after locking it rolls back to a
-savepoint, releasing the collection and the document, before it tries again. They hold the Vault's lock through
+A write that finds its document moved after locking it, or a move that finds
+its destination collection gone, rolls back to a savepoint, releasing every
+collection and the document, before it tries again. They hold the Vault's lock through
 the Git work and their remaining database writes up to their commit, and a Git
 command may run for up to 30 seconds (`git_write_timeout_secs`). In a Bare Git
 installation the other writes of a Vault therefore also wait for a document
