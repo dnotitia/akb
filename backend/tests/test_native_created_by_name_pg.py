@@ -3,7 +3,8 @@
 The unit test pins which query runs for which token; this one asks PostgreSQL
 what it does with them. Every statement the lookup sends must be answerable
 from an index of the real `users` table, and both token forms, plus a username
-that looks like a UUID, must still resolve against real rows.
+that looks like a UUID and an id whose user has no display name, must still
+resolve against real rows.
 
 The predicate it replaced, `id::text = $1 OR username = $1`, is planned here
 too: it stays a sequential scan even with sequential scans disabled, which is
@@ -146,5 +147,33 @@ async def test_both_token_forms_resolve_through_indexes():
                     "owner",
                 )
                 assert ("Seq Scan", None) in replaced
+        finally:
+            await pool.close()
+
+
+async def test_an_id_without_a_display_name_resolves_to_the_username():
+    # A version-1 id: `id::text` matched ids of every UUID version.
+    member_id = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+    async with _users_database() as dsn:
+        setup = await asyncpg.connect(dsn)
+        try:
+            await setup.execute(
+                """
+                INSERT INTO users (id, username, email, password_hash, display_name)
+                VALUES ($1, 'member', 'member@example.test', 'unusable', NULL)
+                """,
+                member_id,
+            )
+        finally:
+            await setup.close()
+
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+        try:
+            recording = _RecordingPool(pool)
+            service = NativeDocumentService(pool=recording)
+
+            assert await service._created_by_name(str(member_id)) == "member"
+            # The id lookup answered; no username lookup followed it.
+            assert [value for _, value in recording.statements] == [member_id]
         finally:
             await pool.close()

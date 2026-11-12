@@ -16,9 +16,16 @@ import pytest
 
 from app.services.native_document_service import NativeDocumentService, _canonical_user_id
 
+_BY_ID = "SELECT COALESCE(display_name, username) FROM users WHERE id = $1"
+_BY_USERNAME = "SELECT COALESCE(display_name, username) FROM users WHERE username = $1"
+
 
 class _Users:
-    """A `users` table answering only the two indexed lookups."""
+    """A `users` table answering only the two indexed lookups.
+
+    It computes `COALESCE(display_name, username)` itself, so it accepts each
+    lookup only in the exact form that selects that expression.
+    """
 
     def __init__(self, *rows: tuple[uuid.UUID, str, str | None]) -> None:
         self.rows = rows
@@ -27,11 +34,10 @@ class _Users:
     async def fetchval(self, query: str, value: object):
         self.queries.append((query, value))
         normalized = " ".join(query.split())
-        assert "::text" not in normalized and " OR " not in normalized
-        if normalized.endswith("WHERE id = $1"):
+        if normalized == _BY_ID:
             assert isinstance(value, uuid.UUID)
             matches = [row for row in self.rows if row[0] == value]
-        elif normalized.endswith("WHERE username = $1"):
+        elif normalized == _BY_USERNAME:
             matches = [row for row in self.rows if row[1] == value]
         else:  # pragma: no cover - a new query shape must be reviewed here
             raise AssertionError(f"unexpected query: {normalized}")
@@ -65,13 +71,39 @@ async def test_a_user_id_is_resolved_by_primary_key_alone():
     assert [value for _, value in pool.conn.queries] == [user_id]
 
 
+async def test_an_id_without_a_display_name_resolves_to_the_username():
+    user_id = uuid.uuid4()
+    service, pool = _service((user_id, "alice", None))
+
+    assert await service._created_by_name(str(user_id)) == "alice"
+    assert pool.conn.queries == [(_BY_ID, user_id)]
+
+
+@pytest.mark.parametrize(
+    "user_id",
+    [
+        uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8"),
+        uuid.uuid3(uuid.NAMESPACE_URL, "https://example.test/users/owner"),
+        uuid.uuid5(uuid.NAMESPACE_URL, "https://example.test/users/owner"),
+        uuid.UUID("01890a5d-ac96-774b-bcce-b302099a8057"),
+    ],
+    ids=lambda user_id: f"v{user_id.version}",
+)
+async def test_a_canonical_uuid_of_any_version_is_a_user_id(user_id):
+    """`id::text` matched an id of any UUID version, not only random ones."""
+    assert user_id.version != 4
+    service, pool = _service((user_id, "owner", "Owner"))
+
+    assert _canonical_user_id(str(user_id)) == user_id
+    assert await service._created_by_name(str(user_id)) == "Owner"
+    assert pool.conn.queries == [(_BY_ID, user_id)]
+
+
 async def test_a_username_is_resolved_by_username_alone():
     service, pool = _service((uuid.uuid4(), "alice", None))
 
     assert await service._created_by_name("alice") == "alice"
-    assert pool.conn.queries == [
-        ("SELECT COALESCE(display_name, username) FROM users WHERE username = $1", "alice"),
-    ]
+    assert pool.conn.queries == [(_BY_USERNAME, "alice")]
 
 
 async def test_a_uuid_shaped_username_still_resolves():
