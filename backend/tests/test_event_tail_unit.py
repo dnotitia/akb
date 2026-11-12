@@ -210,7 +210,8 @@ def test_start_position_matrix_obeys_header_priority_and_earliest_exclusion() ->
 
 def test_cursor_scope_and_retention_gap_fail_closed_with_recovery_cursors() -> None:
     codec = EventCursorCodec("cursor-secret")
-    bounds = EventBounds(earliest_id=10, latest_id=25)
+    # Retention deleted the Vault's events up to 9.
+    bounds = EventBounds(earliest_id=10, latest_id=25, deleted_through=9)
 
     with pytest.raises(EventCursorError):
         resolve_start_position(
@@ -233,6 +234,55 @@ def test_cursor_scope_and_retention_gap_fail_closed_with_recovery_cursors() -> N
     # that first retained event, and a cursor at the current tail waits.
     validate_event_gap(codec, VAULT_ID, (), position=9, bounds=bounds)
     validate_event_gap(codec, VAULT_ID, (), position=25, bounds=bounds)
+
+
+def test_a_cursor_far_below_a_vaults_first_event_is_no_gap_until_something_is_deleted() -> None:
+    """Event ids are shared by every Vault, so other Vaults' events advance them.
+
+    A cursor taken on an empty Vault is far below its first event without
+    having missed anything; only a deletion makes a gap, and the refusal
+    resumes at the highest deleted id.
+    """
+    codec = EventCursorCodec("cursor-secret")
+
+    nothing_deleted = EventBounds(earliest_id=101, latest_id=140)
+    validate_event_gap(codec, VAULT_ID, (), position=0, bounds=nothing_deleted)
+
+    swept = EventBounds(earliest_id=121, latest_id=140, deleted_through=120)
+    validate_event_gap(codec, VAULT_ID, (), position=120, bounds=swept)
+    with pytest.raises(EventGapError) as exc_info:
+        validate_event_gap(codec, VAULT_ID, (), position=0, bounds=swept)
+    assert codec.decode(exc_info.value.details["earliest_cursor"]) == (VAULT_ID, (), 120)
+    assert codec.decode(exc_info.value.details["latest_cursor"]) == (VAULT_ID, (), 140)
+
+
+@pytest.mark.parametrize(
+    ("bounds", "earliest", "latest"),
+    [
+        # Nothing deleted: just before the first retained event, or the last one.
+        (EventBounds(earliest_id=101, latest_id=140), 100, 140),
+        # Deleted from the start: the same, the watermark sitting just below.
+        (EventBounds(earliest_id=121, latest_id=140, deleted_through=120), 120, 140),
+        # A late event outlived a later deleted one: earliest starts after the
+        # deletion, where the tail is complete, so it is never refused.
+        (EventBounds(earliest_id=103, latest_id=140, deleted_through=105), 105, 140),
+        # Everything deleted: both start at the watermark.
+        (EventBounds(earliest_id=None, latest_id=None, deleted_through=120), 120, 120),
+        # An empty Vault never swept.
+        (EventBounds(earliest_id=None, latest_id=None), 0, 0),
+    ],
+)
+def test_start_positions_never_land_below_the_watermark(bounds: EventBounds, earliest: int, latest: int) -> None:
+    codec = EventCursorCodec("cursor-secret")
+
+    def resolved(start: str | None) -> int:
+        return resolve_start_position(
+            codec, VAULT_ID, (), bounds, last_event_id=None, cursor=None, start=start
+        )
+
+    assert (resolved("earliest"), resolved(None)) == (earliest, latest)
+    for position in (earliest, latest):
+        validate_event_gap(codec, VAULT_ID, (), position=position, bounds=bounds)
 
 
 def test_sse_records_and_heartbeat_keep_control_data_distinct() -> None:

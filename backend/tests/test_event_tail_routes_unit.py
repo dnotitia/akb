@@ -82,7 +82,8 @@ async def test_open_tail_preflights_retention_gap_before_returning_stream(monkey
 
     class _Connection:
         async def fetchrow(self, *_args):
-            return {"earliest_id": 10, "latest_id": 20}
+            # Retention deleted the Vault's events up to 9.
+            return {"earliest_id": 10, "latest_id": 20, "deleted_through": 9}
 
     class _Acquire:
         def __await__(self):
@@ -153,7 +154,7 @@ class _BoundsPool:
         return None
 
     async def fetchrow(self, *_args):
-        return {"earliest_id": None, "latest_id": None}
+        return {"earliest_id": None, "latest_id": None, "deleted_through": None}
 
 
 class _Hub:
@@ -346,7 +347,7 @@ async def test_a_failed_preflight_gives_its_slot_back(tail, monkeypatch) -> None
         pool = _BoundsPool()
 
         async def fetchrow(*_args):
-            return {"earliest_id": 10, "latest_id": 20}
+            return {"earliest_id": 10, "latest_id": 20, "deleted_through": 9}
 
         pool.fetchrow = fetchrow  # type: ignore[method-assign]
         return pool

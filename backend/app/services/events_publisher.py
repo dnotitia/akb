@@ -326,7 +326,14 @@ async def _process_once() -> int:
 
 async def _sweep_once() -> int:
     """Purge published rows older than SWEEP_GRACE_INTERVAL.
-    Rate-limited to once per SWEEP_INTERVAL_SECONDS."""
+    Rate-limited to once per SWEEP_INTERVAL_SECONDS.
+
+    The same statement raises each affected Vault's retention watermark to the
+    highest id it deleted (migration 133), so the delete and the record of it
+    commit together. An event tail cursor below the watermark missed a deleted
+    event and is refused with 410. Events of a Vault that no longer exists
+    record nothing: no tail can open on it.
+    """
     global _last_sweep_at
     now = time.monotonic()
     if now - _last_sweep_at < SWEEP_INTERVAL_SECONDS:
@@ -340,7 +347,15 @@ async def _sweep_once() -> int:
                 DELETE FROM events
                  WHERE redis_published_at IS NOT NULL
                    AND redis_published_at < NOW() - INTERVAL '{SWEEP_GRACE_INTERVAL}'
-                RETURNING 1
+                RETURNING vault_id, id
+            ), watermarks AS (
+                INSERT INTO event_retention_watermarks AS w (vault_id, deleted_through)
+                SELECT d.vault_id, MAX(d.id)
+                  FROM d
+                  JOIN vaults v ON v.id = d.vault_id
+                 GROUP BY d.vault_id
+                ON CONFLICT (vault_id) DO UPDATE
+                   SET deleted_through = GREATEST(w.deleted_through, EXCLUDED.deleted_through)
             )
             SELECT COUNT(*) FROM d
             """

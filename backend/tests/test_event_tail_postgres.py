@@ -112,7 +112,8 @@ async def test_event_repository_orders_and_isolates_vault_rows():
         third_id = await _insert_event(pool, vault_id, "table.rows_changed", "alice")
 
         async with pool.acquire() as conn:
-            assert await get_vault_event_bounds(conn, vault_id) == (first_id, third_id)
+            # Nothing was deleted, so the Vault has no retention watermark yet.
+            assert await get_vault_event_bounds(conn, vault_id) == (first_id, third_id, 0)
             rows = await list_vault_events(conn, vault_id, after_id=0)
             assert [row["id"] for row in rows] == [first_id, third_id]
             assert all(row["vault_id"] == vault_id for row in rows)
@@ -120,30 +121,42 @@ async def test_event_repository_orders_and_isolates_vault_rows():
         assert second_id not in {first_id, third_id}
 
 
-async def test_retention_bounds_drive_gap_recovery_without_skipping():
+async def test_retention_bounds_drive_gap_recovery_without_skipping(monkeypatch):
     async with _fresh_database() as pool:
         vault_id = await _make_vault(pool, "event-gap")
         first_id = await _insert_event(pool, vault_id, "document.put", "alice")
         second_id = await _insert_event(pool, vault_id, "document.update", "alice")
         latest_id = await _insert_event(pool, vault_id, "document.delete", "alice")
 
+        # The first event was published long enough ago for the sweeper.
+        await pool.execute(
+            "UPDATE events SET redis_published_at = NOW() - INTERVAL '8 days' WHERE id = $1", first_id
+        )
+        await _sweep(monkeypatch, pool)
         async with pool.acquire() as conn:
-            await conn.execute("DELETE FROM events WHERE id = $1", first_id)
-            earliest_id, current_latest_id = await get_vault_event_bounds(conn, vault_id)
+            earliest_id, current_latest_id, deleted_through = await get_vault_event_bounds(conn, vault_id)
 
-        assert earliest_id == second_id
-        assert current_latest_id == latest_id
+        assert (earliest_id, current_latest_id, deleted_through) == (second_id, latest_id, first_id)
         codec = EventCursorCodec("cursor-secret")
+        bounds = EventBounds(earliest_id, current_latest_id, deleted_through)
         with pytest.raises(EventGapError) as exc_info:
-            validate_event_gap(
-                codec,
-                vault_id,
-                (),
-                position=first_id - 1,
-                bounds=EventBounds(earliest_id, current_latest_id),
-            )
-        assert exc_info.value.details["earliest_cursor"]
-        assert exc_info.value.details["latest_cursor"]
+            validate_event_gap(codec, vault_id, (), position=first_id - 1, bounds=bounds)
+        # Resuming at the watermark skips nothing that is still retained.
+        assert codec.decode(exc_info.value.details["earliest_cursor"]) == (vault_id, (), first_id)
+        assert codec.decode(exc_info.value.details["latest_cursor"]) == (vault_id, (), latest_id)
+        validate_event_gap(codec, vault_id, (), position=first_id, bounds=bounds)
+
+
+async def _sweep(monkeypatch, pool: asyncpg.Pool) -> int:
+    """Run the events sweeper once against ``pool``, past its rate limit."""
+    from app.services import events_publisher
+
+    async def get_pool() -> asyncpg.Pool:
+        return pool
+
+    monkeypatch.setattr(events_publisher, "get_pool", get_pool)
+    monkeypatch.setattr(events_publisher, "_last_sweep_at", float("-inf"))
+    return await events_publisher._sweep_once()
 
 
 async def test_postgres_tail_stream_preserves_order_filter_checkpoints_and_resume(monkeypatch):

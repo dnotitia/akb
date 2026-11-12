@@ -112,6 +112,16 @@ received a cursor yet resumes from there rather than after the newest event.
 A revoked reader stops receiving events within about a second and gets no
 further frame, and an idle tail closes within one heartbeat.
 
+A cursor is refused with 410 `event_gap` only when retention deleted an event
+it never received. Each Vault records the highest event id that the events
+sweeper deleted, in the statement that deletes it (migration 133); a cursor
+below that mark is refused, and the refusal's `earliest_cursor` resumes at it.
+Event ids are shared by every Vault, so a cursor taken before a Vault's first
+event, on an empty Vault, is usually far below that event and is still valid.
+`start=earliest` replays from the first position after which nothing was
+deleted. For a Vault that already had events when migration 133 ran, the mark
+starts just below its earliest retained event, where the boundary was before.
+
 All tail database work in a process, opening included, shares at most
 `event_tail_db_concurrency` connections. Work beyond that waits for a free
 slot without holding a connection, and a slot is free again only once its
@@ -135,7 +145,7 @@ Limits per server process; each environment variable overrides its key:
 
 A new tail's errors come in this order: 403, or 404 for an unknown Vault; then
 429 for an account at its quota and 503 for a full process; then 400 for an
-invalid kind or cursor, and 410 for a cursor older than the retained tail. A
+invalid kind or cursor, and 410 for a cursor that missed a deleted event. A
 caller without access is told so even when it would also be refused for
 capacity, and an account at its quota gets 429 even when the process is also
 full: retrying cannot help either, and the SDK's change channel retries a 5xx

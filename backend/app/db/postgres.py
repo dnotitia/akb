@@ -422,6 +422,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "128_approval_service_bootstrap.py",  # non-secret requester credential lineage
         "129_sso_request_recovery.py",  # permanent requester nonce and stable history paging
         "131_events_notify_vault.py",  # events NOTIFY names the Vault, so an event wakes only that Vault's tails
+        "133_event_retention_watermark.py",  # per-Vault highest deleted event id; the tail's 410 boundary
     ):
         if filename in applied:
             continue

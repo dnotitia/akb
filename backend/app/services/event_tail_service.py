@@ -382,10 +382,17 @@ def stats_snapshot() -> dict[str, int | bool]:
 
 @dataclass(frozen=True)
 class EventBounds:
-    """The retained event-id range for one Vault."""
+    """The retained event-id range for one Vault, and how far retention deleted.
+
+    ``deleted_through`` is the highest id of the Vault's events that retention
+    has deleted, 0 if none. Event ids are shared by every Vault, so the range
+    alone cannot tell a cursor that missed a deleted event from one taken
+    before the Vault's first event.
+    """
 
     earliest_id: int | None
     latest_id: int | None
+    deleted_through: int = 0
 
 
 def _canonical_uuid(value: UUID | str) -> UUID:
@@ -515,8 +522,11 @@ def resolve_start_position(
         return position
 
     if start == "earliest":
-        return max(0, (bounds.earliest_id or 1) - 1)
-    return bounds.latest_id or 0
+        # Just before the earliest retained event, unless retention deleted
+        # an event after it: then from there, the earliest position whose
+        # tail is complete.
+        return max(bounds.deleted_through, (bounds.earliest_id or 1) - 1)
+    return max(bounds.latest_id or 0, bounds.deleted_through)
 
 
 def validate_event_gap(
@@ -527,13 +537,18 @@ def validate_event_gap(
     position: int,
     bounds: EventBounds,
 ) -> None:
-    """Reject a cursor that cannot reach the retained head without a gap."""
-    earliest = bounds.earliest_id
-    if earliest is None or position >= earliest - 1:
+    """Reject a cursor that never received an event retention has since deleted.
+
+    The Vault's watermark is the highest id it deleted, so a cursor below it
+    missed that event. A cursor at or above it missed nothing, however far
+    below the Vault's first retained event it is. The refusal's earliest
+    cursor resumes at the watermark, after which nothing was deleted.
+    """
+    if position >= bounds.deleted_through:
         return
-    latest_position = bounds.latest_id if bounds.latest_id is not None else position
+    latest_position = max(bounds.latest_id or 0, bounds.deleted_through)
     raise EventGapError(
-        earliest_cursor=codec.encode(vault_id, kinds, max(0, earliest - 1)),
+        earliest_cursor=codec.encode(vault_id, kinds, bounds.deleted_through),
         latest_cursor=codec.encode(vault_id, kinds, latest_position),
     )
 
@@ -623,9 +638,9 @@ async def open_tail(
             access = await check_vault_access(user_id, vault, required_role="reader", _conn=conn)
             normalized_kinds = normalize_kind_filter(kinds)
             vault_id = access["vault_id"]
-            earliest_id, latest_id = await get_vault_event_bounds(conn, vault_id)
+            earliest_id, latest_id, deleted_through = await get_vault_event_bounds(conn, vault_id)
         codec = EventCursorCodec()
-        bounds = EventBounds(earliest_id=earliest_id, latest_id=latest_id)
+        bounds = EventBounds(earliest_id=earliest_id, latest_id=latest_id, deleted_through=deleted_through)
         resolved = resolve_start_position(
             codec,
             vault_id,

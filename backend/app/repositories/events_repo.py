@@ -73,25 +73,33 @@ async def emit_event(
 async def get_vault_event_bounds(
     conn,
     vault_id: uuid.UUID | str,
-) -> tuple[int | None, int | None]:
-    """Return the retained ``events.id`` range for one Vault.
+) -> tuple[int | None, int | None, int]:
+    """Return the retained ``events.id`` range for one Vault, and its watermark.
 
-    The range deliberately ignores kind filters. A filtered consumer still
-    advances across every retained event, emitting checkpoints for kinds it
-    did not select, so retention-gap validation must use the complete Vault
-    tail rather than only the selected subset.
+    The watermark is the highest id of the Vault's events that retention has
+    deleted, 0 if none (migration 133). The range deliberately ignores kind
+    filters. A filtered consumer still advances across every retained event,
+    emitting checkpoints for kinds it did not select, so retention-gap
+    validation must use the complete Vault tail rather than only the selected
+    subset.
     """
+    vault_uuid = _to_uuid_or_none(vault_id)
     row = await conn.fetchrow(
         """
-        SELECT MIN(id) AS earliest_id, MAX(id) AS latest_id
-          FROM events
-         WHERE vault_id = $1
+        SELECT MIN(e.id) AS earliest_id,
+               MAX(e.id) AS latest_id,
+               (SELECT w.deleted_through
+                  FROM event_retention_watermarks w
+                 WHERE w.vault_id = $1) AS deleted_through
+          FROM events e
+         WHERE e.vault_id = $1
         """,
-        _to_uuid_or_none(vault_id),
+        vault_uuid,
     )
     return (
         int(row["earliest_id"]) if row["earliest_id"] is not None else None,
         int(row["latest_id"]) if row["latest_id"] is not None else None,
+        int(row["deleted_through"] or 0),
     )
 
 

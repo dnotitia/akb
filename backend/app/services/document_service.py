@@ -2546,7 +2546,8 @@ class DocumentService:
                     # events first: the seed put() emitted document.put rows
                     # (events has no vault FK cascade) — leaving them would
                     # feed consumers an event for a vault this rollback is
-                    # about to erase.
+                    # about to erase. The vault's event retention watermark
+                    # needs no update: it goes with the vault row, by cascade.
                     await conn.execute("DELETE FROM events WHERE vault_id = $1", vault_id)
                     await conn.execute("DELETE FROM edges WHERE vault_id = $1", vault_id)
                     await delete_vault_chunks(conn, vault_id)

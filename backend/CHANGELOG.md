@@ -24,6 +24,11 @@ specifically; the proxy has its own log in
   meantime. A tail whose checks keep taking that long ends after three in a
   row, the first check of a batch included, and first sends a checkpoint at
   the last position it delivered, so a client without a cursor resumes there.
+  A cursor is refused with 410 `event_gap` only when retention deleted an
+  event it never received: migration 133 records the highest deleted event id
+  per Vault, raised in the statement that deletes. A cursor taken before a
+  Vault's first event, which other Vaults' events usually leave far below it,
+  is no longer refused.
   A process serves at most `event_tail_max_streams` tails (default 256,
   `AKB_EVENT_TAIL_MAX_STREAMS`); past that a new tail gets 503
   `event_tail_capacity` with `Retry-After`. One account may hold at most
