@@ -1319,7 +1319,8 @@ async def alter_table(
     All are optional and combine in one TX. Adding a unique key
     PREFLIGHTS existing rows for duplicates BEFORE any DDL — on a
     violation the whole alter rolls back (physical schema + registry
-    unchanged). Emits `table.alter` as the last statement of the alter.
+    unchanged). Emits `table.alter`, and `table.rows_changed` for an enum
+    value rename, as the last statements of the alter.
 
     A caller that runs further DDL in the same transaction passes
     ``_events`` and inserts the collected events after its own last locking
@@ -1694,7 +1695,7 @@ async def alter_table(
                             )
                             if renames:
                                 await table_data_repo.rename_enum_values(
-                                    conn, pg_name, current["name"], renames,
+                                    conn, pg_name, current["name"], renames, events=events,
                                 )
                         if set_default or drop_default:
                             await table_data_repo.alter_column_default(conn, pg_name, next_col)
