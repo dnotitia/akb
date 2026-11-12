@@ -97,6 +97,10 @@ async def _ready_database(monkeypatch, tmp_path, *, role_connection_limit: int |
     monkeypatch.setattr(process_settings, "git_storage_path", str(tmp_path / "vaults"))
     from app import main
 
+    # Another test module may have replaced `get_pool` on `app.main` before
+    # this one runs; readiness must probe the real pool this test builds.
+    monkeypatch.setattr(main, "get_pool", postgres.get_pool)
+
     admin = await asyncpg.connect(_ADMIN_DSN)
     name = f"akb_readyz_{uuid.uuid4().hex[:12]}"
     role = password = None
