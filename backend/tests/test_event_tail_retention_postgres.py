@@ -1160,3 +1160,82 @@ async def test_the_install_names_the_vaults_table_when_a_vault_change_keeps_it_f
             await migrator.close()
 
         assert not await _trigger_installed(setup_pool)
+
+
+async def test_a_vault_delete_removes_only_the_marks_it_locked_in_order():
+    """A mark created while a Vault delete waits must not join that delete out of order.
+
+    The Vault delete trigger locked the marks in Vault id order and then
+    deleted them in a second statement, with a new snapshot. A mark created
+    between the two, here A's while the delete held B and waited at C, was
+    deleted without the ordered lock: with a sweep holding A and waiting for
+    B, the delete then waited for A, and PostgreSQL failed one of them with
+    a deadlock. The trigger now locks and deletes in one statement, deleting
+    only the marks it locked; a mark created after that statement's snapshot
+    is left behind, and is inert.
+    """
+    vault_a = uuid.UUID("00000000-0000-4000-8000-00000000000a")
+    vault_b = uuid.UUID("00000000-0000-4000-8000-00000000000b")
+    vault_c = uuid.UUID("00000000-0000-4000-8000-00000000000c")
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        events: dict[uuid.UUID, list[int]] = {}
+        for vault_id, name in (
+            (vault_a, "retention-late-a"),
+            (vault_b, "retention-late-b"),
+            (vault_c, "retention-late-c"),
+        ):
+            await setup_pool.execute(
+                "INSERT INTO vaults (id, name, git_path) VALUES ($1, $2, $3)", vault_id, name, f"/tmp/{name}.git"
+            )
+            events[vault_id] = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(2)]
+        # B and C have marks; A has none yet.
+        await setup_pool.execute("DELETE FROM events WHERE id = $1", events[vault_b][0])
+        await setup_pool.execute("DELETE FROM events WHERE id = $1", events[vault_c][0])
+        assert await _watermarks(setup_pool) == {vault_b: events[vault_b][0], vault_c: events[vault_c][0]}
+        await _publish_long_ago(setup_pool, [events[vault_a][1], events[vault_b][1]])
+        holder = await asyncpg.connect(_database_dsn(database))
+        deleting = await asyncpg.connect(_database_dsn(database))
+        sweeping = await asyncpg.connect(_database_dsn(database))
+        tasks: list[asyncio.Future] = []
+        try:
+            holding = holder.transaction()
+            await holding.start()
+            await holder.fetchval("SELECT 1 FROM event_retention_watermarks WHERE vault_id = $1 FOR KEY SHARE", vault_c)
+            deletion = deleting.transaction()
+            await deletion.start()
+            removing = asyncio.ensure_future(
+                deleting.execute("DELETE FROM vaults WHERE id = ANY($1::uuid[])", [vault_a, vault_b, vault_c])
+            )
+            tasks.append(removing)
+            # The Vault delete holds B's mark and waits at C's.
+            await _waits_for(setup_pool, deleting, holder)
+            # A's mark is created now, after the Vault delete's snapshot.
+            await setup_pool.execute("DELETE FROM events WHERE id = $1", events[vault_a][0])
+            sweep = sweeping.transaction()
+            await sweep.start()
+            raising = asyncio.ensure_future(sweeping.fetchval(_EARLIER_SWEEP))
+            tasks.append(raising)
+            # The sweep raises A's mark and waits at B's, which the delete holds.
+            await _waits_for(setup_pool, sweeping, deleting)
+            await holding.commit()
+            done, _ = await asyncio.wait(tasks, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            failures = [task.exception() for task in done if task.exception() is not None]
+            assert not failures, failures
+            assert removing.done()
+            await deletion.commit()
+            assert await asyncio.wait_for(raising, 5) == 2
+            await sweep.commit()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            for conn in (holder, deleting, sweeping):
+                await conn.close()
+            for task in tasks:
+                with contextlib.suppress(BaseException):
+                    await task
+
+        # C's mark went with its Vault. The sweep raised A's mark and wrote B's
+        # again after the delete: inert marks of Vaults that are gone.
+        assert await _watermarks(setup_pool) == {vault_a: events[vault_a][1], vault_b: events[vault_b][1]}
