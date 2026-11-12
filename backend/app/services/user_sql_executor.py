@@ -35,7 +35,7 @@ from app.models.vault_scope import (
     current_vault_scope,
 )
 from app.repositories import vault_write_policy_repo
-from app.repositories.events_repo import emit_event
+from app.repositories.events_repo import EventBuffer
 from app.util.errors import VAULT_ARCHIVED, VAULT_WRITE_MANAGED, err
 from app.services.role_sync import token_role_name, user_role_name
 
@@ -56,12 +56,16 @@ async def human_admin_sql_bypass(conn, user_id: uuid.UUID | str, is_admin: bool)
 
 
 async def _check_vault_write_policy(
-    conn: asyncpg.Connection, vault_names: list[str], user_id: uuid.UUID | str, *, admin_bypass: bool,
-) -> tuple[dict | None, bool]:
-    """Return a policy error and whether an admin override was recorded.
+    conn: asyncpg.Connection, vault_names: list[str], user_id: uuid.UUID | str, *,
+    admin_bypass: bool, overrides: EventBuffer,
+) -> dict | None:
+    """Return a policy error, or collect the admin overrides into ``overrides``.
 
     Hold each declared Vault against archive, mark and grant changes until
-    the statement transaction finishes.
+    the statement transaction finishes. The caller inserts the override
+    events after the statement: an event insert holds the Vault's event lock
+    until commit (migration 132), which must not be held while the statement
+    runs or waits for rows.
     """
     vaults = await conn.fetch(
         "SELECT id, name, status FROM vaults WHERE name = ANY($1::text[]) ORDER BY id FOR SHARE",
@@ -75,7 +79,7 @@ async def _check_vault_write_policy(
         return err(
             f"Vault '{', '.join(archived)}' is archived (read-only); writes via "
             "akb_sql are not allowed. Unarchive the vault first.", code=VAULT_ARCHIVED,
-        ), False
+        )
 
     # Read policy *after* locking. A grant may have changed while we waited
     # for its writer, which serializes on the parent Vault row.
@@ -88,12 +92,12 @@ async def _check_vault_write_policy(
                 f"Vault '{policy['name']}' is write-managed by "
                 f"{policy['managed_by']}; writes require a granted service token",
                 code=VAULT_WRITE_MANAGED,
-            ), False
-        await emit_event(
-            conn, "vault.write_policy_admin_bypass", vault_id=policy["id"], actor_id=str(user_id),
+            )
+        overrides.add(
+            "vault.write_policy_admin_bypass", vault_id=policy["id"], actor_id=str(user_id),
             payload={"managed_by": policy["managed_by"], "required_role": "writer", "vault": policy["name"]},
         )
-    return None, bool(managed)
+    return None
 
 
 # ── Result shaping ────────────────────────────────────────────
@@ -278,10 +282,11 @@ class UserSqlExecutor:
                     scope = current_vault_scope.get()
                     token_id = current_token_id.get()
                     admin_bypass = scope is None and await human_admin_sql_bypass(conn, user_id, is_admin)
-                    audited_override = False
+                    overrides = EventBuffer()
                     if enforce_vault_write_policy and not (read_only and should_fetch):
-                        denial, audited_override = await _check_vault_write_policy(
-                            conn, vault_names or [], user_id, admin_bypass=admin_bypass,
+                        denial = await _check_vault_write_policy(
+                            conn, vault_names or [], user_id,
+                            admin_bypass=admin_bypass, overrides=overrides,
                         )
                         if denial:
                             if not should_fetch:
@@ -325,16 +330,29 @@ class UserSqlExecutor:
                     if read_only:
                         await conn.execute("SET TRANSACTION READ ONLY")
 
-                    if not audited_override:
+                    if not overrides:
                         return await _run_statement(conn, sql, bind_params, should_fetch, vault_names or [])
                     # Keep the override audit event even if PostgreSQL rejects
-                    # the user's statement. Only the statement rolls back.
+                    # the user's statement. Only the statement rolls back, and
+                    # the event is inserted after it, as the transaction's last
+                    # locking statement.
+                    outcome: dict = {}
+                    statement_error: asyncpg.PostgresError | None = None
                     try:
                         async with conn.transaction():
-                            return await _run_statement(conn, sql, bind_params, should_fetch, vault_names or [])
+                            outcome = await _run_statement(conn, sql, bind_params, should_fetch, vault_names or [])
                     except asyncpg.PostgresError as exc:
                         statement_error = exc
-                raise statement_error
+                    if not read_only:
+                        await overrides.flush(conn)
+                if read_only:
+                    # A read-only transaction cannot insert the event. Its
+                    # statement wrote nothing, so the event commits alone.
+                    async with conn.transaction():
+                        await overrides.flush(conn)
+                if statement_error is not None:
+                    raise statement_error
+                return outcome
         except asyncpg.exceptions.ReadOnlySQLTransactionError as e:
             raise PermissionDeniedError(str(e), pg_sqlstate="25006") from e
         except asyncpg.exceptions.InsufficientPrivilegeError as e:
