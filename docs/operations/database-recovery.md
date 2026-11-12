@@ -97,6 +97,16 @@ Connecting and the ping both stay inside the 2-second step. Each API process
 therefore holds one PostgreSQL connection beyond its pool. An unreachable
 database still fails readiness at once.
 
+That connection proves the database answers, not that the pool can still open
+a connection to it. The pool's idle connections can expire, and a server at
+`max_connections` refuses new ones while a connection opened earlier keeps
+working. So when the pool shows nothing that proves it could serve a request
+(no idle connection, room to open one, and no acquire within
+`readyz_pool_saturation_grace_secs`), the probe also takes one connection
+through the pool within the rest of its 2-second step and runs `SELECT 1`. If
+the pool cannot open it, readiness reports `db: error:pool_unavailable`, or
+`db: error:pool_timeout` when it does not answer in time.
+
 A server at `max_connections` refuses that connection with SQLSTATE `53300`
 while the pool's open connections keep working. Readiness then asks the pool,
 without waiting for a connection:

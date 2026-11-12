@@ -424,6 +424,40 @@ async def test_idle_pool_connection_that_never_answers_is_given_up_within_the_pr
     assert elapsed < db.main._READY_DB_TIMEOUT_SECONDS + 0.5
 
 
+async def test_pool_that_can_no_longer_open_connections_is_not_ready(monkeypatch, tmp_path):
+    # The probe's own connection is opened first. Then the pool's connections
+    # end, and the server lets the role keep only that one: requests could not
+    # get a connection, while the probe's connection still answers.
+    async with _ready_database(monkeypatch, tmp_path, role_connection_limit=_POOL_SIZE + 1) as db:
+        monkeypatch.setattr(db.main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+        assert (await db.client.get("/readyz")).status_code == 200
+        assert await _probe_backend_pid(db) is not None
+
+        pool_pids = await db.admin.fetch(
+            "SELECT pid FROM pg_stat_activity WHERE datname = $1 AND application_name <> $2",
+            db.name,
+            postgres.READINESS_APPLICATION_NAME,
+        )
+        for row in pool_pids:
+            await db.admin.fetchval("SELECT pg_terminate_backend($1)", row["pid"])
+        async with asyncio.timeout(2):
+            while db.pool.get_size() > 0:
+                await asyncio.sleep(0.01)
+        await db.admin.execute(f'ALTER ROLE "{db.name}" CONNECTION LIMIT 1')
+        await asyncio.sleep(_PAST_GRACE)  # no acquire within the grace
+        db.main._ready_state.ts -= 31  # past the success cache
+
+        started = time.monotonic()
+        response = await db.client.get("/readyz")
+        elapsed = time.monotonic() - started
+
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]["detail"]
+    assert detail["db"] == "error:pool_unavailable"
+    assert detail["pool"]["size"] == 0 and detail["pool"]["idle"] == 0
+    assert elapsed < db.main._READY_DB_TIMEOUT_SECONDS + 0.5
+
+
 async def test_database_gone_is_not_ready_at_once(ready_db):
     assert (await ready_db.client.get("/readyz")).status_code == 200
     assert await _probe_backend_pid(ready_db) is not None

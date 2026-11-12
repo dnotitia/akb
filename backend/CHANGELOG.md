@@ -112,6 +112,12 @@ specifically; the proxy has its own log in
   is saturated, a ready result is not cached and the soft vector check is
   skipped as `skipped:pool_saturated`. See
   `docs/operations/database-recovery.md`.
+- When the request pool shows nothing that proves it could serve a request (no
+  idle connection, room to open one, and no acquire within the grace),
+  readiness takes one connection through it within the probe's remaining
+  budget and runs `SELECT 1`. A pool that cannot open that connection reports
+  `db: error:pool_unavailable` or `db: error:pool_timeout` and is not ready,
+  even while the probe's own connection still answers.
 - When the server refuses the readiness probe's connection at
   `max_connections`, readiness asks the pool instead. With an idle connection
   it runs `SELECT 1` on that connection within the probe's remaining budget

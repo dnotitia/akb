@@ -38,6 +38,9 @@ class _Pool:
         self.idle_conn = SimpleNamespace(fetchval=AsyncMock(return_value=1), terminate=MagicMock())
         self.acquire_timeouts: list[float | None] = []
         self.release_timeouts: list[float | None] = []
+        # How opening a connection goes when nothing is idle: refused, or stalled.
+        self.acquire_error: BaseException | None = None
+        self.acquire_delay = 0.0
 
     def get_size(self) -> int:
         return self.size
@@ -53,6 +56,10 @@ class _Pool:
 
     async def acquire(self, *, timeout=None):
         self.acquire_timeouts.append(timeout)
+        if self.acquire_delay:
+            await asyncio.sleep(self.acquire_delay)
+        if self.acquire_error is not None:
+            raise self.acquire_error
         return self.idle_conn
 
     async def release(self, conn, *, timeout=None) -> None:
@@ -293,6 +300,72 @@ async def test_zero_grace_fails_at_the_first_saturated_probe(main, probe, monkey
 
     assert ok is False
     assert detail["pool"]["saturated_for_secs"] == 0.0
+
+
+# ── A pool that cannot show it works ────────────────────────────────────────
+
+
+def _unproven(probe) -> None:
+    """Room to open a connection, none idle, and no acquire within the grace."""
+    probe.pool.size, probe.pool.idle = 1, 0
+    probe.clock.now += GRACE
+
+
+async def test_unproven_pool_is_checked_with_one_bounded_acquire(main, probe):
+    _unproven(probe)
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is True
+    assert detail["db"] == "ok"
+    probe.pool.idle_conn.fetchval.assert_awaited_once_with("SELECT 1")
+    (acquire_timeout,) = probe.pool.acquire_timeouts
+    assert acquire_timeout is not None and 0 < acquire_timeout <= main._READY_DB_TIMEOUT_SECONDS
+    assert len(probe.pool.release_timeouts) == 1
+
+
+async def test_unproven_pool_that_the_server_refuses_is_not_ready(main, probe):
+    # The probe's own connection, opened earlier, still answers; the pool
+    # cannot open one, so requests could not be served.
+    _unproven(probe)
+    probe.pool.acquire_error = asyncpg.TooManyConnectionsError("sorry, too many clients already")
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is False
+    assert detail["db"] == "error:pool_unavailable"
+    assert detail["pool"]["size"] == 1 and detail["pool"]["idle"] == 0
+    probe.store.health.assert_not_awaited()
+
+
+async def test_unproven_pool_that_cannot_connect_in_time_is_not_ready_within_the_budget(main, probe):
+    _unproven(probe)
+    probe.pool.acquire_delay = 60
+
+    started = time.monotonic()
+    ok, detail = await asyncio.wait_for(main._probe_ready(), timeout=3)
+    elapsed = time.monotonic() - started
+
+    assert ok is False
+    assert detail["db"] == "error:pool_timeout"
+    assert elapsed < main._READY_DB_TIMEOUT_SECONDS + 0.5
+
+
+@pytest.mark.parametrize("evidence", ["idle", "recent_acquire", "saturated"])
+async def test_pool_that_shows_it_works_is_not_borrowed_from(main, probe, evidence):
+    _unproven(probe)
+    if evidence == "idle":
+        probe.pool.idle = 1
+    elif evidence == "recent_acquire":
+        probe.progress.acquire()
+    else:
+        probe.pool.size = probe.pool.max_size  # judged by the wedge rule instead
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is True
+    assert detail["db"] == "ok"
+    assert probe.pool.acquire_timeouts == []
 
 
 # ── /readyz cache ────────────────────────────────────────────────────────────

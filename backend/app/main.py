@@ -512,6 +512,20 @@ _DB_OK_BY_POOL_PROGRESS = "ok:pool_progress"
 _DB_READY = ("ok", _DB_OK_BY_POOL_IDLE, _DB_OK_BY_POOL_PROGRESS)
 
 
+def _pool_unproven(pool: asyncpg.Pool) -> bool:
+    """Nothing shows the pool could serve a request now: no idle connection,
+    room to open one, and no acquire within the grace.
+
+    Its connections may have expired since, and a server at max_connections
+    refuses new ones even while the probe's own connection, opened earlier,
+    still answers. Only an acquire through the pool settles that.
+    """
+    if pool.get_idle_size() > 0 or pool.get_size() >= pool.get_max_size():
+        return False
+    _, last_acquire_age = pool_progress()
+    return last_acquire_age is None or last_acquire_age >= settings.readyz_pool_saturation_grace_secs
+
+
 def _remaining(budget: asyncio.Timeout) -> float | None:
     deadline = budget.when()
     return None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
@@ -590,9 +604,12 @@ async def _probe_ready() -> tuple[bool, dict]:
         "document_revision_backend": selected_document_revision_backend(),
     }
     pool: asyncpg.Pool | None = None
+    # Which check a failure belongs to: the database itself, or the pool's
+    # ability to open a connection to it.
+    stage = "db"
     try:
         # Initialization/reconnection is part of the same probe budget, and so
-        # is the pool's answer when the server refuses the probe connection.
+        # is every answer the pool gives.
         async with asyncio.timeout(_READY_DB_TIMEOUT_SECONDS) as budget:
             # An existing pool is returned at once; nothing is borrowed from it.
             pool = await get_pool()
@@ -604,8 +621,12 @@ async def _probe_ready() -> tuple[bool, dict]:
                 if vouched is None:
                     raise
                 detail["db"] = vouched
+            if detail["db"] == "ok" and _pool_unproven(pool):
+                stage = "pool"
+                await _ping_through_pool(pool, budget)
     except Exception as e:  # noqa: BLE001 — no connection strings in a public probe
-        detail["db"] = "error:timeout" if isinstance(e, TimeoutError) else "error:unavailable"
+        failure = "timeout" if isinstance(e, TimeoutError) else "unavailable"
+        detail["db"] = f"error:{failure}" if stage == "db" else f"error:pool_{failure}"
     observed: _PoolObservation | None = None
     if pool is not None:
         observed = _observe_pool(pool, _ready_state)
