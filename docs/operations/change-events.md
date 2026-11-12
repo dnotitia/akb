@@ -223,9 +223,6 @@ settings changes, table migrations (enum value renames included) and app
 rollouts insert their events last, so a writer of the same Vault does not wait
 behind them while they still take other locks, and that a Bare Git document
 write on a busy Vault fails before its Git commit.
-`test_sql_scanner_postgres.py` runs generated statements against PostgreSQL
-and checks that `akb_sql`'s statement checks see exactly the function calls and
-statement separators that PostgreSQL runs.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native
