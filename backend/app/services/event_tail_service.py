@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -37,6 +38,7 @@ from app.repositories.events_repo import get_vault_event_bounds, list_vault_even
 from app.services.access_service import check_vault_access
 from app.services.event_tail_hub import event_tail_hub_connected, get_event_tail_hub
 
+logger = logging.getLogger("akb.event_tail")
 
 EVENT_BATCH_SIZE = 100
 HEARTBEAT_INTERVAL_SECONDS = 15.0
@@ -47,8 +49,13 @@ HEARTBEAT_INTERVAL_SECONDS = 15.0
 _RECHECK_DURING_YIELD_SECONDS = 1.0
 # A check that took longer than that window has expired by the time it
 # returns. After this many such checks in a row the stream ends; its client
-# reconnects and resumes from its cursor.
+# reconnects and resumes from the checkpoint the stream sends last.
 _MAX_STALE_ACCESS_CHECKS = 3
+# How long a connection may take to go back to the pool. asyncpg waits for a
+# cancelled query to stop and then resets the connection; a half-open
+# connection may never answer. Past the deadline asyncpg closes it instead,
+# which gives its place in the pool back.
+_RETURN_DEADLINE_SECONDS = 5.0
 # Each overrides the app.yaml key of the same name; see those settings.
 MAX_STREAMS_ENV_VAR = "AKB_EVENT_TAIL_MAX_STREAMS"
 MAX_STREAMS_PER_USER_ENV_VAR = "AKB_EVENT_TAIL_MAX_STREAMS_PER_USER"
@@ -307,12 +314,14 @@ async def _tail_db_connection() -> AsyncIterator[Any]:
     """Borrow one pool connection within the event tail's database budget.
 
     Waiting for a slot holds nothing. A slot is given back only once its
-    connection is back in the pool. asyncpg returns a connection in a shielded
-    task, which goes on when the borrower is cancelled while it waits for
-    that return, as a stream is when its client leaves. The slot is therefore
-    given back when that return finishes, not when the borrower's cleanup
-    runs. Event tail work never holds more pool connections than the budget,
-    however many streams are woken or cancelled at once.
+    connection is back in the pool, or closed. asyncpg returns a connection in
+    a shielded task, which goes on when the borrower is cancelled while it
+    waits for that return, as a stream is when its client leaves. The slot is
+    therefore given back when that return finishes, not when the borrower's
+    cleanup runs, and the return has a deadline, so a connection that never
+    comes back cannot keep a slot either. Event tail work never holds more
+    pool connections than the budget, however many streams are woken or
+    cancelled at once.
     """
     budget = _current_db_budget()
     budget.waiters += 1
@@ -321,21 +330,35 @@ async def _tail_db_connection() -> AsyncIterator[Any]:
     finally:
         budget.waiters -= 1
     budget.in_use += 1
-    returning: asyncio.Future[Any] | None = None
+    returning: asyncio.Future[None] | None = None
     try:
         pool = await get_pool()
-        checkout = pool.acquire()
-        conn = await checkout.__aenter__()
+        conn = await pool.acquire()
         try:
             yield conn
         finally:
-            # asyncpg's checkout ignores the exception it is told about.
-            returning = asyncio.ensure_future(checkout.__aexit__(None, None, None))
+            returning = asyncio.ensure_future(_return_connection(pool, conn))
             returning.add_done_callback(lambda _returned: budget.give_back())
             await asyncio.shield(returning)
     finally:
         if returning is None:
             budget.give_back()
+
+
+async def _return_connection(pool: Any, conn: Any) -> None:
+    """Give ``conn`` back to ``pool`` within _RETURN_DEADLINE_SECONDS.
+
+    Past the deadline, or when the return fails, asyncpg closes the connection,
+    which also gives its place in the pool back. The borrower's work is done
+    either way, so the failure is logged rather than raised.
+    """
+    try:
+        await pool.release(conn, timeout=_RETURN_DEADLINE_SECONDS)
+    except Exception as exc:  # noqa: BLE001 - the connection is closed; nothing is left to undo
+        logger.warning(
+            "An event tail connection did not return to the pool (%s); it was closed instead",
+            type(exc).__name__,
+        )
 
 
 def stats_snapshot() -> dict[str, int | bool]:
@@ -695,22 +718,30 @@ async def _recheck_access(*, user_id: str, vault: str, vault_id: UUID | str) -> 
     return checked_at
 
 
-async def _fresh_access_check(*, user_id: str, vault: str, vault_id: UUID | str) -> float:
-    """Check access until a check covers the next row; returns when that check started.
+def _outcome_seen(task: asyncio.Future[Any]) -> None:
+    """Mark a check's outcome as read: the stream may end before it reads it."""
+    if not task.cancelled():
+        task.exception()
 
-    A check covers rows for _RECHECK_DURING_YIELD_SECONDS from when it started.
-    One that took longer, in its queries or in giving its connection back, has
-    expired when it returns, and access may have been revoked while it ran, so
-    it is run again. After _MAX_STALE_ACCESS_CHECKS expired checks in a row,
-    raises _AccessLost: the stream ends quietly and its client resumes from
-    its cursor. A failed check raises _AccessLost too.
-    """
-    loop = asyncio.get_running_loop()
-    for _ in range(_MAX_STALE_ACCESS_CHECKS):
-        checked_at = await _recheck_access(user_id=user_id, vault=vault, vault_id=vault_id)
-        if loop.time() - checked_at <= _RECHECK_DURING_YIELD_SECONDS:
-            return checked_at
-    raise _AccessLost
+
+def _checkpoint_frame(cursor: str) -> str:
+    checkpoint = TailCheckpointV1(version=1, cursor=cursor)
+    return format_sse("checkpoint", cursor, checkpoint.model_dump(mode="json", exclude_none=True))
+
+
+def _row_frame(
+    row: Mapping[str, Any],
+    *,
+    codec: EventCursorCodec,
+    vault: str,
+    vault_id: UUID | str,
+    kinds: tuple[str, ...],
+) -> str:
+    """The frame for one row: its change, or a checkpoint when its kind is filtered out."""
+    cursor = codec.encode(vault_id, kinds, int(row["id"]))
+    if not kinds or row["kind"] in kinds:
+        return format_sse("change", cursor, _event_envelope(row, cursor=cursor, vault=vault))
+    return _checkpoint_frame(cursor)
 
 
 async def _stream_events(
@@ -734,12 +765,15 @@ async def _stream_events(
 
     Invariant: no row is yielded unless an access check has passed that
     started after the row was read and no more than
-    _RECHECK_DURING_YIELD_SECONDS before the row is yielded. Before each row
-    whose last check is older than that, the stream checks again until a check
-    is that recent; after _MAX_STALE_ACCESS_CHECKS slow checks in a row it
-    ends, and its client resumes from its cursor. A reader slower than the
-    window therefore stops receiving rows within about that long of losing
-    access.
+    _RECHECK_DURING_YIELD_SECONDS before the row is yielded. Freshness is
+    judged once the row's frame is built, right before it is sent. A check
+    that has expired is run again until one is that recent, and heartbeats
+    keep their interval while those checks run. A check that expired before
+    it covered a single row, the pass's own included, was itself slow; after
+    _MAX_STALE_ACCESS_CHECKS slow checks in a row the stream sends a
+    checkpoint at the last position it delivered and ends, so a client that
+    never received a cursor still resumes from there. A check that fails ends
+    the stream with no further frame.
     """
     try:
         # Wake-ups come from the process-wide LISTEN hub, for this Vault's
@@ -776,37 +810,50 @@ async def _stream_events(
                 if pass_checked_at is not None:
                     checked_at = pass_checked_at
                 if rows:
+                    # Whether the current check has covered a row yet.
+                    check_covered_a_row = False
                     for row in rows:
                         if await request.is_disconnected():
                             return
+                        frame = _row_frame(row, codec=codec, vault=vault, vault_id=vault_id, kinds=kinds)
                         if loop.time() - checked_at > _RECHECK_DURING_YIELD_SECONDS:
-                            try:
-                                checked_at = await _fresh_access_check(
-                                    user_id=user_id,
-                                    vault=vault,
-                                    vault_id=vault_id,
+                            # One that expired before covering a row was slow;
+                            # one that covered rows aged while the reader read.
+                            slow_checks = 1 if not check_covered_a_row else 0
+                            while True:
+                                if slow_checks >= _MAX_STALE_ACCESS_CHECKS:
+                                    # Access could not be confirmed in time. Say
+                                    # where to resume, then end; the client
+                                    # reconnects from there.
+                                    yield _checkpoint_frame(codec.encode(vault_id, kinds, current_position))
+                                    return
+                                recheck = asyncio.ensure_future(
+                                    _recheck_access(user_id=user_id, vault=vault, vault_id=vault_id)
                                 )
-                            except _AccessLost:
-                                return
+                                recheck.add_done_callback(_outcome_seen)
+                                try:
+                                    # Heartbeats keep flowing while the check runs.
+                                    while not recheck.done():
+                                        due_in = HEARTBEAT_INTERVAL_SECONDS - (loop.time() - last_frame_at)
+                                        if due_in > 0:
+                                            await asyncio.wait({recheck}, timeout=due_in)
+                                        else:
+                                            yield format_heartbeat()
+                                            last_frame_at = loop.time()
+                                finally:
+                                    if not recheck.done():
+                                        recheck.cancel()
+                                try:
+                                    checked_at = recheck.result()
+                                except _AccessLost:
+                                    return
+                                if loop.time() - checked_at <= _RECHECK_DURING_YIELD_SECONDS:
+                                    break
+                                slow_checks += 1
+                        yield frame
                         current_position = int(row["id"])
-                        event_cursor = codec.encode(vault_id, kinds, current_position)
-                        if not kinds or row["kind"] in kinds:
-                            frame = format_sse(
-                                "change",
-                                event_cursor,
-                                _event_envelope(row, cursor=event_cursor, vault=vault),
-                            )
-                            yield frame
-                            last_frame_at = loop.time()
-                        else:
-                            checkpoint = TailCheckpointV1(version=1, cursor=event_cursor)
-                            frame = format_sse(
-                                "checkpoint",
-                                event_cursor,
-                                checkpoint.model_dump(mode="json", exclude_none=True),
-                            )
-                            yield frame
-                            last_frame_at = loop.time()
+                        check_covered_a_row = True
+                        last_frame_at = loop.time()
                     continue
 
                 remaining = max(

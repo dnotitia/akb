@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 import gc
 import json
 import sys
 import threading
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
@@ -63,14 +64,25 @@ class _Pool:
         self._available = asyncio.Semaphore(max_size)
         self.checked_out = 0
         self.acquisitions = 0
+        self.release_timeouts: list[float | None] = []
 
     def acquire(self) -> "_Acquire":
         return _Acquire(self)
 
+    async def release(self, _connection: object, *, timeout: float | None = None) -> None:
+        self.release_timeouts.append(timeout)
+        self.checked_out -= 1
+        self._available.release()
+
 
 class _Acquire:
+    """Like asyncpg's checkout: awaited for a connection, or used as a context manager."""
+
     def __init__(self, pool: _Pool) -> None:
         self._pool = pool
+
+    def __await__(self) -> Any:
+        return self.__aenter__().__await__()
 
     async def __aenter__(self) -> object:
         await self._pool._available.acquire()
@@ -574,7 +586,7 @@ async def test_a_slow_recheck_during_which_access_was_revoked_sends_no_further_r
 
 @pytest.mark.asyncio
 async def test_a_stream_whose_checks_keep_outlasting_the_window_ends(monkeypatch, hub) -> None:
-    """Each expired check is repeated, but not forever: the stream ends, and its client resumes by cursor."""
+    """Each expired check is repeated, but not forever: the stream says where to resume, and ends."""
     from app.services import event_tail_service
 
     pool, _connection, request = _stream_test_doubles()
@@ -605,14 +617,123 @@ async def test_a_stream_whose_checks_keep_outlasting_the_window_ends(monkeypatch
         assert (await anext(stream)).startswith("event: change\n")
         slow = True
         await asyncio.sleep(0.3)
+        resume_at = await anext(stream)
         with pytest.raises(StopAsyncIteration):
             await anext(stream)
     finally:
         await stream.aclose()
 
+    # A checkpoint at the last row sent: the client resumes from row 2.
+    assert resume_at == _resume_checkpoint(1)
     assert event_tail_service._MAX_STALE_ACCESS_CHECKS == 3
-    # The pass's check, then three re-checks that each took too long.
+    # The pass's check covered row 1 and aged while the reader was slow, which
+    # is not the check's doing; then three re-checks that each took too long.
     assert checks == 1 + event_tail_service._MAX_STALE_ACCESS_CHECKS
+
+
+def _slow_check_stream(monkeypatch, *, rows: list[dict[str, Any]]) -> tuple[Any, AsyncIterator[str], dict[str, Any]]:
+    """A stream over ``rows`` whose access checks take ``state['delay']`` seconds and pass while ``state['granted']``."""
+    from app.exceptions import ForbiddenError
+    from app.services import event_tail_service
+
+    pool, _connection, request = _stream_test_doubles()
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "list_vault_events", AsyncMock(return_value=rows))
+    state: dict[str, Any] = {"delay": 0.0, "granted": True, "checks": 0}
+
+    async def access(*_args: Any, _conn: Any, **_kwargs: Any) -> dict[str, Any]:
+        state["checks"] += 1
+        granted = state["granted"]
+        if state["delay"]:
+            await asyncio.sleep(state["delay"])
+        if not granted:
+            raise ForbiddenError("revoked")
+        return {"vault_id": VAULT_ID}
+
+    monkeypatch.setattr(event_tail_service, "check_vault_access", access)
+    stream = event_tail_service._stream_events(
+        request,
+        user_id="user",
+        vault="vault",
+        vault_id=VAULT_ID,
+        kinds=(),
+        position=0,
+        codec=EventCursorCodec("cursor-secret"),
+    )
+    return event_tail_service, stream, state
+
+
+def _resume_checkpoint(position: int) -> str:
+    cursor = EventCursorCodec("cursor-secret").encode(VAULT_ID, (), position)
+    return format_sse("checkpoint", cursor, {"version": 1, "cursor": cursor})
+
+
+@pytest.mark.asyncio
+async def test_the_pass_check_counts_toward_the_slow_check_limit(monkeypatch, hub) -> None:
+    """A pass whose own check expired before its first row is one slow check of three, not a free one."""
+    service, stream, state = _slow_check_stream(monkeypatch, rows=[_row(1), _row(2)])
+    monkeypatch.setattr(service, "_RECHECK_DURING_YIELD_SECONDS", 0.2)
+    state["delay"] = 0.3
+    try:
+        frames = [frame async for frame in stream]
+    finally:
+        await stream.aclose()
+
+    # Nothing was delivered, so the client resumes from where the stream started.
+    assert frames == [_resume_checkpoint(0)]
+    assert state["checks"] == service._MAX_STALE_ACCESS_CHECKS == 3
+
+
+@pytest.mark.asyncio
+async def test_heartbeats_keep_flowing_while_slow_rechecks_run(monkeypatch, hub) -> None:
+    """Checks of 6 s against a 15 s heartbeat, scaled down: three in a row outlast a heartbeat interval."""
+    service, stream, state = _slow_check_stream(monkeypatch, rows=[_row(1), _row(2)])
+    heartbeat = 0.5
+    monkeypatch.setattr(service, "HEARTBEAT_INTERVAL_SECONDS", heartbeat)
+    monkeypatch.setattr(service, "_RECHECK_DURING_YIELD_SECONDS", 0.1)
+    loop = asyncio.get_running_loop()
+    try:
+        assert (await anext(stream)).startswith("event: change\n")
+        state["delay"] = 0.2
+        # A reader a little slower than the window: the next row needs a new check.
+        await asyncio.sleep(0.15)
+        arrivals: list[tuple[float, str]] = []
+        asked_at = loop.time()
+        async for frame in stream:
+            arrivals.append((loop.time(), frame))
+    finally:
+        await stream.aclose()
+
+    assert [frame for _, frame in arrivals] == [format_heartbeat(), _resume_checkpoint(1)]
+    gaps = [later - earlier for earlier, later in zip([asked_at] + [at for at, _ in arrivals], [at for at, _ in arrivals])]
+    # No silence longer than a heartbeat interval, with slack for a loaded loop.
+    assert max(gaps) < heartbeat + 0.25
+
+
+@pytest.mark.asyncio
+async def test_freshness_is_judged_after_the_frame_is_built(monkeypatch, hub) -> None:
+    """Building a frame takes time too; a check that expires while it is built is renewed before sending."""
+    service, stream, state = _slow_check_stream(monkeypatch, rows=[_row(1)])
+    window = 0.2
+    monkeypatch.setattr(service, "_RECHECK_DURING_YIELD_SECONDS", window)
+    build_envelope = service._event_envelope
+
+    def slow_envelope(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        # A large payload takes longer than the window to serialize, and
+        # access is revoked meanwhile.
+        time.sleep(window + 0.1)
+        state["granted"] = False
+        return build_envelope(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_event_envelope", slow_envelope)
+    try:
+        frames = [frame async for frame in stream]
+    finally:
+        await stream.aclose()
+
+    assert frames == []
+    # The pass's check, and the one before sending that found the revocation.
+    assert state["checks"] == 2
 
 
 @pytest.mark.asyncio
@@ -660,6 +781,8 @@ async def test_tail_database_work_holds_no_more_connections_than_its_budget(monk
     assert pool.checked_out == 0
     assert budget() == (0, 0)
     assert event_tail_service.stats_snapshot()["budget_size"] == 2
+    # Every connection went back with the return deadline.
+    assert pool.release_timeouts == [event_tail_service._RETURN_DEADLINE_SECONDS] * 7
 
 
 def test_the_database_budget_belongs_to_the_event_loop_that_uses_it(monkeypatch) -> None:

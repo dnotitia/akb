@@ -14,15 +14,18 @@ specifically; the proxy has its own log in
   longer runs an access query for every event it sends. All tail database work
   in a process shares at most `event_tail_db_concurrency` connections (default
   6, overridden by `AKB_EVENT_TAIL_DB_CONCURRENCY`), and a connection counts
-  against it until it is back in the pool, even when its stream was cancelled.
+  against it until it is back in the pool, even when its stream was cancelled;
+  one that takes more than five seconds to go back is closed instead.
   Opening a tail checks access within the same budget, after admission is
   decided, so many open tails, a burst of events or a burst of reconnects can
   no longer exhaust the pool and fail readiness; a caller without access still
   gets 403 or 404 before any capacity error. An access check that took longer
-  than a second is repeated before the next event, and a tail whose checks
-  keep taking that long ends after three, so its client resumes from its
-  cursor. A process serves at most `event_tail_max_streams` tails (default
-  256, `AKB_EVENT_TAIL_MAX_STREAMS`); past that a new tail gets 503
+  than a second is repeated before the next event, with heartbeats in the
+  meantime. A tail whose checks keep taking that long ends after three in a
+  row, the first check of a batch included, and first sends a checkpoint at
+  the last position it delivered, so a client without a cursor resumes there.
+  A process serves at most `event_tail_max_streams` tails (default 256,
+  `AKB_EVENT_TAIL_MAX_STREAMS`); past that a new tail gets 503
   `event_tail_capacity` with `Retry-After`. One account may hold at most
   `event_tail_max_streams_per_user` of them (default 48,
   `AKB_EVENT_TAIL_MAX_STREAMS_PER_USER`); past that its next tail gets 429

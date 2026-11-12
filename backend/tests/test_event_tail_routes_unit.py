@@ -85,6 +85,9 @@ async def test_open_tail_preflights_retention_gap_before_returning_stream(monkey
             return {"earliest_id": 10, "latest_id": 20}
 
     class _Acquire:
+        def __await__(self):
+            return self.__aenter__().__await__()
+
         async def __aenter__(self):
             return _Connection()
 
@@ -94,6 +97,9 @@ async def test_open_tail_preflights_retention_gap_before_returning_stream(monkey
     class _Pool:
         def acquire(self):
             return _Acquire()
+
+        async def release(self, _connection, *, timeout=None):
+            return None
 
     monkeypatch.setattr(settings, "system_hmac_secret", "cursor-secret")
 
@@ -125,10 +131,20 @@ async def test_open_tail_preflights_retention_gap_before_returning_stream(monkey
 
 
 class _BoundsPool:
-    """Answers the open_tail bounds preflight for an empty Vault."""
+    """Answers the open_tail bounds preflight for an empty Vault.
+
+    It is its own connection, lent like an asyncpg checkout: awaited, or used
+    as a context manager.
+    """
 
     def acquire(self):
         return self
+
+    def __await__(self):
+        return self.__aenter__().__await__()
+
+    async def release(self, _connection, *, timeout=None):
+        return None
 
     async def __aenter__(self):
         return self

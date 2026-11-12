@@ -84,23 +84,42 @@ class _TailPool:
     def acquire(self, *args: Any, **kwargs: Any) -> _TailAcquire:
         return _TailAcquire(self, self._pool.acquire(*args, **kwargs))
 
+    async def release(self, connection: Any, *, timeout: float | None = None) -> None:
+        try:
+            await self._pool.release(connection, timeout=timeout)
+        finally:
+            self.held -= 1
+
 
 class _TailAcquire:
+    """asyncpg's checkout, counted: awaited for a connection, or used as a context manager.
+
+    A connection counts as held until it is back in the pool.
+    """
+
     def __init__(self, owner: _TailPool, inner: Any) -> None:
         self._owner = owner
         self._inner = inner
 
+    def __await__(self) -> Any:
+        return self._lend(self._inner).__await__()
+
     async def __aenter__(self) -> Any:
-        connection = await self._inner.__aenter__()
+        return await self._lend(self._inner.__aenter__())
+
+    async def __aexit__(self, *exc_info: Any) -> Any:
+        try:
+            return await self._inner.__aexit__(*exc_info)
+        finally:
+            self._owner.held -= 1
+
+    async def _lend(self, lending: Any) -> Any:
+        connection = await lending
         self._owner.held += 1
         self._owner.most_held = max(self._owner.most_held, self._owner.held)
         if self._owner.hold:
             await asyncio.sleep(self._owner.hold)
         return connection
-
-    async def __aexit__(self, *exc_info: Any) -> Any:
-        self._owner.held -= 1
-        return await self._inner.__aexit__(*exc_info)
 
 
 class _Tail:
@@ -115,13 +134,22 @@ class _Tail:
         self.reading = 0
         self.checks = 0
         self.rechecks = 0
+        # Each access check takes this much longer, as on a slow database.
+        self.check_delay = 0.0
 
-    async def open(self, *, user_id: str, vault: str, start: str | None = None) -> Any:
+    async def open(
+        self,
+        *,
+        user_id: str,
+        vault: str,
+        start: str | None = None,
+        last_event_id: str | None = None,
+    ) -> Any:
         response = await event_tail_service.open_tail(
             _Request(),  # type: ignore[arg-type]
             user_id=user_id,
             vault=vault,
-            last_event_id=None,
+            last_event_id=last_event_id,
             cursor=None,
             start=start,
             kinds=None,
@@ -168,7 +196,10 @@ async def _tail(
 
     async def counting_check_vault_access(*args: Any, **kwargs: Any) -> dict[str, Any]:
         tail.checks += 1
-        return await real_check_vault_access(*args, **kwargs)
+        access = await real_check_vault_access(*args, **kwargs)
+        if tail.check_delay:
+            await asyncio.sleep(tail.check_delay)
+        return access
 
     # The check repeated for a reader slower than one check covers.
     real_recheck_access = getattr(event_tail_service, "_recheck_access", None)
@@ -653,3 +684,124 @@ async def test_a_reconnect_storm_holds_no_more_connections_than_the_budget(monke
         assert statuses[8:32] == [503] * 24
         # Told it has no access, which it does not retry, rather than to retry later.
         assert statuses[32:] == [403] * 8
+
+
+def _last_id(frames: list[str]) -> str | None:
+    """What the SDK reconnects with as Last-Event-ID: the id of the last frame that had one."""
+    ids = [line[len("id: ") :] for frame in frames for line in frame.splitlines() if line.startswith("id: ")]
+    return ids[-1] if ids else None
+
+
+async def test_a_client_without_a_cursor_resumes_from_the_checkpoint_sent_when_checks_stay_slow(monkeypatch):
+    """A stream whose access checks keep outlasting their window ends early.
+
+    It used to end without a frame. A client that had no cursor yet, because
+    nothing had been sent, reconnected without one and started after the
+    newest event: the event the stream had read but not sent was skipped for
+    good. The stream now sends a checkpoint at the last position it delivered
+    before it ends, and the client resumes from there.
+    """
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "event-slow-checks")
+        user_id = await _make_reader(setup_pool, "slow-checks-reader", [vault_id])
+        for _ in range(100):
+            await _insert_event(setup_pool, vault_id, "document.put", "alice")
+        async with _tail(monkeypatch, setup_pool) as tail:
+            monkeypatch.setattr(event_tail_service, "_RECHECK_DURING_YIELD_SECONDS", 0.2)
+            # Without a cursor the stream starts after the newest event, 100.
+            body = await tail.open(user_id=user_id, vault="event-slow-checks")
+            reader = asyncio.create_task(_frames(body))
+            try:
+                await _until(lambda: tail.hub.connected and tail.hub.subscriber_count == 1)
+                await _settled(tail)
+                # From here on every check takes longer than the window it covers.
+                tail.check_delay = 0.3
+                event_id = await _insert_event(setup_pool, vault_id, "document.put", "alice")
+                first_frames = await asyncio.wait_for(reader, 10)
+            finally:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+                await body.aclose()
+
+            # The SDK reconnects with the last id it saw, or without one.
+            tail.check_delay = 0.0
+            resumed = await tail.open(user_id=user_id, vault="event-slow-checks", last_event_id=_last_id(first_frames))
+            try:
+                delivered = await asyncio.wait_for(_changes(resumed, 1), 5)
+            finally:
+                await resumed.aclose()
+
+        assert event_id == 101
+        assert _positions(first_frames) == [100]
+        assert first_frames[0].startswith("event: checkpoint\n")
+        assert _positions(delivered) == [event_id]
+
+
+async def _frames(body: Any) -> list[str]:
+    return [frame async for frame in body]
+
+
+async def test_a_connection_that_never_finishes_returning_is_closed_and_frees_its_slot(monkeypatch, caplog):
+    """asyncpg's return can wait on the server and a half-open connection never answers.
+
+    The return used to wait without end, so the connection kept its budget
+    slot, and closing the pool waited for it too. It now has a deadline, past
+    which asyncpg closes the connection, and the slot is free again.
+    """
+    import logging
+
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        never = asyncio.Event()
+        stuck_returns = 0
+
+        async def reset_that_never_finishes(_connection: Any) -> None:
+            nonlocal stuck_returns
+            if stuck_returns:
+                stuck_returns -= 1
+                await never.wait()
+
+        pool = await asyncpg.create_pool(
+            _database_dsn(database), min_size=0, max_size=2, reset=reset_that_never_finishes
+        )
+
+        async def get_pool() -> asyncpg.Pool:
+            return pool
+
+        deadline = 0.5
+        monkeypatch.setattr(event_tail_service, "get_pool", get_pool)
+        monkeypatch.setattr(event_tail_service, "_RETURN_DEADLINE_SECONDS", deadline)
+        monkeypatch.setenv("AKB_EVENT_TAIL_DB_CONCURRENCY", "1")
+        monkeypatch.setattr(event_tail_service, "_db_budget", None, raising=False)
+        caplog.set_level(logging.WARNING, logger="akb.event_tail")
+        loop = asyncio.get_running_loop()
+
+        async def borrow() -> int:
+            async with event_tail_service._tail_db_connection() as conn:
+                return await conn.fetchval("SELECT pg_backend_pid()")
+
+        async def backend_alive(pid: int) -> bool:
+            return bool(await setup_pool.fetchval("SELECT count(*) FROM pg_stat_activity WHERE pid = $1", pid))
+
+        try:
+            stuck_returns = 1
+            started = loop.time()
+            pid = await asyncio.wait_for(borrow(), 5)
+            returned_after = loop.time() - started
+            # The slot is free again: the return gave up at its deadline.
+            assert event_tail_service.stats_snapshot()["budget_in_use"] == 0
+            # asyncpg closed the connection; its server process goes away.
+            for _ in range(100):
+                if not await backend_alive(pid):
+                    break
+                await asyncio.sleep(0.05)
+            assert not await backend_alive(pid)
+            # The next borrower gets a connection at once.
+            await asyncio.wait_for(borrow(), 5)
+        finally:
+            never.set()
+            # Closing the pool does not wait on the abandoned return.
+            await asyncio.wait_for(pool.close(), 5)
+
+        assert deadline <= returned_after < deadline + 1.5
+        assert any("did not return to the pool" in record.getMessage() for record in caplog.records)

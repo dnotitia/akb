@@ -104,16 +104,21 @@ it borrows one for the batch and, when the batch has rows, checks the reader's
 access on that same connection before sending any of them. A pass that finds
 nothing checks nothing, except the pass after each heartbeat. Before each
 event, a check that started more than a second earlier is repeated, and so is
-a check that itself took longer than that to finish; a tail whose checks keep
-taking that long ends after three in a row, and its client resumes from its
-cursor. A revoked reader therefore stops receiving events within about a
-second, and an idle tail closes within one heartbeat.
+a check that itself took longer than that to finish; heartbeats keep their
+interval meanwhile. A tail whose checks keep taking that long, the first check
+of a batch included, ends after three in a row. Before it ends it sends a
+checkpoint at the last position it delivered, so a client that has not
+received a cursor yet resumes from there rather than after the newest event.
+A revoked reader stops receiving events within about a second and gets no
+further frame, and an idle tail closes within one heartbeat.
 
 All tail database work in a process, opening included, shares at most
 `event_tail_db_concurrency` connections. Work beyond that waits for a free
 slot without holding a connection, and a slot is free again only once its
 connection is back in the pool, even when the stream that used it was
-cancelled. Tail load, a burst of reconnects included, therefore cannot take
+cancelled. A connection that takes more than five seconds to go back, as a
+half-open one can, is closed instead, which frees its slot and its place in
+the pool. Tail load, a burst of reconnects included, therefore cannot take
 the pool that other requests and the readiness probe need. At startup a server
 process logs a warning when its pool size (`pg_pool_max_size`, or
 `AKB_PG_POOL_MAX_SIZE`) less `event_tail_db_concurrency` and
