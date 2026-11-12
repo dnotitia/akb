@@ -347,7 +347,10 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
         kinds=("table.rows_changed",),
         position=9,
         codec=EventCursorCodec("cursor-secret"),
+        checked_at=asyncio.get_running_loop().time(),
     )
+    # Where the stream starts, before anything is read.
+    start = await anext(stream)
     checkpoint = await anext(stream)
     # The batch was read on a pooled connection that went back before the
     # first frame was handed out.
@@ -356,8 +359,11 @@ async def test_stream_emits_checkpoint_for_skipped_event_and_change_envelope(mon
     assert pool.checked_out == 0
     await stream.aclose()
 
-    assert checkpoint.startswith("event: checkpoint\nid: ec1.")
+    codec = EventCursorCodec("cursor-secret")
+    assert start == _checkpoint_at(9, kinds=("table.rows_changed",))
+    assert checkpoint == _checkpoint_at(10, kinds=("table.rows_changed",))
     assert change.startswith("event: change\nid: ec1.")
+    assert codec.decode(change.split("\n", 2)[1][4:])[2] == 11
     checkpoint_body = json.loads(checkpoint.split("data: ", 1)[1])
     change_body = json.loads(change.split("data: ", 1)[1])
     assert checkpoint_body["version"] == 1
@@ -403,6 +409,7 @@ async def test_empty_wakeups_do_not_restart_heartbeat_deadline(monkeypatch, hub)
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        checked_at=asyncio.get_running_loop().time(),
     )
     notification_task: asyncio.Task[None] | None = None
 
@@ -416,6 +423,7 @@ async def test_empty_wakeups_do_not_restart_heartbeat_deadline(monkeypatch, hub)
             await asyncio.sleep(0)
 
     try:
+        assert await anext(stream) == _checkpoint_at(0)
         next_frame = asyncio.create_task(anext(stream))
         await asyncio.wait_for(subscribed(), timeout=0.1)
         notification_task = asyncio.create_task(keep_waking())
@@ -438,7 +446,11 @@ async def test_empty_wakeups_do_not_restart_heartbeat_deadline(monkeypatch, hub)
 
 @pytest.mark.asyncio
 async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatch, hub) -> None:
-    """The access check runs after the read, so it covers the rows just read."""
+    """The access check runs after the read, so it covers the rows just read.
+
+    Only the start checkpoint, sent on the access check that opened the
+    stream, comes before it.
+    """
     from app.exceptions import ForbiddenError
     from app.services import event_tail_service
 
@@ -471,7 +483,9 @@ async def test_stream_closes_without_emitting_after_access_is_revoked(monkeypatc
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        checked_at=asyncio.get_running_loop().time(),
     )
+    assert await anext(stream) == _checkpoint_at(0)
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
     assert hub.subscriptions == []
@@ -522,8 +536,11 @@ async def test_more_waiting_streams_than_pool_connections_leave_the_pool_usable(
                 kinds=(),
                 position=0,
                 codec=codec,
+                checked_at=asyncio.get_running_loop().time(),
             )
         )
+    for stream in streams:
+        assert await anext(stream) == _checkpoint_at(0)
     first_frames = [asyncio.create_task(anext(stream)) for stream in streams]
 
     async def all_parked() -> None:
@@ -618,8 +635,10 @@ async def test_a_slow_recheck_during_which_access_was_revoked_sends_no_further_r
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        checked_at=asyncio.get_running_loop().time(),
     )
     try:
+        assert await anext(stream) == _checkpoint_at(0)
         assert (await anext(stream)).startswith("event: change\n")
         slow_checks = 1
         # A reader slower than the window: the next row needs a new check.
@@ -636,7 +655,10 @@ async def test_a_slow_recheck_during_which_access_was_revoked_sends_no_further_r
 
 @pytest.mark.asyncio
 async def test_a_stream_whose_checks_keep_outlasting_the_window_ends(monkeypatch, hub) -> None:
-    """Each expired check is repeated, but not forever: the stream says where to resume, and ends."""
+    """Each expired check is repeated, but not forever: the stream ends with no further frame.
+
+    Its client resumes from the last cursor it received.
+    """
     from app.services import event_tail_service
 
     pool, _connection, request = _stream_test_doubles()
@@ -662,19 +684,18 @@ async def test_a_stream_whose_checks_keep_outlasting_the_window_ends(monkeypatch
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        checked_at=asyncio.get_running_loop().time(),
     )
     try:
+        assert await anext(stream) == _checkpoint_at(0)
         assert (await anext(stream)).startswith("event: change\n")
         slow = True
         await asyncio.sleep(0.3)
-        resume_at = await anext(stream)
         with pytest.raises(StopAsyncIteration):
             await anext(stream)
     finally:
         await stream.aclose()
 
-    # A checkpoint at the last row sent: the client resumes from row 2.
-    assert resume_at == _resume_checkpoint(1)
     assert event_tail_service._MAX_STALE_ACCESS_CHECKS == 3
     # The pass's check covered row 1 and aged while the reader was slow, which
     # is not the check's doing; then three re-checks that each took too long.
@@ -709,12 +730,13 @@ def _slow_check_stream(monkeypatch, *, rows: list[dict[str, Any]]) -> tuple[Any,
         kinds=(),
         position=0,
         codec=EventCursorCodec("cursor-secret"),
+        checked_at=asyncio.get_running_loop().time(),
     )
     return event_tail_service, stream, state
 
 
-def _resume_checkpoint(position: int) -> str:
-    cursor = EventCursorCodec("cursor-secret").encode(VAULT_ID, (), position)
+def _checkpoint_at(position: int, *, kinds: tuple[str, ...] = ()) -> str:
+    cursor = EventCursorCodec("cursor-secret").encode(VAULT_ID, kinds, position)
     return format_sse("checkpoint", cursor, {"version": 1, "cursor": cursor})
 
 
@@ -729,8 +751,9 @@ async def test_the_pass_check_counts_toward_the_slow_check_limit(monkeypatch, hu
     finally:
         await stream.aclose()
 
-    # Nothing was delivered, so the client resumes from where the stream started.
-    assert frames == [_resume_checkpoint(0)]
+    # Only the start checkpoint, sent on the open's check; the client resumes
+    # from it.
+    assert frames == [_checkpoint_at(0)]
     assert state["checks"] == service._MAX_STALE_ACCESS_CHECKS == 3
 
 
@@ -743,6 +766,7 @@ async def test_heartbeats_keep_flowing_while_slow_rechecks_run(monkeypatch, hub)
     monkeypatch.setattr(service, "_RECHECK_DURING_YIELD_SECONDS", 0.1)
     loop = asyncio.get_running_loop()
     try:
+        assert await anext(stream) == _checkpoint_at(0)
         assert (await anext(stream)).startswith("event: change\n")
         state["delay"] = 0.2
         # A reader a little slower than the window: the next row needs a new check.
@@ -751,11 +775,15 @@ async def test_heartbeats_keep_flowing_while_slow_rechecks_run(monkeypatch, hub)
         asked_at = loop.time()
         async for frame in stream:
             arrivals.append((loop.time(), frame))
+        ended_at = loop.time()
     finally:
         await stream.aclose()
 
-    assert [frame for _, frame in arrivals] == [format_heartbeat(), _resume_checkpoint(1)]
-    gaps = [later - earlier for earlier, later in zip([asked_at] + [at for at, _ in arrivals], [at for at, _ in arrivals])]
+    # A heartbeat while the third check ran, and no frame once access could
+    # not be confirmed in time.
+    assert [frame for _, frame in arrivals] == [format_heartbeat()]
+    moments = [asked_at] + [at for at, _ in arrivals] + [ended_at]
+    gaps = [later - earlier for earlier, later in zip(moments, moments[1:])]
     # No silence longer than a heartbeat interval, with slack for a loaded loop.
     assert max(gaps) < heartbeat + 0.25
 
@@ -781,9 +809,92 @@ async def test_freshness_is_judged_after_the_frame_is_built(monkeypatch, hub) ->
     finally:
         await stream.aclose()
 
-    assert frames == []
+    assert frames == [_checkpoint_at(0)]
     # The pass's check, and the one before sending that found the revocation.
     assert state["checks"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("granted", [True, False])
+async def test_the_start_checkpoint_waits_for_a_fresh_check(monkeypatch, hub, granted: bool) -> None:
+    """The start checkpoint is a frame like any other: sent only on a check that still covers it."""
+    from app.exceptions import ForbiddenError
+    from app.services import event_tail_service
+
+    pool, _connection, request = _stream_test_doubles()
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "list_vault_events", AsyncMock(return_value=[]))
+    access = AsyncMock(return_value={"vault_id": VAULT_ID}) if granted else AsyncMock(side_effect=ForbiddenError("revoked"))
+    monkeypatch.setattr(event_tail_service, "check_vault_access", access)
+    loop = asyncio.get_running_loop()
+    stream = event_tail_service._stream_events(
+        request,
+        user_id="user",
+        vault="vault",
+        vault_id=VAULT_ID,
+        kinds=(),
+        position=7,
+        codec=EventCursorCodec("cursor-secret"),
+        # open_tail's check started long enough ago to have expired.
+        checked_at=loop.time() - 5,
+    )
+    try:
+        if granted:
+            assert await anext(stream) == _checkpoint_at(7)
+        else:
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+    finally:
+        await stream.aclose()
+
+    # It was checked again before anything was sent.
+    assert access.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeats_keep_flowing_while_a_slow_pass_runs(monkeypatch, hub) -> None:
+    """A batch read or its check can take longer than a heartbeat interval; the heartbeat does not wait."""
+    from app.services import event_tail_service
+
+    pool, _connection, request = _stream_test_doubles()
+    heartbeat = 0.1
+    monkeypatch.setattr(event_tail_service, "get_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr(event_tail_service, "HEARTBEAT_INTERVAL_SECONDS", heartbeat)
+    monkeypatch.setattr(event_tail_service, "check_vault_access", AsyncMock(return_value={"vault_id": VAULT_ID}))
+
+    async def slow_read(_conn: Any, _vault_id: Any, *, after_id: int, limit: int) -> list[dict[str, Any]]:
+        # The database answers the first read only after several heartbeat intervals.
+        await asyncio.sleep(0.35)
+        return [_row(1)] if after_id == 0 else []
+
+    monkeypatch.setattr(event_tail_service, "list_vault_events", slow_read)
+    loop = asyncio.get_running_loop()
+    stream = event_tail_service._stream_events(
+        request,
+        user_id="user",
+        vault="vault",
+        vault_id=VAULT_ID,
+        kinds=(),
+        position=0,
+        codec=EventCursorCodec("cursor-secret"),
+        checked_at=loop.time(),
+    )
+    arrivals: list[tuple[float, str]] = []
+    try:
+        assert await anext(stream) == _checkpoint_at(0)
+        asked_at = loop.time()
+        async for frame in stream:
+            arrivals.append((loop.time(), frame))
+            if frame.startswith("event: change\n"):
+                break
+    finally:
+        await stream.aclose()
+
+    frames = [frame for _, frame in arrivals]
+    assert frames[:-1] and set(frames[:-1]) == {format_heartbeat()}
+    assert frames[-1].startswith("event: change\n")
+    moments = [asked_at] + [at for at, _ in arrivals]
+    assert max(later - earlier for earlier, later in zip(moments, moments[1:])) < heartbeat + 0.1
 
 
 @pytest.mark.asyncio

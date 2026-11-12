@@ -78,9 +78,13 @@ async def test_more_open_streams_than_pool_connections_leave_the_pool_usable(mon
                 kinds=(),
                 position=0,
                 codec=codec,
+                checked_at=asyncio.get_running_loop().time(),
             )
             for _ in range(_STREAMS)
         ]
+        # Each stream first says where it starts; then it waits for its Vault.
+        for stream in streams:
+            assert (await anext(stream)).startswith("event: checkpoint\n")
         first_frames = [asyncio.create_task(anext(stream)) for stream in streams]
         try:
             # Every stream has subscribed, read its empty Vault, and is waiting.

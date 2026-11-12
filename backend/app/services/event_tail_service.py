@@ -18,11 +18,10 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import threading
-from typing import Any, AsyncIterator, Mapping
+from typing import Any, AsyncGenerator, AsyncIterator, Mapping
 from uuid import UUID
 import weakref
 
@@ -49,7 +48,7 @@ HEARTBEAT_INTERVAL_SECONDS = 15.0
 _RECHECK_DURING_YIELD_SECONDS = 1.0
 # A check that took longer than that window has expired by the time it
 # returns. After this many such checks in a row the stream ends; its client
-# reconnects and resumes from the checkpoint the stream sends last.
+# reconnects and resumes from the last cursor it received.
 _MAX_STALE_ACCESS_CHECKS = 3
 # How long a connection may take to go back to the pool. asyncpg waits for a
 # cancelled query to stop and then resets the connection; a half-open
@@ -635,6 +634,7 @@ async def open_tail(
         raise
     try:
         async with _tail_db_connection() as conn:
+            checked_at = asyncio.get_running_loop().time()
             access = await check_vault_access(user_id, vault, required_role="reader", _conn=conn)
             normalized_kinds = normalize_kind_filter(kinds)
             vault_id = access["vault_id"]
@@ -665,6 +665,7 @@ async def open_tail(
             kinds=normalized_kinds,
             position=resolved,
             codec=codec,
+            checked_at=checked_at,
             slot=slot,
         )
         # The generator gives the slot back in its `finally`, but only once it
@@ -759,6 +760,76 @@ def _row_frame(
     return _checkpoint_frame(cursor)
 
 
+class _StreamClock:
+    """The times a stream's access checks and heartbeats are measured from."""
+
+    __slots__ = ("checked_at", "check_covered_a_frame", "check_when_empty", "last_frame_at")
+
+    def __init__(self, *, checked_at: float, now: float) -> None:
+        # When the last passed access check started, and whether a frame has
+        # been sent on it since.
+        self.checked_at = checked_at
+        self.check_covered_a_frame = False
+        # When the last frame, a heartbeat included, was sent.
+        self.last_frame_at = now
+        # Set by a heartbeat: the next pass checks access even if it finds nothing.
+        self.check_when_empty = False
+
+
+async def _heartbeats_while(task: asyncio.Future[Any], clock: _StreamClock) -> AsyncGenerator[str, None]:
+    """Yield a heartbeat each time one falls due, until ``task`` is done.
+
+    A heartbeat counts as sent once the stream asks for its next frame, as the
+    heartbeat of the stream's own wait does. If the stream ends first, the
+    task is cancelled.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        while not task.done():
+            due_in = HEARTBEAT_INTERVAL_SECONDS - (loop.time() - clock.last_frame_at)
+            if due_in > 0:
+                await asyncio.wait({task}, timeout=due_in)
+                continue
+            yield format_heartbeat()
+            clock.last_frame_at = loop.time()
+            clock.check_when_empty = True
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+async def _renew_access(
+    clock: _StreamClock,
+    *,
+    user_id: str,
+    vault: str,
+    vault_id: UUID | str,
+) -> AsyncGenerator[str, None]:
+    """Check access until a check covers the next frame, yielding heartbeats meanwhile.
+
+    Call when the current check started more than _RECHECK_DURING_YIELD_SECONDS
+    ago. A check that expired before it covered a frame was itself slow, and so
+    is each re-check that outlasts the window. After _MAX_STALE_ACCESS_CHECKS
+    slow checks in a row, or when a check fails, raises _AccessLost: the stream
+    ends with no further frame, and its client resumes from the last cursor it
+    received, its start checkpoint at least.
+    """
+    loop = asyncio.get_running_loop()
+    slow_checks = 0 if clock.check_covered_a_frame else 1
+    while slow_checks < _MAX_STALE_ACCESS_CHECKS:
+        recheck = asyncio.ensure_future(_recheck_access(user_id=user_id, vault=vault, vault_id=vault_id))
+        recheck.add_done_callback(_outcome_seen)
+        async with contextlib.aclosing(_heartbeats_while(recheck, clock)) as heartbeats:
+            async for heartbeat in heartbeats:
+                yield heartbeat
+        clock.checked_at = recheck.result()
+        clock.check_covered_a_frame = False
+        if loop.time() - clock.checked_at <= _RECHECK_DURING_YIELD_SECONDS:
+            return
+        slow_checks += 1
+    raise _AccessLost
+
+
 async def _stream_events(
     request: Request,
     *,
@@ -768,27 +839,28 @@ async def _stream_events(
     kinds: tuple[str, ...],
     position: int,
     codec: EventCursorCodec,
+    checked_at: float,
     slot: _StreamSlot | None = None,
 ) -> AsyncIterator[str]:
     """Send ``vault_id``'s events after ``position`` until the client leaves or loses access.
 
+    The first frame is a checkpoint at ``position``, sent on the access check
+    open_tail started at ``checked_at`` (loop time), so every client holds a
+    cursor to resume from whether or not it brought one.
+
     Each pass borrows one pooled connection, within the database budget, to
     read the next batch and, when it found rows, to check access; the
     connection goes back before any frame is sent. A pass that finds nothing
-    checks nothing, except the pass right after a heartbeat, so a stream that
+    checks nothing, except the pass after a heartbeat, so a stream that
     receives no rows still closes within one heartbeat of losing access.
+    Heartbeats keep their interval while a pass or a check runs.
 
-    Invariant: no row is yielded unless an access check has passed that
-    started after the row was read and no more than
-    _RECHECK_DURING_YIELD_SECONDS before the row is yielded. Freshness is
-    judged once the row's frame is built, right before it is sent. A check
-    that has expired is run again until one is that recent, and heartbeats
-    keep their interval while those checks run. A check that expired before
-    it covered a single row, the pass's own included, was itself slow; after
-    _MAX_STALE_ACCESS_CHECKS slow checks in a row the stream sends a
-    checkpoint at the last position it delivered and ends, so a client that
-    never received a cursor still resumes from there. A check that fails ends
-    the stream with no further frame.
+    Invariant: no frame other than a heartbeat is yielded unless an access
+    check has passed that started no more than _RECHECK_DURING_YIELD_SECONDS
+    before the frame is yielded and, for a row's frame, after the row was
+    read. Freshness is judged once the frame is built, right before it is
+    sent; _renew_access says what happens when the check has expired. A
+    stream whose access cannot be confirmed ends with no further frame.
     """
     try:
         # Wake-ups come from the process-wide LISTEN hub, for this Vault's
@@ -799,90 +871,84 @@ async def _stream_events(
         try:
             wakeup = subscription.wakeup
             loop = asyncio.get_running_loop()
-            last_frame_at = loop.time()
+            clock = _StreamClock(checked_at=checked_at, now=loop.time())
             current_position = position
-            # When the last passed access check started. Every pass that reads
-            # rows checks, so this is set before any row is sent; -inf would
-            # force a check if it were not.
-            checked_at = -math.inf
-            check_when_empty = False
+
+            if await request.is_disconnected():
+                return
+            start_frame = _checkpoint_frame(codec.encode(vault_id, kinds, position))
+            if loop.time() - clock.checked_at > _RECHECK_DURING_YIELD_SECONDS:
+                try:
+                    async with contextlib.aclosing(
+                        _renew_access(clock, user_id=user_id, vault=vault, vault_id=vault_id)
+                    ) as heartbeats:
+                        async for heartbeat in heartbeats:
+                            yield heartbeat
+                except _AccessLost:
+                    return
+            yield start_frame
+            clock.last_frame_at = loop.time()
+            clock.check_covered_a_frame = True
+
             while True:
                 if await request.is_disconnected():
                     return
 
                 wakeup.clear()
-                try:
-                    rows, pass_checked_at = await _read_pass(
+                read = asyncio.ensure_future(
+                    _read_pass(
                         user_id=user_id,
                         vault=vault,
                         vault_id=vault_id,
                         after_id=current_position,
-                        check_when_empty=check_when_empty,
+                        check_when_empty=clock.check_when_empty,
                     )
+                )
+                read.add_done_callback(_outcome_seen)
+                async with contextlib.aclosing(_heartbeats_while(read, clock)) as heartbeats:
+                    async for heartbeat in heartbeats:
+                        yield heartbeat
+                try:
+                    rows, pass_checked_at = read.result()
                 except _AccessLost:
                     return
-                check_when_empty = False
                 if pass_checked_at is not None:
-                    checked_at = pass_checked_at
-                if rows:
-                    # Whether the current check has covered a row yet.
-                    check_covered_a_row = False
-                    for row in rows:
-                        if await request.is_disconnected():
+                    clock.checked_at = pass_checked_at
+                    clock.check_covered_a_frame = False
+                    clock.check_when_empty = False
+
+                for row in rows:
+                    if await request.is_disconnected():
+                        return
+                    frame = _row_frame(row, codec=codec, vault=vault, vault_id=vault_id, kinds=kinds)
+                    if loop.time() - clock.checked_at > _RECHECK_DURING_YIELD_SECONDS:
+                        try:
+                            async with contextlib.aclosing(
+                                _renew_access(clock, user_id=user_id, vault=vault, vault_id=vault_id)
+                            ) as heartbeats:
+                                async for heartbeat in heartbeats:
+                                    yield heartbeat
+                        except _AccessLost:
                             return
-                        frame = _row_frame(row, codec=codec, vault=vault, vault_id=vault_id, kinds=kinds)
-                        if loop.time() - checked_at > _RECHECK_DURING_YIELD_SECONDS:
-                            # One that expired before covering a row was slow;
-                            # one that covered rows aged while the reader read.
-                            slow_checks = 1 if not check_covered_a_row else 0
-                            while True:
-                                if slow_checks >= _MAX_STALE_ACCESS_CHECKS:
-                                    # Access could not be confirmed in time. Say
-                                    # where to resume, then end; the client
-                                    # reconnects from there.
-                                    yield _checkpoint_frame(codec.encode(vault_id, kinds, current_position))
-                                    return
-                                recheck = asyncio.ensure_future(
-                                    _recheck_access(user_id=user_id, vault=vault, vault_id=vault_id)
-                                )
-                                recheck.add_done_callback(_outcome_seen)
-                                try:
-                                    # Heartbeats keep flowing while the check runs.
-                                    while not recheck.done():
-                                        due_in = HEARTBEAT_INTERVAL_SECONDS - (loop.time() - last_frame_at)
-                                        if due_in > 0:
-                                            await asyncio.wait({recheck}, timeout=due_in)
-                                        else:
-                                            yield format_heartbeat()
-                                            last_frame_at = loop.time()
-                                finally:
-                                    if not recheck.done():
-                                        recheck.cancel()
-                                try:
-                                    checked_at = recheck.result()
-                                except _AccessLost:
-                                    return
-                                if loop.time() - checked_at <= _RECHECK_DURING_YIELD_SECONDS:
-                                    break
-                                slow_checks += 1
-                        yield frame
-                        current_position = int(row["id"])
-                        check_covered_a_row = True
-                        last_frame_at = loop.time()
+                    yield frame
+                    current_position = int(row["id"])
+                    clock.last_frame_at = loop.time()
+                    clock.check_covered_a_frame = True
+                if rows:
                     continue
 
                 remaining = max(
                     0.0,
-                    HEARTBEAT_INTERVAL_SECONDS - (loop.time() - last_frame_at),
+                    HEARTBEAT_INTERVAL_SECONDS - (loop.time() - clock.last_frame_at),
                 )
                 try:
                     await asyncio.wait_for(wakeup.wait(), timeout=remaining)
                 except TimeoutError:
                     yield format_heartbeat()
-                    last_frame_at = loop.time()
+                    clock.last_frame_at = loop.time()
                     # A stream with no new rows checks nothing on its own, so
                     # the pass after each heartbeat checks access regardless.
-                    check_when_empty = True
+                    clock.check_when_empty = True
         finally:
             hub.unsubscribe(subscription)
     finally:

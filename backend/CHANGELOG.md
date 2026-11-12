@@ -22,11 +22,13 @@ specifically; the proxy has its own log in
   gets 403 or 404 before any capacity error. An access check that took longer
   than a second is repeated before the next event, with heartbeats in the
   meantime. A tail whose checks keep taking that long ends after three in a
-  row, the first check of a batch included, and first sends a checkpoint at
-  the last position it delivered, so a client without a cursor resumes there.
-  A cursor is refused with 410 `event_gap` only when retention deleted an
-  event it never received: migration 133 records the highest deleted event id
-  per Vault, raised in the statement that deletes. A cursor taken before a
+  row, the first check of a batch included, with no further frame. Every tail
+  now starts with a checkpoint at its starting position, sent on the access
+  check that opened it, so a client that brought no cursor still has one to
+  resume from. Heartbeats also keep their interval while a batch is read. A
+  cursor is refused with 410 `event_gap` only when retention deleted an event
+  it never received: migration 133 records the highest deleted event id per
+  Vault, raised in the statement that deletes. A cursor taken before a
   Vault's first event, which other Vaults' events usually leave far below it,
   is no longer refused.
   A process serves at most `event_tail_max_streams` tails (default 256,
@@ -39,8 +41,8 @@ specifically; the proxy has its own log in
   Migration 131 makes the `events` trigger's notification name the event's
   Vault, so an event wakes only that Vault's tails instead of every open tail.
   Startup logs a warning when the pool leaves fewer than four connections
-  beside the tail budget and `write_lane_concurrency`. Frames, cursors and
-  heartbeats are unchanged.
+  beside the tail budget and `write_lane_concurrency`. The formats of frames,
+  cursors and heartbeats are unchanged; only the start checkpoint is new.
 
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain

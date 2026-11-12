@@ -325,10 +325,13 @@ async def test_a_stream_dropped_before_its_body_starts_gives_its_slot_back(tail)
 @pytest.mark.asyncio
 async def test_a_cancelled_stream_gives_its_slot_and_subscription_back(tail) -> None:
     response = await tail.open()
+    # Every stream starts with a checkpoint at its start position.
+    assert (await anext(response.body_iterator)).startswith("event: checkpoint\n")
     reading = asyncio.create_task(anext(response.body_iterator))
 
     async def parked() -> None:
-        while not tail.hub.subscriptions:
+        # Subscribed, past its first read, and waiting for a wake-up.
+        while not tail.hub.subscriptions or not tail.service.list_vault_events.await_count:
             await asyncio.sleep(0.001)
 
     await asyncio.wait_for(parked(), timeout=1.0)
@@ -443,10 +446,12 @@ async def test_an_account_gets_its_quota_back_however_its_streams_end(tail, monk
 
     # The stream was cancelled while it waited.
     response = await tail.open(user_id="account")
+    assert (await anext(response.body_iterator)).startswith("event: checkpoint\n")
     reading = asyncio.create_task(anext(response.body_iterator))
 
     async def parked() -> None:
-        while not tail.hub.subscriptions:
+        # Subscribed, past its first read, and waiting for a wake-up.
+        while not tail.hub.subscriptions or not tail.service.list_vault_events.await_count:
             await asyncio.sleep(0.001)
 
     await asyncio.wait_for(parked(), timeout=1.0)

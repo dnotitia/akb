@@ -323,7 +323,7 @@ async def test_a_burst_across_many_streams_leaves_the_pool_to_other_requests(mon
                 asyncio.create_task(_changes(body, count)) for body, count in zip(bodies, expected) if count
             ]
             idle_bodies = [body for body, count in zip(bodies, expected) if not count]
-            idle = [asyncio.create_task(anext(body)) for body in idle_bodies]
+            idle = [asyncio.create_task(_changes(body, 1)) for body in idle_bodies]
             latencies: list[float] = []
             stop_probing = asyncio.Event()
             probe = asyncio.create_task(_probe(tail.pool, latencies, stop_probing))
@@ -465,7 +465,8 @@ async def test_access_revoked_between_the_read_and_the_check_sends_none_of_the_r
             body = await tail.open(user_id=user_id, vault="event-revoke-read", start="earliest")
             frames = [frame async for frame in body]
 
-            assert frames == []
+            # The start checkpoint, sent on open_tail's check, and none of the rows.
+            assert len(frames) == 1 and frames[0].startswith("event: checkpoint\n")
             # open_tail's check, before the revocation, and the pass's, after it.
             assert tail.checks == 2
             assert tail.tail_pool.held == 0
@@ -479,6 +480,7 @@ async def test_a_slow_reader_is_checked_again_before_its_next_row(monkeypatch):
         async with _tail(monkeypatch, setup_pool) as tail:
             # A reader that keeps up is sent the whole batch on one check.
             body = await tail.open(user_id=user_id, vault="event-revoke-slow", start="earliest")
+            assert _positions([await anext(body)]) == [event_ids[0] - 1]
             assert _positions([await anext(body) for _ in event_ids]) == event_ids
             await body.aclose()
             # open_tail's check, then one for the whole batch.
@@ -486,6 +488,7 @@ async def test_a_slow_reader_is_checked_again_before_its_next_row(monkeypatch):
 
             tail.checks = 0
             body = await tail.open(user_id=user_id, vault="event-revoke-slow", start="earliest")
+            await anext(body)
             first = await anext(body)
             await _revoke(setup_pool, vault_id, user_id)
             # Slower than the window one check covers: the next row waits for a new check.
@@ -692,28 +695,32 @@ def _last_id(frames: list[str]) -> str | None:
     return ids[-1] if ids else None
 
 
-async def test_a_client_without_a_cursor_resumes_from_the_checkpoint_sent_when_checks_stay_slow(monkeypatch):
-    """A stream whose access checks keep outlasting their window ends early.
+async def test_a_client_without_a_cursor_resumes_from_its_start_checkpoint_after_slow_checks(monkeypatch):
+    """A stream whose access checks keep outlasting their window ends with no further frame.
 
-    It used to end without a frame. A client that had no cursor yet, because
-    nothing had been sent, reconnected without one and started after the
-    newest event: the event the stream had read but not sent was skipped for
-    good. The stream now sends a checkpoint at the last position it delivered
-    before it ends, and the client resumes from there.
+    A client that brought no cursor and had received nothing then reconnected
+    without one and started after the newest event, so an event the stream
+    had read but could not send was skipped for good. Every stream now starts
+    with a checkpoint at its start position, sent on the access check that
+    opened it, and the client resumes from there. On an empty Vault that
+    position is far below the Vault's first event, as other Vaults' events
+    take ids meanwhile; nothing was deleted, so resuming there is not refused.
     """
     async with _fresh_database() as setup_pool:
         vault_id = await _make_vault(setup_pool, "event-slow-checks")
+        other_vault_id = await _make_vault(setup_pool, "event-slow-checks-other")
         user_id = await _make_reader(setup_pool, "slow-checks-reader", [vault_id])
-        for _ in range(100):
-            await _insert_event(setup_pool, vault_id, "document.put", "alice")
         async with _tail(monkeypatch, setup_pool) as tail:
             monkeypatch.setattr(event_tail_service, "_RECHECK_DURING_YIELD_SECONDS", 0.2)
-            # Without a cursor the stream starts after the newest event, 100.
+            # Without a cursor, on an empty Vault, the stream starts at 0.
             body = await tail.open(user_id=user_id, vault="event-slow-checks")
             reader = asyncio.create_task(_frames(body))
             try:
                 await _until(lambda: tail.hub.connected and tail.hub.subscriber_count == 1)
                 await _settled(tail)
+                # Another Vault's events take the next hundred ids.
+                for _ in range(100):
+                    await _insert_event(setup_pool, other_vault_id, "document.put", "alice")
                 # From here on every check takes longer than the window it covers.
                 tail.check_delay = 0.3
                 event_id = await _insert_event(setup_pool, vault_id, "document.put", "alice")
@@ -732,7 +739,8 @@ async def test_a_client_without_a_cursor_resumes_from_the_checkpoint_sent_when_c
                 await resumed.aclose()
 
         assert event_id == 101
-        assert _positions(first_frames) == [100]
+        # Only the start checkpoint: nothing is sent once access cannot be confirmed in time.
+        assert _positions(first_frames) == [0]
         assert first_frames[0].startswith("event: checkpoint\n")
         assert _positions(delivered) == [event_id]
 

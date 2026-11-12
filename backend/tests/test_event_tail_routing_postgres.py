@@ -135,9 +135,13 @@ async def test_an_event_wakes_only_the_streams_of_its_vault(monkeypatch):
                 kinds=(),
                 position=0,
                 codec=codec,
+                checked_at=asyncio.get_running_loop().time(),
             )
             for index in range(2 * len(names))
         ]
+        # Each stream first says where it starts; then it waits for its Vault.
+        for stream in streams:
+            assert (await anext(stream)).startswith("event: checkpoint\n")
         first_frames = [asyncio.create_task(anext(stream)) for stream in streams]
         try:
             await _until(lambda: hub.connected and hub.subscriber_count == len(streams))

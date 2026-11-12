@@ -199,6 +199,7 @@ async def test_stream_reads_a_commit_on_its_heartbeat_while_the_listener_cannot_
             kinds=(),
             position=0,
             codec=codec,
+            checked_at=asyncio.get_running_loop().time(),
         )
         frames: list[str] = []
 

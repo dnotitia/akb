@@ -99,17 +99,20 @@ delivery rather than dropping it.
 
 Opening a tail first decides admission, which reads nothing. It then checks
 the caller's access and reads the Vault's retained range on one connection,
-before any event is read. A waiting tail holds no pooled connection. To read,
-it borrows one for the batch and, when the batch has rows, checks the reader's
-access on that same connection before sending any of them. A pass that finds
-nothing checks nothing, except the pass after each heartbeat. Before each
-event, a check that started more than a second earlier is repeated, and so is
-a check that itself took longer than that to finish; heartbeats keep their
-interval meanwhile. A tail whose checks keep taking that long, the first check
-of a batch included, ends after three in a row. Before it ends it sends a
-checkpoint at the last position it delivered, so a client that has not
-received a cursor yet resumes from there rather than after the newest event.
-A revoked reader stops receiving events within about a second and gets no
+before any event is read. The tail's first frame is a checkpoint at its
+starting position, sent on that access check, so a client that brought no
+cursor holds one from the start; store it like any other cursor.
+
+A waiting tail holds no pooled connection. To read, it borrows one for the
+batch and, when the batch has rows, checks the reader's access on that same
+connection before sending any of them. A pass that finds nothing checks
+nothing, except the pass after each heartbeat. Before each frame, a check that
+started more than a second earlier is repeated, and so is a check that itself
+took longer than that to finish. A tail whose checks keep taking that long,
+the first check of a batch included, ends after three in a row with no further
+frame, and its client resumes from the last cursor it received. Heartbeats
+keep their 15-second interval while a batch is read or access is checked. A
+revoked reader stops receiving events within about a second and gets no
 further frame, and an idle tail closes within one heartbeat.
 
 A cursor is refused with 410 `event_gap` only when retention deleted an event

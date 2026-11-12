@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -193,12 +194,17 @@ async def test_postgres_tail_stream_preserves_order_filter_checkpoints_and_resum
             kinds=("table.rows_changed",),
             position=first_id - 1,
             codec=codec,
+            checked_at=asyncio.get_running_loop().time(),
         )
+        start_frame = await anext(stream)
         first_frame = await anext(stream)
         selected_frame = await anext(stream)
         skipped_frame = await anext(stream)
         await stream.aclose()
 
+        # Where the stream starts, then one frame per retained event.
+        assert start_frame.startswith("event: checkpoint\n")
+        assert codec.decode(start_frame.splitlines()[1][4:])[2] == first_id - 1
         assert first_frame.startswith("event: checkpoint\n")
         assert selected_frame.startswith("event: change\n")
         assert skipped_frame.startswith("event: checkpoint\n")
@@ -218,12 +224,15 @@ async def test_postgres_tail_stream_preserves_order_filter_checkpoints_and_resum
             kinds=("table.rows_changed",),
             position=selected_id,
             codec=codec,
+            checked_at=asyncio.get_running_loop().time(),
         )
+        resumed_start = await anext(resumed)
         checkpoint_after_resume = await anext(resumed)
         next_change = await anext(resumed)
         await resumed.aclose()
         await hub.close()
         assert hub.subscriber_count == 0
+        assert codec.decode(resumed_start.splitlines()[1][4:])[2] == selected_id
         assert checkpoint_after_resume.startswith("event: checkpoint\n")
         assert next_change.startswith("event: change\n")
         assert codec.decode(next_change.splitlines()[1][4:])[2] == resumed_id
