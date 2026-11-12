@@ -21,15 +21,21 @@ specifically; the proxy has its own log in
 
   The cost: transactions that write events for the same Vault run one at a
   time from taking the Vault's lock to their commit, so writes insert their
-  events after their other locking statements. Bare Git document writes take
-  the lock before their Git commit instead, so a busy Vault fails them before
-  Git changes. A transaction waits at most 5 seconds in total for its Vault;
-  past that it fails with a retryable `write_busy` (HTTP 429,
-  `Retry-After: 1`) instead of an internal error. A deadlock (`40P01`) stays
-  an internal error. The Vault's lock is a row lock that no SQL role can
-  take, and `akb_sql` refuses PostgreSQL's advisory lock functions. Waiting
-  transactions keep their database connections for up to 5 seconds; the
-  number of waiters is not bounded.
+  events after their other locking statements. Bare Git document writes
+  instead lock the rows they change after their Git commit (collection and
+  edges), then the Vault's lock, then commit to Git, so a busy Vault fails
+  them before Git changes; they hold the lock through the Git work. A
+  transaction waits at most 5 seconds in total for its Vault, also when the
+  Vault's lock row has to be created; every Vault gets its row when it is
+  created (and existing Vaults in the migration) and loses it when it is
+  deleted. Past 5 seconds the wait fails with SQLSTATE 55P03 and the
+  constraint name `akb_event_lock_timeout`, which alone returns a retryable
+  `write_busy` (HTTP 429, `Retry-After: 1`) instead of an internal error.
+  Other lock timeouts and deadlocks (`40P01`) stay internal errors. The
+  Vault's lock is a row lock that no SQL role can take, and `akb_sql` refuses
+  PostgreSQL's advisory lock functions. Waiting transactions keep their
+  database connections for up to 5 seconds; the number of waiters is not
+  bounded.
 
   The migration takes its table lock in short attempts, so event inserts keep
   flowing while a transaction of the previous release is open, and stops the

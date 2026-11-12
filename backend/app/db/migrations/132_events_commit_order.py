@@ -13,11 +13,15 @@ next event of that Vault draws its id only after every earlier one has
 committed or rolled back, so within a Vault id order is commit order. Events
 without a Vault take no lock. The trigger draws every id and the column keeps
 no default, so an event uses one sequence value; an INSERT that names no id,
-as earlier releases do, still works. Event-writing transactions of one Vault
-run one at a time from taking the lock to their commit. Services insert the
-event as their last locking statement to keep that span short; Bare Git
-document writes take the lock (``akb_lock_vault_events``) before their Git
-commit, because the commit does not roll back with the transaction.
+as earlier releases do, still works. A trigger on ``vaults`` creates a Vault's
+row with the Vault and deletes it with the Vault, and the migration creates
+the rows of existing Vaults. Event-writing transactions of one Vault run one
+at a time from taking the lock to their commit. Services insert the event as
+their last locking statement to keep that span short; Bare Git document writes
+lock the rows they change later and then take the lock
+(``akb_lock_vault_events``) before their Git commit, because the commit does
+not roll back with the transaction. The wait for the lock ends after 5 seconds
+with SQLSTATE 55P03 and the constraint name ``akb_event_lock_timeout``.
 
 Dynamic tables' row-change events (migration 086) are queued by their
 statement trigger and inserted when the transaction commits, after every lock
@@ -27,10 +31,11 @@ lock between cascade levels.
 The migration leaves the notification trigger from migration 015 as it is, so
 it applies in either order with a migration that replaces that function.
 
-The changes need ACCESS EXCLUSIVE on ``events``. A lock request that waits
-queues every later event insert behind it, so the migration asks for the lock
-with a short timeout, holds nothing while it backs off, and asks again; it
-gives up with an error after a bounded number of attempts.
+The changes need ACCESS EXCLUSIVE on ``events``, and the trigger on ``vaults``
+needs SHARE ROW EXCLUSIVE on it. A lock request that waits queues every later
+conflicting request behind it, so the migration asks for its locks with a
+short timeout, holds nothing while it backs off, and asks again; it gives up
+with an error after a bounded number of attempts.
 """
 
 import asyncio
