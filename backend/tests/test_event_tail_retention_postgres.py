@@ -3,9 +3,9 @@
 The tail refused a cursor more than one below the Vault's earliest retained
 event. Event ids are shared by every Vault, so a cursor taken on an empty Vault,
 before its first event, is usually far below that event without having missed
-anything, and the tail refused it all the same. Retention now records, per
-Vault, the highest event id it deleted, in the statement that deletes, and the
-tail refuses only a cursor below that.
+anything, and the tail refused it all the same. A trigger on events now records,
+per Vault, the highest event id deleted, in every statement that deletes, and
+the tail refuses only a cursor below that.
 """
 
 from __future__ import annotations
@@ -25,6 +25,30 @@ from tests.test_event_tail_postgres import _database_dsn, _fresh_database, _inse
 pytestmark = pytest.mark.asyncio
 
 _MIGRATION = "133_event_retention_watermark.py"
+# The sweep an earlier release runs: it knows nothing of the watermark.
+_EARLIER_SWEEP = """
+    WITH d AS (
+        DELETE FROM events
+         WHERE redis_published_at IS NOT NULL
+           AND redis_published_at < NOW() - INTERVAL '7 days'
+        RETURNING 1
+    )
+    SELECT COUNT(*) FROM d
+"""
+
+
+async def _as_before_the_migration(pool: asyncpg.Pool) -> None:
+    """Remove what migration 133 installed, keeping its table."""
+    await pool.execute("DROP TRIGGER IF EXISTS akb_events_record_deletions ON events")
+    await pool.execute("DELETE FROM event_retention_watermarks")
+
+
+async def _trigger_installed(pool: asyncpg.Pool) -> bool:
+    return bool(
+        await pool.fetchval(
+            "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'events'::regclass AND tgname = 'akb_events_record_deletions'"
+        )
+    )
 
 
 async def _publish_long_ago(pool: asyncpg.Pool, event_ids: list[int]) -> None:
@@ -95,7 +119,7 @@ async def test_a_cursor_older_than_swept_events_is_refused_at_the_watermark(monk
                 assert _positions(delivered) == event_ids[3:]
 
 
-async def test_the_sweeper_records_the_watermark_in_the_statement_that_deletes(monkeypatch):
+async def test_a_delete_records_the_watermark_in_its_own_statement(monkeypatch):
     async with _fresh_database() as setup_pool:
         database = await setup_pool.fetchval("SELECT current_database()")
         vault_id = await _make_vault(setup_pool, "retention-sweeper")
@@ -114,7 +138,7 @@ async def test_the_sweeper_records_the_watermark_in_the_statement_that_deletes(m
         try:
             hold = holder.transaction()
             await hold.start()
-            # Hold the Vault's watermark row: the sweep cannot record its new mark.
+            # Hold the Vault's watermark row: the sweep's delete cannot record its new mark.
             await holder.execute(
                 "SELECT 1 FROM event_retention_watermarks WHERE vault_id = $1 FOR UPDATE", vault_id
             )
@@ -153,19 +177,112 @@ async def test_the_watermark_starts_at_the_old_boundary_for_vaults_that_have_eve
             await _insert_event(setup_pool, gone, "document.put", "alice")
         earliest = await _insert_event(setup_pool, with_events, "document.put", "alice")
         await _insert_event(setup_pool, with_events, "document.update", "alice")
-        # As before the migration: nothing recorded.
-        await setup_pool.execute("DELETE FROM event_retention_watermarks")
+        await _as_before_the_migration(setup_pool)
 
         migration = _load_migration(_MIGRATION)
         assert migration is not None
         async with setup_pool.acquire() as conn:
             await migration.migrate(conn=conn)
         assert await _watermarks(setup_pool) == {with_events: earliest - 1}
+        assert await _trigger_installed(setup_pool)
 
-        # Applying it again keeps a mark the sweeper has since raised.
+        # Applying it again keeps a mark raised since.
         await setup_pool.execute(
             "UPDATE event_retention_watermarks SET deleted_through = $2 WHERE vault_id = $1", with_events, earliest
         )
         async with setup_pool.acquire() as conn:
             await migration.migrate(conn=conn)
         assert await _watermarks(setup_pool) == {with_events: earliest}
+
+
+async def test_applying_the_migration_again_sets_no_starting_mark():
+    """Once the trigger records deletions, a starting mark would only claim one that never happened.
+
+    A Vault that was empty when the migration first ran, and has an event
+    since, used to get a mark below that event from a second application, and
+    a cursor taken while it was empty was then refused.
+    """
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "retention-reapplied")
+        await _insert_event(setup_pool, vault_id, "document.put", "alice")
+        migration = _load_migration(_MIGRATION)
+        assert migration is not None
+        async with setup_pool.acquire() as conn:
+            await migration.migrate(conn=conn)
+            await migration.migrate(conn=conn)
+
+        assert await _watermarks(setup_pool) == {}
+        assert await _trigger_installed(setup_pool)
+
+
+async def test_a_delete_by_an_earlier_release_records_the_watermark(monkeypatch):
+    """During a rolling deployment, or after a rollback, an earlier release's sweeper deletes events.
+
+    It knows nothing of the watermark, and its deletions used to go unrecorded,
+    so a cursor that never received a deleted event resumed past it.
+    """
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "retention-earlier-release")
+        user_id = await _make_reader(setup_pool, "retention-earlier-reader", [vault_id])
+        event_ids = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(3)]
+        await _publish_long_ago(setup_pool, event_ids[:2])
+        assert await setup_pool.fetchval(_EARLIER_SWEEP) == 2
+        # And an operator's delete by hand.
+        await setup_pool.execute("DELETE FROM events WHERE id = $1", event_ids[2])
+
+        assert await _watermarks(setup_pool) == {vault_id: event_ids[2]}
+        codec = EventCursorCodec(_CURSOR_SECRET)
+        async with _tail(monkeypatch, setup_pool) as tail:
+            with pytest.raises(EventGapError) as exc_info:
+                await tail.open(
+                    user_id=user_id,
+                    vault="retention-earlier-release",
+                    last_event_id=codec.encode(vault_id, (), event_ids[0]),
+                )
+        assert codec.decode(exc_info.value.details["earliest_cursor"]) == (vault_id, (), event_ids[2])
+
+
+@pytest.mark.parametrize("first", ["delete", "migration"])
+async def test_a_delete_during_the_migration_is_recorded_or_waits(first: str):
+    """No delete falls between the starting marks and the trigger.
+
+    A delete already under way when the migration starts finishes first, and
+    the starting marks see its result; one that starts while the migration
+    runs waits for it, and the trigger records it.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        vault_id = await _make_vault(setup_pool, "retention-migrating")
+        event_ids = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(3)]
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        assert migration is not None
+        migrating = await asyncpg.connect(_database_dsn(database))
+        deleting = await asyncpg.connect(_database_dsn(database))
+        try:
+            if first == "delete":
+                deletion = deleting.transaction()
+                await deletion.start()
+                await deleting.execute("DELETE FROM events WHERE id = $1", event_ids[0])
+                applying = asyncio.create_task(migration.migrate(conn=migrating))
+                await asyncio.sleep(0.3)
+                # The migration waits for the delete under way.
+                assert not applying.done()
+                await deletion.commit()
+                await asyncio.wait_for(applying, 5)
+            else:
+                migration_tx = migrating.transaction()
+                await migration_tx.start()
+                await migration.migrate(conn=migrating)
+                deletion_task = asyncio.create_task(deleting.execute("DELETE FROM events WHERE id = $1", event_ids[0]))
+                await asyncio.sleep(0.3)
+                # The delete waits for the migration to commit.
+                assert not deletion_task.done()
+                await migration_tx.commit()
+                await asyncio.wait_for(deletion_task, 5)
+        finally:
+            await migrating.close()
+            await deleting.close()
+
+        # Either way the deleted event is below the mark.
+        assert await _watermarks(setup_pool) == {vault_id: event_ids[0]}

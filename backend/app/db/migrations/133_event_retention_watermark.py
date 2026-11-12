@@ -1,18 +1,27 @@
-"""Record, per Vault, the highest event id that retention has deleted.
+"""Record, per Vault, the highest event id that has been deleted.
 
 The event tail refused a cursor with 410 whenever it was more than one below
 the Vault's earliest retained event. Event ids are shared by every Vault, so a
 cursor taken before a Vault's first event, on an empty Vault, is usually far
 below that event without having missed anything, and it was refused all the
-same. The watermark records what was actually deleted: the sweeper raises it
-in the statement that deletes the events, and a cursor is refused only when it
-is below it.
+same. The watermark records what was actually deleted, and a cursor is
+refused only when it is below it.
 
-Deletions before this migration left no record. A Vault that still has events
-starts with its watermark just below its earliest retained event, the boundary
-the tail used until now, so history that may already have been swept is still
-refused. A Vault with no retained events starts without one, as it had no
-boundary before. The row goes with its Vault.
+A statement trigger on events raises the mark in every statement that
+deletes, so deletions are recorded whichever code issues them, including the
+sweeper of an earlier release that runs beside this one during a rolling
+deployment or after a rollback.
+
+The starting marks and the trigger are installed in one step while deletes
+and inserts on events wait, so no delete falls between them. Deletions before
+this migration left no record: a Vault that still has events starts just below
+its earliest one, the boundary the tail used until now, so history that may
+already have been swept is still refused, and a Vault with no events starts
+without a mark. Once the trigger exists, applying this again sets no starting
+mark: one set later could claim a deletion that never happened. The lock waits
+only for one grouped scan of events, which retention keeps small. A TRUNCATE of
+events records nothing; only the test runtime's reset uses one, and it
+truncates this table and the Vaults with it.
 """
 
 from pathlib import Path

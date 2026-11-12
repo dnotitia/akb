@@ -115,10 +115,12 @@ keep their 15-second interval while a batch is read or access is checked. A
 revoked reader stops receiving events within about a second and gets no
 further frame, and an idle tail closes within one heartbeat.
 
-A cursor is refused with 410 `event_gap` only when retention deleted an event
-it never received. Each Vault records the highest event id that the events
-sweeper deleted, in the statement that deletes it (migration 133); a cursor
-below that mark is refused, and the refusal's `earliest_cursor` resumes at it.
+A cursor is refused with 410 `event_gap` only when an event it never received
+was deleted. A trigger on `events` records, per Vault, the highest event id
+deleted, in every statement that deletes, whichever code issues it: this
+release's sweeper, an earlier release's during a rolling deployment or after a
+rollback, or an operator (migration 133). A cursor below that mark is refused,
+and the refusal's `earliest_cursor` resumes at it.
 Event ids are shared by every Vault, so a cursor taken before a Vault's first
 event, on an empty Vault, is usually far below that event and is still valid.
 `start=earliest` replays from the first position after which nothing was
