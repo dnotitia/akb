@@ -710,6 +710,25 @@ async def test_capacity_refusal_is_a_retryable_503_on_the_rest_surface(monkeypat
     assert body["message"] == "Event tail capacity is exhausted on this server"
 
 
+@pytest.mark.asyncio
+async def test_an_unconfirmed_start_is_a_retryable_503_on_the_rest_surface(monkeypatch, tmp_path) -> None:
+    from app.config import settings
+
+    # Importing the app builds services that create the storage root.
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
+    from app.main import akb_error_handler
+    from app.services.event_tail_service import EventTailUnavailableError
+
+    response = await akb_error_handler(None, EventTailUnavailableError())
+
+    # The Retry-After header the OpenAPI document promises for this 503.
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    body = json.loads(response.body)
+    assert body["code"] == "event_tail_unavailable"
+    assert body["hint"] == "Retry after the Retry-After delay."
+
+
 def test_stream_cap_comes_from_the_environment_then_app_yaml(monkeypatch) -> None:
     from app.config import settings
     from app.services import event_tail_service

@@ -1076,6 +1076,33 @@ def test_event_tail_openapi_contract_is_authenticated_typed_sse():
     assert schemas["TailCheckpointV1"]["required"] == ["version", "cursor"]
 
 
+def test_event_tail_openapi_names_its_refusals_and_their_retry_after_header():
+    """A generated client sees why a new tail was refused and when to try again."""
+    schema = app.openapi()
+    responses = schema["paths"]["/api/v1/events/{vault}"]["get"]["responses"]
+    retry_after = {
+        "description": "Seconds to wait before retrying.",
+        "schema": {"type": "integer", "minimum": 0},
+    }
+    error_body = {"application/json": {"schema": {"$ref": "#/components/schemas/AkbError"}}}
+
+    unavailable = responses["503"]
+    assert "`event_tail_capacity`" in unavailable["description"]
+    assert "`event_tail_unavailable`" in unavailable["description"]
+    assert unavailable["headers"] == {"Retry-After": retry_after}
+    assert unavailable["content"] == error_body
+
+    quota = responses["429"]
+    assert "`event_tail_user_quota`" in quota["description"]
+    assert quota["headers"] == {"Retry-After": retry_after}
+    assert quota["content"] == error_body
+
+    # Other operations keep the generic 503.
+    search_unavailable = schema["paths"]["/api/v1/search"]["get"]["responses"]["503"]
+    assert search_unavailable["description"] == "Service Unavailable"
+    assert "headers" not in search_unavailable
+
+
 def test_browse_pagination_receipt_is_published_for_sdk_consumers():
     schema = app.openapi()
     envelope = schema["components"]["schemas"]["AkbDocumentEnvelope"]
