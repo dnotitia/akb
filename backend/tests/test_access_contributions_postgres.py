@@ -837,3 +837,33 @@ async def test_a_weaker_grant_does_not_demote_in_postgres(live_role_sync):
     await access_service.grant_access(str(granter), name, member_name, "reader")
     assert await env.stored_role(vault_id, member) == "admin"
     assert await _pg_membership(env, vault_id, member) == {"admin"}
+
+
+async def test_access_changes_insert_their_event_after_the_role_changes(env, monkeypatch):
+    """The event insert holds the Vault's event lock until commit (migration
+    132), so it comes after the PostgreSQL role changes of its transaction."""
+    calls: list[str] = []
+    real_emit = access_service.emit_event
+    real_sync = env.role_sync.sync_vault_user_in_conn
+
+    async def emit(conn, kind, **kwargs):
+        calls.append(kind)
+        return await real_emit(conn, kind, **kwargs)
+
+    async def sync(conn, vault_id, user_id):
+        calls.append("role_sync")
+        return await real_sync(conn, vault_id, user_id)
+
+    monkeypatch.setattr(access_service, "emit_event", emit)
+    monkeypatch.setattr(env.role_sync, "sync_vault_user_in_conn", sync)
+    name, vault_id, owner, member, granter = await _fixture(env, "eventorder")
+    member_name = await env.pool.fetchval("SELECT username FROM users WHERE id = $1", member)
+
+    await access_service.grant_access(str(granter), name, member_name, "reader")
+    assert calls == ["role_sync", "access.grant"]
+    calls.clear()
+    await access_service.revoke_access(str(granter), name, member_name)
+    assert calls == ["role_sync", "access.revoke"]
+    calls.clear()
+    await access_service.transfer_ownership(str(owner), name, member_name)
+    assert calls == ["role_sync", "role_sync", "access.transfer_ownership"]

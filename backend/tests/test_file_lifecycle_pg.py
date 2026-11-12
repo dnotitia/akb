@@ -449,3 +449,34 @@ async def test_collection_delete_rollback_preserves_file_and_cleanup_ownership(
         assert not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM s3_delete_outbox WHERE s3_key=$1)", key)
         assert await conn.fetchval("SELECT EXISTS(SELECT 1 FROM collections WHERE id=$1)", cid)
     assert objects[key] == OLD
+
+
+async def test_file_writes_insert_their_event_after_the_projection_intent(
+    pool, vault_id, service, objects, monkeypatch,
+):
+    """The event insert holds the Vault's event lock until commit (migration
+    132), so it follows the projection outbox upsert of its transaction."""
+    order: list[str] = []
+    real_emit = fs.emit_event
+
+    async def emit(conn, kind, **kwargs):
+        order.append(kind)
+        return await real_emit(conn, kind, **kwargs)
+
+    async def projection_delete(*_args, **_kwargs):
+        order.append("projection_delete")
+
+    monkeypatch.setattr(fs, "emit_event", emit)
+    monkeypatch.setattr(fs, "enqueue_native_file_projection_delete", projection_delete)
+    fs.enqueue_native_file_projection.side_effect = lambda *_a, **_k: order.append("projection")
+
+    name, fid, _ = await seed(pool, vault_id, objects, state="pending")
+    await service.confirm_upload(vault_id, str(fid), actor_id="tester")
+    assert order == ["projection", "file.put"]
+    order.clear()
+    rid = await replacement(service, name, vault_id, fid, objects)
+    await publish(service, name, vault_id, fid, rid)
+    assert order == ["projection", "file.update"]
+    order.clear()
+    await service.delete(vault_id, str(fid), actor_id="tester")
+    assert order == ["projection_delete", "file.delete"]
