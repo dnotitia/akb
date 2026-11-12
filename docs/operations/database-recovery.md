@@ -88,8 +88,9 @@ a 2-second whole-endpoint guarantee: callers can wait for the shared readiness
 lock. Concurrent failed probes can therefore queue. Failed readiness results
 are not cache-fresh, allowing an immediate new probe after recovery.
 
-The ping runs on one dedicated connection, never on a request-pool connection.
-Its `application_name` is `akb-readiness-probe`. The first probe opens it and
+The ping runs on one dedicated connection, not on a request-pool connection;
+the one exception, a server at `max_connections`, is described below. Its
+`application_name` is `akb-readiness-probe`. The first probe opens it and
 later probes reuse it. A failed ping discards it and the next probe opens a new
 one; a probe that finds it closed by the server opens a new one before pinging.
 Connecting and the ping both stay inside the 2-second step. Each API process
@@ -97,11 +98,17 @@ therefore holds one PostgreSQL connection beyond its pool. An unreachable
 database still fails readiness at once.
 
 A server at `max_connections` refuses that connection with SQLSTATE `53300`
-while the pool's open connections keep working. If the pool is open and an
-acquire has completed within `readyz_pool_saturation_grace_secs`, readiness
-reports `db: ok:pool_progress` and stays ready; that result is not cached.
-Without such an acquire, and for every other connection error, readiness
-fails as before.
+while the pool's open connections keep working. Readiness then asks the pool,
+without waiting for a connection:
+
+- If the pool has an idle connection, the probe borrows it for the rest of its
+  2-second step and runs `SELECT 1` on it: `db: ok:pool_idle`. If that ping
+  fails, readiness fails.
+- Otherwise, if an acquire has completed within
+  `readyz_pool_saturation_grace_secs`: `db: ok:pool_progress`.
+
+Neither result is cached. A closing pool, a pool with neither, and every other
+connection error fail readiness as before.
 
 ### Pool saturation
 
@@ -167,8 +174,9 @@ the shutdown order. `backend/tests/test_readiness_probe_postgres.py` saturates
 a real pool built by `get_pool`. It checks that `/readyz` stays 200 within the
 probe budget, and past the grace while more tasks than connections keep taking
 turns. It turns 503 once the holders never let go. A role at its connection
-limit makes the server refuse the probe connection, which stays 200 while the
-pool progresses. The suite also checks that readiness fails at once when the
+limit makes the server refuse the probe connection. That stays 200 through an
+idle pool connection, then through recent acquires while every connection is
+held, and turns 503 once those stop. The suite also checks that readiness fails at once when the
 database is gone, that a terminated probe connection is reopened, and that
 shutdown closes it. It reads the same `AKB_TEST_DSN` and `REQUIRE_REAL_PG`
 variables as the suite below.

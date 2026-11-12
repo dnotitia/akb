@@ -112,10 +112,12 @@ specifically; the proxy has its own log in
   skipped as `skipped:pool_saturated`. See
   `docs/operations/database-recovery.md`.
 - When the server refuses the readiness probe's connection at
-  `max_connections`, readiness stays ready with `db: ok:pool_progress` if the
-  pool is open and has completed an acquire within the grace. Such a result
-  is not cached. Without recent progress, and for every other connection
-  error, readiness still fails.
+  `max_connections`, readiness asks the pool instead. With an idle connection
+  it runs `SELECT 1` on that connection within the probe's remaining budget
+  and reports `db: ok:pool_idle`. With none, it reports `db: ok:pool_progress`
+  if an acquire has completed within the grace. Neither result is cached. A
+  failed ping on the idle connection, a pool with neither, and every other
+  connection error still fail readiness.
 
 ### Search
 

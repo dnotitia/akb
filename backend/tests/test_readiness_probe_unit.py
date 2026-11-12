@@ -14,6 +14,7 @@ same behaviour against a real one.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 import time
 from types import SimpleNamespace
@@ -29,11 +30,14 @@ GRACE = 30.0
 
 
 class _Pool:
-    """Just the occupancy reads readiness uses; it never borrows a connection."""
+    """The occupancy reads readiness uses, and the one borrow it may make: an
+    idle connection, when the server has refused the probe's own."""
 
     def __init__(self, size: int, max_size: int, idle: int) -> None:
         self.size, self.max_size, self.idle = size, max_size, idle
         self.closing = False
+        self.idle_conn = SimpleNamespace(fetchval=AsyncMock(return_value=1))
+        self.acquire_timeouts: list[float | None] = []
 
     def get_size(self) -> int:
         return self.size
@@ -46,6 +50,11 @@ class _Pool:
 
     def is_closing(self) -> bool:
         return self.closing
+
+    @contextlib.asynccontextmanager
+    async def acquire(self, *, timeout=None):
+        self.acquire_timeouts.append(timeout)
+        yield self.idle_conn
 
     async def fetchval(self, *_args):  # pragma: no cover — a failure if ever reached
         raise AssertionError("readiness must not borrow a request-pool connection")
@@ -303,7 +312,62 @@ async def test_ping_failure_is_not_ready_and_still_reports_the_pool(main, probe)
 _SERVER_FULL = asyncpg.TooManyConnectionsError("sorry, too many clients already")
 
 
-async def test_server_at_max_connections_with_recent_pool_progress_is_ready(main, probe):
+async def test_server_at_max_connections_pings_through_an_idle_pool_connection(main, probe):
+    probe.ping.side_effect = _SERVER_FULL
+    probe.clock.now += 2 * GRACE  # no acquire within the grace: progress cannot vouch
+
+    ok, detail = await main._probe_ready()
+
+    assert ok is True
+    assert detail["db"] == "ok:pool_idle"
+    probe.pool.idle_conn.fetchval.assert_awaited_once_with("SELECT 1")
+    # Borrowed for the rest of the probe's database budget, no longer.
+    (timeout,) = probe.pool.acquire_timeouts
+    assert timeout is not None and 0 < timeout <= main._READY_DB_TIMEOUT_SECONDS
+    assert detail["vector_store"] == "ok"
+
+
+async def test_ready_on_an_idle_pool_connection_is_not_cached(main, probe):
+    probe.ping.side_effect = _SERVER_FULL
+
+    first = await main.readyz()
+    second = await main.readyz()
+
+    assert first["detail"]["db"] == second["detail"]["db"] == "ok:pool_idle"
+    assert first["cached"] is False and second["cached"] is False
+    assert len(probe.pool.acquire_timeouts) == 2
+
+
+async def test_failed_ping_on_the_idle_pool_connection_is_not_ready(main, probe):
+    probe.ping.side_effect = _SERVER_FULL
+    probe.pool.idle_conn.fetchval.side_effect = asyncpg.ConnectionDoesNotExistError("gone")
+
+    ok, detail = await main._probe_ready()
+
+    # Recent progress does not override a ping that failed on the pool itself.
+    assert ok is False
+    assert detail["db"] == "error:unavailable"
+
+
+async def test_hung_ping_on_the_idle_pool_connection_is_cut_off_inside_the_probe_budget(main, probe):
+    async def hang(*_args):
+        await asyncio.sleep(60)
+
+    probe.ping.side_effect = _SERVER_FULL
+    probe.pool.idle_conn.fetchval.side_effect = hang
+
+    ok, detail = await asyncio.wait_for(main._probe_ready(), timeout=3)
+
+    assert ok is False
+    assert detail["db"] == "error:timeout"
+
+
+def _no_idle(pool: _Pool) -> None:
+    pool.idle = 0  # every open connection is lent out: nothing to borrow
+
+
+async def test_server_at_max_connections_without_an_idle_connection_relies_on_recent_progress(main, probe):
+    _no_idle(probe.pool)
     probe.ping.side_effect = _SERVER_FULL
     probe.clock.now += GRACE - 1  # the latest acquire completed GRACE - 1 seconds ago
 
@@ -311,10 +375,12 @@ async def test_server_at_max_connections_with_recent_pool_progress_is_ready(main
 
     assert ok is True
     assert detail["db"] == "ok:pool_progress"
+    assert probe.pool.acquire_timeouts == []
     assert detail["vector_store"] == "ok"
 
 
 async def test_ready_on_pool_progress_is_not_cached(main, probe):
+    _no_idle(probe.pool)
     probe.ping.side_effect = _SERVER_FULL
 
     first = await main.readyz()
@@ -325,7 +391,8 @@ async def test_ready_on_pool_progress_is_not_cached(main, probe):
     assert probe.ping.await_count == 2
 
 
-async def test_server_at_max_connections_without_recent_progress_is_not_ready(main, probe):
+async def test_server_at_max_connections_without_idle_or_recent_progress_is_not_ready(main, probe):
+    _no_idle(probe.pool)
     probe.ping.side_effect = _SERVER_FULL
     probe.clock.now += GRACE
 
@@ -336,7 +403,8 @@ async def test_server_at_max_connections_without_recent_progress_is_not_ready(ma
     probe.store.health.assert_not_awaited()
 
 
-async def test_server_at_max_connections_without_any_recorded_acquire_is_not_ready(main, probe):
+async def test_server_at_max_connections_without_idle_or_any_recorded_acquire_is_not_ready(main, probe):
+    _no_idle(probe.pool)
     probe.progress.last_at = None
     probe.ping.side_effect = _SERVER_FULL
 
@@ -346,7 +414,9 @@ async def test_server_at_max_connections_without_any_recorded_acquire_is_not_rea
     assert detail["db"] == "error:unavailable"
 
 
-async def test_closing_pool_does_not_vouch_for_the_database(main, probe):
+@pytest.mark.parametrize("idle", [0, 1])
+async def test_closing_pool_does_not_vouch_for_the_database(main, probe, idle):
+    probe.pool.idle = idle
     probe.pool.closing = True
     probe.ping.side_effect = _SERVER_FULL
 
@@ -354,6 +424,7 @@ async def test_closing_pool_does_not_vouch_for_the_database(main, probe):
 
     assert ok is False
     assert detail["db"] == "error:unavailable"
+    assert probe.pool.acquire_timeouts == []
 
 
 @pytest.mark.parametrize("failure", [
@@ -363,13 +434,14 @@ async def test_closing_pool_does_not_vouch_for_the_database(main, probe):
     asyncpg.InvalidCatalogNameError("database does not exist"),
     asyncpg.CannotConnectNowError("the database system is starting up"),
 ])
-async def test_other_connect_errors_stay_not_ready_despite_pool_progress(main, probe, failure):
-    probe.ping.side_effect = failure  # the latest acquire is 0 s old
+async def test_other_connect_errors_stay_not_ready_despite_an_idle_pool_and_progress(main, probe, failure):
+    probe.ping.side_effect = failure  # one idle connection; the latest acquire is 0 s old
 
     ok, detail = await main._probe_ready()
 
     assert ok is False
     assert detail["db"] == "error:unavailable"
+    assert probe.pool.acquire_timeouts == []
 
 
 async def test_hung_ping_is_cut_off_inside_the_probe_budget(main, probe):

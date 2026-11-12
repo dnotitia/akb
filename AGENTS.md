@@ -257,7 +257,8 @@ The following Git layout and locking apply only to the Bare Git backend:
   The vector store is a **soft** check: a failed ping reports
   `"vector_store": "degraded:..."` in the detail but still returns
   ready (search degrades, everything else keeps working).
-  The DB ping uses a dedicated connection, never the request pool. A
+  The DB ping uses a dedicated connection, not the request pool (which answers
+  only when the server refuses that connection). A
   saturated pool (`size == max`, `idle == 0`) fails readiness only after
   `readyz_pool_saturation_grace_secs` (default 30) with no completed acquire;
   one whose connections keep changing hands stays ready. Reported in

@@ -487,22 +487,36 @@ def _pool_wedged(pool_detail: dict, grace: float) -> bool:
 
 
 # A server at max_connections refuses the probe's own connection while the
-# pool's open connections keep working. Acquires completed within the grace
-# show the database still answers this process, so readiness holds with this
-# label instead of "ok".
+# pool's open connections keep working. Readiness then asks the pool instead,
+# without queueing behind it, and labels a ready answer by how it was proven:
+# a ping on an idle pool connection, or acquires completed within the grace.
+_DB_OK_BY_POOL_IDLE = "ok:pool_idle"
 _DB_OK_BY_POOL_PROGRESS = "ok:pool_progress"
+_DB_READY = ("ok", _DB_OK_BY_POOL_IDLE, _DB_OK_BY_POOL_PROGRESS)
 
 
-def _db_failure_label(exc: Exception, pool) -> str:
-    if (
-        isinstance(exc, asyncpg.TooManyConnectionsError)
-        and pool is not None
-        and not pool.is_closing()
-    ):
-        _, last_acquire_age = pool_progress()
-        if last_acquire_age is not None and last_acquire_age < settings.readyz_pool_saturation_grace_secs:
-            return _DB_OK_BY_POOL_PROGRESS
-    return "error:timeout" if isinstance(exc, TimeoutError) else "error:unavailable"
+async def _db_ok_despite_full_server(pool: asyncpg.Pool, budget: asyncio.Timeout) -> str | None:
+    """How the pool vouches for the database after the server refused the
+    probe's connection, or None when it cannot. A failing ping raises.
+
+    An idle connection is borrowed for the rest of the probe's budget only.
+    Nothing runs between the idle check and asyncpg taking a holder from its
+    queue, so the probe never waits behind a saturated pool. If the holder it
+    takes has lost its connection, asyncpg reconnects, the full server refuses
+    that too, and readiness fails.
+    """
+    if pool.is_closing():
+        return None
+    if pool.get_idle_size() > 0:
+        deadline = budget.when()
+        remaining = None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
+        async with pool.acquire(timeout=remaining) as conn:
+            await conn.fetchval("SELECT 1")
+        return _DB_OK_BY_POOL_IDLE
+    _, last_acquire_age = pool_progress()
+    if last_acquire_age is not None and last_acquire_age < settings.readyz_pool_saturation_grace_secs:
+        return _DB_OK_BY_POOL_PROGRESS
+    return None
 
 
 async def _probe_ready() -> tuple[bool, dict]:
@@ -514,30 +528,39 @@ async def _probe_ready() -> tuple[bool, dict]:
     break login/auth/CRUD for ~30s.
 
     The DB ping runs on a dedicated connection, and the request pool is only
-    observed. A pool that clients have fully checked out is not a database
-    failure, and a client burst saturates every replica's pool at the same
-    moment: failing readiness on it would leave the Service with no endpoints
-    while the database is fine. Saturation fails readiness only once it has
-    lasted `readyz_pool_saturation_grace_secs` at every probe and no acquire
-    has completed within that time: the pool is wedged, not busy.
+    observed; it answers for the database only when the server refuses that
+    connection (`_db_ok_despite_full_server`). A pool that clients have fully
+    checked out is not a database failure, and a client burst saturates every
+    replica's pool at the same moment: failing readiness on it would leave the
+    Service with no endpoints while the database is fine. Saturation fails
+    readiness only once it has lasted `readyz_pool_saturation_grace_secs` at
+    every probe and no acquire has completed within that time: the pool is
+    wedged, not busy.
     """
     detail: dict = {
         "document_revision_backend": selected_document_revision_backend(),
     }
     pool: asyncpg.Pool | None = None
     try:
-        # Initialization/reconnection is part of the same probe budget.
-        async with asyncio.timeout(_READY_DB_TIMEOUT_SECONDS):
+        # Initialization/reconnection is part of the same probe budget, and so
+        # is the pool's answer when the server refuses the probe connection.
+        async with asyncio.timeout(_READY_DB_TIMEOUT_SECONDS) as budget:
             # An existing pool is returned at once; nothing is borrowed from it.
             pool = await get_pool()
-            await readiness_ping(timeout=_READY_DB_TIMEOUT_SECONDS)
-        detail["db"] = "ok"
+            try:
+                await readiness_ping(timeout=_READY_DB_TIMEOUT_SECONDS)
+                detail["db"] = "ok"
+            except asyncpg.TooManyConnectionsError:
+                vouched = await _db_ok_despite_full_server(pool, budget)
+                if vouched is None:
+                    raise
+                detail["db"] = vouched
     except Exception as e:  # noqa: BLE001 — no connection strings in a public probe
-        detail["db"] = _db_failure_label(e, pool)
+        detail["db"] = "error:timeout" if isinstance(e, TimeoutError) else "error:unavailable"
     if pool is not None:
         # Pool stats help diagnose leaks and bursts, on a failed probe too.
         detail["pool"] = _observe_pool(pool, _ready_state)
-    if detail["db"] not in ("ok", _DB_OK_BY_POOL_PROGRESS):
+    if detail["db"] not in _DB_READY:
         return False, detail
     saturated_for = _pool_saturated_for(detail)
     if saturated_for is not None:
@@ -574,8 +597,8 @@ def _cache_fresh(state: _ReadyState) -> bool:
     # twice the actual outage window.
     # Nor a success that saw a saturated pool: the grace is measured across
     # probes, so each probe during saturation has to look at the pool again.
-    # Nor one that rested on pool progress instead of a ping: that holds only
-    # for the grace after the latest acquire.
+    # Nor one the pool vouched for instead of the probe's own connection: an
+    # idle connection or recent acquires prove the database only for now.
     return (
         state.detail is not None
         and state.ok

@@ -276,16 +276,39 @@ async def test_saturated_pool_whose_holders_never_let_go_answers_503_and_recover
     assert recovered.json()["detail"]["vector_store"] == "ok"
 
 
-async def test_server_refusing_the_probe_connection_is_ready_while_the_pool_progresses(monkeypatch, tmp_path):
-    # The role may open only the pool's own connections, so the server refuses
-    # the probe's with "too many connections" while the pool keeps working.
+# In the next two tests the role may open only the pool's own connections, so
+# the server refuses the probe's with "too many connections" (SQLSTATE 53300)
+# while the pool's connections keep working.
+
+
+async def test_server_refusing_the_probe_connection_pings_through_an_idle_pool_connection(monkeypatch, tmp_path):
     async with _ready_database(monkeypatch, tmp_path, role_connection_limit=_POOL_SIZE) as db:
         monkeypatch.setattr(db.main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
-        assert await db.pool.fetchval("SELECT 1") == 1  # an acquire completes
+        await asyncio.sleep(_PAST_GRACE)  # an idle pool: no acquire within the grace
+        assert db.pool.get_idle_size() == _POOL_SIZE
+        _, last_acquire_age = postgres.pool_progress()
+        assert last_acquire_age is None or last_acquire_age >= _GRACE
 
-        progressing = await db.client.get("/readyz")
-        await asyncio.sleep(_PAST_GRACE)  # nothing acquires any more
-        stalled = await db.client.get("/readyz")
+        first = await db.client.get("/readyz")
+        second = await db.client.get("/readyz")
+
+    assert first.status_code == 200, first.text
+    assert first.json()["detail"]["db"] == "ok:pool_idle"
+    assert first.json()["detail"]["vector_store"] == "ok"
+    # Never cached: the next probe asks the pool again.
+    assert second.status_code == 200, second.text
+    assert second.json()["cached"] is False
+
+
+async def test_server_refusing_the_probe_connection_with_every_connection_held_relies_on_progress(
+    monkeypatch, tmp_path,
+):
+    async with _ready_database(monkeypatch, tmp_path, role_connection_limit=_POOL_SIZE) as db:
+        monkeypatch.setattr(db.main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+        async with _every_connection_checked_out(db.pool):  # the holders' acquires just completed
+            progressing = await db.client.get("/readyz")
+            await asyncio.sleep(_PAST_GRACE)  # the holders never let go: no acquire since
+            stalled = await db.client.get("/readyz")
 
     assert progressing.status_code == 200, progressing.text
     assert progressing.json()["detail"]["db"] == "ok:pool_progress"
