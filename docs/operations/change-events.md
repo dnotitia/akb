@@ -147,14 +147,21 @@ at 9, and a cursor at 10 resumes without a 410 although it never received 20,
 as it did with the earlier boundary. A Vault whose events had all been deleted
 starts with no mark.
 
-Migration 133 installs the trigger while inserts and deletes on `events` wait,
-for as long as one grouped scan of the table takes. A request for that lock
-that has to wait would make every later event insert wait behind it, so the
-migration asks with a 500 ms lock timeout and holds nothing while it backs off
-between attempts (0.25 s, doubling to 2 s). A transaction that keeps an event
-it wrote open therefore holds up other event writes for at most about half a
-second at a time. After 40 attempts the migration stops the server's start with
-an error naming the cause; end the long transaction and start the server again.
+Migration 133 installs the trigger, and records the highest event id at that
+moment, while inserts and deletes on `events` wait. It reads no events, so
+that wait does not grow with the table, which keeps growing when the sweeper
+does not run, as without Redis. Migration 134 then sets the starting marks
+from the events up to that id, in its own transaction and without that lock:
+writes go on while it scans, a delete that races it is still recorded, and
+neither lowers the other's mark. A Vault whose events all came after the
+trigger gets no starting mark. When the trigger is already in place,
+migration 133 asks for no lock at all. A request for the lock that has to wait
+would make every later event insert wait behind it, so the migration asks
+with a 500 ms lock timeout and holds nothing while it backs off between
+attempts (0.25 s, doubling to 2 s). A transaction that keeps an event it wrote
+open therefore holds up other event writes for at most about half a second at
+a time. After 40 attempts the migration stops the server's start with an error
+naming the cause; end the long transaction and start the server again.
 
 All tail database work in a process, opening included, shares at most
 `event_tail_db_concurrency` connections. Work beyond that waits for a free

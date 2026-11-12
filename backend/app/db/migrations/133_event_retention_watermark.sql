@@ -8,6 +8,14 @@ CREATE TABLE IF NOT EXISTS event_retention_watermarks (
     deleted_through BIGINT NOT NULL CHECK (deleted_through >= 0)
 );
 
+-- The highest event id when the trigger below was installed. Migration 134
+-- sets the starting marks from the events at or below it, and deletes the
+-- row as it does; every event above it was inserted after the trigger, which
+-- records any deletion of it. One row at most.
+CREATE TABLE IF NOT EXISTS event_retention_backfill (
+    boundary BIGINT NOT NULL CHECK (boundary >= 0)
+);
+
 -- Every delete from events raises the mark of each Vault it touched, in the
 -- deleting statement, whichever code issues it: this release's sweeper, an
 -- earlier release's during a rolling deployment or after a rollback, or an
@@ -26,20 +34,16 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- The starting marks and the trigger are installed together, once, while
--- deletes and inserts on events wait: no delete can fall between the two, and
--- the trigger's presence records that the starting marks were set, so
--- running this again sets none (a mark set later would claim a deletion that
--- never happened). Deletions before this point left no record, and cannot be
--- reconstructed. A Vault that still has events starts just below its earliest
--- one, the boundary the tail used until now, so history that may already have
--- been swept is still refused; a later event deleted while an earlier one was
--- kept stays unknown, as it was before. A Vault with no events starts without
--- a mark, as it had no boundary before. Reads are not blocked. The migration's
--- Python step takes this lock before running this file, with a short lock
--- timeout and retries, so later event inserts do not queue behind a waiting
--- request; once held, it lasts as long as one grouped scan of events, which
--- retention keeps small.
+-- The trigger and the backfill boundary are installed together, once, while
+-- inserts and deletes on events wait: every event at or below the boundary
+-- was committed before the trigger existed, and every later one after it.
+-- Nothing here scans events: the boundary is read from the end of the
+-- primary key, so the lock lasts no longer on a large table. The trigger's
+-- presence, checked again under the lock, records that this was done, so
+-- running this again records no second boundary. The migration's Python step
+-- checks for the trigger before it asks for any lock, and asks with a short
+-- lock timeout and retries, so later event inserts do not queue behind a
+-- waiting request.
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -47,12 +51,8 @@ BEGIN
          WHERE tgrelid = 'events'::regclass AND tgname = 'akb_events_record_deletions'
     ) THEN
         LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE;
-        INSERT INTO event_retention_watermarks (vault_id, deleted_through)
-        SELECT e.vault_id, MIN(e.id) - 1
-          FROM events e
-          JOIN vaults v ON v.id = e.vault_id
-         GROUP BY e.vault_id
-        ON CONFLICT (vault_id) DO NOTHING;
+        INSERT INTO event_retention_backfill (boundary)
+        SELECT COALESCE(MAX(id), 0) FROM events;
         CREATE TRIGGER akb_events_record_deletions
         AFTER DELETE ON events
         REFERENCING OLD TABLE AS akb_deleted_events

@@ -27,6 +27,7 @@ from tests.test_event_tail_postgres import _database_dsn, _fresh_database, _inse
 pytestmark = pytest.mark.asyncio
 
 _MIGRATION = "133_event_retention_watermark.py"
+_BACKFILL = "134_event_retention_backfill.py"
 # The sweep an earlier release runs: it knows nothing of the watermark.
 _EARLIER_SWEEP = """
     WITH d AS (
@@ -40,9 +41,19 @@ _EARLIER_SWEEP = """
 
 
 async def _as_before_the_migration(pool: asyncpg.Pool) -> None:
-    """Remove what migration 133 installed, keeping its table."""
+    """Remove what migrations 133 and 134 installed and set, keeping their tables."""
     await pool.execute("DROP TRIGGER IF EXISTS akb_events_record_deletions ON events")
     await pool.execute("DELETE FROM event_retention_watermarks")
+    await pool.execute("DELETE FROM event_retention_backfill")
+
+
+async def _install_and_backfill(conn: asyncpg.Connection) -> None:
+    """Apply migration 133 and then 134, each committing on its own, as a boot does."""
+    for filename in (_MIGRATION, _BACKFILL):
+        migration = _load_migration(filename)
+        assert migration is not None
+        async with conn.transaction():
+            await migration.migrate(conn=conn)
 
 
 async def _trigger_installed(pool: asyncpg.Pool) -> bool:
@@ -204,19 +215,17 @@ async def test_the_watermark_starts_at_the_old_boundary_for_vaults_that_have_eve
         await _insert_event(setup_pool, with_events, "document.update", "alice")
         await _as_before_the_migration(setup_pool)
 
-        migration = _load_migration(_MIGRATION)
-        assert migration is not None
         async with setup_pool.acquire() as conn:
-            await migration.migrate(conn=conn)
+            await _install_and_backfill(conn)
         assert await _watermarks(setup_pool) == {with_events: earliest - 1}
         assert await _trigger_installed(setup_pool)
 
-        # Applying it again keeps a mark raised since.
+        # Applying them again keeps a mark raised since.
         await setup_pool.execute(
             "UPDATE event_retention_watermarks SET deleted_through = $2 WHERE vault_id = $1", with_events, earliest
         )
         async with setup_pool.acquire() as conn:
-            await migration.migrate(conn=conn)
+            await _install_and_backfill(conn)
         assert await _watermarks(setup_pool) == {with_events: earliest}
 
 
@@ -236,10 +245,8 @@ async def test_a_deletion_before_the_migration_cannot_be_reconstructed(monkeypat
         kept = await _insert_event(setup_pool, vault_id, "document.put", "alice")
         deleted = await _insert_event(setup_pool, vault_id, "document.update", "alice")
         await setup_pool.execute("DELETE FROM events WHERE id = $1", deleted)
-        migration = _load_migration(_MIGRATION)
-        assert migration is not None
         async with setup_pool.acquire() as conn:
-            await migration.migrate(conn=conn)
+            await _install_and_backfill(conn)
         assert await _watermarks(setup_pool) == {vault_id: kept - 1}
 
         later = await _insert_event(setup_pool, vault_id, "document.update", "alice")
@@ -269,14 +276,13 @@ async def test_applying_the_migration_again_sets_no_starting_mark():
     async with _fresh_database() as setup_pool:
         vault_id = await _make_vault(setup_pool, "retention-reapplied")
         await _insert_event(setup_pool, vault_id, "document.put", "alice")
-        migration = _load_migration(_MIGRATION)
-        assert migration is not None
         async with setup_pool.acquire() as conn:
-            await migration.migrate(conn=conn)
-            await migration.migrate(conn=conn)
+            await _install_and_backfill(conn)
+            await _install_and_backfill(conn)
 
         assert await _watermarks(setup_pool) == {}
         assert await _trigger_installed(setup_pool)
+        assert await setup_pool.fetchval("SELECT count(*) FROM event_retention_backfill") == 0
 
 
 async def test_a_delete_by_an_earlier_release_records_the_watermark(monkeypatch):
@@ -307,12 +313,12 @@ async def test_a_delete_by_an_earlier_release_records_the_watermark(monkeypatch)
 
 
 @pytest.mark.parametrize("first", ["delete", "migration"])
-async def test_a_delete_during_the_migration_is_recorded_or_waits(first: str):
-    """No delete falls between the starting marks and the trigger.
+async def test_a_delete_during_the_install_is_recorded_or_waits(first: str):
+    """No delete falls between the backfill boundary and the trigger.
 
-    A delete already under way when the migration starts finishes first, and
-    the starting marks see its result; one that starts while the migration
-    runs waits for it, and the trigger records it.
+    A delete already under way when migration 133 starts finishes first, and
+    the starting marks see its result; one that starts while 133 runs waits
+    for it, and the trigger records it.
     """
     async with _fresh_database() as setup_pool:
         database = await setup_pool.fetchval("SELECT current_database()")
@@ -320,7 +326,8 @@ async def test_a_delete_during_the_migration_is_recorded_or_waits(first: str):
         event_ids = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(3)]
         await _as_before_the_migration(setup_pool)
         migration = _load_migration(_MIGRATION)
-        assert migration is not None
+        backfill = _load_migration(_BACKFILL)
+        assert migration is not None and backfill is not None
         migrating = await asyncpg.connect(_database_dsn(database))
         deleting = await asyncpg.connect(_database_dsn(database))
         try:
@@ -344,6 +351,7 @@ async def test_a_delete_during_the_migration_is_recorded_or_waits(first: str):
                 assert not deletion_task.done()
                 await migration_tx.commit()
                 await asyncio.wait_for(deletion_task, 5)
+            await backfill.migrate(conn=migrating)
         finally:
             await migrating.close()
             await deleting.close()
@@ -430,3 +438,225 @@ async def test_the_migration_gives_up_with_an_error_that_names_the_cause(monkeyp
         # Nothing of the migration stayed behind.
         assert not await _trigger_installed(setup_pool)
         assert await _watermarks(setup_pool) == {}
+        assert await setup_pool.fetchval("SELECT count(*) FROM event_retention_backfill") == 0
+
+
+async def test_applying_the_install_again_asks_for_no_lock(monkeypatch):
+    """With the trigger in place, migration 133 has nothing to do, and waits for nothing.
+
+    It used to ask for the events lock before it looked for the trigger, so
+    applying it again beside a transaction that kept an event open waited
+    through every attempt and then failed.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        vault_id = await _make_vault(setup_pool, "retention-reinstall")
+        migration = _load_migration(_MIGRATION)
+        assert migration is not None
+        monkeypatch.setattr(migration, "ATTEMPTS", 3)
+        monkeypatch.setattr(migration, "FIRST_BACKOFF_SECONDS", 0.05)
+        long_writer = await asyncpg.connect(_database_dsn(database))
+        migrator = await asyncpg.connect(_database_dsn(database))
+        try:
+            holding = long_writer.transaction()
+            await holding.start()
+            await _write_event(long_writer, vault_id)
+            started = time.monotonic()
+            await asyncio.wait_for(migration.migrate(conn=migrator), 10)
+            elapsed = time.monotonic() - started
+            await holding.rollback()
+        finally:
+            await long_writer.close()
+            await migrator.close()
+
+        assert elapsed < 0.5
+        assert await _trigger_installed(setup_pool)
+        assert await setup_pool.fetchval("SELECT count(*) FROM event_retention_backfill") == 0
+
+
+async def test_an_install_that_finds_the_trigger_under_its_lock_adds_nothing():
+    """Two installs at once: the second saw no trigger before it asked for the lock, and finds it once it holds it."""
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        assert migration is not None
+        first = await asyncpg.connect(_database_dsn(database))
+        second = await asyncpg.connect(_database_dsn(database))
+        try:
+            installing = first.transaction()
+            await installing.start()
+            await migration.migrate(conn=first)
+            again = asyncio.create_task(migration.migrate(conn=second))
+            await _waits_for(setup_pool, second, first)
+            await installing.commit()
+            await asyncio.wait_for(again, 10)
+        finally:
+            await first.close()
+            await second.close()
+
+        assert (
+            await setup_pool.fetchval(
+                "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'events'::regclass "
+                "AND tgname = 'akb_events_record_deletions'"
+            )
+            == 1
+        )
+        # One boundary, the first install's.
+        assert await setup_pool.fetchval("SELECT count(*) FROM event_retention_backfill") == 1
+
+
+async def test_the_install_reads_no_event_rows_under_its_lock():
+    """Migration 133 holds inserts and deletes on events, so it must not scan them.
+
+    It used to set the starting marks under that lock with a grouped scan of
+    every event, and with the sweeper off, as when no Redis is configured, the
+    table only grows. The boundary is read from the end of the primary key,
+    and the scan is migration 134's, without the lock.
+    """
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "retention-install-scan")
+        await setup_pool.execute(
+            """
+            INSERT INTO events (vault_id, kind, resource_uri, actor_id, payload)
+            SELECT $1, 'document.put', 'akb://event-test/document.put', 'alice', '{}'::jsonb
+              FROM generate_series(1, 2000)
+            """,
+            vault_id,
+        )
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        assert migration is not None
+        async with setup_pool.acquire() as conn:
+            async with conn.transaction():
+                await migration.migrate(conn=conn)
+                read = await conn.fetchrow(
+                    "SELECT seq_tup_read, idx_tup_fetch FROM pg_stat_xact_user_tables WHERE relname = 'events'"
+                )
+
+        assert read["seq_tup_read"] + read["idx_tup_fetch"] <= 1, dict(read)
+        assert await _trigger_installed(setup_pool)
+
+
+async def test_event_writes_go_through_while_the_backfill_runs():
+    """Migration 134 reads events without the lock that stops writes."""
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        vault_id = await _make_vault(setup_pool, "retention-backfill-writes")
+        other = await _make_vault(setup_pool, "retention-backfill-other")
+        first = await _insert_event(setup_pool, vault_id, "document.put", "alice")
+        await _insert_event(setup_pool, vault_id, "document.update", "alice")
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        backfill = _load_migration(_BACKFILL)
+        assert migration is not None and backfill is not None
+        async with setup_pool.acquire() as conn:
+            async with conn.transaction():
+                await migration.migrate(conn=conn)
+        backfilling = await asyncpg.connect(_database_dsn(database))
+        writer = await asyncpg.connect(_database_dsn(database))
+        try:
+            setting = backfilling.transaction()
+            await setting.start()
+            await backfill.migrate(conn=backfilling)
+            # The backfill has not committed; a write to events does not wait for it.
+            started = time.monotonic()
+            await asyncio.wait_for(_write_event(writer, other), 5)
+            waited = time.monotonic() - started
+            await setting.commit()
+        finally:
+            await backfilling.close()
+            await writer.close()
+
+        assert waited < 0.5
+        assert await _watermarks(setup_pool) == {vault_id: first - 1}
+
+
+@pytest.mark.parametrize("first", ["delete", "backfill"])
+async def test_a_delete_racing_the_backfill_is_recorded_and_no_lower_mark_replaces_it(first: str):
+    """Migration 134 runs beside deletes, and its marks must merge with the trigger's.
+
+    Whichever writes the Vault's mark first, the other waits for it and keeps
+    the higher of the two: the delete stays recorded, and the starting mark,
+    just below the earliest event the backfill saw, does not lower it.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        vault_id = await _make_vault(setup_pool, "retention-racing")
+        event_ids = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(3)]
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        backfill = _load_migration(_BACKFILL)
+        assert migration is not None and backfill is not None
+        async with setup_pool.acquire() as conn:
+            async with conn.transaction():
+                await migration.migrate(conn=conn)
+        backfilling = await asyncpg.connect(_database_dsn(database))
+        deleting = await asyncpg.connect(_database_dsn(database))
+        try:
+            setting = backfilling.transaction()
+            deletion = deleting.transaction()
+            if first == "delete":
+                await deletion.start()
+                # The trigger writes the Vault's mark; the delete has not committed.
+                await deleting.execute("DELETE FROM events WHERE id = $1", event_ids[1])
+                await setting.start()
+                # The backfill still sees the deleted event, and waits for the mark's row.
+                applying = asyncio.create_task(backfill.migrate(conn=backfilling))
+                await _waits_for(setup_pool, backfilling, deleting)
+                await deletion.commit()
+                await asyncio.wait_for(applying, 5)
+                await setting.commit()
+            else:
+                await setting.start()
+                await backfill.migrate(conn=backfilling)
+                await deletion.start()
+                # The trigger waits for the backfill's mark.
+                removing = asyncio.create_task(deleting.execute("DELETE FROM events WHERE id = $1", event_ids[1]))
+                await _waits_for(setup_pool, deleting, backfilling)
+                await setting.commit()
+                await asyncio.wait_for(removing, 5)
+                await deletion.commit()
+        finally:
+            await backfilling.close()
+            await deleting.close()
+
+        assert await _watermarks(setup_pool) == {vault_id: event_ids[1]}
+
+
+async def test_the_backfill_gives_no_mark_to_a_vault_whose_events_all_came_after_the_install(monkeypatch):
+    """Events above the boundary are the trigger's alone.
+
+    A Vault that was empty when the trigger was installed, and has events by
+    the time the backfill runs, would otherwise get a mark just below its
+    first event, and a cursor taken while it was empty would be refused.
+    """
+    async with _fresh_database() as setup_pool:
+        older = await _make_vault(setup_pool, "retention-before-install")
+        newer = await _make_vault(setup_pool, "retention-after-install")
+        user_id = await _make_reader(setup_pool, "retention-after-reader", [newer])
+        first_older = await _insert_event(setup_pool, older, "document.put", "alice")
+        await _as_before_the_migration(setup_pool)
+        migration = _load_migration(_MIGRATION)
+        backfill = _load_migration(_BACKFILL)
+        assert migration is not None and backfill is not None
+        # A cursor taken while the newer Vault was empty.
+        cursor = EventCursorCodec(_CURSOR_SECRET).encode(newer, (), 0)
+        async with setup_pool.acquire() as conn:
+            async with conn.transaction():
+                await migration.migrate(conn=conn)
+        # Between the two migrations: other events, then the newer Vault's first.
+        for _ in range(5):
+            await _insert_event(setup_pool, older, "document.update", "alice")
+        first_newer = await _insert_event(setup_pool, newer, "document.put", "alice")
+        async with setup_pool.acquire() as conn:
+            await backfill.migrate(conn=conn)
+
+        assert await _watermarks(setup_pool) == {older: first_older - 1}
+        async with _tail(monkeypatch, setup_pool) as tail:
+            resumed = await tail.open(user_id=user_id, vault="retention-after-install", last_event_id=cursor)
+            try:
+                delivered = await asyncio.wait_for(_changes(resumed, 1), 5)
+            finally:
+                await resumed.aclose()
+        assert _positions(delivered) == [first_newer]

@@ -10,27 +10,24 @@ refused only when it is below it.
 A statement trigger on events raises the mark in every statement that
 deletes, so deletions are recorded whichever code issues them, including the
 sweeper of an earlier release that runs beside this one during a rolling
-deployment or after a rollback.
+deployment or after a rollback. A TRUNCATE of events records nothing; only
+the test runtime's reset uses one, and it truncates this table and the Vaults
+with it.
 
-The starting marks and the trigger are installed in one step while deletes
-and inserts on events wait, so no delete falls between them. Deletions before
-this migration left no record, and nothing can reconstruct them: a Vault that
-still has events starts just below its earliest one, the boundary the tail
-used until now, so history that may already have been swept is still refused,
-and a Vault with no events starts without a mark. A later event deleted before
-the migration while an earlier one was kept therefore stays unknown, as it was
-before. Once the trigger exists, applying this again sets no starting mark:
-one set later could claim a deletion that never happened. A TRUNCATE of events
-records nothing; only the test runtime's reset uses one, and it truncates this
-table and the Vaults with it.
+This migration installs the trigger and records the backfill boundary, the
+highest event id at that moment, while inserts and deletes on events wait;
+migration 134 then sets the starting marks from the events at or below the
+boundary, without that lock. Nothing here scans events, so the lock lasts as
+long on a large table as on a small one.
 
-The step needs SHARE ROW EXCLUSIVE on events, which waits for every open
+Installing needs SHARE ROW EXCLUSIVE on events, which waits for every open
 transaction that wrote an event, and a lock request that waits queues every
-later event insert, of any Vault, behind it. So the migration asks for the
-lock with a short timeout inside a savepoint, holds nothing while it backs
-off, and asks again; after a bounded number of attempts it stops with an
-error that names the cause. Once it holds the lock, it waits only for one
-grouped scan of events, which retention keeps small.
+later event insert, of any Vault, behind it. So the migration first looks for
+the trigger and, when it is there, does nothing and asks for no lock.
+Otherwise it asks for the lock with a short timeout inside a savepoint, holds
+nothing while it backs off, and asks again; after a bounded number of attempts
+it stops with an error that names the cause. Under the lock the SQL looks for
+the trigger again, in case another session installed it meanwhile.
 """
 
 import asyncio
@@ -42,6 +39,12 @@ LOCK_TIMEOUT = "500ms"
 ATTEMPTS = 40
 FIRST_BACKOFF_SECONDS = 0.25
 MAX_BACKOFF_SECONDS = 2.0
+TRIGGER_INSTALLED = """
+    SELECT EXISTS (
+        SELECT 1 FROM pg_trigger
+         WHERE tgrelid = to_regclass('events') AND tgname = 'akb_events_record_deletions'
+    )
+"""
 
 
 async def migrate(conn=None):
@@ -51,6 +54,8 @@ async def migrate(conn=None):
         pool = await get_pool()
         async with pool.acquire() as connection:
             await migrate(connection)
+        return
+    if await conn.fetchval(TRIGGER_INSTALLED):
         return
     sql = Path(__file__).with_suffix(".sql").read_text()
     backoff = FIRST_BACKOFF_SECONDS
