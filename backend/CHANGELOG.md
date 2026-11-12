@@ -24,7 +24,9 @@ specifically; the proxy has its own log in
   retrying. `GET /health` reports the tail counters under `event_tail`.
   Migration 131 makes the `events` trigger's notification name the event's
   Vault, so an event wakes only that Vault's tails instead of every open tail.
-  Frames, cursors and heartbeats are unchanged.
+  Startup logs a warning when the pool leaves fewer than four connections
+  beside the tail budget and `write_lane_concurrency`. Frames, cursors and
+  heartbeats are unchanged.
 
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain

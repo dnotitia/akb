@@ -106,7 +106,10 @@ reader therefore stops receiving events within about a second, and an idle
 tail closes within one heartbeat. All tail database work in a process shares
 at most `event_tail_db_concurrency` connections; work beyond that waits for a
 free slot without holding a connection, so tail load cannot take the pool that
-other requests and the readiness probe need.
+other requests and the readiness probe need. At startup a server process logs
+a warning when its pool size (`pg_pool_max_size`, or `AKB_PG_POOL_MAX_SIZE`)
+less `event_tail_db_concurrency` and `write_lane_concurrency` leaves fewer
+than four connections for everything else.
 
 Limits per server process; each environment variable overrides its key:
 
