@@ -23,7 +23,7 @@ import pytest
 from app.db.transient import transient_error
 from app.exceptions import NotFoundError
 from app.models.document import DocumentPutRequest, DocumentUpdateRequest
-from app.repositories.document_repo import CollectionRepository
+from app.repositories.document_repo import CollectionRepository, DocumentRepository
 from app.repositories.events_repo import emit_event
 from app.services.collection_service import CollectionService
 from app.services.document_service import DocumentService
@@ -435,3 +435,67 @@ async def test_a_recursive_delete_also_deletes_a_sub_collection_created_before_i
             result = await asyncio.wait_for(deleting, timeout=_EVENT_LOCK_WAIT_SECONDS * 3)
         assert result["deleted_sub_collections"] == 2
         assert await pool.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", vault_id) == 0
+
+
+async def test_a_retry_after_a_collection_change_does_not_hold_the_document(tmp_path):
+    """The document moves to another collection while a write waits to lock
+    it. The write must give the document up before it asks for the new
+    collection: a recursive delete that holds that collection and waits for
+    the document would otherwise deadlock with it."""
+    git = GitService(storage_path=str(tmp_path))
+    service = DocumentService(git=git)
+    async with _fresh_database() as pool:
+        vault = "git-lock-retry"
+        vault_id = await _make_vault(pool, vault)
+        git.init_vault(vault)
+        await service.put(DocumentPutRequest(vault=vault, collection="b", title="Moving", content="body"))
+        doc_id = await pool.fetchval("SELECT id FROM documents WHERE vault_id = $1", vault_id)
+        c_id = await pool.fetchval(
+            "INSERT INTO collections (id, vault_id, path, name) VALUES ($1, $2, 'c', 'c') RETURNING id",
+            uuid.uuid4(), vault_id,
+        )
+        locking: asyncio.Task | None = None
+        async with (
+            pool.acquire() as writer,
+            pool.acquire() as mover,
+            pool.acquire() as deleter,
+            pool.acquire() as observer,
+            _OpenTransaction(writer),
+            _OpenTransaction(deleter) as deleting,
+        ):
+            try:
+                async with _OpenTransaction(mover) as moving:
+                    await mover.execute("SELECT 1 FROM documents WHERE id = $1 FOR UPDATE", doc_id)
+                    # The write reads the document in `b`, locks `b`, then waits for the document.
+                    locking = asyncio.create_task(service._lock_document(
+                        DocumentRepository(pool), writer, vault_id, str(doc_id), share_collection=True,
+                    ))
+                    await asyncio.wait_for(_a_backend_blocked_by(observer, mover), timeout=10)
+                    # The document moves from `b` to `c`.
+                    await mover.execute(
+                        "UPDATE documents SET collection_id = $1, path = 'c/moving.md' WHERE id = $2",
+                        c_id, doc_id,
+                    )
+                    # A recursive delete of `c` queues for `c`, which the move's
+                    # reference to it holds, so it gets `c` before the write does.
+                    taking_c = asyncio.create_task(deleter.execute(
+                        "SELECT 1 FROM collections WHERE id = $1 FOR UPDATE", c_id,
+                    ))
+                    await asyncio.wait_for(_until_blocked(observer, 2), timeout=10)
+                    await moving.commit()
+                await asyncio.wait_for(taking_c, timeout=10)
+                # The write finds the document in `c` and waits for `c`.
+                await asyncio.wait_for(_a_backend_blocked_by(observer, deleter), timeout=10)
+                # The delete removes the document while the write waits for `c`.
+                await asyncio.wait_for(
+                    deleter.execute("DELETE FROM documents WHERE id = $1", doc_id),
+                    timeout=_EVENT_LOCK_WAIT_SECONDS,
+                )
+                await deleting.commit()
+                with pytest.raises(NotFoundError):
+                    await asyncio.wait_for(locking, timeout=10)
+            finally:
+                if locking is not None and not locking.done():
+                    locking.cancel()
+                    with contextlib.suppress(BaseException):
+                        await locking

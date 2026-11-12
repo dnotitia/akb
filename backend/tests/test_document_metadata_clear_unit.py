@@ -3,7 +3,7 @@
 Persistence I/O is in memory; the real merge, Markdown serialization, revision
 write and subsequent service GET run to guard the complete metadata round-trip.
 """
-
+import contextlib
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -99,7 +99,8 @@ async def test_metadata_clear_round_trip(monkeypatch, backend, operation):
 
         @asynccontextmanager
         async def path_lock(*_, **__):
-            yield object()
+            # Statements are faked; only the savepoints run on the connection.
+            yield SimpleNamespace(transaction=contextlib.nullcontext)
 
         monkeypatch.setattr(service, "_path_lock", path_lock)
         monkeypatch.setattr(git_module.asset_service, "claim_document_assets", AsyncMock(return_value=set()))

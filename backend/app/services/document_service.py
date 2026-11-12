@@ -413,6 +413,10 @@ def validate_vault_name(name: str) -> None:
         )
 
 
+class _DocumentMoved(Exception):
+    """The document changed path or collection between its read and its lock."""
+
+
 class DocumentService:
     def __init__(self, git: GitService | None = None):
         # The Git arm's storage handle, NOT part of the service interface.
@@ -585,22 +589,31 @@ class DocumentService:
         asked for the collection would deadlock with it. The collection is read
         without a lock, locked (``FOR KEY SHARE`` with ``share_collection``,
         otherwise ``FOR NO KEY UPDATE``), and checked again once the document
-        row is locked; a document that changed collection meanwhile is read
-        again.
+        row is locked. Each attempt runs in a savepoint: if the document
+        changed collection meanwhile, rolling it back releases both locks, and
+        the next attempt starts from a fresh read, so a retry never asks for a
+        collection while it holds the document.
         """
         for _ in range(3):
-            current = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
-            if not current:
-                raise NotFoundError("Document", doc_ref)
-            await lock_collection_rows(
-                conn, [current.get("collection_id")],
-                strength="key share" if share_collection else "no key update",
-            )
-            row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref, for_update=True)
-            if not row:
-                raise NotFoundError("Document", doc_ref)
-            if (row.get("id"), row.get("collection_id")) == (current.get("id"), current.get("collection_id")):
-                return row
+            try:
+                async with conn.transaction():
+                    current = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
+                    if not current:
+                        raise NotFoundError("Document", doc_ref)
+                    await lock_collection_rows(
+                        conn, [current.get("collection_id")],
+                        strength="key share" if share_collection else "no key update",
+                    )
+                    row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref, for_update=True)
+                    if not row:
+                        raise NotFoundError("Document", doc_ref)
+                    if (row.get("id"), row.get("collection_id")) != (
+                        current.get("id"), current.get("collection_id")
+                    ):
+                        raise _DocumentMoved
+                    return row
+            except _DocumentMoved:
+                continue
         raise ConflictError(f"Document {doc_ref} changed collection during this write; retry it")
 
     async def _collection_for_write(
@@ -1386,31 +1399,38 @@ class DocumentService:
             # Re-read under the lock and recompute the target from fresh state.
             # Both collections are locked before the document, in the order a
             # recursive collection delete takes them (see _lock_document); the
-            # destination is created here if it is new. A document that moved
-            # meanwhile is read again.
+            # destination is created here if it is new. Each attempt runs in a
+            # savepoint: a document that moved meanwhile rolls it back,
+            # releasing the collection and document locks, and the next
+            # attempt starts from a fresh read.
             for _ in range(3):
-                current = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
-                if not current:
-                    raise NotFoundError("Document", doc_ref)
-                target_coll, _, _ = _target(current["path"], current["id"])
-                new_collection_id = (
-                    await self._collection_for_write(
-                        coll_repo, vault_id, target_coll, conn,
-                        also_lock=current.get("collection_id"),
-                    )
-                    if target_coll else None
-                )
-                if new_collection_id is None:
-                    await lock_collection_rows(conn, [current.get("collection_id")])
-                row = await doc_repo.find_by_ref_with_conn(
-                    conn, vault_id, doc_ref, for_update=True,
-                )
-                if not row:
-                    raise NotFoundError("Document", doc_ref)
-                if (row.get("id"), row["path"], row.get("collection_id")) == (
-                    current.get("id"), current["path"], current.get("collection_id")
-                ):
-                    break
+                try:
+                    async with conn.transaction():
+                        current = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
+                        if not current:
+                            raise NotFoundError("Document", doc_ref)
+                        target_coll, _, _ = _target(current["path"], current["id"])
+                        new_collection_id = (
+                            await self._collection_for_write(
+                                coll_repo, vault_id, target_coll, conn,
+                                also_lock=current.get("collection_id"),
+                            )
+                            if target_coll else None
+                        )
+                        if new_collection_id is None:
+                            await lock_collection_rows(conn, [current.get("collection_id")])
+                        row = await doc_repo.find_by_ref_with_conn(
+                            conn, vault_id, doc_ref, for_update=True,
+                        )
+                        if not row:
+                            raise NotFoundError("Document", doc_ref)
+                        if (row.get("id"), row["path"], row.get("collection_id")) != (
+                            current.get("id"), current["path"], current.get("collection_id")
+                        ):
+                            raise _DocumentMoved
+                except _DocumentMoved:
+                    continue
+                break
             else:
                 raise ConflictError(f"Document {doc_ref} moved during this write; retry it")
             old_path = row["path"]
