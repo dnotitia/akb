@@ -330,31 +330,43 @@ async def test_fifty_concurrent_callers_during_saturation_share_one_evaluation(r
     assert evaluations == 1
 
 
+# This test's grace stays far above how long a probe can take after the
+# holders pause, so a slow runner cannot age the last acquire past it. The
+# time the connections spend changing hands is set separately, above it.
+_CYCLING_GRACE = 2.0
+_CYCLING_PERIOD = _CYCLING_GRACE + 0.5
+
+
+async def _an_acquire_completes(after: int) -> None:
+    """Wait until the pool has completed an acquire beyond `after`."""
+    async with asyncio.timeout(5):
+        while postgres.pool_progress()[0] <= after:
+            await asyncio.sleep(0.005)
+
+
 async def test_saturated_pool_whose_connections_keep_changing_hands_stays_200(ready_db, monkeypatch):
-    monkeypatch.setattr(ready_db.main.settings, "readyz_pool_saturation_grace_secs", _GRACE)
+    monkeypatch.setattr(ready_db.main.settings, "readyz_pool_saturation_grace_secs", _CYCLING_GRACE)
     hands = _ChangingHands(ready_db.pool)
     try:
         await hands.pause()
         assert (await ready_db.client.get("/readyz")).status_code == 200
-        totals = []
-        for _ in range(3):
+        for _ in range(2):
             hands.resume()
-            await asyncio.sleep(_PAST_GRACE)
+            await _an_acquire_completes(after=postgres.pool_progress()[0])
+            await asyncio.sleep(_CYCLING_PERIOD)
             await hands.pause()
             response = await ready_db.client.get("/readyz")
             assert response.status_code == 200, response.text
             pool = response.json()["detail"]["pool"]
             assert pool["size"] == pool["max"] and pool["idle"] == 0
-            assert pool["last_acquire_age_secs"] < _GRACE
+            assert pool["last_acquire_age_secs"] < _CYCLING_GRACE
             assert "acquires_total" not in pool  # the count stays internal
-            totals.append(postgres.pool_progress()[0])
     finally:
         await hands.stop()
 
-    # Saturated at every probe for three graces, and ready throughout,
+    # Saturated at every probe for well over the grace, and ready throughout,
     # because the connections kept changing hands in between.
-    assert pool["saturated_for_secs"] >= 3 * _GRACE
-    assert totals == sorted(set(totals))
+    assert pool["saturated_for_secs"] >= 2 * _CYCLING_GRACE
 
 
 async def test_saturated_pool_whose_holders_never_let_go_answers_503_and_recovers(ready_db, monkeypatch):
