@@ -19,16 +19,30 @@ specifically; the proxy has its own log in
   a connection. A transaction of several Vaults is admitted for all of them at
   once. A wait longer than `vault_write_queue_timeout_secs` (default
   10 seconds) fails with a retryable `write_busy` (HTTP 429, `Retry-After: 1`)
-  before the write's event, Git commit, document, prepared Native payload or
-  File lease renewal; a refused File replacement keeps its upload for the same
-  confirmation to be sent again. Reads are not admitted: row reads through the
-  table API run in a read-only transaction, and `akb_sql` runs each statement
-  in a read-only transaction first and runs it again as an admitted write only
-  when PostgreSQL refuses it there. Such a write is admitted for the Vaults
-  whose tables it changes as well as those it declares. A new Bare Git Vault
-  holds its write lane and admission through its seed document, and a write
-  whose Vault was replaced under its name starts again for the new Vault, or
-  fails with a conflict when it was replaced twice.
+  before the write's event, Git commit, document or prepared Native payload; a
+  File upload confirmation refused at its publication keeps the lease renewal
+  it committed before, and a refused File replacement keeps its upload for the
+  same confirmation to be sent again. A Native recursive collection delete
+  refused after some of its documents went says so: `partially_applied` and a
+  hint that sending it again continues it.
+
+  Reads are not admitted: row reads through the table API run in a read-only
+  transaction, and `akb_sql` and `POST /api/v1/tables/{vault}/sql` take a new
+  `read_only` option, false by default, that runs the statement in a
+  read-only transaction without admission. Otherwise a statement is a write
+  and runs once, admitted for the Vaults it declares and for those whose
+  tables its plan (`EXPLAIN`) changes; reading the plan is limited by
+  `akb_sql_plan_concurrency` (default 2) and `akb_sql_plan_lock_timeout_ms`
+  (default 500), past which the write fails with `write_busy`. A write that
+  changes rows of an undeclared Vault through a function is rolled back with
+  an `invalid_argument` error naming it.
+
+  A new Bare Git Vault holds its write-lane gate and admission through its
+  seed document but takes a global write-lane slot only for each Git
+  operation. A write whose Vault was replaced under its name starts again for
+  the new Vault, or fails with a conflict when it was replaced twice. An app
+  rollout target refused by admission is deferred for 5 seconds so other
+  rollouts proceed.
 
 - On the Native authority a recursive collection delete is now atomic per
   document and completes when run again. Each document's delete commits with
