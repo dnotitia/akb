@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
+import httpx
 import pytest
 
 from app.config import settings
@@ -20,6 +21,7 @@ from app.services import app_resource_service as resources
 from app.services import app_rollout_service as rollout
 from app.services import app_rollout_worker as worker
 from app.services import access_service
+from app.services import auth_service
 from app.services.app_identity_service import AppPrincipal
 from app.services.auth_service import AuthenticatedUser
 
@@ -538,9 +540,14 @@ async def test_app_status_requires_a_live_installation_read_grant(lifecycle_pool
         )
 
 
-async def test_member_active_status_reads_live_lifecycle_and_requires_real_membership(
-    lifecycle_pool,
+async def test_active_status_reads_live_lifecycle_and_enforces_vault_authority(
+    lifecycle_pool, monkeypatch, tmp_path,
 ):
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
+    monkeypatch.setattr(settings, "auth_mode", "local")
+    monkeypatch.setattr(auth_service, "get_pool", lambda: lifecycle_pool)
+    from app.main import app
+
     app_id = await _app(lifecycle_pool, "member-status")
     release_id = await _release(lifecycle_pool, app_id, "1.0.0")
     next_release_id = await _release(lifecycle_pool, app_id, "2.0.0")
@@ -559,7 +566,6 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
                 (vault_id, reader_id, "reader", _ADMIN_ID),
                 (vault_id, writer_id, "writer", _ADMIN_ID),
                 (vault_id, vault_admin_id, "admin", _ADMIN_ID),
-                (vault_id, _ADMIN_ID, "admin", _ADMIN_ID),
                 (foreign_vault_id, foreign_admin_id, "admin", _ADMIN_ID),
             ],
         )
@@ -584,21 +590,74 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
         (writer_id, "writer"),
         (vault_admin_id, "vault-admin"),
     ]
-    for user_id, label in members:
-        before = await lifecycle_pool.fetchval(
-            "SELECT count(*) FROM vault_app_installations WHERE id=$1", installation_id
+    admin_token = auth_service.create_jwt(str(_ADMIN_ID), _admin().username)
+    member_tokens = {
+        label: auth_service.create_jwt(str(user_id), label) for user_id, label in members
+    }
+    path = f"/api/v1/apps/{app_id}/installations/{vault_id}"
+
+    async def get(path: str, token: str) -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test",
+        ) as client:
+            return await client.get(path, headers={"Authorization": f"Bearer {token}"})
+
+    async def assert_active(path: str, token: str, expected: bool) -> None:
+        response = await get(f"{path}/active", token)
+        assert response.status_code == 200, response.text
+        assert response.json() == {"active": expected}
+        assert response.headers["cache-control"] == "no-store"
+
+    async def assert_denied(path: str, token: str) -> None:
+        response = await get(f"{path}/active", token)
+        assert response.status_code == 403, response.text
+        assert response.json()["code"] == "permission_denied"
+        assert response.headers["cache-control"] == "no-store"
+
+    async def issue_token(user_id: uuid.UUID, key_class: str, vault_scope: dict | None = None) -> str:
+        token, token_hash, prefix = auth_service.generate_pat(key_class)
+        await lifecycle_pool.execute(
+            """
+            INSERT INTO tokens (user_id, name, token_hash, token_prefix, scopes, vault_scope, key_class)
+            VALUES ($1, 'installation-status', $2, $3, '{read}', $4::jsonb, $5)
+            """,
+            user_id,
+            token_hash,
+            prefix,
+            json.dumps(vault_scope) if vault_scope is not None else None,
+            key_class,
         )
-        status = await installation.get_member_installation_active_status(
-            app_id,
-            vault_id,
-            user=_member_session(user_id, label),
-            correlation_id=str(uuid.uuid4()),
-        )
-        after = await lifecycle_pool.fetchval(
-            "SELECT count(*) FROM vault_app_installations WHERE id=$1", installation_id
-        )
-        assert status == {"active": True}
-        assert after == before
+        return token
+
+    detail = await get(path, admin_token)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["installation_id"] == str(installation_id)
+    await assert_active(path, admin_token, True)
+
+    service_admin_id = await _user(lifecycle_pool, "service-admin")
+    await lifecycle_pool.execute(
+        "UPDATE users SET account_kind='service', is_admin=TRUE WHERE id=$1", service_admin_id,
+    )
+    service_admin_token = await issue_token(service_admin_id, "service")
+    assert (await get(path, service_admin_token)).status_code == 200
+    await assert_active(path, service_admin_token, True)
+
+    scoped_admin_token = await issue_token(_ADMIN_ID, "pat", {"prefixes": ["member-foreign-"]})
+    assert (await get(path, scoped_admin_token)).status_code == 403
+    await assert_denied(path, scoped_admin_token)
+
+    service_member_id = await _user(lifecycle_pool, "service-member")
+    await lifecycle_pool.execute("UPDATE users SET account_kind='service' WHERE id=$1", service_member_id)
+    await lifecycle_pool.execute(
+        "INSERT INTO vault_access (vault_id, user_id, role, granted_by) VALUES ($1, $2, 'reader', $3)",
+        vault_id,
+        service_member_id,
+        _ADMIN_ID,
+    )
+    await assert_denied(path, await issue_token(service_member_id, "service"))
+
+    for token in member_tokens.values():
+        await assert_active(path, token, True)
 
     for lifecycle, desired, current, blocked_reason, expected_active in (
         ("installing", release_id, None, None, False),
@@ -623,13 +682,8 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
                 current,
                 blocked_reason,
             )
-        status = await installation.get_member_installation_active_status(
-            app_id,
-            vault_id,
-            user=_member_session(reader_id, "reader"),
-            correlation_id=str(uuid.uuid4()),
-        )
-        assert status == {"active": expected_active}
+        for token in (member_tokens["reader"], admin_token):
+            await assert_active(path, token, expected_active)
 
     async with lifecycle_pool.acquire() as conn:
         await conn.execute(
@@ -664,12 +718,7 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
         user=_admin(),
         correlation_id=str(uuid.uuid4()),
     )
-    assert await installation.get_member_installation_active_status(
-        app_id,
-        vault_id,
-        user=_member_session(reader_id, "reader"),
-        correlation_id=str(uuid.uuid4()),
-    ) == {"active": False}
+    await assert_active(path, member_tokens["reader"], False)
     restored = await _command(
         lifecycle_pool,
         app_id,
@@ -678,12 +727,7 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
         mode="restore",
     )
     assert restored["lifecycle"] == "active"
-    assert await installation.get_member_installation_active_status(
-        app_id,
-        vault_id,
-        user=_member_session(reader_id, "reader"),
-        correlation_id=str(uuid.uuid4()),
-    ) == {"active": True}
+    await assert_active(path, member_tokens["reader"], True)
 
     without_installation_vault_id = await _vault(
         lifecycle_pool, "member-status-empty", owner_id=owner_id
@@ -695,39 +739,22 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
             reader_id,
             _ADMIN_ID,
         )
-    assert await installation.get_member_installation_active_status(
-        app_id,
-        without_installation_vault_id,
-        user=_member_session(reader_id, "reader"),
-        correlation_id=str(uuid.uuid4()),
-    ) == {"active": False}
-
-    missing = await installation.get_member_installation_active_status(
-        uuid.uuid4(),
-        vault_id,
-        user=_member_session(reader_id, "reader"),
-        correlation_id=str(uuid.uuid4()),
-    )
-    assert missing == {"active": False}
+    empty_path = f"/api/v1/apps/{app_id}/installations/{without_installation_vault_id}"
+    await assert_active(f"/api/v1/apps/{uuid.uuid4()}/installations/{vault_id}", member_tokens["reader"], False)
+    await assert_active(empty_path, admin_token, False)
+    await assert_active(empty_path, member_tokens["reader"], False)
 
     async with lifecycle_pool.acquire() as conn:
         await conn.execute("UPDATE vaults SET public_access='reader' WHERE id=$1", vault_id)
-    denials: list[str] = []
-    for user, requested_app_id, requested_vault_id in (
-        (_member_session(outsider_id, "outsider"), app_id, vault_id),
-        (_member_session(foreign_admin_id, "foreign-admin"), app_id, vault_id),
-        (_admin(), app_id, vault_id),
-        (_member_session(outsider_id, "outsider"), uuid.uuid4(), uuid.uuid4()),
-    ):
-        with pytest.raises(ForbiddenError) as denied:
-            await installation.get_member_installation_active_status(
-                requested_app_id,
-                requested_vault_id,
-                user=user,
-                correlation_id=str(uuid.uuid4()),
-            )
-        denials.append(denied.value.message)
-    assert denials == ["Installation request denied"] * len(denials)
+    outsider_token = auth_service.create_jwt(str(outsider_id), "outsider")
+    foreign_admin_token = auth_service.create_jwt(str(foreign_admin_id), "foreign-admin")
+    await assert_denied(path, outsider_token)
+    await assert_denied(path, foreign_admin_token)
+    missing_vault_path = f"/api/v1/apps/{app_id}/installations/{uuid.uuid4()}"
+    await assert_denied(missing_vault_path, outsider_token)
+    missing_vault = await get(f"{missing_vault_path}/active", admin_token)
+    assert missing_vault.status_code == 404, missing_vault.text
+    assert missing_vault.headers["cache-control"] == "no-store"
 
     async with lifecycle_pool.acquire() as conn:
         await conn.execute(
@@ -735,13 +762,12 @@ async def test_member_active_status_reads_live_lifecycle_and_requires_real_membe
             vault_id,
             reader_id,
         )
-    with pytest.raises(ForbiddenError, match="Installation request denied"):
-        await installation.get_member_installation_active_status(
-            app_id,
-            vault_id,
-            user=_member_session(reader_id, "reader"),
-            correlation_id=str(uuid.uuid4()),
-        )
+    await assert_denied(path, member_tokens["reader"])
+
+    async with lifecycle_pool.acquire() as conn:
+        await conn.execute("UPDATE vaults SET status='archived' WHERE id=$1", vault_id)
+    await assert_denied(path, admin_token)
+    await assert_active(path, member_tokens["owner"], True)
 
 
 async def test_uninstall_revokes_immediately_and_replays_without_deleting_resources(

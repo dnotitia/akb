@@ -785,7 +785,7 @@ async def test_member_installation_unavailable_fault_is_bounded_and_reversible(
         app_installation_service, "check_vault_access", allow_owner_access
     )
 
-    before = await app_installation_service.get_member_installation_active_status(
+    before = await app_installation_service.get_installation_active_status(
         app_id, vault_id, user=user, correlation_id="before-fault"
     )
 
@@ -799,13 +799,13 @@ async def test_member_installation_unavailable_fault_is_bounded_and_reversible(
         "fault_injection", "status_active", True, "member_installation_unavailable"
     )
     with pytest.raises(AKBError) as unavailable:
-        await app_installation_service.get_member_installation_active_status(
+        await app_installation_service.get_installation_active_status(
             app_id, vault_id, user=user, correlation_id="during-fault"
         )
     disabled = await runtime.fixture_control(
         "fault_injection", "status_active", False, "member_installation_unavailable"
     )
-    after = await app_installation_service.get_member_installation_active_status(
+    after = await app_installation_service.get_installation_active_status(
         app_id, vault_id, user=user, correlation_id="after-fault"
     )
     other_scenario = E2ERuntime(make_config(tmp_path / "other"))
