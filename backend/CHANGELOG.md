@@ -7,17 +7,18 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
-- On the Native authority a recursive collection delete is now one
-  transaction. It deleted each document in a transaction of its own, so a
-  failure partway, such as a `write_busy` from the Vault's event lock, left
-  the documents deleted so far deleted while the collections stayed. The
-  documents are now deleted together with the collections, files and tables,
-  after every document's row and path is locked, and their `document.delete`
-  events are inserted with the `collection.delete` at the end; a failure rolls
-  back all of it. A document that another request deletes or moves out of the
-  collection meanwhile is left as it is and no longer counted in
-  `deleted_docs`; such a document used to fail the delete or be deleted at its
-  new path.
+- On the Native authority a recursive collection delete is now atomic per
+  document and completes when run again. Each document's delete commits with
+  its `document.delete` event in a short transaction that locks only that
+  document; the collections, files and tables follow with `collection.delete`
+  once no live document is left under the prefix. A failure part-way returns
+  the error and leaves the documents deleted so far deleted, each with its
+  event; the same delete run again continues with the rest. A document that
+  another request deletes or moves out of the collection meanwhile is left as
+  it is and not counted in `deleted_docs`; such a document used to fail the
+  delete or be deleted at its new path. In a database cut over from Bare Git
+  the delete used to fail every time on the preserved `documents` rows; it now
+  leaves them, and the collection rows they reference, in place.
 
 - A recursive collection delete no longer deletes the documents of a
   sub-collection that another request created under its prefix while it ran

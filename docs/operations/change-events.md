@@ -246,17 +246,27 @@ Known limits that predate the ordering change:
   write commits into an existing sub-collection after a recursive delete read
   the prefix's documents is not deleted, while its collection row is: the
   document stays without a collection row.
+- In a database cut over from Bare Git, the `documents` rows stay as immutable
+  history, and a trigger refuses to change them, including the `SET NULL` that
+  deleting a collection they reference would perform. A recursive collection
+  delete therefore leaves those rows and the collection rows they reference in
+  place (listed as `retained_collections` in the `collection.delete` payload),
+  while it deletes the Native documents, the other collections, files and
+  tables. Removing such a collection row needs a schema change.
 
-On the Native authority a recursive collection delete deletes its documents in
-its own transaction, together with the collections, files and tables under the
-prefix: it locks every document's Resource row, in id order, and then all of
-their paths before it deletes the first of them, and it inserts each document's
-`document.delete` and then the `collection.delete` as the transaction's last
-statements. A failure at any point, including a `write_busy` from the Vault's
-event lock, rolls back all of it, so the delete can simply be run again. A
-document that another request deletes or moves out of the prefix while the
-delete waits for its row is left as that request left it and is not counted in
-`deleted_docs`.
+On the Native authority a recursive collection delete removes the documents
+first, one at a time. Each document's delete and its `document.delete` commit
+together in a short transaction that locks only that document's Resource, so the
+delete never waits for a second Resource while it holds one. A document that
+another request deleted, or moved out of the prefix, meanwhile is left as that
+request left it and is not counted. The collections, files and tables under the
+prefix, with the `collection.delete`, follow in a last transaction, once no live
+document is left under the prefix; a document written there meanwhile is
+deleted in another round, up to three, before the delete gives up with a
+retryable conflict. A failure part-way, including a `write_busy` from the
+Vault's event lock, returns the error and leaves the documents deleted so far
+deleted, each with its event; running the same delete again continues with the
+documents that remain. `deleted_docs` counts the documents that call deleted.
 
 ## Regression verification
 
@@ -292,9 +302,13 @@ into a new sub-collection removes expired intents first, so none of them
 deadlocks with the delete.
 `test_collection_delete_native_atomic_postgres.py` holds the Vault's event lock
 after a Native recursive delete removed its first document and checks that the
-delete then fails with `write_busy` and leaves every document and collection in
-place, that its events commit together at its end, and that a document deleted
-by another request while the delete waits is not deleted or counted again.
+delete fails with `write_busy`, that the first document stays deleted with its
+event committed in its own transaction, and that running the delete again
+completes it; that the delete holds one document at a time; that a document
+deleted or moved out by another request while the delete waits is left alone
+and not counted; and, on a database cut over from Bare Git, that the delete
+leaves the preserved `documents` rows and the collection they reference and can
+run again.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native
