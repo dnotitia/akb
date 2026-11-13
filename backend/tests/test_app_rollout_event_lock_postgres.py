@@ -59,7 +59,7 @@ def _step(step_id: str, phase: str, operation: str, payload: dict) -> dict:
     return step
 
 
-def _manifest() -> tuple[dict, str, str]:
+def _manifest(app_key: str = "rollout-order") -> tuple[dict, str, str]:
     current = [_table("orders", ["flag"]), _table("items", ["note"])]
     desired = [_table("orders", ["flag", "extra"]), _table("items", ["note", "extra"])]
     upgrade = [
@@ -77,7 +77,7 @@ def _manifest() -> tuple[dict, str, str]:
     current_fingerprint = resources.canonical_table_fingerprint(current)
     manifest = {
         "manifest_version": 2,
-        "app_key": "rollout-order",
+        "app_key": app_key,
         "source_revision": "a" * 40,
         "image_digest": "sha256:" + "b" * 64,
         "schema_version": 3,
@@ -93,16 +93,18 @@ def _manifest() -> tuple[dict, str, str]:
     return manifest, rollout.manifest_checksum(manifest, version="2.0.0"), current_fingerprint
 
 
-async def _installation(pool: asyncpg.Pool, *, own_items: bool) -> tuple[uuid.UUID, uuid.UUID, str]:
+async def _installation(
+    pool: asyncpg.Pool, *, own_items: bool, vault: str = _VAULT, app_key: str = "rollout-order",
+) -> tuple[uuid.UUID, uuid.UUID, str]:
     """An installed app owning `orders` and `items`, with a pending upgrade.
 
     Without `own_items` the app loses `items` after the upgrade is requested,
     so the worker's second step fails its ownership check.
     """
-    manifest, checksum, current_fingerprint = _manifest()
+    manifest, checksum, current_fingerprint = _manifest(app_key)
     async with pool.acquire() as conn:
         app_id = await conn.fetchval(
-            "INSERT INTO app_definitions(app_key) VALUES('rollout-order') RETURNING id",
+            "INSERT INTO app_definitions(app_key) VALUES($1) RETURNING id", app_key,
         )
         old_id, new_id = [
             await conn.fetchval(
@@ -113,7 +115,7 @@ async def _installation(pool: asyncpg.Pool, *, own_items: bool) -> tuple[uuid.UU
             for version in ("1.0.0", "2.0.0")
         ]
         vault_id = await conn.fetchval(
-            "INSERT INTO vaults(name,git_path) VALUES($1,$2) RETURNING id", _VAULT, f"/tmp/{_VAULT}.git",
+            "INSERT INTO vaults(name,git_path) VALUES($1,$2) RETURNING id", vault, f"/tmp/{vault}.git",
         )
         installation_id = await conn.fetchval(
             "INSERT INTO vault_app_installations(app_id,vault_id,desired_release_id,current_release_id,lifecycle) "
@@ -129,11 +131,11 @@ async def _installation(pool: asyncpg.Pool, *, own_items: bool) -> tuple[uuid.UU
             columns = [{"name": column, "type": "text"}]
             await table_data_repo.create_dynamic_table(
                 conn,
-                table_data_repo.pg_table_name(_VAULT, name),
+                table_data_repo.pg_table_name(vault, name),
                 columns,
-                vault_name=_VAULT,
+                vault_name=vault,
                 vault_id=vault_id,
-                resource_uri=f"akb://{_VAULT}/table/{name}",
+                resource_uri=f"akb://{vault}/table/{name}",
             )
             await conn.execute(
                 "INSERT INTO vault_tables(id,vault_id,name,columns,unique_keys,indexes) "
@@ -161,7 +163,7 @@ async def _installation(pool: asyncpg.Pool, *, own_items: bool) -> tuple[uuid.UU
             await conn.execute(
                 "UPDATE app_owned_resources SET status = 'retained' WHERE resource_key = 'items'",
             )
-    return vault_id, uuid.UUID(requested["job_id"]), table_data_repo.pg_table_name(_VAULT, "items")
+    return vault_id, uuid.UUID(requested["job_id"]), table_data_repo.pg_table_name(vault, "items")
 
 
 async def _events(pool: asyncpg.Pool, vault_id: uuid.UUID) -> list[tuple[int, str, str | None]]:

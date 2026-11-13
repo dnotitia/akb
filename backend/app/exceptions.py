@@ -448,21 +448,46 @@ class ExternalProfileReadOnlyError(AKBError):
         )
 
 
+# The hints a write_busy response carries, over REST and MCP.
+WRITE_BUSY_HINT = (
+    "The vault is under heavy write load. Wait a few seconds and retry; no partial write occurred."
+)
+WRITE_BUSY_PARTIAL_HINT = (
+    "The vault is under heavy write load. Part of the operation may have completed already; "
+    "wait a few seconds and send the same request again to continue it."
+)
+
+
 class WriteBusyError(AKBError):
     """Write admission timed out → HTTP 429.
 
     Raised by the write lane (services/write_lane.py) when a git-committing
     write waited out its queue deadline (per-vault gate + global lane), or
-    when the global waiter backstop is full. The request performed no work —
-    retrying after a short backoff is always safe. ``retry_after_secs`` is
-    surfaced as the HTTP ``Retry-After`` header and in the MCP error envelope.
+    when the global waiter backstop is full, and by the Vault write admission.
+    The request performed no work — retrying after a short backoff is always
+    safe. ``retry_after_secs`` is surfaced as the HTTP ``Retry-After`` header
+    and in the MCP error envelope.
+
+    ``partially_applied`` marks an operation that commits in several
+    transactions, such as a recursive collection delete on the Native
+    authority, and was refused after some of them committed: the same request
+    sent again continues it.
     """
 
-    def __init__(self, vault: str, waited_secs: float, retry_after_secs: int = 5):
+    def __init__(
+        self, vault: str, waited_secs: float, retry_after_secs: int = 5,
+        *, partially_applied: bool = False,
+    ):
         self.retry_after_secs = retry_after_secs
+        self.partially_applied = partially_applied
+        message = f"Write queue for vault '{vault}' is saturated (gave up after {waited_secs:.0f}s); retry shortly"
+        if partially_applied:
+            message += "; part of the operation has completed, and sending it again continues it"
         super().__init__(
-            f"Write queue for vault '{vault}' is saturated (gave up after {waited_secs:.0f}s); retry shortly",
+            message,
             status_code=429,
+            hint=WRITE_BUSY_PARTIAL_HINT if partially_applied else None,
+            details={"partially_applied": True} if partially_applied else None,
         )
 
 

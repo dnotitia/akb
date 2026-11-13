@@ -169,7 +169,7 @@ from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
 from app.services.user_directory import resolve_display_names
 from app.services.vault_write_admission import vault_write_admission
-from app.services.write_lane import run_compensation, run_git_write, write_lane
+from app.services.write_lane import run_compensation, run_git_write, vault_gate, write_lane
 from app.repositories import table_data_repo
 from app.utils import ensure_list
 
@@ -2420,17 +2420,20 @@ class DocumentService:
         # "appeared during this section and wasn't there before" implies
         # exactly that. Both gates are intentionally held through compensation.
         #
-        # The new Vault's write lane and then its write admission, the order
-        # every document write takes them in, are entered before its first
-        # Git commit and before its row becomes visible, and held through the
-        # seed, whose put() re-enters both without waiting. A request that
-        # reaches the Vault as soon as its row commits waits behind the
-        # creation; it cannot fill the Vault's admission or hold its lane and
-        # fail the seed after the Git commit.
+        # The new Vault's write-lane gate and then its write admission, the
+        # order every document write takes them in, are entered before its
+        # first Git commit and before its row becomes visible, and held
+        # through the seed, whose put() re-enters both without waiting. A
+        # request that reaches the Vault as soon as its row commits waits
+        # behind the creation; it cannot fill the Vault's admission or hold
+        # its gate and fail the seed after the Git commit. Only the gate is
+        # held, not a global lane slot: each Git operation takes a slot for
+        # itself, so a creation waiting for the role authority lock holds
+        # none of the slots other Vaults' writes need.
         new_vault_id = uuid.uuid4()
         async with _create_lock(name):
             async with self._vault_creation_lock(name):
-                async with write_lane(name), vault_write_admission(new_vault_id, vault=name):
+                async with vault_gate(name), vault_write_admission(new_vault_id, vault=name):
                     return await self._create_vault_standard(
                         name=name, description=description, template=template,
                         public_access=public_access, owner_id=owner_id, uid=uid,
@@ -2462,8 +2465,8 @@ class DocumentService:
             vault_yaml = f"name: {name}\ndescription: {description}\n"
             if template:
                 vault_yaml += f"template: {template}\n"
-            # Commit executor (not the shared to_thread pool), on the lane
-            # slot create_vault holds.
+            # Commit executor (not the shared to_thread pool), on a lane slot
+            # taken for this commit alone.
             await run_git_write(
                 self.git.commit_file,
                 vault_name=name, file_path=".vault.yaml",

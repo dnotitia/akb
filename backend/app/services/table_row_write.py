@@ -617,9 +617,6 @@ async def _execute_mutation(
             is_admin=is_admin,
             vault_names=[vault_name],
             vault_ids=[vault_id],
-            # A compiled mutation writes its table's rows: skip the
-            # read-only attempt.
-            writes=True,
         )
     except PermissionDeniedError as e:
         return err(str(e), code=PERMISSION_DENIED, pg_sqlstate=e.pg_sqlstate)

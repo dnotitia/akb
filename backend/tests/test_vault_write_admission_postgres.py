@@ -22,6 +22,7 @@ import pytest
 from app.config import settings
 from app.db import postgres as postgres_module
 from app.exceptions import ConflictError, WriteBusyError
+from app.util.errors import INVALID_ARGUMENT, METHOD_NOT_ALLOWED, MULTI_STATEMENT, PERMISSION_DENIED
 from app.models.document import DocumentPutRequest
 from app.repositories import events_repo
 from app.repositories.events_repo import emit_event
@@ -381,9 +382,10 @@ async def test_sql_is_admitted_for_the_vault_it_finds_by_name(monkeypatch):
 
 async def test_a_rollout_target_refused_by_its_vaults_admission_is_released(monkeypatch):
     """The worker leases a rollout target and then waits for the target's
-    Vault. When the admission refuses it, the worker gives the lease back, so
-    the next run takes the target again at once, rather than after the lease
-    expires with the rest of its batch held behind it."""
+    Vault. When the admission refuses it, the worker gives the lease back and
+    defers the target briefly, rather than hold it, with the rest of its batch
+    behind it, until the lease expires. Once the deferral ends, the next run
+    takes the target and applies it."""
     monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.3, raising=False)
     async with _fresh_database() as pool:
@@ -391,19 +393,24 @@ async def test_a_rollout_target_refused_by_its_vaults_admission_is_released(monk
         async with _vault_full(vault_id):
             assert await rollout_worker.run_once() == 0
         target = await pool.fetchrow(
-            "SELECT state, attempts, lease_owner, lease_expires_at FROM app_rollout_targets WHERE job_id = $1",
+            "SELECT state, attempts, lease_owner, lease_expires_at > NOW() AS deferred "
+            "FROM app_rollout_targets WHERE job_id = $1",
             job_id,
         )
-        assert dict(target) == {"state": "pending", "attempts": 0, "lease_owner": None, "lease_expires_at": None}
+        assert dict(target) == {"state": "pending", "attempts": 0, "lease_owner": None, "deferred": True}
+        assert await rollout_worker.run_once() == 0
+        # The deferral ends.
+        await pool.execute("UPDATE app_rollout_targets SET lease_expires_at = NOW() WHERE job_id = $1", job_id)
         assert await rollout_worker.run_once() == 1
         assert await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", job_id) == "applied"
 
 
-async def test_sql_reads_run_while_their_vault_is_full(tmp_path, monkeypatch):
-    """A Vault's admission is full. A SELECT through raw SQL runs at once, in
-    a read-only transaction without admission. A statement that writes, here
-    a data-modifying WITH that starts like a query, is refused by PostgreSQL
-    in that transaction and then waits for the Vault's admission."""
+async def test_sql_runs_read_only_without_admission_only_when_asked(tmp_path, monkeypatch):
+    """A Vault's admission is full. A SELECT sent with `read_only` runs at once,
+    in a read-only transaction without admission, and PostgreSQL refuses a
+    data-modifying WITH sent that way. Without `read_only` a statement is a
+    write, whatever it is, and waits for the Vault's admission; no statement is
+    tried first to find out what it does."""
     monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.3, raising=False)
     async with _fresh_database() as pool:
@@ -415,21 +422,26 @@ async def test_sql_reads_run_while_their_vault_is_full(tmp_path, monkeypatch):
         admin = await ctx.user(f"{vault}-admin", admin=True)
         monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(pool))
 
-        def run(sql: str):
+        def run(sql: str, **kwargs):
             return table_service.execute_sql(
                 vault_names=[vault], user_id=str(admin), actor_id="tester", sql=sql, is_admin=True,
+                **kwargs,
             )
 
+        count = f"SELECT count(*) AS n FROM {pg_name}"
+        modifying = (
+            f"WITH added AS (INSERT INTO {pg_name} (value) VALUES ('row') RETURNING value) "
+            "SELECT value FROM added"
+        )
         async with _vault_full(vault_id):
             started = time.monotonic()
-            read = await run(f"SELECT count(*) AS n FROM {pg_name}")
+            read = await run(count, read_only=True)
             assert time.monotonic() - started < 0.3
             assert read["items"] == [{"n": 0}]
+            refused = await run(modifying, read_only=True)
+            assert (refused["code"], refused["details"]["pg_sqlstate"]) == (PERMISSION_DENIED, "25006")
             with pytest.raises(WriteBusyError):
-                await run(
-                    f"WITH added AS (INSERT INTO {pg_name} (value) VALUES ('row') RETURNING value) "
-                    "SELECT value FROM added"
-                )
+                await run(count)
         assert await pool.fetchval(f"SELECT count(*) FROM {pg_name}") == 0
 
 
@@ -460,3 +472,365 @@ async def test_sql_is_admitted_for_the_tables_its_plan_writes_before_it_runs(tmp
         )
         assert result["affected_rows"] == 1
         assert writes == [True]
+
+
+
+async def test_sql_writes_waiting_for_a_table_lock_leave_connections_for_another_vault(tmp_path, monkeypatch):
+    """A transaction holds a dynamic table's ACCESS EXCLUSIVE lock, as a column
+    being added does while that transaction waits for its Vault's event lock.
+    24 raw SQL writes to the table go to its Vault through a pool of 8
+    connections, and a reader of another Vault takes a connection every 0.1 s.
+    Each write first reads its plan, which waits for the table's lock: at most
+    two plans are read at once, each waits at most half a second and then
+    fails with write_busy, and the writes that get a plan wait for the table
+    admitted, at most two at a time. The reader is served at once. Each write
+    used to try its statement first on a connection of its own, without
+    admission, and those tries took every connection while they waited."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 2, raising=False)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0, raising=False)
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 2, raising=False)
+    monkeypatch.setattr(settings, "akb_sql_plan_lock_timeout_ms", 500, raising=False)
+    async with _fresh_database() as admin_pool:
+        ctx = _Context(pool=admin_pool, tmp_path=tmp_path, monkeypatch=monkeypatch)
+        vault = "storm-sql"
+        vault_id = await _make_vault(admin_pool, vault)
+        quiet = await _make_vault(admin_pool, "quiet")
+        monkeypatch.setattr(table_service, "get_role_sync", lambda: _AnyRoleSync())
+        pg_name = await ctx.table(vault, vault_id)
+        admin = await ctx.user(f"{vault}-admin", admin=True)
+        database = await admin_pool.fetchval("SELECT current_database()")
+        app_pool = await asyncpg.create_pool(_database_dsn(database), min_size=1, max_size=_POOL_SIZE)
+        previous_pool = postgres_module._pool
+        postgres_module._pool = app_pool
+        monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(app_pool))
+        writes: list[asyncio.Task] = []
+        waits: list[float] = []
+        try:
+            async with admin_pool.acquire() as holder:
+                async with _OpenTransaction(holder):
+                    await holder.execute(f"LOCK TABLE {pg_name} IN ACCESS EXCLUSIVE MODE")
+                    writes = [
+                        asyncio.create_task(table_service.execute_sql(
+                            vault_names=[vault], user_id=str(admin), actor_id="storm",
+                            sql=f"INSERT INTO {pg_name} (value) VALUES ('row')", is_admin=True,
+                        ))
+                        for _ in range(_WRITERS)
+                    ]
+                    await asyncio.sleep(0.5)
+                    until = time.monotonic() + _FILE_HOLD_SECONDS
+                    while time.monotonic() < until:
+                        started = time.monotonic()
+                        try:
+                            # The lock is held until this loop ends, so a
+                            # pool the writes took would never free up.
+                            async with app_pool.acquire(timeout=_OTHER_VAULT_WAIT_BOUND * 3) as reader:
+                                await reader.fetchval(
+                                    "SELECT count(*) FROM collections WHERE vault_id = $1", quiet,
+                                )
+                        except TimeoutError:
+                            waits.append(time.monotonic() - started)
+                            break
+                        waits.append(time.monotonic() - started)
+                        await asyncio.sleep(0.1)
+            results = await asyncio.wait_for(asyncio.gather(*writes, return_exceptions=True), timeout=60)
+        finally:
+            for task in writes:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*writes, return_exceptions=True)
+            postgres_module._pool = previous_pool
+            await app_pool.close()
+
+        busy = sum(isinstance(r, WriteBusyError) for r in results)
+        committed = sum(isinstance(r, dict) and r.get("affected_rows") == 1 for r in results)
+        others = [r for r in results if not isinstance(r, WriteBusyError) and not (
+            isinstance(r, dict) and r.get("affected_rows") == 1)]
+        print(
+            f"\nother-Vault pool wait: max {max(waits):.3f}s over {len(waits)} reads; "
+            f"writes committed {committed}, write_busy {busy}, other {others}"
+        )
+        assert max(waits) < _OTHER_VAULT_WAIT_BOUND, waits
+        assert others == []
+        assert busy > 0
+        assert await admin_pool.fetchval(f"SELECT count(*) FROM {pg_name}") == committed
+
+
+async def test_a_statement_writing_an_undeclared_vault_is_rolled_back_not_run_again(tmp_path, monkeypatch):
+    """No statement akb_sql accepts can create a function, but a function an
+    administrator installed can write a dynamic table its caller's plan does
+    not show. The write's queued row change is checked before commit: the
+    statement is rolled back with an error naming the Vault it wrote, and is
+    not run again. It used to run once more, admitted for that Vault, and so
+    did whatever else the function does that a rollback does not undo, here
+    advancing a sequence."""
+    async with _fresh_database() as pool:
+        ctx = _Context(pool=pool, tmp_path=tmp_path, monkeypatch=monkeypatch)
+        await _make_vault(pool, "fn-declared")
+        target = await _make_vault(pool, "fn-target")
+        monkeypatch.setattr(table_service, "get_role_sync", lambda: _AnyRoleSync())
+        pg_name = await ctx.table("fn-target", target)
+        admin = await ctx.user("fn-admin", admin=True)
+        monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(pool))
+        await pool.execute("CREATE SEQUENCE fn_calls")
+        await pool.execute(
+            "CREATE FUNCTION fn_writes_elsewhere() RETURNS void LANGUAGE sql AS "
+            f"$$ SELECT nextval('fn_calls'); INSERT INTO {pg_name} (value) VALUES ('row') $$"
+        )
+
+        result = await table_service.execute_sql(
+            vault_names=["fn-declared"], user_id=str(admin), actor_id="tester",
+            sql="SELECT fn_writes_elsewhere()", is_admin=True,
+        )
+        assert (result["code"], result["details"]["undeclared_vaults"]) == (INVALID_ARGUMENT, ["fn-target"])
+        assert await pool.fetchval(f"SELECT count(*) FROM {pg_name}") == 0
+        assert await pool.fetchval("SELECT last_value FROM fn_calls") == 1
+        assert await pool.fetchval("SELECT count(*) FROM events WHERE vault_id = $1", target) == 0
+
+
+async def test_akb_sql_cannot_add_writes_its_plan_and_admission_do_not_see(tmp_path, monkeypatch):
+    """A raw SQL write is admitted for the Vaults its plan writes, and the
+    events of its dynamic-table rows are inserted at commit. akb_sql accepts one
+    SELECT, WITH, INSERT, UPDATE or DELETE statement, so a caller cannot create
+    a function that writes out of the plan's sight, run a DO block, or have the
+    deferred event trigger fire early with SET CONSTRAINTS. No function a SQL
+    role may call writes a table: apart from trigger functions, which cannot be
+    called, there is a check of a payload's encoding and the Vault event lock,
+    which needs a table no SQL role is granted."""
+    async with _fresh_database() as pool:
+        ctx = _Context(pool=pool, tmp_path=tmp_path, monkeypatch=monkeypatch)
+        vault = "sql-guard"
+        vault_id = await _make_vault(pool, vault)
+        admin = await ctx.user(f"{vault}-admin", admin=True)
+        monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(pool))
+        for sql, code in (
+            ("CREATE FUNCTION pg_temp.f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$", METHOD_NOT_ALLOWED),
+            ("DO $$ BEGIN PERFORM 1; END $$", METHOD_NOT_ALLOWED),
+            ("SET CONSTRAINTS ALL IMMEDIATE", METHOD_NOT_ALLOWED),
+            ("SELECT 1; CREATE FUNCTION pg_temp.f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$", MULTI_STATEMENT),
+        ):
+            result = await table_service.execute_sql(
+                vault_names=[vault], user_id=str(admin), actor_id="tester", sql=sql, is_admin=True,
+            )
+            assert result.get("code") == code, (sql, result)
+
+        callable_functions = {
+            r["proname"]: (r["prosecdef"], r["result"])
+            for r in await pool.fetch(
+                """
+                SELECT p.proname, p.prosecdef, pg_get_function_result(p.oid) AS result
+                  FROM pg_proc p
+                  JOIN pg_namespace n ON n.oid = p.pronamespace
+                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+                   AND n.nspname NOT LIKE 'pg_toast%'
+                   AND has_function_privilege('public', p.oid, 'EXECUTE')
+                   AND pg_get_function_result(p.oid) <> 'trigger'
+                   AND p.prolang IN (SELECT oid FROM pg_language WHERE lanname IN ('sql', 'plpgsql'))
+                """
+            )
+        }
+        assert callable_functions == {
+            "akb_is_utf8_payload": (False, "boolean"),
+            "akb_lock_vault_events": (False, "void"),
+        }
+        assert not await pool.fetchval(
+            "SELECT count(*) FROM information_schema.routine_privileges "
+            "WHERE grantee LIKE 'akb\\_%' AND privilege_type = 'EXECUTE'"
+        )
+        assert not await pool.fetchval("SELECT has_schema_privilege('public', 'public', 'CREATE')")
+        role = f"akb_user_{uuid.uuid4().hex}"
+        await pool.execute(f'CREATE ROLE "{role}" NOLOGIN')
+        try:
+            async with pool.acquire() as conn:
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    async with conn.transaction():
+                        await conn.execute(f'SET LOCAL ROLE "{role}"')
+                        await conn.execute("SELECT akb_lock_vault_events($1)", vault_id)
+        finally:
+            await pool.execute(f'DROP ROLE "{role}"')
+
+
+async def test_a_busy_vaults_rollout_target_does_not_hold_back_another_rollout(monkeypatch):
+    """Two rollouts wait. The target claimed first belongs to a Vault whose
+    admission stays full. After each refusal the worker defers that target
+    instead of making it the next claim again, so the other rollout is
+    applied meanwhile."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.3, raising=False)
+    async with _fresh_database() as pool:
+        installed = {}
+        for name in ("rollout-a", "rollout-b"):
+            vault_id, job_id, _items = await _installation(pool, own_items=True, vault=name, app_key=name)
+            installed[job_id] = vault_id
+        claimed_first = await pool.fetchval(
+            "SELECT job_id FROM app_rollout_targets ORDER BY job_id, batch_no, ordinal LIMIT 1",
+        )
+        busy_job = claimed_first
+        other_job = next(job for job in installed if job != busy_job)
+        async with _vault_full(installed[busy_job]):
+            outcomes = [await rollout_worker.run_once() for _ in range(3)]
+        assert outcomes[0] == 0 and 1 in outcomes, outcomes
+        assert await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", other_job) == "applied"
+        deferred = await pool.fetchrow(
+            "SELECT state, lease_owner, lease_expires_at > NOW() AS later FROM app_rollout_targets WHERE job_id = $1",
+            busy_job,
+        )
+        assert dict(deferred) == {"state": "pending", "lease_owner": None, "later": True}
+
+
+async def test_vault_creations_waiting_for_the_role_lock_leave_the_git_lane_to_other_vaults(tmp_path, monkeypatch):
+    """Another transaction holds the role authority lock, as long table DDL
+    does. Eight Bare Git Vault creations reach that lock after their first Git
+    commit, each holding its new Vault's gate. They hold none of the eight
+    global Git lane slots while they wait, so a document write to another
+    Vault takes a slot and commits. A creation used to hold a slot from start
+    to end. The creations complete once the lock is released."""
+    from app.services import write_lane
+
+    monkeypatch.setattr(settings, "write_lane_concurrency", 8, raising=False)
+    monkeypatch.setattr(settings, "write_lane_queue_timeout_secs", 2.0, raising=False)
+    monkeypatch.setattr(write_lane, "_global_slots", None)
+    async with _fresh_database() as pool:
+        documents = DocumentService(git=GitService(storage_path=str(tmp_path)))
+        monkeypatch.setattr(document_service_module, "get_role_sync", lambda: _AnyRoleSync())
+        await documents.create_vault("lane-other")
+        creations: list[asyncio.Task] = []
+        try:
+            async with pool.acquire() as holder:
+                async with holder.transaction():
+                    await holder.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "akb:role-sync:reconcile",
+                    )
+                    creations = [
+                        asyncio.create_task(documents.create_vault(f"lane-waiting-{i}")) for i in range(8)
+                    ]
+
+                    async def all_waiting() -> None:
+                        while await pool.fetchval(
+                            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted "
+                            "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+                        ) < 8:
+                            await asyncio.sleep(0.02)
+
+                    await asyncio.wait_for(all_waiting(), timeout=20)
+                    written = await asyncio.wait_for(documents.put(DocumentPutRequest(
+                        vault="lane-other", collection="notes", title="During", content="written meanwhile",
+                    )), timeout=10)
+                    assert written.path.startswith("notes/")
+            await asyncio.wait_for(asyncio.gather(*creations), timeout=60)
+        finally:
+            for task in creations:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*creations, return_exceptions=True)
+        assert await pool.fetchval("SELECT count(*) FROM vaults WHERE name LIKE 'lane-waiting-%'") == 8
+
+
+async def test_a_file_confirmation_refused_at_its_publication_keeps_its_lease_renewal(tmp_path, monkeypatch):
+    """A File upload confirmation is admitted twice: to renew its lease, and,
+    after it read the upload, to publish it. When the Vault fills up while
+    the upload is read, the publication is refused with write_busy; the lease
+    renewal stays committed and the File stays pending. The same confirmation
+    sent again once the Vault has room publishes it."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.3, raising=False)
+    async with _fresh_database() as pool:
+        ctx = _Context(pool=pool, tmp_path=tmp_path, monkeypatch=monkeypatch)
+        vault_id = await _make_vault(pool, "confirm-twice")
+        blobs = ctx.fake_objects()
+        fid = await ctx.file(vault_id, blobs, state="pending")
+        before = await pool.fetchval("SELECT updated_at FROM vault_files WHERE id = $1", fid)
+        held, release = asyncio.Event(), asyncio.Event()
+
+        async def hold() -> None:
+            async with vault_write_admission(vault_id):
+                held.set()
+                await release.wait()
+
+        reading = file_service.s3_adapter.iter_chunks
+        holders: list[asyncio.Task] = []
+
+        def fill_while_reading(key):
+            if not holders:
+                holders.append(asyncio.get_running_loop().create_task(hold()))
+            return reading(key)
+
+        files = file_service.FileService()
+        monkeypatch.setattr(file_service.s3_adapter, "iter_chunks", fill_while_reading)
+        try:
+            with pytest.raises(WriteBusyError):
+                await files.confirm_upload(vault_id, str(fid), actor_id="tester")
+        finally:
+            release.set()
+            await asyncio.gather(*holders, return_exceptions=True)
+        assert held.is_set()
+        row = await pool.fetchrow("SELECT upload_state, updated_at FROM vault_files WHERE id = $1", fid)
+        assert row["upload_state"] == "pending" and row["updated_at"] > before
+        assert await pool.fetchval(
+            "SELECT count(*) FROM events WHERE vault_id = $1 AND kind = 'file.put'", vault_id,
+        ) == 0
+
+        monkeypatch.setattr(file_service.s3_adapter, "iter_chunks", reading)
+        await files.confirm_upload(vault_id, str(fid), actor_id="tester")
+        assert await pool.fetchval("SELECT upload_state FROM vault_files WHERE id = $1", fid) == "confirmed"
+
+
+async def test_a_recursive_delete_refused_part_way_says_it_partly_completed(monkeypatch):
+    """A Native recursive delete commits each document on its own. When the
+    Vault's admission refuses the second document after the first was
+    deleted, the delete fails with a write_busy that says the operation partly
+    completed and that sending it again continues it, over MCP and REST; the
+    same delete sent again completes it. A refusal before anything was
+    deleted keeps the plain write_busy."""
+    from app.services import collection_service as collection_service_module
+    from app.util.errors import WRITE_BUSY, exception_envelope
+    from tests.test_collection_delete_native_atomic_postgres import _native_vault
+
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.3, raising=False)
+    async with _fresh_database() as pool:
+        vault = "partial-delete"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        delete_document = collection_service_module._delete_native_document
+        holders: list[asyncio.Task] = []
+        release = asyncio.Event()
+
+        async def hold() -> None:
+            async with vault_write_admission(vault_id):
+                await release.wait()
+
+        async def busy_after_the_first(*args, **kwargs):
+            deleted = await delete_document(*args, **kwargs)
+            if not holders:
+                holders.append(asyncio.create_task(hold()))
+                await asyncio.sleep(0)
+            return deleted
+
+        def delete():
+            return CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester",
+            )
+
+        monkeypatch.setattr(collection_service_module, "_delete_native_document", busy_after_the_first)
+        try:
+            with pytest.raises(WriteBusyError) as partial:
+                await delete()
+        finally:
+            release.set()
+            await asyncio.gather(*holders, return_exceptions=True)
+        assert partial.value.partially_applied
+        envelope = exception_envelope(partial.value)
+        assert (envelope["code"], envelope["details"]["partially_applied"]) == (WRITE_BUSY, True)
+        assert "Part of the operation may have completed" in envelope["hint"]
+        assert partial.value.hint == envelope["hint"]
+        assert await pool.fetchval(
+            "SELECT count(*) FROM native_resources WHERE namespace_id = $1 AND lifecycle = 'live'", vault_id,
+        ) == 1
+
+        monkeypatch.setattr(collection_service_module, "_delete_native_document", delete_document)
+        async with _vault_full(vault_id):
+            with pytest.raises(WriteBusyError) as plain:
+                await delete()
+        assert not plain.value.partially_applied
+        assert "no partial write occurred" in exception_envelope(plain.value)["hint"]
+        result = await delete()
+        assert result["deleted_docs"] == 1

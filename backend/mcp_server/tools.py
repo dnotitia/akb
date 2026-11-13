@@ -990,6 +990,13 @@ TOOLS = [
                     "description": "Vault names whose tables are referenced (default: single vault)",
                 },
                 "vault": {"type": "string", "description": "Single vault shorthand (instead of vaults array)"},
+                "read_only": {
+                    "type": "boolean",
+                    "description": (
+                        "Run in a read-only transaction, which PostgreSQL enforces, without waiting for "
+                        "the vault's write admission. Default false: the statement runs as a write."
+                    ),
+                },
             },
             "required": ["sql"],
         },

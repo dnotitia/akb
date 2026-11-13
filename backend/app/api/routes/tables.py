@@ -241,6 +241,9 @@ class SqlRequest(NFCModel):
     sql: str
     params: list[Any] | None = None
     vaults: list[str] | None = None
+    # Run in a READ ONLY transaction, which PostgreSQL enforces, without the
+    # Vault write admission. By default the statement is an admitted write.
+    read_only: bool = False
 
 
 class QueryRowsRequest(NFCModel):
@@ -416,6 +419,7 @@ async def execute_sql(vault: str, req: SqlRequest, user: AuthenticatedUser = Dep
             sql=req.sql.strip(),
             params=req.params,
             is_admin=user.is_admin,
+            read_only=req.read_only,
         )
     )
     # Serialise with pydantic-core (Rust) instead of FastAPI's default

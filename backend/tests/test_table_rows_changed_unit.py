@@ -14,15 +14,23 @@ class _Conn:
     def __init__(self) -> None:
         self.executed: list[tuple[str, tuple[Any, ...]]] = []
 
-    async def fetchval(self, sql: str, user_id: uuid.UUID) -> bool:
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        if sql.startswith("EXPLAIN"):
+            # The write's plan, read before its admission: no dynamic table.
+            return None
         # Actor propagation is tested using an active human administrator.
-        assert "FROM users WHERE id=$1 FOR SHARE" in sql
-        assert user_id == uuid.UUID("00000000-0000-0000-0000-000000000001")
+        assert "FROM users WHERE id=$1" in sql
+        assert args == (uuid.UUID("00000000-0000-0000-0000-000000000001"),)
         return True
 
     async def execute(self, sql: str, *args: Any) -> str:
         self.executed.append((sql, args))
         return "OK"
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        # The write's check of the row changes it queued: none here.
+        assert "events_row_change_queue" in sql
+        return []
 
 
 @pytest.mark.asyncio

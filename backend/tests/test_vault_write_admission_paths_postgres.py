@@ -314,8 +314,8 @@ async def _table(ctx: _Context, operation: str) -> _Case:
 
 
 async def _sql_elsewhere(ctx: _Context, operation: str) -> _Case:
-    """SQL declared for one Vault that writes another Vault's table: the
-    write waits for the Vault it writes."""
+    """SQL declared for one Vault whose plan writes another Vault's table:
+    the write waits for the Vault it writes."""
     declared = "admit-sql-declared"
     target = f"admit-sql-{operation}"
     await _make_vault(ctx.pool, declared)
@@ -323,17 +323,7 @@ async def _sql_elsewhere(ctx: _Context, operation: str) -> _Case:
     pg_name = await ctx.table(target, target_id)
     admin = await ctx.user(f"{target}-admin", admin=True)
     ctx.monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(ctx.pool))
-    if operation == "plan":
-        # The statement's plan names the table.
-        sql = f"INSERT INTO {pg_name} (value) VALUES ('row')"
-    else:
-        # A function writes the table: its plan does not show it, the row
-        # change its transaction queues does.
-        await ctx.pool.execute(
-            "CREATE FUNCTION admission_writes_elsewhere() RETURNS void LANGUAGE sql "
-            f"AS $$ INSERT INTO {pg_name} (value) VALUES ('row') $$"
-        )
-        sql = "SELECT admission_writes_elsewhere()"
+    sql = f"INSERT INTO {pg_name} (value) VALUES ('row')"
     return _Case(target_id, lambda: table_service.execute_sql(
         vault_names=[declared], user_id=str(admin), actor_id="tester", sql=sql, is_admin=True,
     ))
@@ -419,7 +409,7 @@ _CASES: dict[str, tuple[Callable[[_Context, str], Awaitable[_Case]], str]] = {
     **{f"collection.{op}": (_collection, op) for op in ("create", "delete", "native_delete")},
     **{f"file.{op}": (_file, op) for op in ("confirm", "replace", "delete")},
     **{f"table.{op}": (_table, op) for op in ("create", "drop", "alter", "migration", "rows", "sql")},
-    **{f"table.sql_elsewhere_{op}": (_sql_elsewhere, op) for op in ("plan", "function")},
+    "table.sql_elsewhere": (_sql_elsewhere, "plan"),
     **{f"access.{op}": (_access, op) for op in (
         "grant", "revoke", "transfer", "metadata", "public", "set_policy", "bootstrap_policy",
         "remove_policy", "add_grant", "remove_grant", "check_override",

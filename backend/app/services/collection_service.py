@@ -16,7 +16,9 @@ import asyncpg
 
 from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
-from app.exceptions import ConflictError, ForbiddenError, NotFoundError
+from app.config import settings
+from app.db.transient import is_event_lock_timeout
+from app.exceptions import ConflictError, ForbiddenError, NotFoundError, WriteBusyError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import (
     CollectionRepository,
@@ -249,6 +251,11 @@ def _tables_refused_part_way(
     )
 
 
+def _write_busy(exc: BaseException) -> bool:
+    """A refused admission, or the wait for the Vault's event lock ended."""
+    return isinstance(exc, WriteBusyError) or is_event_lock_timeout(exc)
+
+
 async def _earlier_recursive_delete(conn, vault_id: uuid.UUID, prefix: str) -> bool:
     """Whether a recursive delete of ``prefix`` ever deleted a Native document.
 
@@ -399,12 +406,15 @@ class CollectionService:
         files and tables with `collection.delete` in a last transaction once
         no live document is left under `P`. A failure part-way leaves the
         documents deleted so far deleted and returns the error; running the
-        same delete again continues with the rest. When nothing is left under
-        `P` because an earlier recursive delete of `P` deleted its documents,
-        the delete succeeds with zero counts instead of `NotFoundError` and
-        records `collection.delete` (see `_earlier_recursive_delete`); the
-        event is at least once, so it can be recorded more than once for one
-        prefix. The counts are what this call deleted.
+        same delete again continues with the rest. A busy Vault (a refused
+        admission, or its event lock timing out) after some documents went
+        fails with a `WriteBusyError` marked `partially_applied`. When nothing
+        is left under `P` because an earlier recursive delete of `P` deleted
+        its documents, the delete succeeds with zero counts instead of
+        `NotFoundError` and records `collection.delete` (see
+        `_earlier_recursive_delete`); the event is at least once, so it can be
+        recorded more than once for one prefix. The counts are what this call
+        deleted.
 
         Race-safety: the target row (if any) and all sub-collection
         rows are locked `FOR UPDATE` inside the same transaction, so a
@@ -461,6 +471,15 @@ class CollectionService:
                 raise _tables_refused_part_way(
                     exc, vault=vault, prefix=norm, deleted=native_deleted,
                 ) from exc
+            raise
+        except Exception as exc:
+            # A busy Vault after some documents went: say that the delete
+            # partly completed and that sending it again continues it.
+            if native_deleted and _write_busy(exc):
+                waited = (
+                    settings.vault_write_queue_timeout_secs if isinstance(exc, WriteBusyError) else 5.0
+                )
+                raise WriteBusyError(vault, waited, retry_after_secs=1, partially_applied=True) from exc
             raise
         raise ConflictError(
             f"Documents kept arriving under {norm!r} during the delete; retry it"

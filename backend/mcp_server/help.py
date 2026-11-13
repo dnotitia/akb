@@ -1669,7 +1669,16 @@ akb_sql(vaults=["sales","external-projects"],
 Permissions: SELECT requires a Vault reader role; writes require a writer role.
 A credential with read authority but no write authority runs SQL in a PostgreSQL
 read-only transaction. Database mutations are denied even when the account has
-write privileges. Write-authorized credentials retain the existing write path.""",
+write privileges. Write-authorized credentials retain the existing write path.
+
+`read_only=true` runs the statement in a PostgreSQL read-only transaction
+without waiting for the vault's write admission; use it for queries, so they
+are not held back while the vault is busy with writes. Without it (the default)
+the statement runs once as a write, admitted for the vaults it names and those
+whose tables it changes.
+```
+akb_sql(vault="sales", sql="SELECT stage, COUNT(*) FROM pipeline GROUP BY stage", read_only=true)
+```""",
 
     "images": """# Inline Document Images
 

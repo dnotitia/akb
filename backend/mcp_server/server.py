@@ -70,7 +70,6 @@ from app.util.errors import (
     NOT_FOUND,
     UNKNOWN_ARGUMENT,
     UNKNOWN_TOOL,
-    WRITE_BUSY,
 )
 from app.util.text import fuzzy_hint, to_nfc
 from app.services import publication_service, table_service
@@ -1358,7 +1357,7 @@ async def _handle_sql(args: dict, uid: str, user: _MCPUser) -> dict:
         actor_id=user.username,
         sql=sql,
         is_admin=user.is_admin,
-        read_only=_call_scope("akb_sql", args, user) == _READ_SCOPE,
+        read_only=args.get("read_only") is True or _call_scope("akb_sql", args, user) == _READ_SCOPE,
     )
 
 
@@ -2132,15 +2131,11 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     try:
         return await handler(args, uid, user)
     except WriteBusyError as e:
-        # Write-lane admission timed out (429-class). Precise code +
+        # Write-lane or Vault admission timed out (429-class). Precise code +
         # machine-readable backoff so agents retry instead of treating
-        # it as an internal failure. No partial write occurred.
-        return err(
-            str(e),
-            code=WRITE_BUSY,
-            hint="The vault is under heavy write load. Wait a few seconds and retry; no partial write occurred.",
-            retry_after_secs=e.retry_after_secs,
-        )
+        # it as an internal failure. Unless the error says the operation
+        # partly completed, no partial write occurred.
+        return exception_envelope(e)
 
 
 # ── Entry point ──────────────────────────────────────────────
