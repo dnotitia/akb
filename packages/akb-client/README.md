@@ -166,9 +166,10 @@ starts. The backoff never waits more than 30 seconds, and a stream's first
 event or comment resets it.
 
 A refusal's `Retry-After` is waited in full, however long, or the backoff or
-the reconnection time when that is longer. A random extra of less than 20% of
-the `Retry-After`, and less than one second, goes on top of the longer wait,
-so that clients refused together do not come back together.
+the reconnection time when that is longer. When the `Retry-After` is positive,
+a random extra of less than 20% of it, and less than one second, goes on top
+of the longer wait, so that clients refused together do not come back
+together. A `Retry-After` of zero adds no extra.
 
 A 4xx refusal ends the subscription instead. That includes 429
 `event_tail_user_quota`, which an account gets at its stream quota.

@@ -762,7 +762,8 @@ async function responseError(response: Response): Promise<AkbError> {
  * time in [c/2, c], where c = min(30000, max(reconnection time, 250) × 2^n) ms.
  * A refusal's Retry-After is a floor on that, not capped. The longer of the
  * two then gets a random extra in [0, min(20% of the Retry-After, 1000)) ms,
- * rounded down, so that a long own wait does not line clients up either.
+ * rounded down (none when the Retry-After is zero), so that a long own wait
+ * does not line clients up either.
  */
 function refusedOpenDelayMs(state: SubscriptionState, retryAfterMs: number | null): number {
   const step = Math.max(state.retryDelayMs, DEFAULT_RECONNECT_DELAY_MS);
