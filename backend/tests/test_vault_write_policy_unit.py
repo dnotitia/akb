@@ -57,6 +57,8 @@ async def pool(monkeypatch):
         "015_events_outbox.py",
         "044_vault_write_policy.py",
         "045_vault_write_grant_actions.py",
+        # Raw SQL checks the row changes its transaction queued (132).
+        "132_events_commit_order.py",
     ):
         migration = _load_migration(filename)
         assert migration is not None
@@ -886,29 +888,46 @@ class TestAkbSqlDualEnforcement:
         from app.repositories import vault_write_policy_repo as repo
         from app.services import table_service
 
+        from app.services.role_sync import user_role_name
+
         owner = await _create_user(pool)
         vault_id, vault = await _create_named_vault(pool, owner)
         token = await _create_token(pool, owner)
         await repo.set_policy(vault_id, "collector:acme", "admin-user")
         await repo.add_grant(vault_id, token, "admin-user")
+        # The statement must be a write: SQL first runs in a read-only
+        # transaction, which reads the policy without waiting for its
+        # writer, and only a write goes on to the check that waits. Its
+        # table and the owner's role let it get that far.
+        role = user_role_name(owner)
+        table = f"vwp_items_{uuid.uuid4().hex[:12]}"
+        async with pool.acquire() as conn:
+            await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
+            await conn.execute(f'CREATE TABLE "{table}" (x int)')
 
-        # Hold the same Vault lock as the grant API. Wait for PostgreSQL to
-        # report contention before committing the revocation.
-        with _auth_context(token_id=token):
-            async with asyncio.TaskGroup() as group, pool.acquire() as policy:
-                async with policy.transaction():
-                    await policy.execute("SELECT id FROM vaults WHERE id=$1 FOR UPDATE", vault_id)
-                    await repo.remove_grant(vault_id, token, conn=policy)
-                    request = group.create_task(table_service.execute_sql(
-                        vault_names=[vault], user_id=str(owner), actor_id="writer", sql="UPDATE items SET x=1",
-                    ))
-                    async with pool.acquire() as observer, asyncio.timeout(10):
-                        while not await observer.fetchval(
-                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
-                            "WHERE $1::int = ANY(pg_blocking_pids(pid)))", policy.get_server_pid(),
-                        ):
-                            await asyncio.sleep(0.01)
-        assert request.result()["code"] == "vault_write_managed"
+        try:
+            # Hold the same Vault lock as the grant API. Wait for PostgreSQL
+            # to report contention before committing the revocation.
+            with _auth_context(token_id=token):
+                async with asyncio.TaskGroup() as group, pool.acquire() as policy:
+                    async with policy.transaction():
+                        await policy.execute("SELECT id FROM vaults WHERE id=$1 FOR UPDATE", vault_id)
+                        await repo.remove_grant(vault_id, token, conn=policy)
+                        request = group.create_task(table_service.execute_sql(
+                            vault_names=[vault], user_id=str(owner), actor_id="writer",
+                            sql=f'UPDATE "{table}" SET x=1',
+                        ))
+                        async with pool.acquire() as observer, asyncio.timeout(10):
+                            while not await observer.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                                "WHERE $1::int = ANY(pg_blocking_pids(pid)))", policy.get_server_pid(),
+                            ):
+                                await asyncio.sleep(0.01)
+            assert request.result()["code"] == "vault_write_managed"
+        finally:
+            async with pool.acquire() as conn:
+                await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+                await conn.execute(f'DROP ROLE IF EXISTS "{role}"')
 
     async def test_akb_sql_multi_vault_blocks_on_the_second_referenced_vault(
         self, pool,

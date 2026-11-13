@@ -20,14 +20,16 @@ model.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import asyncpg
 
 from app.config import settings
-from app.exceptions import NotFoundError
+from app.exceptions import ConflictError, NotFoundError
 from app.models.vault_scope import (
     current_request_jwt_claims,
     current_token_id,
@@ -38,7 +40,12 @@ from app.repositories import vault_write_policy_repo
 from app.repositories.events_repo import EventBuffer
 from app.util.errors import VAULT_ARCHIVED, VAULT_WRITE_MANAGED, err
 from app.services.role_sync import token_role_name, user_role_name
-from app.services.vault_write_admission import vault_write_admission
+from app.services.vault_write_admission import (
+    VaultReplacedError,
+    is_admitted,
+    retry_if_vault_replaced,
+    vault_write_admission,
+)
 
 logger = logging.getLogger("akb.user_sql")
 
@@ -56,25 +63,36 @@ async def human_admin_sql_bypass(conn, user_id: uuid.UUID | str, is_admin: bool)
         FROM users WHERE id=$1 FOR SHARE""", uuid.UUID(str(user_id))))
 
 
+_DECLARED_VAULTS = "SELECT id, name, status FROM vaults WHERE name = ANY($1::text[]) ORDER BY id"
+_DECLARED_VAULTS_FOR_SHARE = _DECLARED_VAULTS + " FOR SHARE"
+
+
 async def _check_vault_write_policy(
     conn: asyncpg.Connection, vault_names: list[str], user_id: uuid.UUID | str, *,
-    admin_bypass: bool, overrides: EventBuffer,
+    admin_bypass: bool, overrides: EventBuffer | None, lock: bool = True,
+    admitted: frozenset[uuid.UUID] | None = None,
 ) -> dict | None:
-    """Return a policy error, or collect the admin overrides into ``overrides``.
+    """Return a policy error, or collect the admin overrides into ``overrides``
+    (``None`` evaluates the policy without recording them).
 
-    Hold each declared Vault against archive, mark and grant changes until
-    the statement transaction finishes. The caller inserts the override
-    events after the statement: an event insert holds the Vault's event lock
-    until commit (migration 132), which must not be held while the statement
-    runs or waits for rows.
+    With ``lock``, hold each declared Vault against archive, mark and grant
+    changes until the statement transaction finishes. The caller inserts the
+    override events after the statement: an event insert holds the Vault's
+    event lock until commit (migration 132), which must not be held while
+    the statement runs or waits for rows.
+
+    ``admitted`` is the set of Vaults the transaction was admitted for by id,
+    resolved from the names before it took its connection. A declared name
+    that now names another Vault raises ``VaultReplacedError``.
     """
     vaults = await conn.fetch(
-        "SELECT id, name, status FROM vaults WHERE name = ANY($1::text[]) ORDER BY id FOR SHARE",
-        vault_names,
+        _DECLARED_VAULTS_FOR_SHARE if lock else _DECLARED_VAULTS, vault_names,
     )
     missing = set(vault_names) - {v["name"] for v in vaults}
     if missing:
         raise NotFoundError("Vault", min(missing))
+    if admitted is not None and any(v["id"] not in admitted for v in vaults):
+        raise VaultReplacedError
     archived = sorted(v["name"] for v in vaults if v["status"] == "archived")
     if archived:
         return err(
@@ -94,6 +112,8 @@ async def _check_vault_write_policy(
                 f"{policy['managed_by']}; writes require a granted service token",
                 code=VAULT_WRITE_MANAGED,
             )
+        if overrides is None:
+            continue
         overrides.add(
             "vault.write_policy_admin_bypass", vault_id=policy["id"], actor_id=str(user_id),
             payload={"managed_by": policy["managed_by"], "required_role": "writer", "vault": policy["name"]},
@@ -233,7 +253,7 @@ class UserSqlExecutor:
     """Run user-supplied SQL under the caller's PG role.
 
     The class holds a reference to the pool (same pool the rest of the
-    backend uses; no separate pool). Per-call:
+    backend uses; no separate pool). Per transaction:
       1. Open transaction.
       2. SET LOCAL ROLE:
            - scoped PAT     → akb_token_<tid>  (owner-ACL ∩ scope; even if admin)
@@ -242,6 +262,9 @@ class UserSqlExecutor:
       3. SET LOCAL search_path = public.
       4. Execute SQL.
       5. Commit (or rollback on exception).
+    A statement runs first in a read-only transaction and, only when
+    PostgreSQL refuses it there as a write, again in an admitted one (see
+    `execute`).
 
     Step 2's role is reset by COMMIT/ROLLBACK, so reuse of the pooled
     connection across users is safe. The transaction-local ``akb.actor_id``
@@ -252,6 +275,7 @@ class UserSqlExecutor:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self.pool = pool
 
+    @retry_if_vault_replaced
     async def execute(
         self,
         *,
@@ -265,6 +289,7 @@ class UserSqlExecutor:
         read_only: bool = False,
         enforce_vault_write_policy: bool = False,
         vault_ids: Optional[list[uuid.UUID]] = None,
+        writes: bool = False,
     ) -> dict:
         """Run `sql` under the caller's PG role. Returns a result envelope
         compatible with the existing `akb_sql` contract.
@@ -273,102 +298,56 @@ class UserSqlExecutor:
         downstream consumers. Raw SQL also checks declared Vault write policies;
         PostgreSQL roles control access to the actual tables.
 
-        A statement that can write a dynamic table's rows, or an admin
-        override, writes events of the declared Vaults (`vault_ids`, or those
-        named by `vault_names`), so it is admitted for them before it takes a
-        pool connection. A read-only transaction writes neither and is not.
+        A statement that writes a dynamic table's rows, or an admin override,
+        writes Vault events, so it is admitted for those Vaults before it
+        takes the pool connection it writes on. Whether a statement writes is
+        left to PostgreSQL, never read from its text. Unless the caller asks
+        for `read_only` or says the statement `writes`, it first runs in a
+        read-only transaction without admission; only when PostgreSQL refuses
+        it there as a write (SQLSTATE 25006) does it run again, as a write.
+        A write is admitted for the declared Vaults (`vault_ids`, or those
+        named by `vault_names`) and for the Vaults whose tables its plan
+        modifies, all at once. Before it commits, the transaction checks the
+        row changes it queued; a change of a Vault it was not admitted for
+        rolls it back, and it runs once more admitted for that Vault too.
         """
         should_fetch = (
             sql.strip().upper().startswith(("SELECT", "WITH"))
             if fetch is None else fetch
         )
-        bind_params = params or []
+        statement = _Statement(
+            user_id=user_id, actor_id=actor_id, sql=sql, params=params or [],
+            fetch=should_fetch, is_admin=is_admin, vault_names=vault_names or [],
+            check_policy=enforce_vault_write_policy,
+        )
         try:
-            # A data-modifying WITH starts like a query, so only a read-only
-            # transaction is known to write no rows; a read-only one still
-            # records an admin override when it checks the write policy.
-            admitted: list[uuid.UUID] = []
-            if not read_only or (enforce_vault_write_policy and not should_fetch):
-                admitted = (
-                    list(vault_ids) if vault_ids is not None
-                    else await self._vault_ids(vault_names or [])
-                )
-            async with vault_write_admission(*admitted), self.pool.acquire() as conn:
-                async with conn.transaction():
-                    scope = current_vault_scope.get()
-                    token_id = current_token_id.get()
-                    admin_bypass = scope is None and await human_admin_sql_bypass(conn, user_id, is_admin)
-                    overrides = EventBuffer()
-                    if enforce_vault_write_policy and not (read_only and should_fetch):
-                        denial = await _check_vault_write_policy(
-                            conn, vault_names or [], user_id,
-                            admin_bypass=admin_bypass, overrides=overrides,
-                        )
-                        if denial:
-                            if not should_fetch:
-                                return denial
-                            # A row-returning statement can have side effects. Keep
-                            # reads available and let PostgreSQL enforce the policy.
-                            read_only = True
-                    if scope is not None and token_id is not None:
-                        # Scoped PAT → the narrow per-token role (membership =
-                        # owner-ACL ∩ scope). Precedence over is_admin: a
-                        # SCOPED admin token does NOT bypass — PG confines its
-                        # akb_sql to the scope (42501 outside). If the role is
-                        # missing (a best-effort provisioning hook failed
-                        # before the reconciler ran), this SET raises →
-                        # fail-CLOSED: we never fall back to the full
-                        # akb_user_<uid>, which would defeat the scope.
-                        role = token_role_name(token_id)
-                        await conn.execute(f'SET LOCAL ROLE "{role}"')
-                    elif not admin_bypass:
-                        role = user_role_name(user_id)
-                        # asyncpg passes the role name as an identifier here;
-                        # we built it ourselves from a UUID so the only chars
-                        # are [a-z0-9_]. No injection risk.
-                        await conn.execute(f'SET LOCAL ROLE "{role}"')
-                    # else: live unscoped human admin → connection default.
-                    # Reset search_path defensively — a previous tx on this
-                    # pooled connection might have left a different default
-                    # (it shouldn't, but be explicit).
-                    await conn.execute("SET LOCAL search_path = public")
-                    await conn.execute(
-                        "SELECT set_config('akb.actor_id', $1, true)",
-                        actor_id,
-                    )
-                    request_claims = current_request_jwt_claims.get()
-                    if request_claims is not None:
-                        await conn.execute(
-                            "SELECT set_config('request.jwt.claims', $1, true)",
-                            request_claims.to_json(),
-                        )
-
-                    if read_only:
-                        await conn.execute("SET TRANSACTION READ ONLY")
-
-                    if not overrides:
-                        return await _run_statement(conn, sql, bind_params, should_fetch, vault_names or [])
-                    # Keep the override audit event even if PostgreSQL rejects
-                    # the user's statement. Only the statement rolls back, and
-                    # the event is inserted after it, as the transaction's last
-                    # locking statement.
-                    outcome: dict = {}
-                    statement_error: asyncpg.PostgresError | None = None
-                    try:
-                        async with conn.transaction():
-                            outcome = await _run_statement(conn, sql, bind_params, should_fetch, vault_names or [])
-                    except asyncpg.PostgresError as exc:
-                        statement_error = exc
-                    if not read_only:
-                        await overrides.flush(conn)
-                if read_only:
-                    # A read-only transaction cannot insert the event. Its
-                    # statement wrote nothing, so the event commits alone.
-                    async with conn.transaction():
-                        await overrides.flush(conn)
-                if statement_error is not None:
-                    raise statement_error
-                return outcome
+            if read_only:
+                # A read-only transaction writes no rows, but a write policy
+                # check can still record an admin override.
+                admitted: frozenset[uuid.UUID] = frozenset()
+                if enforce_vault_write_policy and not should_fetch:
+                    admitted = await self._declared(statement, vault_ids)
+                async with vault_write_admission(*admitted):
+                    return await self._run(statement, read_only=True, admitted=admitted)
+            modified: frozenset[uuid.UUID] = frozenset()
+            if not writes:
+                probe = await self._probe(statement)
+                if probe.result is not None:
+                    return probe.result
+                modified = probe.modified
+            admitted = await self._declared(statement, vault_ids) | modified
+            try:
+                async with vault_write_admission(*admitted):
+                    return await self._run(statement, read_only=False, admitted=admitted)
+            except _UnadmittedRowChanges as exc:
+                admitted |= exc.vault_ids
+            try:
+                async with vault_write_admission(*admitted):
+                    return await self._run(statement, read_only=False, admitted=admitted)
+            except _UnadmittedRowChanges as exc:
+                raise ConflictError(
+                    "The statement changed the rows of other Vaults on each of two attempts; retry it",
+                ) from exc
         except asyncpg.exceptions.ReadOnlySQLTransactionError as e:
             raise PermissionDeniedError(str(e), pg_sqlstate="25006") from e
         except asyncpg.exceptions.InsufficientPrivilegeError as e:
@@ -404,6 +383,103 @@ class UserSqlExecutor:
                 raise mapped from exc
             raise
 
+    async def _probe(self, statement: _Statement) -> _Probe:
+        """Run the statement in a read-only transaction, without admission.
+
+        Returns its result, a policy refusal of a statement that does not
+        return rows, or, when PostgreSQL refused the statement as a write,
+        the Vaults whose tables its plan modifies. The policy is read
+        without locking the Vaults, so a read does not wait for a Vault
+        settings change; the write that follows checks it again under lock.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                admin_bypass = await _admin_bypass(conn, statement)
+                denied = None
+                if statement.check_policy:
+                    denied = await _check_vault_write_policy(
+                        conn, statement.vault_names, statement.user_id,
+                        admin_bypass=admin_bypass, overrides=None, lock=False,
+                    )
+                    if denied and not statement.fetch:
+                        return _Probe(result=denied)
+                await _enter_statement_role(conn, statement, admin_bypass)
+                await conn.execute("SET TRANSACTION READ ONLY")
+                try:
+                    async with conn.transaction():
+                        return _Probe(result=await _run_statement(
+                            conn, statement.sql, statement.params, statement.fetch,
+                            statement.vault_names,
+                        ))
+                except asyncpg.exceptions.ReadOnlySQLTransactionError:
+                    if denied:
+                        # A write the policy refuses: keep PostgreSQL's refusal.
+                        raise
+                return _Probe(result=None, modified=await _modified_vaults(conn, statement))
+
+    async def _run(
+        self, statement: _Statement, *, read_only: bool, admitted: frozenset[uuid.UUID],
+    ) -> dict:
+        should_fetch = statement.fetch
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                admin_bypass = await _admin_bypass(conn, statement)
+                overrides = EventBuffer()
+                if statement.check_policy and not (read_only and should_fetch):
+                    denial = await _check_vault_write_policy(
+                        conn, statement.vault_names, statement.user_id,
+                        admin_bypass=admin_bypass, overrides=overrides, admitted=admitted,
+                    )
+                    if denial:
+                        if not should_fetch:
+                            return denial
+                        # A row-returning statement can have side effects. Keep
+                        # reads available and let PostgreSQL enforce the policy.
+                        read_only = True
+                await _enter_statement_role(conn, statement, admin_bypass)
+
+                if read_only:
+                    await conn.execute("SET TRANSACTION READ ONLY")
+
+                if not overrides:
+                    result = await _run_statement(
+                        conn, statement.sql, statement.params, should_fetch, statement.vault_names,
+                    )
+                    if not read_only:
+                        await _check_row_changes_admitted(conn)
+                    return result
+                # Keep the override audit event even if PostgreSQL rejects
+                # the user's statement. Only the statement rolls back, and
+                # the event is inserted after it, as the transaction's last
+                # locking statement.
+                outcome: dict = {}
+                statement_error: asyncpg.PostgresError | None = None
+                try:
+                    async with conn.transaction():
+                        outcome = await _run_statement(
+                            conn, statement.sql, statement.params, should_fetch,
+                            statement.vault_names,
+                        )
+                except asyncpg.PostgresError as exc:
+                    statement_error = exc
+                if not read_only:
+                    await _check_row_changes_admitted(conn)
+                    await overrides.flush(conn)
+            if read_only:
+                # A read-only transaction cannot insert the event. Its
+                # statement wrote nothing, so the event commits alone.
+                async with conn.transaction():
+                    await overrides.flush(conn)
+            if statement_error is not None:
+                raise statement_error
+            return outcome
+
+    async def _declared(
+        self, statement: _Statement, vault_ids: Optional[list[uuid.UUID]],
+    ) -> frozenset[uuid.UUID]:
+        if vault_ids is not None:
+            return frozenset(vault_ids)
+        return frozenset(await self._vault_ids(statement.vault_names))
 
     async def _vault_ids(self, vault_names: list[str]) -> list[uuid.UUID]:
         """The ids of the named Vaults, read before the statement's transaction."""
@@ -412,6 +488,153 @@ class UserSqlExecutor:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("SELECT id FROM vaults WHERE name = ANY($1::text[])", vault_names)
         return [row["id"] for row in rows]
+
+
+@dataclass(frozen=True)
+class _Statement:
+    user_id: uuid.UUID | str
+    actor_id: str
+    sql: str
+    params: list[Any]
+    fetch: bool
+    is_admin: bool
+    vault_names: list[str]
+    check_policy: bool
+
+
+@dataclass(frozen=True)
+class _Probe:
+    result: dict | None
+    modified: frozenset[uuid.UUID] = frozenset()
+
+
+class _UnadmittedRowChanges(Exception):
+    """The transaction queued row changes of Vaults it was not admitted for."""
+
+    def __init__(self, vault_ids: frozenset[uuid.UUID]) -> None:
+        super().__init__(", ".join(sorted(str(v) for v in vault_ids)))
+        self.vault_ids = vault_ids
+
+
+async def _admin_bypass(conn, statement: _Statement) -> bool:
+    """Whether a live unscoped human administrator keeps the backend role."""
+    return current_vault_scope.get() is None and await human_admin_sql_bypass(
+        conn, statement.user_id, statement.is_admin,
+    )
+
+
+async def _enter_statement_role(conn, statement: _Statement, admin_bypass: bool) -> None:
+    """Take the caller's role and settings for the rest of the transaction."""
+    scope = current_vault_scope.get()
+    token_id = current_token_id.get()
+    if scope is not None and token_id is not None:
+        # Scoped PAT → the narrow per-token role (membership =
+        # owner-ACL ∩ scope). Precedence over is_admin: a
+        # SCOPED admin token does NOT bypass — PG confines its
+        # akb_sql to the scope (42501 outside). If the role is
+        # missing (a best-effort provisioning hook failed
+        # before the reconciler ran), this SET raises →
+        # fail-CLOSED: we never fall back to the full
+        # akb_user_<uid>, which would defeat the scope.
+        role = token_role_name(token_id)
+        await conn.execute(f'SET LOCAL ROLE "{role}"')
+    elif not admin_bypass:
+        role = user_role_name(statement.user_id)
+        # asyncpg passes the role name as an identifier here;
+        # we built it ourselves from a UUID so the only chars
+        # are [a-z0-9_]. No injection risk.
+        await conn.execute(f'SET LOCAL ROLE "{role}"')
+    # else: live unscoped human admin → connection default.
+    # Reset search_path defensively — a previous tx on this
+    # pooled connection might have left a different default
+    # (it shouldn't, but be explicit).
+    await conn.execute("SET LOCAL search_path = public")
+    await conn.execute(
+        "SELECT set_config('akb.actor_id', $1, true)",
+        statement.actor_id,
+    )
+    request_claims = current_request_jwt_claims.get()
+    if request_claims is not None:
+        await conn.execute(
+            "SELECT set_config('request.jwt.claims', $1, true)",
+            request_claims.to_json(),
+        )
+
+
+# The Vault of each dynamic table is the first argument of its row-change
+# triggers (`table_data_repo.create_dynamic_table`); those triggers queue the
+# table's `table.rows_changed` events for that Vault.
+_VAULTS_OF_TABLES = r"""
+SELECT DISTINCT split_part(encode(t.tgargs, 'escape'), '\000', 1) AS vault_id
+  FROM pg_catalog.pg_trigger AS t
+  JOIN pg_catalog.pg_class AS c ON c.oid = t.tgrelid
+  JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+  JOIN unnest($1::text[], $2::text[]) AS m(schema_name, table_name)
+    ON n.nspname = m.schema_name AND c.relname = m.table_name
+ WHERE t.tgname IN (
+     'akb_rows_changed_insert_trigger',
+     'akb_rows_changed_update_trigger',
+     'akb_rows_changed_delete_trigger'
+ )
+"""
+
+
+async def _modified_vaults(conn, statement: _Statement) -> frozenset[uuid.UUID]:
+    """The Vaults whose dynamic tables the statement's plan modifies.
+
+    ``EXPLAIN`` plans the statement without running it, under the
+    statement's role. Foreign keys of a dynamic table only reference tables
+    of its own Vault, so a cascade stays in a Vault the plan names. A
+    statement that cannot be explained, or writes through a function, is
+    covered by the check of its queued row changes before it commits.
+    """
+    try:
+        async with conn.transaction():
+            plan = await conn.fetchval(
+                "EXPLAIN (VERBOSE, FORMAT JSON) " + statement.sql, *statement.params,
+            )
+    except asyncpg.PostgresError:
+        return frozenset()
+    relations = _modified_relations(json.loads(plan) if isinstance(plan, str) else plan)
+    if not relations:
+        return frozenset()
+    # The trigger catalog is read under the backend role.
+    await conn.execute("SET LOCAL ROLE NONE")
+    schemas, tables = zip(*sorted(relations))
+    rows = await conn.fetch(_VAULTS_OF_TABLES, list(schemas), list(tables))
+    return frozenset(uuid.UUID(row["vault_id"]) for row in rows if row["vault_id"])
+
+
+def _modified_relations(plan: Any) -> set[tuple[str, str]]:
+    """(schema, relation) of every ModifyTable node in an EXPLAIN JSON plan."""
+    found: set[tuple[str, str]] = set()
+    stack = [plan]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, list):
+            stack.extend(node)
+        elif isinstance(node, dict):
+            if node.get("Node Type") == "ModifyTable" and node.get("Relation Name"):
+                found.add((node.get("Schema") or "public", node["Relation Name"]))
+            stack.extend(node.values())
+    return found
+
+
+async def _check_row_changes_admitted(conn) -> None:
+    """Raise ``_UnadmittedRowChanges`` when the transaction queued row
+    changes of a Vault it is not admitted for.
+
+    Dynamic tables queue their row changes, and the events are inserted, and
+    the Vault's event lock taken, only when the transaction commits
+    (migration 132). The queue holds no committed rows (each is deleted as
+    its event is inserted), so the rows this transaction sees are its own.
+    """
+    # The queue is read under the backend role.
+    await conn.execute("SET LOCAL ROLE NONE")
+    rows = await conn.fetch("SELECT DISTINCT vault_id FROM public.events_row_change_queue")
+    unadmitted = frozenset(row["vault_id"] for row in rows if not is_admitted(row["vault_id"]))
+    if unadmitted:
+        raise _UnadmittedRowChanges(unadmitted)
 
 
 # ── Singleton accessor ────────────────────────────────────────
