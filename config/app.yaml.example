@@ -16,6 +16,11 @@ db_user: akb
 # keys — the deployment-layer knob for k8s / akb-platform.
 # pg_pool_min_size: 2
 # pg_pool_max_size: 30
+# Transactions of one Vault that write its events and may hold a pool
+# connection at once, per process (optional; defaults shown). The others wait
+# without a connection, then fail with a retryable write_busy after the timeout.
+# vault_write_concurrency: 4
+# vault_write_queue_timeout_secs: 10.0
 
 # Runtime safety budgets. Each Kiwi child holds its own model in memory, so do
 # not derive this from host CPU count. Kubernetes grants 45 seconds for pod

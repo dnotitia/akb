@@ -7,6 +7,20 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- A burst of writes to one Vault no longer takes the whole database pool.
+  Transactions that write a Vault's events wait for that Vault's event lock,
+  and they used to wait holding their pool connection, so requests for other
+  Vaults waited for a connection until the writers gave up at the lock's
+  5-second deadline. Every event-writing path (documents, collections, Files,
+  tables and their rows, `akb_sql`, access and Vault settings, app rollouts,
+  external Git synchronization) is now admitted for its Vault before it takes
+  a connection: each process admits at most `vault_write_concurrency`
+  (default 4) transactions of one Vault at a time, and the others wait without
+  a connection. A wait longer than `vault_write_queue_timeout_secs` (default
+  10 seconds) fails with a retryable `write_busy` (HTTP 429, `Retry-After: 1`)
+  before any database or Git change. Row reads through the table API now run
+  in a read-only transaction.
+
 - On the Native authority a recursive collection delete is now atomic per
   document and completes when run again. Each document's delete commits with
   its `document.delete` event in a short transaction that locks only that

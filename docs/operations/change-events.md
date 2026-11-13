@@ -164,18 +164,29 @@ in the MCP envelope. Any other lock wait past its limit, such as one under a
 `lock_timeout` set on the database role, and a deadlock (`40P01`) remain
 internal errors, because either can end a Bare Git write after its Git commit.
 
-A waiting transaction keeps its pooled database connection while it waits.
-Because a holder keeps the Vault's lock from its event insert to its commit,
-and a Bare Git document write keeps it through its Git work as well, other
-writers of the same Vault can each wait the full 5 seconds with a connection
-held, and then fail with `write_busy`. They accumulate when a holder is slow or
-when one Vault receives more event-writing transactions than it can commit one
-at a time, and they take connections that other Vaults' requests and the
-readiness check also need. AKB does not bound the number of waiters: admission
-control in front of the connection pool for writers of the same Vault, and a
-readiness check that does not depend on the shared pool, are deferred to a
-separate change. Until then the 5-second deadline and `write_busy` bound each
-wait.
+A transaction that waits for the Vault's lock keeps its pooled database
+connection while it waits. A holder keeps the lock from its event insert to its
+commit, and a Bare Git document write through its Git work as well, so when one
+Vault received more event-writing transactions than it could commit one at a
+time, they took every connection that other Vaults' requests also needed.
+Every transaction that may write a Vault's events (document, collection, File,
+table, table row and `akb_sql` writes, access and Vault settings changes, app
+rollouts, external Git synchronization, and a check that records an admin
+override) is therefore admitted for that Vault before it takes a connection.
+Each API process admits at most `vault_write_concurrency` (default 4) such
+transactions of one Vault at a time; the others wait, in arrival order and
+without a connection. One that waits longer than
+`vault_write_queue_timeout_secs` (default 10 seconds) fails with a retryable
+`write_busy` (HTTP 429 with `Retry-After: 1`, or `retry_after_secs` in the MCP
+envelope) before it has changed anything in the database or in Git; a File
+replacement whose publication is refused this way leaves only the scheduled
+cleanup of the bytes it copied. A Bare Git document write enters the Bare Git
+write lane first and then this admission. The limit is per process: with
+several processes a Vault can have that many admitted transactions in each, and
+the event lock still orders them, so an admitted transaction can still wait up
+to 5 seconds for it. Reads are not admitted. An event written for a Vault
+outside its admission is logged once per event kind. The readiness check still
+uses the shared pool.
 
 During a rolling deployment the first upgraded process applies migration 132.
 Processes still on the previous release then take the Vault lock too, but some
@@ -385,6 +396,14 @@ remains under the prefix; it also checks that a creation locks its ancestors in
 id order, together with a move's source, and that a measurement File upload
 into a new sub-collection removes expired intents first, so none of them
 deadlocks with the delete.
+`test_vault_write_admission_postgres.py` sends 24 collection creates to one
+Vault through a pool of 8 connections while another transaction holds that
+Vault's event lock, and checks that a reader of another Vault keeps getting a
+connection within a second and that every create commits once the lock is
+free. `test_vault_write_admission_paths_postgres.py` fills a Vault's admission
+and drives each event-writing path, which must fail with `write_busy` without
+changing anything; it also scans the application for every place that writes a
+Vault's events and fails when one has no such case.
 `test_collection_delete_native_atomic_postgres.py` holds the Vault's event lock
 after a Native recursive delete removed its first document and checks that the
 delete fails with `write_busy`, that the first document stays deleted with its
