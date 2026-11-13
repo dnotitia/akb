@@ -57,7 +57,7 @@ def _use(monkeypatch, pool: asyncpg.Pool, *, redis_url: str = ""):
 
 
 async def _sweep_pass(monkeypatch, pool: asyncpg.Pool, *, redis_url: str = "") -> list[int]:
-    """Run the sweeper's steps against ``pool`` until one deletes nothing; what each deleted."""
+    """Run a pass of the sweeper against ``pool``; each step's number of old events, ending at 0."""
     sweeper = _use(monkeypatch, pool, redis_url=redis_url)
     steps: list[int] = []
     while True:
@@ -252,11 +252,11 @@ async def test_with_redis_the_sweep_deletes_only_events_published_before_the_per
         assert await _watermarks(setup_pool) == {vault_id: published_lately}
 
 
-async def _hold_a_sweep(conn: asyncpg.Connection, through: int) -> int:
-    """Run the sweep's delete for the ids up to ``through`` in ``conn``'s open transaction."""
+async def _hold_a_sweep(conn: asyncpg.Connection, event_ids: list[int]) -> int:
+    """Run the sweep's delete of ``event_ids`` in ``conn``'s open transaction."""
     from app.services import events_sweeper
 
-    return await conn.fetchval(events_sweeper._DELETE_EXPIRED, 0, through, _RETENTION_DAYS)
+    return await conn.fetchval(events_sweeper._DELETE_EXPIRED, event_ids, _RETENTION_DAYS)
 
 
 async def _done_or_blocked_by(
@@ -307,7 +307,7 @@ async def test_a_sweep_beside_another_sweep_waits_for_no_event_row(monkeypatch):
         try:
             sweeping = other.transaction()
             await sweeping.start()
-            assert await _hold_a_sweep(other, held[-1]) == 3
+            assert await _hold_a_sweep(other, held) == 3
             steps = await asyncio.wait_for(_sweep_pass(monkeypatch, setup_pool), 2)
             await sweeping.commit()
         finally:
@@ -336,7 +336,7 @@ async def test_two_sweeps_of_one_vault_wait_only_for_its_mark_and_record_the_hig
         try:
             first = other.transaction()
             await first.start()
-            assert await _hold_a_sweep(other, expired[1]) == 2
+            assert await _hold_a_sweep(other, expired[:2]) == 2
             sweeping = asyncio.ensure_future(_sweep_pass(monkeypatch, setup_pool))
             tasks.append(sweeping)
             # The second sweep deleted the other two events and waits for the mark.
@@ -399,7 +399,7 @@ async def test_a_sweep_and_a_vault_delete_take_marks_in_the_same_order(monkeypat
             await _waits_for(setup_pool, deleting, holder)
             sweep = sweeping.transaction()
             await sweep.start()
-            raising = asyncio.ensure_future(_hold_a_sweep(sweeping, a_events[1]))
+            raising = asyncio.ensure_future(_hold_a_sweep(sweeping, [b_events[1], a_events[1]]))
             tasks.append(raising)
             await _done_or_waiting(setup_pool, raising, sweeping, deleting)
             await holding.commit()
@@ -452,7 +452,7 @@ async def test_a_sweep_beside_a_vault_cleanup_of_the_same_events_does_not_deadlo
             if first == "sweep":
                 sweeping = other.transaction()
                 await sweeping.start()
-                assert await _hold_a_sweep(other, aside[-1]) == 4
+                assert await _hold_a_sweep(other, doomed + aside) == 4
                 deleting_events = asyncio.ensure_future(
                     cleanup.execute("DELETE FROM events WHERE vault_id = $1", vault_id)
                 )
@@ -707,3 +707,62 @@ async def test_an_open_tail_goes_on_when_only_events_it_sent_are_deleted(monkeyp
         assert _positions(sent) == expired
         assert await _watermarks(setup_pool) == {vault_id: expired[-1]}
         assert _positions(following) == [latest]
+
+
+class _CommitAfterRead:
+    """A connection that runs ``after_read`` once the batch is read, before the delete."""
+
+    def __init__(self, conn: asyncpg.Connection, after_read) -> None:
+        self._conn = conn
+        self._after_read = after_read
+
+    async def fetch(self, *args):
+        rows = await self._conn.fetch(*args)
+        await self._after_read()
+        return rows
+
+    async def fetchval(self, *args):
+        return await self._conn.fetchval(*args)
+
+
+@pytest.mark.parametrize("redis_url", ["", "redis://sweep-test"], ids=["without-redis", "with-redis"])
+async def test_a_batch_deletes_only_the_events_it_read_when_a_lower_id_commits_in_between(monkeypatch, redis_url):
+    """The read and the delete are two statements, each with a snapshot of its own.
+
+    The delete took every expired event in the range of ids the batch read,
+    so an event committed between the two statements with an id inside that
+    range, drawn earlier by a transaction that stayed open, was deleted too,
+    and one statement could delete more than a batch. The delete is now given
+    the ids the batch read.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        vault_id = await _make_vault(setup_pool, "sweep-read-ids")
+        writer = await asyncpg.connect(_database_dsn(database))
+        try:
+            writing = writer.transaction()
+            await writing.start()
+            # The lowest id, drawn by a transaction that stays open.
+            late = await writer.fetchval(
+                """
+                INSERT INTO events (vault_id, kind, payload, occurred_at, redis_published_at)
+                VALUES ($1, 'document.put', '{}'::jsonb, NOW() - INTERVAL '30 days', NOW() - INTERVAL '8 days')
+                RETURNING id
+                """,
+                vault_id,
+            )
+            read = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(2)]
+            await _age(setup_pool, read)
+            await _publish_long_ago(setup_pool, read)
+            sweeper = _use(monkeypatch, setup_pool, redis_url=redis_url)
+            monkeypatch.setattr(sweeper, "BATCH_SIZE", 2)
+            delete = sweeper._DELETE_PUBLISHED if redis_url else sweeper._DELETE_EXPIRED
+            async with setup_pool.acquire() as conn:
+                step = await sweeper._sweep_batch(_CommitAfterRead(conn, writing.commit), 0, delete)
+        finally:
+            await writer.close()
+
+        assert late < read[0]
+        assert step == (2, 2, read[-1])
+        # The event committed after the read is left for a later pass.
+        assert await _remaining(setup_pool) == [late]

@@ -132,26 +132,40 @@ frame, and an idle tail closes within one heartbeat.
 
 The outbox keeps an event for `event_retention_days` (default 7), and a
 sweeper that every worker process runs, with or without Redis, then deletes
-it. With `redis_url` set, the period starts when the publisher writes the
-event to the stream, and an event not yet published is kept. Without it
-nothing publishes, and the period starts when the event occurred. Either way
-the sweeper reads events from the oldest id, a batch of 1,000 per statement
-and transaction, deletes the batch's events past retention, and stops at the
-first event that neither occurred nor was published more than the period ago.
-Without Redis an expired event behind that one, even one whose transaction
-began earlier, is kept a little longer than the period, never less. Each
-batch locks its events with SKIP LOCKED before it deletes them, so sweeps in
-two processes, or a sweep beside any other delete of the same events, an
-operator's included, wait for no event row and cannot deadlock over them.
-Earlier releases swept only with Redis, in one statement over every published
-event past the period: an installation without Redis kept every event, and
-one with it deleted a backlog in a single transaction that could wait for,
-and deadlock with, another delete of the same events. A tail client away for
-longer than the period should expect 410 `event_gap`, below, and reconcile
-current state through AKB. `GET /health` reports the publisher's counters
-under `events`. Without `redis_url` its `publishing` is `off` and the counters
-are 0: the events the outbox keeps for the tail will never be published, so
-they do not hold the top-level `status` at `reconciling`.
+it. With `redis_url` set, the period starts when the publisher records the
+event as published (`redis_published_at`): when it writes the event to the
+stream, or marks it published without writing it, as it does the gardener's
+own bookkeeping events. An event not recorded as published is kept. Without
+`redis_url` nothing publishes, and the period starts when the event occurred.
+Either way the sweeper reads events from the oldest id, a batch of 1,000 per
+statement and transaction, deletes those of the batch's ids that are past
+retention, and stops at the first event that neither occurred nor was
+recorded as published more than the period ago. Without Redis an expired
+event behind that one, even one whose transaction began earlier, is kept a
+little longer than the period, never less. Ids drawn before migration 133,
+when the id sequence's cache could be above 1, may be out of order, and an
+expired event behind a newer one then waits for it, with or without Redis.
+Each statement checks every event's own time, so this can only delay a
+deletion, never make one early. Workers that disagree about `redis_url`, as
+during a change of it, each apply their own rule: one without it deletes an
+event that occurred more than the period ago, recorded as published or not,
+so an event no publisher has written yet can be deleted before one does.
+Neither rule deletes an event before the period has passed since it
+occurred; give every worker the same setting. Each batch locks its events
+with SKIP LOCKED before it deletes them, so a sweep never waits for an event
+row another statement holds, and a sweep cannot deadlock with another sweep
+or with a single statement that deletes events, an operator's included. A
+transaction that deletes events in more than one statement still can, as
+with any other delete of events. Earlier releases swept only with Redis, in
+one statement over every published event past the period: an installation
+without Redis kept every event, and one with it deleted a backlog in a single
+transaction that could wait for, and deadlock with, another delete of the
+same events. A tail client away for longer than the period may get 410
+`event_gap`, below, and should then reconcile current state through AKB.
+`GET /health` reports the publisher's counters under `events`. Without
+`redis_url` its `publishing` is `off` and the counters are 0: the events the
+outbox keeps for the tail will never be published, so they do not hold the
+top-level `status` at `reconciling`.
 
 A cursor is refused with 410 `event_gap` only when an event it never received
 was deleted. A trigger on `events` records, per Vault, the highest event id

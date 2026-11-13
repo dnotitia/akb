@@ -77,8 +77,8 @@ async def test_a_batch_of_old_events_is_deleted_through_its_last_id_and_the_pass
     _serve(monkeypatch, sweeper, conn)
 
     assert await sweeper.sweep_once() == 3
-    # The delete covers the ids after the pass's position through the last old one.
-    assert conn.deletes == [(0, 9, 7)]
+    # The delete is given the ids the batch read, not their range.
+    assert conn.deletes == [([4, 7, 9], 7)]
     assert sweeper._position == 9
 
 
@@ -89,7 +89,7 @@ async def test_an_event_that_is_not_old_bounds_the_delete_and_the_next_step_ends
 
     assert await sweeper.sweep_once() == 1
     # The old event behind the one that is not is not reached.
-    assert conn.deletes == [(2, 4, 7)]
+    assert conn.deletes == [([4], 7)]
     assert sweeper._position == 4
 
     ended = _Conn([(7, False), (9, True)], deleted=0)
@@ -115,7 +115,7 @@ async def test_with_redis_a_batch_is_deleted_by_publication_in_the_same_bounded_
 
     assert await sweeper.sweep_once() == 2
     assert conn.statements == [sweeper._DELETE_PUBLISHED]
-    assert conn.deletes == [(0, 7, 7)]
+    assert conn.deletes == [([4, 7], 7)]
     assert "FOR UPDATE SKIP LOCKED" in sweeper._DELETE_PUBLISHED
     assert sweeper._position == 7
 
@@ -136,5 +136,28 @@ async def test_a_step_that_fails_starts_the_next_pass_from_the_oldest_event(monk
     monkeypatch.setattr(sweeper, "_position", 3)
 
     with pytest.raises(ConnectionResetError):
+        await sweeper.sweep_once()
+    assert sweeper._position == 0
+
+
+@pytest.mark.parametrize("failing", ["get_pool", "acquire"])
+async def test_a_step_that_cannot_get_a_connection_starts_the_next_pass_from_the_oldest_event(
+    monkeypatch, sweeper, failing
+):
+    """The position went back to 0 only once the step had its connection, so a lost pool kept it."""
+
+    class _FailingPool:
+        def acquire(self):
+            raise ConnectionRefusedError("the pool is closed")
+
+    async def get_pool():
+        if failing == "get_pool":
+            raise ConnectionRefusedError("no database")
+        return _FailingPool()
+
+    monkeypatch.setattr(sweeper, "get_pool", get_pool)
+    monkeypatch.setattr(sweeper, "_position", 42)
+
+    with pytest.raises(ConnectionRefusedError):
         await sweeper.sweep_once()
     assert sweeper._position == 0

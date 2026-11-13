@@ -7,32 +7,50 @@ run (`lifecycle.start_workers`), with or without Redis.
 
 An event is kept for `event_retention_days`, counted:
 
-- with `redis_url` set, from its publication to the stream. An event that has
-  not been published is kept, as before.
+- with `redis_url` set, from when the publisher records it as published
+  (`redis_published_at`): when it writes the event to the stream, or marks it
+  published without writing it, as it does the gardener's own bookkeeping
+  events. An event that is not recorded as published is kept, as before.
 - without it, where nothing publishes, from when it occurred.
 
 A pass reads the events in id order from the oldest, one batch per step, and
-goes on while they are old: occurred, or published, more than the period ago.
-Each batch's statement deletes its old events that are past retention, all of
-them without Redis and the ones published that long ago with it, and leaves
-the rest. The pass ends at the first event that is not old. Without Redis an
-expired event behind that one waits for it, even when its own transaction
-began earlier, so it is kept a little longer than the period, never less.
-With Redis no event past retention is behind it: an event is published after
-its id is drawn, ids are drawn in order (migration 133 sets the id sequence's
-cache to 1), and that one occurred inside the period. A backlog is therefore
-deleted in statements of at most one batch each, every one its own
-transaction, and a pass with nothing to delete reads one batch.
+goes on while they are old: occurred, or recorded as published, more than the
+period ago. Each batch's statement is given the ids of the batch's old events
+and deletes those past retention, all of them without Redis and the ones
+published that long ago with it, and leaves the rest. The pass ends at the
+first event that is not old. Without Redis an expired event behind that one
+waits for it, even when its own transaction began earlier, so it is kept a
+little longer than the period, never less. With Redis, of the ids drawn since
+migration 133 set the id sequence's cache to 1, none past retention is behind
+it: an event is published after its id is drawn, those ids are drawn in
+order, and that one occurred inside the period. Ids drawn before migration
+133, with a larger cache, may be out of order, and an event past retention
+behind it then waits for it too. Either way the statement checks each event's
+own time, so a pass ending early only delays a deletion, never makes one
+early. A backlog is therefore deleted in statements of at most one batch
+each, every one its own transaction, and a pass whose first event is not old
+reads one batch.
+
+Workers that disagree about `redis_url`, as during a change of it, each sweep
+by their own rule: one without it deletes events that occurred more than the
+period ago, recorded as published or not, and one with it keeps the
+unpublished ones. As an event is published after it occurred, neither
+deletes one before the period has passed since it occurred; an event no
+publisher has written yet can, however, be deleted before one does, so give
+every worker the same setting.
 
 Every delete fires the `events` delete trigger (migration 133), which raises
 each affected Vault's retention watermark in the same statement, so an event
 tail cursor below the watermark is refused with 410 and resumes at it. A
-batch locks its events with SKIP LOCKED before it deletes them, so a sweep in
-another process, or any other delete of the same events, never makes it wait
-for an event row: a row another statement holds is left to that statement.
-The trigger then takes the Vaults' marks in Vault id order, as every writer
-of marks does, and nothing that holds a mark waits for an event row, so the
-wait it can have for a mark closes no cycle.
+batch locks its events with SKIP LOCKED before it deletes them, so a sweep
+never waits for an event row another statement holds: the row is left to that
+statement. The trigger then takes the Vaults' marks in Vault id order, as
+every writer of marks does, and a single statement that deletes events holds
+its event rows before it takes any mark: a sweep therefore cannot deadlock
+with another sweep, or with another statement that deletes events on its own.
+A transaction that deletes events in more than one statement still can: once
+its first statement holds a Vault's mark, its next one may wait for an event
+row a sweep holds while the sweep waits for that mark.
 """
 
 from __future__ import annotations
@@ -64,15 +82,16 @@ _READ_BATCH = """
      LIMIT $2
 """
 
-# Without Redis: the events of a range of ids that occurred more than the
-# period ago.
+# Without Redis: the events, of the ids a batch read, that occurred more than
+# the period ago. The ids, not their range: the delete is a statement of its
+# own, and an event committed after the read with an id among them is not
+# the batch's to delete.
 _DELETE_EXPIRED = """
     WITH locked AS MATERIALIZED (
         SELECT id
           FROM events
-         WHERE id > $1
-           AND id <= $2
-           AND occurred_at < NOW() - make_interval(days => $3)
+         WHERE id = ANY($1::bigint[])
+           AND occurred_at < NOW() - make_interval(days => $2)
          ORDER BY id
            FOR UPDATE SKIP LOCKED
     ),
@@ -85,16 +104,15 @@ _DELETE_EXPIRED = """
     SELECT COUNT(*) FROM d
 """
 
-# With Redis: the events of a range of ids published to the stream more than
-# the period ago.
+# With Redis: the events, of the ids a batch read, published more than the
+# period ago.
 _DELETE_PUBLISHED = """
     WITH locked AS MATERIALIZED (
         SELECT id
           FROM events
-         WHERE id > $1
-           AND id <= $2
+         WHERE id = ANY($1::bigint[])
            AND redis_published_at IS NOT NULL
-           AND redis_published_at < NOW() - make_interval(days => $3)
+           AND redis_published_at < NOW() - make_interval(days => $2)
          ORDER BY id
            FOR UPDATE SKIP LOCKED
     ),
@@ -112,43 +130,45 @@ _DELETE_PUBLISHED = """
 _position = 0
 
 
-async def _sweep_batch(conn, after: int) -> tuple[int, int, int]:
+async def _sweep_batch(conn, after: int, delete: str) -> tuple[int, int, int]:
     """Read the batch after ``after`` and delete its old events past retention.
 
-    Both statements lock their rows with SKIP LOCKED, in one transaction each.
-    Returns how many old events lead the batch, up to the first that is not
-    old (0 once the pass is over), how many of them the statement deleted, and
-    the position the pass goes on from.
+    ``delete`` is the statement for the configured transport, `_DELETE_EXPIRED`
+    or `_DELETE_PUBLISHED`. It is given the ids of the old events the batch
+    read, so it deletes at most a batch, and locks them with SKIP LOCKED, in a
+    transaction of its own. Returns how many old events lead the batch, up to
+    the first that is not old (0 once the pass is over), how many of them the
+    statement deleted, and the position the pass goes on from.
     """
     days = settings.event_retention_days
     batch = await conn.fetch(_READ_BATCH, after, BATCH_SIZE, days)
-    old = 0
+    old: list[int] = []
     for row in batch:
         if not row["old"]:
             break
-        old += 1
+        old.append(row["id"])
     if not old:
         return 0, 0, 0
-    through = batch[old - 1]["id"]
-    statement = _DELETE_PUBLISHED if settings.redis_url else _DELETE_EXPIRED
-    deleted = int(await conn.fetchval(statement, after, through, days) or 0)
-    return old, deleted, through
+    deleted = int(await conn.fetchval(delete, old, days) or 0)
+    return len(old), deleted, old[-1]
 
 
 async def sweep_once() -> int:
     """Take one step of the pass: one batch.
 
-    Returns how many old events the batch held, deleted or left (unpublished,
-    or held by another statement), and the runner then takes the next step at
-    once; 0 once the pass is over, and the runner waits SWEEP_INTERVAL_SECONDS
-    before the next one.
+    Returns the number of old events the batch held, deleted or left
+    (unpublished, or held by another statement), and the runner then takes
+    the next step at once; 0 once the pass is over, and the runner waits
+    SWEEP_INTERVAL_SECONDS before the next one.
     """
     global _position
+    # A step that fails, before it has a connection or after, starts the next
+    # pass from the oldest event.
+    after, _position = _position, 0
+    delete = _DELETE_PUBLISHED if settings.redis_url else _DELETE_EXPIRED
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # A step that fails starts the next pass from the oldest event.
-        after, _position = _position, 0
-        old, deleted, _position = await _sweep_batch(conn, after)
+        old, deleted, _position = await _sweep_batch(conn, after, delete)
     if deleted:
         logger.info("events sweep: purged %d rows", deleted)
     return old

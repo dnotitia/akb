@@ -1394,12 +1394,14 @@ class Settings(BaseModel):
     redis_stream_maxlen: int = 100_000  # XADD MAXLEN ~ ceiling
     # Days the `events` outbox keeps an event before the sweeper, which runs
     # with or without Redis, deletes it. With redis_url set the period starts
-    # when the event is published to the stream, and an unpublished event is
-    # kept: the window lets an operator debug delivery against the outbox
-    # after the fact. Without redis_url the period starts when the event
-    # occurred. The event tail refuses a cursor that missed a deleted event
-    # with 410 `event_gap`, so a tail client away for longer than this should
-    # expect to reconcile.
+    # when the publisher records the event as published (redis_published_at:
+    # written to the stream, or marked published without it, as the
+    # gardener's bookkeeping events are), and an event not recorded as
+    # published is kept: the window lets an operator debug delivery against
+    # the outbox after the fact. Without redis_url the period starts when the
+    # event occurred. The event tail refuses a cursor that missed a deleted
+    # event with 410 `event_gap`, so a tail client away for longer than this
+    # may get one and should then reconcile.
     event_retention_days: int = Field(default=7, ge=1, le=3650)
 
     # Vault Change Event Tail (`GET /api/v1/events/{vault}`). A waiting stream
