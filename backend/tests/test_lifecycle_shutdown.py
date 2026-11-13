@@ -55,6 +55,7 @@ async def test_stop_workers_broadcasts_then_joins_every_component(monkeypatch):
     names = {
         lifecycle.m1_file_transfer_reaper: "m1",
         lifecycle.events_publisher: "events",
+        lifecycle.events_sweeper: "events_sweeper",
         lifecycle.metadata_worker: "metadata",
         lifecycle.external_git_poller: "external_git",
         lifecycle.asset_gc_worker: "asset_gc",
@@ -123,6 +124,7 @@ async def test_one_stop_failure_does_not_skip_siblings(monkeypatch):
     modules = [
         lifecycle.m1_file_transfer_reaper,
         lifecycle.events_publisher,
+        lifecycle.events_sweeper,
         lifecycle.metadata_worker,
         lifecycle.external_git_poller,
         lifecycle.asset_gc_worker,

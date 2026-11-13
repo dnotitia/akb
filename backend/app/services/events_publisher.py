@@ -6,7 +6,8 @@ transaction as the domain change. This worker reads pending rows
 (`redis_published_at IS NULL`), `XADD`s them to a Redis Stream, and
 marks the row published. On Redis outage the rows accumulate and the
 backoff schedule (shared with the indexing workers) keeps
-retries bounded.
+retries bounded. `events_sweeper`, which runs with or without Redis,
+deletes published rows once they are past their retention period.
 
 External consumers subscribe via `XREAD` / consumer groups:
     XREAD COUNT 100 BLOCK 5000 STREAMS akb:events $
@@ -24,7 +25,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -86,14 +86,6 @@ def _table_name_from_uri(resource_uri: str) -> str:
     if idx < 0:
         return ""
     return resource_uri[idx + len(marker):]
-
-# Sweep tuning — purge rows that were successfully published more than
-# 7 days ago. The grace window exists so an operator can debug delivery
-# issues against the outbox after the fact; once it's expired the row
-# is also gone from the stream's MAXLEN window so no reason to keep it.
-SWEEP_GRACE_INTERVAL = "7 days"
-SWEEP_INTERVAL_SECONDS = 3600.0
-_last_sweep_at: float = 0.0
 
 
 # ── Redis client (lazy, shared) ──────────────────────────────────
@@ -321,56 +313,15 @@ async def _process_once() -> int:
         return succeeded
 
 
-# ── Sweeper ──────────────────────────────────────────────────────
-
-
-async def _sweep_once() -> int:
-    """Purge published rows older than SWEEP_GRACE_INTERVAL.
-    Rate-limited to once per SWEEP_INTERVAL_SECONDS.
-
-    The events table's delete trigger raises each affected Vault's retention
-    watermark in this statement, as it does for any delete (migration 133). An
-    event tail cursor below the watermark missed a deleted event and is
-    refused with 410.
-    """
-    global _last_sweep_at
-    now = time.monotonic()
-    if now - _last_sweep_at < SWEEP_INTERVAL_SECONDS:
-        return 0
-    _last_sweep_at = now
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        n = await conn.fetchval(
-            f"""
-            WITH d AS (
-                DELETE FROM events
-                 WHERE redis_published_at IS NOT NULL
-                   AND redis_published_at < NOW() - INTERVAL '{SWEEP_GRACE_INTERVAL}'
-                RETURNING 1
-            )
-            SELECT COUNT(*) FROM d
-            """
-        )
-    n = int(n or 0)
-    if n:
-        logger.info("events sweep: purged %d rows", n)
-    return n
-
-
 # ── Loop ─────────────────────────────────────────────────────────
 
 
 async def _tick() -> int:
     try:
-        n = await _process_once()
+        return await _process_once()
     except Exception as e:  # noqa: BLE001
         logger.exception("events_publisher tick failed: %s", e)
-        n = 0
-    try:
-        await _sweep_once()
-    except Exception as e:  # noqa: BLE001
-        logger.exception("events_publisher sweep failed: %s", e)
-    return n
+        return 0
 
 
 _runner = BackfillRunner("events_publisher", _tick)

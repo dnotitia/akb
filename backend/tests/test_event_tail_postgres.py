@@ -149,15 +149,19 @@ async def test_retention_bounds_drive_gap_recovery_without_skipping(monkeypatch)
 
 
 async def _sweep(monkeypatch, pool: asyncpg.Pool) -> int:
-    """Run the events sweeper once against ``pool``, past its rate limit."""
-    from app.services import events_publisher
+    """Run one step of the events sweeper against ``pool``, as it runs with Redis.
+
+    With Redis the step deletes, in one statement, every event published more
+    than the retention period ago.
+    """
+    from app.services import events_sweeper
 
     async def get_pool() -> asyncpg.Pool:
         return pool
 
-    monkeypatch.setattr(events_publisher, "get_pool", get_pool)
-    monkeypatch.setattr(events_publisher, "_last_sweep_at", float("-inf"))
-    return await events_publisher._sweep_once()
+    monkeypatch.setattr(events_sweeper, "get_pool", get_pool)
+    monkeypatch.setattr(events_sweeper.settings, "redis_url", "redis://events-sweeper-test")
+    return await events_sweeper.sweep_once()
 
 
 async def test_postgres_tail_stream_preserves_order_filter_checkpoints_and_resume(monkeypatch):

@@ -27,6 +27,7 @@ from app.services import (
     embed_worker,
     event_tail_service,
     events_publisher,
+    events_sweeper,
     external_git_poller,
     http_pool,
     m1_file_transfer_reaper,
@@ -482,10 +483,15 @@ def start_workers(*, include_api_local: bool = True) -> None:
         started.append("metadata_worker")
     else:
         logger.info("metadata_worker disabled (LLM not configured)")
+    # The sweeper deletes `events` outbox rows past event_retention_days,
+    # with or without Redis. It ran inside the publisher, so without
+    # redis_url nothing deleted them and the table grew without bound.
+    events_sweeper.start()
+    started.append("events_sweeper")
     # events_publisher fans `events` outbox rows out to Redis Streams.
-    # Without redis_url we leave the rows accumulating in PG (still
-    # useful for in-process LISTEN/NOTIFY consumers, sweeper just
-    # never runs). No worker = no log noise / no abandoned-row stats.
+    # Without redis_url the rows stay in PG only, for the event tail and
+    # in-process LISTEN/NOTIFY consumers. No worker = no log noise / no
+    # abandoned-row stats.
     if settings.redis_url:
         events_publisher.start()
         started.append("events_publisher")
@@ -527,6 +533,7 @@ async def stop_workers(*, include_api_local: bool = True) -> None:
         ("role_sync", lambda: get_role_sync().stop_reconcile_timer()),
         ("m1_file_transfer_reaper", m1_file_transfer_reaper.stop),
         ("events_publisher", events_publisher.stop),
+        ("events_sweeper", events_sweeper.stop),
         ("notification_worker", notification_worker.stop),
         ("account_deletion_worker", account_deletion_worker.stop),
         ("sso_account_sync", sso_account_sync.stop),

@@ -130,6 +130,21 @@ check fails tries again after the next heartbeat. Heartbeats keep their
 reader stops receiving events within about a second and gets no further
 frame, and an idle tail closes within one heartbeat.
 
+The outbox keeps an event for `event_retention_days` (default 7), and a
+sweeper that every worker process runs, with or without Redis, then deletes
+it. With `redis_url` set, the period starts when the publisher writes the
+event to the stream, and an event not yet published is kept. Without it
+nothing publishes, and the period starts when the event occurred: the sweeper
+reads events from the oldest id, a batch of 1,000 per statement, and stops at
+the first one still inside the period, so an event behind that one, even one
+whose transaction began earlier, is kept a little longer than the period,
+never less. Each of those batches locks its events with SKIP LOCKED before it
+deletes them, so sweeps in two processes, or a sweep beside another delete of
+the same events, wait for no event row. Earlier releases swept only with
+Redis, so an installation without it kept every event. A tail client
+away for longer than the period should expect 410 `event_gap`, below, and
+reconcile current state through AKB.
+
 A cursor is refused with 410 `event_gap` only when an event it never received
 was deleted. A trigger on `events` records, per Vault, the highest event id
 deleted, in every statement that deletes, whichever code issues it: this
@@ -161,8 +176,9 @@ sequence had handed out at that moment, while inserts and deletes on
 `events` wait. If the sequence's cache is above 1 it sets it to 1 first, so
 that no session can later hand out an id it drew ahead before the install;
 the cache stays 1. It reads no events, so that wait does not depend on how many
-rows the table holds, live or deleted and not yet cleaned up; the table keeps
-growing when the sweeper does not run, as without Redis. Migration 134 then
+rows the table holds, live or deleted and not yet cleaned up, however large an
+installation without Redis, which earlier releases never swept, let it grow.
+Migration 134 then
 sets the starting marks from the events up to that id, in its own
 transaction and without that lock, so writes go on while it scans. A Vault
 that already has a mark keeps it: only the trigger can have written one

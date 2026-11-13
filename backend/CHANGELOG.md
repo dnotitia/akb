@@ -7,6 +7,20 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- Without `redis_url`, the `events` outbox no longer grows without bound. Its
+  sweep ran inside the Redis publisher, which starts only with Redis; it now
+  has a worker of its own that every worker process runs either way. An event
+  is kept for `event_retention_days` (new, default 7). With Redis the period
+  starts at publication to the stream, as before, and an unpublished event is
+  kept. Without it the period starts when the event occurred, and the sweeper
+  deletes events from the oldest id, 1,000 per statement, up to the first one
+  still inside the period; each batch locks its rows with SKIP LOCKED, so
+  sweeps in two processes do not wait for each other's rows. Every deletion
+  raises the Vault's retention watermark through the `events` delete trigger,
+  so an event tail cursor that missed a deleted event is refused with 410
+  `event_gap`. The first pass on an installation that ran without Redis
+  deletes its backlog in those batches.
+
 - Open `GET /api/v1/events/{vault}` SSE tails no longer hold request-pool
   connections. Each server process wakes them from one dedicated PostgreSQL
   `LISTEN` connection. A tail borrows one pooled connection to read a batch

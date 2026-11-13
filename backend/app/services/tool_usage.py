@@ -572,10 +572,9 @@ async def purge_once() -> int:
     """Drop raw rows past retention that carry a claim stamp.
 
     An unfolded row is never deleted however old it is, because the aggregate
-    that would replace it does not exist yet. Unlike the ``events`` outbox —
-    whose purge lives inside the publisher and stops the moment its transport
-    is unconfigured, letting the table grow forever — this runs independently
-    of ``enabled`` so disabling collection still prunes.
+    that would replace it does not exist yet. This runs independently of
+    ``enabled`` so disabling collection still prunes, as the ``events``
+    outbox's sweeper runs whether or not its Redis transport is configured.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -648,10 +647,10 @@ _flusher = BackfillRunner(
     log_progress=False,
 )
 # Deliberately a SEPARATE runner from the flusher, and started regardless of
-# `enabled`: the `events` outbox puts its purge inside the publisher, so
-# clearing `redis_url` stops publishing AND pruning and the table grows without
-# bound. Turning tracking off here must still drain and prune what was already
-# collected.
+# `enabled`: the `events` outbox once kept its purge inside the publisher, so
+# clearing `redis_url` stopped publishing AND pruning and the table grew
+# without bound. Turning tracking off here must still drain and prune what was
+# already collected.
 _maintainer = BackfillRunner(
     "tool_usage_maintenance", maintenance_once,
     idle_secs=settings.tool_usage.rollup_interval_secs,
