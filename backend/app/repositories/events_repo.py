@@ -18,6 +18,8 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 
+from app.services.vault_write_admission import note_event_write
+
 
 async def emit_event(
     conn,
@@ -52,9 +54,12 @@ async def emit_event(
     full document body here; subscribers can `akb_get` if they need
     content. Useful: title, path, doc_type, prior commit hash, etc.
 
-    Returns the new event id.
+    Returns the new event id. A transaction that writes an event for a
+    Vault enters ``vault_write_admission`` for it before taking its pool
+    connection (see ``app.services.vault_write_admission``).
     """
     vault_uuid = _to_uuid_or_none(vault_id)
+    note_event_write(vault_uuid, kind)
     payload_json = json.dumps(payload or {})
     event_id = await conn.fetchval(
         """
@@ -85,9 +90,9 @@ async def lock_vault_events(conn, vault_id: uuid.UUID | str) -> None:
     while it waits for nothing else. The event insert's own trigger finds the
     lock already held.
     """
-    await conn.execute(
-        "SELECT public.akb_lock_vault_events($1)", _to_uuid_or_none(vault_id),
-    )
+    vault_uuid = _to_uuid_or_none(vault_id)
+    note_event_write(vault_uuid, "vault event lock")
+    await conn.execute("SELECT public.akb_lock_vault_events($1)", vault_uuid)
 
 
 class EventBuffer:
