@@ -345,6 +345,34 @@ test("a stream cut mid-event is reopened from the last cursor instead of failing
   }
 });
 
+test("a CRLF split across chunks is one line ending, and a lone CR still ends a line", async () => {
+  const data = "data: {\"version\":1,\"cursor\":\"ec1.x\"}";
+  for (const [shape, chunks] of [
+    // Every CR of the frame is the last byte of a chunk and its LF the first of the next.
+    ["CRLF split after each CR", ["event: checkpoint\r", "\nid: ec1.x\r", `\n${data}\r`, "\n\r", "", "\n"]],
+    ["CR-only line endings split after each CR", ["event: checkpoint\r", "id: ec1.x\r", `${data}\r`, "\r"]],
+  ]) {
+    const checkpoints = [];
+    const fetch = async (_input, init = {}) => sseResponse(chunks, 200, init.signal, false);
+    const subscription = await createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+      .vault("vault")
+      .channel()
+      .on("checkpoint", (checkpoint) => checkpoints.push(checkpoint.cursor))
+      .subscribe();
+    let failure = null;
+    subscription.closed.catch((error) => {
+      failure = error;
+    });
+
+    await waitFor(() => failure !== null || checkpoints.length > 0);
+    assert.equal(failure, null, `${shape} ended the channel`);
+    assert.deepEqual(checkpoints, ["ec1.x"], shape);
+    assert.equal(subscription.cursor, "ec1.x", shape);
+    await subscription.unsubscribe();
+    await subscription.closed;
+  }
+});
+
 test("a 429 user quota refusal still ends the channel and carries its code and Retry-After", async () => {
   const quota = () => json(
     {

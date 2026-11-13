@@ -134,16 +134,24 @@ class SseParser {
   private hasFields = false;
   private retryDelayMs: number | null = null;
   private commented = false;
+  // The last chunk ended on a CR, which already ended its line; an LF that
+  // starts the next chunk is the rest of that CRLF, not an empty line.
+  private endedOnCr = false;
 
   feed(chunk: string): SseParserResult {
-    this.buffer += chunk;
+    let text = chunk;
+    if (this.endedOnCr && text.length > 0) {
+      if (text.startsWith("\n")) text = text.slice(1);
+      this.endedOnCr = false;
+    }
+    this.buffer += text;
     const frames: SseFrame[] = [];
     let newlineIndex = this.findNewline();
     while (newlineIndex >= 0) {
       let line = this.buffer.slice(0, newlineIndex);
-      const lineEndingLength = this.buffer[newlineIndex] === "\r" && this.buffer[newlineIndex + 1] === "\n"
-        ? 2
-        : 1;
+      const endsOnCr = this.buffer[newlineIndex] === "\r";
+      if (endsOnCr && newlineIndex === this.buffer.length - 1) this.endedOnCr = true;
+      const lineEndingLength = endsOnCr && this.buffer[newlineIndex + 1] === "\n" ? 2 : 1;
       this.buffer = this.buffer.slice(newlineIndex + lineEndingLength);
       if (line.endsWith("\r")) line = line.slice(0, -1);
       const frame = this.consumeLine(line);

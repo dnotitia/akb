@@ -29,6 +29,9 @@ streams already open.
   ends it, is discarded, as the SSE parsing rules require, and the stream is
   reopened from the last cursor. It used to be dispatched, or to end the
   channel with `protocol_error` when its JSON was cut.
+- A CRLF line ending split between two chunks of a stream is one line ending.
+  The LF used to read as an empty line, which dispatched the event early and
+  ended the channel with `protocol_error`.
 - `AkbError` has a new `retryAfterMs` field: the wait the response's
   `Retry-After` asked for, in milliseconds, or `null`. HTTP error responses
   set it, from `akbFetch` as from the channel.
