@@ -58,9 +58,11 @@ The marks have no foreign key to vaults. A Vault's delete removes its mark,
 but an ordinary delete leaves the Vault's events behind, and sweeping them
 later writes a mark for a Vault that is gone. It is inert, as Vault ids are
 never reused, yet it would stay for good. The step that ends a pass removes
-the marks of Vaults that no longer exist and have no event left; while an
-event of the Vault id remains, its mark stays, as the line that event's 410 is
-drawn by. That delete locks the marks in Vault id order with SKIP LOCKED,
+the marks of Vaults that no longer exist when its statement's snapshot holds
+no event of theirs; a mark whose Vault id still has an event there stays, as
+the line that event's 410 is drawn by. An event of such a Vault id inserted
+after that snapshot can make a later delete write the mark again, for a later
+pass to remove. That delete locks the marks in Vault id order with SKIP LOCKED,
 leaving a mark another statement holds for a later pass, so it waits for no
 row lock and closes no cycle.
 """

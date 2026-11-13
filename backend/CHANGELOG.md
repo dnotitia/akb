@@ -12,9 +12,11 @@ specifically; the proxy has its own log in
   sweeping them later wrote a mark for the deleted Vault, which then stayed
   for good: inert, as Vault ids are never reused, but one row for every such
   Vault. Once a pass has nothing left to delete, the sweeper deletes the
-  marks of Vaults that are gone and have no event left; while an event of the
-  Vault id remains, its mark stays. The delete locks the marks in Vault id
-  order with SKIP LOCKED, so it waits for no other writer of marks.
+  marks of Vaults that are gone when its statement's snapshot holds no event
+  of theirs; a mark whose Vault id still has an event there stays. An event of
+  such a Vault id inserted after that snapshot can make a later delete write
+  the mark again, for a later pass to remove. The delete locks the marks in
+  Vault id order with SKIP LOCKED, so it waits for no other writer of marks.
 
 - Without `redis_url`, `GET /health` no longer counts the `events` outbox's
   events as waiting to be published. Nothing publishes them, yet each was

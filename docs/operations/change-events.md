@@ -185,10 +185,14 @@ locked, so two of them cannot deadlock over marks either; a mark created
 while it runs is left behind, inert. A mark written for a Vault
 after its delete, as when its leftover events are swept later, is inert as
 well: Vault ids are never reused. Once a pass has nothing left to delete, the
-sweeper removes the marks of Vaults that no longer exist and have no event
-left; while an event of the Vault id remains, its mark stays. That delete
-locks the marks in Vault id order and skips one another statement holds
-(SKIP LOCKED), leaving it to a later pass, so it waits for no row lock. A
+sweeper removes the marks of Vaults that no longer exist when the cleanup
+statement's snapshot holds no event of theirs; a mark whose Vault id still
+has an event in that snapshot stays. An event of such a Vault id inserted
+after that snapshot can outlive the mark the cleanup removed; the delete that
+later removes it writes the mark again, and a later pass removes that one.
+That cleanup locks the marks in Vault id order and skips one another
+statement holds (SKIP LOCKED), leaving it to a later pass, so it waits for no
+row lock. A
 cursor below a mark is refused, and the refusal's `earliest_cursor` resumes
 at it. An open tail reads the Vault's mark with each batch, in the statement
 that reads the batch: when it is above the tail's position, an event the tail
