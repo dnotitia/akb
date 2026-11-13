@@ -132,26 +132,29 @@ def test_member_installation_active_status_is_an_allowlisted_boolean():
 
 
 @pytest.mark.asyncio
-async def test_member_installation_status_rejects_app_credentials_before_database(monkeypatch):
+@pytest.mark.parametrize("account_kind", ["app", "service"])
+async def test_installation_active_status_rejects_nonhuman_members_before_database(
+    monkeypatch, account_kind,
+):
     async def unexpected_pool():
-        raise AssertionError("application credentials must be rejected before database access")
+        raise AssertionError("Nonhuman credentials must be rejected before database access")
 
     monkeypatch.setattr(installation, "get_pool", unexpected_pool)
-    app_user = AuthenticatedUser(
+    user = AuthenticatedUser(
         user_id=str(uuid.uuid4()),
         username="app-principal",
         email="app@example.invalid",
         display_name=None,
         is_admin=False,
         auth_method="pat",
-        account_kind="app",
+        account_kind=account_kind,
     )
 
     with pytest.raises(ForbiddenError, match="Installation request denied"):
-        await installation.get_member_installation_active_status(
+        await installation.get_installation_active_status(
             uuid.uuid4(),
             uuid.uuid4(),
-            user=app_user,
+            user=user,
             correlation_id="test",
         )
 
@@ -205,7 +208,7 @@ async def test_member_installation_unavailable_is_not_reported_as_inactive(monke
     monkeypatch.setattr(installation, "check_vault_access", allow_owner_access)
 
     with pytest.raises(AKBError) as unavailable:
-        await installation.get_member_installation_active_status(
+        await installation.get_installation_active_status(
             uuid.uuid4(), vault_id, user=user, correlation_id="test"
         )
 

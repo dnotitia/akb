@@ -319,7 +319,7 @@ class InstallationProjection(ControlPlaneModel):
 
 
 class InstallationActiveStatus(BaseModel):
-    """Minimal canonical active flag exposed to Vault members."""
+    """Whether the canonical installation is active."""
 
     model_config = ConfigDict(extra="forbid")
 
