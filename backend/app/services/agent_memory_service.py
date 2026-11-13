@@ -42,6 +42,7 @@ from typing import Literal, get_args
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.models.document import DocumentPutRequest
+from app.repositories.document_repo import CollectionRepository
 from app.services.document_service import DocumentService
 from app.services.native_document_service import NativeDocumentService
 from app.services.revision_backend import get_document_service
@@ -772,15 +773,10 @@ class AgentMemoryService:
             # `collections` rows are flat by path within a vault — the
             # repo enforces uniqueness on (vault_id, path). `name` is
             # the path basename; `last_updated` doubles as creation
-            # time on first write.
-            name = coll_path.rsplit("/", 1)[-1]
-            await conn.execute(
-                """
-                INSERT INTO collections (id, vault_id, path, name, summary, last_updated)
-                VALUES ($1, $2, $3, $4, $5, NOW())
-                ON CONFLICT (vault_id, path) DO NOTHING
-                """,
-                uuid.uuid4(), v["id"], coll_path, name, summary,
+            # time on first write. Through the repository, like every
+            # collection insert, so the new row locks its ancestors.
+            await CollectionRepository(pool).create_empty(
+                v["id"], coll_path, summary=summary, conn=conn, stamp_last_updated=True,
             )
 
     async def _find_session_collection(

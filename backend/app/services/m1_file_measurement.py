@@ -233,12 +233,17 @@ class MeasurementFileService:
         token = _new_token()
         requested_file_id = uuid.uuid4()
         collection_path = normalize_collection_path(collection)
+        # Expired intents go in a transaction of their own, before the upload's.
+        # Creating the collection below locks its ancestors, and a recursive
+        # delete that holds one of them removes its collection's intents with
+        # it: an upload still holding an intent it removed would deadlock with
+        # that delete.
+        await self.reap_transfer_intents()
         pool = await get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 if not await lock_vault_for_child_write(conn, vault_id):
                     raise ConflictError("Vault was deleted during file upload")
-                await self.reap_transfer_intents(conn)
                 collection_id = None
                 if collection_path:
                     collection_id = await CollectionRepository(pool).get_or_create(

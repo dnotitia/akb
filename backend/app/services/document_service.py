@@ -634,11 +634,15 @@ class DocumentService:
         recreated destination, whose id may sort below the source's, would
         break the id order of collection locks; it raises ``_StaleRead``
         instead, so the move's savepoint releases every collection lock before
-        it reads again.
+        it reads again. When get_or_create inserts the collection it locks the
+        new collection's ancestors, and ``also_lock`` with them in one
+        id-ordered pass; the lock below then finds ``also_lock`` held.
         """
         for _ in range(1 if also_lock is not None else 3):
             try:
-                collection_id = await coll_repo.get_or_create(vault_id, path, conn=conn)
+                collection_id = await coll_repo.get_or_create(
+                    vault_id, path, conn=conn, lock_also=(also_lock,),
+                )
             except CollectionVanishedError:
                 continue
             if conn is None:
