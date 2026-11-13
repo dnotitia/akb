@@ -25,6 +25,10 @@ streams already open.
 - A stream that ends after sending an event or a comment is still reopened
   after the reconnection time: 250 ms, unless the stream's SSE `retry` field
   set another.
+- An event that a stream ends in the middle of, before the blank line that
+  ends it, is discarded, as the SSE parsing rules require, and the stream is
+  reopened from the last cursor. It used to be dispatched, or to end the
+  channel with `protocol_error` when its JSON was cut.
 - `AkbError` has a new `retryAfterMs` field: the wait the response's
   `Retry-After` asked for, in milliseconds, or `null`. HTTP error responses
   set it, from `akbFetch` as from the channel.

@@ -153,16 +153,19 @@ class SseParser {
     return this.takeResult(frames);
   }
 
+  /**
+   * The stream ended. As the SSE parsing rules require, whatever is pending is
+   * discarded: a last line without its line ending, and an event without the
+   * blank line that ends it. A stream cut in the middle of an event therefore
+   * dispatches nothing of it, and the channel resumes from the last cursor.
+   */
   end(): SseParserResult {
-    const frames: SseFrame[] = [];
-    if (this.buffer.length > 0) {
-      const frame = this.consumeLine(this.buffer);
-      if (frame) frames.push(frame);
-      this.buffer = "";
-    }
-    const frame = this.dispatch();
-    if (frame) frames.push(frame);
-    return this.takeResult(frames);
+    this.buffer = "";
+    this.event = "";
+    this.id = null;
+    this.data = [];
+    this.hasFields = false;
+    return this.takeResult([]);
   }
 
   private findNewline(): number {

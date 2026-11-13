@@ -309,6 +309,42 @@ test("Retry-After may be an HTTP-date, and the wait never exceeds 30 s or skips 
   });
 });
 
+test("a stream cut mid-event is reopened from the last cursor instead of failing", async () => {
+  const checkpointStart = "event: checkpoint\nid: ec1.start\ndata: {\"version\":1,\"cursor\":\"ec1.start\"}\n\n";
+  const changeA = "event: change\nid: ec1.a\ndata: {\"version\":1,\"cursor\":\"ec1.a\",\"occurred_at\":\"2026-01-01T00:00:00Z\",\"vault\":\"vault\",\"kind\":\"document.put\",\"payload\":{}}\n\n";
+  for (const [cut, tail] of [
+    ["inside its JSON", changeA.slice(0, changeA.indexOf("\"occurred_at\""))],
+    ["before its terminating blank line", changeA.slice(0, -1)],
+  ]) {
+    const calls = [];
+    const changes = [];
+    const fetch = async (_input, init = {}) => {
+      calls.push(Object.fromEntries(new Headers(init.headers)));
+      if (calls.length === 1) return sseResponse([checkpointStart, tail]);
+      return sseResponse([changeA], 200, init.signal, false);
+    };
+    const subscription = await createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+      .vault("vault")
+      .channel()
+      .on("change", (event) => changes.push({ cursor: event.cursor, stream: calls.length }))
+      .subscribe();
+    let failure = null;
+    subscription.closed.catch((error) => {
+      failure = error;
+    });
+
+    await waitFor(() => failure !== null || changes.some((change) => change.stream === 2));
+    assert.equal(failure, null, `a stream cut ${cut} ended the channel`);
+    // The cut event is discarded, so the second stream resumes after the checkpoint.
+    assert.equal(calls.length, 2, cut);
+    assert.equal(calls[1]["last-event-id"], "ec1.start", cut);
+    assert.deepEqual(changes, [{ cursor: "ec1.a", stream: 2 }], cut);
+    assert.equal(subscription.cursor, "ec1.a", cut);
+    await subscription.unsubscribe();
+    await subscription.closed;
+  }
+});
+
 test("a 429 user quota refusal still ends the channel and carries its code and Retry-After", async () => {
   const quota = () => json(
     {

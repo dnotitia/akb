@@ -157,7 +157,9 @@ anything, as when a proxy accepts the request and drops it, are tried again
 with a backoff: the first in a row waits a random time between 250 and 500 ms,
 and each further one doubles that range. A refusal's `Retry-After` is the
 shortest wait it allows. No wait exceeds 30 seconds, even for a longer
-`Retry-After`, and a stream's first event or comment resets the backoff.
+`Retry-After`, and a stream's first event or comment resets the backoff. An
+event that a stream ends in the middle of, before the blank line that ends
+it, is discarded, so the channel resumes from the last cursor it received.
 
 A 4xx refusal ends the subscription instead. That includes 429
 `event_tail_user_quota`, which an account gets at its stream quota.
