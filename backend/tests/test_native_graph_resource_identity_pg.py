@@ -587,6 +587,9 @@ async def test_a_collection_delete_clears_a_native_documents_edges_by_identity(m
     reproducible single-threaded. What IS reproducible is the other half of
     the same change: an edge carrying this resource's identity is cleared
     whatever URI it names, which the path-keyed cleanup could not see.
+
+    The derived worker clears them, from the intent each document's delete
+    records; the delete itself no longer does after its commit.
     """
     from app.repositories.document_repo import CollectionRepository
     from app.services import collection_service as coll_mod
@@ -626,6 +629,7 @@ async def test_a_collection_delete_clears_a_native_documents_edges_by_identity(m
             vault=VAULT, path="specs", recursive=True, agent_id="review",
         )
         assert result["deleted_docs"] == 1, result
+        await NativeDerivedWorker(pool).settle(namespace_id=vault_id, timeout_seconds=15)
 
         assert await _edges(pool) == []
 

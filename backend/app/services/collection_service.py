@@ -23,21 +23,18 @@ from app.repositories.document_repo import (
     DocumentRepository,
     lock_collection_rows,
 )
-from app.repositories.events_repo import emit_event
+from app.repositories.events_repo import EventBuffer, emit_event
 from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
 from app.services.git_service import GitService
 from app.services.index_service import (
     delete_document_chunks, delete_file_chunks, delete_table_chunks,
 )
-from app.services.kg_service import (
-    delete_document_relations,
-    delete_native_document_edges,
-)
+from app.services.kg_service import delete_document_relations, delete_native_document_edges
 from app.services.m1_file_measurement import _tombstone_native_text_file
 from app.services.publication_service import delete_publications_for_file
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services import skill_policy
-from app.services.uri_service import file_uri, table_uri
+from app.services.uri_service import doc_uri, file_uri, table_uri
 from app.services.write_lane import run_git_write, write_lane
 
 logger = logging.getLogger("akb.collections")
@@ -106,6 +103,178 @@ def _normalize_path(path: str) -> str:
 
 class _CollectionsChanged(Exception):
     """A collection appeared under the prefix between reading and locking it."""
+
+
+class _DocumentsRemain(Exception):
+    """A live Native document is under the prefix when the collections go."""
+
+
+# How many times a recursive delete deletes the prefix's Native documents and
+# then tries its collections, when documents keep arriving meanwhile.
+_NATIVE_DELETE_ROUNDS = 3
+
+# The hint of a delete that left collections in place after a Native cutover.
+RETAINED_COLLECTIONS_HINT = (
+    "The collections in retained_collections keep their rows: documents preserved from before "
+    "this Vault was cut over to the Native authority still reference them, and that history is "
+    "kept as it is. They hold no live documents, and deleting them again leaves them in place."
+)
+
+
+def _under(path: str, prefix: str) -> bool:
+    bare = prefix.rstrip("/")
+    return path == bare or path.startswith(bare + "/")
+
+
+async def _live_native_documents_under(conn, vault_id: uuid.UUID, prefix: str) -> list[dict]:
+    bare = prefix.rstrip("/")
+    rows = await conn.fetch(
+        "SELECT resource_id, current_path AS path "
+        "FROM native_resources "
+        "WHERE namespace_id = $1 AND surface = 'document' "
+        "AND lifecycle = 'live' "
+        "AND (current_path = $2 OR current_path LIKE $3 ESCAPE '\\') "
+        "ORDER BY current_path, resource_id",
+        vault_id,
+        bare,
+        CollectionRepository._like_escape(bare) + "/%",
+    )
+    return [dict(r) for r in rows]
+
+
+async def _delete_native_document(
+    native, *, vault: str, vault_id: uuid.UUID, prefix: str, resource_id: uuid.UUID, actor: str,
+) -> str | None:
+    """Delete one live Native document under ``prefix``, with its event, and
+    return the path it was deleted at.
+
+    The delete, the document's graph edges and its ``document.delete`` commit
+    together in one short transaction that locks only this document's Resource
+    (and its path), so it never waits for a second Resource while it holds one.
+    The edges go while the Resource is locked: a document restored afterwards
+    starts without the links it had when its delete committed, and keeps the
+    ones made after its restore (a link racing the delete is a known limit;
+    see docs/operations/change-events.md). A document deleted, or moved out of
+    the prefix, by
+    another request since it was listed is left as it is, and None is
+    returned.
+
+    Its chunks are removed by the derived worker, from the invalidation intent
+    the delete records; the worker locks the Resource and skips the intent once
+    the Resource has a later Revision.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await native.repository.lock_resource(conn, resource_id)
+            if (
+                row is None
+                or row["namespace_id"] != vault_id
+                or row["surface"] != "document"
+                or row["lifecycle"] != "live"
+                or not _under(row["current_path"], prefix)
+            ):
+                return None
+            events = EventBuffer()
+            await native.delete_resource(
+                namespace_id=vault_id,
+                surface="document",
+                path=row["current_path"],
+                actor=actor,
+                mutation_id=uuid.uuid4(),
+                expected_revision_id=row["head_revision_id"],
+                expected_resource_id=resource_id,
+                retain_document_assets=False,
+                message=f"[delete-collection] {prefix}\n\nagent: {actor}\naction: delete-collection",
+                subject=f"[delete-collection] {prefix}",
+                conn=conn,
+                events=events,
+            )
+            # Keyed on the resource, and on the path read under its row lock.
+            await delete_native_document_edges(conn, vault_id, vault, resource_id, row["current_path"])
+            # The event is the transaction's last statement.
+            await events.flush(conn)
+    return row["current_path"]
+
+
+async def _delete_native_documents_under(
+    *, vault: str, vault_id: uuid.UUID, prefix: str, actor: str, deleted: list[str],
+) -> None:
+    """Delete the live Native documents under ``prefix`` one by one, appending
+    the path of each one this call deletes to ``deleted``. A failure part-way
+    leaves the documents deleted so far deleted, each with its event; running
+    the delete again continues from the documents that remain."""
+    from app.services.native_document_service import NativeDocumentService
+
+    native = await NativeDocumentService()._native()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        listed = await _live_native_documents_under(conn, vault_id, prefix)
+    for doc in listed:
+        path = await _delete_native_document(
+            native, vault=vault, vault_id=vault_id, prefix=prefix,
+            resource_id=doc["resource_id"], actor=actor,
+        )
+        if path is not None:
+            deleted.append(path)
+
+
+def _tables_refused_part_way(
+    refused: ForbiddenError, *, vault: str, prefix: str, deleted: list[str],
+) -> ForbiddenError:
+    """The table refusal of a recursive delete that already deleted documents.
+
+    A caller who may not delete tables is refused before any document goes
+    when the prefix holds a table. A table created under the prefix by
+    another request after that check is found by the last transaction, which
+    checks again under its locks, once the documents are deleted. They stay
+    deleted, and the refusal says so, as a busy Vault's ``write_busy`` does:
+    ``partially_applied`` and the deleted documents' URIs in its details. The
+    same request from this caller is refused before deleting anything else;
+    only a caller allowed to delete the table can finish the delete.
+    """
+    uris = [doc_uri(vault, path) for path in deleted]
+    return ForbiddenError(
+        f"{refused.message}; {len(uris)} document(s) under {prefix!r} were deleted "
+        "before the table was found",
+        code=refused.code,
+        hint=(
+            f"The documents in details.deleted_uris were deleted before a table appeared under "
+            f"{prefix!r}, and stay deleted. Only a caller with the 'admin' role on the Vault can "
+            "finish this delete: the same request from such a caller deletes the rest, the table "
+            "included. Sent again without that role, it is refused before anything else is deleted."
+        ),
+        details={"partially_applied": True, "deleted_docs": len(uris), "deleted_uris": uris},
+    )
+
+
+async def _earlier_recursive_delete(conn, vault_id: uuid.UUID, prefix: str) -> bool:
+    """Whether a recursive delete of ``prefix`` ever deleted a Native document.
+
+    A recursive delete gives each Native document it deletes a Revision with
+    the subject ``[delete-collection] <prefix>``. Revisions are kept, so this
+    tells a prefix an earlier delete emptied, and that delete may have stopped
+    before recording ``collection.delete``, from one that never held anything.
+    """
+    return bool(await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM native_revisions "
+        "WHERE namespace_id = $1 AND action = 'delete' AND subject = $2)",
+        vault_id, f"[delete-collection] {prefix}",
+    ))
+
+
+async def _legacy_documents_fenced(conn) -> bool:
+    """Whether a Native cutover has fenced the `documents` rows.
+
+    After an existing-database cutover the rows stay as immutable history: a
+    trigger refuses every insert, update and delete of them, including the
+    `SET NULL` that deleting a collection they reference would perform.
+    """
+    if await conn.fetchval("SELECT to_regclass('public.native_revision_legacy_write_fence')") is None:
+        return False
+    return bool(await conn.fetchval(
+        "SELECT state <> 'open' FROM native_revision_legacy_write_fence WHERE fence_key = TRUE",
+    ))
 
 
 class CollectionService:
@@ -224,6 +393,18 @@ class CollectionService:
           `{ok, collection, deleted_docs, deleted_files,
           deleted_sub_collections, deleted_tables}`.
 
+        On the Native authority the documents go first, one per short
+        transaction with its `document.delete` event, and the collections,
+        files and tables with `collection.delete` in a last transaction once
+        no live document is left under `P`. A failure part-way leaves the
+        documents deleted so far deleted and returns the error; running the
+        same delete again continues with the rest. When nothing is left under
+        `P` because an earlier recursive delete of `P` deleted its documents,
+        the delete succeeds with zero counts instead of `NotFoundError` and
+        records `collection.delete` (see `_earlier_recursive_delete`); the
+        event is at least once, so it can be recorded more than once for one
+        prefix. The counts are what this call deleted.
+
         Race-safety: the target row (if any) and all sub-collection
         rows are locked `FOR UPDATE` inside the same transaction, so a
         concurrent `akb_put` that calls
@@ -237,13 +418,10 @@ class CollectionService:
         """
         norm = _normalize_path(path)
         skill_policy.check_collection_delete(norm)
-        vault_repo, coll_repo = await self._repos()
+        vault_repo, _ = await self._repos()
         vault_id = await vault_repo.get_id_by_name(vault)
         if not vault_id:
             raise NotFoundError("Vault", vault)
-
-        pool = await get_pool()
-        doc_repo = DocumentRepository(pool)
         # Native-authority emptiness check (#543): on `postgres_native` the
         # native path never writes `documents`, so a collection whose live
         # documents were all created after the cutover presents as empty to
@@ -255,22 +433,66 @@ class CollectionService:
         from app.services import document_counters as _counters
 
         native_authority = _counters.native_documents_are_authoritative()
+        native_deleted: list[str] = []
+        try:
+            for _ in range(_NATIVE_DELETE_ROUNDS):
+                if native_authority and recursive:
+                    if not allow_table_delete:
+                        # Refuse before any document goes; the last
+                        # transaction checks the tables again under its locks.
+                        await self._refuse_tables_under(vault, vault_id, norm)
+                    await _delete_native_documents_under(
+                        vault=vault, vault_id=vault_id, prefix=norm,
+                        actor=agent_id or "unknown", deleted=native_deleted,
+                    )
+                try:
+                    return await self._delete_collections(
+                        vault=vault, vault_id=vault_id, norm=norm, path=path,
+                        recursive=recursive, agent_id=agent_id,
+                        allow_table_delete=allow_table_delete,
+                        native_authority=native_authority, native_deleted=len(native_deleted),
+                    )
+                except _DocumentsRemain:
+                    continue
+        except ForbiddenError as exc:
+            # A table appeared under the prefix after some documents went.
+            if native_deleted:
+                raise _tables_refused_part_way(
+                    exc, vault=vault, prefix=norm, deleted=native_deleted,
+                ) from exc
+            raise
+        raise ConflictError(
+            f"Documents kept arriving under {norm!r} during the delete; retry it"
+        )
 
-        async def _native_docs_under(
-            conn, vault_uuid: uuid.UUID, prefix: str,
-        ) -> list[dict]:
-            bare = prefix.rstrip("/")
-            rows = await conn.fetch(
-                "SELECT resource_id, current_path AS path "
-                "FROM native_resources "
-                "WHERE namespace_id = $1 AND surface = 'document' "
-                "AND lifecycle = 'live' "
-                "AND (current_path = $2 OR current_path LIKE $3 ESCAPE '\\')",
-                vault_uuid,
-                bare,
-                CollectionRepository._like_escape(bare) + "/%",
+    async def _refuse_tables_under(self, vault: str, vault_id: uuid.UUID, norm: str) -> None:
+        _, coll_repo = await self._repos()
+        if await coll_repo.list_tables_under(vault_id, norm):
+            raise ForbiddenError(
+                "Deleting a collection that contains tables requires "
+                f"'admin' role on vault '{vault}'"
             )
-            return [dict(r) for r in rows]
+
+    async def _delete_collections(
+        self,
+        *,
+        vault: str,
+        vault_id: uuid.UUID,
+        norm: str,
+        path: str,
+        recursive: bool,
+        agent_id: str | None,
+        allow_table_delete: bool,
+        native_authority: bool,
+        native_deleted: int,
+    ) -> dict:
+        """The delete's last transaction: the collections, files, tables and
+        legacy documents under ``norm``, and the `collection.delete` event.
+        Raises ``_DocumentsRemain`` when a live Native document is still under
+        the prefix of a recursive delete."""
+        _, coll_repo = await self._repos()
+        pool = await get_pool()
+        doc_repo = DocumentRepository(pool)
         docs_count = 0
         files_count = 0
         sub_count = 0
@@ -285,6 +507,7 @@ class CollectionService:
         # search is correct either way.
         doc_paths_for_git: list[str] = []
         commit_msg_for_git: str = ""
+        retained_paths: list[str] = []
 
         async with pool.acquire() as conn:
             async with role_authority_transaction(conn):
@@ -335,9 +558,25 @@ class CollectionService:
                             )
                             if not await _all_locked(locked):
                                 raise _CollectionsChanged
-                            docs = await coll_repo.list_docs_under(vault_id, norm, conn=conn)
-                            if native_authority:
-                                docs = docs + await _native_docs_under(conn, vault_id, norm)
+                            legacy_docs = await coll_repo.list_docs_under(vault_id, norm, conn=conn)
+                            # After a Native cutover the `documents` rows are
+                            # immutable history: they are neither deleted nor
+                            # counted, and a collection they reference keeps
+                            # its row (deleting it would set theirs to NULL).
+                            fenced = await _legacy_documents_fenced(conn)
+                            preserved = legacy_docs if fenced else []
+                            if fenced:
+                                legacy_docs = []
+                            native_docs = (
+                                await _live_native_documents_under(conn, vault_id, norm)
+                                if native_authority else []
+                            )
+                            if native_docs and recursive:
+                                # The documents go one by one before this
+                                # transaction; one written meanwhile is
+                                # deleted in another round.
+                                raise _DocumentsRemain
+                            docs = legacy_docs + native_docs
                             files = await coll_repo.list_files_under(
                                 vault_id, norm, conn=conn, for_update=True,
                             )
@@ -365,15 +604,42 @@ class CollectionService:
                 )
 
                 # ── Total-empty check ───────────────────────────
-                # Nothing at or under the prefix → genuine 404.
+                # Nothing at or under the prefix → genuine 404, unless an
+                # earlier recursive delete of this prefix deleted its Native
+                # documents and stopped before this point: then the prefix is
+                # deleted already, and this one completes it.
                 if (
                     target_row is None
                     and not sub_rows
                     and not docs
                     and not files
                     and not tables
+                    and not native_deleted
                 ):
-                    raise NotFoundError("Collection", norm)
+                    if not (native_authority and recursive):
+                        raise NotFoundError("Collection", norm)
+                    if not await _earlier_recursive_delete(conn, vault_id, norm):
+                        raise NotFoundError("Collection", norm)
+                    # `collection.delete` is at least once: it is recorded by
+                    # every delete that finds the prefix empty, whether or
+                    # not an earlier one recorded it already.
+                    nothing = {
+                        "deleted_docs": 0,
+                        "deleted_files": 0,
+                        "deleted_sub_collections": 0,
+                        "deleted_tables": 0,
+                    }
+                    completion = EventBuffer()
+                    completion.add(
+                        "collection.delete",
+                        vault_id=vault_id,
+                        resource_uri=None,
+                        actor_id=agent_id,
+                        payload={"vault": vault, "path": norm, **nothing},
+                    )
+                    await completion.flush(conn)
+                    logger.info("Collection delete: vault=%s path=%s already emptied", vault, norm)
+                    return {"ok": True, "collection": norm, **nothing}
 
                 # ── Empty-mode reject ───────────────────────────
                 # `recursive=False` succeeds ONLY when the target row
@@ -414,52 +680,15 @@ class CollectionService:
                 # UNIQUE(vault_id, path), the next document created (or moved)
                 # onto that path would be reached through the old public
                 # link.
-                for d in docs:
-                    # Native-authority rows carry a resource_id, not a legacy
-                    # documents id (#543). They are deleted through the native
-                    # revision service (lifecycle + revision chain), not the
-                    # legacy repository — which would find no row and report
-                    # the delete as a no-op while the live document survives.
-                    if native_authority and "resource_id" in d:
-                        # Same delete the native document service performs
-                        # (revision chain + lifecycle), minus the body-asset
-                        # retention that belongs to single-document delete:
-                        # collection delete removes the whole prefix.
-                        from app.services.native_document_service import (
-                            NativeDocumentService,
-                        )
-
-                        native_svc = NativeDocumentService()
-                        vault_id_resolved, current = await native_svc._current(
-                            vault, str(d["resource_id"]),
-                        )
-                        native = await native_svc._native()
-                        await native.delete_resource(
-                            namespace_id=vault_id_resolved,
-                            surface="document",
-                            path=current.path,
-                            actor=agent_id or "unknown",
-                            mutation_id=uuid.uuid4(),
-                            expected_revision_id=current.revision_id,
-                            expected_resource_id=current.resource_id,
-                            retain_document_assets=False,
-                            message=f"[delete-collection] {norm}\n\nagent: {agent_id or 'unknown'}\naction: delete-collection",
-                            subject=f"[delete-collection] {norm}",
-                        )
-                        await delete_document_chunks(conn, str(d["resource_id"]))
-                        # Keyed on the resource, and on the path the native
-                        # service just resolved under its own lock — NOT on
-                        # `d["path"]`, which came from the unlocked
-                        # `list_docs_under` snapshot. The publication cleanup a
-                        # few lines below already refuses that snapshot for the
-                        # same reason; the edge cleanup did not, so a document
-                        # moved since the snapshot took whichever resource now
-                        # owns that path down with it (same shape as akb#654).
-                        await delete_native_document_edges(
-                            conn, vault_id_resolved, vault,
-                            current.resource_id, current.path,
-                        )
-                        continue
+                #
+                # Events are collected and inserted as the transaction's last
+                # statements: inserting one takes the Vault's event lock, and
+                # this transaction still has rows to lock and delete.
+                events = EventBuffer()
+                # Native-authority documents (#543) are deleted through the
+                # native revision service before this transaction, one by
+                # one (`_delete_native_documents_under`); none is left here.
+                for d in legacy_docs:
                     await delete_document_chunks(conn, str(d["id"]))
                     await delete_document_relations(conn, vault, d["path"])
                     # The URI for the publication cleanup is derived from
@@ -565,28 +794,45 @@ class CollectionService:
                 ids_to_delete: list[uuid.UUID] = [r["id"] for r in sub_rows]
                 if target_row is not None:
                     ids_to_delete.append(target_row["id"])
+                retained: set[uuid.UUID] = set()
+                if preserved and ids_to_delete:
+                    retained = {
+                        r["collection_id"] for r in await conn.fetch(
+                            "SELECT DISTINCT collection_id FROM documents "
+                            "WHERE vault_id = $1 AND collection_id = ANY($2::uuid[])",
+                            vault_id, ids_to_delete,
+                        )
+                    }
+                    ids_to_delete = [cid for cid in ids_to_delete if cid not in retained]
+                    sub_rows = [r for r in sub_rows if r["id"] not in retained]
                 if ids_to_delete:
                     await conn.execute(
                         "DELETE FROM collections WHERE id = ANY($1::uuid[])",
                         ids_to_delete,
                     )
 
-                await emit_event(
-                    conn,
+                # Only the documents this call deleted are counted; one that
+                # was deleted or moved away meanwhile is not.
+                docs_count = len(legacy_docs) + native_deleted
+                payload = {
+                    "vault": vault,
+                    "path": norm,
+                    "deleted_docs": docs_count,
+                    "deleted_files": len(files),
+                    "deleted_sub_collections": len(sub_rows),
+                    "deleted_tables": len(tables),
+                }
+                retained_paths = sorted(r["path"] for r in candidates if r["id"] in retained)
+                if retained_paths:
+                    payload["retained_collections"] = retained_paths
+                events.add(
                     "collection.delete",
                     vault_id=vault_id,
                     resource_uri=None,
                     actor_id=agent_id,
-                    payload={
-                        "vault": vault,
-                        "path": norm,
-                        "deleted_docs": len(docs),
-                        "deleted_files": len(files),
-                        "deleted_sub_collections": len(sub_rows),
-                        "deleted_tables": len(tables),
-                    },
+                    payload=payload,
                 )
-                docs_count = len(docs)
+                await events.flush(conn)
                 files_count = len(files)
                 sub_count = len(sub_rows)
                 tables_count = len(tables)
@@ -594,11 +840,11 @@ class CollectionService:
                 # Only Bare Git installations own repository files. Native
                 # authority must not enter the Git lane, even when historical
                 # legacy catalog rows are included in the PG cleanup.
-                doc_paths_for_git = [] if native_authority else [d["path"] for d in docs]
+                doc_paths_for_git = [] if native_authority else [d["path"] for d in legacy_docs]
                 if doc_paths_for_git:
                     commit_msg_for_git = (
                         f"[delete-collection] {norm}\n\n"
-                        f"{len(docs)} docs, {len(files)} files\n"
+                        f"{len(legacy_docs)} docs, {len(files)} files\n"
                         f"agent: {agent_id or 'unknown'}\n"
                         f"action: delete-collection"
                     )
@@ -644,7 +890,7 @@ class CollectionService:
             "Collection delete: vault=%s path=%s docs=%d files=%d sub=%d tables=%d",
             vault, norm, docs_count, files_count, sub_count, tables_count,
         )
-        return {
+        result: dict = {
             "ok": True,
             "collection": norm,
             "deleted_docs": docs_count,
@@ -652,3 +898,8 @@ class CollectionService:
             "deleted_sub_collections": sub_count,
             "deleted_tables": tables_count,
         }
+        if retained_paths:
+            # After a Native cutover: these rows stay (see the retention step).
+            result["retained_collections"] = retained_paths
+            result["hint"] = RETAINED_COLLECTIONS_HINT
+        return result

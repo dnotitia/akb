@@ -159,3 +159,53 @@ def test_non_empty_409_keeps_legacy_detail_and_normalized_details(client, monkey
         "message": "Collection has 2 document(s), 1 sub-collection(s)",
         **expected_counts,
     }
+
+
+def test_delete_reports_the_collections_a_cutover_keeps(client, monkeypatch):
+    """After a Native cutover a recursive delete can leave collections that
+    preserved documents reference; the REST body lists them, with the hint
+    that explains why. Without them, neither key appears."""
+    hint = "p keeps its row: preserved documents reference it"
+
+    async def _delete(**_kwargs):
+        return {
+            "ok": True,
+            "collection": "p",
+            "deleted_docs": 0,
+            "deleted_files": 0,
+            "deleted_sub_collections": 0,
+            "deleted_tables": 0,
+            "retained_collections": ["p"],
+            "hint": hint,
+        }
+
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/p", params={"recursive": "true"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["retained_collections"], body["hint"]) == (["p"], hint)
+
+
+def test_a_table_refusal_after_documents_went_keeps_its_details(client, monkeypatch):
+    """A writer's recursive delete refused at a table that appeared after some
+    documents were deleted answers 403 with the documents it deleted."""
+    from app.exceptions import ForbiddenError
+
+    details = {
+        "partially_applied": True,
+        "deleted_docs": 1,
+        "deleted_uris": ["akb://reef/coll/notes/doc/a.md"],
+    }
+
+    async def _delete(**_kwargs):
+        raise ForbiddenError("refused", hint="only an admin can finish", details=details)
+
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/notes", params={"recursive": "true"})
+
+    assert response.status_code == 403
+    body = response.json()
+    assert (body["code"], body["details"], body["hint"]) == (
+        "permission_denied", details, "only an admin can finish",
+    )
