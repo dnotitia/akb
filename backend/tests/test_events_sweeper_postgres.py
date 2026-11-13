@@ -766,3 +766,111 @@ async def test_a_batch_deletes_only_the_events_it_read_when_a_lower_id_commits_i
         assert step == (2, 2, read[-1])
         # The event committed after the read is left for a later pass.
         assert await _remaining(setup_pool) == [late]
+
+
+async def test_an_open_tail_ends_on_the_watermark_alone_when_no_later_event_follows(monkeypatch):
+    """The read that finds the deletion can find no row at all.
+
+    Nothing follows the deleted events, so the tail's next batch is empty.
+    The watermark is read with it all the same, and the tail ends; its
+    client's reconnect is refused with 410.
+    """
+    from app.services import event_tail_service
+
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "sweep-tail-empty")
+        user_id = await _make_reader(setup_pool, "sweep-tail-empty-reader", [vault_id])
+        expired = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(3)]
+        await _age(setup_pool, expired)
+        codec = EventCursorCodec(_CURSOR_SECRET)
+        async with _tail(monkeypatch, setup_pool) as tail:
+            monkeypatch.setattr(event_tail_service, "EVENT_BATCH_SIZE", 1)
+            body = await tail.open(user_id=user_id, vault="sweep-tail-empty", start="earliest")
+            try:
+                first = await asyncio.wait_for(_changes(body, 1), 5)
+                await _sweep_pass(monkeypatch, setup_pool)
+                following = await asyncio.wait_for(anext(body, None), 5)
+            finally:
+                await body.aclose()
+            assert _positions(first) == [expired[0]]
+            assert await _remaining(setup_pool) == []
+            assert following is None
+            with pytest.raises(EventGapError) as exc_info:
+                await tail.open(
+                    user_id=user_id, vault="sweep-tail-empty", last_event_id=codec.encode(vault_id, (), expired[0])
+                )
+        assert codec.decode(exc_info.value.details["earliest_cursor"]) == (vault_id, (), expired[-1])
+
+
+class _SweepAfterFirstStatement:
+    """A connection that runs ``sweep`` once its first statement has returned, before any other."""
+
+    def __init__(self, conn, sweep) -> None:
+        self._conn = conn
+        self._sweep = sweep
+
+    async def _then_sweep(self, result):
+        sweep, self._sweep = self._sweep, None
+        if sweep is not None:
+            await sweep()
+        return result
+
+    async def fetch(self, *args, **kwargs):
+        return await self._then_sweep(await self._conn.fetch(*args, **kwargs))
+
+    async def fetchval(self, *args, **kwargs):
+        return await self._then_sweep(await self._conn.fetchval(*args, **kwargs))
+
+    async def fetchrow(self, *args, **kwargs):
+        return await self._then_sweep(await self._conn.fetchrow(*args, **kwargs))
+
+
+async def test_an_open_tail_reads_its_rows_and_the_watermark_from_one_snapshot(monkeypatch):
+    """A sweep that commits in the middle of the tail's read cannot carry the tail past what it deletes.
+
+    The tail stands after the first of three events, and the first two have
+    expired. The sweep deletes them after the first statement of the tail's
+    next read. The rows and the watermark are read in that one statement,
+    from before the sweep, so the tail sends the second event as it read it,
+    and then the third. Had the watermark been read in a statement of its
+    own, before the rows, it would come from before the sweep and the rows
+    from after it: the tail would send the third event, and a cursor past the
+    deleted second one, with no gap seen.
+    """
+    from app.services import event_tail_service
+
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "sweep-tail-snapshot")
+        user_id = await _make_reader(setup_pool, "sweep-tail-snapshot-reader", [vault_id])
+        first, expired, latest = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(3)]
+        await _age(setup_pool, [first, expired])
+        codec = EventCursorCodec(_CURSOR_SECRET)
+        steps: list[list[int]] = []
+        async with _tail(monkeypatch, setup_pool) as tail:
+            counted_read = event_tail_service.list_vault_events
+
+            async def sweep() -> None:
+                steps.append(await _sweep_pass(monkeypatch, setup_pool))
+
+            async def read_with_a_sweep_in_the_middle(conn, vault, **kwargs):
+                if steps:
+                    return await counted_read(conn, vault, **kwargs)
+                return await counted_read(_SweepAfterFirstStatement(conn, sweep), vault, **kwargs)
+
+            monkeypatch.setattr(event_tail_service, "list_vault_events", read_with_a_sweep_in_the_middle)
+            body = await tail.open(
+                user_id=user_id, vault="sweep-tail-snapshot", last_event_id=codec.encode(vault_id, (), first)
+            )
+            try:
+                next_change = await asyncio.wait_for(_changes(body, 1), 5)
+                # The second event, as the read found it before the sweep; not
+                # the third, with a cursor past the deleted second one.
+                assert _positions(next_change) == [expired]
+                after_it = await asyncio.wait_for(_changes(body, 1), 5)
+            finally:
+                await body.aclose()
+
+        # The sweep ran in the middle of the read and deleted both expired events.
+        assert steps == [[2, 0]]
+        assert await _watermarks(setup_pool) == {vault_id: expired}
+        assert _positions(after_it) == [latest]

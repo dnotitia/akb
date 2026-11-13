@@ -153,10 +153,12 @@ async def _sweep(monkeypatch, pool: asyncpg.Pool) -> int:
 
     The batch reads the oldest events and deletes, in one statement, the ones
     published more than the retention period ago. Returns how many it
-    deleted.
+    deleted. The period is the default seven days the tests publish around,
+    whatever the local configuration sets.
     """
     from app.services import events_sweeper
 
+    monkeypatch.setattr(events_sweeper.settings, "event_retention_days", 7)
     async with pool.acquire() as conn:
         _, deleted, _ = await events_sweeper._sweep_batch(conn, 0, events_sweeper._DELETE_PUBLISHED)
     return deleted
