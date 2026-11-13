@@ -67,17 +67,19 @@ def test_every_cross_origin_response_exposes_them(client):
     assert _exposed(response) == {"retry-after", "date"}
 
 
-def test_the_preflight_still_allows_any_method_and_header(client):
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+def test_the_preflight_still_allows_any_method_and_header(client, method):
     response = client.options(
         "/api/v1/events/reef",
         headers={
             **_ORIGIN,
-            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Method": method,
             "Access-Control-Request-Headers": "authorization, last-event-id",
         },
     )
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "*"
-    assert "GET" in response.headers["access-control-allow-methods"]
+    allowed = {name.strip() for name in response.headers["access-control-allow-methods"].split(",")}
+    assert method in allowed
     assert response.headers["access-control-allow-headers"].lower() == "authorization, last-event-id"
