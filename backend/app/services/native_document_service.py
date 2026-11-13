@@ -84,6 +84,7 @@ from app.services.native_revision_service import (
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
+from app.services.vault_write_admission import vault_write_admission
 from app.util.errors import NATIVE_REVISION_SURFACE_UNSUPPORTED
 from app.util.text import (
     doc_path,
@@ -1738,12 +1739,16 @@ class NativeDocumentService(DocumentService):
                     await role_sync.on_public_access_change_in_conn(
                         conn, vault_id, public_access,
                     )
-                    await self._seed_native_vault_skill(
-                        conn,
-                        vault_id=vault_id,
-                        vault_name=name,
-                        owner_id=uid,
-                    )
+                    # The seed writes the Vault's first event. The Vault
+                    # exists only in this transaction, so nothing else holds
+                    # its admission and entering it here does not wait.
+                    async with vault_write_admission(vault_id, vault=name):
+                        await self._seed_native_vault_skill(
+                            conn,
+                            vault_id=vault_id,
+                            vault_name=name,
+                            owner_id=uid,
+                        )
         except asyncpg.UniqueViolationError as exc:
             if exc.constraint_name == "vaults_name_key":
                 raise VaultNameUnavailableError() from exc

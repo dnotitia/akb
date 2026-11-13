@@ -52,6 +52,7 @@ from app.services.s3_delete_worker import REPLACEMENT_STAGING_PREFIX, REPLACEMEN
 from app.services.s3_delete_worker import enqueue_pending_upload_delete
 from app.services import skill_policy
 from app.services.uri_service import file_uri
+from app.services.vault_write_admission import vault_write_admission
 from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
 from app.services.native_file_projection import (
     enqueue_native_file_projection,
@@ -911,7 +912,7 @@ class FileService:
         ready_to_commit = False
 
         try:
-            async with pool.acquire() as conn:
+            async with vault_write_admission(vault_id, vault=vault_name), pool.acquire() as conn:
                 async with conn.transaction():
                     locked = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
                     if not locked:
@@ -1116,7 +1117,7 @@ class FileService:
             ):
                 inspection_error = ConflictError("Uploaded file hash mismatch; file record was cleaned up.")
 
-        async with pool.acquire() as conn:
+        async with vault_write_admission(vault_id), pool.acquire() as conn:
             async with conn.transaction():
                 locked = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
                 if locked is None:
@@ -1485,7 +1486,7 @@ class FileService:
         # s3_delete_worker after the TX commits, so a crash between
         # commit and S3 cannot leave us with an orphan blob (or a
         # missing-blob row). The outbox row carries the s3_key.
-        async with pool.acquire() as conn:
+        async with vault_write_admission(vault_id), pool.acquire() as conn:
             async with conn.transaction():
                 # Serialize with confirm_replace.  Reading the key before this
                 # transaction can enqueue a stale object if a replacement wins

@@ -65,6 +65,8 @@ async def select_rows(
     compiled = compiled_or_error
 
     try:
+        # A compiled SELECT writes nothing: run it read-only, which also
+        # keeps it out of the Vault's write admission.
         result = await get_user_sql_executor().execute(
             user_id=user_id,
             actor_id=actor_id,
@@ -72,6 +74,7 @@ async def select_rows(
             params=compiled["params"],
             is_admin=is_admin,
             vault_names=[vault_name],
+            read_only=True,
         )
     except PermissionDeniedError as e:
         return err(str(e), code=PERMISSION_DENIED, pg_sqlstate=e.pg_sqlstate)
@@ -125,6 +128,8 @@ async def query_rows(
     compiled = compiled_or_error
 
     try:
+        # A compiled SELECT writes nothing: run it read-only, which also
+        # keeps it out of the Vault's write admission.
         result = await get_user_sql_executor().execute(
             user_id=user_id,
             actor_id=actor_id,
@@ -132,6 +137,7 @@ async def query_rows(
             params=compiled["params"],
             is_admin=is_admin,
             vault_names=[vault_name],
+            read_only=True,
         )
     except PermissionDeniedError as e:
         return err(str(e), code=PERMISSION_DENIED, pg_sqlstate=e.pg_sqlstate)

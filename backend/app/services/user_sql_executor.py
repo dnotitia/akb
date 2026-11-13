@@ -38,6 +38,7 @@ from app.repositories import vault_write_policy_repo
 from app.repositories.events_repo import EventBuffer
 from app.util.errors import VAULT_ARCHIVED, VAULT_WRITE_MANAGED, err
 from app.services.role_sync import token_role_name, user_role_name
+from app.services.vault_write_admission import vault_write_admission
 
 logger = logging.getLogger("akb.user_sql")
 
@@ -263,6 +264,7 @@ class UserSqlExecutor:
         vault_names: Optional[list[str]] = None,
         read_only: bool = False,
         enforce_vault_write_policy: bool = False,
+        vault_ids: Optional[list[uuid.UUID]] = None,
     ) -> dict:
         """Run `sql` under the caller's PG role. Returns a result envelope
         compatible with the existing `akb_sql` contract.
@@ -270,6 +272,11 @@ class UserSqlExecutor:
         `vault_names` is included in the response envelope for
         downstream consumers. Raw SQL also checks declared Vault write policies;
         PostgreSQL roles control access to the actual tables.
+
+        A statement that can write a dynamic table's rows, or an admin
+        override, writes events of the declared Vaults (`vault_ids`, or those
+        named by `vault_names`), so it is admitted for them before it takes a
+        pool connection. A read-only transaction writes neither and is not.
         """
         should_fetch = (
             sql.strip().upper().startswith(("SELECT", "WITH"))
@@ -277,7 +284,16 @@ class UserSqlExecutor:
         )
         bind_params = params or []
         try:
-            async with self.pool.acquire() as conn:
+            # A data-modifying WITH starts like a query, so only a read-only
+            # transaction is known to write no rows; a read-only one still
+            # records an admin override when it checks the write policy.
+            admitted: list[uuid.UUID] = []
+            if not read_only or (enforce_vault_write_policy and not should_fetch):
+                admitted = (
+                    list(vault_ids) if vault_ids is not None
+                    else await self._vault_ids(vault_names or [])
+                )
+            async with vault_write_admission(*admitted), self.pool.acquire() as conn:
                 async with conn.transaction():
                     scope = current_vault_scope.get()
                     token_id = current_token_id.get()
@@ -387,6 +403,15 @@ class UserSqlExecutor:
             if mapped is not None:
                 raise mapped from exc
             raise
+
+
+    async def _vault_ids(self, vault_names: list[str]) -> list[uuid.UUID]:
+        """The ids of the named Vaults, read before the statement's transaction."""
+        if not vault_names:
+            return []
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id FROM vaults WHERE name = ANY($1::text[])", vault_names)
+        return [row["id"] for row in rows]
 
 
 # ── Singleton accessor ────────────────────────────────────────

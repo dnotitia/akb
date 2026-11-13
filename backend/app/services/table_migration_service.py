@@ -20,6 +20,7 @@ from app.repositories import table_registry_repo
 from app.repositories.events_repo import deferred_events
 from app.services.table_service import alter_table, index_table_metadata
 from app.services.uri_service import vault_uri
+from app.services.vault_write_admission import vault_write_admission
 from app.util.text import to_nfc_any
 
 logger = logging.getLogger("akb.tables")
@@ -231,7 +232,7 @@ async def apply_table_migration(
 
     pool = await get_pool()
     changed_tables: dict[str, dict] = {}
-    async with pool.acquire() as conn:
+    async with vault_write_admission(vault_id), pool.acquire() as conn:
         # Every event of the migration is inserted after its last DDL, in
         # operation order and then `table.migration`. The first event insert
         # holds the Vault's event lock until commit (migration 132); a later
