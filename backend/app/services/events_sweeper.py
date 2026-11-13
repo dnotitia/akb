@@ -162,13 +162,15 @@ async def sweep_once() -> int:
     SWEEP_INTERVAL_SECONDS before the next one.
     """
     global _position
-    # A step that fails, before it has a connection or after, starts the next
-    # pass from the oldest event.
+    # A step that fails, before it has a connection, while it holds one, or
+    # as it gives it back, starts the next pass from the oldest event: the
+    # position it reached is kept only once the connection is back.
     after, _position = _position, 0
     delete = _DELETE_PUBLISHED if settings.redis_url else _DELETE_EXPIRED
     pool = await get_pool()
     async with pool.acquire() as conn:
-        old, deleted, _position = await _sweep_batch(conn, after, delete)
+        old, deleted, position = await _sweep_batch(conn, after, delete)
+    _position = position
     if deleted:
         logger.info("events sweep: purged %d rows", deleted)
     return old

@@ -25,8 +25,10 @@ class _Conn:
         self.fail_delete = fail_delete
         self.deletes: list[tuple] = []
         self.statements: list[str] = []
+        self.reads: list[tuple] = []
 
     async def fetch(self, sql: str, *args):
+        self.reads.append(args)
         return self.rows
 
     async def fetchval(self, sql: str, *args):
@@ -38,17 +40,22 @@ class _Conn:
 
 
 class _Pool:
-    def __init__(self, conn: _Conn) -> None:
+    def __init__(self, conn: _Conn, *, fail_release: bool = False) -> None:
         self.conn = conn
+        self.fail_release = fail_release
 
     def acquire(self):
         conn = self.conn
+        fail_release = self.fail_release
 
         class _Acquired:
             async def __aenter__(self):
                 return conn
 
             async def __aexit__(self, *exc):
+                if fail_release:
+                    # Resetting the connection as it goes back to the pool fails.
+                    raise ConnectionResetError("the connection could not be reset")
                 return False
 
         return _Acquired()
@@ -65,9 +72,9 @@ def sweeper(monkeypatch):
     return events_sweeper
 
 
-def _serve(monkeypatch, sweeper, conn: _Conn) -> None:
+def _serve(monkeypatch, sweeper, conn: _Conn, *, fail_release: bool = False) -> None:
     async def get_pool():
-        return _Pool(conn)
+        return _Pool(conn, fail_release=fail_release)
 
     monkeypatch.setattr(sweeper, "get_pool", get_pool)
 
@@ -161,3 +168,28 @@ async def test_a_step_that_cannot_get_a_connection_starts_the_next_pass_from_the
     with pytest.raises(ConnectionRefusedError):
         await sweeper.sweep_once()
     assert sweeper._position == 0
+
+
+async def test_a_step_whose_connection_fails_to_go_back_starts_the_next_pass_from_the_oldest_event(
+    monkeypatch, sweeper
+):
+    """The position the step reached was kept before its connection was given back.
+
+    A step skipped an old event another statement held and deleted the one
+    after it; giving its connection back then failed, and the next try read on
+    from past the skipped event, which waited a further pass. The position is
+    now kept only once the connection is back.
+    """
+    failing = _Conn([(4, True), (7, True)], deleted=1)
+    _serve(monkeypatch, sweeper, failing, fail_release=True)
+    monkeypatch.setattr(sweeper, "_position", 3)
+
+    with pytest.raises(ConnectionResetError):
+        await sweeper.sweep_once()
+    assert failing.reads[0][0] == 3
+    assert sweeper._position == 0
+
+    retry = _Conn([(4, True), (7, True)], deleted=1)
+    _serve(monkeypatch, sweeper, retry)
+    assert await sweeper.sweep_once() == 2
+    assert retry.reads[0][0] == 0
