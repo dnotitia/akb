@@ -62,6 +62,7 @@ const result: AkbResult<TableQueryEnvelope> = unwrapAkbResponse<TableQueryEnvelo
 
 if (result.error) {
   result.error.code.toUpperCase();
+  result.error.retryAfterMs satisfies number | null;
 } else {
   result.data?.items.at(0)?.id.toUpperCase();
 }

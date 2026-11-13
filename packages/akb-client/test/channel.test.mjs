@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 
 import { AkbError, createClient } from "../dist/index.js";
 import { createClient as createLiteClient } from "../dist/lite.js";
 
 const textEncoder = new TextEncoder();
+const CHECKPOINT_READY = "event: checkpoint\nid: ec1.ready\ndata: {\"version\":1,\"cursor\":\"ec1.ready\"}\n\n";
 
 test("channel is vault-scoped and exposes the same auth boundary from main and lite", async () => {
   let fetchCalls = 0;
@@ -145,6 +146,174 @@ test("event gap and invalid cursor remain AkbError responses", async () => {
   );
 });
 
+test("a refused open waits for its Retry-After before the next attempt", async () => {
+  await withFakeClock(async () => {
+    const attempts = [];
+    const fetch = async (_input, init = {}) => {
+      attempts.push(Date.now());
+      if (attempts.length === 1) {
+        return json(
+          { message: "Event tail capacity is exhausted on this server", code: "event_tail_capacity" },
+          503,
+          "Service Unavailable",
+          { "retry-after": "5" },
+        );
+      }
+      return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+    };
+    const opening = createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+      .vault("vault")
+      .channel()
+      .subscribe();
+
+    await until(() => vi.getTimerCount() > 0, "the wait after the refusal");
+    await vi.advanceTimersByTimeAsync(4_999);
+    await settle();
+    assert.equal(attempts.length, 1);
+    await vi.advanceTimersByTimeAsync(1);
+    await until(() => attempts.length === 2, "the second attempt");
+    assert.equal(attempts[1] - attempts[0], 5_000);
+    const subscription = await opening;
+    await subscription.unsubscribe();
+  });
+});
+
+test("without Retry-After, refused opens back off exponentially with jitter up to 30 s", async () => {
+  // Math.random() = 0 takes the bottom of each jittered range, the largest value the top.
+  for (const [random, expected] of [
+    [0, [250, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 15_000]],
+    [1 - 2 ** -53, [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]],
+  ]) {
+    await withFakeClock(async () => {
+      vi.spyOn(Math, "random").mockReturnValue(random);
+      const refusals = expected.length;
+      const attempts = [];
+      const fetch = async (_input, init = {}) => {
+        attempts.push(Date.now());
+        if (attempts.length <= refusals) {
+          return json({ message: "temporary", code: "temporary_failure" }, 503, "Service Unavailable");
+        }
+        return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+      };
+      const opening = createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+        .vault("vault")
+        .channel()
+        .subscribe();
+
+      const delays = await attemptDelays(attempts, refusals + 1);
+      assert.deepEqual(delays, expected);
+      const subscription = await opening;
+      await subscription.unsubscribe();
+    });
+  }
+});
+
+test("a successful open resets the backoff", async () => {
+  await withFakeClock(async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const attempts = [];
+    const fetch = async (_input, init = {}) => {
+      attempts.push(Date.now());
+      switch (attempts.length) {
+        case 4:
+          // Opens, sends its start checkpoint and ends: the channel reconnects.
+          return sseResponse([CHECKPOINT_READY]);
+        case 6:
+          return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+        default:
+          return json({ message: "temporary", code: "temporary_failure" }, 503, "Service Unavailable");
+      }
+    };
+    const opening = createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+      .vault("vault")
+      .channel()
+      .subscribe();
+
+    const delays = await attemptDelays(attempts, 6);
+    // Three refusals back off; the stream that opened ends and is reopened after
+    // the reconnection time; the next refusal starts the backoff again.
+    assert.deepEqual(delays, [250, 500, 1_000, 250, 250]);
+    const subscription = await opening;
+    await subscription.unsubscribe();
+  });
+});
+
+test("Retry-After may be an HTTP-date, and the wait never exceeds 30 s or skips the backoff", async () => {
+  await withFakeClock(async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    vi.setSystemTime(Date.UTC(2026, 10, 13, 0, 0, 0));
+    const refusals = [
+      // Measured from the response's own Date header, not the local clock.
+      { date: "Fri, 13 Nov 2026 00:00:30 GMT", "retry-after": "Fri, 13 Nov 2026 00:00:37 GMT" },
+      // Without a Date header, measured from the local clock (00:00:07 by now).
+      { "retry-after": "Fri, 13 Nov 2026 00:00:10 GMT" },
+      { "retry-after": "120" },
+      // A zero wait does not bypass the backoff of the fourth refusal in a row.
+      { "retry-after": "0" },
+    ];
+    const attempts = [];
+    const fetch = async (_input, init = {}) => {
+      attempts.push(Date.now());
+      const headers = refusals[attempts.length - 1];
+      if (headers) {
+        return json({ message: "temporary", code: "event_tail_unavailable" }, 503, "Service Unavailable", headers);
+      }
+      return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+    };
+    const opening = createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+      .vault("vault")
+      .channel()
+      .subscribe();
+
+    const delays = await attemptDelays(attempts, refusals.length + 1);
+    assert.deepEqual(delays, [7_000, 3_000, 30_000, 2_000]);
+    const subscription = await opening;
+    await subscription.unsubscribe();
+  });
+});
+
+test("a 429 user quota refusal still ends the channel and carries its code and Retry-After", async () => {
+  const quota = () => json(
+    {
+      message: "This account has too many open event streams on this server",
+      code: "event_tail_user_quota",
+      hint: "Close event streams this account no longer reads.",
+    },
+    429,
+    "Too Many Requests",
+    { "retry-after": "5" },
+  );
+  const isQuotaError = (error) => error instanceof AkbError
+    && error.status === 429
+    && error.code === "event_tail_user_quota"
+    && error.hint === "Close event streams this account no longer reads."
+    && error.retryAfterMs === 5_000;
+
+  let openCalls = 0;
+  const refusedOpen = createClient({
+    baseUrl: "https://akb.test/api/v1",
+    fetch: async () => {
+      openCalls += 1;
+      return quota();
+    },
+  }).vault("vault");
+  await assert.rejects(refusedOpen.channel().subscribe(), isQuotaError);
+  assert.equal(openCalls, 1);
+
+  let reconnectCalls = 0;
+  const refusedReconnect = createClient({
+    baseUrl: "https://akb.test/api/v1",
+    fetch: async () => {
+      reconnectCalls += 1;
+      return reconnectCalls === 1 ? sseResponse([CHECKPOINT_READY]) : quota();
+    },
+  }).vault("vault");
+  const subscription = await refusedReconnect.channel().subscribe();
+  await assert.rejects(subscription.closed, isQuotaError);
+  assert.equal(reconnectCalls, 2);
+  assert.equal(subscription.cursor, "ec1.ready");
+});
+
 function sseResponse(chunks, status = 200, signal = null, close = true) {
   const body = new ReadableStream({
     start(controller) {
@@ -164,11 +333,11 @@ function sseResponse(chunks, status = 200, signal = null, close = true) {
   });
 }
 
-function json(body, status, statusText) {
+function json(body, status, statusText, headers = {}) {
   return new Response(JSON.stringify(body), {
     status,
     statusText,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
 }
 
@@ -178,4 +347,45 @@ async function waitFor(predicate) {
     if (Date.now() >= deadline) throw new Error("timed out waiting for channel state");
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+// Only the channel's reconnect timers and the clock are faked; response bodies
+// are still read on the real event loop.
+async function withFakeClock(run) {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  try {
+    await run();
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+}
+
+// Turns the real event loop, on which response bodies are read, until `done()`.
+async function until(done, what) {
+  for (let turn = 0; turn < 1_000; turn += 1) {
+    if (done()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+// Gives anything the channel would do next a chance to happen.
+async function settle() {
+  for (let turn = 0; turn < 20; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+// Runs each reconnect wait to its end and returns the waits between the
+// recorded attempts, in fake milliseconds.
+async function attemptDelays(attempts, count) {
+  await until(() => attempts.length > 0, "the first attempt");
+  while (attempts.length < count) {
+    const before = attempts.length;
+    await until(() => vi.getTimerCount() > 0, `the wait after attempt ${before}`);
+    await vi.advanceTimersToNextTimerAsync();
+    await until(() => attempts.length > before, `attempt ${before + 1}`);
+  }
+  return attempts.slice(1).map((at, index) => at - attempts[index]);
 }

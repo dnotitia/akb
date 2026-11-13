@@ -41,7 +41,50 @@ test("unwrapAkbResponse maps HTTP errors to AkbError", () => {
   assert.equal(result.error.status, 403);
   assert.deepEqual(result.error.details, { pg_sqlstate: "42501" });
   assert.equal(result.error.hint, "Check vault membership.");
+  assert.equal(result.error.retryAfterMs, null);
   assert.throws(() => result.throwOnError(), AkbError);
+});
+
+test("AkbError reports the Retry-After of the response it was built from", async () => {
+  const sentAt = "Sun, 06 Nov 1994 08:49:37 GMT";
+  const retryAfterMs = (headers) => unwrapAkbResponse(
+    new Response(null, { status: 503, statusText: "Service Unavailable", headers }),
+    { message: "busy", code: "event_tail_capacity" },
+  ).error?.retryAfterMs;
+
+  assert.equal(retryAfterMs({ "retry-after": "5" }), 5_000);
+  assert.equal(retryAfterMs({ "retry-after": "007" }), 7_000);
+  // An HTTP-date is measured from the response's Date header, in any of the three HTTP-date forms.
+  assert.equal(retryAfterMs({ date: sentAt, "retry-after": "Sun, 06 Nov 1994 08:49:45 GMT" }), 8_000);
+  assert.equal(retryAfterMs({ date: sentAt, "retry-after": "Sunday, 06-Nov-94 08:49:45 GMT" }), 8_000);
+  assert.equal(retryAfterMs({ date: sentAt, "retry-after": "Sun Nov  6 08:49:45 1994" }), 8_000);
+  assert.equal(retryAfterMs({ date: sentAt, "retry-after": "Sun, 06 Nov 1994 08:49:30 GMT" }), 0);
+  // Without a usable Date header, the local clock is the reference.
+  const local = retryAfterMs({ date: "yesterday", "retry-after": new Date(Date.now() + 60_000).toUTCString() });
+  assert.ok(local > 55_000 && local <= 60_000, `local-clock delay ${local}`);
+
+  for (const invalid of [
+    "",
+    "-1",
+    "1.5",
+    "5, 10",
+    "soon",
+    "12 soon",
+    "Sun, 06 Nov 1994 08:49:37 PST",
+    "sun, 06 nov 1994 08:49:37 gmt",
+    "Sun, 31 Feb 1994 08:49:37 GMT",
+    "Sun, 06 Nov 1994 24:00:00 GMT",
+  ]) {
+    assert.equal(retryAfterMs({ "retry-after": invalid }), null, JSON.stringify(invalid));
+  }
+  assert.equal(retryAfterMs({}), null);
+
+  const busy = await akbFetch("https://akb.test/api/v1/documents", undefined, async () => new Response(
+    JSON.stringify({ message: "Vault is busy", code: "write_busy" }),
+    { status: 429, headers: { "content-type": "application/json", "retry-after": "2" } },
+  ));
+  assert.equal(busy.error?.code, "write_busy");
+  assert.equal(busy.error?.retryAfterMs, 2_000);
 });
 
 test("akbFetch returns sanitized results for transport, cancel, read, and JSON failures", async () => {

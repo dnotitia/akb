@@ -9,8 +9,13 @@ import type {
 
 const EVENT_KIND_PATTERN = /^[A-Za-z][A-Za-z0-9]*(?:[._:-][A-Za-z0-9]+)*$/u;
 const EVENT_CURSOR_PATTERN = /^ec1\.[A-Za-z0-9_-]+$/u;
+// The reconnection time until a stream's SSE `retry` field sets another, and
+// the smallest step the backoff after a refused open doubles from.
 const DEFAULT_RECONNECT_DELAY_MS = 250;
+// No reconnect wait is longer, whatever Retry-After, `retry` or the backoff ask for.
 const MAX_RECONNECT_DELAY_MS = 30_000;
+// Past this many doublings the cap above applies anyway.
+const MAX_BACKOFF_DOUBLINGS = 16;
 
 type StreamRequest = (
   path: string,
@@ -84,6 +89,8 @@ interface SubscriptionState {
   stopped: boolean;
   closedSettled: boolean;
   retryDelayMs: number;
+  /** Opens refused or failed in a row since the last one that succeeded. */
+  failedOpens: number;
   readonly closed: Promise<void>;
   readonly resolveClosed: () => void;
   readonly rejectClosed: (reason: unknown) => void;
@@ -344,6 +351,7 @@ function createSubscriptionState(
     stopped: false,
     closedSettled: false,
     retryDelayMs: DEFAULT_RECONNECT_DELAY_MS,
+    failedOpens: 0,
     closed,
     resolveClosed,
     rejectClosed,
@@ -385,7 +393,8 @@ async function openInitialConnection(
       terminateSubscription(state, result.error);
       throw result.error;
     }
-    if (!(await waitForReconnect(state))) return subscription;
+    state.failedOpens += 1;
+    if (!(await waitForReconnect(state, refusedOpenDelayMs(state, result.error)))) return subscription;
   }
   return subscription;
 }
@@ -417,8 +426,10 @@ async function reconnect(
   openStream: StreamRequest,
   registrations: readonly Registration[],
 ): Promise<Response | null> {
+  // The stream that ended had opened, so the first wait is the reconnection time.
+  let delayMs = state.retryDelayMs;
   while (!state.stopped) {
-    if (!(await waitForReconnect(state))) return null;
+    if (!(await waitForReconnect(state, delayMs))) return null;
     const result = await openConnection(state, vault, openStream, false, registrations);
     if (result.response) return result.response;
     if (!result.error || state.stopped) return null;
@@ -426,6 +437,8 @@ async function reconnect(
       terminateSubscription(state, result.error);
       return null;
     }
+    state.failedOpens += 1;
+    delayMs = refusedOpenDelayMs(state, result.error);
   }
   return null;
 }
@@ -504,6 +517,8 @@ async function openConnection(
       }, response),
     };
   }
+  // A successful open restarts the backoff of the next refusal.
+  state.failedOpens = 0;
   return { response, error: null };
 }
 
@@ -690,13 +705,32 @@ async function responseError(response: Response): Promise<AkbError> {
   return new AkbError(body, response);
 }
 
-async function waitForReconnect(state: SubscriptionState): Promise<boolean> {
+/**
+ * The wait before reopening after the n-th refused or failed open in a row
+ * (n = `state.failedOpens`).
+ *
+ * The longest of the refusal's Retry-After, the reconnection time, and a
+ * random time in the upper half of 2^n × 250 ms (or of 2^n × the reconnection
+ * time, when that is longer), but never more than 30 s.
+ */
+function refusedOpenDelayMs(state: SubscriptionState, error: AkbError): number {
+  const step = Math.max(state.retryDelayMs, DEFAULT_RECONNECT_DELAY_MS);
+  const doublings = Math.min(state.failedOpens, MAX_BACKOFF_DOUBLINGS);
+  const ceiling = Math.min(MAX_RECONNECT_DELAY_MS, step * 2 ** doublings);
+  const backoff = Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
+  return Math.min(
+    MAX_RECONNECT_DELAY_MS,
+    Math.max(state.retryDelayMs, error.retryAfterMs ?? 0, backoff),
+  );
+}
+
+async function waitForReconnect(state: SubscriptionState, delayMs: number): Promise<boolean> {
   if (state.stopped) return false;
   return await new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => {
       state.wakeWaiters.delete(wake);
       resolve(!state.stopped);
-    }, state.retryDelayMs);
+    }, delayMs);
     const wake = () => {
       clearTimeout(timer);
       state.wakeWaiters.delete(wake);

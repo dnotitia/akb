@@ -102,6 +102,9 @@ returned as `{ data: null, error: AkbError }`. SDK-local errors use these
 stable codes: `transport_error`, `request_aborted`, `response_read_error`, and
 `invalid_json`. `error.status` and `error.response` preserve an HTTP response
 when one exists; transport failures use `null` rather than a fabricated status.
+`error.retryAfterMs` is the wait, in milliseconds, that the response's
+`Retry-After` header asked for, as seconds or an HTTP-date, or `null` when
+there is none.
 The SDK does not copy a credential, request URL/body, or signal reason into
 these errors. Injected fetch rejections are covered by this result boundary;
 invalid input/configuration and token-supplier or user-callback failures keep
@@ -142,6 +145,22 @@ migrated.throwOnError();
 ```
 
 The backend and MCP surfaces are not rewrapped. `kind` remains the HTTP success discriminator and `{ data, error }` exists only at the SDK boundary.
+
+## Change Event channel reconnects
+
+`akb.vault("eng").channel()` resumes its Server-Sent Events tail from the last
+cursor it received. A stream that ends after opening is reopened after the
+reconnection time: 250 ms, unless the stream's SSE `retry` field set another.
+An open refused with a 5xx, or one that fails before a response, is tried
+again with a backoff: the first refusal in a row waits a random time between
+250 and 500 ms, and each further one doubles that range. A refusal's
+`Retry-After` is the shortest wait it allows. No wait exceeds 30 seconds, even
+for a longer `Retry-After`, and an open that succeeds resets the backoff.
+
+A 4xx refusal ends the subscription instead. That includes 429
+`event_tail_user_quota`, which an account gets at its stream quota.
+`subscribe()` rejects, or `closed` rejects once a stream has run, with an
+`AkbError` that carries the refusal's `code`, `status` and `retryAfterMs`.
 
 ## Runtime Table Types
 
