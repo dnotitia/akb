@@ -134,16 +134,21 @@ The outbox keeps an event for `event_retention_days` (default 7), and a
 sweeper that every worker process runs, with or without Redis, then deletes
 it. With `redis_url` set, the period starts when the publisher writes the
 event to the stream, and an event not yet published is kept. Without it
-nothing publishes, and the period starts when the event occurred: the sweeper
-reads events from the oldest id, a batch of 1,000 per statement, and stops at
-the first one still inside the period, so an event behind that one, even one
-whose transaction began earlier, is kept a little longer than the period,
-never less. Each of those batches locks its events with SKIP LOCKED before it
-deletes them, so sweeps in two processes, or a sweep beside another delete of
-the same events, wait for no event row. Earlier releases swept only with
-Redis, so an installation without it kept every event. A tail client
-away for longer than the period should expect 410 `event_gap`, below, and
-reconcile current state through AKB.
+nothing publishes, and the period starts when the event occurred. Either way
+the sweeper reads events from the oldest id, a batch of 1,000 per statement
+and transaction, deletes the batch's events past retention, and stops at the
+first event that neither occurred nor was published more than the period ago.
+Without Redis an expired event behind that one, even one whose transaction
+began earlier, is kept a little longer than the period, never less. Each
+batch locks its events with SKIP LOCKED before it deletes them, so sweeps in
+two processes, or a sweep beside any other delete of the same events, an
+operator's included, wait for no event row and cannot deadlock over them.
+Earlier releases swept only with Redis, in one statement over every published
+event past the period: an installation without Redis kept every event, and
+one with it deleted a backlog in a single transaction that could wait for,
+and deadlock with, another delete of the same events. A tail client away for
+longer than the period should expect 410 `event_gap`, below, and reconcile
+current state through AKB.
 
 A cursor is refused with 410 `event_gap` only when an event it never received
 was deleted. A trigger on `events` records, per Vault, the highest event id

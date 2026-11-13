@@ -12,14 +12,16 @@ specifically; the proxy has its own log in
   has a worker of its own that every worker process runs either way. An event
   is kept for `event_retention_days` (new, default 7). With Redis the period
   starts at publication to the stream, as before, and an unpublished event is
-  kept. Without it the period starts when the event occurred, and the sweeper
-  deletes events from the oldest id, 1,000 per statement, up to the first one
-  still inside the period; each batch locks its rows with SKIP LOCKED, so
-  sweeps in two processes do not wait for each other's rows. Every deletion
-  raises the Vault's retention watermark through the `events` delete trigger,
-  so an event tail cursor that missed a deleted event is refused with 410
-  `event_gap`. The first pass on an installation that ran without Redis
-  deletes its backlog in those batches.
+  kept. Without it the period starts when the event occurred. Either way the
+  sweeper deletes events from the oldest id, at most 1,000 per statement and
+  transaction, and each batch locks its rows with SKIP LOCKED: the Redis sweep
+  no longer deletes every published event past the period in one statement,
+  which could wait for, and deadlock with, an operator's delete of the same
+  events, and sweeps in two processes do not wait for each other's rows.
+  Every deletion raises the Vault's retention watermark through the `events`
+  delete trigger, so an event tail cursor that missed a deleted event is
+  refused with 410 `event_gap`. The first pass on an installation that ran
+  without Redis deletes its backlog in those batches.
 
 - Open `GET /api/v1/events/{vault}` SSE tails no longer hold request-pool
   connections. Each server process wakes them from one dedicated PostgreSQL

@@ -149,10 +149,11 @@ async def test_retention_bounds_drive_gap_recovery_without_skipping(monkeypatch)
 
 
 async def _sweep(monkeypatch, pool: asyncpg.Pool) -> int:
-    """Run one step of the events sweeper against ``pool``, as it runs with Redis.
+    """Run the first step of a pass of the events sweeper against ``pool``, as it runs with Redis.
 
-    With Redis the step deletes, in one statement, every event published more
-    than the retention period ago.
+    The step reads the oldest batch of events and deletes, in one statement,
+    the ones published more than the retention period ago. It returns how
+    many old events the batch held.
     """
     from app.services import events_sweeper
 
@@ -161,6 +162,7 @@ async def _sweep(monkeypatch, pool: asyncpg.Pool) -> int:
 
     monkeypatch.setattr(events_sweeper, "get_pool", get_pool)
     monkeypatch.setattr(events_sweeper.settings, "redis_url", "redis://events-sweeper-test")
+    monkeypatch.setattr(events_sweeper, "_position", 0)
     return await events_sweeper.sweep_once()
 
 

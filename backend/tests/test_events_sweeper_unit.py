@@ -20,10 +20,11 @@ class _Conn:
     """Answers the batch read with ``rows`` and the delete with ``deleted``."""
 
     def __init__(self, rows: list[tuple[int, bool]], deleted: int, *, fail_delete: bool = False) -> None:
-        self.rows = [{"id": event_id, "expired": expired} for event_id, expired in rows]
+        self.rows = [{"id": event_id, "old": old} for event_id, old in rows]
         self.deleted = deleted
         self.fail_delete = fail_delete
         self.deletes: list[tuple] = []
+        self.statements: list[str] = []
 
     async def fetch(self, sql: str, *args):
         return self.rows
@@ -31,6 +32,7 @@ class _Conn:
     async def fetchval(self, sql: str, *args):
         if self.fail_delete:
             raise ConnectionResetError("lost the connection")
+        self.statements.append(sql)
         self.deletes.append(args)
         return self.deleted
 
@@ -70,33 +72,61 @@ def _serve(monkeypatch, sweeper, conn: _Conn) -> None:
     monkeypatch.setattr(sweeper, "get_pool", get_pool)
 
 
-async def test_a_full_batch_of_expired_events_goes_on_after_its_last_id(monkeypatch, sweeper):
+async def test_a_batch_of_old_events_is_deleted_through_its_last_id_and_the_pass_goes_on(monkeypatch, sweeper):
     conn = _Conn([(4, True), (7, True), (9, True)], deleted=3)
     _serve(monkeypatch, sweeper, conn)
 
     assert await sweeper.sweep_once() == 3
-    # The delete covers the ids after the pass's position through the last expired one.
+    # The delete covers the ids after the pass's position through the last old one.
     assert conn.deletes == [(0, 9, 7)]
     assert sweeper._position == 9
 
 
-async def test_an_event_inside_the_period_ends_the_pass_and_bounds_the_delete(monkeypatch, sweeper):
+async def test_an_event_that_is_not_old_bounds_the_delete_and_the_next_step_ends_the_pass(monkeypatch, sweeper):
     conn = _Conn([(4, True), (7, False), (9, True)], deleted=1)
     _serve(monkeypatch, sweeper, conn)
     monkeypatch.setattr(sweeper, "_position", 2)
 
     assert await sweeper.sweep_once() == 1
-    # The expired event behind the one inside the period is not reached.
+    # The old event behind the one that is not is not reached.
     assert conn.deletes == [(2, 4, 7)]
+    assert sweeper._position == 4
+
+    ended = _Conn([(7, False), (9, True)], deleted=0)
+    _serve(monkeypatch, sweeper, ended)
+    assert await sweeper.sweep_once() == 0
+    assert ended.deletes == []
     assert sweeper._position == 0
 
 
-async def test_a_batch_whose_rows_others_hold_ends_the_pass(monkeypatch, sweeper):
-    """Another statement holds every row and is deleting them; this pass stops rather than spin."""
+async def test_old_events_the_statement_leaves_are_passed_over_and_the_pass_goes_on(monkeypatch, sweeper):
+    """Rows another statement holds, or with Redis rows not yet published, stay; the pass moves past them."""
     conn = _Conn([(4, True), (7, True), (9, True)], deleted=0)
     _serve(monkeypatch, sweeper, conn)
 
+    assert await sweeper.sweep_once() == 3
+    assert sweeper._position == 9
+
+
+async def test_with_redis_a_batch_is_deleted_by_publication_in_the_same_bounded_range(monkeypatch, sweeper):
+    monkeypatch.setattr(sweeper.settings, "redis_url", "redis://sweep-test")
+    conn = _Conn([(4, True), (7, True), (9, False)], deleted=1)
+    _serve(monkeypatch, sweeper, conn)
+
+    assert await sweeper.sweep_once() == 2
+    assert conn.statements == [sweeper._DELETE_PUBLISHED]
+    assert conn.deletes == [(0, 7, 7)]
+    assert "FOR UPDATE SKIP LOCKED" in sweeper._DELETE_PUBLISHED
+    assert sweeper._position == 7
+
+
+async def test_an_empty_batch_ends_the_pass(monkeypatch, sweeper):
+    conn = _Conn([], deleted=0)
+    _serve(monkeypatch, sweeper, conn)
+    monkeypatch.setattr(sweeper, "_position", 12)
+
     assert await sweeper.sweep_once() == 0
+    assert conn.deletes == []
     assert sweeper._position == 0
 
 

@@ -239,14 +239,15 @@ async def test_with_redis_the_sweep_deletes_only_events_published_before_the_per
             "UPDATE events SET redis_published_at = NOW() - INTERVAL '2 days' WHERE id = $1", published_lately
         )
 
-        assert await _sweep_pass(monkeypatch, setup_pool, redis_url="redis://sweep-test") == [1, 0]
+        # All three are old; the one published long ago is the one deleted.
+        assert await _sweep_pass(monkeypatch, setup_pool, redis_url="redis://sweep-test") == [3, 0]
         assert await _remaining(setup_pool) == [unpublished, published_lately]
         assert await _watermarks(setup_pool) == {vault_id: published_long_ago}
 
         # A shorter period reaches the event published two days ago.
         sweeper = _use(monkeypatch, setup_pool, redis_url="redis://sweep-test")
         monkeypatch.setattr(sweeper.settings, "event_retention_days", 1)
-        assert await sweeper.sweep_once() == 1
+        assert await sweeper.sweep_once() == 2
         assert await _remaining(setup_pool) == [unpublished]
         assert await _watermarks(setup_pool) == {vault_id: published_lately}
 
@@ -256,6 +257,22 @@ async def _hold_a_sweep(conn: asyncpg.Connection, through: int) -> int:
     from app.services import events_sweeper
 
     return await conn.fetchval(events_sweeper._DELETE_EXPIRED, 0, through, _RETENTION_DAYS)
+
+
+async def _done_or_blocked_by(
+    pool: asyncpg.Pool, task: asyncio.Future, holder: asyncpg.Connection, *, besides: asyncpg.Connection
+) -> None:
+    """Return once ``task`` is done or a session other than ``besides`` waits for a lock ``holder`` holds."""
+
+    async def poll() -> None:
+        while not task.done() and not await pool.fetchval(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) AND pid <> $2",
+            holder.get_server_pid(),
+            besides.get_server_pid(),
+        ):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), 5)
 
 
 async def _blocked_by(pool: asyncpg.Pool, holder: asyncpg.Connection) -> None:
@@ -296,7 +313,8 @@ async def test_a_sweep_beside_another_sweep_waits_for_no_event_row(monkeypatch):
         finally:
             await other.close()
 
-        assert steps == [3, 0]
+        # Six old events; the three the other statement holds are left to it.
+        assert steps == [6, 0]
         assert await _remaining(setup_pool) == [kept]
         assert await _watermarks(setup_pool) == {held_vault: held[-1], free_vault: free[-1]}
 
@@ -335,7 +353,7 @@ async def test_two_sweeps_of_one_vault_wait_only_for_its_mark_and_record_the_hig
                 with contextlib.suppress(BaseException):
                     await task
 
-        assert steps == [2, 0]
+        assert steps == [4, 0]
         assert await _remaining(setup_pool) == []
         assert await _watermarks(setup_pool) == {vault_id: expired[-1]}
 
@@ -446,7 +464,7 @@ async def test_a_sweep_beside_a_vault_cleanup_of_the_same_events_does_not_deadlo
             else:
                 await cleanup.execute("DELETE FROM events WHERE vault_id = $1", vault_id)
                 # The sweep skips the cleanup's rows and does not wait for it.
-                assert await asyncio.wait_for(_sweep_pass(monkeypatch, setup_pool), 2) == [2, 0]
+                assert await asyncio.wait_for(_sweep_pass(monkeypatch, setup_pool), 2) == [4, 0]
             await cleanup.execute("DELETE FROM vaults WHERE id = $1", vault_id)
             await cleaning.commit()
         finally:
@@ -463,3 +481,115 @@ async def test_a_sweep_beside_a_vault_cleanup_of_the_same_events_does_not_deadlo
         assert await _remaining(setup_pool) == []
         assert await _watermarks(setup_pool) == {bystander: aside[-1]}
         assert fresh > aside[-1]
+
+
+async def _publish(pool: asyncpg.Pool, event_ids: list[int], days: int) -> None:
+    """Mark events as published ``days`` ago."""
+    await pool.execute(
+        "UPDATE events SET redis_published_at = NOW() - make_interval(days => $2) WHERE id = ANY($1::bigint[])",
+        event_ids,
+        days,
+    )
+
+
+async def test_with_redis_a_backlog_is_deleted_a_batch_per_statement_past_unpublished_events(monkeypatch):
+    """With Redis the sweep deleted every published event past the period in one unbounded statement.
+
+    It now reads the same batches as without Redis, and each batch's statement
+    deletes only the batch's events published that long ago. An old event not
+    yet published is kept and does not end the pass.
+    """
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "sweep-published-backlog")
+        events = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(6)]
+        await _age(setup_pool, events)
+        published = [events[0], events[2], events[3], events[5]]
+        unpublished = [events[1], events[4]]
+        await _publish(setup_pool, published, days=8)
+        young = await _insert_event(setup_pool, vault_id, "document.update", "alice")
+        sweeper = _use(monkeypatch, setup_pool, redis_url="redis://sweep-test")
+        monkeypatch.setattr(sweeper, "BATCH_SIZE", 2)
+
+        # The first statement reaches only the first batch.
+        assert await sweeper.sweep_once() == 2
+        assert await _remaining(setup_pool) == events[1:] + [young]
+        steps = [2]
+        while steps[-1]:
+            steps.append(await sweeper.sweep_once())
+
+        assert steps == [2, 2, 2, 0]
+        assert await _remaining(setup_pool) == unpublished + [young]
+        assert await _watermarks(setup_pool) == {vault_id: events[5]}
+
+
+async def test_with_redis_a_sweep_beside_an_operator_delete_of_the_same_events_does_not_deadlock(monkeypatch):
+    """An operator's delete takes a Vault's events in id order; a plan can take them in publication order.
+
+    A, B and C were published in the order C, B, A, and a session holds B. The
+    operator's delete takes A and waits for B. The earlier sweep, one statement
+    over the published events, waited for the rows other statements held: read
+    from their index it took C and waited for B as well, and once B was free
+    the operator took it and waited for C while the sweep waited for B, and
+    PostgreSQL failed one of them as a deadlock. The sweep now skips the rows
+    another statement holds, so it finishes while they are held, and waits for
+    neither.
+    """
+    async with _fresh_database() as setup_pool:
+        database = await setup_pool.fetchval("SELECT current_database()")
+        vault_id = await _make_vault(setup_pool, "sweep-operator")
+        a, b, c = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(3)]
+        await _age(setup_pool, [a, b, c], days=11)
+        for event_id, days in ((c, 10), (b, 9), (a, 8)):
+            await _publish(setup_pool, [event_id], days=days)
+        young = await _insert_event(setup_pool, vault_id, "document.update", "alice")
+        # Planner settings under which each statement takes its rows in the
+        # order of an index, plans PostgreSQL may choose: the operator's delete
+        # a Vault's events by id, a sweep over published events by publication.
+        # Without them this small table is read in the order its rows are
+        # stored, the same for both.
+        by_index = {"enable_seqscan": "off", "enable_bitmapscan": "off"}
+        sweep_pool = await asyncpg.create_pool(
+            _database_dsn(database), min_size=1, max_size=1, server_settings=by_index
+        )
+        holder = await asyncpg.connect(_database_dsn(database))
+        operator = await asyncpg.connect(_database_dsn(database), server_settings=by_index)
+        tasks: list[asyncio.Future] = []
+        finished_while_held = False
+        try:
+            holding = holder.transaction()
+            await holding.start()
+            await holder.fetchval("SELECT 1 FROM events WHERE id = $1 FOR UPDATE", b)
+            deleting = asyncio.ensure_future(
+                operator.execute("DELETE FROM events WHERE vault_id = $1 AND id <> $2", vault_id, young)
+            )
+            tasks.append(deleting)
+            # The operator's delete holds A and waits for B.
+            await _waits_for(setup_pool, operator, holder)
+            sweeping = asyncio.ensure_future(_sweep_pass(monkeypatch, sweep_pool, redis_url="redis://sweep-test"))
+            tasks.append(sweeping)
+            try:
+                await asyncio.wait_for(asyncio.shield(sweeping), 2)
+                finished_while_held = True
+            except TimeoutError:
+                pass
+            await holding.commit()
+            done, _ = await asyncio.wait(tasks, timeout=5)
+            failures = [task.exception() for task in done if task.exception() is not None]
+            assert not failures, failures
+            assert deleting.done() and sweeping.done()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await holder.close()
+            await operator.close()
+            await sweep_pool.close()
+            for task in tasks:
+                with contextlib.suppress(BaseException):
+                    await task
+
+        assert finished_while_held, "the sweep waited for rows another statement held"
+        # The sweep took C; the operator took A and B.
+        assert sweeping.result() == [3, 0]
+        assert await _remaining(setup_pool) == [young]
+        assert (await _watermarks(setup_pool))[vault_id] == c
