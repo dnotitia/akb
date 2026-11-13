@@ -43,8 +43,10 @@ specifically; the proxy has its own log in
   that disagree about `redis_url` each apply their own rule, so set it alike
   on every worker. Every deletion raises the Vault's retention watermark
   through the `events` delete trigger, so a tail cursor that missed a deleted
-  event is refused with 410 `event_gap`. The first pass on an installation
-  that ran without Redis deletes its backlog in those batches.
+  event is refused with 410 `event_gap`. On an installation that ran without
+  Redis, the first pass deletes the backlog it can reach, in those batches; an
+  event another statement holds, or one behind an event that is not yet old,
+  waits for a later pass.
 
 - Open `GET /api/v1/events/{vault}` SSE tails no longer hold request-pool
   connections. Each server process wakes them from one dedicated PostgreSQL

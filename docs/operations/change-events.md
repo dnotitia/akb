@@ -141,8 +141,9 @@ Either way the sweeper reads events from the oldest id, a batch of 1,000 per
 statement and transaction, deletes those of the batch's ids that are past
 retention, and stops at the first event that neither occurred nor was
 recorded as published more than the period ago. Without Redis an expired
-event behind that one, even one whose transaction began earlier, is kept a
-little longer than the period, never less. Ids drawn before migration 133,
+event behind that one, even one whose transaction began earlier, is kept
+longer than the period, never less: until the event ahead of it is old too.
+Ids drawn before migration 133,
 when the id sequence's cache could be above 1, may be out of order, and an
 expired event behind a newer one then waits for it, with or without Redis.
 Each statement checks every event's own time, so this can only delay a
@@ -153,10 +154,13 @@ so an event no publisher has written yet can be deleted before one does.
 Neither rule deletes an event before the period has passed since it
 occurred; give every worker the same setting. Each batch locks its events
 with SKIP LOCKED before it deletes them, so a sweep never waits for an event
-row another statement holds, and a sweep cannot deadlock with another sweep
-or with a single statement that deletes events, an operator's included. A
+row another statement holds: it leaves the row to a later pass, unless that
+statement deletes it. A sweep therefore cannot deadlock with another sweep or
+with a single statement that deletes events, an operator's included. A
 transaction that deletes events in more than one statement still can, as
-with any other delete of events. Earlier releases swept only with Redis, in
+with any other delete of events. On an installation that ran without Redis,
+the first pass deletes the backlog it can reach; an event another statement
+holds, or one behind an event that is not yet old, waits for a later pass. Earlier releases swept only with Redis, in
 one statement over every published event past the period: an installation
 without Redis kept every event, and one with it deleted a backlog in a single
 transaction that could wait for, and deadlock with, another delete of the

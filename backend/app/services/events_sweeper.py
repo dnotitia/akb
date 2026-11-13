@@ -19,8 +19,9 @@ period ago. Each batch's statement is given the ids of the batch's old events
 and deletes those past retention, all of them without Redis and the ones
 published that long ago with it, and leaves the rest. The pass ends at the
 first event that is not old. Without Redis an expired event behind that one
-waits for it, even when its own transaction began earlier, so it is kept a
-little longer than the period, never less. With Redis, of the ids drawn since
+waits for it, even when its own transaction began earlier, so it is kept
+longer than the period, never less: until the event ahead of it is old too.
+With Redis, of the ids drawn since
 migration 133 set the id sequence's cache to 1, none past retention is behind
 it: an event is published after its id is drawn, those ids are drawn in
 order, and that one occurred inside the period. Ids drawn before migration
@@ -28,8 +29,9 @@ order, and that one occurred inside the period. Ids drawn before migration
 behind it then waits for it too. Either way the statement checks each event's
 own time, so a pass ending early only delays a deletion, never makes one
 early. A backlog is therefore deleted in statements of at most one batch
-each, every one its own transaction, and a pass whose first event is not old
-reads one batch.
+each, every one its own transaction, as far as a pass can reach: an event
+another statement holds, or one behind an event that is not old, waits for a
+later pass. A pass whose first event is not old reads one batch.
 
 Workers that disagree about `redis_url`, as during a change of it, each sweep
 by their own rule: one without it deletes events that occurred more than the
