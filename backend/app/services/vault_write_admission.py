@@ -62,11 +62,17 @@ _admitted: ContextVar[frozenset[uuid.UUID]] = ContextVar(
 
 
 class _Waiter:
-    __slots__ = ("vault_ids", "granted")
+    __slots__ = ("vault_ids", "granted", "since", "timeout")
 
-    def __init__(self, vault_ids: list[uuid.UUID], granted: asyncio.Future) -> None:
+    def __init__(self, vault_ids: list[uuid.UUID], granted: asyncio.Future, timeout: float) -> None:
         self.vault_ids = vault_ids
         self.granted = granted
+        self.since = time.monotonic()
+        self.timeout = timeout
+
+    def aged(self, now: float) -> bool:
+        """Waited more than half its deadline."""
+        return now - self.since >= self.timeout / 2
 
 
 class _State:
@@ -77,6 +83,13 @@ class _State:
     Vault does not delay the writes of another Vault that share a
     transaction with it. Waiters are granted in arrival order among those
     whose Vaults all have a free slot.
+
+    That alone let single-Vault transactions, arriving one after another,
+    take each Vault of a waiting multi-Vault transaction in turn, so that it
+    never found all of them free before its deadline. Ageing bounds it: once
+    a waiter has waited more than half its deadline, a slot freed on one of
+    its Vaults is kept for it rather than given to a later transaction,
+    until it has all its Vaults. Vaults no aged waiter needs keep flowing.
     """
 
     def __init__(self) -> None:
@@ -85,6 +98,14 @@ class _State:
 
     def free(self, vault_ids: list[uuid.UUID], limit: int) -> bool:
         return all(self.admitted.get(v, 0) < limit for v in vault_ids)
+
+    def kept(self, now: float) -> set[uuid.UUID]:
+        """The Vaults whose freed slots are kept for an aged waiter."""
+        return {
+            v for waiter in self.waiters
+            if not waiter.granted.done() and waiter.aged(now)
+            for v in waiter.vault_ids
+        }
 
     def take(self, vault_ids: list[uuid.UUID]) -> None:
         for v in vault_ids:
@@ -97,13 +118,18 @@ class _State:
                 self.admitted[v] = left
             else:
                 del self.admitted[v]
+        now = time.monotonic()
+        kept: set[uuid.UUID] = set()
         for waiter in list(self.waiters):
             if waiter.granted.done():
                 self.waiters.remove(waiter)
-            elif self.free(waiter.vault_ids, limit):
+            elif self.free(waiter.vault_ids, limit) and kept.isdisjoint(waiter.vault_ids):
                 self.take(waiter.vault_ids)
                 waiter.granted.set_result(None)
                 self.waiters.remove(waiter)
+            elif waiter.aged(now):
+                # Later waiters do not take this waiter's Vaults.
+                kept.update(waiter.vault_ids)
 
 
 # asyncio futures belong to their loop, so the state is kept per loop (tests
@@ -150,10 +176,10 @@ async def vault_write_admission(
     limit = max(1, settings.vault_write_concurrency)
     if timeout is None:
         timeout = settings.vault_write_queue_timeout_secs
-    if state.free(wanted, limit):
+    if state.free(wanted, limit) and state.kept(time.monotonic()).isdisjoint(wanted):
         state.take(wanted)
     else:
-        waiter = _Waiter(wanted, asyncio.get_running_loop().create_future())
+        waiter = _Waiter(wanted, asyncio.get_running_loop().create_future(), timeout)
         state.waiters.append(waiter)
         started = time.monotonic()
         try:

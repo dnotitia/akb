@@ -96,14 +96,15 @@ def _manifest(app_key: str = "rollout-order", prefix: str = "") -> tuple[dict, s
 
 async def _installation(
     pool: asyncpg.Pool, *, own_items: bool, vault: str = _VAULT, app_key: str = "rollout-order",
-    prefix: str = "", vault_id: uuid.UUID | None = None,
+    prefix: str = "", vault_id: uuid.UUID | None = None, job_id: uuid.UUID | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     """An installed app owning `orders` and `items`, with a pending upgrade.
 
     Without `own_items` the app loses `items` after the upgrade is requested,
     so the worker's second step fails its ownership check. With `vault_id`
     the app is installed in that existing Vault, named `vault`; `prefix`
-    names its tables apart from another app's there.
+    names its tables apart from another app's there. `job_id` sets the
+    rollout job's id, which orders the worker's claims.
     """
     manifest, checksum, current_fingerprint = _manifest(app_key, prefix)
     async with pool.acquire() as conn:
@@ -158,11 +159,18 @@ async def _installation(
             "VALUES($1,$2,$3,1,NOW(),$4,'1.0.0',$5,1)",
             installation_id, app_id, vault_id, old_id, current_fingerprint,
         )
-    requested = await rollout.request_rollout(
-        app_id, release_id=new_id, manifest_checksum_value=checksum,
-        idempotency_key=str(uuid.uuid4()), requested_by_kind="admin",
-        correlation_id="test", actor="test", actor_id="test",
-    )
+    if job_id is not None:
+        # The job's id comes from the column default: set it for this job.
+        await pool.execute(f"ALTER TABLE app_rollout_jobs ALTER COLUMN id SET DEFAULT '{job_id}'::uuid")
+    try:
+        requested = await rollout.request_rollout(
+            app_id, release_id=new_id, manifest_checksum_value=checksum,
+            idempotency_key=str(uuid.uuid4()), requested_by_kind="admin",
+            correlation_id="test", actor="test", actor_id="test",
+        )
+    finally:
+        if job_id is not None:
+            await pool.execute("ALTER TABLE app_rollout_jobs ALTER COLUMN id SET DEFAULT uuid_generate_v4()")
     if not own_items:
         async with pool.acquire() as conn:
             await conn.execute(

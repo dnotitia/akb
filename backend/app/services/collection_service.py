@@ -289,22 +289,21 @@ def _with_progress(
     stays the generic one, carrying the same details and hint; the original
     is logged here and becomes its cause.
     """
+    details, opening = committed_deletions(
+        vault=vault, deletions=deletions, disclose_paths=disclose_paths,
+    )
     if isinstance(exc, WriteBusyError) and not exc.partially_applied:
-        reported: AKBError | None = WriteBusyError(
+        return WriteBusyError(
             vault, settings.vault_write_queue_timeout_secs, retry_after_secs=exc.retry_after_secs,
-            partially_applied=True,
+            partially_applied=True, progress=details, progress_hint=opening,
         )
-    else:
-        reported = exc if isinstance(exc, AKBError) else transient_error(exc)
+    reported = exc if isinstance(exc, AKBError) else transient_error(exc)
     if reported is None:
         logger.error(
             "recursive delete of %r in vault %s failed after committed deletions",
             prefix, vault, exc_info=exc,
         )
         reported = InternalError()
-    details, opening = committed_deletions(
-        vault=vault, deletions=deletions, disclose_paths=disclose_paths,
-    )
     reported.details = {**(reported.details or {}), **details}
     reported.hint = f"{opening} {reported.hint}" if reported.hint else opening
     if not isinstance(reported, InternalError):

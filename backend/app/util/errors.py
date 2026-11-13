@@ -169,14 +169,9 @@ def err(
 
 
 def _write_busy_envelope(e: "WriteBusyError") -> dict:
-    from app.exceptions import WRITE_BUSY_HINT, WRITE_BUSY_PARTIAL_HINT
-
-    if e.partially_applied:
-        return err(
-            str(e), code=WRITE_BUSY, hint=WRITE_BUSY_PARTIAL_HINT,
-            retry_after_secs=e.retry_after_secs, partially_applied=True,
-        )
-    return err(str(e), code=WRITE_BUSY, hint=WRITE_BUSY_HINT, retry_after_secs=e.retry_after_secs)
+    # The error's own hint and details, as REST gives them: retry_after_secs,
+    # and for a refusal part-way what the operation says about what it did.
+    return err(str(e), code=WRITE_BUSY, hint=e.hint, **(e.details or {}))
 
 
 def exception_envelope(e: Exception) -> dict:

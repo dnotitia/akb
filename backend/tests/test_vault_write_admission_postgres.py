@@ -11,6 +11,7 @@ connection; at most `vault_write_concurrency` transactions of a Vault hold one.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import hashlib
 import time
@@ -39,6 +40,7 @@ from app.services.document_service import DocumentService
 from app.services.git_service import GitService
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
+from app.services.uri_service import doc_uri
 from app.services.vault_write_admission import is_admitted, vault_write_admission
 from tests.test_app_rollout_event_lock_postgres import _installation
 from tests.test_events_commit_order_postgres import (
@@ -449,11 +451,12 @@ async def test_sql_runs_read_only_without_admission_only_when_asked(tmp_path, mo
         assert await pool.fetchval(f"SELECT count(*) FROM {pg_name}") == 0
 
 
-async def test_sql_is_admitted_for_the_tables_its_plan_writes_before_it_runs(tmp_path, monkeypatch):
-    """A statement declared for one Vault whose plan writes another Vault's
-    table is admitted for both before it runs, so it runs once, admitted for
-    the Vault it writes; the check of its queued row changes before commit
-    then finds nothing to add."""
+async def test_sql_whose_plan_writes_an_undeclared_vault_is_refused_before_it_runs(tmp_path, monkeypatch):
+    """An administrator's statement declared for one Vault whose plan writes
+    another Vault's table is refused with an `invalid_argument` naming that
+    Vault, before its admission: it does not run, and is admitted for no
+    Vault. It used to be admitted for both and run. Declared for both, it is
+    admitted for both and runs once."""
     async with _fresh_database() as pool:
         ctx = _Context(pool=pool, tmp_path=tmp_path, monkeypatch=monkeypatch)
         await _make_vault(pool, "plan-declared")
@@ -462,20 +465,38 @@ async def test_sql_is_admitted_for_the_tables_its_plan_writes_before_it_runs(tmp
         admin = await ctx.user("plan-target-admin", admin=True)
         monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(pool))
         writes: list[bool] = []
+        admissions: list[tuple] = []
         run_statement = user_sql_executor._run_statement
+        admission = user_sql_executor.vault_write_admission
 
         async def record(conn, *args, **kwargs):
             if await conn.fetchval("SHOW transaction_read_only") == "off":
                 writes.append(is_admitted(target))
             return await run_statement(conn, *args, **kwargs)
 
+        def recorded_admission(*vault_ids, **kwargs):
+            admissions.append(vault_ids)
+            return admission(*vault_ids, **kwargs)
+
         monkeypatch.setattr(user_sql_executor, "_run_statement", record)
-        result = await table_service.execute_sql(
-            vault_names=["plan-declared"], user_id=str(admin), actor_id="tester",
-            sql=f"INSERT INTO {pg_name} (value) VALUES ('row')", is_admin=True,
-        )
+        monkeypatch.setattr(user_sql_executor, "vault_write_admission", recorded_admission)
+
+        def insert(vaults: list[str]):
+            return table_service.execute_sql(
+                vault_names=vaults, user_id=str(admin), actor_id="tester",
+                sql=f"INSERT INTO {pg_name} (value) VALUES ('row')", is_admin=True,
+            )
+
+        refused = await insert(["plan-declared"])
+        assert (refused["code"], refused["details"]["undeclared_vaults"]) == (INVALID_ARGUMENT, ["plan-target"])
+        assert "was not run" in refused["error"]
+        assert (writes, admissions) == ([], [])
+        assert await pool.fetchval(f"SELECT count(*) FROM {pg_name}") == 0
+
+        result = await insert(["plan-declared", "plan-target"])
         assert result["affected_rows"] == 1
         assert writes == [True]
+        assert len(admissions) == 1 and target in admissions[0]
 
 
 
@@ -653,8 +674,8 @@ async def test_a_statement_writing_an_undeclared_vault_is_rolled_back_not_run_ag
 
 
 async def test_akb_sql_cannot_add_writes_its_plan_and_admission_do_not_see(tmp_path, monkeypatch):
-    """A raw SQL write is admitted for the Vaults its plan writes, and the
-    events of its dynamic-table rows are inserted at commit. akb_sql accepts one
+    """A raw SQL write may write only the Vaults it declares, as its plan
+    shows, and the events of its dynamic-table rows are inserted at commit. akb_sql accepts one
     SELECT, WITH, INSERT, UPDATE or DELETE statement, so a caller cannot create
     a function that writes out of the plan's sight, run a DO block, or have the
     deferred event trigger fire early with SET CONSTRAINTS. No function a SQL
@@ -784,11 +805,39 @@ async def test_a_deferred_rollout_target_does_not_idle_the_worker(monkeypatch):
         assert await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", busy_job) != "applied"
 
 
+def _job(number: int) -> uuid.UUID:
+    """A rollout job id that sorts by ``number``: claims go in job order."""
+    return uuid.UUID(int=number)
+
+
+async def _run_rollouts_until_applied(pool, job_id: uuid.UUID, busy: list[uuid.UUID], timeout: float) -> float:
+    """Run the rollout worker's own runner, with ``busy`` Vaults' admission
+    full, until ``job_id`` is applied; return how long it took."""
+    from app.services import _backfill
+
+    runner = _backfill.BackfillRunner("rollout-under-test", rollout_worker._process_once, idle_secs=10)
+
+    async def applied() -> None:
+        while await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", job_id) != "applied":
+            await asyncio.sleep(0.05)
+
+    async with contextlib.AsyncExitStack() as stack:
+        for vault_id in busy:
+            await stack.enter_async_context(_vault_full(vault_id))
+        started = time.monotonic()
+        runner.start()
+        try:
+            await asyncio.wait_for(applied(), timeout=timeout)
+            return time.monotonic() - started
+        finally:
+            assert await runner.stop(timeout=15)
+
+
 async def test_a_vault_with_several_busy_rollout_targets_does_not_hold_back_another_vault(monkeypatch):
     """Vault `runner-busy` has two apps to roll out, and its admission stays
-    full; another Vault has one, claimed after both. With the default
-    deadlines the worker used to wait 10 seconds for the first busy target,
-    defer it for 5, claim the second, wait 10 more, and find the first
+    full; another Vault has one, whose job is claimed after both. With the
+    default deadlines the worker used to wait 10 seconds for the first busy
+    target, defer it for 5, claim the second, wait 10 more, and find the first
     claimable again, so the other Vault's rollout waited as long as the busy
     Vault stayed busy. Now the worker waits `app_rollout_admission_wait_secs`
     (1 second) and defers every pending target of the busy Vault at once, and
@@ -799,49 +848,59 @@ async def test_a_vault_with_several_busy_rollout_targets_does_not_hold_back_anot
     monkeypatch.setattr(_backfill, "_RUNNERS", [])
     async with _fresh_database() as pool:
         busy, first_job, _items = await _installation(
-            pool, own_items=True, vault="runner-busy", app_key="runner-a1", prefix="a1_",
+            pool, own_items=True, vault="runner-busy", app_key="runner-a1", prefix="a1_", job_id=_job(1),
         )
         _, second_job, _items = await _installation(
             pool, own_items=True, vault="runner-busy", app_key="runner-a2", prefix="a2_", vault_id=busy,
+            job_id=_job(2),
         )
-        # The other Vault's rollout is claimed after both busy ones: job ids
-        # are random, so install until one sorts after them.
-        other_job = None
-        for attempt in range(40):
-            _, job, _items = await _installation(
-                pool, own_items=True, vault=f"runner-quiet-{attempt}", app_key=f"runner-b{attempt}",
-            )
-            if job > max(first_job, second_job):
-                other_job = job
-                break
-        assert other_job is not None
-        runner = _backfill.BackfillRunner("rollout-under-test", rollout_worker._process_once, idle_secs=10)
-
-        async def other_applied() -> None:
-            while await pool.fetchval(
-                "SELECT status FROM app_rollout_jobs WHERE id = $1", other_job,
-            ) != "applied":
-                await asyncio.sleep(0.05)
-
-        async with _vault_full(busy):
-            started = time.monotonic()
-            runner.start()
-            try:
-                await asyncio.wait_for(other_applied(), timeout=6)
-                took = time.monotonic() - started
-                deferred = await pool.fetch(
-                    "SELECT state, lease_expires_at > NOW() AS later FROM app_rollout_targets "
-                    "WHERE vault_id = $1",
-                    busy,
-                )
-            finally:
-                assert await runner.stop(timeout=15)
+        _, other_job, _items = await _installation(
+            pool, own_items=True, vault="runner-quiet", app_key="runner-b", job_id=_job(3),
+        )
+        took = await _run_rollouts_until_applied(pool, other_job, [busy], timeout=6)
+        deferred = await pool.fetch(
+            "SELECT state, lease_expires_at > NOW() AS later FROM app_rollout_targets WHERE vault_id = $1",
+            busy,
+        )
         print(f"\nother Vault's rollout applied after {took:.2f}s")
         assert took < 4, took
         assert [dict(r) for r in deferred] == [{"state": "pending", "later": True}] * 2
         assert await pool.fetchval(
             "SELECT count(*) FROM app_rollout_jobs WHERE id = ANY($1::uuid[]) AND status = 'applied'",
             [first_job, second_job],
+        ) == 0
+
+
+async def test_six_busy_vaults_rollouts_do_not_hold_back_a_quiet_vaults(monkeypatch):
+    """Six Vaults whose admission stays full each have a rollout, claimed
+    before a quiet Vault's. With the default times (1 second to wait for a
+    Vault, 5 seconds of deferral, a 10-second idle interval), the first busy
+    target's deferral used to end as the sixth was refused, and it came first
+    again by job order, so the six took turns and the quiet Vault's rollout
+    was never claimed. Targets never deferred are now claimed before deferred
+    ones, which go in the order their deferrals ended, and the quiet Vault's
+    rollout is applied after one turn of the six."""
+    from app.services import _backfill
+
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(_backfill, "_RUNNERS", [])
+    async with _fresh_database() as pool:
+        busy = []
+        for number in range(1, 7):
+            vault_id, _job_id, _items = await _installation(
+                pool, own_items=True, vault=f"six-busy-{number}", app_key=f"six-busy-{number}",
+                job_id=_job(number),
+            )
+            busy.append(vault_id)
+        _, quiet_job, _items = await _installation(
+            pool, own_items=True, vault="six-quiet", app_key="six-quiet", job_id=_job(7),
+        )
+        took = await _run_rollouts_until_applied(pool, quiet_job, busy, timeout=15)
+        print(f"\nquiet Vault's rollout applied after {took:.2f}s")
+        assert took < 10, took
+        assert await pool.fetchval(
+            "SELECT count(*) FROM app_rollout_targets WHERE vault_id = ANY($1::uuid[]) AND state = 'applied'",
+            busy,
         ) == 0
 
 
@@ -1052,9 +1111,10 @@ async def test_a_recursive_delete_refused_part_way_says_it_partly_completed(monk
     """A Native recursive delete commits each document on its own. When the
     Vault's admission refuses the second document after the first was
     deleted, the delete fails with a write_busy that says the operation partly
-    completed and that sending it again continues it, over MCP and REST; the
-    same delete sent again completes it. A refusal before anything was
-    deleted keeps the plain write_busy."""
+    completed, with how many documents it deleted and, to a caller who may
+    read the Vault, which, and that sending it again continues it, over MCP
+    and REST; the same delete sent again completes it. A refusal before
+    anything was deleted keeps the plain write_busy."""
     from app.services import collection_service as collection_service_module
     from app.util.errors import WRITE_BUSY, exception_envelope
     from tests.test_collection_delete_native_atomic_postgres import _native_vault
@@ -1079,9 +1139,9 @@ async def test_a_recursive_delete_refused_part_way_says_it_partly_completed(monk
                 await asyncio.sleep(0)
             return deleted
 
-        def delete():
+        def delete(reader: bool = True):
             return CollectionService(git=object()).delete(
-                vault=vault, path="notes", recursive=True, agent_id="tester",
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=reader,
             )
 
         monkeypatch.setattr(collection_service_module, "_delete_native_document", busy_after_the_first)
@@ -1093,7 +1153,10 @@ async def test_a_recursive_delete_refused_part_way_says_it_partly_completed(monk
             await asyncio.gather(*holders, return_exceptions=True)
         assert partial.value.partially_applied
         envelope = exception_envelope(partial.value)
-        assert (envelope["code"], envelope["details"]["partially_applied"]) == (WRITE_BUSY, True)
+        assert (envelope["code"], envelope["details"]) == (WRITE_BUSY, {
+            "retry_after_secs": 1, "partially_applied": True, "deleted_docs": 1,
+            "deleted_uris": [doc_uri(vault, "notes/a.md")],
+        })
         assert "Part of the operation may have completed" in envelope["hint"]
         assert partial.value.hint == envelope["hint"]
         assert await pool.fetchval(
@@ -1259,3 +1322,44 @@ async def test_an_admin_override_recorded_before_a_refused_write_stays(monkeypat
         ]
         assert kinds == ["vault.write_policy_admin_bypass"]
         assert await pool.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", vault_id) == 0
+
+
+async def test_a_recursive_delete_refused_part_way_tells_a_write_only_caller_counts(monkeypatch):
+    """The same refusal, for a caller who may write the Vault but not read
+    it: it says how many documents the delete deleted, not which."""
+    from app.services import collection_service as collection_service_module
+    from app.util.errors import exception_envelope
+    from tests.test_collection_delete_native_atomic_postgres import _native_vault
+
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.3, raising=False)
+    async with _fresh_database() as pool:
+        vault = "partial-delete-write-only"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        delete_document = collection_service_module._delete_native_document
+        holders: list[asyncio.Task] = []
+        release = asyncio.Event()
+
+        async def hold() -> None:
+            async with vault_write_admission(vault_id):
+                await release.wait()
+
+        async def busy_after_the_first(*args, **kwargs):
+            deleted = await delete_document(*args, **kwargs)
+            if not holders:
+                holders.append(asyncio.create_task(hold()))
+                await asyncio.sleep(0)
+            return deleted
+
+        monkeypatch.setattr(collection_service_module, "_delete_native_document", busy_after_the_first)
+        try:
+            with pytest.raises(WriteBusyError) as partial:
+                await CollectionService(git=object()).delete(
+                    vault=vault, path="notes", recursive=True, agent_id="tester",
+                )
+        finally:
+            release.set()
+            await asyncio.gather(*holders, return_exceptions=True)
+        envelope = exception_envelope(partial.value)
+        assert envelope["details"] == {"retry_after_secs": 1, "partially_applied": True, "deleted_docs": 1}
+        assert "notes/a.md" not in envelope["hint"]

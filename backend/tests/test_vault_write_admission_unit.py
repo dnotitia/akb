@@ -185,3 +185,48 @@ async def test_an_event_written_without_admission_is_logged_once(caplog, monkeyp
             admission.note_event_write(vault, "table.create")
     messages = [r.getMessage() for r in caplog.records]
     assert len(messages) == 1 and "document.put" in messages[0], messages
+
+
+async def test_a_transaction_of_two_vaults_is_not_starved_by_single_vault_ones(monkeypatch):
+    """Transactions of Vault A alone and of Vault B alone keep arriving, one
+    slot each. A transaction of both waits: without ageing, each freed slot
+    went to the next single-Vault transaction, and it never found both free
+    before its deadline. Once it has waited half its deadline, the slots
+    freed on A and B are kept for it, and it is admitted in time; Vault C
+    keeps flowing meanwhile."""
+    import time
+
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.6)
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    stop = asyncio.Event()
+    others: list[float] = []
+
+    async def stream(vault) -> None:
+        while not stop.is_set():
+            try:
+                async with admission.vault_write_admission(vault):
+                    await asyncio.sleep(0.05)
+            except WriteBusyError:
+                pass
+            await asyncio.sleep(0)
+
+    async def unrelated() -> None:
+        while not stop.is_set():
+            started = time.monotonic()
+            async with admission.vault_write_admission(c):
+                others.append(time.monotonic() - started)
+                await asyncio.sleep(0.02)
+
+    traffic = [asyncio.create_task(stream(v)) for v in (a, b) for _ in range(2)]
+    traffic.append(asyncio.create_task(unrelated()))
+    await asyncio.sleep(0.1)
+    started = time.monotonic()
+    try:
+        async with admission.vault_write_admission(a, b):
+            waited = time.monotonic() - started
+    finally:
+        stop.set()
+        await asyncio.gather(*traffic, return_exceptions=True)
+    assert waited < 0.6, waited
+    assert others and max(others) < 0.3, others

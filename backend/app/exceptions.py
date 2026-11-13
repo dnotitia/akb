@@ -488,26 +488,32 @@ class WriteBusyError(AKBError):
     ``partially_applied`` marks an operation that commits in several
     transactions, such as a recursive collection delete on the Native
     authority, and was refused after some of them committed: the same request
-    sent again continues it.
+    sent again continues it. ``progress`` adds what the operation says about
+    the part that committed to the details, and ``progress_hint`` opens the
+    hint with it.
     """
 
     def __init__(
         self, vault: str, waited_secs: float, retry_after_secs: int = 5,
-        *, partially_applied: bool = False,
+        *, partially_applied: bool = False, progress: dict | None = None,
+        progress_hint: str | None = None,
     ):
         self.retry_after_secs = retry_after_secs
         self.partially_applied = partially_applied
         message = f"Write queue for vault '{vault}' is saturated (gave up after {waited_secs:.0f}s); retry shortly"
         details: dict = {"retry_after_secs": retry_after_secs}
+        hint = WRITE_BUSY_HINT
         if partially_applied:
             message += "; part of the operation has completed, and sending it again continues it"
+            details.update(progress or {})
             details["partially_applied"] = True
+            hint = f"{progress_hint} {WRITE_BUSY_PARTIAL_HINT}" if progress_hint else WRITE_BUSY_PARTIAL_HINT
         super().__init__(
             message,
             status_code=429,
             # app.util.errors.WRITE_BUSY; that module imports this one.
             code="write_busy",
-            hint=WRITE_BUSY_PARTIAL_HINT if partially_applied else WRITE_BUSY_HINT,
+            hint=hint,
             details=details,
         )
 

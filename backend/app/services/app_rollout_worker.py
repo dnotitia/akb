@@ -44,6 +44,12 @@ def _safe_identifier(value: str) -> str:
 async def _claim_target(conn: Any) -> dict[str, Any] | None:
     # A later batch is eligible only after all targets in the preceding batch
     # are applied/replayed.  This keeps the canary and 10-wide order durable.
+    #
+    # Among the eligible targets, those never deferred come first, in job,
+    # batch and ordinal order, then the deferred ones in the order their
+    # deferrals ended. A busy Vault's targets, deferred and claimable again,
+    # used to come first again by job order, so several busy Vaults kept the
+    # worker cycling through them while another Vault's rollout waited.
     row = await conn.fetchrow(
         """
         WITH eligible AS (
@@ -65,7 +71,7 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
                       AND same_batch.batch_no=t.batch_no
                       AND same_batch.state='running'
                )
-             ORDER BY t.job_id, t.batch_no, t.ordinal
+             ORDER BY t.lease_expires_at NULLS FIRST, t.job_id, t.batch_no, t.ordinal
              FOR UPDATE SKIP LOCKED
              LIMIT 1
         )

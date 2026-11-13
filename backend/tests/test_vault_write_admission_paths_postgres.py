@@ -314,8 +314,8 @@ async def _table(ctx: _Context, operation: str) -> _Case:
 
 
 async def _sql_elsewhere(ctx: _Context, operation: str) -> _Case:
-    """SQL declared for one Vault whose plan writes another Vault's table:
-    the write waits for the Vault it writes."""
+    """SQL declaring two Vaults whose plan writes the second one's table: the
+    write waits for every Vault it declares, the one it writes included."""
     declared = "admit-sql-declared"
     target = f"admit-sql-{operation}"
     await _make_vault(ctx.pool, declared)
@@ -325,7 +325,7 @@ async def _sql_elsewhere(ctx: _Context, operation: str) -> _Case:
     ctx.monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(ctx.pool))
     sql = f"INSERT INTO {pg_name} (value) VALUES ('row')"
     return _Case(target_id, lambda: table_service.execute_sql(
-        vault_names=[declared], user_id=str(admin), actor_id="tester", sql=sql, is_admin=True,
+        vault_names=[declared, target], user_id=str(admin), actor_id="tester", sql=sql, is_admin=True,
     ))
 
 

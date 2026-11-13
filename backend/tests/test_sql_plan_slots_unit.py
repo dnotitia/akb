@@ -167,3 +167,52 @@ async def test_a_cancelled_plan_wait_leaves_the_queue_at_once(monkeypatch):
     async with asyncio.timeout(1.0):
         async with user_sql_executor._plan_slot(["quiet"]):
             assert _slots().running == 1
+
+
+async def _single_vault_traffic(enter, vaults: list[str], stop: asyncio.Event) -> list[asyncio.Task]:
+    """Requests for one Vault each, two at a time per Vault, one after
+    another, each holding its Vault for 50 ms: a later request of a Vault is
+    always waiting."""
+
+    async def stream(vault) -> None:
+        while not stop.is_set():
+            try:
+                async with enter([vault]):
+                    await asyncio.sleep(0.05)
+            except WriteBusyError:
+                pass
+            await asyncio.sleep(0)
+
+    return [asyncio.create_task(stream(vault)) for vault in vaults for _ in range(2)]
+
+
+async def test_a_plan_of_two_vaults_is_not_starved_by_single_vault_plans(monkeypatch):
+    """Single-Vault plans of `a` and of `b` keep arriving. A statement
+    declaring both waits: without ageing, each freed token went to the next
+    single-Vault plan, and it never found both free before its deadline. Once
+    it has waited half its deadline, the tokens freed for `a` and `b` are kept
+    for it, and it is read in time; `c` keeps flowing meanwhile."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 3)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.6)
+    stop = asyncio.Event()
+    traffic = await _single_vault_traffic(user_sql_executor._plan_slot, ["a", "b"], stop)
+    others: list[float] = []
+
+    async def unrelated() -> None:
+        while not stop.is_set():
+            started = time.monotonic()
+            async with user_sql_executor._plan_slot(["c"]):
+                others.append(time.monotonic() - started)
+                await asyncio.sleep(0.02)
+
+    traffic.append(asyncio.create_task(unrelated()))
+    await asyncio.sleep(0.1)
+    started = time.monotonic()
+    try:
+        async with user_sql_executor._plan_slot(["a", "b"]):
+            waited = time.monotonic() - started
+    finally:
+        stop.set()
+        await asyncio.gather(*traffic, return_exceptions=True)
+    assert waited < 0.6, waited
+    assert others and max(others) < 0.3, others

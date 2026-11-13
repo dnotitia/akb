@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator
@@ -312,14 +313,17 @@ class UserSqlExecutor:
         With `read_only` the statement runs in a READ ONLY transaction, which
         PostgreSQL enforces, without the Vault write admission. Otherwise it is
         a write and runs exactly once: it is admitted, before it takes the
-        connection it runs on, for the declared Vaults and for the Vaults whose
-        dynamic tables its plan modifies, read with ``EXPLAIN`` without running
-        it. `vault_names` declares the Vaults of raw SQL. `vault_ids` is for a
-        statement the server compiled for one table, whose caller names the
-        Vaults it writes; its plan is not read. Before it commits, the
-        transaction checks the row changes it queued for `table.rows_changed`
-        events; a change of a Vault it was not admitted for rolls it back with
-        `UndeclaredVaultWriteError`.
+        connection it runs on, for the declared Vaults. `vault_names` declares
+        the Vaults of raw SQL, and its plan, read with ``EXPLAIN`` without
+        running it, must modify dynamic tables of declared Vaults only: one
+        that modifies another Vault's is refused with
+        `UndeclaredVaultWriteError` before its admission, administrators'
+        statements included, and does not run. `vault_ids` is for a statement
+        the server compiled for one table, whose caller names the Vaults it
+        writes; its plan is not read. Before it commits, the transaction checks
+        the row changes it queued for `table.rows_changed` events; a change of
+        a Vault it was not admitted for, as a function the plan does not show
+        can make, rolls it back with `UndeclaredVaultWriteError`.
         """
         should_fetch = (
             sql.strip().upper().startswith(("SELECT", "WITH"))
@@ -336,7 +340,10 @@ class UserSqlExecutor:
             admitted = await self._declared(statement, vault_ids)
             if vault_ids is None:
                 # A compiled statement's caller names the Vaults it writes.
-                admitted |= await self._planned(statement)
+                # Raw SQL may write only the Vaults it declares.
+                undeclared = await self._planned(statement) - admitted
+                if undeclared:
+                    raise UndeclaredVaultWriteError(await self._vault_names(undeclared), ran=False)
             async with vault_write_admission(*admitted):
                 return await self._run(statement, read_only=False, admitted=admitted)
         except asyncpg.exceptions.ReadOnlySQLTransactionError as e:
@@ -375,7 +382,8 @@ class UserSqlExecutor:
             raise
 
     async def _planned(self, statement: _Statement) -> frozenset[uuid.UUID]:
-        """The Vaults whose dynamic tables the statement's plan modifies.
+        """The Vaults whose dynamic tables the statement's plan modifies,
+        which ``execute`` requires to be declared.
 
         ``EXPLAIN`` plans the statement without running it, under the
         statement's role, in a read-only transaction on a pool connection
@@ -493,6 +501,15 @@ class UserSqlExecutor:
             return frozenset(vault_ids)
         return frozenset(await self._vault_ids(statement.vault_names))
 
+    async def _vault_names(self, vault_ids: frozenset[uuid.UUID]) -> list[str]:
+        """The names of the given Vaults, ids where a Vault has none any more."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, name FROM vaults WHERE id = ANY($1::uuid[]) ORDER BY name", list(vault_ids),
+            )
+        named = {row["id"] for row in rows}
+        return [row["name"] for row in rows] + sorted(str(v) for v in vault_ids - named)
+
     async def _vault_ids(self, vault_names: list[str]) -> list[uuid.UUID]:
         """The ids of the named Vaults, read before the statement's transaction."""
         if not vault_names:
@@ -515,25 +532,34 @@ class _Statement:
 
 
 class UndeclaredVaultWriteError(Exception):
-    """The statement changed dynamic-table rows of Vaults it was not admitted
-    for: Vaults the request did not declare and its plan did not name, as a
-    function the statement calls can. Its transaction was rolled back."""
+    """The statement writes dynamic-table rows of Vaults the request did not
+    declare. Either its plan shows it, and it was refused before it ran
+    (``ran`` False), or a function the statement calls did, out of the plan's
+    sight, and its transaction was rolled back."""
 
-    def __init__(self, vaults: list[str]) -> None:
+    def __init__(self, vaults: list[str], *, ran: bool = True) -> None:
         names = ", ".join(vaults)
+        outcome = "nothing was committed" if ran else "it was not run"
+        verb = "changed rows of" if ran else "writes"
         super().__init__(
-            f"The statement changed rows of Vault(s) {names}, which the request did not declare; "
-            "nothing was committed. Declare every Vault it writes in vaults and send it again.",
+            f"The statement {verb} Vault(s) {names}, which the request did not declare; "
+            f"{outcome}. Declare every Vault it writes in vaults and send it again.",
         )
         self.vaults = vaults
 
 
 class _PlanWaiter:
-    __slots__ = ("vaults", "granted")
+    __slots__ = ("vaults", "granted", "since", "timeout")
 
-    def __init__(self, vaults: frozenset[str], granted: asyncio.Future) -> None:
+    def __init__(self, vaults: frozenset[str], granted: asyncio.Future, timeout: float) -> None:
         self.vaults = vaults
         self.granted = granted
+        self.since = time.monotonic()
+        self.timeout = timeout
+
+    def aged(self, now: float) -> bool:
+        """Waited more than half its deadline."""
+        return now - self.since >= self.timeout / 2
 
 
 class _PlanSlots:
@@ -546,7 +572,10 @@ class _PlanSlots:
     among those whose Vaults are all free. Plans of a Vault whose table is
     locked therefore wait one behind another, whatever other Vaults they
     declare with it, and a statement of another Vault takes the next free
-    slot.
+    slot. As in the Vault write admission, a waiter that has waited more
+    than half its deadline keeps the tokens freed for its Vaults from later
+    statements until it has all of them, so single-Vault statements taking
+    its Vaults in turn cannot keep it waiting past its deadline.
     """
 
     def __init__(self) -> None:
@@ -557,6 +586,10 @@ class _PlanSlots:
     def free(self, vaults: frozenset[str], limit: int) -> bool:
         return self.running < limit and self.busy.isdisjoint(vaults)
 
+    def kept(self, now: float) -> set[str]:
+        """The Vaults whose freed tokens are kept for an aged waiter."""
+        return {vault for waiter in self.waiters if waiter.aged(now) for vault in waiter.vaults}
+
     def take(self, vaults: frozenset[str]) -> None:
         self.running += 1
         self.busy |= vaults
@@ -564,13 +597,18 @@ class _PlanSlots:
     def give_back(self, vaults: frozenset[str], limit: int) -> None:
         self.running -= 1
         self.busy -= vaults
+        now = time.monotonic()
+        kept: set[str] = set()
         for waiter in list(self.waiters):
             if self.running >= limit:
                 break
-            if self.free(waiter.vaults, limit):
+            if self.free(waiter.vaults, limit) and kept.isdisjoint(waiter.vaults):
                 self.take(waiter.vaults)
                 waiter.granted.set_result(None)
                 self.waiters.remove(waiter)
+            elif waiter.aged(now):
+                # Later waiters do not take this waiter's Vaults.
+                kept |= waiter.vaults
 
 
 # Plan readers per event loop (tests run each in a loop of its own).
@@ -593,11 +631,12 @@ async def _plan_slot(vaults: list[str]) -> AsyncIterator[None]:
     timeout = settings.vault_write_queue_timeout_secs
     wanted = frozenset(vaults)
     # Every release grants the waiters that became free, so none of them is
-    # free now: a statement that finds a slot and its Vaults free goes first.
-    if slots.free(wanted, limit):
+    # free now: a statement that finds a slot and its Vaults free, and kept
+    # for no aged waiter, goes first.
+    if slots.free(wanted, limit) and slots.kept(time.monotonic()).isdisjoint(wanted):
         slots.take(wanted)
     else:
-        waiter = _PlanWaiter(wanted, loop.create_future())
+        waiter = _PlanWaiter(wanted, loop.create_future(), timeout)
         slots.waiters.append(waiter)
         try:
             async with asyncio.timeout(timeout):
