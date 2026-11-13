@@ -25,6 +25,9 @@ db_user: akb
 # once per process, each waiting this long for a table lock before write_busy.
 # akb_sql_plan_concurrency: 2
 # akb_sql_plan_lock_timeout_ms: 500
+# The app rollout worker waits this long for a target's Vault; a busy Vault's
+# pending targets are then deferred and other Vaults' targets go first.
+# app_rollout_admission_wait_secs: 1.0
 
 # Runtime safety budgets. Each Kiwi child holds its own model in memory, so do
 # not derive this from host CPU count. Kubernetes grants 45 seconds for pod
