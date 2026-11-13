@@ -64,12 +64,20 @@ def _fixture(monkeypatch, *, native: bool, legacy: bool = False):
     legacy_delete = AsyncMock(return_value=True)
     monkeypatch.setattr(collection_service.DocumentRepository, "delete_with_publications", legacy_delete)
     monkeypatch.setattr("app.services.notification_producer.enqueue_document_change", AsyncMock())
+    # The collection's events are collected and inserted through events_repo.
+    monkeypatch.setattr("app.repositories.events_repo.emit_event", AsyncMock())
     native_delete = AsyncMock()
+    locked_rows = [{
+        "resource_id": resource_id, "namespace_id": vault_id, "surface": "document",
+        "lifecycle": "live", "current_path": "c/native.md", "head_revision_id": revision_id,
+    }]
+    repository = SimpleNamespace(
+        lock_resources=AsyncMock(return_value=locked_rows), lock_paths=AsyncMock(),
+    )
     native_svc = SimpleNamespace(
-        _current=AsyncMock(return_value=(vault_id, SimpleNamespace(
-            path="c/native.md", resource_id=resource_id, revision_id=revision_id,
-        ))),
-        _native=AsyncMock(return_value=SimpleNamespace(delete_resource=native_delete)),
+        _native=AsyncMock(return_value=SimpleNamespace(
+            delete_resource=native_delete, repository=repository,
+        )),
     )
     monkeypatch.setattr("app.services.native_document_service.NativeDocumentService", lambda: native_svc)
 

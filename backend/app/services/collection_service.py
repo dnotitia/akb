@@ -23,7 +23,7 @@ from app.repositories.document_repo import (
     DocumentRepository,
     lock_collection_rows,
 )
-from app.repositories.events_repo import emit_event
+from app.repositories.events_repo import EventBuffer, emit_event
 from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
 from app.services.git_service import GitService
 from app.services.index_service import (
@@ -106,6 +106,68 @@ def _normalize_path(path: str) -> str:
 
 class _CollectionsChanged(Exception):
     """A collection appeared under the prefix between reading and locking it."""
+
+
+async def _delete_native_documents(
+    conn,
+    *,
+    vault: str,
+    vault_id: uuid.UUID,
+    prefix: str,
+    resource_ids: list[uuid.UUID],
+    actor: str,
+    events: EventBuffer,
+) -> int:
+    """Delete the live Native documents among ``resource_ids`` that are still
+    under ``prefix``, in ``conn``'s transaction, and return how many.
+
+    Every Resource row is locked first, in id order, and then all of their
+    paths, before any of them is deleted: a Native write locks its row before
+    its paths, so this never waits for a row while it holds a path that write
+    needs. Each delete is the one the native document service performs
+    (revision chain + lifecycle), minus the body-asset retention that belongs
+    to a single-document delete; its event goes to ``events``.
+    """
+    from app.services.native_document_service import NativeDocumentService
+
+    native = await NativeDocumentService()._native()
+    bare = prefix.rstrip("/")
+    locked = await native.repository.lock_resources(conn, resource_ids)
+    # A document that was deleted, or moved out of the prefix, while this
+    # waited for its row is left as it is now.
+    live = [
+        row for row in locked
+        if row["namespace_id"] == vault_id
+        and row["surface"] == "document"
+        and row["lifecycle"] == "live"
+        and (row["current_path"] == bare or row["current_path"].startswith(bare + "/"))
+    ]
+    await native.repository.lock_paths(
+        conn, vault_id, "document", *(row["current_path"] for row in live),
+    )
+    for row in live:
+        await native.delete_resource(
+            namespace_id=vault_id,
+            surface="document",
+            path=row["current_path"],
+            actor=actor,
+            mutation_id=uuid.uuid4(),
+            expected_revision_id=row["head_revision_id"],
+            expected_resource_id=row["resource_id"],
+            retain_document_assets=False,
+            message=f"[delete-collection] {prefix}\n\nagent: {actor}\naction: delete-collection",
+            subject=f"[delete-collection] {prefix}",
+            conn=conn,
+            events=events,
+        )
+        await delete_document_chunks(conn, str(row["resource_id"]))
+        # Keyed on the resource, and on the path read under its row lock — not
+        # on the unlocked listing, so a document moved since the listing does
+        # not take whichever resource now owns that path down with it.
+        await delete_native_document_edges(
+            conn, vault_id, vault, row["resource_id"], row["current_path"],
+        )
+    return len(live)
 
 
 class CollectionService:
@@ -414,52 +476,32 @@ class CollectionService:
                 # UNIQUE(vault_id, path), the next document created (or moved)
                 # onto that path would be reached through the old public
                 # link.
-                for d in docs:
-                    # Native-authority rows carry a resource_id, not a legacy
-                    # documents id (#543). They are deleted through the native
-                    # revision service (lifecycle + revision chain), not the
-                    # legacy repository — which would find no row and report
-                    # the delete as a no-op while the live document survives.
-                    if native_authority and "resource_id" in d:
-                        # Same delete the native document service performs
-                        # (revision chain + lifecycle), minus the body-asset
-                        # retention that belongs to single-document delete:
-                        # collection delete removes the whole prefix.
-                        from app.services.native_document_service import (
-                            NativeDocumentService,
-                        )
-
-                        native_svc = NativeDocumentService()
-                        vault_id_resolved, current = await native_svc._current(
-                            vault, str(d["resource_id"]),
-                        )
-                        native = await native_svc._native()
-                        await native.delete_resource(
-                            namespace_id=vault_id_resolved,
-                            surface="document",
-                            path=current.path,
-                            actor=agent_id or "unknown",
-                            mutation_id=uuid.uuid4(),
-                            expected_revision_id=current.revision_id,
-                            expected_resource_id=current.resource_id,
-                            retain_document_assets=False,
-                            message=f"[delete-collection] {norm}\n\nagent: {agent_id or 'unknown'}\naction: delete-collection",
-                            subject=f"[delete-collection] {norm}",
-                        )
-                        await delete_document_chunks(conn, str(d["resource_id"]))
-                        # Keyed on the resource, and on the path the native
-                        # service just resolved under its own lock — NOT on
-                        # `d["path"]`, which came from the unlocked
-                        # `list_docs_under` snapshot. The publication cleanup a
-                        # few lines below already refuses that snapshot for the
-                        # same reason; the edge cleanup did not, so a document
-                        # moved since the snapshot took whichever resource now
-                        # owns that path down with it (same shape as akb#654).
-                        await delete_native_document_edges(
-                            conn, vault_id_resolved, vault,
-                            current.resource_id, current.path,
-                        )
-                        continue
+                #
+                # Events are collected and inserted as the transaction's last
+                # statements: inserting one takes the Vault's event lock, and
+                # this transaction still has rows to lock and delete.
+                events = EventBuffer()
+                # Native-authority rows carry a resource_id, not a legacy
+                # documents id (#543). They are deleted through the native
+                # revision service (lifecycle + revision chain), not the
+                # legacy repository — which would find no row and report the
+                # delete as a no-op while the live document survives. They are
+                # deleted in this transaction, so the documents and the
+                # collections go together or not at all.
+                native_docs = [d for d in docs if native_authority and "resource_id" in d]
+                legacy_docs = [d for d in docs if not (native_authority and "resource_id" in d)]
+                native_deleted = 0
+                if native_docs:
+                    native_deleted = await _delete_native_documents(
+                        conn,
+                        vault=vault,
+                        vault_id=vault_id,
+                        prefix=norm,
+                        resource_ids=[d["resource_id"] for d in native_docs],
+                        actor=agent_id or "unknown",
+                        events=events,
+                    )
+                for d in legacy_docs:
                     await delete_document_chunks(conn, str(d["id"]))
                     await delete_document_relations(conn, vault, d["path"])
                     # The URI for the publication cleanup is derived from
@@ -571,8 +613,10 @@ class CollectionService:
                         ids_to_delete,
                     )
 
-                await emit_event(
-                    conn,
+                # A Native document that was deleted or moved away while
+                # this delete waited for it is not counted.
+                docs_count = len(legacy_docs) + native_deleted
+                events.add(
                     "collection.delete",
                     vault_id=vault_id,
                     resource_uri=None,
@@ -580,13 +624,13 @@ class CollectionService:
                     payload={
                         "vault": vault,
                         "path": norm,
-                        "deleted_docs": len(docs),
+                        "deleted_docs": docs_count,
                         "deleted_files": len(files),
                         "deleted_sub_collections": len(sub_rows),
                         "deleted_tables": len(tables),
                     },
                 )
-                docs_count = len(docs)
+                await events.flush(conn)
                 files_count = len(files)
                 sub_count = len(sub_rows)
                 tables_count = len(tables)
