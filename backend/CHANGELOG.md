@@ -33,7 +33,10 @@ specifically; the proxy has its own log in
 
   A refused write's REST body now carries the `write_busy` code, with
   `retry_after_secs` (and `partially_applied` when it applies) in its
-  details and a hint; it used to carry `internal`.
+  details and a hint; it used to carry `internal`. Its legacy `detail` field
+  is therefore an object (`message`, `code`, `hint`, `details`), as for
+  other coded errors, where a plain refusal used to give the message as a
+  string; the top-level `message` and `error` are unchanged.
 
   Compiled table reads (`GET /api/v1/tables/{vault}/{table}/rows` and its
   `query` form) run in a read-only transaction and are not admitted, and
@@ -44,9 +47,10 @@ specifically; the proxy has its own log in
   Vaults it declares and for those whose tables its plan (`EXPLAIN`) changes.
   An MCP `akb_sql` call whose credential has read but not write scope always
   runs read-only. Reading the plan is limited by `akb_sql_plan_concurrency`
-  (default 2), with statements of different Vaults taking turns for a slot,
-  and by `akb_sql_plan_lock_timeout_ms` (default 500), past which the write
-  fails with `write_busy`. A write that changes rows of an undeclared Vault
+  (default 2) and to one plan per declared Vault, every declared Vault's
+  token taken at once, so plans waiting for one Vault's locked table do not
+  hold back another Vault; and by `akb_sql_plan_lock_timeout_ms` (default
+  500), past which the write fails with `write_busy`. A write that changes rows of an undeclared Vault
   through a function is rolled back with an `invalid_argument` error naming
   it. An unscoped system administrator's raw SQL runs under the backend's
   role and is admitted only for those Vaults, not for another Vault whose
@@ -58,9 +62,11 @@ specifically; the proxy has its own log in
   failed creation wait for their slot without the lane's deadline, so a busy
   lane no longer leaves a half-created Vault. A write whose Vault was replaced
   under its name starts again for the new Vault, or fails with a conflict when
-  it was replaced twice. An app rollout target refused by admission is
-  deferred for 5 seconds, and the worker claims the next eligible target at
-  once instead of sleeping, so other rollouts proceed.
+  it was replaced twice. An app rollout waits at most
+  `app_rollout_admission_wait_secs` (default 1 second) for a target's Vault;
+  a refusal defers every pending target of that Vault for 5 seconds, and the
+  worker claims the next eligible target at once instead of sleeping, so
+  other Vaults' rollouts proceed.
 
 - On the Native authority a recursive collection delete is now atomic per
   document and completes when run again. Each document's delete commits with
