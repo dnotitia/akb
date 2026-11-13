@@ -37,6 +37,7 @@ from app.services.publication_service import delete_publications_for_file
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services import skill_policy
 from app.services.uri_service import doc_uri, file_uri, table_uri
+from app.services.vault_write_admission import vault_write_admission
 from app.services.write_lane import run_git_write, write_lane
 
 logger = logging.getLogger("akb.collections")
@@ -537,7 +538,7 @@ class CollectionService:
             raise NotFoundError("Vault", vault)
 
         pool = await get_pool()
-        async with pool.acquire() as conn:
+        async with vault_write_admission(vault_id, vault=vault), pool.acquire() as conn:
             async with conn.transaction():
                 if not await lock_vault_for_child_write(conn, vault_id):
                     raise ConflictError("Vault was deleted during collection creation")
@@ -744,7 +745,9 @@ class CollectionService:
         committed: list[bool] = []
         progress = deletions if deletions is not None else _Deletions(recursive=recursive)
 
-        async with _ReleaseAfterCommit(
+        # Admitted for the transaction only: the Git cleanup after it takes
+        # the write lane, which an admitted transaction must not wait for.
+        async with vault_write_admission(vault_id, vault=vault), _ReleaseAfterCommit(
             pool.acquire(), done=done, committed=committed, deletions=progress,
             what=f"collection delete of {norm!r} in vault {vault}",
         ) as conn:

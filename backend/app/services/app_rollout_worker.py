@@ -29,6 +29,7 @@ from app.services.app_resource_service import (
 from app.services.table_service import alter_table
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import table_uri
+from app.services.vault_write_admission import vault_write_admission
 
 logger = logging.getLogger("akb.app_rollout_worker")
 LEASE_SECONDS = 120
@@ -420,7 +421,7 @@ async def _schema_fingerprint(conn: Any, vault_id: uuid.UUID, installation_id: u
 
 async def _process_target(target: dict[str, Any]) -> None:
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with vault_write_admission(target["vault_id"]), pool.acquire() as conn:
         # One transaction applies every step of the target. Step events are
         # inserted when it ends, on every exit: an event insert holds the
         # Vault's event lock until commit (migration 132), and a later step's

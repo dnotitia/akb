@@ -30,6 +30,7 @@ from app.services.m1_reference_payload_store import (
 )
 from app.services.native_payload_verification import payload_store_for_placement
 from app.services.uri_service import doc_uri
+from app.services.vault_write_admission import vault_write_admission
 
 
 Failpoint = Callable[[str], Awaitable[None] | None]
@@ -334,14 +335,30 @@ class NativeRevisionService:
         raise ConflictError("Unable to allocate a unique native Revision ID after collisions")
 
     @asynccontextmanager
-    async def _authority_transaction(self, conn: asyncpg.Connection | None):
-        """Use a caller-owned connection, or preserve ordinary create semantics."""
+    async def _authority_transaction(
+        self, conn: asyncpg.Connection | None, *, namespace_id: uuid.UUID, surface: str,
+    ):
+        """Use a caller-owned connection, or preserve ordinary create semantics.
+
+        A transaction of its own is admitted for the Vault first (see
+        ``_vault_write_admission``); a caller-owned one was admitted by its
+        caller.
+        """
         if conn is not None:
             yield conn
             return
-        async with self.pool.acquire() as acquired:
+        async with self._vault_write_admission(namespace_id, surface), self.pool.acquire() as acquired:
             async with acquired.transaction():
                 yield acquired
+
+    @staticmethod
+    def _vault_write_admission(namespace_id: uuid.UUID, surface: str):
+        """Admit a mutation for its Vault before it takes a pool connection.
+
+        A Document mutation writes the Vault's event, which waits for the
+        Vault's event lock; a File projection writes none.
+        """
+        return vault_write_admission(namespace_id if surface == "document" else None)
 
     async def _emit_document_change(
         self, conn: asyncpg.Connection, kind: str, *, surface: str,
@@ -610,7 +627,9 @@ class NativeRevisionService:
         activity_id = uuid.uuid4()
         intent_id = uuid.uuid4()
         try:
-            async with self._authority_transaction(conn) as conn:
+            async with self._authority_transaction(
+                conn, namespace_id=namespace_id, surface=surface,
+            ) as conn:
                 await self.repository.lock_mutation(conn, namespace_id, mutation_id)
                 prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
                 if prior is not None:
@@ -828,7 +847,7 @@ class NativeRevisionService:
         manifest_id = uuid.uuid4()
         activity_id = uuid.uuid4()
         intent_id = uuid.uuid4()
-        async with self.pool.acquire() as conn:
+        async with self._vault_write_admission(namespace_id, surface), self.pool.acquire() as conn:
             async with conn.transaction():
                 await self.repository.lock_mutation(conn, namespace_id, mutation_id)
                 prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
@@ -1038,7 +1057,7 @@ class NativeRevisionService:
         activity_id = uuid.uuid4()
         intent_id = uuid.uuid4()
         try:
-            async with self.pool.acquire() as conn:
+            async with self._vault_write_admission(namespace_id, surface), self.pool.acquire() as conn:
                 async with conn.transaction():
                     await self.repository.lock_mutation(conn, namespace_id, mutation_id)
                     prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
@@ -1262,7 +1281,7 @@ class NativeRevisionService:
         activity_id = uuid.uuid4()
         intent_id = uuid.uuid4()
         try:
-            async with self.pool.acquire() as conn:
+            async with self._vault_write_admission(namespace_id, surface), self.pool.acquire() as conn:
                 async with conn.transaction():
                     await self.repository.lock_mutation(conn, namespace_id, mutation_id)
                     prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
@@ -1521,7 +1540,9 @@ class NativeRevisionService:
         revision_id = await self._allocate_revision_id(conn=conn)
         activity_id = uuid.uuid4()
         intent_id = uuid.uuid4()
-        async with self._authority_transaction(conn) as conn:
+        async with self._authority_transaction(
+            conn, namespace_id=namespace_id, surface=surface,
+        ) as conn:
             await self.repository.lock_mutation(conn, namespace_id, mutation_id)
             prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
             if prior is not None:
