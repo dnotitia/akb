@@ -213,6 +213,13 @@ async def test_replace_failure_returns_committed_receipts_and_stops(legacy_grep)
     assert result["replacements"][0]["previous_commit"] == _parent_token(rows[0]["path"])
     assert result["details"]["failed_uri"].endswith("/doc/001.md")
     assert result["details"]["committed_replacements"] == 1
+    # Part of the request committed: the hint names it and asks to replace
+    # only the rest, not to send the request again.
+    assert result["details"]["partially_applied"] is True
+    replaced = result["replacements"][0]
+    assert f"{replaced['uri']} ({replaced['commit']})" in result["hint"]
+    assert "Do not send the same request again" in result["hint"]
+    assert result["details"]["failed_uri"] in result["hint"]
     assert [path for path, _request in documents.update_calls] == [
         rows[0]["path"],
         rows[1]["path"],

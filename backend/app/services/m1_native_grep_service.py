@@ -1022,6 +1022,7 @@ class M1NativeGrepService:
                         exc,
                         failed_uri=head_body.uri,
                         committed_replacements=len(replacements),
+                        completed=replacements,
                     )
                     break
                 replacements.append(

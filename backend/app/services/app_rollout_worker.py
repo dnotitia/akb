@@ -570,7 +570,10 @@ async def _process_once() -> int:
         # with the rest of its batch, until the lease expires.
         await _release_target(target)
         logger.info("rollout target %s deferred: its Vault is busy", target["id"])
-        return 0
+        # Other targets may be eligible meanwhile: report work done, so the
+        # runner claims again at once, past the deferred target, instead of
+        # sleeping its idle interval.
+        return 1
     return 1
 
 

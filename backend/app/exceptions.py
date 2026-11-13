@@ -481,13 +481,17 @@ class WriteBusyError(AKBError):
         self.retry_after_secs = retry_after_secs
         self.partially_applied = partially_applied
         message = f"Write queue for vault '{vault}' is saturated (gave up after {waited_secs:.0f}s); retry shortly"
+        details: dict = {"retry_after_secs": retry_after_secs}
         if partially_applied:
             message += "; part of the operation has completed, and sending it again continues it"
+            details["partially_applied"] = True
         super().__init__(
             message,
             status_code=429,
-            hint=WRITE_BUSY_PARTIAL_HINT if partially_applied else None,
-            details={"partially_applied": True} if partially_applied else None,
+            # app.util.errors.WRITE_BUSY; that module imports this one.
+            code="write_busy",
+            hint=WRITE_BUSY_PARTIAL_HINT if partially_applied else WRITE_BUSY_HINT,
+            details=details,
         )
 
 

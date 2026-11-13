@@ -405,6 +405,39 @@ async def test_default_lifecycle_cancel_during_slot_wait_aborts(monkeypatch):
             pass
 
 
+async def test_a_write_inside_vault_gate_waits_for_a_slot_past_the_deadline(monkeypatch):
+    """Vault creation holds its new Vault's gate, not a slot, and its seed
+    write and compensation take a slot inside it after the Vault's first
+    commit. They wait for one like lifecycle work, past the lane's deadline,
+    counted as lifecycle waiters; giving up would leave a half-created
+    Vault."""
+    monkeypatch.setattr(settings, "write_lane_concurrency", 1)
+    monkeypatch.setattr(settings, "write_lane_queue_timeout_secs", 0.05)
+    release = asyncio.Event()
+    hog_in = asyncio.Event()
+
+    async def hog():
+        async with write_lane.write_lane("other"):
+            hog_in.set()
+            await release.wait()
+
+    async def seed():
+        async with write_lane.vault_gate("new"):
+            async with write_lane.write_lane("new"):
+                return "seeded"
+
+    hog_task = asyncio.create_task(hog())
+    await hog_in.wait()
+    seeding = asyncio.create_task(seed())
+    await asyncio.sleep(0.2)  # four times the lane's deadline
+    assert not seeding.done()
+    assert write_lane.snapshot()["lifecycle_waiters"] == 1
+    release.set()
+    await hog_task
+    assert await asyncio.wait_for(seeding, timeout=1.0) == "seeded"
+    assert write_lane.snapshot()["lifecycle_waiters"] == 0
+
+
 async def test_run_compensation_absorbs_cancel_until_done():
     """run_compensation must keep the caller parked until the inner work
     completes even when cancelled — a bare shield detaches the work and
