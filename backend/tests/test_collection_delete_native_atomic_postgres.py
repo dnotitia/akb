@@ -25,21 +25,23 @@ import pytest
 from git import Repo
 
 from app.db.transient import transient_error
-from app.exceptions import NotFoundError
+from app.exceptions import ForbiddenError, NotFoundError
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
 from app.services import collection_service as collection_service_module
-from app.services import document_counters, kg_service, native_derived_worker
+from app.services import document_counters, kg_service, native_derived_worker, queue_rescuer
 from app.services.collection_service import CollectionService
 from app.services.git_service import GitService
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_revision_backfill import NativeRevisionBackfill
 from app.services.native_revision_cutover import CutoverVaultInput, NativeRevisionCutover
 from app.services._backfill import MAX_RETRIES
+from app.repositories import table_data_repo
 from app.services.native_derived_worker import NativeDerivedWorker
+from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri
-from app.util.errors import WRITE_BUSY
+from app.util.errors import PERMISSION_DENIED, WRITE_BUSY, exception_envelope
 from tests.test_events_commit_order_postgres import (
     _EVENT_LOCK_WAIT_SECONDS,
     _OpenTransaction,
@@ -346,6 +348,9 @@ async def test_a_recursive_delete_after_a_cutover_leaves_the_preserved_rows(tmp_
             vault=vault, path="p", recursive=True, agent_id="tester",
         )
         assert (result["deleted_docs"], result["deleted_sub_collections"]) == (2, 1)
+        # The response says which collection stayed, and why.
+        assert result["retained_collections"] == ["p"]
+        assert result["hint"] == collection_service_module.RETAINED_COLLECTIONS_HINT
         assert await pool.fetchval(
             "SELECT count(*) FROM native_resources WHERE namespace_id = $1 AND lifecycle = 'live'",
             vault_id,
@@ -363,6 +368,10 @@ async def test_a_recursive_delete_after_a_cutover_leaves_the_preserved_rows(tmp_
             vault=vault, path="p", recursive=True, agent_id="tester",
         )
         assert (again["deleted_docs"], again["deleted_sub_collections"]) == (0, 0)
+        assert (again["retained_collections"], again["hint"]) == (["p"], result["hint"])
+        # Browse shows the retained collection, empty, as the response says.
+        browsed = await NativeDocumentService(pool=pool).browse(vault)
+        assert [(item.path, item.type) for item in browsed.items] == [("p", "collection")]
 
 
 async def _link(vault: str, source: str, target: str) -> None:
@@ -570,23 +579,54 @@ async def _last_outcome(pool, resource_id: uuid.UUID) -> str | None:
     )
 
 
+async def _derived(pool, resource_id: uuid.UUID) -> dict:
+    """The derived state of a Native document: its chunks, derived head and
+    the vector deletes queued for its chunks."""
+    chunk_ids = [r["id"] for r in await pool.fetch(
+        "SELECT id FROM chunks WHERE source_type = 'native_document' AND source_id = $1", resource_id,
+    )]
+    return {
+        "chunks": chunk_ids,
+        "head": await pool.fetchval(
+            "SELECT revision_id FROM native_derived_heads WHERE resource_id = $1", resource_id,
+        ),
+        "vector_deletes": [r["chunk_id"] for r in await pool.fetch(
+            "SELECT chunk_id FROM vector_delete_outbox WHERE source_type = 'native_document' "
+            "AND source_id = $1 ORDER BY chunk_id",
+            resource_id,
+        )],
+    }
+
+
+async def _indexed_then_deleted(pool, monkeypatch, vault: str) -> tuple[uuid.UUID, uuid.UUID, dict]:
+    """A Native Vault whose documents the worker indexed, then deleted
+    recursively; returns the Vault, its first document and that document's
+    derived state before the delete."""
+    vault_id = await _native_vault(pool, monkeypatch, vault)
+    first = await pool.fetchval(
+        "SELECT resource_id FROM native_resources WHERE namespace_id = $1 AND current_path = $2",
+        vault_id, _PATHS[0],
+    )
+    await _drain(NativeDerivedWorker(pool))
+    indexed = await _derived(pool, first)
+    assert indexed["chunks"] and indexed["head"] is not None and indexed["vector_deletes"] == []
+    await CollectionService(git=object()).delete(
+        vault=vault, path="notes", recursive=True, agent_id="tester",
+    )
+    return vault_id, first, indexed
+
+
 async def test_a_cleanup_that_keeps_failing_is_abandoned_and_can_be_requeued(monkeypatch):
-    """A delete intent whose application fails on every attempt is retried
-    with backoff until its `MAX_RETRIES`-th attempt fails. It is then
-    abandoned: completed with outcome `abandoned`, its chunks left in place,
-    and counted as abandoned in the queue's statistics. An operator re-opens
-    it with `requeue_abandoned`, and once the cause is gone the worker applies
-    it."""
+    """The documents were indexed, with chunks and a derived head, before the
+    recursive delete. Applying the delete's intent fails on every attempt, and
+    each failure rolls back, so the chunks stay. After its `MAX_RETRIES`-th
+    attempt the intent is abandoned: completed with outcome `abandoned` and
+    counted in the queue's statistics. An operator re-opens it with
+    `requeue_abandoned`; once the cause is gone, the worker removes the
+    chunks and the derived head and queues the vector deletes of exactly
+    those chunks."""
     async with _fresh_database() as pool:
-        vault = "native-cleanup-abandoned"
-        vault_id = await _native_vault(pool, monkeypatch, vault)
-        first = await pool.fetchval(
-            "SELECT resource_id FROM native_resources WHERE namespace_id = $1 AND current_path = $2",
-            vault_id, _PATHS[0],
-        )
-        await CollectionService(git=object()).delete(
-            vault=vault, path="notes", recursive=True, agent_id="tester",
-        )
+        vault_id, first, indexed = await _indexed_then_deleted(pool, monkeypatch, "native-cleanup-abandoned")
         cleanup = native_derived_worker.delete_native_document_edges
         broken = {"on": True}
 
@@ -605,9 +645,188 @@ async def test_a_cleanup_that_keeps_failing_is_abandoned_and_can_be_requeued(mon
         assert await _open_intents(pool, first) == []
         assert await _last_outcome(pool, first) == "abandoned"
         assert (await worker.pending_stats(vault_id))["abandoned"] >= 1
+        assert await _derived(pool, first) == indexed
 
         broken["on"] = False
         assert await worker.requeue_abandoned(namespace_id=vault_id, resource_id=first) == 1
         assert await worker.requeue_abandoned(namespace_id=vault_id, resource_id=first) == 0
         await _drain(worker)
         assert await _last_outcome(pool, first) == "deleted"
+        assert await _derived(pool, first) == {
+            "chunks": [], "head": None, "vector_deletes": sorted(indexed["chunks"]),
+        }
+
+
+async def test_a_final_claim_that_expires_is_abandoned_by_the_rescuer(monkeypatch):
+    """A claim that ends without an outcome, as when its process stops, is
+    claimed again once its 10-minute lease expires, except the final one: an
+    intent claimed for its `MAX_RETRIES`-th attempt is not claimed again, and
+    the queue rescuer marks it abandoned once its lease expired. Its
+    `last_error` stays the exception class of the last failed attempt, or is
+    `claim lease expired after final attempt` when no attempt recorded one.
+    Re-opened, it is applied."""
+    async with _fresh_database() as pool:
+        vault_id, first, indexed = await _indexed_then_deleted(pool, monkeypatch, "native-final-claim")
+        second = await pool.fetchval(
+            "SELECT resource_id FROM native_resources WHERE namespace_id = $1 AND current_path = $2",
+            vault_id, _PATHS[1],
+        )
+        # Seven attempts ended without an outcome; the second document's last
+        # one recorded an exception.
+        await pool.execute(
+            "UPDATE native_invalidation_intents SET retry_count = $1 "
+            "WHERE namespace_id = $2 AND completed_at IS NULL",
+            MAX_RETRIES - 1, vault_id,
+        )
+        await pool.execute(
+            "UPDATE native_invalidation_intents SET last_error = 'DeadlockDetectedError' "
+            "WHERE resource_id = $1 AND completed_at IS NULL",
+            second,
+        )
+        worker = NativeDerivedWorker(pool)
+        # The final claims, whose process stops before an outcome.
+        for _ in range(2):
+            assert (await worker._claim_one())["retry_count"] == MAX_RETRIES
+        assert await worker._claim_one() is None
+        await pool.execute(
+            "UPDATE native_invalidation_intents SET next_attempt_at = NOW() - INTERVAL '1 second' "
+            "WHERE namespace_id = $1 AND completed_at IS NULL",
+            vault_id,
+        )
+        assert await worker.process_once() == 0
+        assert await queue_rescuer._rescue_once() == 2
+        outcomes = {
+            r["resource_id"]: (r["delivery_outcome"], r["last_error"])
+            for r in await pool.fetch(
+                "SELECT resource_id, delivery_outcome, last_error FROM native_invalidation_intents "
+                "WHERE namespace_id = $1 AND completed_at IS NOT NULL AND delivery_outcome = 'abandoned'",
+                vault_id,
+            )
+        }
+        assert outcomes == {
+            first: ("abandoned", "claim lease expired after final attempt"),
+            second: ("abandoned", "DeadlockDetectedError"),
+        }
+        assert await _derived(pool, first) == indexed
+
+        assert await worker.requeue_abandoned(namespace_id=vault_id) == 2
+        await _drain(worker)
+        assert await _last_outcome(pool, first) == "deleted"
+        assert (await _derived(pool, first))["chunks"] == []
+
+
+async def test_requeue_reopens_only_an_abandoned_intent_at_the_head(monkeypatch):
+    """`notes/a.md`'s first Revision R1 was abandoned, and its current Revision
+    R2 waits to be indexed. R1's intent carries the later `occurred_at`, as an
+    intent written by a process whose clock runs ahead can. The worker keeps
+    one pending intent per Resource, the one stamped last. Re-opening R1 made
+    it close R2's intent as superseded and then close R1 too, since R1 is not
+    the Head: R2 was never indexed, while the queue looked settled. Now R1 is
+    closed as superseded instead of re-opened, and R2 is indexed."""
+    async with _fresh_database() as pool:
+        vault_id = await _native_vault(pool, monkeypatch, "native-requeue-head")
+        native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        first = await pool.fetchrow(
+            "SELECT resource_id, head_revision_id FROM native_resources "
+            "WHERE namespace_id = $1 AND current_path = $2",
+            vault_id, _PATHS[0],
+        )
+        await pool.execute(
+            "UPDATE native_invalidation_intents SET completed_at = NOW(), delivery_outcome = 'abandoned', "
+            "retry_count = $2, last_error = 'DeadlockDetectedError' WHERE revision_id = $1",
+            first["head_revision_id"], MAX_RETRIES,
+        )
+        current = await native.replace_text(
+            namespace_id=vault_id, surface="document", path=_PATHS[0], payload="current body token",
+            actor="tester", mutation_id=uuid.uuid4(), expected_revision_id=first["head_revision_id"],
+            expected_resource_id=first["resource_id"],
+        )
+        await pool.execute(
+            "UPDATE native_invalidation_intents SET occurred_at = ("
+            "  SELECT occurred_at FROM native_invalidation_intents WHERE revision_id = $2"
+            ") + INTERVAL '1 second' WHERE revision_id = $1",
+            first["head_revision_id"], current.revision_id,
+        )
+        worker = NativeDerivedWorker(pool)
+        assert await worker.requeue_abandoned(namespace_id=vault_id, resource_id=first["resource_id"]) == 0
+        await _drain(worker)
+        outcomes = {
+            r["revision_id"]: r["delivery_outcome"]
+            for r in await pool.fetch(
+                "SELECT revision_id, delivery_outcome FROM native_invalidation_intents WHERE resource_id = $1",
+                first["resource_id"],
+            )
+        }
+        assert outcomes == {first["head_revision_id"]: "superseded", current.revision_id: "applied"}
+        derived = await _derived(pool, first["resource_id"])
+        assert derived["head"] == current.revision_id
+        assert await pool.fetchval(
+            "SELECT bool_and(content LIKE '%current body token%') FROM chunks "
+            "WHERE source_type = 'native_document' AND source_id = $1",
+            first["resource_id"],
+        )
+        stats = await worker.pending_stats(vault_id)
+        assert (stats["pending"], stats["abandoned_at_head"], stats["status"]) == (0, 0, "ok")
+
+
+async def test_a_table_created_after_the_check_refuses_the_rest_and_lists_what_went(monkeypatch):
+    """A writer may not delete a collection holding a table. Its recursive
+    delete of `notes` found no table, and then another request created one
+    under `notes` while the documents were deleted. The last transaction
+    finds the table and refuses, after both documents went: the refusal
+    says the delete partly completed and lists the deleted documents, over
+    MCP and REST alike. The same writer is refused again before anything
+    else goes; an admin's delete finishes it, the table included."""
+    async with _fresh_database() as pool:
+        vault = "native-table-appears"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        check = CollectionService._refuse_tables_under
+        created: list[str] = []
+
+        async def table_created_after_the_check(self, vault_name, vid, norm):
+            await check(self, vault_name, vid, norm)
+            if not created:
+                pg_name = table_data_repo.pg_table_name(vault, "late")
+                columns = [{"name": "value", "type": "text"}]
+                async with pool.acquire() as conn:
+                    await table_data_repo.create_dynamic_table(
+                        conn, pg_name, columns, vault_name=vault, vault_id=vault_id,
+                        resource_uri=f"akb://{vault}/table/late",
+                    )
+                    await conn.execute(
+                        "INSERT INTO vault_tables (id, vault_id, name, description, columns, unique_keys, "
+                        "indexes, collection_id) VALUES ($1, $2, 'late', '', $3::jsonb, '[]'::jsonb, "
+                        "'[]'::jsonb, (SELECT id FROM collections WHERE vault_id = $2 AND path = 'notes'))",
+                        uuid.uuid4(), vault_id, '[{"name": "value", "type": "text"}]',
+                    )
+                created.append(pg_name)
+
+        monkeypatch.setattr(CollectionService, "_refuse_tables_under", table_created_after_the_check)
+
+        def delete(*, admin: bool):
+            return CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", allow_table_delete=admin,
+            )
+
+        with pytest.raises(ForbiddenError) as partial:
+            await delete(admin=False)
+        uris = [doc_uri(vault, path) for path in _PATHS]
+        assert partial.value.details == {"partially_applied": True, "deleted_docs": 2, "deleted_uris": uris}
+        assert "'admin' role" in partial.value.hint
+        envelope = exception_envelope(partial.value)
+        assert (envelope["code"], envelope["details"]["deleted_uris"]) == (PERMISSION_DENIED, uris)
+        assert envelope["hint"] == partial.value.hint
+        assert await _state(pool, vault_id) == {
+            "documents": [(path, "deleted") for path in _PATHS],
+            "collections": ["notes"],
+            "events": ["document.delete", "document.delete"],
+        }
+
+        with pytest.raises(ForbiddenError) as again:
+            await delete(admin=False)
+        assert again.value.details is None
+
+        result = await delete(admin=True)
+        assert (result["deleted_docs"], result["deleted_tables"]) == (0, 1)
+        assert (await _state(pool, vault_id))["collections"] == []
+        assert await pool.fetchval("SELECT to_regclass($1)", created[0]) is None

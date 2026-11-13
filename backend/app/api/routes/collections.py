@@ -51,6 +51,9 @@ class AkbCollectionDeleteEnvelope(BaseModel):
     deleted_files: int
     deleted_sub_collections: int
     deleted_tables: int
+    # After a Native cutover: collections the delete left in place, and why.
+    retained_collections: list[str] | None = None
+    hint: str | None = None
 
 
 @router.get(
@@ -122,6 +125,7 @@ async def create_collection(
 @router.delete(
     "/collections/{vault}/{path:path}",
     response_model=AkbCollectionDeleteEnvelope,
+    response_model_exclude_none=True,
     summary="Delete a collection",
     operation_id="collectionsDeleteCollection",
     tags=["collections"],

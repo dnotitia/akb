@@ -196,7 +196,9 @@ def exception_envelope(e: Exception) -> dict:
     if isinstance(e, ReservedSystemPathError):
         return err(str(e), code=RESERVED_SYSTEM_PATH_CODE)
     if isinstance(e, ForbiddenError):
-        return err(str(e), code=PERMISSION_DENIED)
+        # A refusal that says more, such as a recursive delete refused after
+        # some of its documents went, keeps its hint and details.
+        return err(str(e), code=PERMISSION_DENIED, hint=e.hint, **(e.details or {}))
     if isinstance(e, NotFoundError):
         return err(str(e), code=NOT_FOUND)
     if isinstance(e, ConflictError):

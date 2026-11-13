@@ -286,6 +286,8 @@ export interface AkbCollectionDeleteEnvelope {
   deleted_files: number;
   deleted_sub_collections: number;
   deleted_tables: number;
+  retained_collections?: string[];
+  hint?: string;
 }
 
 export interface AkbActivityFileChange {

@@ -323,35 +323,61 @@ async def _requeue_abandoned(
     namespace_id: uuid.UUID,
     resource_id: uuid.UUID | None = None,
 ) -> int:
-    """Re-open the abandoned intents of one namespace, or of one Resource in it.
+    """Re-open the abandoned intents of one namespace, or of one Resource in it,
+    whose Revision is still the Resource's Head, and return how many.
 
     An intent is abandoned when its last allowed attempt failed (see
-    ``NativeDerivedWorker._failure``): the worker stops retrying it, and the
-    chunks, graph edges and derived head of that Revision stay as they were.
-    Re-opening keeps the intent's identity and starts its attempts again, now;
-    the worker then re-checks the Resource's head as on any attempt, so an
-    intent a later Revision replaced is closed as superseded.
+    ``NativeDerivedWorker._failure``) or its final claim expired (see
+    ``queue_rescuer``): the worker stops retrying it, and the chunks, graph
+    edges and derived head of that Revision stay as they were. Re-opening
+    keeps the intent's identity and starts its attempts again, now.
+
+    An abandoned intent of an earlier Revision is closed as superseded
+    instead. Re-opened, it would be the work of a Revision the Resource has
+    moved past, and the worker keeps one pending intent per Resource, chosen
+    by ``occurred_at``, which comes from the clock of the process that wrote
+    it: an older Revision stamped later could make it close the pending
+    intent of the current Head.
     """
     params: list[object] = [namespace_id]
     scope = ""
     if resource_id is not None:
         params.append(resource_id)
-        scope = "AND resource_id = $2"
+        scope = "AND i.resource_id = $2"
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            UPDATE native_invalidation_intents
-               SET claimed_at = NULL, retry_count = 0, next_attempt_at = NOW(),
-                   completed_at = NULL, delivery_outcome = NULL, last_error = NULL
-             WHERE namespace_id = $1
-               AND completed_at IS NOT NULL
-               AND delivery_outcome = 'abandoned'
-               {scope}
-            RETURNING intent_id
+            UPDATE native_invalidation_intents AS i
+               SET claimed_at = NULL,
+                   retry_count = 0,
+                   next_attempt_at = CASE WHEN a.at_head THEN NOW() END,
+                   completed_at = CASE WHEN a.at_head THEN NULL ELSE NOW() END,
+                   delivery_outcome = CASE WHEN a.at_head THEN NULL ELSE 'superseded' END,
+                   last_error = CASE WHEN a.at_head THEN NULL ELSE i.last_error END
+              FROM (
+                  SELECT i.intent_id,
+                         COALESCE(r.head_revision_id = i.revision_id, FALSE) AS at_head
+                    FROM native_invalidation_intents AS i
+                    LEFT JOIN native_resources AS r
+                      ON r.namespace_id = i.namespace_id AND r.resource_id = i.resource_id
+                   WHERE i.namespace_id = $1
+                     AND i.completed_at IS NOT NULL
+                     AND i.delivery_outcome = 'abandoned'
+                     {scope}
+              ) AS a
+             WHERE i.intent_id = a.intent_id
+               AND i.delivery_outcome = 'abandoned'
+            RETURNING a.at_head
             """,
             *params,
         )
-    return len(rows)
+    requeued = sum(1 for row in rows if row["at_head"])
+    if len(rows) > requeued:
+        logger.info(
+            "closed %d abandoned derived intent(s) of earlier Revisions as superseded",
+            len(rows) - requeued,
+        )
+    return requeued
 
 
 async def requeue_abandoned(
@@ -362,7 +388,8 @@ async def requeue_abandoned(
     """Operator entry point: re-open abandoned derived intents of a Vault.
 
     An explicit namespace is required; ``resource_id`` narrows it to one
-    Resource. Returns how many intents were re-opened.
+    Resource. Only intents whose Revision is still the Head are re-opened;
+    the others are closed as superseded. Returns how many were re-opened.
     """
     return await _requeue_abandoned(await get_pool(), namespace_id=namespace_id, resource_id=resource_id)
 
