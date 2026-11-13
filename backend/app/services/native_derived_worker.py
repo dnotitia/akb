@@ -394,8 +394,33 @@ async def requeue_abandoned(
     return await _requeue_abandoned(await get_pool(), namespace_id=namespace_id, resource_id=resource_id)
 
 
+# The rows a claim may change: the intent as this claim left it, open. A
+# claim is identified by its `claimed_at` and `retry_count`; re-opening an
+# intent, claiming it again or completing it changes them.
+_THIS_CLAIM = (
+    "intent_id = $1 AND claimed_at IS NOT DISTINCT FROM $2 "
+    "AND retry_count IS NOT DISTINCT FROM $3 AND completed_at IS NULL"
+)
+
+
+def _claim(intent: dict) -> tuple:
+    return intent["intent_id"], intent.get("claimed_at"), intent.get("retry_count")
+
+
+_CLAIM_HELD = f"SELECT intent_id FROM native_invalidation_intents WHERE {_THIS_CLAIM} FOR UPDATE"
+
+
 class NativeDerivedWorker:
-    """One-batch native invalidation consumer with durable retry state."""
+    """One-batch native invalidation consumer with durable retry state.
+
+    Every outcome a claim writes (applied, deleted, superseded, a retry or
+    abandoned) is written only to the intent as that claim left it
+    (`_THIS_CLAIM`), and a claim applies derived state only while it holds
+    the intent so (`_CLAIM_HELD`, locked in the apply transaction). A claim
+    that outlived its lease, after which the intent was abandoned and
+    re-opened, or claimed again, changes nothing; the current claim does the
+    work.
+    """
 
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
@@ -468,22 +493,22 @@ class NativeDerivedWorker:
 
     async def _complete(
         self,
-        intent_id: uuid.UUID,
+        intent: dict,
         outcome: str,
         *,
         selected_delivery: str = SELECTED_DELIVERY,
     ) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(
-                """
+                f"""
                 UPDATE native_invalidation_intents
-                   SET completed_at = NOW(), delivery_outcome = $2,
-                       selected_delivery = $3,
+                   SET completed_at = NOW(), delivery_outcome = $4,
+                       selected_delivery = $5,
                        retry_count = 0, claimed_at = NULL,
                        next_attempt_at = NULL, last_error = NULL
-                 WHERE intent_id = $1
+                 WHERE {_THIS_CLAIM}
                 """,
-                intent_id,
+                *_claim(intent),
                 outcome,
                 selected_delivery,
             )
@@ -495,29 +520,34 @@ class NativeDerivedWorker:
         terminal = attempt_count >= MAX_RETRIES
         async with self.pool.acquire() as conn:
             if terminal:
-                await conn.execute(
-                    """
+                result = await conn.execute(
+                    f"""
                     UPDATE native_invalidation_intents
                        SET claimed_at = NULL,
                            completed_at = NOW(), delivery_outcome = 'abandoned',
-                           next_attempt_at = NULL, last_error = $2
-                     WHERE intent_id = $1 AND completed_at IS NULL
+                           next_attempt_at = NULL, last_error = $4
+                     WHERE {_THIS_CLAIM}
                     """,
-                    intent["intent_id"],
+                    *_claim(intent),
                     type(error).__name__,
                 )
             else:
-                await conn.execute(
-                    """
+                result = await conn.execute(
+                    f"""
                     UPDATE native_invalidation_intents
                        SET claimed_at = NULL,
-                           next_attempt_at = $2, last_error = $3
-                     WHERE intent_id = $1 AND completed_at IS NULL
+                           next_attempt_at = $4, last_error = $5
+                     WHERE {_THIS_CLAIM}
                     """,
-                    intent["intent_id"],
+                    *_claim(intent),
                     next_at,
                     type(error).__name__,
                 )
+        if result == "UPDATE 0":
+            # A stale claim: the intent was re-opened or claimed again since,
+            # and this failure is not its outcome.
+            logger.info("native derived intent %s: a stale claim's failure was ignored", intent["intent_id"])
+            return
         if terminal:
             await self._log_abandonment(intent, error, attempt_count)
 
@@ -622,28 +652,22 @@ class NativeDerivedWorker:
                     """,
                     intent["resource_id"],
                 )
-                if resource is None or resource["head_revision_id"] != intent["revision_id"]:
+                if await conn.fetchrow(_CLAIM_HELD, *_claim(intent)) is None:
+                    return  # A stale claim changes nothing.
+                if (
+                    resource is None
+                    or resource["head_revision_id"] != intent["revision_id"]
+                    or resource["lifecycle"] != "deleted"
+                ):
                     await conn.execute(
-                        """
+                        f"""
                         UPDATE native_invalidation_intents
                            SET completed_at = NOW(), delivery_outcome = 'superseded',
                                retry_count = 0, claimed_at = NULL,
                                next_attempt_at = NULL, last_error = NULL
-                         WHERE intent_id = $1
+                         WHERE {_THIS_CLAIM}
                         """,
-                        intent["intent_id"],
-                    )
-                    return
-                if resource["lifecycle"] != "deleted":
-                    await conn.execute(
-                        """
-                        UPDATE native_invalidation_intents
-                           SET completed_at = NOW(), delivery_outcome = 'superseded',
-                               retry_count = 0, claimed_at = NULL,
-                               next_attempt_at = NULL, last_error = NULL
-                         WHERE intent_id = $1
-                        """,
-                        intent["intent_id"],
+                        *_claim(intent),
                     )
                     return
                 await self._drop_chunks(
@@ -671,14 +695,14 @@ class NativeDerivedWorker:
                     intent["resource_id"],
                 )
                 await conn.execute(
-                    """
+                    f"""
                     UPDATE native_invalidation_intents
                        SET completed_at = NOW(), delivery_outcome = 'deleted',
                            retry_count = 0, claimed_at = NULL,
                            next_attempt_at = NULL, last_error = NULL
-                     WHERE intent_id = $1
+                     WHERE {_THIS_CLAIM}
                     """,
-                    intent["intent_id"],
+                    *_claim(intent),
                 )
 
     async def _apply_live(self, intent: dict, head: dict) -> int:
@@ -717,20 +741,22 @@ class NativeDerivedWorker:
                     """,
                     intent["resource_id"],
                 )
+                if await conn.fetchrow(_CLAIM_HELD, *_claim(intent)) is None:
+                    return 0  # A stale claim changes nothing.
                 if (
                     resource is None
                     or resource["lifecycle"] != "live"
                     or resource["head_revision_id"] != intent["revision_id"]
                 ):
                     await conn.execute(
-                        """
+                        f"""
                         UPDATE native_invalidation_intents
                            SET completed_at = NOW(), delivery_outcome = 'superseded',
                                retry_count = 0, claimed_at = NULL,
                                next_attempt_at = NULL, last_error = NULL
-                         WHERE intent_id = $1
+                         WHERE {_THIS_CLAIM}
                         """,
-                        intent["intent_id"],
+                        *_claim(intent),
                     )
                     return 0
                 await self._drop_chunks(conn, intent["resource_id"], source_type)
@@ -824,14 +850,14 @@ class NativeDerivedWorker:
                         intent["intent_id"],
                     )
                 await conn.execute(
-                    """
+                    f"""
                     UPDATE native_invalidation_intents
                        SET completed_at = NOW(), delivery_outcome = 'applied',
                            retry_count = 0, claimed_at = NULL,
                            next_attempt_at = NULL, last_error = NULL
-                     WHERE intent_id = $1
+                     WHERE {_THIS_CLAIM}
                     """,
-                    intent["intent_id"],
+                    *_claim(intent),
                 )
         return len(chunks)
 
@@ -842,7 +868,7 @@ class NativeDerivedWorker:
         try:
             head = await self._head(intent["resource_id"])
             if head is None or head["head_revision_id"] != intent["revision_id"]:
-                await self._complete(intent["intent_id"], "superseded")
+                await self._complete(intent, "superseded")
                 return 1
             if head["lifecycle"] == "deleted":
                 await self._apply_delete(intent)

@@ -25,7 +25,7 @@ import pytest
 from git import Repo
 
 from app.db.transient import transient_error
-from app.exceptions import ForbiddenError, NotFoundError
+from app.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
 from app.services import collection_service as collection_service_module
@@ -345,11 +345,11 @@ async def test_a_recursive_delete_after_a_cutover_leaves_the_preserved_rows(tmp_
         preserved = dict(await pool.fetchrow("SELECT * FROM documents WHERE id = $1", doc_id))
 
         result = await CollectionService(git=object()).delete(
-            vault=vault, path="p", recursive=True, agent_id="tester",
+            vault=vault, path="p", recursive=True, agent_id="tester", disclose_paths=True,
         )
         assert (result["deleted_docs"], result["deleted_sub_collections"]) == (2, 1)
         # The response says which collection stayed, and why.
-        assert result["retained_collections"] == ["p"]
+        assert (result["retained_collection_count"], result["retained_collections"]) == (1, ["p"])
         assert result["hint"] == collection_service_module.RETAINED_COLLECTIONS_HINT
         assert await pool.fetchval(
             "SELECT count(*) FROM native_resources WHERE namespace_id = $1 AND lifecycle = 'live'",
@@ -365,10 +365,16 @@ async def test_a_recursive_delete_after_a_cutover_leaves_the_preserved_rows(tmp_
         assert '"retained_collections": ["p"]' in payload
 
         again = await CollectionService(git=object()).delete(
-            vault=vault, path="p", recursive=True, agent_id="tester",
+            vault=vault, path="p", recursive=True, agent_id="tester", disclose_paths=True,
         )
         assert (again["deleted_docs"], again["deleted_sub_collections"]) == (0, 0)
         assert (again["retained_collections"], again["hint"]) == (["p"], result["hint"])
+        # A caller who may not read the Vault is told how many, not which.
+        write_only = await CollectionService(git=object()).delete(
+            vault=vault, path="p", recursive=True, agent_id="tester",
+        )
+        assert write_only["retained_collection_count"] == 1
+        assert "retained_collections" not in write_only
         # Browse shows the retained collection, empty, as the response says.
         browsed = await NativeDocumentService(pool=pool).browse(vault)
         assert [(item.path, item.type) for item in browsed.items] == [("p", "collection")]
@@ -803,9 +809,10 @@ async def test_a_table_created_after_the_check_refuses_the_rest_and_lists_what_w
 
         monkeypatch.setattr(CollectionService, "_refuse_tables_under", table_created_after_the_check)
 
-        def delete(*, admin: bool):
+        def delete(*, admin: bool, reader: bool = True):
             return CollectionService(git=object()).delete(
                 vault=vault, path="notes", recursive=True, agent_id="tester", allow_table_delete=admin,
+                disclose_paths=reader,
             )
 
         with pytest.raises(ForbiddenError) as partial:
@@ -813,6 +820,7 @@ async def test_a_table_created_after_the_check_refuses_the_rest_and_lists_what_w
         uris = [doc_uri(vault, path) for path in _PATHS]
         assert partial.value.details == {"partially_applied": True, "deleted_docs": 2, "deleted_uris": uris}
         assert "'admin' role" in partial.value.hint
+        assert "committed deletions for" in partial.value.hint
         envelope = exception_envelope(partial.value)
         assert (envelope["code"], envelope["details"]["deleted_uris"]) == (PERMISSION_DENIED, uris)
         assert envelope["hint"] == partial.value.hint
@@ -823,10 +831,188 @@ async def test_a_table_created_after_the_check_refuses_the_rest_and_lists_what_w
         }
 
         with pytest.raises(ForbiddenError) as again:
-            await delete(admin=False)
+            await delete(admin=False, reader=False)
         assert again.value.details is None
 
         result = await delete(admin=True)
         assert (result["deleted_docs"], result["deleted_tables"]) == (0, 1)
         assert (await _state(pool, vault_id))["collections"] == []
         assert await pool.fetchval("SELECT to_regclass($1)", created[0]) is None
+
+
+async def test_a_table_refusal_tells_a_write_only_caller_counts_not_paths(monkeypatch):
+    """The same late table, for a caller who may write the Vault but not read
+    it: the refusal says how many documents this request deleted, not which."""
+    async with _fresh_database() as pool:
+        vault = "native-table-write-only"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        check = CollectionService._refuse_tables_under
+
+        async def table_created_after_the_check(self, vault_name, vid, norm):
+            await check(self, vault_name, vid, norm)
+            await _late_table(pool, vault, vault_id, "notes")
+
+        monkeypatch.setattr(CollectionService, "_refuse_tables_under", table_created_after_the_check)
+        with pytest.raises(ForbiddenError) as partial:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester",
+            )
+        assert partial.value.details == {"partially_applied": True, "deleted_docs": 2}
+        assert "2 document(s)" in partial.value.hint
+        assert not any(path in partial.value.hint for path in _PATHS)
+        envelope = exception_envelope(partial.value)
+        assert "deleted_uris" not in envelope["details"]
+
+
+async def _late_table(pool, vault: str, vault_id: uuid.UUID, collection: str) -> None:
+    """A table another request creates under ``collection``, once."""
+    if await pool.fetchval("SELECT 1 FROM vault_tables WHERE vault_id = $1 AND name = 'late'", vault_id):
+        return
+    pg_name = table_data_repo.pg_table_name(vault, "late")
+    columns = [{"name": "value", "type": "text"}]
+    async with pool.acquire() as conn:
+        await table_data_repo.create_dynamic_table(
+            conn, pg_name, columns, vault_name=vault, vault_id=vault_id,
+            resource_uri=f"akb://{vault}/table/late",
+        )
+        await conn.execute(
+            "INSERT INTO vault_tables (id, vault_id, name, description, columns, unique_keys, "
+            "indexes, collection_id) VALUES ($1, $2, 'late', '', $3::jsonb, '[]'::jsonb, "
+            "'[]'::jsonb, (SELECT id FROM collections WHERE vault_id = $2 AND path = $4))",
+            uuid.uuid4(), vault_id, '[{"name": "value", "type": "text"}]', collection,
+        )
+
+
+async def test_a_restored_document_stays_listed_as_deleted_by_this_request(monkeypatch):
+    """The delete committed `notes/a.md` and `notes/b.md`. Before its last
+    transaction another request restored `notes/a.md` and created a table
+    under `notes`, so the delete started another round, whose table check
+    refuses it. The refusal lists both documents as the ones this request
+    committed deletions for, and its hint says later writes or restores may
+    have changed them: `notes/a.md` is live again."""
+    async with _fresh_database() as pool:
+        vault = "native-restored-in-between"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        last_transaction = CollectionService._delete_collections
+        changed: list[bool] = []
+
+        async def restore_and_add_a_table(self, **kwargs):
+            if not changed:
+                changed.append(True)
+                row = await pool.fetchrow(
+                    "SELECT resource_id, head_revision_id FROM native_resources "
+                    "WHERE namespace_id = $1 AND current_path = $2",
+                    vault_id, _PATHS[0],
+                )
+                await native.restore_text(
+                    namespace_id=vault_id, surface="document", path=_PATHS[0], payload="restored",
+                    actor="other", mutation_id=uuid.uuid4(), expected_revision_id=row["head_revision_id"],
+                    expected_resource_id=row["resource_id"],
+                )
+                await _late_table(pool, vault, vault_id, "notes")
+            return await last_transaction(self, **kwargs)
+
+        monkeypatch.setattr(CollectionService, "_delete_collections", restore_and_add_a_table)
+        with pytest.raises(ForbiddenError) as partial:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert partial.value.details["deleted_uris"] == [doc_uri(vault, path) for path in _PATHS]
+        assert "committed deletions for" in partial.value.hint
+        assert "later writes or restores may have changed them since" in partial.value.hint
+        assert (await _state(pool, vault_id))["documents"] == [(_PATHS[0], "live"), (_PATHS[1], "deleted")]
+
+
+async def test_a_delete_whose_rounds_run_out_says_what_it_deleted(monkeypatch):
+    """Before each round's last transaction another request writes a document
+    under `notes`, so every round finds one and the delete gives up after its
+    third with a conflict. The conflict says the delete partly completed and,
+    to a caller who may read the Vault, lists the four documents this request
+    committed deletions for, over MCP as over REST; the document written last
+    stays."""
+    async with _fresh_database() as pool:
+        vault = "native-rounds-run-out"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        last_transaction = CollectionService._delete_collections
+        arrived: list[str] = []
+
+        async def a_document_arrives(self, **kwargs):
+            path = f"notes/late-{len(arrived)}.md"
+            await native.create_text(
+                namespace_id=vault_id, surface="document", path=path,
+                payload="written meanwhile", actor="other", mutation_id=uuid.uuid4(),
+            )
+            arrived.append(path)
+            return await last_transaction(self, **kwargs)
+
+        monkeypatch.setattr(CollectionService, "_delete_collections", a_document_arrives)
+
+        def delete(reader: bool):
+            return CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=reader,
+            )
+
+        with pytest.raises(ConflictError) as ran_out:
+            await delete(reader=True)
+        deleted = [*_PATHS, *arrived[:2]]
+        assert ran_out.value.details == {
+            "partially_applied": True,
+            "deleted_docs": 4,
+            "deleted_uris": [doc_uri(vault, path) for path in deleted],
+        }
+        assert "committed deletions for" in ran_out.value.hint
+        envelope = exception_envelope(ran_out.value)
+        assert (envelope["code"], envelope["details"]["deleted_docs"]) == ("conflict", 4)
+        assert envelope["hint"] == ran_out.value.hint
+        assert (await _state(pool, vault_id))["documents"][-1] == (arrived[2], "live")
+
+        arrived.clear()
+        with pytest.raises(ConflictError) as write_only:
+            await delete(reader=False)
+        assert write_only.value.details == {"partially_applied": True, "deleted_docs": 3}
+
+
+async def test_a_stale_final_claim_does_not_abandon_the_reopened_intent(monkeypatch):
+    """A worker made the final claim of `notes/a.md`'s delete intent and
+    stalled. The lease expired, the queue rescuer abandoned the intent, and an
+    operator re-opened it. The stalled worker then fails, or finishes: its
+    claim is stale, so neither its failure nor its work changes the
+    re-opened intent, which a new claim applies."""
+    async with _fresh_database() as pool:
+        vault_id, first, indexed = await _indexed_then_deleted(pool, monkeypatch, "native-stale-claim")
+        await pool.execute(
+            "UPDATE native_invalidation_intents SET retry_count = $1 "
+            "WHERE resource_id = $2 AND completed_at IS NULL",
+            MAX_RETRIES - 1, first,
+        )
+        worker = NativeDerivedWorker(pool)
+        stale = None
+        while True:
+            claim = await worker._claim_one()
+            assert claim is not None
+            if claim["resource_id"] == first:
+                stale = claim
+                break
+            # The other document's intent: apply it as usual.
+            await worker._apply_delete(claim)
+        assert stale["retry_count"] == MAX_RETRIES
+        await pool.execute(
+            "UPDATE native_invalidation_intents SET next_attempt_at = NOW() - INTERVAL '1 second' "
+            "WHERE resource_id = $1 AND completed_at IS NULL",
+            first,
+        )
+        assert await queue_rescuer._rescue_once() == 1
+        assert await worker.requeue_abandoned(namespace_id=vault_id, resource_id=first) == 1
+
+        # The stalled worker resumes: its failure, and its work, are stale.
+        await worker._failure(stale, asyncpg.exceptions.DeadlockDetectedError("deadlock detected"))
+        assert await _open_intents(pool, first) == [(0, None)]
+        await worker._apply_delete(stale)
+        assert await _open_intents(pool, first) == [(0, None)]
+        assert await _derived(pool, first) == indexed
+
+        await _drain(worker)
+        assert await _last_outcome(pool, first) == "deleted"
+        assert (await _derived(pool, first))["chunks"] == []

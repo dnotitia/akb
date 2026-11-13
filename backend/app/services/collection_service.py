@@ -115,10 +115,36 @@ _NATIVE_DELETE_ROUNDS = 3
 
 # The hint of a delete that left collections in place after a Native cutover.
 RETAINED_COLLECTIONS_HINT = (
-    "The collections in retained_collections keep their rows: documents preserved from before "
-    "this Vault was cut over to the Native authority still reference them, and that history is "
-    "kept as it is. They hold no live documents, and deleting them again leaves them in place."
+    "Some collections keep their rows (retained_collection_count): documents preserved from "
+    "before this Vault was cut over to the Native authority still reference them, and that "
+    "history is kept as it is. They hold no live documents, and deleting them again leaves them "
+    "in place."
 )
+
+
+def committed_deletions(
+    *, vault: str, deleted: list[str], disclose_paths: bool,
+) -> tuple[dict, str]:
+    """The details, and the opening of the hint, of a recursive delete that
+    stopped after it committed deletions for some documents.
+
+    The paths are given only to a caller who may read the Vault
+    (``disclose_paths``); another gets the count. They are the documents this
+    request deleted, which later writes or restores may have changed since.
+    """
+    details: dict = {"partially_applied": True, "deleted_docs": len(deleted)}
+    if disclose_paths:
+        details["deleted_uris"] = [doc_uri(vault, path) for path in deleted]
+        opening = (
+            "details.deleted_uris lists the documents this request committed deletions for; "
+            "later writes or restores may have changed them since."
+        )
+    else:
+        opening = (
+            f"This request committed deletions for {len(deleted)} document(s); later writes or "
+            "restores may have changed them since."
+        )
+    return details, opening
 
 
 def _under(path: str, prefix: str) -> bool:
@@ -220,31 +246,50 @@ async def _delete_native_documents_under(
 
 
 def _tables_refused_part_way(
-    refused: ForbiddenError, *, vault: str, prefix: str, deleted: list[str],
+    refused: ForbiddenError, *, vault: str, prefix: str, deleted: list[str], disclose_paths: bool,
 ) -> ForbiddenError:
     """The table refusal of a recursive delete that already deleted documents.
 
     A caller who may not delete tables is refused before any document goes
     when the prefix holds a table. A table created under the prefix by
     another request after that check is found by the last transaction, which
-    checks again under its locks, once the documents are deleted. They stay
-    deleted, and the refusal says so, as a busy Vault's ``write_busy`` does:
-    ``partially_applied`` and the deleted documents' URIs in its details. The
-    same request from this caller is refused before deleting anything else;
-    only a caller allowed to delete the table can finish the delete.
+    checks again under its locks, once documents were deleted, or by the
+    check of a later round. The refusal says so, as a busy Vault's
+    ``write_busy`` does (see ``committed_deletions``). The same request from
+    this caller is refused before deleting anything else; only a caller
+    allowed to delete the table can finish the delete.
     """
-    uris = [doc_uri(vault, path) for path in deleted]
+    details, opening = committed_deletions(vault=vault, deleted=deleted, disclose_paths=disclose_paths)
     return ForbiddenError(
-        f"{refused.message}; {len(uris)} document(s) under {prefix!r} were deleted "
-        "before the table was found",
+        f"{refused.message}; this request had committed deletions for {len(deleted)} document(s) "
+        f"under {prefix!r} when the table was found",
         code=refused.code,
         hint=(
-            f"The documents in details.deleted_uris were deleted before a table appeared under "
-            f"{prefix!r}, and stay deleted. Only a caller with the 'admin' role on the Vault can "
-            "finish this delete: the same request from such a caller deletes the rest, the table "
-            "included. Sent again without that role, it is refused before anything else is deleted."
+            f"{opening} A table appeared under {prefix!r} after the delete checked for one. Only a "
+            "caller with the 'admin' role on the Vault can finish this delete: the same request "
+            "from such a caller deletes the rest, the table included. Sent again without that "
+            "role, it is refused before anything else is deleted."
         ),
-        details={"partially_applied": True, "deleted_docs": len(uris), "deleted_uris": uris},
+        details=details,
+    )
+
+
+def _documents_kept_arriving(
+    *, vault: str, prefix: str, deleted: list[str], disclose_paths: bool,
+) -> ConflictError:
+    """The conflict of a recursive delete whose rounds ran out while documents
+    kept arriving under its prefix."""
+    message = f"Documents kept arriving under {prefix!r} during the delete; retry it"
+    if not deleted:
+        return ConflictError(message)
+    details, opening = committed_deletions(vault=vault, deleted=deleted, disclose_paths=disclose_paths)
+    return ConflictError(
+        f"{message}; this request had committed deletions for {len(deleted)} document(s)",
+        hint=(
+            f"{opening} Send the same request again to continue the delete once documents stop "
+            f"arriving under {prefix!r}."
+        ),
+        details=details,
     )
 
 
@@ -366,6 +411,7 @@ class CollectionService:
         recursive: bool,
         agent_id: str | None,
         allow_table_delete: bool = False,
+        disclose_paths: bool = False,
     ) -> dict:
         """Delete a collection using **prefix semantics** over the path.
 
@@ -403,7 +449,10 @@ class CollectionService:
         the delete succeeds with zero counts instead of `NotFoundError` and
         records `collection.delete` (see `_earlier_recursive_delete`); the
         event is at least once, so it can be recorded more than once for one
-        prefix. The counts are what this call deleted.
+        prefix. The counts are what this call deleted. Paths of documents and
+        collections (`deleted_uris`, `retained_collections`) are given only
+        with `disclose_paths`, which the caller's boundary sets when the
+        caller may read the Vault; counts are given always.
 
         Race-safety: the target row (if any) and all sub-collection
         rows are locked `FOR UPDATE` inside the same transaction, so a
@@ -451,6 +500,7 @@ class CollectionService:
                         recursive=recursive, agent_id=agent_id,
                         allow_table_delete=allow_table_delete,
                         native_authority=native_authority, native_deleted=len(native_deleted),
+                        disclose_paths=disclose_paths,
                     )
                 except _DocumentsRemain:
                     continue
@@ -459,10 +509,11 @@ class CollectionService:
             if native_deleted:
                 raise _tables_refused_part_way(
                     exc, vault=vault, prefix=norm, deleted=native_deleted,
+                    disclose_paths=disclose_paths,
                 ) from exc
             raise
-        raise ConflictError(
-            f"Documents kept arriving under {norm!r} during the delete; retry it"
+        raise _documents_kept_arriving(
+            vault=vault, prefix=norm, deleted=native_deleted, disclose_paths=disclose_paths,
         )
 
     async def _refuse_tables_under(self, vault: str, vault_id: uuid.UUID, norm: str) -> None:
@@ -485,6 +536,7 @@ class CollectionService:
         allow_table_delete: bool,
         native_authority: bool,
         native_deleted: int,
+        disclose_paths: bool = False,
     ) -> dict:
         """The delete's last transaction: the collections, files, tables and
         legacy documents under ``norm``, and the `collection.delete` event.
@@ -900,6 +952,9 @@ class CollectionService:
         }
         if retained_paths:
             # After a Native cutover: these rows stay (see the retention step).
-            result["retained_collections"] = retained_paths
+            # Their paths only for a caller who may read the Vault.
+            result["retained_collection_count"] = len(retained_paths)
+            if disclose_paths:
+                result["retained_collections"] = retained_paths
             result["hint"] = RETAINED_COLLECTIONS_HINT
         return result

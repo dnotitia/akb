@@ -213,7 +213,10 @@ def exception_envelope(e: Exception) -> dict:
             )
         if e.code == NATIVE_REVISION_SELECTOR_AMBIGUOUS:
             return err(str(e), code=NATIVE_REVISION_SELECTOR_AMBIGUOUS)
-        return err(str(e), code=CONFLICT)
+        # A conflict that says more, such as a recursive delete that ran out
+        # of rounds after some of its documents went, keeps its hint and
+        # details.
+        return err(str(e), code=CONFLICT, hint=e.hint, **(e.details or {}))
     if isinstance(e, InvalidColumnTypeError):
         return err(
             str(e),

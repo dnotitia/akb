@@ -29,7 +29,11 @@ def client(monkeypatch):
     async def _writer(*_args, **_kwargs):
         return {"role": "writer"}
 
+    async def _reader(*_args, **_kwargs):
+        return True
+
     monkeypatch.setattr(collections, "check_vault_access", _writer)
+    monkeypatch.setattr(collections, "_can_read_vault", _reader)
     app.dependency_overrides[get_current_user] = lambda: _FakeUser()
     try:
         yield TestClient(app)
@@ -84,6 +88,7 @@ def test_delete_adds_only_literal_kind_and_preserves_all_counts(client, monkeypa
             "recursive": True,
             "agent_id": "u-collections",
             "allow_table_delete": False,
+            "disclose_paths": True,
         }
         return {
             "ok": True,
@@ -209,3 +214,39 @@ def test_a_table_refusal_after_documents_went_keeps_its_details(client, monkeypa
     assert (body["code"], body["details"], body["hint"]) == (
         "permission_denied", details, "only an admin can finish",
     )
+
+
+def test_delete_discloses_paths_only_to_a_reader(client, monkeypatch):
+    """A write-only credential's delete is told counts, not paths."""
+    seen = {}
+
+    async def _cannot_read(*_args, **_kwargs):
+        return False
+
+    async def _delete(**kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "collection": "p", "deleted_docs": 0, "deleted_files": 0,
+                "deleted_sub_collections": 0, "deleted_tables": 0}
+
+    monkeypatch.setattr(collections, "_can_read_vault", _cannot_read)
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/p", params={"recursive": "true"})
+    assert response.status_code == 200
+    assert seen["disclose_paths"] is False
+
+
+def test_a_conflict_after_documents_went_keeps_its_details(client, monkeypatch):
+    """A recursive delete that ran out of rounds after documents went answers
+    409 with what it did."""
+    from app.exceptions import ConflictError
+
+    details = {"partially_applied": True, "deleted_docs": 2}
+
+    async def _delete(**_kwargs):
+        raise ConflictError("kept arriving", hint="send it again", details=details)
+
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/notes", params={"recursive": "true"})
+    assert response.status_code == 409
+    body = response.json()
+    assert (body["code"], body["details"], body["hint"]) == ("conflict", details, "send it again")

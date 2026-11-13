@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user
+from app.api.routes.tables import _can_read_vault
 from app.exceptions import NotFoundError
 from app.models.document import BrowseResponse
 from app.services.access_service import check_vault_access
@@ -52,6 +53,8 @@ class AkbCollectionDeleteEnvelope(BaseModel):
     deleted_sub_collections: int
     deleted_tables: int
     # After a Native cutover: collections the delete left in place, and why.
+    # Their paths only for a caller who may read the Vault.
+    retained_collection_count: int | None = None
     retained_collections: list[str] | None = None
     hint: str | None = None
 
@@ -156,6 +159,8 @@ async def delete_collection(
             recursive=recursive,
             agent_id=user.user_id,
             allow_table_delete=role_level(access.get("role")) >= role_level("admin"),
+            # Paths of what the delete did or left go only to a reader.
+            disclose_paths=await _can_read_vault(user, vault),
         )
         return {"kind": "collection_delete", **result}
     except InvalidPathError as exc:
