@@ -6,6 +6,7 @@ This module intentionally has no public route or compatibility composition.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import inspect
 import json
@@ -129,6 +130,21 @@ def _verify_snapshot_payload(payload_bytes: bytes, row: dict) -> str:
     if hashlib.sha256(payload_bytes).hexdigest() != row["digest"]:
         raise ReferencePayloadIntegrityError("Head manifest digest mismatch")
     return payload_bytes.decode(row["encoding"], errors="strict")
+
+
+def _admitted_before_preparing(method):
+    """Admit a payload mutation for its Vault before it prepares the payload.
+
+    Preparing writes the payload's row on a connection of its own, so the
+    Vault's admission comes first: a refused mutation leaves no payload
+    behind. The publication inside is then admitted already.
+    """
+    @functools.wraps(method)
+    async def admitted(self, **kwargs):
+        async with self._vault_write_admission(kwargs["namespace_id"], kwargs["surface"]):
+            return await method(self, **kwargs)
+
+    return admitted
 
 
 class NativeRevisionService:
@@ -455,6 +471,7 @@ class NativeRevisionService:
             raise ConflictError(f"Native Resource conflict: reference changed while mutation waited: {reference}")
         return resource
 
+    @_admitted_before_preparing
     async def create_text(
         self,
         *,
@@ -760,6 +777,7 @@ class NativeRevisionService:
             occurred_at=occurred_at,
         )
 
+    @_admitted_before_preparing
     async def replace_text(
         self,
         *,
@@ -967,6 +985,7 @@ class NativeRevisionService:
             occurred_at=occurred_at,
         )
 
+    @_admitted_before_preparing
     async def restore_text(
         self,
         *,

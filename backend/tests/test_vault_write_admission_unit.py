@@ -44,7 +44,7 @@ async def test_a_vault_admits_up_to_its_limit_and_queues_the_rest():
     release.set()
     await asyncio.wait_for(asyncio.gather(*holders), timeout=5)
     assert entered[2].is_set()
-    assert admission.snapshot() == {"vaults": 0, "transactions": 0}
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
 
 
 async def test_a_full_vault_does_not_hold_back_another_vault():
@@ -77,11 +77,11 @@ async def test_a_wait_past_the_deadline_is_write_busy_and_leaves_nothing(monkeyp
     envelope = exception_envelope(busy.value)
     assert (envelope["code"], envelope["details"]["retry_after_secs"]) == (WRITE_BUSY, 1)
     assert not admission.is_admitted(vault)
-    # Only the two holders remain; the timed-out waiter left no count behind.
-    assert admission.snapshot() == {"vaults": 1, "transactions": 2}
+    # Only the two holders remain; the timed-out waiter left nothing behind.
+    assert admission.snapshot() == {"vaults": 1, "admitted": 2, "waiting": 0}
     release.set()
     await asyncio.gather(*holders)
-    assert admission.snapshot() == {"vaults": 0, "transactions": 0}
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
 
 
 async def test_admission_is_reentrant_within_a_task(monkeypatch):
@@ -106,7 +106,7 @@ async def test_several_vaults_are_admitted_together_or_not_at_all(monkeypatch):
     with pytest.raises(WriteBusyError):
         async with admission.vault_write_admission(second, first, None):
             pytest.fail("admitted while one Vault was full")
-    # The slot it took for `first` was given back.
+    # It held no slot of `first` while it waited.
     async with asyncio.timeout(1):
         async with admission.vault_write_admission(first):
             pass
@@ -115,6 +115,37 @@ async def test_several_vaults_are_admitted_together_or_not_at_all(monkeypatch):
     async with asyncio.timeout(1):
         async with admission.vault_write_admission(first, second):
             assert admission.is_admitted(first) and admission.is_admitted(second)
+
+
+async def test_a_full_vault_does_not_delay_another_vaults_writes(monkeypatch):
+    """A transaction for A and B waits while B is full, without holding A's
+    slot: a transaction for A alone is admitted at once, and the A-and-B one
+    follows when B frees."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1)
+    a, b = uuid.uuid4(), uuid.uuid4()
+    release_b = asyncio.Event()
+    b_held = asyncio.Event()
+    holder = asyncio.create_task(_hold(b, b_held, release_b))
+    await asyncio.wait_for(b_held.wait(), timeout=5)
+    both_entered, release_both = asyncio.Event(), asyncio.Event()
+
+    async def both() -> None:
+        async with admission.vault_write_admission(a, b):
+            both_entered.set()
+            await release_both.wait()
+
+    waiting = asyncio.create_task(both())
+    await asyncio.sleep(0.05)
+    assert admission.snapshot()["waiting"] == 1
+    async with asyncio.timeout(0.5):
+        async with admission.vault_write_admission(a):
+            assert not both_entered.is_set()
+    release_b.set()
+    await holder
+    await asyncio.wait_for(both_entered.wait(), timeout=5)
+    release_both.set()
+    await waiting
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
 
 
 async def test_a_cancelled_waiter_leaves_no_slot_taken(monkeypatch):
@@ -131,7 +162,7 @@ async def test_a_cancelled_waiter_leaves_no_slot_taken(monkeypatch):
         await waiter
     release.set()
     await holder
-    assert admission.snapshot() == {"vaults": 0, "transactions": 0}
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
     async with asyncio.timeout(1):
         async with admission.vault_write_admission(vault):
             pass
@@ -140,7 +171,7 @@ async def test_a_cancelled_waiter_leaves_no_slot_taken(monkeypatch):
 async def test_no_vault_is_no_admission():
     async with asyncio.timeout(1):
         async with admission.vault_write_admission(None):
-            assert admission.snapshot() == {"vaults": 0, "transactions": 0}
+            assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
 
 
 async def test_an_event_written_without_admission_is_logged_once(caplog, monkeypatch):

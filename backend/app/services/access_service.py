@@ -41,7 +41,11 @@ from app.services import document_counters
 from app.services.edge_boundary import edge_scope_sql, vault_uri_prefix
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
-from app.services.vault_write_admission import vault_write_admission
+from app.services.vault_write_admission import (
+    check_admitted_vault,
+    retry_if_vault_replaced,
+    vault_write_admission,
+)
 from app.services.write_lane import run_compensation, run_git_write
 from app.util.errors import NOT_FOUND, err
 from app.util.text import to_nfc
@@ -607,6 +611,7 @@ async def get_user_role(user_id: str, vault_name: str) -> str | None:
 
 # ── Grant / Revoke ───────────────────────────────────────────
 
+@retry_if_vault_replaced
 async def grant_access(
     granter_id: str, vault_name: str, target_username: str | None, role: str,
     *, target_user_id: str | None = None,
@@ -643,6 +648,7 @@ async def grant_access(
                 "SELECT id, owner_id, status, public_access FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
             )
+            check_admitted_vault(access["vault_id"], vault["id"] if vault else None)
             if not vault:
                 raise NotFoundError("Vault", vault_name)
             if vault["status"] == "archived":
@@ -713,6 +719,7 @@ async def grant_access(
     }
 
 
+@retry_if_vault_replaced
 async def revoke_access(
     revoker_id: str, vault_name: str, target_username: str | None,
     *, target_user_id: str | None = None,
@@ -745,6 +752,7 @@ async def revoke_access(
                 "SELECT id, owner_id, status, public_access FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
             )
+            check_admitted_vault(access["vault_id"], vault["id"] if vault else None)
             if not vault:
                 raise NotFoundError("Vault", vault_name)
             if vault["status"] == "archived":
@@ -1278,6 +1286,7 @@ def _coerce_example(v):
 
 # ── Transfer ownership ──────────────────────────────────────
 
+@retry_if_vault_replaced
 async def transfer_ownership(
     owner_id: str,
     vault_name: str,
@@ -1310,6 +1319,7 @@ async def transfer_ownership(
                 "SELECT id, owner_id FROM vaults WHERE name = $1 FOR UPDATE",
                 vault_name,
             )
+            check_admitted_vault(access["vault_id"], vault["id"] if vault else None)
             if not vault:
                 raise NotFoundError("Vault", vault_name)
             current_owner_uid = uuid.UUID(owner_id)
@@ -1520,6 +1530,7 @@ async def unarchive_vault(user_id: str, vault_name: str) -> dict:
     return {"vault": vault_name, "status": "active"}
 
 
+@retry_if_vault_replaced
 async def update_vault_metadata(
     user_id: str,
     vault_name: str,
@@ -1549,14 +1560,14 @@ async def update_vault_metadata(
     sql = f"UPDATE vaults SET {', '.join(sets)}, updated_at = NOW() WHERE name = ${len(args)}"
 
     pool = await get_pool()
-    async with vault_write_admission(
-        await _vault_id_for_admission(pool, vault_name), vault=vault_name,
-    ), pool.acquire() as conn:
+    admitted_id = await _vault_id_for_admission(pool, vault_name)
+    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
         async with role_authority_transaction(conn), deferred_events(conn) as events:
             # Ownership may change while waiting for the shared authority guard.
-            await check_vault_access(
+            found = await check_vault_access(
                 user_id, vault_name, required_role="owner", _conn=conn, _events=events,
             )
+            check_admitted_vault(admitted_id, found["vault_id"])
             await conn.execute(sql, *args)
             if public_access is not None:
                 vault_id = await conn.fetchval("SELECT id FROM vaults WHERE name=$1", vault_name)
@@ -1567,6 +1578,7 @@ async def update_vault_metadata(
     return {"vault": vault_name, "updated": True}
 
 
+@retry_if_vault_replaced
 async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
     """Owner-only mutation of `vaults.public_access`.
 
@@ -1583,15 +1595,15 @@ async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
     level = validate_public_access(level)
 
     pool = await get_pool()
-    async with vault_write_admission(
-        await _vault_id_for_admission(pool, vault_name), vault=vault_name,
-    ), pool.acquire() as conn:
+    admitted_id = await _vault_id_for_admission(pool, vault_name)
+    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
         # Events go in after the Vault row update and role DDL.
         async with role_authority_transaction(conn), deferred_events(conn) as events:
             # Ownership may change while waiting for the shared authority guard.
-            await check_vault_access(
+            found = await check_vault_access(
                 user_id, vault_name, required_role="owner", _conn=conn, _events=events,
             )
+            check_admitted_vault(admitted_id, found["vault_id"])
             vault = await conn.fetchrow(
                 "SELECT id, status FROM vaults WHERE name = $1", vault_name,
             )
@@ -1632,6 +1644,7 @@ async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
 # break-glass sequence (Task 8/9's handoff note) fully auditable: a smart
 # no-op dedup would hide exactly the events that sequence needs recorded.
 
+@retry_if_vault_replaced
 async def set_vault_write_policy(
     actor_id: str, vault_name: str, managed_by: str, note: str | None = None,
 ) -> dict:
@@ -1652,13 +1665,13 @@ async def set_vault_write_policy(
         raise ValidationError("managed_by must not be empty")
 
     pool = await get_pool()
-    async with vault_write_admission(
-        await _vault_id_for_admission(pool, vault_name), vault=vault_name,
-    ), pool.acquire() as conn:
+    admitted_id = await _vault_id_for_admission(pool, vault_name)
+    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
             )
+            check_admitted_vault(admitted_id, vault["id"] if vault else None)
             if not vault:
                 raise NotFoundError("Vault", vault_name)
 
@@ -1712,6 +1725,7 @@ async def set_vault_write_policy(
     }
 
 
+@retry_if_vault_replaced
 async def bootstrap_vault_write_policy(
     actor_id: str,
     vault_name: str,
@@ -1753,13 +1767,13 @@ async def bootstrap_vault_write_policy(
         normalized_grants.append((tid, str(tid), actions))
 
     pool = await get_pool()
-    async with vault_write_admission(
-        await _vault_id_for_admission(pool, vault_name), vault=vault_name,
-    ), pool.acquire() as conn:
+    admitted_id = await _vault_id_for_admission(pool, vault_name)
+    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
             )
+            check_admitted_vault(admitted_id, vault["id"] if vault else None)
             if not vault:
                 raise NotFoundError("Vault", vault_name)
 
@@ -1840,6 +1854,7 @@ async def bootstrap_vault_write_policy(
     }
 
 
+@retry_if_vault_replaced
 async def remove_vault_write_policy(actor_id: str, vault_name: str) -> dict:
     """Admin-only: unmark ``vault_name`` — restore ordinary ACL-gated writes.
 
@@ -1856,13 +1871,13 @@ async def remove_vault_write_policy(actor_id: str, vault_name: str) -> dict:
     prove the guard is a true no-op once unmarked, not a one-way ratchet.
     """
     pool = await get_pool()
-    async with vault_write_admission(
-        await _vault_id_for_admission(pool, vault_name), vault=vault_name,
-    ), pool.acquire() as conn:
+    admitted_id = await _vault_id_for_admission(pool, vault_name)
+    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
             )
+            check_admitted_vault(admitted_id, vault["id"] if vault else None)
             if not vault:
                 raise NotFoundError("Vault", vault_name)
 
@@ -1884,6 +1899,7 @@ async def remove_vault_write_policy(actor_id: str, vault_name: str) -> dict:
     return {"vault": vault_name, "unmarked": True, "was_marked": existing is not None}
 
 
+@retry_if_vault_replaced
 async def add_vault_write_grant(
     actor_id: str,
     vault_name: str,
@@ -1910,13 +1926,13 @@ async def add_vault_write_grant(
         raise ValidationError(f"Invalid token_id: {token_id!r}") from None
 
     pool = await get_pool()
-    async with vault_write_admission(
-        await _vault_id_for_admission(pool, vault_name), vault=vault_name,
-    ), pool.acquire() as conn:
+    admitted_id = await _vault_id_for_admission(pool, vault_name)
+    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
             )
+            check_admitted_vault(admitted_id, vault["id"] if vault else None)
             if not vault:
                 raise NotFoundError("Vault", vault_name)
 
@@ -1976,6 +1992,7 @@ async def add_vault_write_grant(
     return result
 
 
+@retry_if_vault_replaced
 async def remove_vault_write_grant(actor_id: str, vault_name: str, token_id: str) -> dict:
     """Admin-only: revoke ``token_id``'s write grant on ``vault_name``.
 
@@ -1993,13 +2010,13 @@ async def remove_vault_write_grant(actor_id: str, vault_name: str, token_id: str
         raise ValidationError(f"Invalid token_id: {token_id!r}") from None
 
     pool = await get_pool()
-    async with vault_write_admission(
-        await _vault_id_for_admission(pool, vault_name), vault=vault_name,
-    ), pool.acquire() as conn:
+    admitted_id = await _vault_id_for_admission(pool, vault_name)
+    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
             )
+            check_admitted_vault(admitted_id, vault["id"] if vault else None)
             if not vault:
                 raise NotFoundError("Vault", vault_name)
 

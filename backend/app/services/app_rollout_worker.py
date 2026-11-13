@@ -16,7 +16,7 @@ from typing import Any
 from app.services.role_authority import role_authority_transaction
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import ConflictError, ValidationError
+from app.exceptions import ConflictError, ValidationError, WriteBusyError
 from app.repositories import table_data_repo, table_registry_repo
 from app.repositories.events_repo import EventBuffer, deferred_events
 from app.services import app_rollout_service, table_service
@@ -559,8 +559,27 @@ async def _process_once() -> int:
                 await conn.execute("UPDATE app_rollout_jobs SET status='running' WHERE id=$1 AND status='pending'", target["job_id"])
     if not target:
         return 0
-    await _process_target(target)
+    try:
+        await _process_target(target)
+    except WriteBusyError:
+        # The Vault's admission refused the target before any of its work.
+        # Give the lease back so the target is retried, rather than held,
+        # with the rest of its batch, until the lease expires.
+        await _release_target(target)
+        logger.info("rollout target %s deferred: its Vault is busy", target["id"])
+        return 0
     return 1
+
+
+async def _release_target(target: dict[str, Any]) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE app_rollout_targets SET state='pending', attempts=GREATEST(attempts-1, 0), "
+            "lease_owner=NULL, lease_expires_at=NULL "
+            "WHERE id=$1 AND state='running' AND lease_owner=$2",
+            target["id"], _worker_id,
+        )
 
 
 _worker_id = f"rollout-{uuid.uuid4()}"
