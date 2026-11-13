@@ -9,11 +9,15 @@ Lookup order (first hit wins):
 The split exists so that `app.yaml` is safe to commit/share (no
 secrets) and `secret.yaml` stays out of source control. Both files
 are flat YAML mappings using the same keys as the Settings model
-below — no environment variables are read, with one deliberate
-exception: the AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE pool-sizing
-overrides read in app/db/postgres.py, a deployment-layer knob so
-k8s operators and the akb-platform control plane can tune the pool
-per deployment without re-rendering config files.
+below — no environment variables are read here. The deliberate
+exceptions are deployment-layer overrides, read where they apply so
+k8s operators and the akb-platform control plane can tune a deployment
+without re-rendering config files. CONTRIBUTING.md (Configuration)
+lists them; where one replaces a key below, the variable wins. For
+example, AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE replace the pool
+sizes and are read in app/db/postgres.py, and
+AKB_VAULT_HEALTH_CACHE_TTL_SECS replaces vault_health_cache_ttl_secs
+and is read once, when app/services/health.py is imported.
 """
 
 import ipaddress
@@ -25,7 +29,7 @@ from typing import Literal, cast
 from urllib.parse import quote, urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from app.services.sparse_shapes import SparseShape, SparseShapeDecision, SparseShapeSetting
 
@@ -53,6 +57,11 @@ def parse_git_version(text: str) -> tuple[int, int, int] | None:
 
 
 NATIVE_REVISION_M1_MEASUREMENT_DATABASE_NAME = "akb_revision_m1_measurement"
+
+# Upper bound of `vault_health_cache_ttl_secs`. Shared with the
+# AKB_VAULT_HEALTH_CACHE_TTL_SECS override in app/services/health.py so the
+# YAML key and the environment variable enforce one range.
+VAULT_HEALTH_CACHE_TTL_MAX_SECS = 3600.0
 
 _DNS1123_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _NATIVE_RUNTIME_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -522,7 +531,7 @@ class Settings(BaseModel):
     # max_connections is 100 and the pgvector driver holds its own pool of
     # up to 8 — while giving concurrent write bursts more headroom. The
     # AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE env vars take precedence
-    # over these keys (the one deliberate env exception; module docstring).
+    # over these keys (a deliberate env exception; module docstring).
     pg_pool_min_size: int = 2
     pg_pool_max_size: int = 30
 
@@ -1304,6 +1313,28 @@ class Settings(BaseModel):
     # embedding API's rate limit or PG pool budget caps it. 1 keeps the
     # legacy single-task behavior; 4-8 is the typical production knob.
     indexing_concurrency: int = 1
+    # Per-vault indexing health (`GET /health/vault/{name}`) is a set of
+    # aggregates over the vault's whole chunk and queue population, so its
+    # cost grows with the vault, and the web console polls it for each of the
+    # user's vaults on a timer, from every open tab. Each API process reuses
+    # one result per vault for this many seconds; concurrent misses share one
+    # computation, and neither a failure nor a result missing a part that
+    # failed is reused. The reader-role check still
+    # runs on every request. 0 disables the cache. The
+    # AKB_VAULT_HEALTH_CACHE_TTL_SECS env var takes precedence (a
+    # deployment-layer knob, the same class as AKB_PG_POOL_MIN_SIZE/MAX_SIZE);
+    # see app/services/health.py.
+    vault_health_cache_ttl_secs: float = Field(default=30.0, ge=0.0, le=VAULT_HEALTH_CACHE_TTL_MAX_SECS)
+
+    @field_validator("vault_health_cache_ttl_secs", mode="before")
+    @classmethod
+    def refuse_boolean_vault_health_cache_ttl(cls, value: object) -> object:
+        # YAML reads true/false (and on/off, yes/no) as booleans, which a float
+        # field takes as 1 and 0, so `false` would quietly turn the cache off.
+        # The AKB_VAULT_HEALTH_CACHE_TTL_SECS override refuses the same words.
+        if isinstance(value, bool):
+            raise ValueError("vault_health_cache_ttl_secs must be a number of seconds, not a boolean")
+        return value
 
     # ── Write-lane admission (design/proposal/command-lane-write-path,
     # round-05). Git-committing writes pass a two-stage gate BEFORE
