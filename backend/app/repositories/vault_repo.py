@@ -60,8 +60,12 @@ class VaultRepository:
         owner_id: uuid.UUID | None = None,
         public_access: str = "none",
         conn=None,
+        *,
+        vault_id: uuid.UUID | None = None,
     ) -> uuid.UUID:
-        vault_id = uuid.uuid4()
+        """Insert the Vault row. ``vault_id`` lets a creator that already
+        holds the new Vault's write admission give the row that id."""
+        vault_id = vault_id or uuid.uuid4()
         sql = "INSERT INTO vaults (id, name, description, git_path, owner_id, public_access) VALUES ($1, $2, $3, $4, $5, $6)"
         args = (vault_id, name, description, git_path, owner_id, public_access)
         try:

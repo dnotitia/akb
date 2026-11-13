@@ -1723,8 +1723,11 @@ class NativeDocumentService(DocumentService):
         # These strict same-connection hooks observe the uncommitted catalog
         # row while scoped PAT memberships are computed, and PostgreSQL rolls
         # back both the row and role DDL if either hook fails or is cancelled.
+        new_vault_id = uuid.uuid4()
         try:
-            async with pool.acquire() as conn:
+            # Admitted before its connection like every event write; nothing
+            # else can reach the Vault before this transaction commits.
+            async with vault_write_admission(new_vault_id, vault=name), pool.acquire() as conn:
                 async with role_authority_transaction(conn):
                     vault_id = await vault_repo.create(
                         name=name,
@@ -1733,22 +1736,19 @@ class NativeDocumentService(DocumentService):
                         owner_id=uid,
                         public_access=public_access,
                         conn=conn,
+                        vault_id=new_vault_id,
                     )
                     role_sync = get_role_sync()
                     await role_sync.on_vault_create_in_conn(conn, vault_id, uid)
                     await role_sync.on_public_access_change_in_conn(
                         conn, vault_id, public_access,
                     )
-                    # The seed writes the Vault's first event. The Vault
-                    # exists only in this transaction, so nothing else holds
-                    # its admission and entering it here does not wait.
-                    async with vault_write_admission(vault_id, vault=name):
-                        await self._seed_native_vault_skill(
-                            conn,
-                            vault_id=vault_id,
-                            vault_name=name,
-                            owner_id=uid,
-                        )
+                    await self._seed_native_vault_skill(
+                        conn,
+                        vault_id=vault_id,
+                        vault_name=name,
+                        owner_id=uid,
+                    )
         except asyncpg.UniqueViolationError as exc:
             if exc.constraint_name == "vaults_name_key":
                 raise VaultNameUnavailableError() from exc

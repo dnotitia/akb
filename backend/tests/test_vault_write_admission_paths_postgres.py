@@ -3,10 +3,13 @@
 Each case below holds the only admission slot of a Vault in another task and
 then drives one write of that Vault through its service. The write must fail
 with a retryable `write_busy` within the admission deadline, before it changed
-anything: no event, no row, no Git commit. A path that took its pool connection
-without admission would instead go ahead (or wait on the database), so a
-missing path fails its case. Once the slot is free the same write succeeds and
-records an event, which shows the case drives a real event write.
+anything: no event, no row, no prepared payload, no File lease, no Git commit.
+While it waits for admission it must hold no more pool connections than before
+it started. A path that took its pool connection without admission would
+instead go ahead (or wait on the database), and one that took it before
+admission would hold it while waiting, so a missing path fails its case. Once
+the slot is free the same write succeeds and records an event, which shows the
+case drives a real event write.
 
 `test_every_vault_event_writer_is_registered` keeps the list complete: it scans
 the application for every place that writes a Vault's events and fails when one
@@ -37,12 +40,14 @@ from app.repositories.document_repo import CollectionRepository
 from app.services import (
     access_service,
     app_rollout_worker,
+    document_counters,
     file_service,
     table_migration_service,
     table_row_write,
     table_service,
     user_sql_executor,
 )
+from app.services import vault_write_admission as admission
 from app.services.collection_service import CollectionService
 from app.services.document_service import DocumentService
 from app.services.external_git_service import ExternalGitService
@@ -192,10 +197,23 @@ async def _native_document(ctx: _Context, operation: str) -> _Case:
         namespace_id=vault_id, surface="document", path="notes/first.md",
         payload="first body", actor="tester", mutation_id=uuid.uuid4(),
     )
+    gone = await native.create_text(
+        namespace_id=vault_id, surface="document", path="notes/gone.md",
+        payload="gone body", actor="tester", mutation_id=uuid.uuid4(),
+    )
+    tombstone = await native.delete_resource(
+        namespace_id=vault_id, surface="document", path=gone.path, actor="tester",
+        mutation_id=uuid.uuid4(), expected_revision_id=gone.revision_id,
+    )
     writes = {
         "create": lambda: native.create_text(
             namespace_id=vault_id, surface="document", path="notes/second.md",
             payload="second body", actor="tester", mutation_id=uuid.uuid4(),
+        ),
+        "restore": lambda: native.restore_text(
+            namespace_id=vault_id, surface="document", path=gone.path, payload="restored body",
+            actor="tester", mutation_id=uuid.uuid4(), expected_revision_id=tombstone.revision_id,
+            expected_resource_id=gone.resource_id,
         ),
         "replace": lambda: native.replace_text(
             namespace_id=vault_id, surface="document", path=doc.path, payload="changed body",
@@ -218,6 +236,13 @@ async def _collection(ctx: _Context, operation: str) -> _Case:
     vault_id = await _make_vault(ctx.pool, vault)
     await CollectionRepository(ctx.pool).get_or_create(vault_id, "existing")
     collections = CollectionService(git=object())
+    if operation == "native_delete":
+        # Each Native document goes in a transaction of its own.
+        ctx.monkeypatch.setattr(document_counters, "native_documents_are_authoritative", lambda: True)
+        await ctx.native().create_text(
+            namespace_id=vault_id, surface="document", path="existing/first.md",
+            payload="first body", actor="tester", mutation_id=uuid.uuid4(),
+        )
     if operation == "create":
         return _Case(vault_id, lambda: collections.create(
             vault=vault, path="fresh", summary=None, agent_id="tester",
@@ -364,8 +389,8 @@ async def _external_git(ctx: _Context, operation: str) -> _Case:
 
 _CASES: dict[str, tuple[Callable[[_Context, str], Awaitable[_Case]], str]] = {
     **{f"git.{op}": (_git_document, op) for op in ("put", "update", "edit", "move", "delete")},
-    **{f"native.{op}": (_native_document, op) for op in ("create", "replace", "move", "delete")},
-    **{f"collection.{op}": (_collection, op) for op in ("create", "delete")},
+    **{f"native.{op}": (_native_document, op) for op in ("create", "replace", "restore", "move", "delete")},
+    **{f"collection.{op}": (_collection, op) for op in ("create", "delete", "native_delete")},
     **{f"file.{op}": (_file, op) for op in ("confirm", "replace", "delete")},
     **{f"table.{op}": (_table, op) for op in ("create", "drop", "alter", "migration", "rows", "sql")},
     **{f"access.{op}": (_access, op) for op in (
@@ -399,17 +424,28 @@ async def _vault_full(vault_id: uuid.UUID):
 async def _state(pool, vault_id: uuid.UUID) -> dict:
     """Everything a write of the Vault could have changed."""
     tables = (
-        "events", "documents", "collections", "vault_files", "vault_tables", "vault_access",
-        "vault_write_policy", "vault_write_grants", "native_resources", "native_revisions",
+        "events", "documents", "collections", "vault_tables", "vault_access",
+        "vault_write_policy", "vault_write_grants",
     )
     state = {table: await pool.fetchval(f"SELECT count(*) FROM {table} WHERE vault_id = $1", vault_id)
-             for table in tables if table not in {"native_resources", "native_revisions"}}
-    for table in ("native_resources", "native_revisions"):
+             for table in tables}
+    for table in ("native_resources", "native_revisions", "m1_reference_payloads"):
         state[table] = await pool.fetchval(f"SELECT count(*) FROM {table} WHERE namespace_id = $1", vault_id)
+    # Every column, so a lease that only moved `updated_at` shows too.
+    state["vault_files"] = await pool.fetchval(
+        "SELECT coalesce(string_agg(f::text, '|' ORDER BY f.id), '') FROM vault_files f WHERE vault_id = $1",
+        vault_id,
+    )
     state["vault"] = dict(await pool.fetchrow(
         "SELECT owner_id, description, public_access, updated_at FROM vaults WHERE id = $1", vault_id,
     ))
     state["outbox"] = await pool.fetchval("SELECT count(*) FROM s3_delete_outbox")
+    vault_name = await pool.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
+    state["table_rows"] = {}
+    for table in await pool.fetch("SELECT name FROM vault_tables WHERE vault_id = $1 ORDER BY name", vault_id):
+        pg_name = table_data_repo.pg_table_name(vault_name, table["name"])
+        if await pool.fetchval("SELECT to_regclass($1) IS NOT NULL", pg_name):
+            state["table_rows"][table["name"]] = await pool.fetchval(f"SELECT count(*) FROM {pg_name}")
     return state
 
 
@@ -425,10 +461,12 @@ async def test_a_write_waits_for_its_vaults_admission(case, tmp_path, monkeypatc
         heads_before = _git_heads(tmp_path)
         async with _vault_full(prepared.vault_id):
             started = time.monotonic()
-            with pytest.raises(WriteBusyError):
-                await asyncio.wait_for(prepared.write(), timeout=_DEADLINE + 5)
+            held_while_waiting = await _refused_holding_no_more_connections(pool, prepared.write)
             waited = time.monotonic() - started
         assert waited < _DEADLINE + 2, waited
+        assert held_while_waiting <= 0, (
+            f"held {held_while_waiting} more pool connection(s) while waiting for admission"
+        )
         after = await _state(pool, prepared.vault_id)
         for key in prepared.allowed_changes:
             after.pop(key), before.pop(key)
@@ -439,6 +477,33 @@ async def test_a_write_waits_for_its_vaults_admission(case, tmp_path, monkeypatc
             assert await pool.fetchval(
                 "SELECT count(*) FROM events WHERE vault_id = $1", prepared.vault_id,
             ) > before["events"]
+
+
+async def _refused_holding_no_more_connections(pool, write: Callable[[], Awaitable[object]]) -> int:
+    """Run a write that its Vault's admission must refuse, and return the most
+    pool connections it held above the starting count while it waited for
+    admission."""
+    def in_use() -> int:
+        return pool.get_size() - pool.get_idle_size()
+
+    baseline = in_use()
+    peak = None
+    task = asyncio.ensure_future(write())
+    deadline = time.monotonic() + _DEADLINE + 5
+    try:
+        while not task.done() and time.monotonic() < deadline:
+            # The loop runs one task at a time: while the write is registered
+            # as a waiter, it is suspended in the admission wait.
+            if admission.snapshot()["waiting"]:
+                peak = max(peak if peak is not None else in_use(), in_use())
+            await asyncio.sleep(0.002)
+    finally:
+        if not task.done():
+            task.cancel()
+    with pytest.raises(WriteBusyError):
+        await task
+    assert peak is not None, "the write never waited for admission"
+    return peak - baseline
 
 
 def _git_heads(storage: Path) -> dict[str, str]:
@@ -469,7 +534,8 @@ _EMITTERS: dict[str, str] = {
     "services/access_service.py:check_vault_access": "access.check_override",
     "services/app_rollout_worker.py:_process_target": "app_rollout.target",
     "services/collection_service.py:CollectionService.create": "collection.create",
-    "services/collection_service.py:CollectionService.delete": "collection.delete",
+    "services/collection_service.py:CollectionService._delete_collections": "collection.delete",
+    "services/collection_service.py:_delete_native_document": "collection.native_delete",
     "services/document_service.py:DocumentService._put_locked": "git.put",
     "services/document_service.py:DocumentService._update_locked": "git.update",
     "services/document_service.py:DocumentService._edit_locked": "git.edit",
@@ -482,7 +548,7 @@ _EMITTERS: dict[str, str] = {
     "services/file_service.py:FileService.delete": "file.delete",
     "services/native_revision_service.py:NativeRevisionService._publish_create": "native.create",
     "services/native_revision_service.py:NativeRevisionService._publish_replace": "native.replace",
-    "services/native_revision_service.py:NativeRevisionService._publish_restore": "native.replace",
+    "services/native_revision_service.py:NativeRevisionService._publish_restore": "native.restore",
     "services/native_revision_service.py:NativeRevisionService._publish_move": "native.move",
     "services/native_revision_service.py:NativeRevisionService._publish_delete": "native.delete",
     "services/table_migration_service.py:apply_table_migration": "table.migration",

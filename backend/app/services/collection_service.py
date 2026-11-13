@@ -165,7 +165,7 @@ async def _delete_native_document(
     the Resource has a later Revision.
     """
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with vault_write_admission(vault_id, vault=vault), pool.acquire() as conn:
         async with conn.transaction():
             row = await native.repository.lock_resource(conn, resource_id)
             if (

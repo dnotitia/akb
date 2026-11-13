@@ -69,6 +69,11 @@ T = TypeVar("T")
 # admitted writers (holding PG connections) would have to sit in.
 _slot_held: ContextVar[bool] = ContextVar("akb_write_slot_held", default=False)
 
+# Vaults whose gate the current task holds. A nested write_lane for one of
+# them is entered without waiting: Vault creation holds its new Vault's gate
+# through the seed document's own write.
+_gates_held: ContextVar[frozenset[str]] = ContextVar("akb_write_gates_held", default=frozenset())
+
 # Per-vault admission gates (1 concurrent writer per vault — git commits
 # serialize per vault anyway, so more buys nothing while git is on the
 # synchronous path; see round-05 "granularity").
@@ -117,8 +122,13 @@ async def write_lane(vault: str):
     the whole critical section (git commit + PG transaction). Raises
     :class:`WriteBusyError` (→ 429) when the deadline or the global waiter
     backstop is exceeded — in both cases no work has been done yet.
+    Re-entrant within a task: a call nested in one for the same ``vault``
+    holds its gate and slot already and does not wait.
     """
     global _waiters
+    if vault in _gates_held.get():
+        yield
+        return
     if _waiters >= settings.write_lane_max_waiters:
         logger.warning(
             "write lane backstop hit (%d waiters) — rejecting write for vault %s",
@@ -148,7 +158,11 @@ async def write_lane(vault: str):
         finally:
             _waiters -= 1
         slot_token = _slot_held.set(True)
-        yield
+        gates_token = _gates_held.set(_gates_held.get() | {vault})
+        try:
+            yield
+        finally:
+            _gates_held.reset(gates_token)
     finally:
         if slot_token is not None:
             _slot_held.reset(slot_token)
