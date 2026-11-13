@@ -159,6 +159,10 @@ async def test_measurement_upload_checks_the_parent_vault_lock(monkeypatch):
         def transaction(self):
             return FakeTransaction()
 
+        async def execute(self, *_args):
+            # Expired intents are removed first, in a statement of their own.
+            return "DELETE 0"
+
     class FakeAcquire:
         async def __aenter__(self):
             return FakeConnection()

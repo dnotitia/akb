@@ -24,11 +24,13 @@ import asyncpg
 import pytest
 
 import app.services.document_service as document_service_module
+from app.config import settings
 from app.models.document import DocumentPutRequest
 from app.repositories.document_repo import CollectionRepository
 from app.services.collection_service import CollectionService
 from app.services.document_service import DocumentService
 from app.services.git_service import GitService
+from app.services.m1_file_measurement import MeasurementFileService
 from tests.test_document_git_event_lock_postgres import _until_blocked
 from tests.test_events_commit_order_postgres import (
     _EVENT_LOCK_WAIT_SECONDS,
@@ -280,6 +282,86 @@ async def test_a_creation_locks_its_ancestors_in_id_order(tmp_path):
         # The put created `p/q/new` after the delete, whole.
         assert await _collections(pool, vault_id) == [("p/q/new", 1, 1)]
         assert "deep body" in git.read_file(vault, put.path)
+
+
+async def test_an_upload_into_a_new_sub_collection_and_a_recursive_delete_do_not_deadlock(
+    tmp_path, monkeypatch,
+):
+    """A measurement File upload into a new `p/new` removes expired transfer
+    intents and then creates the collection. An expired intent of `p` cascades
+    with `p`'s row when a recursive delete removes it. Removing the intents in
+    the upload's transaction, the upload held that intent while it waited for
+    `p`, which the delete holds, and the delete waited for the intent: a
+    deadlock. The upload now removes them in a transaction of its own first."""
+    monkeypatch.setattr(settings, "native_revision_m1_file_driver", "fscas")
+    monkeypatch.setattr(settings, "native_revision_m1_file_fscas_root", str(tmp_path))
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.test")
+    collections = CollectionService(git=object())
+    async with _fresh_database() as pool:
+        vault = "child-create-upload"
+        vault_id = await _make_vault(pool, vault)
+        parent = await CollectionRepository(pool).get_or_create(vault_id, "p")
+        await pool.execute(
+            "INSERT INTO m1_file_transfer_intents (id, file_id, vault_id, collection_id, method, "
+            "filename, mime_type, actor_id, token_digest, expires_at) "
+            "VALUES ($1, $2, $3, $4, 'PUT', 'old.bin', 'application/octet-stream', 'fixture', $5, "
+            "NOW() - INTERVAL '1 hour')",
+            uuid.uuid4(), uuid.uuid4(), vault_id, parent, "a" * 64,
+        )
+
+        # Hold the delete at its document read, with `p` locked.
+        list_docs_under = CollectionRepository.list_docs_under
+        delete_reading = asyncio.Event()
+        release_delete = asyncio.Event()
+        delete_pid: int | None = None
+
+        async def holding_list_docs_under(self, *args, **kwargs):
+            nonlocal delete_pid
+            if delete_pid is None:
+                delete_pid = kwargs["conn"].get_server_pid()
+                delete_reading.set()
+                await release_delete.wait()
+            return await list_docs_under(self, *args, **kwargs)
+
+        monkeypatch.setattr(CollectionRepository, "list_docs_under", holding_list_docs_under)
+
+        deleting = asyncio.create_task(collections.delete(
+            vault=vault, path="p", recursive=True, agent_id="tester",
+        ))
+        uploading: asyncio.Task | None = None
+        async with pool.acquire() as observer:
+            try:
+                await asyncio.wait_for(delete_reading.wait(), timeout=10)
+                assert delete_pid is not None
+                uploading = asyncio.create_task(MeasurementFileService().initiate_upload(
+                    vault_name=vault, vault_id=vault_id, collection="p/new", filename="new.bin",
+                    actor_id="tester", mime_type="application/octet-stream", description="",
+                    content_hash=None,
+                ))
+
+                async def upload_waits_for_the_delete() -> None:
+                    while not await observer.fetchval(
+                        "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                        delete_pid,
+                    ):
+                        await asyncio.sleep(0.01)
+
+                await asyncio.wait_for(upload_waits_for_the_delete(), timeout=10)
+                release_delete.set()
+                deleted, uploaded = await asyncio.wait_for(
+                    asyncio.gather(deleting, uploading, return_exceptions=True), timeout=_TIMEOUT,
+                )
+            finally:
+                release_delete.set()
+                await _cancel(deleting, uploading)
+
+        assert not isinstance(deleted, BaseException), repr(deleted)
+        assert not isinstance(uploaded, BaseException), repr(uploaded)
+        # The upload created `p/new` after the delete removed `p`.
+        assert await _collections(pool, vault_id) == [("p/new", 0, 0)]
+        assert await pool.fetchval(
+            "SELECT count(*) FROM m1_file_transfer_intents WHERE vault_id = $1", vault_id,
+        ) == 1
 
 
 @pytest.mark.parametrize("entry", ["get_or_create", "create_empty"])
