@@ -25,7 +25,12 @@ from app.exceptions import ConflictError, WriteBusyError
 from app.models.document import DocumentPutRequest
 from app.repositories import events_repo
 from app.repositories.events_repo import emit_event
-from app.services import access_service, file_service
+from app.services import (
+    access_service,
+    file_service,
+    table_service,
+    user_sql_executor,
+)
 from app.services import app_rollout_worker as rollout_worker
 from app.services import document_service as document_service_module
 from app.services.collection_service import CollectionService
@@ -336,6 +341,44 @@ async def test_a_vault_write_is_admitted_for_the_vault_it_finds_by_name(monkeypa
             await access_service.set_vault_write_policy("tester", "renamed-twice", "collector:test")
 
 
+async def test_sql_is_admitted_for_the_vault_it_finds_by_name(monkeypatch):
+    """The same for raw SQL, whose declared Vault names are resolved to ids
+    for its admission before its transaction checks their write policy."""
+    async with _fresh_database() as pool:
+        await _make_vault(pool, "sql-renamed")
+        admin = await pool.fetchval(
+            "INSERT INTO users (id, username, email, password_hash, is_admin) "
+            "VALUES ($1, 'sql-renamed-admin', 'sql-renamed-admin@example.com', '!fixture!', TRUE) RETURNING id",
+            uuid.uuid4(),
+        )
+        await pool.execute("CREATE TABLE sql_renamed_rows (value text)")
+        executor = user_sql_executor.UserSqlExecutor(pool)
+        admitted_runs: list[bool] = []
+        run_statement = user_sql_executor._run_statement
+
+        async def record(conn, *args, **kwargs):
+            if await conn.fetchval("SHOW transaction_read_only") == "off":
+                current = await conn.fetchval("SELECT id FROM vaults WHERE name = 'sql-renamed'")
+                admitted_runs.append(is_admitted(current))
+            return await run_statement(conn, *args, **kwargs)
+
+        monkeypatch.setattr(user_sql_executor, "_run_statement", record)
+        _vault_replaced_while_waiting(pool, monkeypatch, executor, "_vault_ids", 1)
+
+        def insert():
+            return executor.execute(
+                user_id=admin, actor_id="tester", sql="INSERT INTO sql_renamed_rows VALUES ('row')",
+                is_admin=True, vault_names=["sql-renamed"], enforce_vault_write_policy=True,
+            )
+
+        await insert()
+        assert admitted_runs == [True]
+        _vault_replaced_while_waiting(pool, monkeypatch, executor, "_vault_ids", 2)
+        with pytest.raises(ConflictError):
+            await insert()
+        assert await pool.fetchval("SELECT count(*) FROM sql_renamed_rows") == 1
+
+
 async def test_a_rollout_target_refused_by_its_vaults_admission_is_released(monkeypatch):
     """The worker leases a rollout target and then waits for the target's
     Vault. When the admission refuses it, the worker gives the lease back, so
@@ -354,3 +397,66 @@ async def test_a_rollout_target_refused_by_its_vaults_admission_is_released(monk
         assert dict(target) == {"state": "pending", "attempts": 0, "lease_owner": None, "lease_expires_at": None}
         assert await rollout_worker.run_once() == 1
         assert await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", job_id) == "applied"
+
+
+async def test_sql_reads_run_while_their_vault_is_full(tmp_path, monkeypatch):
+    """A Vault's admission is full. A SELECT through raw SQL runs at once, in
+    a read-only transaction without admission. A statement that writes, here
+    a data-modifying WITH that starts like a query, is refused by PostgreSQL
+    in that transaction and then waits for the Vault's admission."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.3, raising=False)
+    async with _fresh_database() as pool:
+        ctx = _Context(pool=pool, tmp_path=tmp_path, monkeypatch=monkeypatch)
+        vault = "sql-reads"
+        vault_id = await _make_vault(pool, vault)
+        monkeypatch.setattr(table_service, "get_role_sync", lambda: _AnyRoleSync())
+        pg_name = await ctx.table(vault, vault_id)
+        admin = await ctx.user(f"{vault}-admin", admin=True)
+        monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(pool))
+
+        def run(sql: str):
+            return table_service.execute_sql(
+                vault_names=[vault], user_id=str(admin), actor_id="tester", sql=sql, is_admin=True,
+            )
+
+        async with _vault_full(vault_id):
+            started = time.monotonic()
+            read = await run(f"SELECT count(*) AS n FROM {pg_name}")
+            assert time.monotonic() - started < 0.3
+            assert read["items"] == [{"n": 0}]
+            with pytest.raises(WriteBusyError):
+                await run(
+                    f"WITH added AS (INSERT INTO {pg_name} (value) VALUES ('row') RETURNING value) "
+                    "SELECT value FROM added"
+                )
+        assert await pool.fetchval(f"SELECT count(*) FROM {pg_name}") == 0
+
+
+async def test_sql_is_admitted_for_the_tables_its_plan_writes_before_it_runs(tmp_path, monkeypatch):
+    """A statement declared for one Vault whose plan writes another Vault's
+    table is admitted for both before it runs, so it runs once, admitted for
+    the Vault it writes; the check of its queued row changes before commit
+    then finds nothing to add."""
+    async with _fresh_database() as pool:
+        ctx = _Context(pool=pool, tmp_path=tmp_path, monkeypatch=monkeypatch)
+        await _make_vault(pool, "plan-declared")
+        target = await _make_vault(pool, "plan-target")
+        pg_name = await ctx.table("plan-target", target)
+        admin = await ctx.user("plan-target-admin", admin=True)
+        monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(pool))
+        writes: list[bool] = []
+        run_statement = user_sql_executor._run_statement
+
+        async def record(conn, *args, **kwargs):
+            if await conn.fetchval("SHOW transaction_read_only") == "off":
+                writes.append(is_admitted(target))
+            return await run_statement(conn, *args, **kwargs)
+
+        monkeypatch.setattr(user_sql_executor, "_run_statement", record)
+        result = await table_service.execute_sql(
+            vault_names=["plan-declared"], user_id=str(admin), actor_id="tester",
+            sql=f"INSERT INTO {pg_name} (value) VALUES ('row')", is_admin=True,
+        )
+        assert result["affected_rows"] == 1
+        assert writes == [True]

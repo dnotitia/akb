@@ -9,7 +9,7 @@ import pytest
 
 from app.services.role_sync import user_role_name
 from app.services.user_sql_executor import PermissionDeniedError, UserSqlExecutor
-from tests.test_table_row_cas_postgres import _database_dsn, _DSN, _fresh_database
+from tests.test_events_commit_order_postgres import _database_dsn, _DSN, _fresh_database
 
 
 @pytest.mark.asyncio

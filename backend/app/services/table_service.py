@@ -2041,8 +2041,9 @@ async def execute_sql(
             code=UNIQUE_VIOLATION,
             pg_sqlstate=e.pg_sqlstate,
         )
-    except (NotFoundError, TransientDependencyError, WriteBusyError):
-        # Preserve a Vault disappearing after name resolution, dependency
+    except (ConflictError, NotFoundError, TransientDependencyError, WriteBusyError):
+        # Preserve a Vault disappearing after name resolution, or replaced
+        # under its name twice while the statement waited, dependency
         # failures and a busy Vault's admission (a retryable write_busy)
         # without acquiring another connection for SQL hints.
         raise
