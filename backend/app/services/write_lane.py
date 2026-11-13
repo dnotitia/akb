@@ -69,9 +69,9 @@ T = TypeVar("T")
 # admitted writers (holding PG connections) would have to sit in.
 _slot_held: ContextVar[bool] = ContextVar("akb_write_slot_held", default=False)
 
-# Vaults whose gate the current task holds. A nested write_lane for one of
-# them is entered without waiting: Vault creation holds its new Vault's gate
-# through the seed document's own write.
+# Vaults whose gate the current task holds (write_lane, vault_gate). A nested
+# write_lane for one of them does not wait for the gate again: Vault creation
+# holds its new Vault's gate through the seed document's own write.
 _gates_held: ContextVar[frozenset[str]] = ContextVar("akb_write_gates_held", default=frozenset())
 
 # Per-vault admission gates (1 concurrent writer per vault — git commits
@@ -123,11 +123,16 @@ async def write_lane(vault: str):
     :class:`WriteBusyError` (→ 429) when the deadline or the global waiter
     backstop is exceeded — in both cases no work has been done yet.
     Re-entrant within a task: a call nested in one for the same ``vault``
-    holds its gate and slot already and does not wait.
+    holds its gate already and does not wait for it again. Inside
+    ``vault_gate`` it takes only a global slot, for its own section.
     """
     global _waiters
     if vault in _gates_held.get():
-        yield
+        if _slot_held.get():
+            yield
+        else:
+            async with _global_slot(vault):
+                yield
         return
     if _waiters >= settings.write_lane_max_waiters:
         logger.warning(
@@ -170,6 +175,58 @@ async def write_lane(vault: str):
             sem.release()
         if got_gate:
             gate.release()
+
+
+@asynccontextmanager
+async def _global_slot(vault: str):
+    """One global lane slot for a section of a task that holds ``vault``'s
+    gate through ``vault_gate``, under the lane's deadline."""
+    sem = _global_sem()
+    timeout = settings.write_lane_queue_timeout_secs
+    try:
+        async with asyncio.timeout(timeout):
+            await sem.acquire()
+    except TimeoutError:
+        logger.warning("write lane slot timed out after %.0fs for vault %s", timeout, vault)
+        raise WriteBusyError(vault, timeout) from None
+    token = _slot_held.set(True)
+    try:
+        yield
+    finally:
+        _slot_held.reset(token)
+        sem.release()
+
+
+@asynccontextmanager
+async def vault_gate(vault: str):
+    """Hold ``vault``'s gate, but no global slot, for a longer section.
+
+    Vault creation holds its new Vault's gate from before the Vault exists
+    until its seed document is written, so no other git-committing write of
+    the Vault runs meanwhile. It takes a global slot only around its Git
+    operations (``run_git_write`` takes one for each, and the seed's own
+    ``write_lane`` takes one for its section), so creations waiting for
+    something else, such as the role authority lock, hold none of the slots
+    other Vaults' writes need. Raises :class:`WriteBusyError` when the gate
+    is not free within the lane's deadline.
+    """
+    if vault in _gates_held.get():
+        yield
+        return
+    gate = _vault_gate(vault)
+    timeout = settings.write_lane_queue_timeout_secs
+    try:
+        async with asyncio.timeout(timeout):
+            await gate.acquire()
+    except TimeoutError:
+        logger.warning("write lane gate timed out after %.0fs for vault %s", timeout, vault)
+        raise WriteBusyError(vault, timeout) from None
+    token = _gates_held.set(_gates_held.get() | {vault})
+    try:
+        yield
+    finally:
+        _gates_held.reset(token)
+        gate.release()
 
 
 def start_commit_pool() -> None:

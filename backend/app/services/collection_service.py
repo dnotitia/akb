@@ -17,8 +17,9 @@ import asyncpg
 
 from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
+from app.config import settings
 from app.db.transient import transient_error
-from app.exceptions import AKBError, ConflictError, ForbiddenError, InternalError, NotFoundError
+from app.exceptions import AKBError, ConflictError, ForbiddenError, InternalError, NotFoundError, WriteBusyError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import (
     CollectionRepository,
@@ -281,12 +282,20 @@ def _with_progress(
     ``committed_deletions`` are added to the error's own, its hint opens with
     them, and its code, status and retry information stay its own. A database
     error that the API reports as a transient error (such as the Vault's
-    event lock timing out) is reported as that error. Any other exception is
-    an internal error and is reported as one, an ``InternalError`` whose
-    message stays the generic one, carrying the same details and hint; the
-    original is logged here and becomes its cause.
+    event lock timing out) is reported as that error. A refused admission,
+    whose plain form says that nothing was written, is reported as a
+    ``write_busy`` marked ``partially_applied``. Any other exception is an
+    internal error and is reported as one, an ``InternalError`` whose message
+    stays the generic one, carrying the same details and hint; the original
+    is logged here and becomes its cause.
     """
-    reported = exc if isinstance(exc, AKBError) else transient_error(exc)
+    if isinstance(exc, WriteBusyError) and not exc.partially_applied:
+        reported: AKBError | None = WriteBusyError(
+            vault, settings.vault_write_queue_timeout_secs, retry_after_secs=exc.retry_after_secs,
+            partially_applied=True,
+        )
+    else:
+        reported = exc if isinstance(exc, AKBError) else transient_error(exc)
     if reported is None:
         logger.error(
             "recursive delete of %r in vault %s failed after committed deletions",
@@ -616,15 +625,18 @@ class CollectionService:
         files and tables with `collection.delete` in a last transaction once
         no live document is left under `P`. A failure part-way leaves the
         documents deleted so far deleted and returns the error; running the
-        same delete again continues with the rest. When nothing is left under
-        `P` because an earlier recursive delete of `P` deleted its documents,
-        the delete succeeds with zero counts instead of `NotFoundError` and
-        records `collection.delete` (see `_earlier_recursive_delete`); the
-        event is at least once, so it can be recorded more than once for one
-        prefix. The counts are what this call deleted. Paths of documents and
-        collections (`deleted_uris`, `retained_collections`) are given only
-        with `disclose_paths`, which the caller's boundary sets when the
-        caller may read the Vault; counts are given always.
+        same delete again continues with the rest. A busy Vault (a refused
+        admission, or its event lock timing out) after some documents went
+        fails with a `write_busy` marked `partially_applied`. When nothing
+        is left under `P` because an earlier recursive delete of `P` deleted
+        its documents, the delete succeeds with zero counts instead of
+        `NotFoundError` and records `collection.delete` (see
+        `_earlier_recursive_delete`); the event is at least once, so it can be
+        recorded more than once for one prefix. The counts are what this call
+        deleted. Paths of documents and collections (`deleted_uris`,
+        `retained_collections`) are given only with `disclose_paths`, which
+        the caller's boundary sets when the caller may read the Vault; counts
+        are given always.
 
         Race-safety: the target row (if any) and all sub-collection
         rows are locked `FOR UPDATE` inside the same transaction, so a

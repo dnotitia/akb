@@ -1345,6 +1345,13 @@ class Settings(BaseModel):
     # How long a transaction waits for admission before it fails with a
     # retryable write_busy (HTTP 429, Retry-After), having done no work.
     vault_write_queue_timeout_secs: float = 10.0
+    # A raw SQL write reads its plan (EXPLAIN) on a pool connection before its
+    # admission, to admit the Vaults it writes. At most this many plans are
+    # read at once per process; the others wait without a connection.
+    akb_sql_plan_concurrency: int = 2
+    # How long reading a plan waits for a table lock before the write fails
+    # with a retryable write_busy instead of holding its connection.
+    akb_sql_plan_lock_timeout_ms: int = 500
 
     # BM25 corpus tuning (driver-neutral; lives in main PG vocab).
     bm25_k1: float = 1.5

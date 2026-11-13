@@ -50,6 +50,9 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
             SELECT t.id
               FROM app_rollout_targets t
              WHERE t.state='pending'
+               -- A pending target's lease expiry is the time before which it
+               -- is not retried (see _release_target).
+               AND (t.lease_expires_at IS NULL OR t.lease_expires_at <= NOW())
                AND NOT EXISTS (
                    SELECT 1 FROM app_rollout_targets prior
                     WHERE prior.job_id=t.job_id
@@ -571,14 +574,23 @@ async def _process_once() -> int:
     return 1
 
 
+# How long a target its Vault's admission refused waits before it is claimed
+# again, so the worker takes other eligible targets meanwhile.
+BUSY_RETRY_SECONDS = 5
+
+
 async def _release_target(target: dict[str, Any]) -> None:
+    """Make a refused target pending again, not to be claimed again for
+    ``BUSY_RETRY_SECONDS``. Claims are in job, batch and ordinal order, so a
+    target retried at once would be the next claim again while its Vault
+    stays busy, and keep every other rollout waiting behind it."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE app_rollout_targets SET state='pending', attempts=GREATEST(attempts-1, 0), "
-            "lease_owner=NULL, lease_expires_at=NULL "
+            "lease_owner=NULL, lease_expires_at=NOW()+($3::text || ' seconds')::interval "
             "WHERE id=$1 AND state='running' AND lease_owner=$2",
-            target["id"], _worker_id,
+            target["id"], _worker_id, str(BUSY_RETRY_SECONDS),
         )
 
 

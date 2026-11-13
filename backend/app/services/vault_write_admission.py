@@ -23,9 +23,9 @@ several Vaults is admitted for all of them at once, under one deadline, and
 holds none of them while it waits, so a full Vault does not delay another
 Vault's writes. Code inside an admitted transaction must not wait for another
 admission, and must not take the Bare Git write lane, which is entered before
-this admission. Vault creation takes the new Vault's lane and then its
-admission and holds both through its seed document, whose write re-enters
-both.
+this admission. Vault creation takes the new Vault's write-lane gate (not a
+global lane slot) and then its admission and holds both through its seed
+document, whose write re-enters both.
 
 A write that resolves its Vault's name to an id for admission checks, in its
 transaction, that the name still names that Vault (``check_admitted_vault``);

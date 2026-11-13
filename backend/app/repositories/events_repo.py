@@ -111,6 +111,13 @@ class EventBuffer:
     def __len__(self) -> int:
         return len(self._pending)
 
+    def vault_ids(self) -> set[uuid.UUID]:
+        """The Vaults the collected events belong to."""
+        return {
+            v if isinstance(v, uuid.UUID) else uuid.UUID(str(v))
+            for _, fields in self._pending if (v := fields["vault_id"]) is not None
+        }
+
     def add(
         self,
         kind: str,

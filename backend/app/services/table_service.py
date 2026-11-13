@@ -46,6 +46,7 @@ from app.services.uri_service import table_uri
 from app.services.vault_write_admission import vault_write_admission
 from app.services.user_sql_executor import (
     PermissionDeniedError,
+    UndeclaredVaultWriteError,
     UniqueViolationError,
     get_user_sql_executor,
 )
@@ -1959,6 +1960,15 @@ async def execute_sql(
     role and run as the backend service role — matching the existing
     human system-admin trust model. For service accounts and other users, PG
     is the authority.
+
+    ``read_only`` runs the statement in a READ ONLY transaction, which
+    PostgreSQL enforces, without the Vault write admission. Otherwise (the
+    default) it runs once as an admitted write, whatever it does; see
+    ``UserSqlExecutor.execute``.
+
+    Only one SELECT, WITH, INSERT, UPDATE or DELETE statement is accepted, so
+    a caller cannot create a function, run a ``DO`` block or change when a
+    deferred trigger fires (``SET CONSTRAINTS``).
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -2041,6 +2051,10 @@ async def execute_sql(
             code=UNIQUE_VIOLATION,
             pg_sqlstate=e.pg_sqlstate,
         )
+    except UndeclaredVaultWriteError as e:
+        # The statement changed rows of a Vault it did not declare, through a
+        # function its plan does not show; its transaction was rolled back.
+        return err(str(e), code=INVALID_ARGUMENT, undeclared_vaults=e.vaults)
     except (ConflictError, NotFoundError, TransientDependencyError, WriteBusyError):
         # Preserve a Vault disappearing after name resolution, or replaced
         # under its name twice while the statement waited, dependency
