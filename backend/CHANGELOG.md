@@ -11,9 +11,14 @@ specifically; the proxy has its own log in
   document and completes when run again. Each document's delete commits with
   its `document.delete` event in a short transaction that locks only that
   document; the collections, files and tables follow with `collection.delete`
-  once no live document is left under the prefix. A failure part-way returns
-  the error and leaves the documents deleted so far deleted, each with its
-  event; the same delete run again continues with the rest. A document that
+  once no live document is left under the prefix. The delete does not lock
+  every document of the prefix before deleting the first. A failure part-way
+  returns the error and leaves the documents deleted so far deleted, each with
+  its event; the same delete run again continues with the rest. A writer's
+  delete refused at a table that another request created under the prefix
+  after the delete checked for one says which documents it already deleted:
+  `partially_applied` and `deleted_uris` in the 403's details; only an admin
+  or owner can finish it. A document that
   another request deletes or moves out of the collection meanwhile is left as
   it is and not counted in `deleted_docs`; such a document used to fail the
   delete or be deleted at its new path. Run again after it deleted every
@@ -23,11 +28,14 @@ specifically; the proxy has its own log in
   document's graph edges are removed in its own delete transaction, and its
   chunks by the derived worker, which skips a document restored or moved again
   since; the delete used to remove both right after its commit and could take
-  a restored document's new links with them. Abandoned derived intents can be
-  re-opened with `native_derived_worker.requeue_abandoned`. In a database cut
-  over from Bare Git the delete used to fail every time on the preserved
-  `documents` rows; it now leaves them, and the collection rows they
-  reference, in place.
+  a restored document's new links with them. Abandoned derived intents whose
+  Revision is still the Head can be re-opened with
+  `native_derived_worker.requeue_abandoned`, which closes those of earlier
+  Revisions as superseded. In a database cut over from Bare Git the delete
+  used to fail every time on the preserved `documents` rows; it now leaves
+  them, and the collection rows they reference, in place, and lists those
+  collections as `retained_collections`, with a hint, in its response (MCP,
+  REST and the TypeScript client's type).
 
 - A recursive collection delete no longer deletes the documents of a
   sub-collection that another request created under its prefix while it ran

@@ -152,8 +152,10 @@ async def _delete_native_document(
     together in one short transaction that locks only this document's Resource
     (and its path), so it never waits for a second Resource while it holds one.
     The edges go while the Resource is locked: a document restored afterwards
-    starts without the links it had before the delete, and keeps the ones made
-    after its restore. A document deleted, or moved out of the prefix, by
+    starts without the links it had when its delete committed, and keeps the
+    ones made after its restore (a link racing the delete is a known limit;
+    see docs/operations/change-events.md). A document deleted, or moved out of
+    the prefix, by
     another request since it was listed is left as it is, and None is
     returned.
 
