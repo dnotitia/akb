@@ -1,6 +1,6 @@
 {
   "name": "@akb/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Reference AKB REST client boundary for kind envelopes and {data,error} results.",
   "type": "module",
   "sideEffects": false,
@@ -28,6 +28,7 @@
     "bin/",
     "dist/",
     "README.md",
+    "CHANGELOG.md",
     "scripts/"
   ],
   "scripts": {

@@ -349,6 +349,10 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    # A script on another origin reads only safelisted response headers unless
+    # they are exposed. The SDK's change channel waits for a refusal's
+    # Retry-After and measures an HTTP-date value from Date.
+    expose_headers=["Retry-After", "Date"],
 )
 # JSON listings such as a full-vault browse are multi-MB and compress well.
 # Starlette already skips SSE and 206 range responses; binary downloads are

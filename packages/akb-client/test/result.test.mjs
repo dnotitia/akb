@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 
 import { AkbError, akbFetch, createClient, createTypedFetch, unwrapAkbResponse } from "../src/index.js";
 import { createClient as createLiteClient } from "../src/lite.js";
@@ -41,7 +41,133 @@ test("unwrapAkbResponse maps HTTP errors to AkbError", () => {
   assert.equal(result.error.status, 403);
   assert.deepEqual(result.error.details, { pg_sqlstate: "42501" });
   assert.equal(result.error.hint, "Check vault membership.");
+  assert.equal(result.error.retryAfterMs, null);
   assert.throws(() => result.throwOnError(), AkbError);
+});
+
+test("AkbError reports the Retry-After of the response it was built from", async () => {
+  const sentAt = "Sun, 06 Nov 1994 08:49:37 GMT";
+  const retryAfterMs = (headers) => unwrapAkbResponse(
+    new Response(null, { status: 503, statusText: "Service Unavailable", headers }),
+    { message: "busy", code: "event_tail_capacity" },
+  ).error?.retryAfterMs;
+
+  assert.equal(retryAfterMs({ "retry-after": "5" }), 5_000);
+  assert.equal(retryAfterMs({ "retry-after": "007" }), 7_000);
+  // An HTTP-date is measured from the response's Date header, in any of the three HTTP-date forms.
+  assert.equal(retryAfterMs({ date: sentAt, "retry-after": "Sun, 06 Nov 1994 08:49:45 GMT" }), 8_000);
+  assert.equal(retryAfterMs({ date: sentAt, "retry-after": "Sunday, 06-Nov-94 08:49:45 GMT" }), 8_000);
+  assert.equal(retryAfterMs({ date: sentAt, "retry-after": "Sun Nov  6 08:49:45 1994" }), 8_000);
+  assert.equal(retryAfterMs({ date: sentAt, "retry-after": "Sun, 06 Nov 1994 08:49:30 GMT" }), 0);
+  // Without a usable Date header, the local clock is the reference.
+  const local = retryAfterMs({ date: "yesterday", "retry-after": new Date(Date.now() + 60_000).toUTCString() });
+  assert.ok(local > 55_000 && local <= 60_000, `local-clock delay ${local}`);
+
+  for (const invalid of [
+    "",
+    "-1",
+    "1.5",
+    "5, 10",
+    "soon",
+    "12 soon",
+    "Sun, 06 Nov 1994 08:49:37 PST",
+    "sun, 06 nov 1994 08:49:37 gmt",
+    "Sun, 31 Feb 1994 08:49:37 GMT",
+    "Sun, 06 Nov 1994 24:00:00 GMT",
+  ]) {
+    assert.equal(retryAfterMs({ "retry-after": invalid }), null, JSON.stringify(invalid));
+  }
+  assert.equal(retryAfterMs({}), null);
+
+  const busy = await akbFetch("https://akb.test/api/v1/documents", undefined, async () => new Response(
+    JSON.stringify({ message: "Vault is busy", code: "write_busy" }),
+    { status: 429, headers: { "content-type": "application/json", "retry-after": "2" } },
+  ));
+  assert.equal(busy.error?.code, "write_busy");
+  assert.equal(busy.error?.retryAfterMs, 2_000);
+});
+
+// The Retry-After an HTTP error built from a response with these headers reports.
+function retryAfterOf(headers) {
+  return unwrapAkbResponse(
+    new Response(null, { status: 503, statusText: "Service Unavailable", headers }),
+    { message: "busy", code: "event_tail_capacity" },
+  ).error?.retryAfterMs;
+}
+
+test("a local error keeps the Retry-After of the response it could not read, and nothing else of it", async () => {
+  const refusal = (body) => async () => new Response(body, {
+    status: 503,
+    statusText: "Service Unavailable",
+    headers: { "content-type": "application/json", "retry-after": "5" },
+  });
+  const unreadable = new ReadableStream({
+    start(controller) {
+      controller.error(new TypeError("terminated"));
+    },
+  });
+
+  for (const [code, fetchImpl] of [
+    ["invalid_json", refusal("{")],
+    ["response_read_error", refusal(unreadable)],
+  ]) {
+    const result = await akbFetch("https://akb.test/api/v1/events/eng", undefined, fetchImpl);
+    assert.equal(result.error?.code, code);
+    assert.equal(result.error?.status, 503, code);
+    assert.equal(result.error?.retryAfterMs, 5_000, code);
+    // The error keeps the wait and the plain status fields, not the body or headers.
+    assert.deepEqual(result.error?.payload, { message: result.error?.message, code }, code);
+    assert.deepEqual(Object.keys(result.error?.response ?? {}).sort(), ["ok", "status", "statusText"], code);
+  }
+});
+
+test("an RFC 850 year more than 50 years after the reference is the one a century earlier", () => {
+  const sentAt = "Fri, 13 Nov 2026 00:00:00 GMT";
+  // Exactly 50 years ahead is not more than 50 years ahead.
+  assert.equal(
+    retryAfterOf({ date: sentAt, "retry-after": "Friday, 13-Nov-76 00:00:00 GMT" }),
+    Date.UTC(2076, 10, 13) - Date.UTC(2026, 10, 13),
+  );
+  // A day later is, in the same year: the date is in 1976, which has passed.
+  assert.equal(retryAfterOf({ date: sentAt, "retry-after": "Sunday, 14-Nov-76 00:00:00 GMT" }), 0);
+});
+
+test("an RFC 850 century comes from the response's Date, else from the local clock", () => {
+  // Ten seconds before 2100 on the server's clock, "00" is 2100, not 2000.
+  assert.equal(
+    retryAfterOf({ date: "Thu, 31 Dec 2099 23:59:55 GMT", "retry-after": "Friday, 01-Jan-00 00:00:05 GMT" }),
+    10_000,
+  );
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    vi.setSystemTime(Date.UTC(2026, 10, 13));
+    // Without a usable Date, the local year 2026 makes "00" the year 2000, long past.
+    for (const date of [undefined, "soon"]) {
+      const headers = { "retry-after": "Saturday, 01-Jan-00 00:00:05 GMT", ...(date ? { date } : {}) };
+      assert.equal(retryAfterOf(headers), 0, String(date));
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a leap second in an HTTP-date is the second after :59", () => {
+  assert.equal(
+    retryAfterOf({ date: "Tue, 30 Jun 2015 23:59:59 GMT", "retry-after": "Tue, 30 Jun 2015 23:59:60 GMT" }),
+    1_000,
+  );
+});
+
+test("an HTTP-date whose weekday is not its date's is not a Retry-After", () => {
+  const sentAt = "Fri, 13 Nov 2026 00:00:00 GMT";
+  assert.equal(retryAfterOf({ date: sentAt, "retry-after": "Fri, 13 Nov 2026 00:00:05 GMT" }), 5_000);
+  for (const wrong of [
+    "Mon, 13 Nov 2026 00:00:05 GMT",
+    "Monday, 13-Nov-26 00:00:05 GMT",
+    "Mon Nov 13 00:00:05 2026",
+  ]) {
+    assert.equal(retryAfterOf({ date: sentAt, "retry-after": wrong }), null, wrong);
+  }
 });
 
 test("akbFetch returns sanitized results for transport, cancel, read, and JSON failures", async () => {

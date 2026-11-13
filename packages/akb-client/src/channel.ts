@@ -9,8 +9,22 @@ import type {
 
 const EVENT_KIND_PATTERN = /^[A-Za-z][A-Za-z0-9]*(?:[._:-][A-Za-z0-9]+)*$/u;
 const EVENT_CURSOR_PATTERN = /^ec1\.[A-Za-z0-9_-]+$/u;
+// The reconnection time until a stream's SSE `retry` field sets another, and
+// the smallest step the backoff after a refused open doubles from.
 const DEFAULT_RECONNECT_DELAY_MS = 250;
+// The longest wait the channel chooses itself, by its backoff or by an SSE
+// `retry` field. A refusal's Retry-After is waited in full, however long.
 const MAX_RECONNECT_DELAY_MS = 30_000;
+// Past this many doublings the cap above applies anyway.
+const MAX_BACKOFF_DOUBLINGS = 16;
+// After a refusal with a Retry-After, each client adds a random extra below
+// min(20% of the Retry-After, 1 s) to the longer of the Retry-After and its
+// own wait, so that clients refused together come back apart.
+const RETRY_AFTER_JITTER_RATIO = 0.2;
+const RETRY_AFTER_JITTER_MAX_MS = 1_000;
+// The longest delay one timer takes; setTimeout fires at once for a longer
+// one, so a longer wait is a chain of timers.
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 type StreamRequest = (
   path: string,
@@ -84,6 +98,12 @@ interface SubscriptionState {
   stopped: boolean;
   closedSettled: boolean;
   retryDelayMs: number;
+  /**
+   * Opens in a row that were refused, failed, or gave a stream that ended
+   * before its first event or comment. A stream's first event or comment
+   * resets it.
+   */
+  failedOpens: number;
   readonly closed: Promise<void>;
   readonly resolveClosed: () => void;
   readonly rejectClosed: (reason: unknown) => void;
@@ -98,6 +118,8 @@ interface SseFrame {
 interface SseParserResult {
   readonly frames: SseFrame[];
   readonly retryDelayMs: number | null;
+  /** Whether a comment line, such as a heartbeat, was read. */
+  readonly commented: boolean;
 }
 
 class ChannelProtocolError extends AkbError {
@@ -120,16 +142,25 @@ class SseParser {
   private data: string[] = [];
   private hasFields = false;
   private retryDelayMs: number | null = null;
+  private commented = false;
+  // The last chunk ended on a CR, which already ended its line; an LF that
+  // starts the next chunk is the rest of that CRLF, not an empty line.
+  private endedOnCr = false;
 
   feed(chunk: string): SseParserResult {
-    this.buffer += chunk;
+    let text = chunk;
+    if (this.endedOnCr && text.length > 0) {
+      if (text.startsWith("\n")) text = text.slice(1);
+      this.endedOnCr = false;
+    }
+    this.buffer += text;
     const frames: SseFrame[] = [];
     let newlineIndex = this.findNewline();
     while (newlineIndex >= 0) {
       let line = this.buffer.slice(0, newlineIndex);
-      const lineEndingLength = this.buffer[newlineIndex] === "\r" && this.buffer[newlineIndex + 1] === "\n"
-        ? 2
-        : 1;
+      const endsOnCr = this.buffer[newlineIndex] === "\r";
+      if (endsOnCr && newlineIndex === this.buffer.length - 1) this.endedOnCr = true;
+      const lineEndingLength = endsOnCr && this.buffer[newlineIndex + 1] === "\n" ? 2 : 1;
       this.buffer = this.buffer.slice(newlineIndex + lineEndingLength);
       if (line.endsWith("\r")) line = line.slice(0, -1);
       const frame = this.consumeLine(line);
@@ -139,16 +170,19 @@ class SseParser {
     return this.takeResult(frames);
   }
 
+  /**
+   * The stream ended. As the SSE parsing rules require, whatever is pending is
+   * discarded: a last line without its line ending, and an event without the
+   * blank line that ends it. A stream cut in the middle of an event therefore
+   * dispatches nothing of it, and the channel resumes from the last cursor.
+   */
   end(): SseParserResult {
-    const frames: SseFrame[] = [];
-    if (this.buffer.length > 0) {
-      const frame = this.consumeLine(this.buffer);
-      if (frame) frames.push(frame);
-      this.buffer = "";
-    }
-    const frame = this.dispatch();
-    if (frame) frames.push(frame);
-    return this.takeResult(frames);
+    this.buffer = "";
+    this.event = "";
+    this.id = null;
+    this.data = [];
+    this.hasFields = false;
+    return this.takeResult([]);
   }
 
   private findNewline(): number {
@@ -161,7 +195,10 @@ class SseParser {
 
   private consumeLine(line: string): SseFrame | null {
     if (line === "") return this.dispatch();
-    if (line.startsWith(":")) return null;
+    if (line.startsWith(":")) {
+      this.commented = true;
+      return null;
+    }
 
     const separator = line.indexOf(":");
     const field = separator < 0 ? line : line.slice(0, separator);
@@ -207,9 +244,10 @@ class SseParser {
   }
 
   private takeResult(frames: SseFrame[]): SseParserResult {
-    const retryDelayMs = this.retryDelayMs;
+    const { retryDelayMs, commented } = this;
     this.retryDelayMs = null;
-    return { frames, retryDelayMs };
+    this.commented = false;
+    return { frames, retryDelayMs, commented };
   }
 }
 
@@ -344,6 +382,7 @@ function createSubscriptionState(
     stopped: false,
     closedSettled: false,
     retryDelayMs: DEFAULT_RECONNECT_DELAY_MS,
+    failedOpens: 0,
     closed,
     resolveClosed,
     rejectClosed,
@@ -385,7 +424,10 @@ async function openInitialConnection(
       terminateSubscription(state, result.error);
       throw result.error;
     }
-    if (!(await waitForReconnect(state))) return subscription;
+    state.failedOpens += 1;
+    if (!(await waitForReconnect(state, refusedOpenDelayMs(state, result.error.retryAfterMs)))) {
+      return subscription;
+    }
   }
   return subscription;
 }
@@ -404,7 +446,7 @@ async function runSubscription(
     if (state.stopped) return;
     if (streamResult === "terminal") return;
 
-    const next = await reconnect(state, vault, openStream, registrations);
+    const next = await reconnect(state, vault, openStream, registrations, streamResult === "dropped");
     if (!next) return;
     currentResponse = next;
   }
@@ -416,9 +458,18 @@ async function reconnect(
   vault: string,
   openStream: StreamRequest,
   registrations: readonly Registration[],
+  dropped: boolean,
 ): Promise<Response | null> {
+  // A stream that sent an event or a comment is reopened after the
+  // reconnection time. One that ended before either, as when a proxy accepts
+  // the request and drops it, counts as another refused open.
+  let delayMs = state.retryDelayMs;
+  if (dropped) {
+    state.failedOpens += 1;
+    delayMs = refusedOpenDelayMs(state, null);
+  }
   while (!state.stopped) {
-    if (!(await waitForReconnect(state))) return null;
+    if (!(await waitForReconnect(state, delayMs))) return null;
     const result = await openConnection(state, vault, openStream, false, registrations);
     if (result.response) return result.response;
     if (!result.error || state.stopped) return null;
@@ -426,6 +477,8 @@ async function reconnect(
       terminateSubscription(state, result.error);
       return null;
     }
+    state.failedOpens += 1;
+    delayMs = refusedOpenDelayMs(state, result.error.retryAfterMs);
   }
   return null;
 }
@@ -507,32 +560,43 @@ async function openConnection(
   return { response, error: null };
 }
 
+/**
+ * Reads a stream until it ends: "ended" if an event or a comment arrived
+ * first, "dropped" if none did, "terminal" if the subscription stopped on it.
+ */
 async function consumeResponse(
   state: SubscriptionState,
   vault: string,
   registrations: readonly Registration[],
   response: Response,
-): Promise<"retry" | "terminal"> {
+): Promise<"ended" | "dropped" | "terminal"> {
   const parser = new SseParser();
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
+  let live = false;
+  const consume = async (result: SseParserResult): Promise<void> => {
+    if (!live && (result.frames.length > 0 || result.commented)) {
+      // The first event or comment shows the open reached a live stream.
+      live = true;
+      state.failedOpens = 0;
+    }
+    await consumeParserResult(state, vault, registrations, result);
+  };
+  const ended = (): "ended" | "dropped" => (live ? "ended" : "dropped");
   try {
     while (!state.stopped) {
       const chunk = await reader.read();
       if (chunk.done) {
         const tail = decoder.decode();
-        if (tail.length > 0) {
-          await consumeParserResult(state, vault, registrations, parser.feed(tail));
-        }
-        await consumeParserResult(state, vault, registrations, parser.end());
-        return "retry";
+        if (tail.length > 0) await consume(parser.feed(tail));
+        await consume(parser.end());
+        return ended();
       }
-      const result = parser.feed(decoder.decode(chunk.value, { stream: true }));
-      await consumeParserResult(state, vault, registrations, result);
+      await consume(parser.feed(decoder.decode(chunk.value, { stream: true })));
     }
-    return "retry";
+    return ended();
   } catch (error) {
-    if (state.stopped || isAbortError(error, state.signal)) return "retry";
+    if (state.stopped || isAbortError(error, state.signal)) return ended();
     if (error instanceof ChannelProtocolError) {
       terminateSubscription(state, error);
       return "terminal";
@@ -541,7 +605,7 @@ async function consumeResponse(
       terminateSubscription(state, error.cause);
       return "terminal";
     }
-    return "retry";
+    return ended();
   } finally {
     try {
       reader.releaseLock();
@@ -690,19 +754,52 @@ async function responseError(response: Response): Promise<AkbError> {
   return new AkbError(body, response);
 }
 
-async function waitForReconnect(state: SubscriptionState): Promise<boolean> {
+/**
+ * The wait before reopening after the n-th unsuccessful open in a row
+ * (n = `state.failedOpens`).
+ *
+ * The channel's own wait is the longer of the reconnection time and a random
+ * time in [c/2, c], where c = min(30000, max(reconnection time, 250) × 2^n) ms.
+ * A refusal's Retry-After is a floor on that, not capped. The longer of the
+ * two then gets a random extra in [0, min(20% of the Retry-After, 1000)) ms,
+ * rounded down (none when the Retry-After is zero), so that a long own wait
+ * does not line clients up either.
+ */
+function refusedOpenDelayMs(state: SubscriptionState, retryAfterMs: number | null): number {
+  const step = Math.max(state.retryDelayMs, DEFAULT_RECONNECT_DELAY_MS);
+  const doublings = Math.min(state.failedOpens, MAX_BACKOFF_DOUBLINGS);
+  const ceiling = Math.min(MAX_RECONNECT_DELAY_MS, step * 2 ** doublings);
+  const backoff = Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
+  const own = Math.max(state.retryDelayMs, backoff);
+  if (retryAfterMs === null) return own;
+  const spread = Math.min(retryAfterMs * RETRY_AFTER_JITTER_RATIO, RETRY_AFTER_JITTER_MAX_MS);
+  return Math.max(own, retryAfterMs) + Math.floor(Math.random() * spread);
+}
+
+async function waitForReconnect(state: SubscriptionState, delayMs: number): Promise<boolean> {
   if (state.stopped) return false;
   return await new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => {
-      state.wakeWaiters.delete(wake);
-      resolve(!state.stopped);
-    }, state.retryDelayMs);
+    let remainingMs = delayMs;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const wake = () => {
       clearTimeout(timer);
       state.wakeWaiters.delete(wake);
       resolve(false);
     };
+    const arm = () => {
+      const stepMs = Math.min(remainingMs, MAX_TIMER_DELAY_MS);
+      remainingMs -= stepMs;
+      timer = setTimeout(() => {
+        if (remainingMs > 0 && !state.stopped) {
+          arm();
+          return;
+        }
+        state.wakeWaiters.delete(wake);
+        resolve(!state.stopped);
+      }, stepMs);
+    };
     state.wakeWaiters.add(wake);
+    arm();
   });
 }
 
