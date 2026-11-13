@@ -16,10 +16,19 @@ specifically; the proxy has its own log in
   external Git synchronization) is now admitted for its Vault before it takes
   a connection: each process admits at most `vault_write_concurrency`
   (default 4) transactions of one Vault at a time, and the others wait without
-  a connection. A wait longer than `vault_write_queue_timeout_secs` (default
+  a connection. A transaction of several Vaults is admitted for all of them at
+  once. A wait longer than `vault_write_queue_timeout_secs` (default
   10 seconds) fails with a retryable `write_busy` (HTTP 429, `Retry-After: 1`)
-  before any database or Git change. Row reads through the table API now run
-  in a read-only transaction.
+  before the write's event, Git commit, document, prepared Native payload or
+  File lease renewal; a refused File replacement keeps its upload for the same
+  confirmation to be sent again. Reads are not admitted: row reads through the
+  table API run in a read-only transaction, and `akb_sql` runs each statement
+  in a read-only transaction first and runs it again as an admitted write only
+  when PostgreSQL refuses it there. Such a write is admitted for the Vaults
+  whose tables it changes as well as those it declares. A new Bare Git Vault
+  holds its write lane and admission through its seed document, and a write
+  whose Vault was replaced under its name starts again for the new Vault, or
+  fails with a conflict when it was replaced twice.
 
 - On the Native authority a recursive collection delete is now atomic per
   document and completes when run again. Each document's delete commits with
