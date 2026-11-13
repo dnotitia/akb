@@ -69,13 +69,29 @@ def replacement_budget_error(*, total_docs: int, max_replacements: int) -> dict:
     )
 
 
+# How many committed replacements a partial failure's hint names by URI.
+_HINTED_REPLACEMENTS = 10
+
+
 def replacement_failure_error(
     exc: Exception,
     *,
     failed_uri: str,
     committed_replacements: int,
+    completed: list[dict] | None = None,
 ) -> dict:
-    """Preserve a canonical error plus recovery metadata after a partial write."""
+    """Preserve a canonical error plus recovery metadata after a partial write.
+
+    Replacements commit document by document, and ``completed`` holds the
+    receipts of those that committed before the failure (each with its URI
+    and its new revision, a Native revision or a Git commit). When there are
+    any, the envelope says the request partly completed
+    (``details.partially_applied``), and its hint names them and asks to
+    apply the replacement only to the documents not replaced yet: the same
+    request sent again would replace the text again in a replaced document
+    whose new text still matches the pattern. The error's own hint, such as a
+    ``write_busy`` hint that says nothing was written, would be wrong then.
+    """
     envelope = exception_envelope(exc)
     details = dict(envelope.get("details") or {})
     details.update(
@@ -84,5 +100,23 @@ def replacement_failure_error(
             "committed_replacements": committed_replacements,
         }
     )
+    if committed_replacements:
+        details["partially_applied"] = True
+        receipts = completed or []
+        named = ", ".join(
+            f"{item['uri']} ({item.get('revision') or item.get('commit')})"
+            for item in receipts[:_HINTED_REPLACEMENTS]
+        )
+        more = (
+            f" and {len(receipts) - _HINTED_REPLACEMENTS} more"
+            if len(receipts) > _HINTED_REPLACEMENTS else ""
+        )
+        envelope["hint"] = (
+            f"{committed_replacements} replacement(s) committed before this failure and are "
+            f"listed in `replacements`: {named}{more}. Do not send the same request again: it "
+            "would replace the text again in any of those documents that still matches the "
+            "pattern. Apply the replacement only to the documents not replaced yet, starting "
+            f"with {failed_uri}."
+        )
     envelope["details"] = details
     return envelope

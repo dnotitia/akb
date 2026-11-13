@@ -1347,7 +1347,8 @@ class Settings(BaseModel):
     vault_write_queue_timeout_secs: float = 10.0
     # A raw SQL write reads its plan (EXPLAIN) on a pool connection before its
     # admission, to admit the Vaults it writes. At most this many plans are
-    # read at once per process; the others wait without a connection.
+    # read at once per process; the others wait without a connection, and
+    # statements declaring different Vaults take turns for a free slot.
     akb_sql_plan_concurrency: int = 2
     # How long reading a plan waits for a table lock before the write fails
     # with a retryable write_busy instead of holding its connection.
