@@ -103,30 +103,61 @@ async def get_vault_event_bounds(
     )
 
 
+class VaultEventBatch(list):
+    """A batch of one Vault's events, and the Vault's watermark read with it.
+
+    ``deleted_through`` is the highest id of the Vault's events that has been
+    deleted, 0 if none (migration 133), read in the statement that read the
+    rows, so the two come from one snapshot. A reader whose position is below
+    it never received a deleted event; the rows alone cannot show that, as
+    they skip over it.
+    """
+
+    deleted_through: int = 0
+
+
 async def list_vault_events(
     conn,
     vault_id: uuid.UUID | str,
     *,
     after_id: int,
     limit: int = 100,
-) -> list[dict[str, Any]]:
-    """Read retained Vault events in their monotonic database order."""
+) -> VaultEventBatch:
+    """Read retained Vault events in their monotonic database order, with the Vault's watermark."""
     if limit < 1:
         raise ValueError("event batch limit must be positive")
 
     vault_uuid = _to_uuid_or_none(vault_id)
     rows = await conn.fetch(
         """
-        SELECT id, occurred_at, vault_id, kind, resource_uri, actor_id, payload
-          FROM events
-         WHERE vault_id = $1
-           AND id > $2
-         ORDER BY id ASC
-         LIMIT $3
+        SELECT mark.deleted_through,
+               e.id, e.occurred_at, e.vault_id, e.kind, e.resource_uri, e.actor_id, e.payload
+          FROM (
+              SELECT COALESCE(
+                  (SELECT w.deleted_through
+                     FROM event_retention_watermarks w
+                    WHERE w.vault_id = $1),
+                  0) AS deleted_through
+          ) mark
+          LEFT JOIN LATERAL (
+              SELECT id, occurred_at, vault_id, kind, resource_uri, actor_id, payload
+                FROM events
+               WHERE vault_id = $1
+                 AND id > $2
+               ORDER BY id ASC
+               LIMIT $3
+          ) e ON TRUE
+         ORDER BY e.id ASC
         """,
         vault_uuid, after_id, limit,
     )
-    return [dict(row) for row in rows]
+    batch = VaultEventBatch(
+        {key: value for key, value in row.items() if key != "deleted_through"}
+        for row in rows
+        if row["id"] is not None
+    )
+    batch.deleted_through = int(rows[0]["deleted_through"] or 0) if rows else 0
+    return batch
 
 
 def _to_uuid_or_none(v: uuid.UUID | str | None) -> uuid.UUID | None:

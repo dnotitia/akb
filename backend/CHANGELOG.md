@@ -14,6 +14,15 @@ specifically; the proxy has its own log in
   "off"` with its counters at 0, and does not read the outbox; with Redis it
   reports `publishing: "on"` and the counters as before.
 
+- An open `GET /api/v1/events/{vault}` tail no longer skips events deleted
+  after it opened. It read on by cursor and checked the Vault's retention
+  watermark only when it opened, so a tail behind a deletion, as of events
+  the retention sweep removed while the tail caught up, sent the next event
+  and a cursor past the gap, and its reconnect was not refused. Each batch
+  read now reads the watermark in the same statement; when it is above the
+  tail's position, the tail ends with no further frame, and the reconnect
+  from the last cursor it received is refused with 410 `event_gap`.
+
 - Without `redis_url`, the `events` outbox no longer grows without bound. Its
   sweep ran inside the Redis publisher, which starts only with Redis; it now
   has a worker of its own that every worker process runs either way. An event

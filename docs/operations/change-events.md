@@ -167,7 +167,13 @@ locked, so two of them cannot deadlock over marks either; a mark created
 while it runs is left behind, inert. A mark written for a Vault
 after its delete, as when its leftover events are swept later, stays behind
 and is inert: Vault ids are never reused. A cursor below that mark is
-refused, and the refusal's `earliest_cursor` resumes at it.
+refused, and the refusal's `earliest_cursor` resumes at it. An open tail
+reads the Vault's mark with each batch, in the statement that reads the
+batch: when it is above the tail's position, an event the tail never sent
+was deleted, by retention or otherwise, after the tail opened. The tail
+then ends with no further frame instead of sending the events after it,
+and the client's reconnect from the last cursor it received is refused
+with 410.
 Event ids are shared by every Vault, so a cursor taken before a Vault's first
 event, on an empty Vault, is usually far below that event and is still valid.
 `start=earliest` replays from the first position after which nothing was

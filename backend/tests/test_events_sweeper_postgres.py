@@ -632,3 +632,78 @@ async def test_the_health_counters_count_publication_work_only_with_redis(monkey
         "abandoned": 0,
         "published": 0,
     }
+
+
+@pytest.mark.parametrize("redis_url", ["", "redis://sweep-test"], ids=["without-redis", "with-redis"])
+async def test_an_open_tail_behind_the_sweep_ends_rather_than_skip_the_deleted_events(monkeypatch, redis_url):
+    """An open tail read on by cursor and never looked at the watermark again.
+
+    A tail behind the sweep had sent the first of a Vault's expired events
+    when the sweep deleted the rest. Its next read passed over them, sent the
+    next event and a cursor past them, and the client never learned of the
+    gap: a reconnect from that cursor was not refused. Each read now reads the
+    watermark with its rows, and the stream ends instead; the reconnect from
+    the last cursor it sent is refused with 410 and resumes at the watermark.
+    """
+    from app.services import event_tail_service
+
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "sweep-tail")
+        user_id = await _make_reader(setup_pool, "sweep-tail-reader", [vault_id])
+        expired = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(3)]
+        await _age(setup_pool, expired)
+        if redis_url:
+            await _publish_long_ago(setup_pool, expired)
+        codec = EventCursorCodec(_CURSOR_SECRET)
+        async with _tail(monkeypatch, setup_pool) as tail:
+            # One event per read, so the stream is between reads after each one.
+            monkeypatch.setattr(event_tail_service, "EVENT_BATCH_SIZE", 1)
+            body = await tail.open(user_id=user_id, vault="sweep-tail", start="earliest")
+            try:
+                first = await asyncio.wait_for(_changes(body, 1), 5)
+                assert _positions(first) == [expired[0]]
+                # The sweep deletes the expired events while the stream waits to
+                # read on, and a new event follows them.
+                await _sweep_pass(monkeypatch, setup_pool, redis_url=redis_url)
+                latest = await _insert_event(setup_pool, vault_id, "document.update", "alice")
+                following = await asyncio.wait_for(anext(body, None), 5)
+            finally:
+                await body.aclose()
+            # The stream ended rather than send the new event past the deleted ones.
+            assert following is None
+            with pytest.raises(EventGapError) as exc_info:
+                await tail.open(
+                    user_id=user_id, vault="sweep-tail", last_event_id=codec.encode(vault_id, (), expired[0])
+                )
+            earliest_cursor = exc_info.value.details["earliest_cursor"]
+            assert codec.decode(earliest_cursor) == (vault_id, (), expired[-1])
+            resumed = await tail.open(user_id=user_id, vault="sweep-tail", last_event_id=earliest_cursor)
+            try:
+                delivered = await asyncio.wait_for(_changes(resumed, 1), 5)
+            finally:
+                await resumed.aclose()
+        assert _positions(delivered) == [latest]
+
+
+async def test_an_open_tail_goes_on_when_only_events_it_sent_are_deleted(monkeypatch):
+    """A watermark at or below the stream's position claims nothing it missed."""
+    from app.services import event_tail_service
+
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "sweep-tail-sent")
+        user_id = await _make_reader(setup_pool, "sweep-tail-sent-reader", [vault_id])
+        expired = [await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(3)]
+        await _age(setup_pool, expired)
+        async with _tail(monkeypatch, setup_pool) as tail:
+            monkeypatch.setattr(event_tail_service, "EVENT_BATCH_SIZE", 1)
+            body = await tail.open(user_id=user_id, vault="sweep-tail-sent", start="earliest")
+            try:
+                sent = await asyncio.wait_for(_changes(body, 3), 5)
+                await _sweep_pass(monkeypatch, setup_pool)
+                latest = await _insert_event(setup_pool, vault_id, "document.update", "alice")
+                following = await asyncio.wait_for(_changes(body, 1), 5)
+            finally:
+                await body.aclose()
+        assert _positions(sent) == expired
+        assert await _watermarks(setup_pool) == {vault_id: expired[-1]}
+        assert _positions(following) == [latest]
