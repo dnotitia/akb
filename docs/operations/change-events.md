@@ -246,10 +246,17 @@ Known limits that predate the ordering change:
   write commits into an existing sub-collection after a recursive delete read
   the prefix's documents is not deleted, while its collection row is: the
   document stays without a collection row.
-- On the Native authority a recursive collection delete commits each
-  document's delete in its own transaction. If it fails partway, for any
-  reason including a `write_busy` from the Vault's event lock, the documents
-  deleted before the failure stay deleted; run the delete again.
+
+On the Native authority a recursive collection delete deletes its documents in
+its own transaction, together with the collections, files and tables under the
+prefix: it locks every document's Resource row, in id order, and then all of
+their paths before it deletes the first of them, and it inserts each document's
+`document.delete` and then the `collection.delete` as the transaction's last
+statements. A failure at any point, including a `write_busy` from the Vault's
+event lock, rolls back all of it, so the delete can simply be run again. A
+document that another request deletes or moves out of the prefix while the
+delete waits for its row is left as that request left it and is not counted in
+`deleted_docs`.
 
 ## Regression verification
 
@@ -283,6 +290,11 @@ remains under the prefix; it also checks that a creation locks its ancestors in
 id order, together with a move's source, and that a measurement File upload
 into a new sub-collection removes expired intents first, so none of them
 deadlocks with the delete.
+`test_collection_delete_native_atomic_postgres.py` holds the Vault's event lock
+after a Native recursive delete removed its first document and checks that the
+delete then fails with `write_busy` and leaves every document and collection in
+place, that its events commit together at its end, and that a document deleted
+by another request while the delete waits is not deleted or counted again.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native
