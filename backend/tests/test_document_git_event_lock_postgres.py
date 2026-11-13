@@ -639,12 +639,12 @@ async def test_a_collection_deleted_inside_get_or_create_is_read_again(tmp_path,
             def __getattr__(self, name):
                 return getattr(self._conn, name)
 
-        async def pausing_get_or_create(self, vault_id, path, conn=None):
+        async def pausing_get_or_create(self, vault_id, path, conn=None, **kwargs):
             nonlocal paused
             if not paused and path == "notes" and conn is not None:
                 paused = True
                 conn = _PausingConn(conn)
-            return await get_or_create(self, vault_id, path, conn=conn)
+            return await get_or_create(self, vault_id, path, conn=conn, **kwargs)
 
         monkeypatch.setattr(CollectionRepository, "get_or_create", pausing_get_or_create)
 

@@ -69,7 +69,7 @@ async def test_put_locks_its_collection_then_the_event_lock_before_its_git_commi
             return super().commit_file(**kwargs)
 
     class _Collections:
-        async def get_or_create(self, vault_id, path, conn=None):
+        async def get_or_create(self, vault_id, path, conn=None, *, lock_also=()):
             return uuid.uuid4()
 
         increment_count = staticmethod(_recorder(calls, "increment_count"))

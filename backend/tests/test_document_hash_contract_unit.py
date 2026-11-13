@@ -384,7 +384,7 @@ class _FakePutDocRepo:
 
 
 class _FakeCollRepo:
-    async def get_or_create(self, vault_id: uuid.UUID, path: str, conn=None) -> uuid.UUID:
+    async def get_or_create(self, vault_id: uuid.UUID, path: str, conn=None, *, lock_also=()) -> uuid.UUID:
         return uuid.uuid4()
 
     async def increment_count(self, collection_id, now, conn=None) -> None:

@@ -231,7 +231,9 @@ class CollectionService:
         blocks until our TX commits. After we commit, the racer sees
         the rows gone and re-inserts with fresh ids — never reusing a
         doomed id, never leaving a doc pointing at a deleted
-        collection.
+        collection. A sub-collection created under the prefix meanwhile
+        is either deleted with the rest or left whole (see the lock step
+        below).
         """
         norm = _normalize_path(path)
         skill_policy.check_collection_delete(norm)
@@ -300,11 +302,30 @@ class CollectionService:
                 # grew before the lock, the attempt's savepoint is rolled
                 # back, releasing its locks, and the set is read again, so the
                 # locks are still taken in one id-ordered pass.
+                #
+                # A transaction that creates a sub-collection locks its
+                # existing ancestors FOR KEY SHARE (CollectionRepository), so
+                # with the target row locked a creation under it waits for
+                # this delete, and one in progress makes the lock above wait
+                # for its commit and then shows up in the second read. A
+                # creation with no ancestor row to lock (no row at `norm`, or
+                # an intermediate row created meanwhile) is caught by reading
+                # the set once more after the documents, files and tables:
+                # one that committed before those reads has its contents among
+                # them, and deleting them while its row stays would leave an
+                # emptied collection with a stale count. Its row then appears
+                # in that read and the attempt starts over. One that commits
+                # later is not among them and stays whole.
                 under_prefix = (
                     "SELECT id, path FROM collections "
                     "WHERE vault_id = $1 AND (path = $2 OR path LIKE $3 ESCAPE '\\')"
                 )
                 prefix_pattern = CollectionRepository._like_escape(norm.rstrip("/")) + "/%"
+
+                async def _all_locked(locked: set[uuid.UUID]) -> bool:
+                    current = await conn.fetch(under_prefix, vault_id, norm, prefix_pattern)
+                    return {r["id"] for r in current} <= locked
+
                 for _ in range(3):
                     try:
                         async with conn.transaction():
@@ -312,8 +333,20 @@ class CollectionService:
                             locked = await lock_collection_rows(
                                 conn, [r["id"] for r in candidates], strength="update",
                             )
-                            current = await conn.fetch(under_prefix, vault_id, norm, prefix_pattern)
-                            if not {r["id"] for r in current} <= locked:
+                            if not await _all_locked(locked):
+                                raise _CollectionsChanged
+                            docs = await coll_repo.list_docs_under(vault_id, norm, conn=conn)
+                            if native_authority:
+                                docs = docs + await _native_docs_under(conn, vault_id, norm)
+                            files = await coll_repo.list_files_under(
+                                vault_id, norm, conn=conn, for_update=True,
+                            )
+                            # Tables living in this collection (FK collection_id is
+                            # ON DELETE SET NULL, so deleting the collection rows
+                            # would otherwise silently re-home them to vault root and
+                            # a table-only collection would pass the empty check).
+                            tables = await coll_repo.list_tables_under(vault_id, norm, conn=conn)
+                            if not await _all_locked(locked):
                                 raise _CollectionsChanged
                     except _CollectionsChanged:
                         continue
@@ -330,16 +363,6 @@ class CollectionService:
                     (dict(r) for r in candidates if r["path"] != norm and r["id"] in locked),
                     key=lambda r: (r["path"], r["id"]),
                 )
-
-                docs = await coll_repo.list_docs_under(vault_id, norm, conn=conn)
-                if native_authority:
-                    docs = docs + await _native_docs_under(conn, vault_id, norm)
-                files = await coll_repo.list_files_under(vault_id, norm, conn=conn, for_update=True)
-                # Tables living in this collection (FK collection_id is
-                # ON DELETE SET NULL, so deleting the collection rows
-                # would otherwise silently re-home them to vault root and
-                # a table-only collection would pass the empty check).
-                tables = await coll_repo.list_tables_under(vault_id, norm, conn=conn)
 
                 # ── Total-empty check ───────────────────────────
                 # Nothing at or under the prefix → genuine 404.

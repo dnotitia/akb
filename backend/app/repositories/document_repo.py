@@ -845,24 +845,45 @@ _LOCK_COLLECTIONS = {
     ),
     "update": "SELECT id FROM collections WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
 }
+_LOCK_COLLECTION = {
+    "key share": "SELECT id FROM collections WHERE id = $1 FOR KEY SHARE",
+    "no key update": "SELECT id FROM collections WHERE id = $1 FOR NO KEY UPDATE",
+    "update": "SELECT id FROM collections WHERE id = $1 FOR UPDATE",
+}
 
 
 async def lock_collection_rows(
-    conn, collection_ids, *, strength: str = "no key update",
+    conn, collection_ids, *, strength: str = "no key update", key_share=(),
 ) -> set[uuid.UUID]:
     """Lock the existing rows among ``collection_ids``, in id order.
 
     ``"no key update"`` suits a write that will change a collection's counts,
     ``"key share"`` one that only needs the collection to stay, and
     ``"update"`` a collection delete; the first two conflict with the last.
-    A Bare Git document write takes its collections before its document and
-    before the Vault's event lock. Returns the ids locked: a row deleted
-    meanwhile is not among them.
+    ``key_share`` adds rows locked ``FOR KEY SHARE`` in the same id-ordered
+    pass, such as the ancestors of a collection being created; a row named in
+    both takes ``strength``. A Bare Git document write takes its collections
+    before its document and before the Vault's event lock. Returns the ids
+    locked: a row deleted meanwhile is not among them.
     """
-    ids = sorted({cid for cid in collection_ids if cid is not None})
-    if not ids:
-        return set()
-    return {row["id"] for row in await conn.fetch(_LOCK_COLLECTIONS[strength], ids)}
+    ids = {cid for cid in collection_ids if cid is not None}
+    shared = {cid for cid in key_share if cid is not None} - ids
+    if not shared:
+        if not ids:
+            return set()
+        return {row["id"] for row in await conn.fetch(_LOCK_COLLECTIONS[strength], sorted(ids))}
+    locked: set[uuid.UUID] = set()
+    for cid in sorted(ids | shared):
+        mode = "key share" if cid in shared else strength
+        if await conn.fetchval(_LOCK_COLLECTION[mode], cid) is not None:
+            locked.add(cid)
+    return locked
+
+
+def collection_ancestor_paths(path: str) -> list[str]:
+    """The proper prefixes of a collection path: ``a/b/c`` has ``a`` and ``a/b``."""
+    parts = [part for part in path.strip("/").split("/") if part]
+    return ["/".join(parts[:i]) for i in range(1, len(parts))]
 
 
 class CollectionVanishedError(RuntimeError):
@@ -875,7 +896,50 @@ class CollectionRepository:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
 
-    async def get_or_create(self, vault_id: uuid.UUID, path: str, conn=None) -> uuid.UUID:
+    async def _in_transaction(self, conn, work):
+        """Run ``work`` in ``conn``'s transaction, or in a new one: a created
+        row must commit together with the locks taken for it."""
+        if conn is None:
+            async with self.pool.acquire() as acq, acq.transaction():
+                return await work(acq)
+        if not conn.is_in_transaction():
+            async with conn.transaction():
+                return await work(conn)
+        return await work(conn)
+
+    @staticmethod
+    async def _lock_ancestors(c, vault_id: uuid.UUID, path: str, lock_also=()) -> None:
+        """Lock the ancestors of a collection this transaction just inserted.
+
+        A recursive collection delete locks the collection at its prefix and
+        every one under it ``FOR UPDATE``. Inserting a sub-collection locks the
+        existing ancestor rows ``FOR KEY SHARE`` until the transaction ends,
+        so a creation under a collection being deleted waits for the delete,
+        and a delete waits for a creation in progress under it and then finds
+        the new row. ``lock_also`` names the other collections the transaction
+        locks ``FOR NO KEY UPDATE`` (a move's source); they join the same
+        id-ordered pass, because a delete that holds one of them and waits for
+        an ancestor would otherwise deadlock with this transaction. Every
+        insert into ``collections`` goes through this repository.
+        """
+        ancestors = collection_ancestor_paths(path)
+        ancestor_ids = []
+        if ancestors:
+            ancestor_ids = [row["id"] for row in await c.fetch(
+                "SELECT id FROM collections WHERE vault_id = $1 AND path = ANY($2::text[])",
+                vault_id, ancestors,
+            )]
+        await lock_collection_rows(c, lock_also, key_share=ancestor_ids)
+
+    async def get_or_create(
+        self, vault_id: uuid.UUID, path: str, conn=None, *, lock_also=(),
+    ) -> uuid.UUID:
+        """Return the collection at ``path``, inserting it if there is none.
+
+        An insert also locks the collection's ancestors (see
+        ``_lock_ancestors``); ``lock_also`` is passed there. Without ``conn``,
+        or with one outside a transaction, it runs in a transaction of its own.
+        """
         async def _do(c):
             # ON CONFLICT handles the SELECT-then-INSERT race where two
             # concurrent PUTs both find no row and both INSERT.
@@ -890,6 +954,7 @@ class CollectionRepository:
                 uuid.uuid4(), vault_id, path, name,
             )
             if row:
+                await self._lock_ancestors(c, vault_id, path, lock_also)
                 return row["id"]
             existing = await c.fetchrow(
                 "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
@@ -901,10 +966,7 @@ class CollectionRepository:
                     f"in vault {vault_id} (concurrent delete?)"
                 )
             return existing["id"]
-        if conn is not None:
-            return await _do(conn)
-        async with self.pool.acquire() as acq:
-            return await _do(acq)
+        return await self._in_transaction(conn, _do)
 
     async def list_by_vault(self, vault_id: uuid.UUID) -> list[dict]:
         async with self.pool.acquire() as conn:
@@ -955,6 +1017,8 @@ class CollectionRepository:
         path: str,
         summary: str | None = None,
         conn=None,
+        *,
+        stamp_last_updated: bool = False,
     ) -> tuple[uuid.UUID, bool, str, str | None, int]:
         """Idempotent insert. Returns
         `(collection_id, created, name, summary, doc_count)`.
@@ -965,21 +1029,24 @@ class CollectionRepository:
         clobber stored state, and callers building a response envelope
         need the truth to surface). `created=False` lets callers
         distinguish a no-op from a fresh create (matters for git commit
-        + event emission).
+        + event emission). An insert locks the collection's ancestors like
+        ``get_or_create``. ``stamp_last_updated`` sets an inserted row's
+        ``last_updated`` to the database's current time instead of NULL.
         """
         async def _do(c):
             cid = uuid.uuid4()
             name = path.rstrip("/").split("/")[-1]
             row = await c.fetchrow(
                 """
-                INSERT INTO collections (id, vault_id, path, name, summary, doc_count)
-                VALUES ($1, $2, $3, $4, $5, 0)
+                INSERT INTO collections (id, vault_id, path, name, summary, doc_count, last_updated)
+                VALUES ($1, $2, $3, $4, $5, 0, CASE WHEN $6::boolean THEN NOW() END)
                 ON CONFLICT (vault_id, path) DO NOTHING
                 RETURNING id, name, summary, doc_count
                 """,
-                cid, vault_id, path, name, summary,
+                cid, vault_id, path, name, summary, stamp_last_updated,
             )
             if row is not None:
+                await self._lock_ancestors(c, vault_id, path)
                 return row["id"], True, row["name"], row["summary"], row["doc_count"]
             existing = await c.fetchrow(
                 """
@@ -993,10 +1060,7 @@ class CollectionRepository:
                 existing["id"], False,
                 existing["name"], existing["summary"], existing["doc_count"],
             )
-        if conn is not None:
-            return await _do(conn)
-        async with self.pool.acquire() as acq:
-            return await _do(acq)
+        return await self._in_transaction(conn, _do)
 
     async def delete_by_id(self, collection_id: uuid.UUID, conn=None) -> None:
         sql = "DELETE FROM collections WHERE id = $1"
