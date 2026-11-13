@@ -20,7 +20,6 @@ model.
 from __future__ import annotations
 
 import asyncio
-import collections
 import json
 import logging
 import uuid
@@ -382,10 +381,10 @@ class UserSqlExecutor:
         statement's role, in a read-only transaction on a pool connection
         taken before the statement's admission. Planning takes the locks the
         statement takes on its tables, so at most `akb_sql_plan_concurrency`
-        plans are read at once in this process, statements of different
-        declared Vaults taking turns for them (`_PlanSlots`), and one that
-        waits longer than `akb_sql_plan_lock_timeout_ms` for a lock fails with
-        a retryable `write_busy` instead of holding its connection. A
+        plans are read at once in this process, and at most one per declared
+        Vault (`_PlanSlots`), and one that waits longer than
+        `akb_sql_plan_lock_timeout_ms` for a lock fails with a retryable
+        `write_busy` instead of holding its connection. A
         statement that cannot be planned is admitted for the Vaults it
         declares, and reports its own error when it runs. Foreign keys of a
         dynamic table only reference tables of its own Vault, so a cascade
@@ -529,46 +528,49 @@ class UndeclaredVaultWriteError(Exception):
         self.vaults = vaults
 
 
+class _PlanWaiter:
+    __slots__ = ("vaults", "granted")
+
+    def __init__(self, vaults: frozenset[str], granted: asyncio.Future) -> None:
+        self.vaults = vaults
+        self.granted = granted
+
+
 class _PlanSlots:
     """The plan readers of one event loop.
 
-    At most `akb_sql_plan_concurrency` plans are read at once. Waiters queue
-    by the Vaults their statement declares, and a free slot goes to the queues
-    in turn, so one Vault whose plans wait for a locked table, and keep
-    arriving, does not make another Vault's statements wait behind all of
-    them.
+    At most `akb_sql_plan_concurrency` plans are read at once, and at most
+    one per Vault: a plan holds a token for every Vault its statement
+    declares, taken all at once or not at all, as the Vault write admission
+    takes its slots. Waiters hold nothing and are served in arrival order
+    among those whose Vaults are all free. Plans of a Vault whose table is
+    locked therefore wait one behind another, whatever other Vaults they
+    declare with it, and a statement of another Vault takes the next free
+    slot.
     """
 
     def __init__(self) -> None:
         self.running = 0
-        self.queues: dict[tuple[str, ...], collections.deque[asyncio.Future]] = {}
-        self.turns: collections.deque[tuple[str, ...]] = collections.deque()
+        self.busy: set[str] = set()
+        self.waiters: list[_PlanWaiter] = []
 
-    def wait(self, key: tuple[str, ...]) -> asyncio.Future:
-        future = asyncio.get_running_loop().create_future()
-        queue = self.queues.get(key)
-        if queue is None:
-            queue = self.queues[key] = collections.deque()
-            self.turns.append(key)
-        queue.append(future)
-        return future
+    def free(self, vaults: frozenset[str], limit: int) -> bool:
+        return self.running < limit and self.busy.isdisjoint(vaults)
 
-    def grant(self, limit: int) -> None:
-        """Give free slots to the next waiting queue in turn."""
-        while self.running < limit and self.turns:
-            key = self.turns.popleft()
-            queue = self.queues[key]
-            while queue and queue[0].done():
-                queue.popleft()
-            if not queue:
-                del self.queues[key]
-                continue
-            queue.popleft().set_result(None)
-            self.running += 1
-            if any(not future.done() for future in queue):
-                self.turns.append(key)
-            else:
-                del self.queues[key]
+    def take(self, vaults: frozenset[str]) -> None:
+        self.running += 1
+        self.busy |= vaults
+
+    def give_back(self, vaults: frozenset[str], limit: int) -> None:
+        self.running -= 1
+        self.busy -= vaults
+        for waiter in list(self.waiters):
+            if self.running >= limit:
+                break
+            if self.free(waiter.vaults, limit):
+                self.take(waiter.vaults)
+                waiter.granted.set_result(None)
+                self.waiters.remove(waiter)
 
 
 # Plan readers per event loop (tests run each in a loop of its own).
@@ -579,35 +581,41 @@ _plan_slots: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _PlanSlots] = 
 
 @asynccontextmanager
 async def _plan_slot(vaults: list[str]) -> AsyncIterator[None]:
-    """Wait for one of `akb_sql_plan_concurrency` plan readers, in the turn of
-    the declared ``vaults``, holding no connection, for at most
-    `vault_write_queue_timeout_secs`."""
+    """Wait for one of `akb_sql_plan_concurrency` plan readers and for the
+    plan tokens of the declared ``vaults``, holding no connection, for at
+    most `vault_write_queue_timeout_secs`. A wait that ends without them,
+    refused or cancelled, leaves the queue at once."""
     loop = asyncio.get_running_loop()
     slots = _plan_slots.get(loop)
     if slots is None:
         slots = _plan_slots[loop] = _PlanSlots()
     limit = max(1, settings.akb_sql_plan_concurrency)
     timeout = settings.vault_write_queue_timeout_secs
-    granted = slots.wait(tuple(sorted(set(vaults))))
-    slots.grant(limit)
-    try:
-        async with asyncio.timeout(timeout):
-            await asyncio.shield(granted)
-    except BaseException as exc:
-        if granted.done() and not granted.cancelled():
-            # Granted as the wait ended: give the slot back.
-            slots.running -= 1
-            slots.grant(limit)
-        else:
-            granted.cancel()
-        if isinstance(exc, TimeoutError):
-            raise WriteBusyError(", ".join(vaults) or "akb_sql", timeout, retry_after_secs=1) from None
-        raise
+    wanted = frozenset(vaults)
+    # Every release grants the waiters that became free, so none of them is
+    # free now: a statement that finds a slot and its Vaults free goes first.
+    if slots.free(wanted, limit):
+        slots.take(wanted)
+    else:
+        waiter = _PlanWaiter(wanted, loop.create_future())
+        slots.waiters.append(waiter)
+        try:
+            async with asyncio.timeout(timeout):
+                await asyncio.shield(waiter.granted)
+        except BaseException as exc:
+            if waiter.granted.done():
+                # Granted as the wait ended: give the tokens back.
+                slots.give_back(wanted, limit)
+            else:
+                waiter.granted.cancel()
+                slots.waiters.remove(waiter)
+            if isinstance(exc, TimeoutError):
+                raise WriteBusyError(", ".join(vaults) or "akb_sql", timeout, retry_after_secs=1) from None
+            raise
     try:
         yield
     finally:
-        slots.running -= 1
-        slots.grant(limit)
+        slots.give_back(wanted, limit)
 
 
 async def _admin_bypass(conn, statement: _Statement, *, lock: bool = True) -> bool:

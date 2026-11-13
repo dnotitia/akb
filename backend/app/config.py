@@ -1347,12 +1347,16 @@ class Settings(BaseModel):
     vault_write_queue_timeout_secs: float = 10.0
     # A raw SQL write reads its plan (EXPLAIN) on a pool connection before its
     # admission, to admit the Vaults it writes. At most this many plans are
-    # read at once per process; the others wait without a connection, and
-    # statements declaring different Vaults take turns for a free slot.
+    # read at once per process, and at most one for each Vault a statement
+    # declares; the others wait without a connection.
     akb_sql_plan_concurrency: int = 2
     # How long reading a plan waits for a table lock before the write fails
     # with a retryable write_busy instead of holding its connection.
     akb_sql_plan_lock_timeout_ms: int = 500
+    # How long the app rollout worker waits for a target's Vault admission.
+    # A busy Vault's targets are then deferred, all of them, and the worker
+    # takes other Vaults' targets, so keep it short.
+    app_rollout_admission_wait_secs: float = 1.0
 
     # BM25 corpus tuning (driver-neutral; lives in main PG vocab).
     bm25_k1: float = 1.5
