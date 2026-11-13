@@ -62,7 +62,6 @@ def _fixture(monkeypatch, *, native: bool, legacy: bool = False):
     for name in (
         "delete_document_chunks",
         "delete_document_relations",
-        "delete_native_document_edges",
         "emit_event",
     ):
         monkeypatch.setattr(collection_service, name, AsyncMock())
@@ -144,3 +143,25 @@ async def test_bare_git_cascade_keeps_post_commit_cleanup(monkeypatch):
     assert f.git_write.call_args.args == (f.git.delete_paths_bulk,)
     assert f.git_write.call_args.kwargs["file_paths"] == ["c/legacy.md"]
     assert all("native_resources" not in call.args[0] for call in f.conn.fetch.call_args_list)
+
+
+async def test_a_native_delete_collects_its_event_only_in_the_callers_transaction():
+    """`events` defers the delete's event to the caller's transaction. Without
+    one the delete would commit in a transaction of its own while the event
+    waited in the caller's buffer, so the combination is refused before any
+    database work."""
+    from app.exceptions import ValidationError
+    from app.repositories.events_repo import EventBuffer
+    from app.services.native_revision_service import NativeRevisionService
+
+    class _NoPool:
+        def acquire(self):
+            raise AssertionError("refused before any database work")
+
+    events = EventBuffer()
+    with pytest.raises(ValidationError, match="caller's transaction"):
+        await NativeRevisionService(_NoPool(), payload_store=object()).delete_resource(
+            namespace_id=uuid.uuid4(), surface="document", path="c/native.md", actor="actor",
+            mutation_id=uuid.uuid4(), events=events,
+        )
+    assert not events

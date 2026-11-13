@@ -29,10 +29,7 @@ from app.services.git_service import GitService
 from app.services.index_service import (
     delete_document_chunks, delete_file_chunks, delete_table_chunks,
 )
-from app.services.kg_service import (
-    delete_document_relations,
-    delete_native_document_edges,
-)
+from app.services.kg_service import delete_document_relations
 from app.services.m1_file_measurement import _tombstone_native_text_file
 from app.services.publication_service import delete_publications_for_file
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
@@ -147,9 +144,14 @@ async def _delete_native_document(
     transaction that locks only this document's Resource (and its path), so it
     never waits for a second Resource while it holds one. A document deleted,
     or moved out of the prefix, by another request since it was listed is left
-    as it is and reported as not deleted. Its chunks and graph edges are
-    removed afterwards, holding no Resource; the invalidation intent its delete
-    records removes them as well if that step does not run.
+    as it is and reported as not deleted.
+
+    Its chunks and graph edges are removed by the derived worker, from the
+    invalidation intent the delete records. The worker locks the Resource and
+    skips the intent once the Resource has a later Revision, so a document
+    restored, moved or linked again after this commit keeps what it has then.
+    Removing them here, after the commit released the Resource, removed those
+    as well.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -180,13 +182,6 @@ async def _delete_native_document(
             )
             # The event is the transaction's last statement.
             await events.flush(conn)
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await delete_document_chunks(conn, str(resource_id))
-            # Keyed on the resource, and on the path read under its row lock —
-            # not on the unlocked listing, so a document moved since the listing
-            # does not take whichever resource now owns that path down with it.
-            await delete_native_document_edges(conn, vault_id, vault, resource_id, row["current_path"])
     return True
 
 
@@ -209,6 +204,50 @@ async def _delete_native_documents_under(*, vault: str, vault_id: uuid.UUID, pre
         ):
             deleted += 1
     return deleted
+
+
+async def _earlier_recursive_delete(conn, vault_id: uuid.UUID, prefix: str) -> bool | None:
+    """Whether an earlier recursive delete of ``prefix`` stopped part-way.
+
+    A recursive delete gives each Native document it deletes a Revision with
+    the subject ``[delete-collection] <prefix>``, committed with its
+    ``document.delete``, and records ``collection.delete`` last. Returns
+    ``None`` when no recursive delete of ``prefix`` deleted a document, so the
+    prefix is unknown; ``True`` when the latest one deleted documents and no
+    ``collection.delete`` of the prefix was recorded after them; ``False``
+    when it was. Event ids of a Vault follow commit order (migration 132).
+
+    Two deletes completing the same prefix take turns on a transaction
+    advisory lock, so the event is recorded once.
+    """
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        f"akb:collection-delete:{vault_id}:{prefix}",
+    )
+    row = await conn.fetchrow(
+        """
+        WITH last_delete AS (
+            SELECT revision_id
+              FROM native_revisions
+             WHERE namespace_id = $1 AND action = 'delete' AND subject = $2
+             ORDER BY occurred_at DESC, revision_id DESC
+             LIMIT 1
+        )
+        SELECT (SELECT max(e.id) FROM events e
+                 WHERE e.vault_id = $1 AND e.kind = 'document.delete'
+                   AND e.payload->>'revision_id' = d.revision_id) AS deleted,
+               (SELECT max(e.id) FROM events e
+                 WHERE e.vault_id = $1 AND e.kind = 'collection.delete'
+                   AND e.payload->>'path' = $3) AS completed
+          FROM last_delete d
+        """,
+        vault_id, f"[delete-collection] {prefix}", prefix,
+    )
+    if row is None:
+        return None
+    if row["completed"] is None:
+        return True
+    return row["deleted"] is not None and row["completed"] < row["deleted"]
 
 
 async def _legacy_documents_fenced(conn) -> bool:
@@ -346,8 +385,11 @@ class CollectionService:
         files and tables with `collection.delete` in a last transaction once
         no live document is left under `P`. A failure part-way leaves the
         documents deleted so far deleted and returns the error; running the
-        same delete again continues with the rest. The counts are what this
-        call deleted.
+        same delete again continues with the rest. When nothing is left under
+        `P` because an earlier recursive delete of `P` deleted it, the delete
+        succeeds with zero counts instead of `NotFoundError`, and records the
+        `collection.delete` that delete did not (see
+        `_earlier_recursive_delete`). The counts are what this call deleted.
 
         Race-safety: the target row (if any) and all sub-collection
         rows are locked `FOR UPDATE` inside the same transaction, so a
@@ -538,7 +580,10 @@ class CollectionService:
                 )
 
                 # ── Total-empty check ───────────────────────────
-                # Nothing at or under the prefix → genuine 404.
+                # Nothing at or under the prefix → genuine 404, unless an
+                # earlier recursive delete of this prefix deleted its Native
+                # documents and stopped before this point: then the prefix is
+                # deleted already, and this one completes it.
                 if (
                     target_row is None
                     and not sub_rows
@@ -547,7 +592,32 @@ class CollectionService:
                     and not tables
                     and not native_deleted
                 ):
-                    raise NotFoundError("Collection", norm)
+                    if not (native_authority and recursive):
+                        raise NotFoundError("Collection", norm)
+                    unfinished = await _earlier_recursive_delete(conn, vault_id, norm)
+                    if unfinished is None:
+                        raise NotFoundError("Collection", norm)
+                    nothing = {
+                        "deleted_docs": 0,
+                        "deleted_files": 0,
+                        "deleted_sub_collections": 0,
+                        "deleted_tables": 0,
+                    }
+                    if unfinished:
+                        completion = EventBuffer()
+                        completion.add(
+                            "collection.delete",
+                            vault_id=vault_id,
+                            resource_uri=None,
+                            actor_id=agent_id,
+                            payload={"vault": vault, "path": norm, **nothing},
+                        )
+                        await completion.flush(conn)
+                    logger.info(
+                        "Collection delete: vault=%s path=%s already deleted (event recorded now: %s)",
+                        vault, norm, unfinished,
+                    )
+                    return {"ok": True, "collection": norm, **nothing}
 
                 # ── Empty-mode reject ───────────────────────────
                 # `recursive=False` succeeds ONLY when the target row

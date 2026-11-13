@@ -1452,10 +1452,14 @@ class NativeRevisionService:
 
         With ``conn`` the delete runs in that caller-owned transaction, which
         commits it, and ``events`` then collects its event for the caller to
-        insert at the end (see ``_emit_document_change``).
+        insert at the end (see ``_emit_document_change``). ``events`` needs
+        ``conn``: without it the delete would commit in a transaction of its
+        own while its event waited in the caller's buffer.
         """
         if conn is not None and not conn.is_in_transaction():
             raise ValidationError("Transaction-aware native deletion requires an active transaction")
+        if events is not None and conn is None:
+            raise ValidationError("Collecting a native delete's event requires the caller's transaction")
         self._validate_common(
             surface=surface,
             path=path,
