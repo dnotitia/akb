@@ -147,9 +147,9 @@ test("event gap and invalid cursor remain AkbError responses", async () => {
 });
 
 test("a refused open waits at least its Retry-After, within the jitter bound", async () => {
-  // Retry-After: 5 allows up to min(20% of 5 s, 1 s) of jitter on top. Math.random() = 0
+  // Retry-After: 5 allows less than min(20% of 5 s, 1 s) of jitter on top. Math.random() = 0
   // takes the bottom of that range and the largest value below 1 its top.
-  for (const [random, expected] of [[0, 5_000], [1 - 2 ** -53, 6_000]]) {
+  for (const [random, expected] of [[0, 5_000], [1 - 2 ** -53, 5_999]]) {
     await withFakeClock(async () => {
       vi.spyOn(Math, "random").mockReturnValue(random);
       const attempts = [];
@@ -314,28 +314,68 @@ test("Retry-After may be an HTTP-date, is waited in full past 30 s, and never sk
   });
 });
 
-test("a Retry-After longer than one timer allows is waited in full", async () => {
+test("a Retry-After longer than one timer allows is waited in full, and stops with the channel", async () => {
+  // 3,000,000 s is more than the 2^31 - 1 ms a single timer can wait.
+  const longRefusal = () => json({ message: "down for maintenance", code: "unavailable" }, 503, "Service Unavailable", {
+    "retry-after": "3000000",
+  });
+  const channelOf = (fetch) => createClient({ baseUrl: "https://akb.test/api/v1", fetch }).vault("vault").channel();
+
   await withFakeClock(async () => {
     vi.spyOn(Math, "random").mockReturnValue(0);
-    // 3,000,000 s is more than the 2^31 - 1 ms a single timer can wait.
     const attempts = [];
-    const fetch = async (_input, init = {}) => {
+    const opening = channelOf(async (_input, init = {}) => {
       attempts.push(Date.now());
-      if (attempts.length === 1) {
-        return json({ message: "down for maintenance", code: "unavailable" }, 503, "Service Unavailable", {
-          "retry-after": "3000000",
-        });
-      }
-      return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
-    };
-    const opening = createClient({ baseUrl: "https://akb.test/api/v1", fetch })
-      .vault("vault")
-      .channel()
-      .subscribe();
+      return attempts.length === 1 ? longRefusal() : sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+    }).subscribe();
 
     assert.deepEqual(await attemptDelays(attempts, 2), [3_000_000_000]);
-    const subscription = await opening;
+    await (await opening).unsubscribe();
+  });
+
+  // Aborting the initial open in its first timer, or in a later one, leaves no
+  // timer and opens nothing more.
+  for (const timersRun of [0, 1]) {
+    await withFakeClock(async () => {
+      const attempts = [];
+      const controller = new AbortController();
+      const opening = channelOf(async () => {
+        attempts.push(Date.now());
+        return longRefusal();
+      }).subscribe({ signal: controller.signal });
+
+      await until(() => vi.getTimerCount() > 0, "the first timer");
+      for (let run = 0; run < timersRun; run += 1) {
+        await vi.advanceTimersToNextTimerAsync();
+        await until(() => vi.getTimerCount() > 0, "the next timer of the chain");
+      }
+      controller.abort();
+      await (await opening).closed;
+      assert.equal(vi.getTimerCount(), 0, `a timer is left after ${timersRun} ran`);
+      await vi.advanceTimersByTimeAsync(4_000_000_000);
+      await settle();
+      assert.equal(attempts.length, 1, `opened again after ${timersRun} ran`);
+    });
+  }
+
+  // So does unsubscribe() during a later timer of a reconnect after an opened stream.
+  await withFakeClock(async () => {
+    const attempts = [];
+    const subscription = await channelOf(async () => {
+      attempts.push(Date.now());
+      return attempts.length === 1 ? sseResponse([CHECKPOINT_READY]) : longRefusal();
+    }).subscribe();
+
+    await until(() => vi.getTimerCount() > 0, "the reconnection time");
+    await vi.advanceTimersToNextTimerAsync();
+    await until(() => attempts.length === 2 && vi.getTimerCount() > 0, "the first timer of the long wait");
+    await vi.advanceTimersToNextTimerAsync();
+    await until(() => vi.getTimerCount() > 0, "the next timer of the chain");
     await subscription.unsubscribe();
+    assert.equal(vi.getTimerCount(), 0, "a timer is left after unsubscribe()");
+    await vi.advanceTimersByTimeAsync(4_000_000_000);
+    await settle();
+    assert.equal(attempts.length, 2, "opened again after unsubscribe()");
   });
 });
 
@@ -343,7 +383,7 @@ test("refusals after a stream has opened honour Retry-After and keep backing off
   // A stream sends its checkpoint and ends; six refusals with Retry-After: 5 follow.
   for (const [random, expected] of [
     [0, [250, 5_000, 5_000, 5_000, 5_000, 5_000, 8_000]],
-    [1 - 2 ** -53, [250, 6_000, 6_000, 6_000, 6_000, 8_000, 16_000]],
+    [1 - 2 ** -53, [250, 5_999, 5_999, 5_999, 5_999, 8_999, 16_999]],
   ]) {
     await withFakeClock(async () => {
       vi.spyOn(Math, "random").mockReturnValue(random);
@@ -367,6 +407,64 @@ test("refusals after a stream has opened honour Retry-After and keep backing off
       await subscription.unsubscribe();
     });
   }
+});
+
+test("the Retry-After jitter goes on top of a longer SSE retry", async () => {
+  // retry: 30000 makes the channel's own wait 30 s; two refusals with Retry-After: 5 follow.
+  for (const [random, expected] of [
+    [0, [30_000, 30_000, 30_000]],
+    [1 - 2 ** -53, [30_000, 30_999, 30_999]],
+  ]) {
+    await withFakeClock(async () => {
+      vi.spyOn(Math, "random").mockReturnValue(random);
+      const attempts = [];
+      const fetch = async (_input, init = {}) => {
+        attempts.push(Date.now());
+        if (attempts.length === 1) return sseResponse(["retry: 30000\n\n", CHECKPOINT_READY]);
+        if (attempts.length <= 3) {
+          return json({ message: "busy", code: "event_tail_capacity" }, 503, "Service Unavailable", {
+            "retry-after": "5",
+          });
+        }
+        return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+      };
+      const subscription = await createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+        .vault("vault")
+        .channel()
+        .subscribe();
+
+      assert.deepEqual(await attemptDelays(attempts, 4), expected);
+      await subscription.unsubscribe();
+    });
+  }
+});
+
+test("the Retry-After jitter never exceeds 20% of a Retry-After", async () => {
+  await withFakeClock(async () => {
+    vi.spyOn(Math, "random").mockReturnValue(1 - 2 ** -53);
+    // Without a Date header, this HTTP-date is 1003 ms after the local clock.
+    vi.setSystemTime(Date.parse("2026-11-13T00:00:00.997Z"));
+    const attempts = [];
+    const fetch = async (_input, init = {}) => {
+      attempts.push(Date.now());
+      if (attempts.length === 1) {
+        return json({ message: "busy", code: "event_tail_unavailable" }, 503, "Service Unavailable", {
+          "retry-after": "Fri, 13 Nov 2026 00:00:02 GMT",
+        });
+      }
+      return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+    };
+    const opening = createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+      .vault("vault")
+      .channel()
+      .subscribe();
+
+    const [delay] = await attemptDelays(attempts, 2);
+    // At most 1003 + 20% of 1003 = 1203.6 ms, so 1203 ms at the top of the range.
+    assert.equal(delay, 1_203);
+    const subscription = await opening;
+    await subscription.unsubscribe();
+  });
 });
 
 test("after an SSE retry of 1000 ms, refusals in a row back off from it", async () => {

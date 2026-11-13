@@ -21,9 +21,10 @@ of streams already open.
   seconds. A stream's first event or comment, a heartbeat included, resets
   it; a bare 2xx response does not.
 - A refusal's `Retry-After`, as seconds or an HTTP-date, is waited in full,
-  however long, plus a random extra of up to 20% of it and at most one second,
-  so that clients refused together come back apart. The backoff still applies
-  when it is longer, so a `Retry-After` of zero does not skip it.
+  however long, or the backoff or the reconnection time when that is longer,
+  so a `Retry-After` of zero does not skip the backoff. A random extra of less
+  than 20% of the `Retry-After`, and less than one second, goes on top of the
+  longer wait, so that clients refused together come back apart.
 - An HTTP-date is measured from the response's `Date` header when it has a
   valid one, which also gives an RFC 850 two-digit year its century. A date
   whose day name is not its own is invalid, and a leap second is the second

@@ -17,8 +17,9 @@ const DEFAULT_RECONNECT_DELAY_MS = 250;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 // Past this many doublings the cap above applies anyway.
 const MAX_BACKOFF_DOUBLINGS = 16;
-// On top of a Retry-After, each client waits a random extra of up to 20% of
-// it, and at most a second, so that clients refused together come back apart.
+// After a refusal with a Retry-After, each client adds a random extra below
+// min(20% of the Retry-After, 1 s) to the longer of the Retry-After and its
+// own wait, so that clients refused together come back apart.
 const RETRY_AFTER_JITTER_RATIO = 0.2;
 const RETRY_AFTER_JITTER_MAX_MS = 1_000;
 // The longest delay one timer takes; setTimeout fires at once for a longer
@@ -759,8 +760,9 @@ async function responseError(response: Response): Promise<AkbError> {
  *
  * The channel's own wait is the longer of the reconnection time and a random
  * time in [c/2, c], where c = min(30000, max(reconnection time, 250) × 2^n) ms.
- * A refusal's Retry-After is a floor on that, not capped, plus a random
- * extra of up to min(20% of it, 1000) ms.
+ * A refusal's Retry-After is a floor on that, not capped. The longer of the
+ * two then gets a random extra in [0, min(20% of the Retry-After, 1000)) ms,
+ * rounded down, so that a long own wait does not line clients up either.
  */
 function refusedOpenDelayMs(state: SubscriptionState, retryAfterMs: number | null): number {
   const step = Math.max(state.retryDelayMs, DEFAULT_RECONNECT_DELAY_MS);
@@ -770,7 +772,7 @@ function refusedOpenDelayMs(state: SubscriptionState, retryAfterMs: number | nul
   const own = Math.max(state.retryDelayMs, backoff);
   if (retryAfterMs === null) return own;
   const spread = Math.min(retryAfterMs * RETRY_AFTER_JITTER_RATIO, RETRY_AFTER_JITTER_MAX_MS);
-  return Math.max(own, retryAfterMs + Math.round(Math.random() * spread));
+  return Math.max(own, retryAfterMs) + Math.floor(Math.random() * spread);
 }
 
 async function waitForReconnect(state: SubscriptionState, delayMs: number): Promise<boolean> {
