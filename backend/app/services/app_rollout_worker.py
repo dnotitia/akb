@@ -51,7 +51,7 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
               FROM app_rollout_targets t
              WHERE t.state='pending'
                -- A pending target's lease expiry is the time before which it
-               -- is not retried (see _release_target).
+               -- is not retried (see _defer_vault_targets).
                AND (t.lease_expires_at IS NULL OR t.lease_expires_at <= NOW())
                AND NOT EXISTS (
                    SELECT 1 FROM app_rollout_targets prior
@@ -424,7 +424,11 @@ async def _schema_fingerprint(conn: Any, vault_id: uuid.UUID, installation_id: u
 
 async def _process_target(target: dict[str, Any]) -> None:
     pool = await get_pool()
-    async with vault_write_admission(target["vault_id"]), pool.acquire() as conn:
+    # A short wait: a busy Vault's targets are deferred, and other Vaults'
+    # targets taken meanwhile (see _process_once).
+    async with vault_write_admission(
+        target["vault_id"], timeout=settings.app_rollout_admission_wait_secs,
+    ), pool.acquire() as conn:
         # One transaction applies every step of the target. Step events are
         # inserted when it ends, on every exit: an event insert holds the
         # Vault's event lock until commit (migration 132), and a later step's
@@ -566,35 +570,52 @@ async def _process_once() -> int:
         await _process_target(target)
     except WriteBusyError:
         # The Vault's admission refused the target before any of its work.
-        # Give the lease back so the target is retried, rather than held,
-        # with the rest of its batch, until the lease expires.
-        await _release_target(target)
-        logger.info("rollout target %s deferred: its Vault is busy", target["id"])
-        # Other targets may be eligible meanwhile: report work done, so the
-        # runner claims again at once, past the deferred target, instead of
-        # sleeping its idle interval.
+        # Give the lease back, and defer the Vault's other pending targets
+        # with it, rather than hold it, with the rest of its batch, until the
+        # lease expires, or claim the Vault's next target only to wait again.
+        deferred = await _defer_vault_targets(target)
+        logger.info(
+            "rollout target %s deferred with %d other target(s) of its Vault: the Vault is busy",
+            target["id"], deferred - 1,
+        )
+        # Other Vaults' targets may be eligible meanwhile: report work done,
+        # so the runner claims again at once instead of sleeping its idle
+        # interval.
         return 1
     return 1
 
 
-# How long a target its Vault's admission refused waits before it is claimed
-# again, so the worker takes other eligible targets meanwhile.
+# How long the targets of a Vault whose admission refused one wait before they
+# are claimed again, so the worker takes other Vaults' targets meanwhile.
 BUSY_RETRY_SECONDS = 5
 
 
-async def _release_target(target: dict[str, Any]) -> None:
-    """Make a refused target pending again, not to be claimed again for
-    ``BUSY_RETRY_SECONDS``. Claims are in job, batch and ordinal order, so a
-    target retried at once would be the next claim again while its Vault
-    stays busy, and keep every other rollout waiting behind it."""
+async def _defer_vault_targets(target: dict[str, Any]) -> int:
+    """Make a refused target pending again, and keep it and every other
+    pending target of its Vault from being claimed for
+    ``BUSY_RETRY_SECONDS``, in one statement; return how many were deferred.
+
+    Claims are in job, batch and ordinal order. Deferring the refused target
+    alone let the worker claim the Vault's next target, wait for the same
+    busy Vault, and find the first one claimable again, so another Vault's
+    rollouts waited behind them for as long as the Vault stayed busy. A
+    deferral already longer is kept.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE app_rollout_targets SET state='pending', attempts=GREATEST(attempts-1, 0), "
-            "lease_owner=NULL, lease_expires_at=NOW()+($3::text || ' seconds')::interval "
-            "WHERE id=$1 AND state='running' AND lease_owner=$2",
-            target["id"], _worker_id, str(BUSY_RETRY_SECONDS),
+        rows = await conn.fetch(
+            "UPDATE app_rollout_targets "
+            "SET state='pending', "
+            "    attempts=CASE WHEN id=$1 THEN GREATEST(attempts-1, 0) ELSE attempts END, "
+            "    lease_owner=NULL, lease_expires_at=NOW()+($4::text || ' seconds')::interval "
+            "WHERE (id=$1 AND state='running' AND lease_owner=$2) "
+            "   OR (vault_id=$3 AND state='pending' "
+            "       AND (lease_expires_at IS NULL "
+            "            OR lease_expires_at < NOW()+($4::text || ' seconds')::interval)) "
+            "RETURNING id",
+            target["id"], _worker_id, target["vault_id"], str(BUSY_RETRY_SECONDS),
         )
+    return len(rows)
 
 
 _worker_id = f"rollout-{uuid.uuid4()}"

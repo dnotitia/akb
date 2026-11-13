@@ -126,7 +126,7 @@ def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
 
 @asynccontextmanager
 async def vault_write_admission(
-    *vault_ids: uuid.UUID | str | None, vault: str | None = None,
+    *vault_ids: uuid.UUID | str | None, vault: str | None = None, timeout: float | None = None,
 ) -> AsyncIterator[None]:
     """Admit the current task to write events for ``vault_ids``.
 
@@ -134,8 +134,8 @@ async def vault_write_admission(
     until the transaction has ended. ``None`` ids are ignored, so a caller
     whose Vault does not exist proceeds to its own not-found handling.
     ``vault`` names the Vault in the error message. Raises ``WriteBusyError``
-    when the Vaults do not all have a free slot within
-    ``vault_write_queue_timeout_secs``.
+    when the Vaults do not all have a free slot within ``timeout``, by
+    default ``vault_write_queue_timeout_secs``.
     """
     held = _admitted.get()
     wanted = sorted({_as_uuid(v) for v in vault_ids if v is not None} - held)
@@ -148,7 +148,8 @@ async def vault_write_admission(
 
     state = _state()
     limit = max(1, settings.vault_write_concurrency)
-    timeout = settings.vault_write_queue_timeout_secs
+    if timeout is None:
+        timeout = settings.vault_write_queue_timeout_secs
     if state.free(wanted, limit):
         state.take(wanted)
     else:

@@ -391,6 +391,7 @@ async def test_a_rollout_target_refused_by_its_vaults_admission_is_released(monk
     ends, the next run takes the target and applies it."""
     monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.3, raising=False)
+    monkeypatch.setattr(settings, "app_rollout_admission_wait_secs", 0.3, raising=False)
     async with _fresh_database() as pool:
         vault_id, job_id, _items = await _installation(pool, own_items=True)
         async with _vault_full(vault_id):
@@ -559,13 +560,14 @@ async def test_sql_writes_waiting_for_a_table_lock_leave_connections_for_another
 
 
 async def test_sql_plans_waiting_for_one_vaults_lock_do_not_hold_back_another_vault(tmp_path, monkeypatch):
-    """A transaction holds Vault A's table lock. 30 raw SQL writes to that
-    table read their plans two at a time, each waiting half a second for the
-    lock. A write to Vault B sent behind them takes its turn after one more of
-    A's plans, since statements declaring different Vaults take turns for the
-    plan slots, and commits within a second and a half. Plans used to be read
-    in arrival order, and B's write waited behind A's until its 3-second
-    deadline."""
+    """A transaction holds Vault A's table lock. Sixty raw SQL writes to that
+    table each declare A with a different companion Vault, and their plans
+    each wait half a second for the lock. A plan holds a token for every Vault
+    its statement declares, so A's plans are read one at a time whatever
+    their companions, and a write to Vault B sent behind them takes the other
+    plan slot at once and commits within a second and a half. With one queue
+    per declared set, B waited behind a turn of each of the sixty sets, past
+    its 3-second deadline."""
     monkeypatch.setattr(settings, "vault_write_concurrency", 2, raising=False)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 3.0, raising=False)
     monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 2, raising=False)
@@ -575,14 +577,17 @@ async def test_sql_plans_waiting_for_one_vaults_lock_do_not_hold_back_another_va
         monkeypatch.setattr(table_service, "get_role_sync", lambda: _AnyRoleSync())
         busy_id = await _make_vault(pool, "plans-busy")
         quiet_id = await _make_vault(pool, "plans-quiet")
+        companions = [f"plans-c{i:02d}" for i in range(60)]
+        for companion in companions:
+            await _make_vault(pool, companion)
         busy_table = await ctx.table("plans-busy", busy_id)
         quiet_table = await ctx.table("plans-quiet", quiet_id)
         admin = await ctx.user("plans-admin", admin=True)
         monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(pool))
 
-        def write(vault: str, table: str):
+        def write(vaults: list[str], table: str):
             return table_service.execute_sql(
-                vault_names=[vault], user_id=str(admin), actor_id=vault,
+                vault_names=vaults, user_id=str(admin), actor_id=vaults[0],
                 sql=f"INSERT INTO {table} (value) VALUES ('row')", is_admin=True,
             )
 
@@ -591,10 +596,13 @@ async def test_sql_plans_waiting_for_one_vaults_lock_do_not_hold_back_another_va
             async with pool.acquire() as holder:
                 async with _OpenTransaction(holder):
                     await holder.execute(f"LOCK TABLE {busy_table} IN ACCESS EXCLUSIVE MODE")
-                    busy_writes = [asyncio.create_task(write("plans-busy", busy_table)) for _ in range(30)]
+                    busy_writes = [
+                        asyncio.create_task(write(["plans-busy", companion], busy_table))
+                        for companion in companions
+                    ]
                     await asyncio.sleep(0.2)
                     started = time.monotonic()
-                    quiet = await write("plans-quiet", quiet_table)
+                    quiet = await write(["plans-quiet"], quiet_table)
                     took = time.monotonic() - started
             outcomes = await asyncio.wait_for(asyncio.gather(*busy_writes, return_exceptions=True), timeout=60)
         finally:
@@ -603,7 +611,7 @@ async def test_sql_plans_waiting_for_one_vaults_lock_do_not_hold_back_another_va
                     task.cancel()
             await asyncio.gather(*busy_writes, return_exceptions=True)
 
-        print(f"\nother-Vault write behind 30 waiting plans: {took:.3f}s")
+        print(f"\nother-Vault write behind 60 waiting plans with different companions: {took:.3f}s")
         assert quiet.get("affected_rows") == 1, quiet
         assert took < 1.5, took
         assert all(
@@ -713,6 +721,7 @@ async def test_a_busy_vaults_rollout_target_does_not_hold_back_another_rollout(m
     applied meanwhile."""
     monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.3, raising=False)
+    monkeypatch.setattr(settings, "app_rollout_admission_wait_secs", 0.3, raising=False)
     async with _fresh_database() as pool:
         installed = {}
         for name in ("rollout-a", "rollout-b"):
@@ -747,6 +756,7 @@ async def test_a_deferred_rollout_target_does_not_idle_the_worker(monkeypatch):
 
     monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 0.3, raising=False)
+    monkeypatch.setattr(settings, "app_rollout_admission_wait_secs", 0.3, raising=False)
     monkeypatch.setattr(_backfill, "_RUNNERS", [])
     async with _fresh_database() as pool:
         installed = {}
@@ -772,6 +782,67 @@ async def test_a_deferred_rollout_target_does_not_idle_the_worker(monkeypatch):
             finally:
                 assert await runner.stop(timeout=10)
         assert await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", busy_job) != "applied"
+
+
+async def test_a_vault_with_several_busy_rollout_targets_does_not_hold_back_another_vault(monkeypatch):
+    """Vault `runner-busy` has two apps to roll out, and its admission stays
+    full; another Vault has one, claimed after both. With the default
+    deadlines the worker used to wait 10 seconds for the first busy target,
+    defer it for 5, claim the second, wait 10 more, and find the first
+    claimable again, so the other Vault's rollout waited as long as the busy
+    Vault stayed busy. Now the worker waits `app_rollout_admission_wait_secs`
+    (1 second) and defers every pending target of the busy Vault at once, and
+    the other rollout is applied within seconds."""
+    from app.services import _backfill
+
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(_backfill, "_RUNNERS", [])
+    async with _fresh_database() as pool:
+        busy, first_job, _items = await _installation(
+            pool, own_items=True, vault="runner-busy", app_key="runner-a1", prefix="a1_",
+        )
+        _, second_job, _items = await _installation(
+            pool, own_items=True, vault="runner-busy", app_key="runner-a2", prefix="a2_", vault_id=busy,
+        )
+        # The other Vault's rollout is claimed after both busy ones: job ids
+        # are random, so install until one sorts after them.
+        other_job = None
+        for attempt in range(40):
+            _, job, _items = await _installation(
+                pool, own_items=True, vault=f"runner-quiet-{attempt}", app_key=f"runner-b{attempt}",
+            )
+            if job > max(first_job, second_job):
+                other_job = job
+                break
+        assert other_job is not None
+        runner = _backfill.BackfillRunner("rollout-under-test", rollout_worker._process_once, idle_secs=10)
+
+        async def other_applied() -> None:
+            while await pool.fetchval(
+                "SELECT status FROM app_rollout_jobs WHERE id = $1", other_job,
+            ) != "applied":
+                await asyncio.sleep(0.05)
+
+        async with _vault_full(busy):
+            started = time.monotonic()
+            runner.start()
+            try:
+                await asyncio.wait_for(other_applied(), timeout=6)
+                took = time.monotonic() - started
+                deferred = await pool.fetch(
+                    "SELECT state, lease_expires_at > NOW() AS later FROM app_rollout_targets "
+                    "WHERE vault_id = $1",
+                    busy,
+                )
+            finally:
+                assert await runner.stop(timeout=15)
+        print(f"\nother Vault's rollout applied after {took:.2f}s")
+        assert took < 4, took
+        assert [dict(r) for r in deferred] == [{"state": "pending", "later": True}] * 2
+        assert await pool.fetchval(
+            "SELECT count(*) FROM app_rollout_jobs WHERE id = ANY($1::uuid[]) AND status = 'applied'",
+            [first_job, second_job],
+        ) == 0
 
 
 async def test_vault_creations_waiting_for_the_role_lock_leave_the_git_lane_to_other_vaults(tmp_path, monkeypatch):

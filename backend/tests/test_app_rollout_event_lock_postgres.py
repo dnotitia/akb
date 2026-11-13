@@ -59,14 +59,15 @@ def _step(step_id: str, phase: str, operation: str, payload: dict) -> dict:
     return step
 
 
-def _manifest(app_key: str = "rollout-order") -> tuple[dict, str, str]:
-    current = [_table("orders", ["flag"]), _table("items", ["note"])]
-    desired = [_table("orders", ["flag", "extra"]), _table("items", ["note", "extra"])]
+def _manifest(app_key: str = "rollout-order", prefix: str = "") -> tuple[dict, str, str]:
+    orders, items = f"{prefix}orders", f"{prefix}items"
+    current = [_table(orders, ["flag"]), _table(items, ["note"])]
+    desired = [_table(orders, ["flag", "extra"]), _table(items, ["note", "extra"])]
     upgrade = [
-        _step("add_orders_extra", "expand", "add_column",
-              {"table": "orders", "column": {"name": "extra", "type": "text"}}),
-        _step("add_items_extra", "expand", "add_column",
-              {"table": "items", "column": {"name": "extra", "type": "text"}}),
+        _step(f"add_{orders}_extra", "expand", "add_column",
+              {"table": orders, "column": {"name": "extra", "type": "text"}}),
+        _step(f"add_{items}_extra", "expand", "add_column",
+              {"table": items, "column": {"name": "extra", "type": "text"}}),
     ]
     fresh = [
         _step(f"create_{table['name']}", "expand", "create_table", {
@@ -95,13 +96,16 @@ def _manifest(app_key: str = "rollout-order") -> tuple[dict, str, str]:
 
 async def _installation(
     pool: asyncpg.Pool, *, own_items: bool, vault: str = _VAULT, app_key: str = "rollout-order",
+    prefix: str = "", vault_id: uuid.UUID | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     """An installed app owning `orders` and `items`, with a pending upgrade.
 
     Without `own_items` the app loses `items` after the upgrade is requested,
-    so the worker's second step fails its ownership check.
+    so the worker's second step fails its ownership check. With `vault_id`
+    the app is installed in that existing Vault, named `vault`; `prefix`
+    names its tables apart from another app's there.
     """
-    manifest, checksum, current_fingerprint = _manifest(app_key)
+    manifest, checksum, current_fingerprint = _manifest(app_key, prefix)
     async with pool.acquire() as conn:
         app_id = await conn.fetchval(
             "INSERT INTO app_definitions(app_key) VALUES($1) RETURNING id", app_key,
@@ -114,9 +118,10 @@ async def _installation(
             )
             for version in ("1.0.0", "2.0.0")
         ]
-        vault_id = await conn.fetchval(
-            "INSERT INTO vaults(name,git_path) VALUES($1,$2) RETURNING id", vault, f"/tmp/{vault}.git",
-        )
+        if vault_id is None:
+            vault_id = await conn.fetchval(
+                "INSERT INTO vaults(name,git_path) VALUES($1,$2) RETURNING id", vault, f"/tmp/{vault}.git",
+            )
         installation_id = await conn.fetchval(
             "INSERT INTO vault_app_installations(app_id,vault_id,desired_release_id,current_release_id,lifecycle) "
             "VALUES($1,$2,$3,$3,'active') RETURNING id",
@@ -127,7 +132,7 @@ async def _installation(
             "VALUES($1,1,$2,'test')",
             installation_id, ["rollout:read", "rollout:request"],
         )
-        for name, column in (("orders", "flag"), ("items", "note")):
+        for name, column in ((f"{prefix}orders", "flag"), (f"{prefix}items", "note")):
             columns = [{"name": column, "type": "text"}]
             await table_data_repo.create_dynamic_table(
                 conn,
@@ -161,9 +166,10 @@ async def _installation(
     if not own_items:
         async with pool.acquire() as conn:
             await conn.execute(
-                "UPDATE app_owned_resources SET status = 'retained' WHERE resource_key = 'items'",
+                "UPDATE app_owned_resources SET status = 'retained' WHERE resource_key = $1",
+                f"{prefix}items",
             )
-    return vault_id, uuid.UUID(requested["job_id"]), table_data_repo.pg_table_name(vault, "items")
+    return vault_id, uuid.UUID(requested["job_id"]), table_data_repo.pg_table_name(vault, f"{prefix}items")
 
 
 async def _events(pool: asyncpg.Pool, vault_id: uuid.UUID) -> list[tuple[int, str, str | None]]:
