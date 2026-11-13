@@ -148,7 +148,10 @@ event past the period: an installation without Redis kept every event, and
 one with it deleted a backlog in a single transaction that could wait for,
 and deadlock with, another delete of the same events. A tail client away for
 longer than the period should expect 410 `event_gap`, below, and reconcile
-current state through AKB.
+current state through AKB. `GET /health` reports the publisher's counters
+under `events`. Without `redis_url` its `publishing` is `off` and the counters
+are 0: the events the outbox keeps for the tail will never be published, so
+they do not hold the top-level `status` at `reconciling`.
 
 A cursor is refused with 410 `event_gap` only when an event it never received
 was deleted. A trigger on `events` records, per Vault, the highest event id

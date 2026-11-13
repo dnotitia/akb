@@ -7,6 +7,13 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- Without `redis_url`, `GET /health` no longer counts the `events` outbox's
+  events as waiting to be published. Nothing publishes them, yet each was
+  reported as pending, and the top-level `status` stayed `reconciling` for as
+  long as any event existed. The `events` section now reports `publishing:
+  "off"` with its counters at 0, and does not read the outbox; with Redis it
+  reports `publishing: "on"` and the counters as before.
+
 - Without `redis_url`, the `events` outbox no longer grows without bound. Its
   sweep ran inside the Redis publisher, which starts only with Redis; it now
   has a worker of its own that every worker process runs either way. An event

@@ -687,6 +687,83 @@ def health_app(monkeypatch, tmp_path):
     return main
 
 
+@pytest.fixture
+def real_events_stats():
+    """The `events` section's reporter as shipped, taken before `health_app` stubs it."""
+    from app.services import events_publisher
+
+    return events_publisher.pending_stats
+
+
+def _events_pool(*, pending: int, reads: list[str]):
+    """An outbox holding ``pending`` unpublished events; each read is recorded."""
+
+    class _Conn:
+        async def fetchrow(self, query, *args):
+            reads.append(query)
+            return {"pending": pending, "retrying": 0, "abandoned": 0, "published": 0}
+
+    class _Pool:
+        def acquire(self):
+            @asynccontextmanager
+            async def _acquire():
+                yield _Conn()
+
+            return _acquire()
+
+    async def _get_pool():
+        return _Pool()
+
+    return _get_pool
+
+
+async def test_health_without_redis_counts_no_event_as_waiting_to_be_published(
+    real_events_stats, health_app, monkeypatch
+):
+    """Without Redis nothing publishes, so the events the outbox keeps are not pending work.
+
+    The section counted every one of them as pending, and the top-level status
+    stayed `reconciling` for as long as any event existed.
+    """
+    from app.services import embed_worker, events_publisher
+
+    reads: list[str] = []
+    monkeypatch.setattr(events_publisher, "pending_stats", real_events_stats)
+    monkeypatch.setattr(events_publisher.settings, "redis_url", "")
+    monkeypatch.setattr(events_publisher, "get_pool", _events_pool(pending=3, reads=reads))
+    monkeypatch.setattr(embed_worker, "pending_stats", _async_return({}))
+
+    result = await health_app.health(user=None)
+
+    assert result["events"] == {
+        "publishing": "off",
+        "pending": 0,
+        "retrying": 0,
+        "abandoned": 0,
+        "published": 0,
+        "stream": events_publisher.settings.redis_event_stream,
+    }
+    assert reads == []
+    assert result["status"] == "ok"
+
+
+async def test_health_with_redis_counts_events_waiting_to_be_published(real_events_stats, health_app, monkeypatch):
+    from app.services import embed_worker, events_publisher
+
+    reads: list[str] = []
+    monkeypatch.setattr(events_publisher, "pending_stats", real_events_stats)
+    monkeypatch.setattr(events_publisher.settings, "redis_url", "redis://health-test")
+    monkeypatch.setattr(events_publisher, "get_pool", _events_pool(pending=3, reads=reads))
+    monkeypatch.setattr(embed_worker, "pending_stats", _async_return({}))
+
+    result = await health_app.health(user=None)
+
+    assert result["events"]["publishing"] == "on"
+    assert result["events"]["pending"] == 3
+    assert len(reads) == 1
+    assert result["status"] == "reconciling"
+
+
 async def test_health_promotes_the_queue_head_age_to_the_top_level(health_app, monkeypatch):
     """The contract term lives at the top level, not inside an operational blob.
 

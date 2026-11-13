@@ -593,3 +593,42 @@ async def test_with_redis_a_sweep_beside_an_operator_delete_of_the_same_events_d
         assert sweeping.result() == [3, 0]
         assert await _remaining(setup_pool) == [young]
         assert (await _watermarks(setup_pool))[vault_id] == c
+
+
+async def test_the_health_counters_count_publication_work_only_with_redis(monkeypatch):
+    """With Redis the outbox's unpublished events are work; without it they never will be published."""
+    from app.services import events_publisher
+
+    async with _fresh_database() as setup_pool:
+        vault_id = await _make_vault(setup_pool, "sweep-health")
+        waiting, retried, abandoned, published = [
+            await _insert_event(setup_pool, vault_id, "document.put", "alice") for _ in range(4)
+        ]
+        await setup_pool.execute("UPDATE events SET attempts = 2 WHERE id = $1", retried)
+        await setup_pool.execute("UPDATE events SET attempts = 8, abandoned_at = NOW() WHERE id = $1", abandoned)
+        await setup_pool.execute("UPDATE events SET redis_published_at = NOW() WHERE id = $1", published)
+
+        async def get_pool() -> asyncpg.Pool:
+            return setup_pool
+
+        monkeypatch.setattr(events_publisher, "get_pool", get_pool)
+        monkeypatch.setattr(events_publisher.settings, "redis_url", "redis://health-test")
+        with_redis = await events_publisher.pending_stats()
+        monkeypatch.setattr(events_publisher.settings, "redis_url", "")
+        without_redis = await events_publisher.pending_stats()
+
+    assert {key: with_redis[key] for key in ("publishing", "pending", "retrying", "abandoned", "published")} == {
+        "publishing": "on",
+        "pending": 2,
+        "retrying": 1,
+        "abandoned": 1,
+        "published": 1,
+    }
+    assert waiting not in (retried, abandoned, published)
+    assert {key: without_redis[key] for key in ("publishing", "pending", "retrying", "abandoned", "published")} == {
+        "publishing": "off",
+        "pending": 0,
+        "retrying": 0,
+        "abandoned": 0,
+        "published": 0,
+    }

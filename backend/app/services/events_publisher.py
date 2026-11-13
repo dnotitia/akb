@@ -337,6 +337,23 @@ async def stop() -> None:
 
 
 async def pending_stats() -> dict:
+    """The publication counters `/health` reports under `events`.
+
+    Without redis_url nothing publishes: no event waits to be published, is
+    retried or is given up on, so `publishing` is `off`, the counters are 0
+    and the outbox is not read. The events it keeps then are for the event
+    tail, until the sweeper deletes them; counting them as pending held the
+    top-level status at `reconciling` for as long as any event existed.
+    """
+    if not settings.redis_url:
+        return {
+            "publishing": "off",
+            "pending": 0,
+            "retrying": 0,
+            "abandoned": 0,
+            "published": 0,
+            "stream": settings.redis_event_stream,
+        }
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -352,6 +369,7 @@ async def pending_stats() -> dict:
             """
         )
     return {
+        "publishing": "on",
         "pending":   int(row["pending"]),
         "retrying":  int(row["retrying"]),
         "abandoned": int(row["abandoned"]),
