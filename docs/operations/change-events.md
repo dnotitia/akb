@@ -266,7 +266,22 @@ deleted in another round, up to three, before the delete gives up with a
 retryable conflict. A failure part-way, including a `write_busy` from the
 Vault's event lock, returns the error and leaves the documents deleted so far
 deleted, each with its event; running the same delete again continues with the
-documents that remain. `deleted_docs` counts the documents that call deleted.
+documents that remain. When nothing is left under the prefix because an earlier
+recursive delete of it deleted its documents, the delete succeeds with zero
+counts rather than reporting the prefix as not found, and records the
+`collection.delete` that delete did not record; it tells this from a prefix
+nothing was deleted under by the Revisions that delete gave its documents,
+whose subject is `[delete-collection] <prefix>`. `deleted_docs` counts the
+documents that call deleted.
+
+A deleted document's chunks and graph edges are removed by the derived worker,
+from the invalidation intent the delete records, not by the delete after its
+commit. The worker locks the Resource and skips the intent once the Resource
+has a later Revision, so a document restored, moved or linked again after the
+delete keeps what it has then. Edges are rows that other writers, such as a
+move re-linking its document, lock in their own order, so the worker's
+transaction can end in a deadlock (`40P01`); the worker then schedules the
+intent again with its usual backoff, and the next attempt removes them.
 
 ## Regression verification
 
@@ -306,9 +321,13 @@ delete fails with `write_busy`, that the first document stays deleted with its
 event committed in its own transaction, and that running the delete again
 completes it; that the delete holds one document at a time; that a document
 deleted or moved out by another request while the delete waits is left alone
-and not counted; and, on a database cut over from Bare Git, that the delete
+and not counted; on a database cut over from Bare Git, that the delete
 leaves the preserved `documents` rows and the collection they reference and can
-run again.
+run again; that a document restored, moved and linked again right after its
+delete committed keeps the new link; that a delete stopped after its documents
+completes when run again, with one `collection.delete`, while a prefix nothing
+was deleted under is not found; and that the derived worker retries a graph
+cleanup that ended in a deadlock.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native

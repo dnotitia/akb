@@ -16,9 +16,15 @@ specifically; the proxy has its own log in
   event; the same delete run again continues with the rest. A document that
   another request deletes or moves out of the collection meanwhile is left as
   it is and not counted in `deleted_docs`; such a document used to fail the
-  delete or be deleted at its new path. In a database cut over from Bare Git
-  the delete used to fail every time on the preserved `documents` rows; it now
-  leaves them, and the collection rows they reference, in place.
+  delete or be deleted at its new path. Run again after it deleted every
+  document but stopped before its last transaction, it succeeds with zero
+  counts and records the `collection.delete` it missed, instead of reporting
+  the collection as not found. A deleted document's chunks and graph edges are
+  removed by the derived worker, which skips a document restored or moved
+  again since; the delete used to remove them right after its commit and could
+  take a restored document's new links with them. In a database cut over from
+  Bare Git the delete used to fail every time on the preserved `documents`
+  rows; it now leaves them, and the collection rows they reference, in place.
 
 - A recursive collection delete no longer deletes the documents of a
   sub-collection that another request created under its prefix while it ran
