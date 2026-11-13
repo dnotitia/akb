@@ -120,6 +120,16 @@ or edit rewrites its document's implicit edges at this point instead of after
 the commit), then take the Vault's lock, and only then commit to Git; a busy
 Vault fails them before Git changes. Every transaction that locks several
 collections, a move or a recursive collection delete, locks them in id order.
+A transaction that creates a collection also locks the collection's existing
+ancestors (`FOR KEY SHARE`), in id order and in one pass with any other
+collection it locks, such as a move's source; a recursive collection delete
+locks the collection at its prefix and those under it `FOR UPDATE`, so either
+the creation waits for the delete or the delete waits for the creation and
+then deletes the new collection too. Every insert into `collections` goes
+through `CollectionRepository`, which takes these locks. After it has read the
+documents, files and tables under its prefix, the delete reads the collections
+under it once more and starts over if one appeared; this covers a prefix that
+has no row of its own, where a creation finds no ancestor to lock.
 A write that finds its document moved after locking it, or a move that finds
 its destination collection gone, rolls back to a savepoint, releasing every
 collection and the document, before it tries again. They hold the Vault's lock through
@@ -222,10 +232,6 @@ reader access checks; its opaque cursor is different from a Redis cursor.
 
 Known limits that predate the ordering change:
 
-- A recursive collection delete does not see a sub-collection that another
-  transaction creates under its prefix and commits only after the delete
-  read and locked the collections; that sub-collection can remain, while
-  documents created in it are deleted with the rest.
 - On the Native authority a recursive collection delete commits each
   document's delete in its own transaction. If it fails partway, for any
   reason including a `write_busy` from the Vault's event lock, the documents
@@ -256,6 +262,11 @@ collections in the same order as a recursive collection delete, and leaves Git
 and the database in agreement when a role's `lock_timeout` ends it; and that
 only the lock's own deadline is reported as `write_busy`, over REST and MCP,
 also when it fails a dynamic-table write at commit.
+`test_collection_delete_child_create_postgres.py` commits a sub-collection
+created under a recursive delete's prefix between the delete's lock and its
+document reads, with and without a row at the prefix, and checks that nothing
+remains under the prefix; it also checks that a creation locks its ancestors in
+id order, together with a move's source, so neither deadlocks with the delete.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native
