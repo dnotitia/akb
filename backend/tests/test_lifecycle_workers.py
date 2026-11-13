@@ -73,6 +73,9 @@ def _stub_workers(monkeypatch, lifecycle, started: list[str]) -> None:
     monkeypatch.setattr(
         lifecycle.search_degradation_stats, "start", rec("search_degradation_flusher"),
     )
+    # The events sweeper starts with or without Redis; a real start would also
+    # create a task off a running loop.
+    monkeypatch.setattr(lifecycle.events_sweeper, "start", rec("events_sweeper"))
 
 
 def _settings(
@@ -152,6 +155,40 @@ def test_start_workers_skips_poller_when_disabled(monkeypatch, tmp_path):
     # … but the always-on workers still start (the gate is surgical).
     assert "embed_worker" in started
     assert "delete_worker" in started
+
+
+@pytest.mark.parametrize("redis_url", [None, "redis://redis:6379/0"])
+def test_start_workers_sweeps_events_with_or_without_redis(monkeypatch, tmp_path, redis_url):
+    """The events outbox's sweep ran inside the Redis publisher.
+
+    Without redis_url the publisher does not start, so nothing deleted an
+    event and the table grew without bound. The sweeper has a runner of its
+    own now, and starts either way.
+    """
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started: list[str] = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    monkeypatch.setattr(lifecycle.events_publisher, "start", lambda: started.append("events_publisher"))
+    configured = _settings(external_git_enabled=False)
+    configured.redis_url = redis_url
+    monkeypatch.setattr(lifecycle, "settings", configured)
+
+    lifecycle.start_workers(include_api_local=False)
+
+    assert "events_sweeper" in started
+    assert ("events_publisher" in started) is bool(redis_url)
+
+
+def test_api_role_runs_no_events_sweeper(monkeypatch, tmp_path):
+    """The sweeper is a durable worker: the worker process runs it, not the API one."""
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started: list[str] = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    monkeypatch.setattr(lifecycle, "settings", _settings(external_git_enabled=False))
+
+    lifecycle.start_api_runtime()
+
+    assert "events_sweeper" not in started
 
 
 def test_worker_role_excludes_api_local_in_memory_sinks(monkeypatch, tmp_path):

@@ -7,6 +7,47 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- Without `redis_url`, `GET /health` no longer counts the `events` outbox's
+  events as waiting to be published. Nothing publishes them, yet each was
+  reported as pending, and the top-level `status` stayed `reconciling` for as
+  long as any event existed. The `events` section now reports `publishing:
+  "off"` with its counters at 0, and does not read the outbox; with Redis it
+  reports `publishing: "on"` and the counters as before.
+
+- An open `GET /api/v1/events/{vault}` tail no longer skips events deleted
+  after it opened. It read on by cursor and checked the Vault's retention
+  watermark only when it opened, so a tail behind a deletion, as of events
+  the retention sweep removed while the tail caught up, sent the next event
+  and a cursor past the gap, and its reconnect was not refused. Each batch
+  read now reads the watermark in the same statement; when it is above the
+  tail's position, the tail ends with no further frame, and the reconnect
+  from the last cursor it received is refused with 410 `event_gap`.
+
+- Without `redis_url`, the `events` outbox no longer grows without bound. Its
+  sweep ran inside the Redis publisher, which starts only with Redis; it now
+  has a worker of its own that every worker process runs either way. An event
+  is kept for `event_retention_days` (new, default 7). With Redis the period
+  starts when the publisher records the event as published, as before: when
+  it writes it to the stream, or marks gardener bookkeeping published
+  without writing it. An event not recorded as published is kept. Without
+  Redis the period starts when the event occurred. Either way the sweeper
+  reads events from the oldest id, at most 1,000 per statement and
+  transaction, deletes those of the ids it read that are past retention, and
+  locks them with SKIP LOCKED first: the Redis sweep no longer deletes every
+  published event past the period in one statement, which could wait for,
+  and deadlock with, an operator's delete of the same events, and a sweep
+  waits for no event row another statement holds. A transaction that deletes
+  events in more than one statement can still deadlock with a sweep, as with
+  any other delete. Ids drawn before migration 133 may be out of order, which
+  can only delay the deletion of such events, never make one early; workers
+  that disagree about `redis_url` each apply their own rule, so set it alike
+  on every worker. Every deletion raises the Vault's retention watermark
+  through the `events` delete trigger, so a tail cursor that missed a deleted
+  event is refused with 410 `event_gap`. On an installation that ran without
+  Redis, the first pass deletes the backlog it can reach, in those batches; an
+  event another statement holds, or one behind an event that is not yet old,
+  waits for a later pass.
+
 - Open `GET /api/v1/events/{vault}` SSE tails no longer hold request-pool
   connections. Each server process wakes them from one dedicated PostgreSQL
   `LISTEN` connection. A tail borrows one pooled connection to read a batch

@@ -130,6 +130,47 @@ check fails tries again after the next heartbeat. Heartbeats keep their
 reader stops receiving events within about a second and gets no further
 frame, and an idle tail closes within one heartbeat.
 
+The outbox keeps an event for `event_retention_days` (default 7), and a
+sweeper that every worker process runs, with or without Redis, then deletes
+it. With `redis_url` set, the period starts when the publisher records the
+event as published (`redis_published_at`): when it writes the event to the
+stream, or marks it published without writing it, as it does the gardener's
+own bookkeeping events. An event not recorded as published is kept. Without
+`redis_url` nothing publishes, and the period starts when the event occurred.
+Either way the sweeper reads events from the oldest id, a batch of 1,000 per
+statement and transaction, deletes those of the batch's ids that are past
+retention, and stops at the first event that neither occurred nor was
+recorded as published more than the period ago. Without Redis an expired
+event behind that one, even one whose transaction began earlier, is kept
+longer than the period, never less: until the event ahead of it is old too.
+Ids drawn before migration 133,
+when the id sequence's cache could be above 1, may be out of order, and an
+expired event behind a newer one then waits for it, with or without Redis.
+Each statement checks every event's own time, so this can only delay a
+deletion, never make one early. Workers that disagree about `redis_url`, as
+during a change of it, each apply their own rule: one without it deletes an
+event that occurred more than the period ago, recorded as published or not,
+so an event no publisher has written yet can be deleted before one does.
+Neither rule deletes an event before the period has passed since it
+occurred; give every worker the same setting. Each batch locks its events
+with SKIP LOCKED before it deletes them, so a sweep never waits for an event
+row another statement holds: it leaves the row to a later pass, unless that
+statement deletes it. A sweep therefore cannot deadlock with another sweep or
+with a single statement that deletes events, an operator's included. A
+transaction that deletes events in more than one statement still can, as
+with any other delete of events. On an installation that ran without Redis,
+the first pass deletes the backlog it can reach; an event another statement
+holds, or one behind an event that is not yet old, waits for a later pass. Earlier releases swept only with Redis, in
+one statement over every published event past the period: an installation
+without Redis kept every event, and one with it deleted a backlog in a single
+transaction that could wait for, and deadlock with, another delete of the
+same events. A tail client away for longer than the period may get 410
+`event_gap`, below, and should then reconcile current state through AKB.
+`GET /health` reports the publisher's counters under `events`. Without
+`redis_url` its `publishing` is `off` and the counters are 0: the events the
+outbox keeps for the tail will never be published, so they do not hold the
+top-level `status` at `reconciling`.
+
 A cursor is refused with 410 `event_gap` only when an event it never received
 was deleted. A trigger on `events` records, per Vault, the highest event id
 deleted, in every statement that deletes, whichever code issues it: this
@@ -144,7 +185,13 @@ locked, so two of them cannot deadlock over marks either; a mark created
 while it runs is left behind, inert. A mark written for a Vault
 after its delete, as when its leftover events are swept later, stays behind
 and is inert: Vault ids are never reused. A cursor below that mark is
-refused, and the refusal's `earliest_cursor` resumes at it.
+refused, and the refusal's `earliest_cursor` resumes at it. An open tail
+reads the Vault's mark with each batch, in the statement that reads the
+batch: when it is above the tail's position, an event the tail never sent
+was deleted, by retention or otherwise, after the tail opened. The tail
+then ends with no further frame instead of sending the events after it,
+and the client's reconnect from the last cursor it received is refused
+with 410.
 Event ids are shared by every Vault, so a cursor taken before a Vault's first
 event, on an empty Vault, is usually far below that event and is still valid.
 `start=earliest` replays from the first position after which nothing was
@@ -161,8 +208,9 @@ sequence had handed out at that moment, while inserts and deletes on
 `events` wait. If the sequence's cache is above 1 it sets it to 1 first, so
 that no session can later hand out an id it drew ahead before the install;
 the cache stays 1. It reads no events, so that wait does not depend on how many
-rows the table holds, live or deleted and not yet cleaned up; the table keeps
-growing when the sweeper does not run, as without Redis. Migration 134 then
+rows the table holds, live or deleted and not yet cleaned up, however large an
+installation without Redis, which earlier releases never swept, let it grow.
+Migration 134 then
 sets the starting marks from the events up to that id, in its own
 transaction and without that lock, so writes go on while it scans. A Vault
 that already has a mark keeps it: only the trigger can have written one

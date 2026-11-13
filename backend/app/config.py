@@ -1386,12 +1386,23 @@ class Settings(BaseModel):
     # table) is always the source of truth; when redis_url is set the
     # events_publisher worker drains the outbox to a Redis Stream so
     # external consumers can subscribe. Empty redis_url disables the
-    # publisher entirely (no worker started, events still accumulate
-    # in PG and are sweepable).
+    # publisher entirely (no worker started; events are still written to
+    # PG, and the sweeper still deletes them after event_retention_days).
     redis_url: str = ""  # e.g. redis://redis:6379/0
     redis_password: str = ""
     redis_event_stream: str = "akb:events"
     redis_stream_maxlen: int = 100_000  # XADD MAXLEN ~ ceiling
+    # Days the `events` outbox keeps an event before the sweeper, which runs
+    # with or without Redis, deletes it. With redis_url set the period starts
+    # when the publisher records the event as published (redis_published_at:
+    # written to the stream, or marked published without it, as the
+    # gardener's bookkeeping events are), and an event not recorded as
+    # published is kept: the window lets an operator debug delivery against
+    # the outbox after the fact. Without redis_url the period starts when the
+    # event occurred. The event tail refuses a cursor that missed a deleted
+    # event with 410 `event_gap`, so a tail client away for longer than this
+    # may get one and should then reconcile.
+    event_retention_days: int = Field(default=7, ge=1, le=3650)
 
     # Vault Change Event Tail (`GET /api/v1/events/{vault}`). A waiting stream
     # holds no database connection. To read its next batch, and to check its

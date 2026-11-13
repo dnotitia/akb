@@ -427,11 +427,18 @@ bm25_b: 0.75
 # events_publisher worker drains the outbox to a Redis Stream so
 # external consumers (other services, dashboards) can subscribe via
 # XREAD / consumer groups. Leave blank to disable the worker — events
-# still accumulate in PG and you can build an SSE endpoint on top of
-# the LISTEN/NOTIFY trigger without Redis.
+# are still written to PG, where the authenticated
+# GET /api/v1/events/{vault} SSE tail reads them without Redis.
 redis_url: ""              # e.g. redis://redis:6379/0
 redis_event_stream: akb:events
 redis_stream_maxlen: 100000
+# Days the outbox keeps an event before the sweeper deletes it (optional;
+# default shown). With redis_url set the period starts when the event is
+# recorded as published (written to the stream, or skipped as gardener
+# bookkeeping), and an event not recorded so is kept; without it, when the
+# event occurred. A tail client away for longer may get 410 and should
+# then reconcile.
+# event_retention_days: 7
 
 # === Personal inbox (PostgreSQL; no Redis required) ===
 notifications_enabled: true

@@ -722,6 +722,16 @@ class _AccessLost(Exception):
     """The stream's reader may no longer read its Vault; the stream ends quietly."""
 
 
+class _EventsDeleted(Exception):
+    """An event above the stream's position was deleted; the stream ends quietly.
+
+    The rows a read returns skip over it, so a stream that went on would send
+    the next one and a cursor past it, and the client would never learn of
+    the gap. Ending instead leaves the client at a cursor below the Vault's
+    watermark, and its reconnect from there is refused with 410.
+    """
+
+
 class _CheckFailed(Exception):
     """An access check could not be made, as when the database connection was lost.
 
@@ -789,6 +799,12 @@ async def _read_pass(
 ) -> tuple[list[dict[str, Any]], float | None]:
     """Read the next batch and check access, both on one borrowed connection.
 
+    The read returns the Vault's watermark from the same statement as the
+    rows. When it is above ``after_id``, an event the stream has not passed
+    was deleted since the stream reached it, so the pass raises
+    _EventsDeleted before anything is sent or checked: the stream must not
+    send the rows after it, nor a cursor past it.
+
     The check runs after the read, so it covers every row read, and only when
     the batch has rows or ``check_when_empty`` asks for it: an empty pass costs
     one query. Returns the rows and the loop time the check started, or None
@@ -798,6 +814,8 @@ async def _read_pass(
     """
     async with _tail_db_connection() as conn:
         rows = await list_vault_events(conn, vault_id, after_id=after_id, limit=EVENT_BATCH_SIZE)
+        if getattr(rows, "deleted_through", 0) > after_id:
+            raise _EventsDeleted
         if not rows and not check_when_empty:
             return rows, None
         checked_at = asyncio.get_running_loop().time()
@@ -973,6 +991,14 @@ async def _stream_events(
     as a slow check before the rows it should cover; an idle stream makes it
     again after the next heartbeat.
 
+    Each read also reads the Vault's watermark, in the same statement as its
+    rows. Retention can delete events the stream has not reached yet, as it
+    can when the stream is behind. When the watermark is above the stream's
+    position, an event it never sent is gone, and the rows after it would
+    carry the client past the gap: the stream ends instead, with no further
+    frame, and the client's reconnect from the last cursor it received is
+    refused with 410.
+
     Invariant: no frame other than a heartbeat or the start checkpoint is
     yielded unless an access check has passed that started no more than
     _RECHECK_DURING_YIELD_SECONDS before the frame is yielded and after the
@@ -1015,7 +1041,7 @@ async def _stream_events(
                         yield heartbeat
                 try:
                     rows, pass_checked_at = read.result()
-                except _AccessLost:
+                except _AccessLost, _EventsDeleted:
                     return
                 except _CheckFailed as failed:
                     rows, pass_checked_at = failed.rows, None
