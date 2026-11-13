@@ -268,20 +268,48 @@ Vault's event lock, returns the error and leaves the documents deleted so far
 deleted, each with its event; running the same delete again continues with the
 documents that remain. When nothing is left under the prefix because an earlier
 recursive delete of it deleted its documents, the delete succeeds with zero
-counts rather than reporting the prefix as not found, and records the
-`collection.delete` that delete did not record; it tells this from a prefix
-nothing was deleted under by the Revisions that delete gave its documents,
-whose subject is `[delete-collection] <prefix>`. `deleted_docs` counts the
+counts rather than reporting the prefix as not found, and records
+`collection.delete`; it tells this from a prefix nothing was deleted under by
+the Revisions that delete gave its documents, whose subject is
+`[delete-collection] <prefix>`, and which are kept. `deleted_docs` counts the
 documents that call deleted.
 
-A deleted document's chunks and graph edges are removed by the derived worker,
-from the invalidation intent the delete records, not by the delete after its
-commit. The worker locks the Resource and skips the intent once the Resource
-has a later Revision, so a document restored, moved or linked again after the
-delete keeps what it has then. Edges are rows that other writers, such as a
-move re-linking its document, lock in their own order, so the worker's
-transaction can end in a deadlock (`40P01`); the worker then schedules the
-intent again with its usual backoff, and the next attempt removes them.
+`collection.delete` is at least once. Every delete that finds the prefix
+empty records it, so one prefix can have it more than once: when a delete
+stopped after its documents and is run again, or when two deletes of the same
+prefix finish together. Consumers treat it as "this prefix is gone", which a
+repeat does not change. Within akb-oss only the event tail and the Redis
+publisher read it, and they pass every event on; the gardener schedulers
+ignore the kind or de-duplicate events without a resource by Vault and kind,
+and Reef reads only `table.rows_changed`.
+
+Each document's graph edges, keyed on its Resource, are removed in the
+document's own delete transaction, while its Resource is locked and before
+its event. A document restored afterwards therefore starts without the links
+it had before the delete and keeps the ones made after its restore. Edges are
+rows that other writers, such as a move re-linking its document, lock in their
+own order, so that transaction can end in a deadlock (`40P01`); the request
+then fails, the document stays, and sending the same delete again continues.
+
+A deleted document's chunks are removed by the derived worker, from the
+invalidation intent the delete records; the worker also removes the
+document's edges once more. The worker locks the Resource and closes the
+intent as superseded once the Resource has a later Revision. Its transaction
+can also end in a deadlock, or fail otherwise; the worker then retries the
+intent with backoff: 1, 5, 15 and 30 minutes, then 1, 2 and 4 hours between
+its attempts. A claimed intent that is not finished is retried after 10
+minutes. When the eighth attempt (`MAX_RETRIES` in `app/services/_backfill.py`)
+fails too, the intent is abandoned: it is completed with
+`delivery_outcome = 'abandoned'` and its `last_error` class, and the derived
+state of that Revision, such as the deleted document's chunks, stays as it
+was. Abandoned intents are counted as `native_derived.abandoned` by
+`GET /health`, and per Vault by `GET /health/vault/{name}`; the rows are those
+of `native_invalidation_intents` with `delivery_outcome = 'abandoned'`, whose
+`last_error` names the exception class. Once the cause is fixed, an operator
+re-opens them with `app.services.native_derived_worker.requeue_abandoned(
+namespace_id=..., resource_id=...)` (the Resource is optional); the worker then
+attempts them again from the first step, and closes as superseded an intent
+whose Resource has changed since.
 
 ## Regression verification
 
@@ -323,11 +351,13 @@ completes it; that the delete holds one document at a time; that a document
 deleted or moved out by another request while the delete waits is left alone
 and not counted; on a database cut over from Bare Git, that the delete
 leaves the preserved `documents` rows and the collection they reference and can
-run again; that a document restored, moved and linked again right after its
-delete committed keeps the new link; that a delete stopped after its documents
-completes when run again, with one `collection.delete`, while a prefix nothing
-was deleted under is not found; and that the derived worker retries a graph
-cleanup that ended in a deadlock.
+run again; that a document restored while the delete is held right after that
+document's commit has lost its earlier link and keeps one made after the
+restore; that a delete stopped after its documents completes when run again,
+recording `collection.delete` at least once, while a prefix nothing was deleted
+under is not found; that the derived worker retries a cleanup that ended in a
+deadlock; and that a cleanup failing on every attempt is abandoned after
+`MAX_RETRIES` attempts and can be re-opened.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native
