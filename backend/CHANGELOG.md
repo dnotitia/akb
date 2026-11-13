@@ -17,8 +17,11 @@ specifically; the proxy has its own log in
   its event; the same delete run again continues with the rest. A writer's
   delete refused at a table that another request created under the prefix
   after the delete checked for one says which documents it already deleted:
-  `partially_applied` and `deleted_uris` in the 403's details; only an admin
-  or owner can finish it. A document that
+  `partially_applied`, `deleted_docs` and `deleted_uris` in the 403's
+  details; only an admin or owner can finish it. A delete that runs out of
+  rounds while documents keep arriving says the same in its 409. The paths
+  (`deleted_uris`, `retained_collections`) go only to a caller who may read
+  the Vault; a write-only caller gets the counts. A document that
   another request deletes or moves out of the collection meanwhile is left as
   it is and not counted in `deleted_docs`; such a document used to fail the
   delete or be deleted at its new path. Run again after it deleted every
@@ -31,11 +34,13 @@ specifically; the proxy has its own log in
   a restored document's new links with them. Abandoned derived intents whose
   Revision is still the Head can be re-opened with
   `native_derived_worker.requeue_abandoned`, which closes those of earlier
-  Revisions as superseded. In a database cut over from Bare Git the delete
-  used to fail every time on the preserved `documents` rows; it now leaves
-  them, and the collection rows they reference, in place, and lists those
-  collections as `retained_collections`, with a hint, in its response (MCP,
-  REST and the TypeScript client's type).
+  Revisions as superseded; a stalled claim of a re-opened intent can no
+  longer abandon it again or replace the new claim's work. In a database cut
+  over from Bare Git the delete used to fail every time on the preserved
+  `documents` rows; it now leaves them, and the collection rows they
+  reference, in place, and reports them in its response as
+  `retained_collection_count`, with a hint, and to a reader as
+  `retained_collections` (MCP, REST and the TypeScript client's type).
 
 - A recursive collection delete no longer deletes the documents of a
   sub-collection that another request created under its prefix while it ran

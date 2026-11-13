@@ -251,11 +251,12 @@ Known limits that predate the ordering change:
   deleting a collection they reference would perform. A recursive collection
   delete therefore leaves those rows and the collection rows they reference in
   place, while it deletes the Native documents, the other collections, files
-  and tables. Its response lists the collections left in place as
-  `retained_collections`, with a `hint` that says why, and so does the
-  `collection.delete` payload; the same delete sent again answers the same
-  way, and browsing shows those collections, empty. Removing such a collection
-  row needs a schema change.
+  and tables. Its response counts the collections left in place
+  (`retained_collection_count`), with a `hint` that says why, and lists their
+  paths (`retained_collections`) to a caller who may read the Vault, as the
+  `collection.delete` payload does; the same delete sent again answers the
+  same way, and browsing shows those collections, empty. Removing such a
+  collection row needs a schema change.
 - `akb_link` and the REST link endpoint resolve a document endpoint without
   the lock a Native delete takes, and an edge's key accepts a deleted
   Resource. A link that resolved a document before that document's delete
@@ -285,10 +286,11 @@ request left it and is not counted. The collections, files and tables under the
 prefix, with the `collection.delete`, follow in a last transaction, once no live
 document is left under the prefix; a document written there meanwhile is
 deleted in another round, up to three, before the delete gives up with a
-retryable conflict. A failure part-way, including a `write_busy` from the
-Vault's event lock, returns the error and leaves the documents deleted so far
-deleted, each with its event; running the same delete again continues with the
-documents that remain. When nothing is left under the prefix because an earlier
+retryable conflict. That conflict (HTTP 409, `conflict`), when the delete had
+deleted documents, says so as the refusals below do. A failure part-way,
+including a `write_busy` from the Vault's event lock, returns the error and
+leaves the documents deleted so far deleted, each with its event; running the
+same delete again continues with the documents that remain. When nothing is left under the prefix because an earlier
 recursive delete of it deleted its documents, the delete succeeds with zero
 counts rather than reporting the prefix as not found, and records
 `collection.delete`; it tells this from a prefix nothing was deleted under by
@@ -300,11 +302,18 @@ A caller that may not delete tables (a writer, not an admin or owner) is
 refused before any document goes when the prefix holds a table. A table that
 another request creates under the prefix after that check is found by the last
 transaction, which checks again under its locks, once the documents are
-deleted. They stay deleted, and the refusal (HTTP 403, `permission_denied`)
-says so: `partially_applied`, `deleted_docs` and the deleted documents'
-`deleted_uris` in its details, and a hint. The same request from that caller is
-refused before anything else goes; only a caller who may delete the table can
-finish the delete.
+deleted, or by the table check of a later round. The refusal (HTTP 403,
+`permission_denied`) says so: `partially_applied` and `deleted_docs` in its
+details, the deleted documents' `deleted_uris` for a caller who may read the
+Vault, and a hint. The URIs are those this request committed deletions for;
+later writes or restores may have changed them since. The same request from
+that caller is refused before anything else goes; only a caller who may delete
+the table can finish the delete.
+
+A caller who may write the Vault but not read it, such as a credential scoped
+to write only, is told how many documents and collections a delete deleted or
+left, never their paths: `deleted_uris` and `retained_collections` are given
+only to a caller with read authority on the Vault, over MCP as over REST.
 
 `collection.delete` is at least once. Every delete that finds the prefix
 empty records it, so one prefix can have it more than once: when a delete
@@ -352,6 +361,14 @@ the Resource's Head, and closes the others as superseded: the work of an
 earlier Revision, re-opened, could close the Head's own pending intent (see the
 clock limit above). The worker then attempts the re-opened intents again from
 the first step.
+
+Each outcome a claim writes, applied, deleted, superseded, a retry or
+abandoned, is written only to the intent as that claim left it, and a claim
+applies derived state only while it holds the intent so, locked in its apply
+transaction. A claim that outlived its lease, after which the intent was
+abandoned and re-opened, or claimed again, therefore changes nothing: its
+failure does not abandon the re-opened intent, and its work does not replace
+the current claim's.
 
 ## Regression verification
 
@@ -405,9 +422,14 @@ retries a cleanup that ended in a deadlock; that a cleanup failing on every
 attempt keeps the document's chunks, is abandoned after `MAX_RETRIES`
 attempts, and once re-opened removes the chunks and queues their vector
 deletes; that a final claim whose lease expired is abandoned by the queue
-rescuer with the `last_error` described above; and that re-opening an
-abandoned intent of an earlier Revision, stamped later than the Head's, closes
-it as superseded and leaves the Head to be indexed.
+rescuer with the `last_error` described above, and that once re-opened, the
+stalled claim's failure and work change nothing while a new claim applies it;
+that re-opening an abandoned intent of an earlier Revision, stamped later than
+the Head's, closes it as superseded and leaves the Head to be indexed; that a
+delete whose rounds run out as documents keep arriving says what it deleted;
+that a document restored after this request deleted it stays listed among the
+deletions it committed; and that a caller who may not read the Vault is told
+counts, not paths.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native

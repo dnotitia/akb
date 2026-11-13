@@ -1192,12 +1192,14 @@ file, and table under `P/`.
   is required and the physical PostgreSQL tables are dropped.
 - A path with no row and no descendants returns a NotFound error.
 - On a Vault cut over to the Native authority, a collection that preserved
-  pre-cutover documents reference keeps its row; the response lists it in
-  `retained_collections`, with a `hint`.
+  pre-cutover documents reference keeps its row; the response counts it in
+  `retained_collection_count`, with a `hint`, and lists it in
+  `retained_collections` if you can read the Vault.
 - If a table appears under the prefix while a writer's recursive delete runs,
   the documents already deleted stay deleted, and the `permission_denied`
-  error lists them (`details.partially_applied`, `details.deleted_uris`). Only
-  an admin or owner can finish that delete.
+  error says so (`details.partially_applied`, `details.deleted_docs`, and
+  `details.deleted_uris` if you can read the Vault). Only an admin or owner
+  can finish that delete. A `conflict` after documents went says the same.
 
 ## Parameters
 | Param | Required | Description |
