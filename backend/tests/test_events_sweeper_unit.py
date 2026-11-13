@@ -17,21 +17,33 @@ def test_event_retention_defaults_to_seven_days_and_refuses_less_than_one() -> N
 
 
 class _Conn:
-    """Answers the batch read with ``rows`` and the delete with ``deleted``."""
+    """Answers the batch read with ``rows``, the delete with ``deleted``, the marks' deletes with ``orphans``."""
 
-    def __init__(self, rows: list[tuple[int, bool]], deleted: int, *, fail_delete: bool = False) -> None:
+    def __init__(
+        self,
+        rows: list[tuple[int, bool]],
+        deleted: int,
+        *,
+        orphans: list[int] | None = None,
+        fail_delete: bool = False,
+    ) -> None:
         self.rows = [{"id": event_id, "old": old} for event_id, old in rows]
         self.deleted = deleted
+        self.orphans = list(orphans or [0])
         self.fail_delete = fail_delete
         self.deletes: list[tuple] = []
         self.statements: list[str] = []
         self.reads: list[tuple] = []
+        self.mark_deletes = 0
 
     async def fetch(self, sql: str, *args):
         self.reads.append(args)
         return self.rows
 
     async def fetchval(self, sql: str, *args):
+        if "event_retention_watermarks" in sql:
+            self.mark_deletes += 1
+            return self.orphans.pop(0) if len(self.orphans) > 1 else self.orphans[0]
         if self.fail_delete:
             raise ConnectionResetError("lost the connection")
         self.statements.append(sql)
@@ -193,3 +205,34 @@ async def test_a_step_whose_connection_fails_to_go_back_starts_the_next_pass_fro
     _serve(monkeypatch, sweeper, retry)
     assert await sweeper.sweep_once() == 2
     assert retry.reads[0][0] == 0
+
+
+async def test_the_marks_of_deleted_vaults_go_only_in_the_step_that_ends_the_pass(monkeypatch, sweeper):
+    """A step with old events returns at once; the step that finds none deletes the marks and returns 0."""
+    busy = _Conn([(4, True)], deleted=1, orphans=[2])
+    _serve(monkeypatch, sweeper, busy)
+    assert await sweeper.sweep_once() == 1
+    assert busy.mark_deletes == 0
+
+    ending = _Conn([(9, False)], deleted=0, orphans=[2])
+    _serve(monkeypatch, sweeper, ending)
+    assert await sweeper.sweep_once() == 0
+    assert ending.mark_deletes == 1
+
+    # With Redis as well.
+    monkeypatch.setattr(sweeper.settings, "redis_url", "redis://sweep-test")
+    published = _Conn([], deleted=0, orphans=[1])
+    _serve(monkeypatch, sweeper, published)
+    assert await sweeper.sweep_once() == 0
+    assert published.mark_deletes == 1
+
+
+async def test_the_step_that_ends_the_pass_deletes_the_marks_a_batch_at_a_time_until_one_is_short(
+    monkeypatch, sweeper
+):
+    monkeypatch.setattr(sweeper, "MARK_BATCH_SIZE", 2)
+    conn = _Conn([], deleted=0, orphans=[2, 2, 1])
+    _serve(monkeypatch, sweeper, conn)
+
+    assert await sweeper.sweep_once() == 0
+    assert conn.mark_deletes == 3

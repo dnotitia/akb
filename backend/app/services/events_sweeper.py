@@ -53,6 +53,16 @@ with another sweep, or with another statement that deletes events on its own.
 A transaction that deletes events in more than one statement still can: once
 its first statement holds a Vault's mark, its next one may wait for an event
 row a sweep holds while the sweep waits for that mark.
+
+The marks have no foreign key to vaults. A Vault's delete removes its mark,
+but an ordinary delete leaves the Vault's events behind, and sweeping them
+later writes a mark for a Vault that is gone. It is inert, as Vault ids are
+never reused, yet it would stay for good. The step that ends a pass removes
+the marks of Vaults that no longer exist and have no event left; while an
+event of the Vault id remains, its mark stays, as the line that event's 410 is
+drawn by. That delete locks the marks in Vault id order with SKIP LOCKED,
+leaving a mark another statement holds for a later pass, so it waits for no
+row lock and closes no cycle.
 """
 
 from __future__ import annotations
@@ -127,6 +137,31 @@ _DELETE_PUBLISHED = """
     SELECT COUNT(*) FROM d
 """
 
+# Marks of Vaults that are gone, at most this many per statement.
+MARK_BATCH_SIZE = 1000
+
+# The marks of Vaults that no longer exist and have no event left, in Vault
+# id order, the order every writer of marks takes them in. Each is locked
+# first and skipped if another statement holds it, so the delete never waits.
+_DELETE_ORPHANED_MARKS = """
+    WITH orphaned AS MATERIALIZED (
+        SELECT w.vault_id
+          FROM event_retention_watermarks w
+         WHERE NOT EXISTS (SELECT 1 FROM vaults v WHERE v.id = w.vault_id)
+           AND NOT EXISTS (SELECT 1 FROM events e WHERE e.vault_id = w.vault_id)
+         ORDER BY w.vault_id
+         LIMIT $1
+           FOR UPDATE OF w SKIP LOCKED
+    ),
+    d AS (
+        DELETE FROM event_retention_watermarks w
+         USING orphaned
+         WHERE w.vault_id = orphaned.vault_id
+        RETURNING 1
+    )
+    SELECT COUNT(*) FROM d
+"""
+
 # The highest event id the pass in progress has passed; 0 when no pass is in
 # progress.
 _position = 0
@@ -155,13 +190,19 @@ async def _sweep_batch(conn, after: int, delete: str) -> tuple[int, int, int]:
     return len(old), deleted, old[-1]
 
 
+async def _delete_orphaned_marks(conn) -> int:
+    """Delete one batch of the marks of Vaults that are gone and have no event left."""
+    return int(await conn.fetchval(_DELETE_ORPHANED_MARKS, MARK_BATCH_SIZE) or 0)
+
+
 async def sweep_once() -> int:
-    """Take one step of the pass: one batch.
+    """Take one step of the pass: one batch, or, once no old event is left, the marks.
 
     Returns the number of old events the batch held, deleted or left
     (unpublished, or held by another statement), and the runner then takes
-    the next step at once; 0 once the pass is over, and the runner waits
-    SWEEP_INTERVAL_SECONDS before the next one.
+    the next step at once. The step that finds no old event left ends the
+    pass: it deletes the marks of Vaults that are gone and returns 0, and the
+    runner waits SWEEP_INTERVAL_SECONDS before the next pass.
     """
     global _position
     # A step that fails, before it has a connection, while it holds one, or
@@ -169,12 +210,21 @@ async def sweep_once() -> int:
     # position it reached is kept only once the connection is back.
     after, _position = _position, 0
     delete = _DELETE_PUBLISHED if settings.redis_url else _DELETE_EXPIRED
+    removed = 0
     pool = await get_pool()
     async with pool.acquire() as conn:
         old, deleted, position = await _sweep_batch(conn, after, delete)
+        if not old:
+            while True:
+                batch = await _delete_orphaned_marks(conn)
+                removed += batch
+                if batch < MARK_BATCH_SIZE:
+                    break
     _position = position
     if deleted:
         logger.info("events sweep: purged %d rows", deleted)
+    if removed:
+        logger.info("events sweep: removed the retention marks of %d deleted Vaults", removed)
     return old
 
 
