@@ -25,8 +25,9 @@ specifically; the proxy has its own log in
   upload for the same confirmation to be sent again. An admin override's
   audit event, which the access check commits before the write, stays when the
   write is refused. A Native recursive collection delete refused after some of
-  its documents went says so: `partially_applied` and a hint that sending it
-  again continues it. A grep replacement refused after some documents were
+  its documents went says so: `partially_applied`, `deleted_docs` and, to a
+  caller who may read the Vault, `deleted_uris`, and a hint that sending it
+  again continues it; MCP now keeps a `write_busy`'s details as REST does. A grep replacement refused after some documents were
   replaced sets `partially_applied` too, and its hint names those documents
   with their new revisions and asks to replace only the rest, not to send the
   same request again.
@@ -38,19 +39,28 @@ specifically; the proxy has its own log in
   other coded errors, where a plain refusal used to give the message as a
   string; the top-level `message` and `error` are unchanged.
 
+  Contract change: raw SQL (`akb_sql`, `POST /api/v1/tables/{vault}/sql`)
+  may write only the Vaults its request declares. A statement whose plan
+  (`EXPLAIN`) modifies a dynamic table of an undeclared Vault is now refused
+  before it runs, with `invalid_argument` naming that Vault in
+  `undeclared_vaults`, administrators' statements included; it used to be
+  admitted for that Vault as well and run.
+
   Compiled table reads (`GET /api/v1/tables/{vault}/{table}/rows` and its
   `query` form) run in a read-only transaction and are not admitted, and
   `akb_sql` and `POST /api/v1/tables/{vault}/sql` take a new `read_only`
   option, false by default, that runs the statement in a read-only
   transaction without admission. Without it a statement, a `SELECT`
   included, is a write: it waits for admission and runs once, admitted for the
-  Vaults it declares and for those whose tables its plan (`EXPLAIN`) changes.
+  Vaults it declares.
   An MCP `akb_sql` call whose credential has read but not write scope always
   runs read-only. Reading the plan is limited by `akb_sql_plan_concurrency`
   (default 2) and to one plan per declared Vault, every declared Vault's
   token taken at once, so plans waiting for one Vault's locked table do not
   hold back another Vault; and by `akb_sql_plan_lock_timeout_ms` (default
-  500), past which the write fails with `write_busy`. A write that changes rows of an undeclared Vault
+  500), past which the write fails with `write_busy`. In the plan slots and
+  the admission alike, a waiter past half its deadline keeps the slots freed
+  on its Vaults, so single-Vault requests cannot starve a multi-Vault one. A write that changes rows of an undeclared Vault
   through a function is rolled back with an `invalid_argument` error naming
   it. An unscoped system administrator's raw SQL runs under the backend's
   role and is admitted only for those Vaults, not for another Vault whose
@@ -65,8 +75,10 @@ specifically; the proxy has its own log in
   it was replaced twice. An app rollout waits at most
   `app_rollout_admission_wait_secs` (default 1 second) for a target's Vault;
   a refusal defers every pending target of that Vault for 5 seconds, and the
-  worker claims the next eligible target at once instead of sleeping, so
-  other Vaults' rollouts proceed.
+  worker claims the next eligible target at once instead of sleeping.
+  Targets never deferred are claimed before deferred ones, which follow in
+  the order their deferrals ended, so busy Vaults do not take turns ahead of
+  another Vault's rollout.
 
 - On the Native authority a recursive collection delete is now atomic per
   document and completes when run again. Each document's delete commits with
