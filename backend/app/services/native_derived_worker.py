@@ -317,6 +317,56 @@ async def current_head_stats(namespace_id: uuid.UUID) -> dict[str, int]:
     return await _current_head_stats(await get_pool(), namespace_id)
 
 
+async def _requeue_abandoned(
+    pool: asyncpg.Pool,
+    *,
+    namespace_id: uuid.UUID,
+    resource_id: uuid.UUID | None = None,
+) -> int:
+    """Re-open the abandoned intents of one namespace, or of one Resource in it.
+
+    An intent is abandoned when its last allowed attempt failed (see
+    ``NativeDerivedWorker._failure``): the worker stops retrying it, and the
+    chunks, graph edges and derived head of that Revision stay as they were.
+    Re-opening keeps the intent's identity and starts its attempts again, now;
+    the worker then re-checks the Resource's head as on any attempt, so an
+    intent a later Revision replaced is closed as superseded.
+    """
+    params: list[object] = [namespace_id]
+    scope = ""
+    if resource_id is not None:
+        params.append(resource_id)
+        scope = "AND resource_id = $2"
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            UPDATE native_invalidation_intents
+               SET claimed_at = NULL, retry_count = 0, next_attempt_at = NOW(),
+                   completed_at = NULL, delivery_outcome = NULL, last_error = NULL
+             WHERE namespace_id = $1
+               AND completed_at IS NOT NULL
+               AND delivery_outcome = 'abandoned'
+               {scope}
+            RETURNING intent_id
+            """,
+            *params,
+        )
+    return len(rows)
+
+
+async def requeue_abandoned(
+    *,
+    namespace_id: uuid.UUID,
+    resource_id: uuid.UUID | None = None,
+) -> int:
+    """Operator entry point: re-open abandoned derived intents of a Vault.
+
+    An explicit namespace is required; ``resource_id`` narrows it to one
+    Resource. Returns how many intents were re-opened.
+    """
+    return await _requeue_abandoned(await get_pool(), namespace_id=namespace_id, resource_id=resource_id)
+
+
 class NativeDerivedWorker:
     """One-batch native invalidation consumer with durable retry state."""
 
@@ -780,6 +830,12 @@ class NativeDerivedWorker:
     async def pending_stats(self, namespace_id: uuid.UUID | None = None) -> dict[str, int | str]:
         """Return queue diagnostics using this worker's pool (tests/operators)."""
         return await _pending_stats(self.pool, namespace_id)
+
+    async def requeue_abandoned(
+        self, *, namespace_id: uuid.UUID, resource_id: uuid.UUID | None = None,
+    ) -> int:
+        """Re-open this namespace's abandoned intents (see `requeue_abandoned`)."""
+        return await _requeue_abandoned(self.pool, namespace_id=namespace_id, resource_id=resource_id)
 
     async def settle(
         self,

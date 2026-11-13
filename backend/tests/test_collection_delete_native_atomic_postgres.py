@@ -35,6 +35,7 @@ from app.services.git_service import GitService
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_revision_backfill import NativeRevisionBackfill
 from app.services.native_revision_cutover import CutoverVaultInput, NativeRevisionCutover
+from app.services._backfill import MAX_RETRIES
 from app.services.native_derived_worker import NativeDerivedWorker
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri
@@ -383,13 +384,15 @@ async def _drain(worker: NativeDerivedWorker, rounds: int = 20) -> None:
         await worker.process_once()
 
 
-async def test_a_document_restored_after_its_delete_keeps_its_new_links(monkeypatch):
-    """Right after the recursive delete committed `notes/a.md`'s delete,
-    another request restores the same Resource, moves it to
-    `elsewhere/a.md` and links it to `other/c.md`. Nothing the delete or the
-    derived worker does after that commit removes the new link. The delete
-    used to remove the Resource's edges itself after the commit, holding no
-    lock on the Resource, and took the new link with them."""
+async def test_a_document_restored_after_its_delete_has_only_its_new_links(monkeypatch):
+    """`notes/a.md` links to `other/c.md`. The recursive delete commits
+    `notes/a.md`'s delete and is held right after that commit, before the next
+    document. Another request then restores the same Resource and moves it to
+    `elsewhere/a.md`: the link it had before the delete is gone, because the
+    delete removed it in its own transaction. A link made after the restore
+    stays, whatever the delete and the derived worker do afterwards. The
+    delete used to leave the old link to the worker, which skips an intent
+    the Resource has moved past, so a restored document got it back."""
     async with _fresh_database() as pool:
         vault = "native-restored-links"
         vault_id = await _native_vault(pool, monkeypatch, vault)
@@ -398,27 +401,29 @@ async def test_a_document_restored_after_its_delete_keeps_its_new_links(monkeypa
             namespace_id=vault_id, surface="document", path="other/c.md",
             payload="body of other/c.md", actor="tester", mutation_id=uuid.uuid4(),
         )
+        await _link(vault, _PATHS[0], "other/c.md")
         first = await pool.fetchval(
             "SELECT resource_id FROM native_resources WHERE namespace_id = $1 AND current_path = $2",
             vault_id, _PATHS[0],
         )
-        # A delete that cleans up after its commit pauses there.
-        paused, resume = asyncio.Event(), asyncio.Event()
-        drop_chunks = collection_service_module.delete_document_chunks
+        committed, resume = asyncio.Event(), asyncio.Event()
+        delete_document = collection_service_module._delete_native_document
 
-        async def pause_before_the_cleanup(conn, source_id):
-            if source_id == str(first) and not paused.is_set():
-                paused.set()
+        async def hold_after_the_first(*args, **kwargs):
+            deleted = await delete_document(*args, **kwargs)
+            if kwargs.get("resource_id") == first:
+                committed.set()
                 await resume.wait()
-            return await drop_chunks(conn, source_id)
+            return deleted
 
-        monkeypatch.setattr(collection_service_module, "delete_document_chunks", pause_before_the_cleanup)
+        monkeypatch.setattr(collection_service_module, "_delete_native_document", hold_after_the_first)
         deleting = asyncio.create_task(CollectionService(git=object()).delete(
             vault=vault, path="notes", recursive=True, agent_id="tester",
         ))
-        waiting = asyncio.create_task(paused.wait())
         try:
-            await asyncio.wait({deleting, waiting}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait_for(committed.wait(), timeout=30)
+            # The delete is held between its documents.
+            assert not deleting.done()
             deleted = await pool.fetchval(
                 "SELECT head_revision_id FROM native_resources WHERE resource_id = $1 AND lifecycle = 'deleted'",
                 first,
@@ -434,14 +439,18 @@ async def test_a_document_restored_after_its_delete_keeps_its_new_links(monkeypa
                 actor="other", mutation_id=uuid.uuid4(), expected_revision_id=restored.revision_id,
                 expected_resource_id=first,
             )
+            assert await pool.fetchval(
+                "SELECT count(*) FROM edges WHERE vault_id = $1 AND (source_resource_id = $2 OR target_resource_id = $2)",
+                vault_id, first,
+            ) == 0
             await _link(vault, "elsewhere/a.md", "other/c.md")
         finally:
             resume.set()
-            waiting.cancel()
         await asyncio.wait_for(deleting, timeout=30)
         await _drain(NativeDerivedWorker(pool))
 
         assert await _link_count(pool, vault_id, vault, "elsewhere/a.md", "other/c.md") == 1
+        assert await _link_count(pool, vault_id, vault, _PATHS[0], "other/c.md") == 0
         assert await pool.fetchval(
             "SELECT lifecycle FROM native_resources WHERE resource_id = $1", first,
         ) == "live"
@@ -451,9 +460,10 @@ async def test_a_delete_stopped_after_its_documents_is_completed_by_a_retry(monk
     """The documents under `notes`, which has no collection row, were deleted
     with their events, and the delete failed before its last transaction, so
     nothing is left under `notes`. Run again, the delete succeeds with nothing
-    to delete and records the `collection.delete` the first run did not; run
-    once more, it succeeds and records nothing. It used to report `notes` as
-    not found. A prefix nothing was deleted under is still not found."""
+    to delete and records the `collection.delete` the first run did not. The
+    event is at least once: a delete run once more records it again. It used
+    to report `notes` as not found. A prefix nothing was deleted under is still
+    not found."""
     async with _fresh_database() as pool:
         vault = "native-converge-final"
         vault_id = await _native_vault(pool, monkeypatch, vault)
@@ -487,25 +497,20 @@ async def test_a_delete_stopped_after_its_documents_is_completed_by_a_retry(monk
         completed = ["document.delete", "document.delete", "collection.delete"]
         assert (await _state(pool, vault_id))["events"] == completed
         assert await delete() == {"ok": True, "collection": "notes", **nothing}
-        assert (await _state(pool, vault_id))["events"] == completed
+        assert (await _state(pool, vault_id))["events"] == [*completed, "collection.delete"]
         with pytest.raises(NotFoundError):
             await delete("never")
 
 
-async def test_the_worker_retries_graph_cleanup_that_deadlocked(monkeypatch):
-    """The derived worker removes a deleted document's graph edges in the
-    transaction that applies its delete. Edges are rows other writers lock in
-    their own order, so that transaction can fail with a deadlock (40P01). The
-    intent is then scheduled again, and its next attempt removes them."""
+async def test_the_worker_retries_a_cleanup_that_deadlocked(monkeypatch):
+    """The derived worker removes a deleted document's chunks, and its graph
+    edges once more, in the transaction that applies the delete's intent.
+    Edges are rows other writers lock in their own order, so that transaction
+    can end in a deadlock (40P01). The intent is then scheduled again with the
+    worker's backoff, and its next attempt applies it."""
     async with _fresh_database() as pool:
         vault = "native-cleanup-retry"
         vault_id = await _native_vault(pool, monkeypatch, vault)
-        native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
-        await native.create_text(
-            namespace_id=vault_id, surface="document", path="other/c.md",
-            payload="body of other/c.md", actor="tester", mutation_id=uuid.uuid4(),
-        )
-        await _link(vault, _PATHS[0], "other/c.md")
         first = await pool.fetchval(
             "SELECT resource_id FROM native_resources WHERE namespace_id = $1 AND current_path = $2",
             vault_id, _PATHS[0],
@@ -524,30 +529,85 @@ async def test_the_worker_retries_graph_cleanup_that_deadlocked(monkeypatch):
 
         monkeypatch.setattr(native_derived_worker, "delete_native_document_edges", deadlock_once)
         worker = NativeDerivedWorker(pool)
-
-        async def open_intents() -> list[tuple[int, str | None]]:
-            rows = await pool.fetch(
-                "SELECT retry_count, last_error FROM native_invalidation_intents "
-                "WHERE resource_id = $1 AND completed_at IS NULL",
-                first,
-            )
-            return [(r["retry_count"], r["last_error"]) for r in rows]
-
         await _drain(worker)
         assert deadlocks == [first]
-        assert await open_intents() == [(1, "DeadlockDetectedError")]
-        assert await _link_count(pool, vault_id, vault, _PATHS[0], "other/c.md") == 1
-
-        await pool.execute(
-            "UPDATE native_invalidation_intents SET next_attempt_at = NOW() "
+        assert await _open_intents(pool, first) == [(1, "DeadlockDetectedError")]
+        later = await pool.fetchval(
+            "SELECT next_attempt_at > NOW() + INTERVAL '50 seconds' FROM native_invalidation_intents "
             "WHERE resource_id = $1 AND completed_at IS NULL",
             first,
         )
+        assert later, "the next attempt waits for the first backoff step"
+
+        await _attempt_now(pool, first)
         await _drain(worker)
-        assert await open_intents() == []
-        assert await pool.fetchval(
-            "SELECT delivery_outcome FROM native_invalidation_intents WHERE resource_id = $1 "
-            "ORDER BY occurred_at DESC, intent_id DESC LIMIT 1",
-            first,
-        ) == "deleted"
-        assert await _link_count(pool, vault_id, vault, _PATHS[0], "other/c.md") == 0
+        assert await _open_intents(pool, first) == []
+        assert await _last_outcome(pool, first) == "deleted"
+
+
+async def _open_intents(pool, resource_id: uuid.UUID) -> list[tuple[int, str | None]]:
+    rows = await pool.fetch(
+        "SELECT retry_count, last_error FROM native_invalidation_intents "
+        "WHERE resource_id = $1 AND completed_at IS NULL",
+        resource_id,
+    )
+    return [(r["retry_count"], r["last_error"]) for r in rows]
+
+
+async def _attempt_now(pool, resource_id: uuid.UUID) -> None:
+    await pool.execute(
+        "UPDATE native_invalidation_intents SET next_attempt_at = NOW() "
+        "WHERE resource_id = $1 AND completed_at IS NULL",
+        resource_id,
+    )
+
+
+async def _last_outcome(pool, resource_id: uuid.UUID) -> str | None:
+    return await pool.fetchval(
+        "SELECT delivery_outcome FROM native_invalidation_intents WHERE resource_id = $1 "
+        "ORDER BY occurred_at DESC, intent_id DESC LIMIT 1",
+        resource_id,
+    )
+
+
+async def test_a_cleanup_that_keeps_failing_is_abandoned_and_can_be_requeued(monkeypatch):
+    """A delete intent whose application fails on every attempt is retried
+    with backoff until its `MAX_RETRIES`-th attempt fails. It is then
+    abandoned: completed with outcome `abandoned`, its chunks left in place,
+    and counted as abandoned in the queue's statistics. An operator re-opens
+    it with `requeue_abandoned`, and once the cause is gone the worker applies
+    it."""
+    async with _fresh_database() as pool:
+        vault = "native-cleanup-abandoned"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        first = await pool.fetchval(
+            "SELECT resource_id FROM native_resources WHERE namespace_id = $1 AND current_path = $2",
+            vault_id, _PATHS[0],
+        )
+        await CollectionService(git=object()).delete(
+            vault=vault, path="notes", recursive=True, agent_id="tester",
+        )
+        cleanup = native_derived_worker.delete_native_document_edges
+        broken = {"on": True}
+
+        async def always_deadlocks(conn, vault_id, vault_name, resource_id, path):
+            if resource_id == first and broken["on"]:
+                raise asyncpg.exceptions.DeadlockDetectedError("deadlock detected")
+            return await cleanup(conn, vault_id, vault_name, resource_id, path)
+
+        monkeypatch.setattr(native_derived_worker, "delete_native_document_edges", always_deadlocks)
+        worker = NativeDerivedWorker(pool)
+        for attempt in range(1, MAX_RETRIES):
+            await _drain(worker)
+            assert await _open_intents(pool, first) == [(attempt, "DeadlockDetectedError")]
+            await _attempt_now(pool, first)
+        await _drain(worker)
+        assert await _open_intents(pool, first) == []
+        assert await _last_outcome(pool, first) == "abandoned"
+        assert (await worker.pending_stats(vault_id))["abandoned"] >= 1
+
+        broken["on"] = False
+        assert await worker.requeue_abandoned(namespace_id=vault_id, resource_id=first) == 1
+        assert await worker.requeue_abandoned(namespace_id=vault_id, resource_id=first) == 0
+        await _drain(worker)
+        assert await _last_outcome(pool, first) == "deleted"

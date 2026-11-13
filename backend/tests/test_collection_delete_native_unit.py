@@ -62,6 +62,7 @@ def _fixture(monkeypatch, *, native: bool, legacy: bool = False):
     for name in (
         "delete_document_chunks",
         "delete_document_relations",
+        "delete_native_document_edges",
         "emit_event",
     ):
         monkeypatch.setattr(collection_service, name, AsyncMock())

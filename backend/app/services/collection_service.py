@@ -29,7 +29,7 @@ from app.services.git_service import GitService
 from app.services.index_service import (
     delete_document_chunks, delete_file_chunks, delete_table_chunks,
 )
-from app.services.kg_service import delete_document_relations
+from app.services.kg_service import delete_document_relations, delete_native_document_edges
 from app.services.m1_file_measurement import _tombstone_native_text_file
 from app.services.publication_service import delete_publications_for_file
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
@@ -140,18 +140,18 @@ async def _delete_native_document(
 ) -> bool:
     """Delete one live Native document under ``prefix``, with its event.
 
-    The delete and its ``document.delete`` commit together in one short
-    transaction that locks only this document's Resource (and its path), so it
-    never waits for a second Resource while it holds one. A document deleted,
-    or moved out of the prefix, by another request since it was listed is left
-    as it is and reported as not deleted.
+    The delete, the document's graph edges and its ``document.delete`` commit
+    together in one short transaction that locks only this document's Resource
+    (and its path), so it never waits for a second Resource while it holds one.
+    The edges go while the Resource is locked: a document restored afterwards
+    starts without the links it had before the delete, and keeps the ones made
+    after its restore. A document deleted, or moved out of the prefix, by
+    another request since it was listed is left as it is and reported as not
+    deleted.
 
-    Its chunks and graph edges are removed by the derived worker, from the
-    invalidation intent the delete records. The worker locks the Resource and
-    skips the intent once the Resource has a later Revision, so a document
-    restored, moved or linked again after this commit keeps what it has then.
-    Removing them here, after the commit released the Resource, removed those
-    as well.
+    Its chunks are removed by the derived worker, from the invalidation intent
+    the delete records; the worker locks the Resource and skips the intent once
+    the Resource has a later Revision.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -180,6 +180,8 @@ async def _delete_native_document(
                 conn=conn,
                 events=events,
             )
+            # Keyed on the resource, and on the path read under its row lock.
+            await delete_native_document_edges(conn, vault_id, vault, resource_id, row["current_path"])
             # The event is the transaction's last statement.
             await events.flush(conn)
     return True
@@ -206,48 +208,19 @@ async def _delete_native_documents_under(*, vault: str, vault_id: uuid.UUID, pre
     return deleted
 
 
-async def _earlier_recursive_delete(conn, vault_id: uuid.UUID, prefix: str) -> bool | None:
-    """Whether an earlier recursive delete of ``prefix`` stopped part-way.
+async def _earlier_recursive_delete(conn, vault_id: uuid.UUID, prefix: str) -> bool:
+    """Whether a recursive delete of ``prefix`` ever deleted a Native document.
 
     A recursive delete gives each Native document it deletes a Revision with
-    the subject ``[delete-collection] <prefix>``, committed with its
-    ``document.delete``, and records ``collection.delete`` last. Returns
-    ``None`` when no recursive delete of ``prefix`` deleted a document, so the
-    prefix is unknown; ``True`` when the latest one deleted documents and no
-    ``collection.delete`` of the prefix was recorded after them; ``False``
-    when it was. Event ids of a Vault follow commit order (migration 132).
-
-    Two deletes completing the same prefix take turns on a transaction
-    advisory lock, so the event is recorded once.
+    the subject ``[delete-collection] <prefix>``. Revisions are kept, so this
+    tells a prefix an earlier delete emptied, and that delete may have stopped
+    before recording ``collection.delete``, from one that never held anything.
     """
-    await conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        f"akb:collection-delete:{vault_id}:{prefix}",
-    )
-    row = await conn.fetchrow(
-        """
-        WITH last_delete AS (
-            SELECT revision_id
-              FROM native_revisions
-             WHERE namespace_id = $1 AND action = 'delete' AND subject = $2
-             ORDER BY occurred_at DESC, revision_id DESC
-             LIMIT 1
-        )
-        SELECT (SELECT max(e.id) FROM events e
-                 WHERE e.vault_id = $1 AND e.kind = 'document.delete'
-                   AND e.payload->>'revision_id' = d.revision_id) AS deleted,
-               (SELECT max(e.id) FROM events e
-                 WHERE e.vault_id = $1 AND e.kind = 'collection.delete'
-                   AND e.payload->>'path' = $3) AS completed
-          FROM last_delete d
-        """,
-        vault_id, f"[delete-collection] {prefix}", prefix,
-    )
-    if row is None:
-        return None
-    if row["completed"] is None:
-        return True
-    return row["deleted"] is not None and row["completed"] < row["deleted"]
+    return bool(await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM native_revisions "
+        "WHERE namespace_id = $1 AND action = 'delete' AND subject = $2)",
+        vault_id, f"[delete-collection] {prefix}",
+    ))
 
 
 async def _legacy_documents_fenced(conn) -> bool:
@@ -386,10 +359,11 @@ class CollectionService:
         no live document is left under `P`. A failure part-way leaves the
         documents deleted so far deleted and returns the error; running the
         same delete again continues with the rest. When nothing is left under
-        `P` because an earlier recursive delete of `P` deleted it, the delete
-        succeeds with zero counts instead of `NotFoundError`, and records the
-        `collection.delete` that delete did not (see
-        `_earlier_recursive_delete`). The counts are what this call deleted.
+        `P` because an earlier recursive delete of `P` deleted its documents,
+        the delete succeeds with zero counts instead of `NotFoundError` and
+        records `collection.delete` (see `_earlier_recursive_delete`); the
+        event is at least once, so it can be recorded more than once for one
+        prefix. The counts are what this call deleted.
 
         Race-safety: the target row (if any) and all sub-collection
         rows are locked `FOR UPDATE` inside the same transaction, so a
@@ -594,29 +568,27 @@ class CollectionService:
                 ):
                     if not (native_authority and recursive):
                         raise NotFoundError("Collection", norm)
-                    unfinished = await _earlier_recursive_delete(conn, vault_id, norm)
-                    if unfinished is None:
+                    if not await _earlier_recursive_delete(conn, vault_id, norm):
                         raise NotFoundError("Collection", norm)
+                    # `collection.delete` is at least once: it is recorded by
+                    # every delete that finds the prefix empty, whether or
+                    # not an earlier one recorded it already.
                     nothing = {
                         "deleted_docs": 0,
                         "deleted_files": 0,
                         "deleted_sub_collections": 0,
                         "deleted_tables": 0,
                     }
-                    if unfinished:
-                        completion = EventBuffer()
-                        completion.add(
-                            "collection.delete",
-                            vault_id=vault_id,
-                            resource_uri=None,
-                            actor_id=agent_id,
-                            payload={"vault": vault, "path": norm, **nothing},
-                        )
-                        await completion.flush(conn)
-                    logger.info(
-                        "Collection delete: vault=%s path=%s already deleted (event recorded now: %s)",
-                        vault, norm, unfinished,
+                    completion = EventBuffer()
+                    completion.add(
+                        "collection.delete",
+                        vault_id=vault_id,
+                        resource_uri=None,
+                        actor_id=agent_id,
+                        payload={"vault": vault, "path": norm, **nothing},
                     )
+                    await completion.flush(conn)
+                    logger.info("Collection delete: vault=%s path=%s already emptied", vault, norm)
                     return {"ok": True, "collection": norm, **nothing}
 
                 # ── Empty-mode reject ───────────────────────────
