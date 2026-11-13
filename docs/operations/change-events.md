@@ -126,10 +126,16 @@ collection it locks, such as a move's source; a recursive collection delete
 locks the collection at its prefix and those under it `FOR UPDATE`, so either
 the creation waits for the delete or the delete waits for the creation and
 then deletes the new collection too. Every insert into `collections` goes
-through `CollectionRepository`, which takes these locks. After it has read the
-documents, files and tables under its prefix, the delete reads the collections
-under it once more and starts over if one appeared; this covers a prefix that
-has no row of its own, where a creation finds no ancestor to lock.
+through `CollectionRepository`, which takes these locks; a measurement File
+upload removes expired transfer intents in a transaction of its own before it
+creates the collection, since a delete removes a collection's intents with it.
+After it has read the documents, files and tables under its prefix, the delete
+reads the collections under it once more and starts over if one appeared; this
+covers a prefix that has no row of its own, where a creation finds no ancestor
+to lock. These rules apply to what the delete selected: the documents, files,
+tables and collections it read go together, and a collection whose contents it
+removed is removed with them. A write that commits after the delete's reads is
+not part of it; see the known limits below for the Native authority.
 A write that finds its document moved after locking it, or a move that finds
 its destination collection gone, rolls back to a savepoint, releasing every
 collection and the document, before it tries again. They hold the Vault's lock through
@@ -232,6 +238,14 @@ reader access checks; its opaque cursor is different from a Redis cursor.
 
 Known limits that predate the ordering change:
 
+- A Native document write commits the document first and registers its
+  collection row afterwards, on its own and on a best-effort basis. When a
+  recursive delete removes the document and its collection in between, the late
+  registration creates the collection row again, empty.
+- Native document writes do not lock collection rows. A document that a Native
+  write commits into an existing sub-collection after a recursive delete read
+  the prefix's documents is not deleted, while its collection row is: the
+  document stays without a collection row.
 - On the Native authority a recursive collection delete commits each
   document's delete in its own transaction. If it fails partway, for any
   reason including a `write_busy` from the Vault's event lock, the documents
@@ -266,7 +280,9 @@ also when it fails a dynamic-table write at commit.
 created under a recursive delete's prefix between the delete's lock and its
 document reads, with and without a row at the prefix, and checks that nothing
 remains under the prefix; it also checks that a creation locks its ancestors in
-id order, together with a move's source, so neither deadlocks with the delete.
+id order, together with a move's source, and that a measurement File upload
+into a new sub-collection removes expired intents first, so none of them
+deadlocks with the delete.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native

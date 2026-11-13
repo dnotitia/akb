@@ -7,13 +7,16 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
-- A recursive collection delete no longer leaves behind a sub-collection that
-  another request created under its prefix while it ran. Such a collection
-  stayed with its count unchanged while the documents created in it were
-  deleted. Creating a collection now locks its existing ancestor collections
-  until the creating transaction ends, in id order with the other collections
-  it locks, and the delete reads the collections under its prefix again after
-  reading their contents, starting over when one appeared.
+- A recursive collection delete no longer deletes the documents of a
+  sub-collection that another request created under its prefix while it ran
+  and leaves that collection behind, with its count unchanged. Creating a
+  collection now locks its existing ancestor collections until the creating
+  transaction ends, in id order with the other collections it locks, and the
+  delete reads the collections under its prefix again after reading their
+  contents, starting over when one appeared. This holds for what the delete
+  selected, where a collection and its contents are created together; on the
+  Native authority a collection's row is registered after its document and
+  `docs/operations/change-events.md` lists the races that remain.
 
 - The SSE event tail (`GET /api/v1/events/{vault}`) no longer skips an event
   whose transaction committed after an event with a larger id. Within a Vault,
