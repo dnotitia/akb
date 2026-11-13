@@ -1012,7 +1012,10 @@ akb_grep(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
 `max_replacements` set high enough for the intended scope.
 Each changed document gets its own revision. If a write fails, replacement
 stops. Earlier writes remain committed and are listed in `replacements`.
-`details.failed_uri` identifies the document that stopped the batch.
+`details.failed_uri` identifies the document that stopped the batch, and
+`details.partially_applied` is true when earlier writes committed. Then do not
+send the same request again, which would replace the text again in a replaced
+document that still matches; replace only the documents not replaced yet.
 Bulk replacement cannot edit the vault guide. Its owner can edit it with `akb_update`.
 
 ## Result Structure

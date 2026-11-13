@@ -19,30 +19,48 @@ specifically; the proxy has its own log in
   a connection. A transaction of several Vaults is admitted for all of them at
   once. A wait longer than `vault_write_queue_timeout_secs` (default
   10 seconds) fails with a retryable `write_busy` (HTTP 429, `Retry-After: 1`)
-  before the write's event, Git commit, document or prepared Native payload; a
-  File upload confirmation refused at its publication keeps the lease renewal
-  it committed before, and a refused File replacement keeps its upload for the
-  same confirmation to be sent again. A Native recursive collection delete
-  refused after some of its documents went says so: `partially_applied` and a
-  hint that sending it again continues it.
+  before the write's own event, Git commit, document or prepared Native
+  payload; a File upload confirmation refused at its publication keeps the
+  lease renewal it committed before, and a refused File replacement keeps its
+  upload for the same confirmation to be sent again. An admin override's
+  audit event, which the access check commits before the write, stays when the
+  write is refused. A Native recursive collection delete refused after some of
+  its documents went says so: `partially_applied` and a hint that sending it
+  again continues it. A grep replacement refused after some documents were
+  replaced sets `partially_applied` too, and its hint names those documents
+  with their new revisions and asks to replace only the rest, not to send the
+  same request again.
 
-  Reads are not admitted: row reads through the table API run in a read-only
-  transaction, and `akb_sql` and `POST /api/v1/tables/{vault}/sql` take a new
-  `read_only` option, false by default, that runs the statement in a
-  read-only transaction without admission. Otherwise a statement is a write
-  and runs once, admitted for the Vaults it declares and for those whose
-  tables its plan (`EXPLAIN`) changes; reading the plan is limited by
-  `akb_sql_plan_concurrency` (default 2) and `akb_sql_plan_lock_timeout_ms`
-  (default 500), past which the write fails with `write_busy`. A write that
-  changes rows of an undeclared Vault through a function is rolled back with
-  an `invalid_argument` error naming it.
+  A refused write's REST body now carries the `write_busy` code, with
+  `retry_after_secs` (and `partially_applied` when it applies) in its
+  details and a hint; it used to carry `internal`.
+
+  Compiled table reads (`GET /api/v1/tables/{vault}/{table}/rows` and its
+  `query` form) run in a read-only transaction and are not admitted, and
+  `akb_sql` and `POST /api/v1/tables/{vault}/sql` take a new `read_only`
+  option, false by default, that runs the statement in a read-only
+  transaction without admission. Without it a statement, a `SELECT`
+  included, is a write: it waits for admission and runs once, admitted for the
+  Vaults it declares and for those whose tables its plan (`EXPLAIN`) changes.
+  An MCP `akb_sql` call whose credential has read but not write scope always
+  runs read-only. Reading the plan is limited by `akb_sql_plan_concurrency`
+  (default 2), with statements of different Vaults taking turns for a slot,
+  and by `akb_sql_plan_lock_timeout_ms` (default 500), past which the write
+  fails with `write_busy`. A write that changes rows of an undeclared Vault
+  through a function is rolled back with an `invalid_argument` error naming
+  it. An unscoped system administrator's raw SQL runs under the backend's
+  role and is admitted only for those Vaults, not for another Vault whose
+  `events` it writes or whose event lock it takes directly.
 
   A new Bare Git Vault holds its write-lane gate and admission through its
   seed document but takes a global write-lane slot only for each Git
-  operation. A write whose Vault was replaced under its name starts again for
-  the new Vault, or fails with a conflict when it was replaced twice. An app
-  rollout target refused by admission is deferred for 5 seconds so other
-  rollouts proceed.
+  operation; after its first Git commit, the seed and the compensation of a
+  failed creation wait for their slot without the lane's deadline, so a busy
+  lane no longer leaves a half-created Vault. A write whose Vault was replaced
+  under its name starts again for the new Vault, or fails with a conflict when
+  it was replaced twice. An app rollout target refused by admission is
+  deferred for 5 seconds, and the worker claims the next eligible target at
+  once instead of sleeping, so other rollouts proceed.
 
 - On the Native authority a recursive collection delete is now atomic per
   document and completes when run again. Each document's delete commits with
