@@ -146,36 +146,41 @@ test("event gap and invalid cursor remain AkbError responses", async () => {
   );
 });
 
-test("a refused open waits for its Retry-After before the next attempt", async () => {
-  await withFakeClock(async () => {
-    const attempts = [];
-    const fetch = async (_input, init = {}) => {
-      attempts.push(Date.now());
-      if (attempts.length === 1) {
-        return json(
-          { message: "Event tail capacity is exhausted on this server", code: "event_tail_capacity" },
-          503,
-          "Service Unavailable",
-          { "retry-after": "5" },
-        );
-      }
-      return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
-    };
-    const opening = createClient({ baseUrl: "https://akb.test/api/v1", fetch })
-      .vault("vault")
-      .channel()
-      .subscribe();
+test("a refused open waits at least its Retry-After, within the jitter bound", async () => {
+  // Retry-After: 5 allows up to min(20% of 5 s, 1 s) of jitter on top. Math.random() = 0
+  // takes the bottom of that range and the largest value below 1 its top.
+  for (const [random, expected] of [[0, 5_000], [1 - 2 ** -53, 6_000]]) {
+    await withFakeClock(async () => {
+      vi.spyOn(Math, "random").mockReturnValue(random);
+      const attempts = [];
+      const fetch = async (_input, init = {}) => {
+        attempts.push(Date.now());
+        if (attempts.length === 1) {
+          return json(
+            { message: "Event tail capacity is exhausted on this server", code: "event_tail_capacity" },
+            503,
+            "Service Unavailable",
+            { "retry-after": "5" },
+          );
+        }
+        return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+      };
+      const opening = createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+        .vault("vault")
+        .channel()
+        .subscribe();
 
-    await until(() => vi.getTimerCount() > 0, "the wait after the refusal");
-    await vi.advanceTimersByTimeAsync(4_999);
-    await settle();
-    assert.equal(attempts.length, 1);
-    await vi.advanceTimersByTimeAsync(1);
-    await until(() => attempts.length === 2, "the second attempt");
-    assert.equal(attempts[1] - attempts[0], 5_000);
-    const subscription = await opening;
-    await subscription.unsubscribe();
-  });
+      await until(() => vi.getTimerCount() > 0, "the wait after the refusal");
+      await vi.advanceTimersByTimeAsync(expected - 1);
+      await settle();
+      assert.equal(attempts.length, 1, `retried before ${expected} ms`);
+      await vi.advanceTimersByTimeAsync(1);
+      await until(() => attempts.length === 2, "the second attempt");
+      assert.equal(attempts[1] - attempts[0], expected);
+      const subscription = await opening;
+      await subscription.unsubscribe();
+    });
+  }
 });
 
 test("without Retry-After, refused opens back off exponentially with jitter up to 30 s", async () => {
@@ -275,7 +280,7 @@ test("a stream that ends before its first event or comment keeps the backoff gro
   });
 });
 
-test("Retry-After may be an HTTP-date, and the wait never exceeds 30 s or skips the backoff", async () => {
+test("Retry-After may be an HTTP-date, is waited in full past 30 s, and never skips the backoff", async () => {
   await withFakeClock(async () => {
     vi.spyOn(Math, "random").mockReturnValue(0);
     vi.setSystemTime(Date.UTC(2026, 10, 13, 0, 0, 0));
@@ -303,10 +308,94 @@ test("Retry-After may be an HTTP-date, and the wait never exceeds 30 s or skips 
       .subscribe();
 
     const delays = await attemptDelays(attempts, refusals.length + 1);
-    assert.deepEqual(delays, [7_000, 3_000, 30_000, 2_000]);
+    assert.deepEqual(delays, [7_000, 3_000, 120_000, 2_000]);
     const subscription = await opening;
     await subscription.unsubscribe();
   });
+});
+
+test("a Retry-After longer than one timer allows is waited in full", async () => {
+  await withFakeClock(async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    // 3,000,000 s is more than the 2^31 - 1 ms a single timer can wait.
+    const attempts = [];
+    const fetch = async (_input, init = {}) => {
+      attempts.push(Date.now());
+      if (attempts.length === 1) {
+        return json({ message: "down for maintenance", code: "unavailable" }, 503, "Service Unavailable", {
+          "retry-after": "3000000",
+        });
+      }
+      return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+    };
+    const opening = createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+      .vault("vault")
+      .channel()
+      .subscribe();
+
+    assert.deepEqual(await attemptDelays(attempts, 2), [3_000_000_000]);
+    const subscription = await opening;
+    await subscription.unsubscribe();
+  });
+});
+
+test("refusals after a stream has opened honour Retry-After and keep backing off", async () => {
+  // A stream sends its checkpoint and ends; six refusals with Retry-After: 5 follow.
+  for (const [random, expected] of [
+    [0, [250, 5_000, 5_000, 5_000, 5_000, 5_000, 8_000]],
+    [1 - 2 ** -53, [250, 6_000, 6_000, 6_000, 6_000, 8_000, 16_000]],
+  ]) {
+    await withFakeClock(async () => {
+      vi.spyOn(Math, "random").mockReturnValue(random);
+      const attempts = [];
+      const fetch = async (_input, init = {}) => {
+        attempts.push(Date.now());
+        if (attempts.length === 1) return sseResponse([CHECKPOINT_READY]);
+        if (attempts.length <= 7) {
+          return json({ message: "busy", code: "event_tail_capacity" }, 503, "Service Unavailable", {
+            "retry-after": "5",
+          });
+        }
+        return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+      };
+      const subscription = await createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+        .vault("vault")
+        .channel()
+        .subscribe();
+
+      assert.deepEqual(await attemptDelays(attempts, 8), expected);
+      await subscription.unsubscribe();
+    });
+  }
+});
+
+test("after an SSE retry of 1000 ms, refusals in a row back off from it", async () => {
+  for (const [random, expected] of [
+    [0, [1_000, 1_000, 2_000]],
+    [1 - 2 ** -53, [1_000, 2_000, 4_000]],
+  ]) {
+    await withFakeClock(async () => {
+      vi.spyOn(Math, "random").mockReturnValue(random);
+      const attempts = [];
+      const fetch = async (_input, init = {}) => {
+        attempts.push(Date.now());
+        if (attempts.length === 1) return sseResponse(["retry: 1000\n\n", CHECKPOINT_READY]);
+        if (attempts.length <= 3) {
+          return json({ message: "temporary", code: "temporary_failure" }, 503, "Service Unavailable");
+        }
+        return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+      };
+      const subscription = await createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+        .vault("vault")
+        .channel()
+        .subscribe();
+
+      // The stream that set it is reopened after 1000 ms; the two refusals that
+      // follow wait in [1000, 2000] and [2000, 4000] ms, not from 250 ms.
+      assert.deepEqual(await attemptDelays(attempts, 4), expected);
+      await subscription.unsubscribe();
+    });
+  }
 });
 
 test("a stream cut mid-event is reopened from the last cursor instead of failing", async () => {
@@ -351,6 +440,8 @@ test("a CRLF split across chunks is one line ending, and a lone CR still ends a 
     // Every CR of the frame is the last byte of a chunk and its LF the first of the next.
     ["CRLF split after each CR", ["event: checkpoint\r", "\nid: ec1.x\r", `\n${data}\r`, "\n\r", "", "\n"]],
     ["CR-only line endings split after each CR", ["event: checkpoint\r", "id: ec1.x\r", `${data}\r`, "\r"]],
+    ["an empty chunk between the CR and LF of a field line", ["event: checkpoint\r", "", "\nid: ec1.x\r\n", `${data}\r\n`, "\r\n"]],
+    ["a full CRLF, then a chunk that starts with the blank line's LF", [`event: checkpoint\r\nid: ec1.x\r\n${data}\r\n`, "\n"]],
   ]) {
     const checkpoints = [];
     const fetch = async (_input, init = {}) => sseResponse(chunks, 200, init.signal, false);
@@ -486,9 +577,13 @@ async function attemptDelays(attempts, count) {
   await until(() => attempts.length > 0, "the first attempt");
   while (attempts.length < count) {
     const before = attempts.length;
-    await until(() => vi.getTimerCount() > 0, `the wait after attempt ${before}`);
-    await vi.advanceTimersToNextTimerAsync();
-    await until(() => attempts.length > before, `attempt ${before + 1}`);
+    // A wait longer than one timer allows is a chain of timers; run each in turn.
+    while (attempts.length === before) {
+      await until(() => vi.getTimerCount() > 0 || attempts.length > before, `the wait after attempt ${before}`);
+      if (attempts.length > before) break;
+      await vi.advanceTimersToNextTimerAsync();
+      await until(() => attempts.length > before || vi.getTimerCount() > 0, `attempt ${before + 1}`);
+    }
   }
   return attempts.slice(1).map((at, index) => at - attempts[index]);
 }

@@ -12,10 +12,18 @@ const EVENT_CURSOR_PATTERN = /^ec1\.[A-Za-z0-9_-]+$/u;
 // The reconnection time until a stream's SSE `retry` field sets another, and
 // the smallest step the backoff after a refused open doubles from.
 const DEFAULT_RECONNECT_DELAY_MS = 250;
-// No reconnect wait is longer, whatever Retry-After, `retry` or the backoff ask for.
+// The longest wait the channel chooses itself, by its backoff or by an SSE
+// `retry` field. A refusal's Retry-After is waited in full, however long.
 const MAX_RECONNECT_DELAY_MS = 30_000;
 // Past this many doublings the cap above applies anyway.
 const MAX_BACKOFF_DOUBLINGS = 16;
+// On top of a Retry-After, each client waits a random extra of up to 20% of
+// it, and at most a second, so that clients refused together come back apart.
+const RETRY_AFTER_JITTER_RATIO = 0.2;
+const RETRY_AFTER_JITTER_MAX_MS = 1_000;
+// The longest delay one timer takes; setTimeout fires at once for a longer
+// one, so a longer wait is a chain of timers.
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 type StreamRequest = (
   path: string,
@@ -749,34 +757,46 @@ async function responseError(response: Response): Promise<AkbError> {
  * The wait before reopening after the n-th unsuccessful open in a row
  * (n = `state.failedOpens`).
  *
- * The longest of the refusal's Retry-After, the reconnection time, and a
- * random time in the upper half of 2^n × 250 ms (or of 2^n × the reconnection
- * time, when that is longer), but never more than 30 s.
+ * The channel's own wait is the longer of the reconnection time and a random
+ * time in [c/2, c], where c = min(30000, max(reconnection time, 250) × 2^n) ms.
+ * A refusal's Retry-After is a floor on that, not capped, plus a random
+ * extra of up to min(20% of it, 1000) ms.
  */
 function refusedOpenDelayMs(state: SubscriptionState, retryAfterMs: number | null): number {
   const step = Math.max(state.retryDelayMs, DEFAULT_RECONNECT_DELAY_MS);
   const doublings = Math.min(state.failedOpens, MAX_BACKOFF_DOUBLINGS);
   const ceiling = Math.min(MAX_RECONNECT_DELAY_MS, step * 2 ** doublings);
   const backoff = Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
-  return Math.min(
-    MAX_RECONNECT_DELAY_MS,
-    Math.max(state.retryDelayMs, retryAfterMs ?? 0, backoff),
-  );
+  const own = Math.max(state.retryDelayMs, backoff);
+  if (retryAfterMs === null) return own;
+  const spread = Math.min(retryAfterMs * RETRY_AFTER_JITTER_RATIO, RETRY_AFTER_JITTER_MAX_MS);
+  return Math.max(own, retryAfterMs + Math.round(Math.random() * spread));
 }
 
 async function waitForReconnect(state: SubscriptionState, delayMs: number): Promise<boolean> {
   if (state.stopped) return false;
   return await new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => {
-      state.wakeWaiters.delete(wake);
-      resolve(!state.stopped);
-    }, delayMs);
+    let remainingMs = delayMs;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const wake = () => {
       clearTimeout(timer);
       state.wakeWaiters.delete(wake);
       resolve(false);
     };
+    const arm = () => {
+      const stepMs = Math.min(remainingMs, MAX_TIMER_DELAY_MS);
+      remainingMs -= stepMs;
+      timer = setTimeout(() => {
+        if (remainingMs > 0 && !state.stopped) {
+          arm();
+          return;
+        }
+        state.wakeWaiters.delete(wake);
+        resolve(!state.stopped);
+      }, stepMs);
+    };
     state.wakeWaiters.add(wake);
+    arm();
   });
 }
 

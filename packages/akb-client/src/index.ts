@@ -3,6 +3,7 @@ import {
   AkbError,
   createLocalError,
   isAbortError,
+  responseRetryAfterMs,
 } from "./errors.js";
 import { makeChangeEventChannel } from "./channel.js";
 import { createQueryBuilder } from "./client/query-builder.js";
@@ -829,7 +830,9 @@ function localErrorResult<T>(
   const errorResponse = response
     ? { ok: response.ok, status: response.status, statusText: response.statusText }
     : null;
-  return makeResult<T>(null, createLocalError(code, errorResponse), response);
+  // Only the wait is taken from the response's headers; nothing else of it is kept.
+  const error = createLocalError(code, errorResponse, responseRetryAfterMs(response));
+  return makeResult<T>(null, error, response);
 }
 
 async function fetchResponse(

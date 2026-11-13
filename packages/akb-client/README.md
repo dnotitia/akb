@@ -104,7 +104,9 @@ stable codes: `transport_error`, `request_aborted`, `response_read_error`, and
 when one exists; transport failures use `null` rather than a fabricated status.
 `error.retryAfterMs` is the wait, in milliseconds, that the response's
 `Retry-After` header asked for, as seconds or an HTTP-date, or `null` when
-there is none.
+there is none. An SDK-local error for a response whose body could not be read
+keeps it too. A long value can exceed what one `setTimeout` waits
+(2^31 − 1 ms), so wait it in steps.
 The SDK does not copy a credential, request URL/body, or signal reason into
 these errors. Injected fetch rejections are covered by this result boundary;
 invalid input/configuration and token-supplier or user-callback failures keep
@@ -151,15 +153,21 @@ The backend and MCP surfaces are not rewrapped. `kind` remains the HTTP success 
 `akb.vault("eng").channel()` resumes its Server-Sent Events tail from the last
 cursor it received. When a stream that has sent an event or a comment, such as
 a heartbeat, ends, it is reopened after the reconnection time: 250 ms, unless
-the stream's SSE `retry` field set another. An open refused with a 5xx, one
-that fails before a response, and one whose stream ends before sending
-anything, as when a proxy accepts the request and drops it, are tried again
-with a backoff: the first in a row waits a random time between 250 and 500 ms,
-and each further one doubles that range. A refusal's `Retry-After` is the
-shortest wait it allows. No wait exceeds 30 seconds, even for a longer
-`Retry-After`, and a stream's first event or comment resets the backoff. An
-event that a stream ends in the middle of, before the blank line that ends
-it, is discarded, so the channel resumes from the last cursor it received.
+the stream's SSE `retry` field set another. An event that a stream ends in the
+middle of, before the blank line that ends it, is discarded, so the channel
+resumes from the last cursor it received.
+
+An open refused with a 5xx, one that fails before a response, and one whose
+stream ends before sending anything, as when a proxy accepts the request and
+drops it, are tried again with a backoff. With the default reconnection time,
+the first in a row waits a random time between 250 and 500 ms, and each
+further one doubles that range; a longer SSE `retry` raises where the range
+starts. The backoff never waits more than 30 seconds, and a stream's first
+event or comment resets it.
+
+A refusal's `Retry-After` is waited in full, however long, plus a random extra
+of up to 20% of it and at most one second, so that clients refused together
+do not come back together. The backoff still applies when it is longer.
 
 A 4xx refusal ends the subscription instead. That includes 429
 `event_tail_user_quota`, which an account gets at its stream quota.
