@@ -149,13 +149,15 @@ The backend and MCP surfaces are not rewrapped. `kind` remains the HTTP success 
 ## Change Event channel reconnects
 
 `akb.vault("eng").channel()` resumes its Server-Sent Events tail from the last
-cursor it received. A stream that ends after opening is reopened after the
-reconnection time: 250 ms, unless the stream's SSE `retry` field set another.
-An open refused with a 5xx, or one that fails before a response, is tried
-again with a backoff: the first refusal in a row waits a random time between
-250 and 500 ms, and each further one doubles that range. A refusal's
-`Retry-After` is the shortest wait it allows. No wait exceeds 30 seconds, even
-for a longer `Retry-After`, and an open that succeeds resets the backoff.
+cursor it received. When a stream that has sent an event or a comment, such as
+a heartbeat, ends, it is reopened after the reconnection time: 250 ms, unless
+the stream's SSE `retry` field set another. An open refused with a 5xx, one
+that fails before a response, and one whose stream ends before sending
+anything, as when a proxy accepts the request and drops it, are tried again
+with a backoff: the first in a row waits a random time between 250 and 500 ms,
+and each further one doubles that range. A refusal's `Retry-After` is the
+shortest wait it allows. No wait exceeds 30 seconds, even for a longer
+`Retry-After`, and a stream's first event or comment resets the backoff.
 
 A 4xx refusal ends the subscription instead. That includes 429
 `event_tail_user_quota`, which an account gets at its stream quota.

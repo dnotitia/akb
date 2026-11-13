@@ -208,7 +208,7 @@ test("without Retry-After, refused opens back off exponentially with jitter up t
   }
 });
 
-test("a successful open resets the backoff", async () => {
+test("the first event of a stream resets the backoff", async () => {
   await withFakeClock(async () => {
     vi.spyOn(Math, "random").mockReturnValue(0);
     const attempts = [];
@@ -230,8 +230,45 @@ test("a successful open resets the backoff", async () => {
       .subscribe();
 
     const delays = await attemptDelays(attempts, 6);
-    // Three refusals back off; the stream that opened ends and is reopened after
-    // the reconnection time; the next refusal starts the backoff again.
+    // Three refusals back off; the stream that sent its checkpoint ends and is
+    // reopened after the reconnection time; the next refusal starts the backoff again.
+    assert.deepEqual(delays, [250, 500, 1_000, 250, 250]);
+    const subscription = await opening;
+    await subscription.unsubscribe();
+  });
+});
+
+test("a stream that ends before its first event or comment keeps the backoff growing", async () => {
+  await withFakeClock(async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const attempts = [];
+    const fetch = async (_input, init = {}) => {
+      attempts.push(Date.now());
+      switch (attempts.length) {
+        case 2:
+          // Accepted, then closed before a single line, as a proxy that drops it.
+          return sseResponse([]);
+        case 3:
+          // Accepted, then failed before a single line.
+          return sseResponse([], 200, null, false, new TypeError("terminated"));
+        case 4:
+          // A comment line is enough to show the stream is live.
+          return sseResponse([": heartbeat\n\n"]);
+        case 6:
+          return sseResponse([CHECKPOINT_READY], 200, init.signal, false);
+        default:
+          return json({ message: "temporary", code: "temporary_failure" }, 503, "Service Unavailable");
+      }
+    };
+    const opening = createClient({ baseUrl: "https://akb.test/api/v1", fetch })
+      .vault("vault")
+      .channel()
+      .subscribe();
+
+    const delays = await attemptDelays(attempts, 6);
+    // The refusal and the two empty streams back off in a row; the stream that
+    // sent a comment is reopened after the reconnection time, and the next
+    // refusal starts the backoff again.
     assert.deepEqual(delays, [250, 500, 1_000, 250, 250]);
     const subscription = await opening;
     await subscription.unsubscribe();
@@ -314,11 +351,13 @@ test("a 429 user quota refusal still ends the channel and carries its code and R
   assert.equal(subscription.cursor, "ec1.ready");
 });
 
-function sseResponse(chunks, status = 200, signal = null, close = true) {
+function sseResponse(chunks, status = 200, signal = null, close = true, failure = null) {
   const body = new ReadableStream({
     start(controller) {
       for (const chunk of chunks) controller.enqueue(textEncoder.encode(chunk));
-      if (close) {
+      if (failure) {
+        controller.error(failure);
+      } else if (close) {
         controller.close();
       } else {
         signal?.addEventListener("abort", () => {
