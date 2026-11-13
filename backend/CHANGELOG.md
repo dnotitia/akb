@@ -110,6 +110,12 @@ specifically; the proxy has its own log in
   body replacements and existing revision/hash preconditions retain their
   semantics. Local file input remains proxy-only.
 
+- Cross-origin responses now expose `Retry-After` and `Date` through
+  `Access-Control-Expose-Headers`, so a browser script on another origin can
+  read when a refusal asks it to retry. The SDK's change channel waits at
+  least that long and measures an HTTP-date from `Date`. Allowed origins,
+  methods and headers are unchanged.
+
 ### Breaking: retired authentication inputs
 
 - Remove configuration inputs that `auth_mode` and server-custodied SSO
