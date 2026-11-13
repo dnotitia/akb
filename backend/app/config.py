@@ -1333,6 +1333,31 @@ class Settings(BaseModel):
     # the 60s idle-in-transaction reaper fires.
     git_write_timeout_secs: float = 30.0
 
+    # ── Vault write admission (services/vault_write_admission.py). Every
+    # transaction that writes a Vault's events is admitted for that Vault
+    # before it takes a pool connection. Such transactions of one Vault run
+    # one at a time on the Vault's event lock (migration 132), and a waiter
+    # would hold its connection, so a busy Vault could take the whole pool.
+    #
+    # Transactions of one Vault that may hold a pool connection at once, per
+    # process. The others wait without one. Keep well under pg_pool_max_size.
+    vault_write_concurrency: int = 4
+    # How long a transaction waits for admission before it fails with a
+    # retryable write_busy (HTTP 429, Retry-After), having done no work.
+    vault_write_queue_timeout_secs: float = 10.0
+    # A raw SQL write reads its plan (EXPLAIN) on a pool connection before its
+    # admission, to admit the Vaults it writes. At most this many plans are
+    # read at once per process, and at most one for each Vault a statement
+    # declares; the others wait without a connection.
+    akb_sql_plan_concurrency: int = 2
+    # How long reading a plan waits for a table lock before the write fails
+    # with a retryable write_busy instead of holding its connection.
+    akb_sql_plan_lock_timeout_ms: int = 500
+    # How long the app rollout worker waits for a target's Vault admission.
+    # A busy Vault's targets are then deferred, all of them, and the worker
+    # takes other Vaults' targets, so keep it short.
+    app_rollout_admission_wait_secs: float = 1.0
+
     # BM25 corpus tuning (driver-neutral; lives in main PG vocab).
     bm25_k1: float = 1.5
     bm25_b: float = 0.75

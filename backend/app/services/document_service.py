@@ -168,7 +168,8 @@ from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
 from app.services.user_directory import resolve_display_names
-from app.services.write_lane import run_compensation, run_git_write, write_lane
+from app.services.vault_write_admission import vault_write_admission
+from app.services.write_lane import run_compensation, run_git_write, vault_gate, write_lane
 from app.repositories import table_data_repo
 from app.utils import ensure_list
 
@@ -550,11 +551,14 @@ class DocumentService:
         suspended coroutine, so a same-vault backlog holds zero connections
         and zero executor threads; the connection is only occupied for the
         actual work span. Deadline exceeded → WriteBusyError (429), with no
-        resources acquired. See services/write_lane.py (round-05).
+        resources acquired. See services/write_lane.py (round-05). The
+        Vault's write admission follows the lane, also before the pool, as
+        for every transaction that writes the Vault's events
+        (services/vault_write_admission.py).
         """
         async with write_lane(vault_name):
             pool = await get_pool()
-            async with pool.acquire() as lock_conn:
+            async with vault_write_admission(vault_id, vault=vault_name), pool.acquire() as lock_conn:
                 async with lock_conn.transaction():
                     # Canonical lifecycle order is vault -> document -> asset.
                     # Taking the parent lock before any path/document/attachment
@@ -570,10 +574,10 @@ class DocumentService:
     async def _move_lock(self, vault_id: uuid.UUID, path_a: str, path_b: str, *, vault_name: str):
         """Lock BOTH the source and destination paths for a move, in a stable
         (sorted) order so two concurrent moves can't deadlock on each other.
-        Same write-lane admission discipline as ``_path_lock``."""
+        Same write-lane and Vault write admission as ``_path_lock``."""
         async with write_lane(vault_name):
             pool = await get_pool()
-            async with pool.acquire() as lock_conn:
+            async with vault_write_admission(vault_id, vault=vault_name), pool.acquire() as lock_conn:
                 async with lock_conn.transaction():
                     if not await lock_vault_for_child_write(lock_conn, vault_id):
                         raise NotFoundError("Vault", vault_name)
@@ -2391,8 +2395,7 @@ class DocumentService:
         # Standard path: init_vault writes a bare directory to disk
         # *before* the DB INSERT. If anything fails in between
         # (commit_file crashes, request gets cancelled mid-flight, DB
-        # write hits a constraint, the seed put() is rejected by a
-        # saturated write lane), the bare directory orphans and
+        # write hits a constraint), the bare directory orphans and
         # init_vault's existence check permanently blocks the same
         # name. Wrap as a transaction: cleanup_vault_dirs undoes the
         # disk side, _rollback_vault_rows undoes the DB side once the
@@ -2405,8 +2408,8 @@ class DocumentService:
         # probe below is unsound: A and B race the same name, A's init
         # wins, B's fails, and B's rollback would see the dir "appear
         # during its attempt" and delete A's repo. (Distinct from the
-        # write-lane vault gate on purpose — the seed put() below takes
-        # that gate, and this lock nests outside it.)
+        # write-lane vault gate on purpose — the creation takes that gate
+        # below, inside this lock.)
         #
         # `existed_before` guards the cancellation edge: an absorbed
         # cancel inside run_git_write discards init_vault's outcome —
@@ -2416,18 +2419,31 @@ class DocumentService:
         # itself brought into existence — and under the create lock,
         # "appeared during this section and wasn't there before" implies
         # exactly that. Both gates are intentionally held through compensation.
+        #
+        # The new Vault's write-lane gate and then its write admission, the
+        # order every document write takes them in, are entered before its
+        # first Git commit and before its row becomes visible, and held
+        # through the seed, whose put() re-enters both without waiting. A
+        # request that reaches the Vault as soon as its row commits waits
+        # behind the creation; it cannot fill the Vault's admission or hold
+        # its gate and fail the seed after the Git commit. Only the gate is
+        # held, not a global lane slot: each Git operation takes a slot for
+        # itself, so a creation waiting for the role authority lock holds
+        # none of the slots other Vaults' writes need.
+        new_vault_id = uuid.uuid4()
         async with _create_lock(name):
             async with self._vault_creation_lock(name):
-                return await self._create_vault_standard(
-                    name=name, description=description, template=template,
-                    public_access=public_access, owner_id=owner_id, uid=uid,
-                    external_git=external_git, vault_repo=vault_repo,
-                    coll_repo=coll_repo,
-                )
+                async with vault_gate(name), vault_write_admission(new_vault_id, vault=name):
+                    return await self._create_vault_standard(
+                        name=name, description=description, template=template,
+                        public_access=public_access, owner_id=owner_id, uid=uid,
+                        external_git=external_git, vault_repo=vault_repo,
+                        coll_repo=coll_repo, vault_id=new_vault_id,
+                    )
 
     async def _create_vault_standard(
         self, *, name, description, template, public_access, owner_id, uid,
-        external_git, vault_repo, coll_repo,
+        external_git, vault_repo, coll_repo, vault_id: uuid.UUID,
     ) -> str:
         existed_before = await asyncio.to_thread(self.git.vault_exists, name)
         git_path: str | None = None
@@ -2449,17 +2465,17 @@ class DocumentService:
             vault_yaml = f"name: {name}\ndescription: {description}\n"
             if template:
                 vault_yaml += f"template: {template}\n"
-            # Commit executor (not the shared to_thread pool), but NO write-
-            # lane gate: the vault is mid-creation so nobody can contend, and
-            # gating would let a saturated lane fail vault creation with 429.
+            # Commit executor (not the shared to_thread pool), on a lane slot
+            # taken for this commit alone.
             await run_git_write(
                 self.git.commit_file,
                 vault_name=name, file_path=".vault.yaml",
                 content=vault_yaml,
                 message=f"[init] Initialize vault: {name}",
             )
-            vault_id = await vault_repo.create(
+            await vault_repo.create(
                 name, description, git_path, owner_id=uid, public_access=public_access,
+                vault_id=vault_id,
             )
             created_vault_id = vault_id
             # PG-native RBAC: create vault group roles + grant admin to owner,

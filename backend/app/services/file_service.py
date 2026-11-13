@@ -31,7 +31,7 @@ import anyio
 
 from app.config import settings
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
+from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError, WriteBusyError
 from app.repositories import vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
@@ -52,6 +52,7 @@ from app.services.s3_delete_worker import REPLACEMENT_STAGING_PREFIX, REPLACEMEN
 from app.services.s3_delete_worker import enqueue_pending_upload_delete
 from app.services import skill_policy
 from app.services.uri_service import file_uri
+from app.services.vault_write_admission import vault_write_admission
 from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
 from app.services.native_file_projection import (
     enqueue_native_file_projection,
@@ -911,7 +912,7 @@ class FileService:
         ready_to_commit = False
 
         try:
-            async with pool.acquire() as conn:
+            async with vault_write_admission(vault_id, vault=vault_name), pool.acquire() as conn:
                 async with conn.transaction():
                     locked = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
                     if not locked:
@@ -1000,13 +1001,17 @@ class FileService:
                     # From this point onward, an exception can be an ambiguous
                     # COMMIT result rather than a known rollback.
                     ready_to_commit = True
-        except Exception:
-            # Staging is never database-owned and can be removed immediately.
+        except Exception as exc:
+            # Staging is never database-owned and can be removed immediately,
+            # except when the Vault's admission refused the publication before
+            # it began: the same confirmation can then be retried with the
+            # bytes the client already uploaded.
             # Do not blindly delete final_key: after the transaction body
             # finishes, COMMIT may have succeeded even when the connection
             # reports an error. Its delayed outbox row is cancelled atomically
             # iff publication committed.
-            await _discard_replacement_objects(staging_key)
+            if not isinstance(exc, WriteBusyError):
+                await _discard_replacement_objects(staging_key)
             if not ready_to_commit:
                 # The transaction body did not finish, so asyncpg enters its
                 # rollback path and the candidate cannot have been adopted.
@@ -1086,7 +1091,9 @@ class FileService:
             vault_name = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
             return _upload_confirmation_envelope(current, vault_name)
 
-        async with pool.acquire() as conn:
+        # The lease waits for the File's row, which a confirmation of the same
+        # File holds while it waits for the Vault's event lock: admitted too.
+        async with vault_write_admission(vault_id), pool.acquire() as conn:
             async with conn.transaction():
                 row = await vault_files_repo.lease_file_upload_confirmation(
                     conn, vault_id, fid,
@@ -1116,7 +1123,7 @@ class FileService:
             ):
                 inspection_error = ConflictError("Uploaded file hash mismatch; file record was cleaned up.")
 
-        async with pool.acquire() as conn:
+        async with vault_write_admission(vault_id), pool.acquire() as conn:
             async with conn.transaction():
                 locked = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
                 if locked is None:
@@ -1485,7 +1492,7 @@ class FileService:
         # s3_delete_worker after the TX commits, so a crash between
         # commit and S3 cannot leave us with an orphan blob (or a
         # missing-blob row). The outbox row carries the s3_key.
-        async with pool.acquire() as conn:
+        async with vault_write_admission(vault_id), pool.acquire() as conn:
             async with conn.transaction():
                 # Serialize with confirm_replace.  Reading the key before this
                 # transaction can enqueue a stale object if a replacement wins

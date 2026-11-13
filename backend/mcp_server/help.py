@@ -1012,7 +1012,10 @@ akb_grep(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
 `max_replacements` set high enough for the intended scope.
 Each changed document gets its own revision. If a write fails, replacement
 stops. Earlier writes remain committed and are listed in `replacements`.
-`details.failed_uri` identifies the document that stopped the batch.
+`details.failed_uri` identifies the document that stopped the batch, and
+`details.partially_applied` is true when earlier writes committed. Then do not
+send the same request again, which would replace the text again in a replaced
+document that still matches; replace only the documents not replaced yet.
 Bulk replacement cannot edit the vault guide. Its owner can edit it with `akb_update`.
 
 ## Result Structure
@@ -1669,7 +1672,16 @@ akb_sql(vaults=["sales","external-projects"],
 Permissions: SELECT requires a Vault reader role; writes require a writer role.
 A credential with read authority but no write authority runs SQL in a PostgreSQL
 read-only transaction. Database mutations are denied even when the account has
-write privileges. Write-authorized credentials retain the existing write path.""",
+write privileges. Write-authorized credentials retain the existing write path.
+
+`read_only=true` runs the statement in a PostgreSQL read-only transaction
+without waiting for the vault's write admission; use it for queries, so they
+are not held back while the vault is busy with writes. Without it (the default)
+the statement runs once as a write, admitted for the vaults it names and those
+whose tables it changes.
+```
+akb_sql(vault="sales", sql="SELECT stage, COUNT(*) FROM pipeline GROUP BY stage", read_only=true)
+```""",
 
     "images": """# Inline Document Images
 

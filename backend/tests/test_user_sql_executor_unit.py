@@ -27,6 +27,9 @@ class _Conn:
         return True  # These forwarding cases use a live human administrator.
 
     async def execute(self, sql: str, *args: Any) -> str:
+        if sql == "SET LOCAL ROLE NONE":
+            # The executor's own check before commit, under the backend role.
+            return "SET"
         self.executed.append((sql, args))
         if sql.startswith("INSERT"):
             return "INSERT 0 3"
@@ -37,6 +40,9 @@ class _Conn:
         return "OK"
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        if "events_row_change_queue" in sql:
+            # A write's check of the row changes it queued: none here.
+            return []
         self.fetched.append((sql, args))
         return [{"value": args[0] if args else 1}]
 

@@ -26,7 +26,9 @@ import asyncpg
 
 from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
-from app.exceptions import AKBError, ConflictError, NotFoundError, TransientDependencyError, ValidationError
+from app.exceptions import (
+    AKBError, ConflictError, NotFoundError, TransientDependencyError, ValidationError, WriteBusyError,
+)
 from app.repositories import table_data_repo, table_registry_repo
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import EventBuffer, emit_event
@@ -41,8 +43,10 @@ from app.services.app_resource_service import (
 from app.services.role_sync import get_role_sync
 from app.services import skill_policy
 from app.services.uri_service import table_uri
+from app.services.vault_write_admission import vault_write_admission
 from app.services.user_sql_executor import (
     PermissionDeniedError,
+    UndeclaredVaultWriteError,
     UniqueViolationError,
     get_user_sql_executor,
 )
@@ -87,12 +91,17 @@ _COLUMN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 @asynccontextmanager
-async def _existing_or_pooled_conn(existing_conn: Any | None) -> AsyncIterator[Any]:
+async def _existing_or_pooled_conn(
+    existing_conn: Any | None, *, admit_vault: uuid.UUID | None = None,
+) -> AsyncIterator[Any]:
+    """Reuse a caller's connection, or take one from the pool after the
+    Vault write admission for ``admit_vault`` (the caller of an existing
+    connection was admitted already)."""
     if existing_conn is not None:
         yield existing_conn
         return
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with vault_write_admission(admit_vault), pool.acquire() as conn:
         yield conn
 
 
@@ -912,7 +921,7 @@ async def create_table(
     now = datetime.now(timezone.utc)
     collection_path = _normalize_collection_path(collection)
 
-    async with pool.acquire() as conn:
+    async with vault_write_admission(vault_id), pool.acquire() as conn:
         # READ COMMITTED explicitly: the advisory lock only helps if the
         # loser can SEE the winner's row after the wait. Under REPEATABLE
         # READ the vault lookup below would fix a snapshot BEFORE the lock
@@ -1223,7 +1232,7 @@ async def drop_table(
     """Drop a vault-scoped table: registry row + dynamic PG table +
     edges referencing the table URI + metadata chunk."""
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with vault_write_admission(vault_id), pool.acquire() as conn:
         async with role_authority_transaction(conn):
             vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
             if not vault:
@@ -1329,7 +1338,7 @@ async def alter_table(
     (migration 132), and later DDL could otherwise wait on a writer that is
     itself waiting for that lock.
     """
-    async with _existing_or_pooled_conn(_conn) as conn:
+    async with _existing_or_pooled_conn(_conn, admit_vault=vault_id) as conn:
         async with _transaction_if_needed(conn, _conn is None):
             events = _events if _events is not None else EventBuffer()
             vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
@@ -1951,6 +1960,15 @@ async def execute_sql(
     role and run as the backend service role — matching the existing
     human system-admin trust model. For service accounts and other users, PG
     is the authority.
+
+    ``read_only`` runs the statement in a READ ONLY transaction, which
+    PostgreSQL enforces, without the Vault write admission. Otherwise (the
+    default) it runs once as an admitted write, whatever it does; see
+    ``UserSqlExecutor.execute``.
+
+    Only one SELECT, WITH, INSERT, UPDATE or DELETE statement is accepted, so
+    a caller cannot create a function, run a ``DO`` block or change when a
+    deferred trigger fires (``SET CONSTRAINTS``).
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -2033,9 +2051,15 @@ async def execute_sql(
             code=UNIQUE_VIOLATION,
             pg_sqlstate=e.pg_sqlstate,
         )
-    except (NotFoundError, TransientDependencyError):
-        # Preserve a Vault disappearing after name resolution and dependency
-        # failures without acquiring another connection for SQL hints.
+    except UndeclaredVaultWriteError as e:
+        # The statement changed rows of a Vault it did not declare, through a
+        # function its plan does not show; its transaction was rolled back.
+        return err(str(e), code=INVALID_ARGUMENT, undeclared_vaults=e.vaults)
+    except (ConflictError, NotFoundError, TransientDependencyError, WriteBusyError):
+        # Preserve a Vault disappearing after name resolution, or replaced
+        # under its name twice while the statement waited, dependency
+        # failures and a busy Vault's admission (a retryable write_busy)
+        # without acquiring another connection for SQL hints.
         raise
     except Exception as e:  # noqa: BLE001 — fall through to enrichment
         msg = str(e)

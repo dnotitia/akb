@@ -24,8 +24,7 @@ import asyncpg
 import pytest
 from git import Repo
 
-from app.db.transient import transient_error
-from app.exceptions import ForbiddenError, NotFoundError
+from app.exceptions import ForbiddenError, NotFoundError, WriteBusyError
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
 from app.services import collection_service as collection_service_module
@@ -100,9 +99,10 @@ async def _deletes_committed_with_their_events(pool, vault_id: uuid.UUID) -> boo
 async def test_a_failure_after_the_first_document_is_completed_by_a_retry(monkeypatch):
     """Once the delete has removed its first document, another transaction
     holds the Vault's event lock past the deadline. The second document's
-    delete rolls back with its event and the request fails with `write_busy`;
-    the first stays deleted, with its event. Run again after the lock is free,
-    the delete removes the second document and the collection."""
+    delete rolls back with its event and the request fails with a
+    `write_busy` that says it partly completed; the first stays deleted, with
+    its event. Run again after the lock is free, the delete removes the second
+    document and the collection."""
     async with _fresh_database() as pool:
         vault = "native-converge-busy"
         vault_id = await _native_vault(pool, monkeypatch, vault)
@@ -124,7 +124,7 @@ async def test_a_failure_after_the_first_document_is_completed_by_a_retry(monkey
 
                 monkeypatch.setattr(collection_service_module, "_delete_native_document", busy_after_the_first)
                 started = time.monotonic()
-                with pytest.raises(asyncpg.LockNotAvailableError) as failure:
+                with pytest.raises(WriteBusyError) as failure:
                     await asyncio.wait_for(
                         CollectionService(git=object()).delete(
                             vault=vault, path="notes", recursive=True, agent_id="tester",
@@ -136,8 +136,11 @@ async def test_a_failure_after_the_first_document_is_completed_by_a_retry(monkey
                 await holding.__aexit__(None, None, None)
             monkeypatch.setattr(collection_service_module, "_delete_native_document", delete_document)
 
-        mapped = transient_error(failure.value)
-        assert mapped is not None and (mapped.status_code, mapped.code) == (429, WRITE_BUSY)
+        assert failure.value.partially_applied
+        assert isinstance(failure.value.__cause__, asyncpg.LockNotAvailableError)
+        envelope = exception_envelope(failure.value)
+        assert (envelope["code"], envelope["details"]["partially_applied"]) == (WRITE_BUSY, True)
+        assert "Part of the operation may have completed" in envelope["hint"]
         assert waited >= _EVENT_LOCK_WAIT_SECONDS - 0.5
         assert await _state(pool, vault_id) == {
             "documents": [("notes/a.md", "deleted"), ("notes/b.md", "live")],

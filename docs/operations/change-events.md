@@ -164,18 +164,142 @@ in the MCP envelope. Any other lock wait past its limit, such as one under a
 `lock_timeout` set on the database role, and a deadlock (`40P01`) remain
 internal errors, because either can end a Bare Git write after its Git commit.
 
-A waiting transaction keeps its pooled database connection while it waits.
-Because a holder keeps the Vault's lock from its event insert to its commit,
-and a Bare Git document write keeps it through its Git work as well, other
-writers of the same Vault can each wait the full 5 seconds with a connection
-held, and then fail with `write_busy`. They accumulate when a holder is slow or
-when one Vault receives more event-writing transactions than it can commit one
-at a time, and they take connections that other Vaults' requests and the
-readiness check also need. AKB does not bound the number of waiters: admission
-control in front of the connection pool for writers of the same Vault, and a
-readiness check that does not depend on the shared pool, are deferred to a
-separate change. Until then the 5-second deadline and `write_busy` bound each
-wait.
+A transaction that waits for the Vault's lock keeps its pooled database
+connection while it waits. A holder keeps the lock from its event insert to its
+commit, and a Bare Git document write through its Git work as well, so when one
+Vault received more event-writing transactions than it could commit one at a
+time, they took every connection that other Vaults' requests also needed.
+Every transaction that may write a Vault's events (document, collection, File,
+table, table row and `akb_sql` writes, access and Vault settings changes, app
+rollouts, external Git synchronization, and a check that records an admin
+override) is therefore admitted for that Vault before it takes a connection.
+Each API process admits at most `vault_write_concurrency` (default 4) such
+transactions of one Vault at a time; the others wait without a connection. A
+transaction that writes several Vaults' events is admitted for all of them at
+once or waits for all of them, holding none, so a full Vault does not delay
+another Vault's writes; among waiters whose Vaults all have room, the earliest
+goes first. One that waits longer than `vault_write_queue_timeout_secs`
+(default 10 seconds) fails with a retryable `write_busy`: over REST, HTTP 429
+with `Retry-After: 1` and a body whose `code` is `write_busy` and whose
+`details` carry `retry_after_secs`; over MCP, the same envelope. A Bare Git
+document write enters the Bare Git write lane first and then this admission.
+The limit is per process: with several processes a Vault can have that many
+admitted transactions in each, and the event lock still orders them, so an
+admitted transaction can still wait up to 5 seconds for it. An event written
+for a Vault outside its admission is logged once per event kind. The readiness
+check still uses the shared pool.
+
+These guarantees cover what the application writes. An unscoped system
+administrator's raw SQL runs under the backend's own database role, so it can
+also write AKB's system tables, such as `events`, or call
+`akb_lock_vault_events`. Such a statement is admitted for the Vaults it
+declares and those whose dynamic tables its plan modifies, not for a Vault
+whose events or event lock it reaches that way.
+
+A write refused this way has written none of its own events, and no Git
+commit, document, Revision, prepared Native payload, collection, table, row or
+access change: those paths are admitted before their first database write, and
+a Native document write before it stores its payload. The access check that
+precedes a write is a separate step: when it records an admin override (an
+unscoped system administrator writing a write-managed Vault), it commits that
+`vault.write_policy_admin_bypass` event in a transaction of its own, admitted
+for the Vault, before the write is admitted, and the event stays when the write
+is then refused. What a refused write may have done before its admission is
+read, such as resolving a Vault's name to its id, and the following, which
+leave the Vault's content unchanged:
+
+- A File upload confirmation is admitted twice: to renew the upload's lease,
+  and, after it read the upload from object storage, to publish the File. A
+  refusal of the publication leaves the renewed lease committed and the File
+  pending; the same confirmation sent again publishes it.
+- A File replacement copies the uploaded bytes and schedules the copy's
+  removal before its publication is admitted. A refusal removes the copy,
+  leaves its scheduled removal, and keeps the upload, so the same confirmation
+  can be sent again once the Vault has room.
+- An app rollout leases its target before the target is admitted, and waits
+  at most `app_rollout_admission_wait_secs` (default 1 second) for the
+  target's Vault. A refusal makes the target pending again and defers it,
+  with every other pending target of its Vault, for 5 seconds, in one
+  statement, and the worker claims again at once rather than sleep its idle
+  interval, so it takes other Vaults' targets meanwhile; once the deferral
+  ends the targets are claimed again in their usual order.
+- External Git synchronization fetches the remote into its mirror before it
+  records each changed file, admitted per file.
+- A raw SQL write reads its plan on a pool connection before its admission,
+  described below.
+
+Two requests are made of several writes, each admitted on its own, so a
+refusal part-way leaves their earlier writes committed; their error says so
+with `partially_applied` in its details:
+
+- A Native recursive collection delete is admitted for each document's
+  transaction and then for the collections'. A refusal part-way, or the
+  Vault's event lock timing out part-way, leaves the documents deleted so far
+  deleted, each with its event, and fails with a `write_busy` whose hint says
+  that the same request sent again continues it.
+- A grep replacement (`akb_grep` with `replace`) writes each document as a
+  write of its own and stops at the first failure. A refusal, or any other
+  failure, after some replacements committed leaves those documents replaced
+  and listed in `replacements`. The hint names them with their new revisions
+  and asks to apply the replacement only to the documents not replaced yet:
+  the same request sent again would replace the text again in a replaced
+  document that still matches the pattern.
+
+A write whose transaction finds its Vault by name, such as an access or Vault
+settings change or raw SQL, resolves the name to the Vault's id for its
+admission before the transaction. When the transaction finds another Vault
+under that name, because the Vault was deleted and another created with the
+name meanwhile, it releases its connection and admission and starts again for
+the Vault it found; a second change fails with a conflict (HTTP 409). Its
+statement has not run when that happens.
+
+Creating a Bare Git Vault takes the new Vault's write-lane gate and then its
+admission before its first Git commit and before its row is visible, and holds
+both through the seed document, so a request that reaches the Vault as soon as
+its row commits waits behind the creation. It holds no global write-lane slot
+meanwhile: each of its Git operations, and the seed's own write, takes one for
+itself, so creations waiting for something else, such as the role authority
+lock, leave the slots to other Vaults' writes. The seed's write, and the
+compensation that removes the Vault's row and repository when the creation
+fails, come after the first Git commit, and wait for their slot as other Vault
+lifecycle work does, without the lane's deadline: giving up there would leave
+a half-created Vault. A Native Vault's creation is admitted before its
+transaction, which commits the Vault with its seed.
+
+The table API's row reads (`GET /api/v1/tables/{vault}/{table}/rows` and
+`POST /api/v1/tables/{vault}/{table}/query`), which the server compiles to a
+`SELECT`, run in a READ ONLY transaction and are not admitted. Raw SQL
+(`akb_sql` and `POST /api/v1/tables/{vault}/sql`) takes a `read_only` option,
+false by default. With it, the statement runs in a READ ONLY transaction, which
+PostgreSQL enforces, without admission; use it for queries, so a busy Vault
+does not hold them back. Without it, any statement, a `SELECT` included, is a
+write for admission: it waits for its Vaults' admission and fails with
+`write_busy` when they stay busy. Over MCP, an `akb_sql` call whose token or
+OAuth scopes grant read but not write always runs read-only; the REST SQL
+endpoint is a POST and needs a write-scoped credential. A write runs exactly
+once: nothing tries it first to find out whether it writes. It is admitted for
+the Vaults the request declares and for every Vault whose dynamic tables its
+plan modifies. The plan is read with `EXPLAIN`, which does not run the
+statement, on a pool connection taken before the admission: at most
+`akb_sql_plan_concurrency` (default 2) plans are read at once per process,
+and at most one for each Vault: a plan holds a token for every Vault its
+statement declares, taken all at once or not at all, as the admission takes
+its slots. The others wait without a connection or a token, and are served in
+arrival order among those whose Vaults are all free. The plans of a Vault
+whose table is locked therefore wait one behind another, whatever other Vaults
+they declare with it, and another Vault's statement takes the free slot. A
+wait that ends without a slot, at its deadline or cancelled, leaves the queue
+at once. A plan that waits longer than `akb_sql_plan_lock_timeout_ms` (default
+500) for a table's lock fails with a retryable `write_busy` rather than hold
+its connection.
+Before the write commits, its transaction checks the dynamic-table row changes
+it queued for `table.rows_changed` events; a change of a Vault it was not
+admitted for rolls it back with an `invalid_argument` error that names that
+Vault in `undeclared_vaults`. `akb_sql` accepts one SELECT, WITH, INSERT,
+UPDATE or DELETE statement, so a caller cannot create a function that writes
+out of the plan's sight, run a `DO` block, or have the deferred event trigger
+fire early with `SET CONSTRAINTS`; and no function a SQL role may call writes
+a table. The check before commit is for functions an administrator installs.
 
 During a rolling deployment the first upgraded process applies migration 132.
 Processes still on the previous release then take the Vault lock too, but some
@@ -385,6 +509,47 @@ remains under the prefix; it also checks that a creation locks its ancestors in
 id order, together with a move's source, and that a measurement File upload
 into a new sub-collection removes expired intents first, so none of them
 deadlocks with the delete.
+`test_vault_write_admission_postgres.py` sends 24 collection creates, and in
+another case 24 confirmations of one pending File, to one Vault through a pool
+of 8 connections while another transaction holds that Vault's event lock, and
+checks that a reader of another Vault keeps getting a connection within a
+second and that every request succeeds once the lock is free. It also checks
+that a refused File replacement is confirmed again without a new upload, and
+that a confirmation refused at its publication keeps its lease renewal; that a
+new Bare Git Vault is seeded while another request holds its admission slot or
+writes a document as soon as its row commits, and that creations waiting for
+the role authority lock leave the Git lane to another Vault's write; that a new
+Vault's seed, and its compensation when the seed fails, wait for a Git lane
+that other Vaults' writes keep busy past its deadline; that a write whose Vault
+was replaced under its name is admitted for the Vault it changes, over the
+access API and raw SQL; that an app rollout target refused by admission is
+released and applied by a later run, and does not hold back another rollout,
+also under the worker's own runner, which sleeps after an iteration without
+work, and with two busy targets of one Vault under the default deadlines;
+that raw SQL runs read-only without admission only when asked to, and
+otherwise as a write that waits; that raw SQL writes waiting for a table lock
+while they read their plans leave connections for another Vault, and, sixty
+of them declaring the locked Vault with sixty different companions, do not
+keep another Vault's statement from reading its plan; that a statement declared
+for one Vault whose plan writes another Vault's table runs once, admitted for
+both, while one that writes an undeclared Vault through an installed function
+is rolled back and not run again; that `akb_sql` refuses `CREATE FUNCTION`, `DO`
+and `SET CONSTRAINTS` and that no function a SQL role may call writes a table;
+that a Native recursive delete refused after its first document says it partly
+completed; that a grep replacement refused after its first document, on Native
+and Bare Git, names the document it replaced and asks to replace only the
+rest; and that an admin override's audit event recorded before a refused write
+stays. `test_sql_plan_slots_unit.py` checks the plan-slot limit, one plan
+per Vault with every declared Vault's token taken at once, and that waits that
+time out or are cancelled leave the queue at once and take no slot;
+`test_write_busy_rest_unit.py` checks the REST response to a refused write and
+to one refused part-way.
+`test_vault_write_admission_paths_postgres.py` fills a Vault's admission and
+drives each event-writing path, including raw SQL declared for one Vault whose
+plan writes another Vault's table. Each must fail with `write_busy` without
+changing anything listed above and without holding a pool connection while it
+waits; it also scans the application for every place that writes a Vault's
+events and fails when one has no such case.
 `test_collection_delete_native_atomic_postgres.py` holds the Vault's event lock
 after a Native recursive delete removed its first document and checks that the
 delete fails with `write_busy`, that the first document stays deleted with its

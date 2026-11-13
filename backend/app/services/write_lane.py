@@ -37,7 +37,9 @@ exceeding it raises :class:`~app.exceptions.WriteBusyError` → HTTP 429 +
 Retry-After / MCP ``write_busy`` envelope. No work has been performed at
 that point, so retrying is always safe. ``write_lane_max_waiters`` is a
 global memory/socket backstop, not a policy knob — normal operation never
-reaches it.
+reaches it. Vault-lifecycle work waits for its global slot without a
+deadline instead: ungated ``run_git_write`` calls, and the sections of a
+Vault creation that run under ``vault_gate`` after its first Git commit.
 
 Like git_service's ``_VAULT_LOCKS``, gate entries are keyed by vault name
 and never reaped; a deleted vault leaves a few idle bytes behind, bounded
@@ -69,6 +71,11 @@ T = TypeVar("T")
 # admitted writers (holding PG connections) would have to sit in.
 _slot_held: ContextVar[bool] = ContextVar("akb_write_slot_held", default=False)
 
+# Vaults whose gate the current task holds (write_lane, vault_gate). A nested
+# write_lane for one of them does not wait for the gate again: Vault creation
+# holds its new Vault's gate through the seed document's own write.
+_gates_held: ContextVar[frozenset[str]] = ContextVar("akb_write_gates_held", default=frozenset())
+
 # Per-vault admission gates (1 concurrent writer per vault — git commits
 # serialize per vault anyway, so more buys nothing while git is on the
 # synchronous path; see round-05 "granularity").
@@ -82,9 +89,11 @@ _global_slots: asyncio.Semaphore | None = None
 # Writers currently inside the admission wait (both stages). Backstop only.
 _waiters: int = 0
 
-# Ungated (vault-lifecycle) calls currently waiting for a global slot in
-# run_git_write. Observability only — no backstop: these are rare
-# operator-grade operations and must not fail with 429 at saturation.
+# Vault-lifecycle calls currently waiting for a global slot without a
+# deadline: ungated run_git_write calls, and a Vault creation's seed write
+# or compensation inside vault_gate. Observability only — no backstop: these
+# are rare operations that must not fail with 429 at saturation once they
+# have changed something.
 _lifecycle_waiters: int = 0
 
 # Dedicated executor for git-MUTATING operations. Git reads keep using
@@ -117,8 +126,22 @@ async def write_lane(vault: str):
     the whole critical section (git commit + PG transaction). Raises
     :class:`WriteBusyError` (→ 429) when the deadline or the global waiter
     backstop is exceeded — in both cases no work has been done yet.
+    Re-entrant within a task: a call nested in one for the same ``vault``
+    holds its gate already and does not wait for it again. Inside
+    ``vault_gate`` it takes only a global slot, for its own section.
     """
     global _waiters
+    if vault in _gates_held.get():
+        if _slot_held.get():
+            yield
+        else:
+            # Inside ``vault_gate``: Vault creation's seed write or its
+            # compensation, after the Vault's first Git commit or row exists.
+            # Giving up here would leave a half-created Vault, so the slot is
+            # awaited as a lifecycle operation awaits one, without a deadline.
+            async with _lifecycle_slot():
+                yield
+        return
     if _waiters >= settings.write_lane_max_waiters:
         logger.warning(
             "write lane backstop hit (%d waiters) — rejecting write for vault %s",
@@ -148,7 +171,11 @@ async def write_lane(vault: str):
         finally:
             _waiters -= 1
         slot_token = _slot_held.set(True)
-        yield
+        gates_token = _gates_held.set(_gates_held.get() | {vault})
+        try:
+            yield
+        finally:
+            _gates_held.reset(gates_token)
     finally:
         if slot_token is not None:
             _slot_held.reset(slot_token)
@@ -156,6 +183,61 @@ async def write_lane(vault: str):
             sem.release()
         if got_gate:
             gate.release()
+
+
+@asynccontextmanager
+async def _lifecycle_slot():
+    """One global lane slot for a section of a task that holds a Vault's gate
+    through ``vault_gate``, awaited without a deadline and counted with the
+    other lifecycle waiters. The wait holds no pool connection."""
+    global _lifecycle_waiters
+    sem = _global_sem()
+    _lifecycle_waiters += 1
+    try:
+        await sem.acquire()
+    finally:
+        _lifecycle_waiters -= 1
+    token = _slot_held.set(True)
+    try:
+        yield
+    finally:
+        _slot_held.reset(token)
+        sem.release()
+
+
+@asynccontextmanager
+async def vault_gate(vault: str):
+    """Hold ``vault``'s gate, but no global slot, for a longer section.
+
+    Vault creation holds its new Vault's gate from before the Vault exists
+    until its seed document is written, so no other git-committing write of
+    the Vault runs meanwhile. It takes a global slot only around its Git
+    operations (``run_git_write`` takes one for each, and the seed's own
+    ``write_lane`` takes one for its section), so creations waiting for
+    something else, such as the role authority lock, hold none of the slots
+    other Vaults' writes need. Those slots are awaited without a deadline:
+    once the creation has a Git commit or a row, its seed and its
+    compensation must not give up on a busy lane. Raises
+    :class:`WriteBusyError` when the gate itself is not free within the
+    lane's deadline, before the creation has done anything.
+    """
+    if vault in _gates_held.get():
+        yield
+        return
+    gate = _vault_gate(vault)
+    timeout = settings.write_lane_queue_timeout_secs
+    try:
+        async with asyncio.timeout(timeout):
+            await gate.acquire()
+    except TimeoutError:
+        logger.warning("write lane gate timed out after %.0fs for vault %s", timeout, vault)
+        raise WriteBusyError(vault, timeout) from None
+    token = _gates_held.set(_gates_held.get() | {vault})
+    try:
+        yield
+    finally:
+        _gates_held.reset(token)
+        gate.release()
 
 
 def start_commit_pool() -> None:

@@ -156,17 +156,24 @@ class _Conn:
     def transaction(self) -> _Txn:
         return _Txn()
 
-    async def fetchval(self, sql: str, user_id: uuid.UUID) -> bool:
-        # This claim-forwarding fixture represents an active human admin.
-        assert "FROM users WHERE id=$1 FOR SHARE" in sql
-        assert user_id == uuid.UUID("11111111-1111-1111-1111-111111111111")
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        if sql.startswith("EXPLAIN"):
+            # The write's plan, read before its admission: no dynamic table.
+            return None
+        # This claim-forwarding fixture represents an active human admin; the
+        # plan reads the account, the statement's transaction locks it.
+        assert "FROM users WHERE id=$1" in sql
+        assert args == (uuid.UUID("11111111-1111-1111-1111-111111111111"),)
         return True
 
     async def execute(self, sql: str, *args: Any) -> str:
         self.executed.append((sql, args))
         return "OK"
 
-    async def fetch(self, _sql: str) -> list[dict[str, Any]]:
+    async def fetch(self, sql: str) -> list[dict[str, Any]]:
+        if "events_row_change_queue" in sql:
+            # The write's check of the row changes it queued: none here.
+            return []
         claims_args = [
             args[0]
             for sql, args in self.executed

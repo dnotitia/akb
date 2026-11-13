@@ -48,6 +48,7 @@ from app.services.index_service import (
 from app.services import asset_service
 from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.uri_service import doc_uri
+from app.services.vault_write_admission import vault_write_admission
 from app.util.text import normalize_collection_path, to_nfc, to_nfc_any
 from app.repositories.vault_files_repo import DocumentAssetOwner
 
@@ -597,7 +598,7 @@ class ExternalGitService:
         pool = await get_pool()
         doc_repo = DocumentRepository(pool)
         coll_repo = CollectionRepository(pool)
-        async with pool.acquire() as conn:
+        async with vault_write_admission(vault_id, vault=vault_name), pool.acquire() as conn:
             async with conn.transaction():
                 if not await lock_vault_for_child_write(conn, vault_id):
                     raise AKBError(
@@ -731,7 +732,7 @@ class ExternalGitService:
         coll_repo = CollectionRepository(pool)
         doc_repo = DocumentRepository(pool)
         from app.services.kg_service import delete_document_relations
-        async with pool.acquire() as conn:
+        async with vault_write_admission(vault_id, vault=vault_name), pool.acquire() as conn:
             async with conn.transaction():
                 if not await lock_vault_for_child_write(conn, vault_id):
                     return "already_absent"

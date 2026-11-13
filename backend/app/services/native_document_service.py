@@ -84,6 +84,7 @@ from app.services.native_revision_service import (
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
+from app.services.vault_write_admission import vault_write_admission
 from app.util.errors import NATIVE_REVISION_SURFACE_UNSUPPORTED
 from app.util.text import (
     doc_path,
@@ -1722,8 +1723,11 @@ class NativeDocumentService(DocumentService):
         # These strict same-connection hooks observe the uncommitted catalog
         # row while scoped PAT memberships are computed, and PostgreSQL rolls
         # back both the row and role DDL if either hook fails or is cancelled.
+        new_vault_id = uuid.uuid4()
         try:
-            async with pool.acquire() as conn:
+            # Admitted before its connection like every event write; nothing
+            # else can reach the Vault before this transaction commits.
+            async with vault_write_admission(new_vault_id, vault=name), pool.acquire() as conn:
                 async with role_authority_transaction(conn):
                     vault_id = await vault_repo.create(
                         name=name,
@@ -1732,6 +1736,7 @@ class NativeDocumentService(DocumentService):
                         owner_id=uid,
                         public_access=public_access,
                         conn=conn,
+                        vault_id=new_vault_id,
                     )
                     role_sync = get_role_sync()
                     await role_sync.on_vault_create_in_conn(conn, vault_id, uid)
