@@ -241,102 +241,104 @@ async def test_every_writer_of_events_and_marks_at_once_never_deadlocks(monkeypa
         async with setup_pool.acquire() as conn:
             await write_events(conn, live, 40)
 
-        deadline = asyncio.get_running_loop().time() + 4.0
+        loop = asyncio.get_running_loop()
         counts = {"swept": 0, "marks_removed": 0, "vaults_deleted": 0, "cleanups": 0}
 
-        def running() -> bool:
-            return asyncio.get_running_loop().time() < deadline
-
-        async def sweep(conn: asyncpg.Connection, delete: str) -> None:
+        def sweeper(delete: str):
             # One process's sweeper: batches of its pass, then the marks.
             position = 0
-            while running():
+
+            async def step(conn: asyncpg.Connection) -> None:
+                nonlocal position
                 old, deleted, position = await events_sweeper._sweep_batch(conn, position, delete)
                 counts["swept"] += deleted
                 if not old:
                     counts["marks_removed"] += await events_sweeper._delete_orphaned_marks(conn)
                     await asyncio.sleep(0.005)
 
-        async def sweep_without_redis(conn: asyncpg.Connection) -> None:
-            await sweep(conn, events_sweeper._DELETE_EXPIRED)
-
-        async def sweep_with_redis(conn: asyncpg.Connection) -> None:
-            await sweep(conn, events_sweeper._DELETE_PUBLISHED)
+            return step
 
         async def delete_vaults(conn: asyncpg.Connection) -> None:
             # As the Vault delete does: lock the Vaults, then delete them. It
             # leaves their events, which the sweeps then delete; their marks
             # are the ones the cleanup removes.
-            while running():
-                pair = sorted(rng.sample(live, 2))
-                async with conn.transaction():
-                    await conn.fetch("SELECT id FROM vaults WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE", pair)
-                    await conn.execute("DELETE FROM vaults WHERE id = ANY($1::uuid[])", pair)
-                counts["vaults_deleted"] += 2
-                for vault_id in pair:
-                    live.remove(vault_id)
-                fresh = [await _make_vault(setup_pool, f"marks-stress-{uuid.uuid4().hex[:12]}") for _ in pair]
-                await write_events(conn, fresh, 10)
-                live.extend(fresh)
-                await asyncio.sleep(0.02)
+            pair = sorted(rng.sample(live, 2))
+            async with conn.transaction():
+                await conn.fetch("SELECT id FROM vaults WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE", pair)
+                await conn.execute("DELETE FROM vaults WHERE id = ANY($1::uuid[])", pair)
+            counts["vaults_deleted"] += 2
+            for vault_id in pair:
+                live.remove(vault_id)
+            fresh = [await _make_vault(setup_pool, f"marks-stress-{uuid.uuid4().hex[:12]}") for _ in pair]
+            await write_events(conn, fresh, 10)
+            live.extend(fresh)
+            await asyncio.sleep(0.02)
 
-        async def clean_up_failed_creates(conn: asyncpg.Connection) -> None:
+        async def clean_up_a_failed_create(conn: asyncpg.Connection) -> None:
             # As a failed create's cleanup does: lock the new Vault, delete its
             # (new) events, then the Vault.
-            while running():
-                vault_id = await _make_vault(setup_pool, f"marks-stress-new-{uuid.uuid4().hex[:12]}")
-                await conn.execute(
-                    "INSERT INTO events (vault_id, kind, payload) SELECT $1::uuid, 'document.put', '{}'::jsonb "
-                    "FROM generate_series(1, 3)",
-                    vault_id,
-                )
-                async with conn.transaction():
-                    await conn.fetchval("SELECT 1 FROM vaults WHERE id = $1 FOR UPDATE", vault_id)
-                    await conn.execute("DELETE FROM events WHERE vault_id = $1", vault_id)
-                    await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
-                counts["cleanups"] += 1
-                await asyncio.sleep(0.01)
+            vault_id = await _make_vault(setup_pool, f"marks-stress-new-{uuid.uuid4().hex[:12]}")
+            await conn.execute(
+                "INSERT INTO events (vault_id, kind, payload) SELECT $1::uuid, 'document.put', '{}'::jsonb "
+                "FROM generate_series(1, 3)",
+                vault_id,
+            )
+            async with conn.transaction():
+                await conn.fetchval("SELECT 1 FROM vaults WHERE id = $1 FOR UPDATE", vault_id)
+                await conn.execute("DELETE FROM events WHERE vault_id = $1", vault_id)
+                await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
+            counts["cleanups"] += 1
+            await asyncio.sleep(0.01)
 
         async def delete_events_by_hand(conn: asyncpg.Connection) -> None:
             # An operator's deletes: one event, or all of a Vault's in one statement.
-            while running():
-                await conn.execute(
-                    "DELETE FROM events WHERE id = (SELECT id FROM events ORDER BY id DESC OFFSET $1 LIMIT 1)",
-                    rng.randrange(50),
-                )
-                if rng.random() < 0.2:
-                    await conn.execute("DELETE FROM events WHERE vault_id = $1", rng.choice(live))
-                await asyncio.sleep(0.005)
+            await conn.execute(
+                "DELETE FROM events WHERE id = (SELECT id FROM events ORDER BY id DESC OFFSET $1 LIMIT 1)",
+                rng.randrange(50),
+            )
+            if rng.random() < 0.2:
+                await conn.execute("DELETE FROM events WHERE vault_id = $1", rng.choice(live))
+            await asyncio.sleep(0.005)
 
         async def keep_writing(conn: asyncpg.Connection) -> None:
-            while running():
-                await write_events(conn, rng.sample(live, 3), 5)
-                await asyncio.sleep(0.01)
+            await write_events(conn, rng.sample(live, 3), 5)
+            await asyncio.sleep(0.01)
 
-        workers = [
-            sweep_without_redis,
-            sweep_without_redis,
-            sweep_with_redis,
-            delete_vaults,
-            clean_up_failed_creates,
-            delete_events_by_hand,
-            keep_writing,
-        ]
-        connections = [await asyncpg.connect(_database_dsn(database)) for _ in workers]
+        workers = {
+            "sweep without Redis": sweeper(events_sweeper._DELETE_EXPIRED),
+            "sweep without Redis, another process": sweeper(events_sweeper._DELETE_EXPIRED),
+            "sweep with Redis": sweeper(events_sweeper._DELETE_PUBLISHED),
+            "Vault deletes": delete_vaults,
+            "failed creates' cleanups": clean_up_a_failed_create,
+            "operator deletes": delete_events_by_hand,
+            "event writes": keep_writing,
+        }
+        steps = dict.fromkeys(workers, 0)
+        started = asyncio.Event()
+        deadline = [float("inf")]
+
+        async def run(name: str, conn: asyncpg.Connection) -> None:
+            # Each worker starts once every connection is open, and takes at
+            # least one step however long that took.
+            await started.wait()
+            while not steps[name] or loop.time() < deadline[0]:
+                await workers[name](conn)
+                steps[name] += 1
+
+        connections = {name: await asyncpg.connect(_database_dsn(database)) for name in workers}
         try:
-            outcomes = await asyncio.wait_for(
-                asyncio.gather(
-                    *(worker(conn) for worker, conn in zip(workers, connections)), return_exceptions=True
-                ),
-                60,
-            )
+            running = [asyncio.ensure_future(run(name, conn)) for name, conn in connections.items()]
+            deadline[0] = loop.time() + 4.0
+            started.set()
+            outcomes = await asyncio.wait_for(asyncio.gather(*running, return_exceptions=True), 60)
         finally:
-            for conn in connections:
+            for conn in connections.values():
                 await conn.close()
 
         failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
         assert not failures, failures
-        assert counts["swept"] and counts["marks_removed"] and counts["vaults_deleted"] and counts["cleanups"], counts
+        assert all(steps.values()), steps
+        assert counts["swept"] and counts["vaults_deleted"] and counts["cleanups"], counts
         # Once everything left is swept, no mark of a Vault that is gone remains.
         await _age(setup_pool, await _remaining(setup_pool))
         await _sweep_pass(monkeypatch, setup_pool)
