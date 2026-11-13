@@ -20,9 +20,14 @@ def _fixture(monkeypatch, *, native: bool, legacy: bool = False):
     conn = MagicMock()
     conn.fetchrow = AsyncMock(return_value={"id": uuid.uuid4()})
     conn.execute = AsyncMock()
+    # No Native cutover fence in this fixture.
+    conn.fetchval = AsyncMock(return_value=None)
+    native_deleted: list[uuid.UUID] = []
 
     async def fetch(sql, *args):
-        return native_rows if "FROM native_resources" in sql else []
+        if "FROM native_resources" in sql:
+            return [] if native_deleted else native_rows
+        return []
 
     conn.fetch = AsyncMock(side_effect=fetch)
 
@@ -66,14 +71,15 @@ def _fixture(monkeypatch, *, native: bool, legacy: bool = False):
     monkeypatch.setattr("app.services.notification_producer.enqueue_document_change", AsyncMock())
     # The collection's events are collected and inserted through events_repo.
     monkeypatch.setattr("app.repositories.events_repo.emit_event", AsyncMock())
-    native_delete = AsyncMock()
-    locked_rows = [{
+    async def delete_resource(**kwargs):
+        native_deleted.append(kwargs["expected_resource_id"])
+
+    native_delete = AsyncMock(side_effect=delete_resource)
+    locked_row = {
         "resource_id": resource_id, "namespace_id": vault_id, "surface": "document",
         "lifecycle": "live", "current_path": "c/native.md", "head_revision_id": revision_id,
-    }]
-    repository = SimpleNamespace(
-        lock_resources=AsyncMock(return_value=locked_rows), lock_paths=AsyncMock(),
-    )
+    }
+    repository = SimpleNamespace(lock_resource=AsyncMock(return_value=locked_row))
     native_svc = SimpleNamespace(
         _native=AsyncMock(return_value=SimpleNamespace(
             delete_resource=native_delete, repository=repository,

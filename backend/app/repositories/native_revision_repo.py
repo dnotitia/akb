@@ -274,31 +274,6 @@ class NativeRevisionRepository:
         return dict(row) if row is not None else None
 
     @staticmethod
-    async def lock_resources(
-        conn: asyncpg.Connection,
-        resource_ids: list[uuid.UUID],
-    ) -> list[dict]:
-        """Lock several Resources ``FOR UPDATE`` in ``resource_id`` order.
-
-        A mutation of one Resource locks its row before its paths; a
-        transaction that changes several locks every row first, in this order,
-        and then all of their paths, so that it never waits for a row while it
-        holds a path another mutation needs."""
-        rows = await conn.fetch(
-            """
-            SELECT resource_id, namespace_id, surface, content_profile,
-                   current_path, lifecycle, head_revision_id,
-                   created_at, updated_at
-              FROM native_resources
-             WHERE resource_id = ANY($1::uuid[])
-             ORDER BY resource_id
-             FOR UPDATE
-            """,
-            sorted(set(resource_ids)),
-        )
-        return [dict(row) for row in rows]
-
-    @staticmethod
     async def insert_resource(
         conn: asyncpg.Connection,
         *,
