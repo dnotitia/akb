@@ -79,14 +79,146 @@ is introduced. Existing DB command and statement deadlines remain 30 seconds.
 | Endpoint | Meaning |
 | --- | --- |
 | `/livez` |Process is serving; no dependency access.|
-| `/readyz` |Successful DB result cached for 30 seconds; vector health is soft.|
+| `/readyz` |DB ping on a dedicated connection. The request pool is observed; the DB check takes one of its connections only when the pool shows nothing that proves it could serve a request (no idle connection, room to open one, and no recent acquire by a request or background work), or when the server refuses the dedicated connection. The soft vector check never takes a request-pool connection. Every result is shared by all callers for 1 second, and a plain success is cached for 30 seconds.|
 | `/health` |Detailed operational/queue diagnostics, not a cheap liveness check.|
 
-Readiness bounds DB pool initialization plus ping together to 2 seconds. The
-vector check retains its 5-second budget. These are probe-step budgets, **not**
-a 2-second whole-endpoint guarantee: callers can wait for the shared readiness
-lock. Concurrent failed probes can therefore queue. Failed readiness results
-are not cache-fresh, allowing an immediate new probe after recovery.
+Readiness bounds DB pool initialization plus ping together to 2 seconds; when
+cancelled, nothing in that step waits on the server. The soft vector check runs
+as a task that the probe waits on for at most 5 seconds. If it has not finished
+by then, it is reported as `vector_store: degraded:timeout` and cancelled
+without waiting for its cleanup. It never takes a request-pool connection: when
+the vector store is pgvector on the main database (no `vector_store_dsn`), the
+check runs on the probe's dedicated connection, and a failure there discards
+that connection like a failed ping, so the next probe starts on a fresh one; a
+store with a database of its own checks a connection from its own pool. A
+pgvector check whose query fails or is cut off terminates that connection
+instead of returning it, because asyncpg can wait without limit for the answer
+to a cancel request and would hold the pool slot meanwhile. After a query that
+answered, returning the connection is bounded to 2 seconds rather than cut
+short: asyncpg finishes the return or terminates the connection itself, so the
+slot never goes to another caller while that return still runs. At most one vector
+check is outstanding: while one that was given up on is still finishing, later
+probes report `degraded:timeout` at once instead of starting another. A check
+given up on while returning its connection is still finishing until that
+return ends, so it never holds a second connection of its pool. One
+evaluation therefore ends within about 7 seconds, inside kubelet's 8-second
+probe timeout. Callers can wait for the shared readiness lock, but they wait for
+the evaluation already running, not for one each. Every
+result, ready or not, answers all callers for one second, and callers that
+arrive while an evaluation runs reuse its result. `/readyz` needs no
+authentication, so this bounds the database work that any number of callers
+can cause to about one evaluation per second per process. After that second, a
+failed result is evaluated again on the next call, so recovery shows within
+about a second.
+
+The ping runs on one dedicated connection, not on a request-pool connection.
+The DB check takes a request-pool connection in two cases only, both described
+below: a pool that shows nothing that proves it could serve a request, and a
+server at `max_connections` that refuses the dedicated connection. The soft
+vector check takes none: for pgvector on the main database it runs on the
+dedicated connection, and a store with a database of its own uses its own pool.
+The dedicated connection's `application_name` is `akb-readiness-probe`. The first probe opens it and
+later probes reuse it. A failed ping discards it and the next probe opens a new
+one; a probe that finds it closed by the server opens a new one before pinging.
+Connecting and the ping both stay inside the 2-second step. Each API process
+therefore holds one PostgreSQL connection beyond its pool. An unreachable
+database still fails readiness at once.
+
+That connection proves the database answers, not that the pool can still open
+a connection to it. The pool's idle connections can expire, and a server at
+`max_connections` refuses new ones while a connection opened earlier keeps
+working. So when the pool shows nothing that proves it could serve a request
+(no idle connection, room to open one, and no acquire within
+`readyz_pool_saturation_grace_secs`), the probe also takes one connection
+through the pool within the rest of its 2-second step and runs `SELECT 1`. If
+the pool cannot open it, readiness reports `db: error:pool_unavailable`, or
+`db: error:pool_timeout` when it does not answer in time. An acquire completed
+by a request or background work after the probe decided to check the pool
+proves the pool too: it ends the probe's wait, and it wins even when the server
+refuses the probe's own extra connection at the same moment. A connection the
+probe has already obtained by then goes back to the pool instead of being
+closed, so the pool does not lose a server slot to the probe. That return runs
+in the background with its own 2-second bound, and the verdict does not wait
+for it: a slow return cannot turn a pool that a request has just proven into a
+failure. Until the return ends, that connection does not count toward pool
+saturation (below). So a probe queued
+behind a request whose connection is still opening does not report a working
+pool as broken.
+
+A server at `max_connections` refuses that connection with SQLSTATE `53300`
+while the pool's open connections keep working. Readiness then asks the pool,
+without waiting for a connection:
+
+- If the pool has an idle connection, the probe borrows it for the rest of its
+  2-second step and runs `SELECT 1` on it: `db: ok:pool_idle`. If that ping
+  fails, readiness fails. The connection goes back within the same budget. One
+  that cannot finish in time is terminated rather than returned, because
+  returning it would wait on a cancel request that may never complete. If a
+  request or background work completes an acquire first, that proves the pool
+  instead (`db: ok:pool_progress`), and a connection the probe obtained
+  meanwhile goes back in the background as described above.
+- Otherwise, if an acquire has completed within
+  `readyz_pool_saturation_grace_secs`: `db: ok:pool_progress`.
+
+Neither result is cached beyond the one-second floor. A closing pool, a pool
+with neither, and every other
+connection error fail readiness as before.
+
+### Pool saturation
+
+The request pool is saturated when every connection it may open is open and
+checked out (`size == max` and `idle == 0`). A connection the probe is still
+giving back after a request proved the pool does not count: once that return
+ends it is idle, or closed and leaves room to open one. `detail.pool` still
+reports it as checked out. Requests wait for a connection while the pool is
+saturated, but the database is not down. A client burst saturates every
+replica's pool at the same moment. If readiness failed on saturation alone,
+every replica would leave the Service together and the burst would become a
+complete outage.
+
+Each probe reads the pool's occupancy without waiting for a connection and
+reports it in `detail.pool` whenever it obtained the pool, including when the
+database check fails:
+
+| Field | Meaning |
+| --- | --- |
+| `size`, `max`, `idle` |Open connections, the pool's limit, and open connections not checked out.|
+| `free` |Earlier name of `idle`, kept for existing readers.|
+| `saturated_for_secs` |Time since the first of the consecutive probes that found the pool saturated; `null` when the last probe did not find it saturated.|
+| `last_acquire_age_secs` |Seconds since the latest completed acquire by a request or background work; `null` before the first. Readiness's own acquires do not count.|
+
+The payload rounds these values to milliseconds; readiness decides on the
+values as measured. The count of completed acquires stays internal, because
+`/readyz` is public.
+
+A saturated pool whose connections keep changing hands is busy, not wedged,
+and stays ready however long it is saturated. Readiness fails only when the
+pool has been saturated at every probe for
+`readyz_pool_saturation_grace_secs` (default 30 seconds) **and** no acquire
+has completed within that time. It then reports not ready with `db: ok` and
+the pool figures. That is the leak or stall case, where taking the replica out
+of the Service is wanted. The pool counts completed acquires in its asyncpg
+`setup` hook, which runs on every acquire. Acquires that readiness makes
+itself, for its pool checks and its vector check, are not counted: a check
+that got a connection and then failed must not let the next probe skip
+checking the pool. A probe that finds an idle
+connection, or room to open one, ends the saturation run. While the pool is
+saturated:
+
+- A ready result is shared only for the one-second floor, so each probe after
+  that looks at the pool again.
+- The soft vector check is skipped and reported as
+  `vector_store: skipped:pool_saturated`. It cannot change the verdict, and
+  since each probe after the floor evaluates again, it would add a statement
+  every second to a database already under that load.
+
+Probes see the pool's occupancy only when they run, so a pool that had room
+between two saturated probes still counts as saturated throughout; the acquire
+count is exact. With the shipped probe settings (every 15 seconds, three
+failures), a replica whose pool stays wedged leaves the Service about
+`grace + 30` seconds after the first probe that sees the saturation. A grace of
+0 fails readiness at the first saturated probe and brings back the outage
+described above; it is not recommended.
 
 A cached ready 200 can overlap a 503 from a data request during a new DB outage.
 Even a fresh `SELECT 1` cannot prove an unrelated data query will succeed. Do not
@@ -99,6 +231,20 @@ soft vector degradation labels rather than raw exception representations.
 `backend/tests/test_transient_api_unit.py` pins REST/MCP errors, sanitization,
 no write replay, SQL-enrichment bypass, false-zero prevention, readiness TTL,
 soft vector failure, recovery and the DB initialization deadline.
+
+`backend/tests/test_readiness_probe_unit.py` pins the busy and wedged verdicts,
+the `max_connections` rule, the pool fields, the cache rule, the acquire
+counter and its hook, the dedicated connection's settings and replacement, and
+the shutdown order. `backend/tests/test_readiness_probe_postgres.py` saturates
+a real pool built by `get_pool`. It checks that `/readyz` stays 200 within the
+probe budget, and past the grace while more tasks than connections keep taking
+turns. It turns 503 once the holders never let go. A role at its connection
+limit makes the server refuse the probe connection. That stays 200 through an
+idle pool connection, then through recent acquires while every connection is
+held, and turns 503 once those stop. The suite also checks that readiness fails at once when the
+database is gone, that a terminated probe connection is reopened, and that
+shutdown closes it. It reads the same `AKB_TEST_DSN` and `REQUIRE_REAL_PG`
+variables as the suite below.
 
 `backend/tests/test_read_disconnect_unit.py` covers the actual main route's
 awaited cleanup, normal/error task termination, exclusions, unusual GET bodies,

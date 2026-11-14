@@ -12,7 +12,7 @@ import logging
 import os
 from urllib.parse import urlsplit
 
-from app.db.postgres import close_pool, get_pool, init_db
+from app.db.postgres import close_pool, close_readiness_connection, get_pool, init_db
 from app.config import settings
 from app.process_role import runtime_process_role
 from app.services._backfill import request_stop_all, runner_snapshots
@@ -600,4 +600,7 @@ async def shutdown_storage() -> None:
         from app.services.keycloak_oidc import get_keycloak_oidc
 
         await get_keycloak_oidc().aclose()
+    # The readiness probe's dedicated connection goes before the pool, like
+    # the other dedicated clients above. Never opened in a worker process.
+    await close_readiness_connection()
     await close_pool()

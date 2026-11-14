@@ -45,7 +45,15 @@ from app.api.routes import (
     tables,
 )
 from app.config import settings
-from app.db.postgres import get_pool
+from app.db.postgres import (
+    forget_pool_progress_waiter,
+    get_pool,
+    pool_progress,
+    pool_progress_waiter,
+    readiness_acquires,
+    readiness_ping,
+    with_readiness_connection,
+)
 from app.db.transient import transient_error
 from app.exceptions import AKBError, TransientDependencyError
 from app.logging_redaction import install_secret_redaction
@@ -416,6 +424,23 @@ async def livez():
 
 
 _READY_TTL_SECONDS = 30.0
+# Every result, ready or not, answers every caller for at least this long.
+# /readyz needs no authentication, and many of its results are not cached
+# beyond this (failures, a saturated pool, a pool vouching for the database);
+# the floor bounds the database work of any number of callers to about one
+# evaluation per interval per process.
+_READY_MIN_INTERVAL_SECONDS = 1.0
+# The database step of one probe: pool initialization (only while there is no
+# pool yet) plus connecting and pinging on the probe's dedicated connection.
+# Nothing in it awaits a server on cancellation (connections are terminated,
+# pending acquires abandoned, returns bounded), so it ends with its budget.
+_READY_DB_TIMEOUT_SECONDS = 2.0
+# How long a probe waits for the soft vector check. The check runs as a task
+# the probe does not cancel-and-await: its cancellation cleanup can wait on a
+# connection that never answers. With the database step, one evaluation, and
+# every caller waiting for it, ends within about 7 seconds, inside kubelet's
+# 8-second probe timeout.
+_READY_VECTOR_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -423,45 +448,394 @@ class _ReadyState:
     ts: float = 0.0
     ok: bool = False
     detail: dict | None = None
+    # Monotonic time of the first probe in the current unbroken run of probes
+    # that found the request pool saturated; None once a probe finds room.
+    pool_saturated_since: float | None = None
 
 
 _ready_state = _ReadyState()
 _ready_lock = asyncio.Lock()
 
 
+@dataclass
+class _PoolObservation:
+    """One reading of the request pool. The verdict uses these values as
+    measured; only the public payload rounds them."""
+
+    size: int
+    max_size: int
+    idle: int
+    # None while the pool has room, which is not "saturated for 0 s".
+    saturated_for: float | None
+    # Whether the connections still change hands: a saturated pool that keeps
+    # completing acquires is busy, one that has stopped is wedged.
+    last_acquire_age: float | None
+
+    def payload(self) -> dict:
+        return {
+            "size": self.size,
+            "max": self.max_size,
+            "idle": self.idle,
+            # The earlier name of `idle`, kept for existing readers.
+            "free": self.idle,
+            "saturated_for_secs": _rounded(self.saturated_for),
+            "last_acquire_age_secs": _rounded(self.last_acquire_age),
+        }
+
+
+def _rounded(seconds: float | None) -> float | None:
+    return None if seconds is None else round(seconds, 3)
+
+
+def _observe_pool(pool, state: _ReadyState) -> _PoolObservation:
+    """Read the request pool's occupancy without waiting for a connection.
+
+    Saturated means every connection the pool may open is open and lent out.
+    A connection the probe is still giving back after standing down
+    (`_stand_down`) does not count toward that: once the return ends it is
+    idle, or closed and leaves room, so it cannot make a pool that a request
+    has just proven look wedged. The reported figures still show it as lent
+    out. The run of saturation is kept on `state` across probes; a probe that
+    finds an idle connection, or room to open one, ends it.
+    """
+    size, max_size, idle = pool.get_size(), pool.get_max_size(), pool.get_idle_size()
+    saturated_for: float | None = None
+    if size >= max_size and idle + len(_standing_down) == 0:
+        now = time.monotonic()
+        if state.pool_saturated_since is None:
+            state.pool_saturated_since = now
+        saturated_for = max(0.0, now - state.pool_saturated_since)
+    else:
+        state.pool_saturated_since = None
+    # The acquire count itself stays internal: the payload is public.
+    _, last_acquire_age = pool_progress()
+    return _PoolObservation(size, max_size, idle, saturated_for, last_acquire_age)
+
+
+def _pool_saturated_for(detail: dict | None) -> float | None:
+    pool = detail.get("pool") if isinstance(detail, dict) else None
+    return pool.get("saturated_for_secs") if isinstance(pool, dict) else None
+
+
+def _pool_wedged(observed: _PoolObservation, grace: float) -> bool:
+    """Saturated for the whole grace, with no acquire completed within it.
+
+    A saturated pool whose connections keep changing hands stays ready however
+    long it is saturated. With no acquire recorded at all (a pool built
+    without the counting hook), the saturation run decides alone.
+    """
+    if observed.saturated_for is None or observed.saturated_for < grace:
+        return False
+    return observed.last_acquire_age is None or observed.last_acquire_age >= grace
+
+
+# A server at max_connections refuses the probe's own connection while the
+# pool's open connections keep working. Readiness then asks the pool instead,
+# without queueing behind it, and labels a ready answer by how it was proven:
+# a ping on an idle pool connection, or acquires completed within the grace.
+_DB_OK_BY_POOL_IDLE = "ok:pool_idle"
+_DB_OK_BY_POOL_PROGRESS = "ok:pool_progress"
+_DB_READY = ("ok", _DB_OK_BY_POOL_IDLE, _DB_OK_BY_POOL_PROGRESS)
+
+
+def _pool_unproven(pool: asyncpg.Pool) -> bool:
+    """Nothing shows the pool could serve a request now: no idle connection,
+    room to open one, and no acquire within the grace.
+
+    Its connections may have expired since, and a server at max_connections
+    refuses new ones even while the probe's own connection, opened earlier,
+    still answers. Only an acquire through the pool settles that.
+    """
+    if pool.get_idle_size() > 0 or pool.get_size() >= pool.get_max_size():
+        return False
+    _, last_acquire_age = pool_progress()
+    return last_acquire_age is None or last_acquire_age >= settings.readyz_pool_saturation_grace_secs
+
+
+def _remaining(budget: asyncio.Timeout) -> float | None:
+    deadline = budget.when()
+    return None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
+
+
+async def _ping_through_pool(pool: asyncpg.Pool, budget: asyncio.Timeout, progress_since: int) -> bool:
+    """Run ``SELECT 1`` on a pool connection, borrowed and given back within
+    the rest of the probe's budget. Raises when that does not succeed in time.
+
+    Returns False without a ping when another caller's acquire has completed
+    since `progress_since`, the count read before the probe decided to check
+    the pool: the pool has just served someone. A probe queued behind a
+    request whose connection is still opening must not report a working pool
+    as broken.
+
+    A connection that cannot finish in time is terminated rather than
+    returned. Its query may never answer, nor the cancel request asyncpg
+    sends for it, and returning it would wait for that cancel for as long
+    again as the acquire was allowed. Terminating frees the pool slot at
+    once and drops the pending cancel request.
+    """
+    conn = await _acquire_unless_another_caller_does(pool, budget, progress_since)
+    if conn is None:
+        return False
+    try:
+        await conn.fetchval("SELECT 1")
+    except BaseException:
+        _terminate_pool_connection(conn)
+        raise
+    left = _remaining(budget)
+    if left is not None and left <= 0:
+        _terminate_pool_connection(conn)
+        raise TimeoutError
+    await pool.release(conn, timeout=left)
+    return True
+
+
+async def _acquire_unless_another_caller_does(pool: asyncpg.Pool, budget: asyncio.Timeout, progress_since: int):
+    """The probe's own acquire, or None once another caller's acquire has
+    completed since `progress_since`.
+
+    The progress waiter is registered before anything else can run, and the
+    count is read again right after, so an acquire that completes in between
+    is not missed. When another caller's acquire and the probe's own both
+    end, the other caller's wins whatever happened to the probe's: the pool
+    has served someone, even if the server refused the probe's extra
+    connection.
+    """
+    progressed = pool_progress_waiter()
+    try:
+        if _progressed_since(progress_since):
+            return None
+        acquiring = asyncio.ensure_future(pool.acquire(timeout=_remaining(budget)))
+        try:
+            await asyncio.wait({acquiring, progressed}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            _abandon_acquire(acquiring)
+            raise
+        if progressed.done() or _progressed_since(progress_since):
+            _stand_down(pool, acquiring)
+            return None
+        return acquiring.result()
+    finally:
+        forget_pool_progress_waiter(progressed)
+
+
+# How long returning a connection the probe stood down from may take.
+_READY_RETURN_TIMEOUT_SECONDS = 2.0
+# Those returns run detached from the evaluation, held here until they end.
+_standing_down: set[asyncio.Task] = set()
+
+
+def _stand_down(pool: asyncpg.Pool, acquiring: asyncio.Future) -> None:
+    """Another caller proved the pool, so the probe needs no connection.
+
+    The verdict is settled; nothing here may wait. One the probe already holds
+    goes back to the pool in a background task: terminating a working
+    connection would cost the pool a server slot that the server, at its
+    connection limit, may not give back, and waiting for the return could
+    outlast the probe's budget and turn a proven pool into a failure. An
+    acquire still pending is abandoned.
+    """
+    if not acquiring.done() or acquiring.cancelled() or acquiring.exception() is not None:
+        _abandon_acquire(acquiring)
+        return
+    returning = asyncio.get_running_loop().create_task(
+        _return_to_pool(pool, acquiring.result()), name="readyz-return-connection",
+    )
+    _standing_down.add(returning)
+    returning.add_done_callback(_standing_down.discard)
+
+
+async def _return_to_pool(pool: asyncpg.Pool, conn) -> None:
+    """Return a connection within its own bound.
+
+    asyncpg terminates a connection whose return fails or runs out of time;
+    the terminate here only makes sure of it. A return still running when this
+    task is cancelled is left to asyncpg, never terminated from outside.
+    """
+    try:
+        await pool.release(conn, timeout=_READY_RETURN_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001 — collected here; the verdict does not depend on it
+        _terminate_pool_connection(conn)
+
+
+def _progressed_since(count: int) -> bool:
+    return pool_progress()[0] != count
+
+
+def _abandon_acquire(acquiring: asyncio.Future) -> None:
+    """Stop waiting for an acquire without awaiting its cleanup. A connection
+    it still hands over is terminated; its error, if any, is consumed."""
+
+    def drop(finished: asyncio.Future) -> None:
+        if finished.cancelled():
+            return
+        if finished.exception() is None:
+            _terminate_pool_connection(finished.result())
+
+    if acquiring.done():
+        drop(acquiring)
+    else:
+        acquiring.add_done_callback(drop)
+        acquiring.cancel()
+
+
+def _terminate_pool_connection(conn) -> None:
+    try:
+        conn.terminate()
+    except Exception:  # noqa: BLE001 — the connection is given up either way
+        logger.debug("readiness could not terminate a pool connection", exc_info=True)
+
+
+async def _db_ok_despite_full_server(pool: asyncpg.Pool, budget: asyncio.Timeout) -> str | None:
+    """How the pool vouches for the database after the server refused the
+    probe's connection, or None when it cannot. A failing ping raises.
+
+    An idle connection is borrowed for the rest of the probe's budget only.
+    If another caller takes it first, that caller's completed acquire proves
+    the pool instead, so the probe does not wait behind it. If the holder the
+    probe takes has lost its connection, asyncpg reconnects, the full server
+    refuses that too, and readiness fails.
+    """
+    if pool.is_closing():
+        return None
+    progress_since = pool_progress()[0]
+    if pool.get_idle_size() > 0:
+        if await _ping_through_pool(pool, budget, progress_since):
+            return _DB_OK_BY_POOL_IDLE
+        return _DB_OK_BY_POOL_PROGRESS
+    _, last_acquire_age = pool_progress()
+    if last_acquire_age is not None and last_acquire_age < settings.readyz_pool_saturation_grace_secs:
+        return _DB_OK_BY_POOL_PROGRESS
+    return None
+
+
 async def _probe_ready() -> tuple[bool, dict]:
+    """One readiness evaluation; see `_evaluate_readiness`."""
+    # Every pool acquire this evaluation makes, directly or through the vector
+    # check it starts, is readiness's own and does not count as pool progress.
+    with readiness_acquires():
+        return await _evaluate_readiness()
+
+
+async def _evaluate_readiness() -> tuple[bool, dict]:
     """Readiness check. DB is the only hard dependency — failing DB takes
     every endpoint down. The vector store only powers search/publication
     views and has its own []-on-error fallback, so vector-store slowness
     is reported but does NOT fail readiness; otherwise a transient blip
     on the configured driver would pull the pod from the Service and
     break login/auth/CRUD for ~30s.
+
+    The DB ping runs on a dedicated connection, and the request pool is only
+    observed; it answers for the database only when the server refuses that
+    connection (`_db_ok_despite_full_server`). A pool that clients have fully
+    checked out is not a database failure, and a client burst saturates every
+    replica's pool at the same moment: failing readiness on it would leave the
+    Service with no endpoints while the database is fine. Saturation fails
+    readiness only once it has lasted `readyz_pool_saturation_grace_secs` at
+    every probe and no acquire has completed within that time: the pool is
+    wedged, not busy.
     """
     detail: dict = {
         "document_revision_backend": selected_document_revision_backend(),
     }
+    pool: asyncpg.Pool | None = None
+    # Which check a failure belongs to: the database itself, or the pool's
+    # ability to open a connection to it.
+    stage = "db"
     try:
-        # Initialization/reconnection is part of the same probe budget.
-        async with asyncio.timeout(2.0):
+        # Initialization/reconnection is part of the same probe budget, and so
+        # is every answer the pool gives.
+        async with asyncio.timeout(_READY_DB_TIMEOUT_SECONDS) as budget:
+            # An existing pool is returned at once; nothing is borrowed from it.
             pool = await get_pool()
-            await pool.fetchval("SELECT 1")
-        detail["db"] = "ok"
-        # Pool stats help diagnose leaks: if free→0 while size→max we are
-        # exhausting the pool and slow callers are holding connections.
-        detail["pool"] = {
-            "size": pool.get_size(),
-            "free": pool.get_idle_size(),
-            "max": pool.get_max_size(),
-        }
+            try:
+                await readiness_ping(timeout=_READY_DB_TIMEOUT_SECONDS)
+                detail["db"] = "ok"
+            except asyncpg.TooManyConnectionsError:
+                vouched = await _db_ok_despite_full_server(pool, budget)
+                if vouched is None:
+                    raise
+                detail["db"] = vouched
+            if detail["db"] == "ok":
+                # Counted before deciding, so an acquire that completes from
+                # here on proves the pool rather than slipping past the probe.
+                progress_since = pool_progress()[0]
+                if _pool_unproven(pool):
+                    stage = "pool"
+                    await _ping_through_pool(pool, budget, progress_since)
     except Exception as e:  # noqa: BLE001 — no connection strings in a public probe
-        detail["db"] = "error:timeout" if isinstance(e, TimeoutError) else "error:unavailable"
+        failure = "timeout" if isinstance(e, TimeoutError) else "unavailable"
+        detail["db"] = f"error:{failure}" if stage == "db" else f"error:pool_{failure}"
+    observed: _PoolObservation | None = None
+    if pool is not None:
+        observed = _observe_pool(pool, _ready_state)
+        # Pool stats help diagnose leaks and bursts, on a failed probe too.
+        detail["pool"] = observed.payload()
+    if detail["db"] not in _DB_READY:
         return False, detail
-    try:
-        vs_ok = await asyncio.wait_for(get_vector_store().health(), timeout=5.0)
-        detail["vector_store"] = "ok" if vs_ok else "degraded:unreachable"
-    except Exception as e:  # noqa: BLE001
-        detail["vector_store"] = "degraded:timeout" if isinstance(e, TimeoutError) else "degraded:unavailable"
+    if observed is not None and observed.saturated_for is not None:
+        if _pool_wedged(observed, settings.readyz_pool_saturation_grace_secs):
+            return False, detail
+        # A saturated result is shared for one second only, so a probe can run
+        # every second while the pool stays saturated. The soft vector check
+        # is skipped then: it cannot change the verdict, and it would add a
+        # statement per second to a database already under that load.
+        detail["vector_store"] = "skipped:pool_saturated"
+        return True, detail
+    detail["vector_store"] = await _vector_store_status()
     return True, detail
+
+
+# The vector check in flight, if any. At most one is outstanding: a probe that
+# finds the previous one still running waits for it, or, once a probe has given
+# up on it, reports the timeout at once instead of starting another. A check
+# given up on while returning its connection runs until that return ends.
+_vector_check: asyncio.Task | None = None
+
+
+async def _vector_store_status() -> str:
+    global _vector_check
+    task = _vector_check
+    if task is None or task.done() or task.get_loop() is not asyncio.get_running_loop():
+        task = asyncio.create_task(_vector_store_health(), name="readyz-vector-check")
+        task.add_done_callback(_consume_outcome)
+        _vector_check = task
+    elif task.cancelling():
+        return "degraded:timeout"
+    done, _ = await asyncio.wait({task}, timeout=_READY_VECTOR_TIMEOUT_SECONDS)
+    if not done:
+        # Left to finish its cleanup in the background, however long that takes.
+        task.cancel()
+        return "degraded:timeout"
+    if task.cancelled():
+        return "degraded:timeout"
+    error = task.exception()
+    if error is not None:
+        return "degraded:timeout" if isinstance(error, TimeoutError) else "degraded:unavailable"
+    return "ok" if task.result() else "degraded:unreachable"
+
+
+async def _vector_store_health() -> bool:
+    # Imported here, as the factory does, so other drivers never load it.
+    from app.services.vector_store.pgvector import PgvectorStore
+
+    store = get_vector_store()
+    if isinstance(store, PgvectorStore) and store.uses_main_pool:
+        # The store reads the database the probe pings, through the request
+        # pool. Its check runs on the probe's dedicated connection instead, so
+        # the soft check never holds a request-pool connection that readiness
+        # then judges as saturated or wedged.
+        shared = store
+        return await with_readiness_connection(
+            lambda conn: shared.health(conn=conn), timeout=_READY_VECTOR_TIMEOUT_SECONDS,
+        )
+    return await store.health()
+
+
+def _consume_outcome(task: asyncio.Task) -> None:
+    # A check the probe gave up on still ends with an outcome; retrieve it so
+    # it is not logged as never retrieved.
+    if not task.cancelled():
+        task.exception()
 
 
 def _ready_response(state: _ReadyState, *, cached: bool):
@@ -476,11 +850,27 @@ def _ready_response(state: _ReadyState, *, cached: bool):
 
 
 def _cache_fresh(state: _ReadyState) -> bool:
-    # Only cache successes. If a previous probe failed, we want to retry
-    # immediately so recovery is reflected in /readyz on the very next
-    # call — a 30s stale-failure cache pulls the pod from the Service for
-    # twice the actual outage window.
-    return state.detail is not None and state.ok and (time.monotonic() - state.ts) < _READY_TTL_SECONDS
+    if state.detail is None:
+        return False
+    age = time.monotonic() - state.ts
+    # Any result is shared for the floor. Callers queued on the lock while an
+    # evaluation runs then reuse it instead of each starting their own.
+    if age < _READY_MIN_INTERVAL_SECONDS:
+        return True
+    # Beyond the floor, only cache successes. If a previous probe failed, we
+    # want to retry promptly so recovery is reflected in /readyz — a 30s
+    # stale-failure cache pulls the pod from the Service for twice the actual
+    # outage window.
+    # Nor a success that saw a saturated pool: the grace is measured across
+    # probes, so each probe during saturation has to look at the pool again.
+    # Nor one the pool vouched for instead of the probe's own connection: an
+    # idle connection or recent acquires prove the database only for now.
+    return (
+        state.ok
+        and state.detail.get("db") == "ok"
+        and _pool_saturated_for(state.detail) is None
+        and age < _READY_TTL_SECONDS
+    )
 
 
 @app.get("/readyz")
