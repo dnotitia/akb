@@ -198,3 +198,41 @@ def test_record_needs_a_blank_line_after_its_data(tmp_path, ending):
     Path(capture).write_bytes(sse(EVENT).replace("\n", ending).removesuffix(ending).encode())
     with pytest.raises(AssertionError, match="incomplete"):
         helper.assert_resumed_events(capture, receipt, VAULT, "opaque-before", native=True)
+
+
+def checkpoint(cursor):
+    return sse({"version": 1, "cursor": cursor}, event="checkpoint")
+
+
+def test_resume_accepts_the_start_checkpoint_at_its_cursor(tmp_path):
+    """Every stream first sends a checkpoint where it starts: for a resume, at the cursor it resumed from."""
+    capture, receipt = captures(tmp_path, checkpoint("opaque-before") + sse(EVENT))
+    helper.assert_resumed_events(capture, receipt, VAULT, "opaque-before", native=True)
+
+
+def test_resume_rejects_a_starting_cursor_after_the_start_checkpoint(tmp_path):
+    replayed = dict(EVENT, cursor="opaque-before")
+    capture, receipt = captures(tmp_path, checkpoint("opaque-before") + sse(replayed))
+    # Refused as a replay of the starting cursor, or already as a duplicate cursor.
+    with pytest.raises(AssertionError, match="starting cursor|duplicate event cursor"):
+        helper.assert_resumed_events(capture, receipt, VAULT, "opaque-before", native=True)
+
+
+def test_the_start_checkpoint_does_not_stand_in_for_a_filtered_events_checkpoint(tmp_path):
+    selected = dict(EVENT, kind="table.rows_changed", cursor="opaque-selected")
+    capture, _receipt = captures(tmp_path, checkpoint("opaque-start") + sse(selected))
+    with pytest.raises(AssertionError, match="advance by checkpoint"):
+        helper.assert_filtered_events(capture, VAULT)
+
+
+@pytest.mark.parametrize(
+    ("lines", "expected"),
+    [
+        (["event: checkpoint", "id: ec1.start", 'data: {"version":1,"cursor":"ec1.start"}'], True),
+        ([": heartbeat"], False),
+        (["event: change", "id: ec1.change", "data: {}"], False),
+        (["event: checkpoint", "data: {}"], False),
+    ],
+)
+def test_a_live_stream_must_start_with_a_checkpoint(lines, expected):
+    assert helper.is_start_checkpoint(lines) is expected

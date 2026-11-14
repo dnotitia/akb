@@ -7,6 +7,56 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- Open `GET /api/v1/events/{vault}` SSE tails no longer hold request-pool
+  connections. Each server process wakes them from one dedicated PostgreSQL
+  `LISTEN` connection. A tail borrows one pooled connection to read a batch
+  and, when the batch has rows, checks access on that same connection; it no
+  longer runs an access query for every event it sends. All tail database work
+  in a process shares at most `event_tail_db_concurrency` connections (default
+  6, overridden by `AKB_EVENT_TAIL_DB_CONCURRENCY`), and a connection counts
+  against it until it is back in the pool, even when its stream was cancelled;
+  one that takes more than five seconds to go back is closed instead.
+  Opening a tail checks access within the same budget, after admission is
+  decided, so many open tails, a burst of events or a burst of reconnects can
+  no longer exhaust the pool and fail readiness; a caller without access still
+  gets 403 or 404 before any capacity error. An access check that took longer
+  than a second is repeated before the next event, with heartbeats in the
+  meantime. A tail whose checks keep taking that long, or keep failing on a
+  transient database fault, ends after three in a row, the first check of a
+  batch included, with no further frame. Every tail now starts with a
+  checkpoint at its starting position, part of the response to the authorized
+  open: built on the access check that opened it and sent before anything
+  else, so a client that brought no cursor still has one to resume from. When
+  access cannot be confirmed in time to build it, the open fails with a
+  retryable 503 `event_tail_unavailable`; once the response has started, the
+  checkpoint is always sent, and access is enforced from the first event on.
+  Heartbeats also keep their interval while a batch is read, and each
+  heartbeat sent during an empty read is followed by an access check before
+  the tail waits again. A cursor is refused with 410 `event_gap` only when an
+  event it never received was deleted: migration 133 adds a trigger that
+  records the highest deleted event id per Vault in every statement that
+  deletes, whichever release issues it. It asks for its lock on `events` with
+  a 500 ms timeout and backs off between attempts, so a long transaction that
+  wrote an event does not hold up other event writes during the upgrade; it
+  takes the lock on `vaults` its other trigger needs only when it is free; and
+  it reads no events under that lock: migration 134 sets the starting marks
+  afterwards, without it. Recording a deletion reads and locks no Vault, so
+  it never waits for a Vault's delete or cleanup; a Vault's delete removes its
+  mark. A cursor taken before a Vault's first event, which other Vaults'
+  events usually leave far below it, is no longer refused.
+  A process serves at most `event_tail_max_streams` tails (default 256,
+  `AKB_EVENT_TAIL_MAX_STREAMS`); past that a new tail gets 503
+  `event_tail_capacity` with `Retry-After`. One account may hold at most
+  `event_tail_max_streams_per_user` of them (default 48,
+  `AKB_EVENT_TAIL_MAX_STREAMS_PER_USER`); past that its next tail gets 429
+  `event_tail_user_quota`, on which the SDK's change channel stops instead of
+  retrying. `GET /health` reports the tail counters under `event_tail`.
+  Migration 131 makes the `events` trigger's notification name the event's
+  Vault, so an event wakes only that Vault's tails instead of every open tail.
+  Startup logs a warning when the pool leaves fewer than four connections
+  beside the tail budget and `write_lane_concurrency`. The formats of frames,
+  cursors and heartbeats are unchanged; only the start checkpoint is new.
+
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain
   their existing receipts and policy errors. A pending call observes a grant

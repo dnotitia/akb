@@ -105,8 +105,23 @@ def assert_document_change(frame: dict, write: dict, vault: str, *, native: bool
             assert payload["resource_id"] == resource_id, "Native resource identity changed"
 
 
+def without_start_checkpoint(frames: list[dict], start: str | None = None) -> list[dict]:
+    """Drop the checkpoint every stream sends first, at its start position.
+
+    With ``start``, only a first checkpoint at exactly that cursor is dropped.
+    """
+    if frames and frames[0]["event"] == "checkpoint" and start in (None, frames[0]["id"]):
+        return frames[1:]
+    return frames
+
+
+def is_start_checkpoint(lines: list[str]) -> bool:
+    """Whether a live frame's lines are a checkpoint, as every stream's first frame is."""
+    return bool(lines) and lines[0] == "event: checkpoint" and any(line.startswith("id: ") for line in lines)
+
+
 def assert_filtered_events(path: str, vault: str) -> None:
-    frames = read_frames(path)
+    frames = without_start_checkpoint(read_frames(path))
 
     changes = [frame for frame in frames if frame.get("event") == "change"]
     checkpoints = [frame for frame in frames if frame.get("event") == "checkpoint"]
@@ -138,7 +153,8 @@ def assert_all_events(path: str, receipt: str, vault: str, *, native: bool) -> N
 
 
 def assert_resumed_events(path: str, receipt: str, vault: str, after: str, *, native: bool) -> None:
-    frames = read_frames(path)
+    # The stream first says where it starts: at the cursor it resumed from.
+    frames = without_start_checkpoint(read_frames(path), after)
     assert all(frame["id"] != after for frame in frames), "resume replayed its starting cursor"
     changes = [frame for frame in frames if frame["event"] == "change"]
     assert len(changes) == 1, "expected exactly one post-cursor document change"
@@ -196,8 +212,9 @@ def assert_live_change(path: str, *, native: bool) -> None:
     started = time.monotonic()
     with urllib.request.urlopen(request, context=context, timeout=22) as response:
         assert response.headers.get("Content-Type", "").startswith("text/event-stream")
-        assert read_frame(response) == [": heartbeat"], "cursor-free tail replayed an old event"
-        assert time.monotonic() - started <= 20, "initial live heartbeat missed its deadline"
+        # Every stream first says where it starts; a change here would be an old event replayed.
+        assert is_start_checkpoint(read_frame(response)), "cursor-free tail replayed an old event"
+        assert time.monotonic() - started <= 20, "initial live frame missed its deadline"
         write_request = urllib.request.Request(
             f"{base}/api/v1/documents", method="POST",
             headers={**headers, "Content-Type": "application/json"},
@@ -263,6 +280,7 @@ def assert_heartbeat_timing() -> None:
     # No writer is running while the first heartbeat establishes the quiet baseline.
     baseline_stream, baseline_started = open_tail(quiet_vault)
     try:
+        assert is_start_checkpoint(read_frame(baseline_stream)), "baseline did not start with its checkpoint"
         baseline_frame = read_frame(baseline_stream)
         baseline_received = time.monotonic()
     finally:
@@ -342,6 +360,8 @@ def assert_heartbeat_timing() -> None:
     try:
         try:
             busy_stream, stream_started = open_tail(quiet_vault)
+            if not is_start_checkpoint(read_frame(busy_stream)):
+                raise AssertionError(f"quiet Vault stream did not start with its checkpoint; {timeline()}")
             # Keep the Vault busy until three heartbeat windows were each provably
             # busy; a slow runner only lengthens the observation instead of failing.
             while busy_windows < 3 and len(heartbeats) < 8 and not writer_errors:

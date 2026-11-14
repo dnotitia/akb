@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import types
 
+import pytest
+
 
 def _import_lifecycle(monkeypatch, tmp_path):
     from app.config import settings
@@ -181,6 +183,70 @@ def test_api_role_starts_no_durable_queue_consumer(monkeypatch, tmp_path):
     assert "search_degradation_flusher" in started
     assert "embed_worker" not in started
     assert "delete_worker" not in started
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "AKB_EVENT_TAIL_MAX_STREAMS",
+        "AKB_EVENT_TAIL_MAX_STREAMS_PER_USER",
+        "AKB_EVENT_TAIL_DB_CONCURRENCY",
+    ],
+)
+def test_api_runtime_refuses_a_malformed_event_tail_limit(monkeypatch, tmp_path, variable):
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started: list[str] = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    monkeypatch.setattr(lifecycle, "settings", _settings(external_git_enabled=False))
+    monkeypatch.setenv(variable, "many")
+
+    # The boot stops here rather than every stream request failing later.
+    with pytest.raises(RuntimeError, match=f"{variable} must be an integer"):
+        lifecycle.start_api_runtime()
+    assert "tool_usage_maintenance" not in started
+
+
+@pytest.mark.parametrize(
+    ("pool_max", "warned"),
+    [
+        # 18 - 6 for event tail work - 8 for writes leaves exactly the 4 asked for.
+        ("18", False),
+        ("17", True),
+        # A pool smaller than the tail budget alone.
+        ("4", True),
+        # Unset: app.yaml's default of 30 leaves 16.
+        ("", False),
+    ],
+)
+def test_api_runtime_warns_when_writes_and_event_tails_leave_the_pool_too_few_connections(
+    monkeypatch, tmp_path, caplog, pool_max, warned
+):
+    import logging
+
+    lifecycle = _import_lifecycle(monkeypatch, tmp_path)
+    started: list[str] = []
+    _stub_workers(monkeypatch, lifecycle, started)
+    monkeypatch.setattr(lifecycle, "settings", _settings(external_git_enabled=False))
+    for variable in ("AKB_PG_POOL_MIN_SIZE", "AKB_EVENT_TAIL_DB_CONCURRENCY"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("AKB_PG_POOL_MAX_SIZE", pool_max)
+    if pool_max == "4":
+        # Below app.yaml's minimum of 2 the pool sizing itself would refuse.
+        monkeypatch.setenv("AKB_PG_POOL_MIN_SIZE", "1")
+    caplog.set_level(logging.WARNING, logger="akb.lifecycle")
+
+    lifecycle.start_api_runtime()
+
+    warnings = [record.getMessage() for record in caplog.records if "left for other requests" in record.getMessage()]
+    assert lifecycle.MIN_POOL_HEADROOM == 4
+    if warned:
+        (message,) = warnings
+        assert f"holds {pool_max} connections" in message
+        assert "AKB_PG_POOL_MAX_SIZE" in message
+    else:
+        assert warnings == []
+    # A warning, not a refusal: the API still starts.
+    assert "tool_usage_maintenance" in started
 
 
 def test_start_workers_starts_metadata_worker_when_enabled_and_llm(monkeypatch, tmp_path):

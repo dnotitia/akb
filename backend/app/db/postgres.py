@@ -16,12 +16,12 @@ _MIGRATION_LOCK_KEY = 0x414B425F4D494752  # ``AKB_MIGR``
 def _pool_sizes() -> tuple[int, int]:
     """Resolve main-pool sizing: env > app.yaml > defaults.
 
-    AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE are the one deliberate
-    env-var exception to the YAML-only config rule (see app.config): the
-    akb-platform operator and k8s operators tune pool size per deployment
-    without re-rendering config files. Invalid values fail startup loudly
-    rather than silently falling back — same philosophy as Settings'
-    extra="forbid".
+    AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE are deliberate env-var
+    exceptions to the YAML-only config rule; app.config's module docstring
+    lists every such exception. The akb-platform operator and k8s operators
+    tune pool size per deployment without re-rendering config files. Invalid
+    values fail startup loudly rather than silently falling back — same
+    philosophy as Settings' extra="forbid".
     """
 
     def resolve(env_key: str, fallback: int) -> int:
@@ -421,6 +421,9 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "127_sso_operation_requests.py",  # human-approved, hash-bound service-key operation requests
         "128_approval_service_bootstrap.py",  # non-secret requester credential lineage
         "129_sso_request_recovery.py",  # permanent requester nonce and stable history paging
+        "131_events_notify_vault.py",  # events NOTIFY names the Vault, so an event wakes only that Vault's tails
+        "133_event_retention_watermark.py",  # per-Vault highest deleted event id; the tail's 410 boundary
+        "134_event_retention_backfill.py",  # starting marks, read outside 133's lock on events
     ):
         if filename in applied:
             continue

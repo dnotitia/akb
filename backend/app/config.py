@@ -9,11 +9,23 @@ Lookup order (first hit wins):
 The split exists so that `app.yaml` is safe to commit/share (no
 secrets) and `secret.yaml` stays out of source control. Both files
 are flat YAML mappings using the same keys as the Settings model
-below — no environment variables are read, with one deliberate
-exception: the AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE pool-sizing
-overrides read in app/db/postgres.py, a deployment-layer knob so
-k8s operators and the akb-platform control plane can tune the pool
-per deployment without re-rendering config files.
+below. No environment variable sets a key, with a few deliberate
+exceptions: deployment-layer knobs that k8s operators and the
+akb-platform control plane set per deployment without re-rendering
+config files. Each overrides its key and is read, and validated,
+where it is used:
+
+  - AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE: `pg_pool_min_size` /
+    `pg_pool_max_size` (app/db/postgres.py)
+  - AKB_STATS_PORT: `stats.port` (app/stats/listener.py)
+  - AKB_TOKENIZER_PROCESSES: `tokenizer_processes`
+    (app/services/lifecycle.py)
+  - AKB_EVENT_TAIL_MAX_STREAMS: `event_tail_max_streams`
+    (app/services/event_tail_service.py)
+  - AKB_EVENT_TAIL_MAX_STREAMS_PER_USER: `event_tail_max_streams_per_user`
+    (app/services/event_tail_service.py)
+  - AKB_EVENT_TAIL_DB_CONCURRENCY: `event_tail_db_concurrency`
+    (app/services/event_tail_service.py)
 """
 
 import ipaddress
@@ -522,7 +534,8 @@ class Settings(BaseModel):
     # max_connections is 100 and the pgvector driver holds its own pool of
     # up to 8 — while giving concurrent write bursts more headroom. The
     # AKB_PG_POOL_MIN_SIZE / AKB_PG_POOL_MAX_SIZE env vars take precedence
-    # over these keys (the one deliberate env exception; module docstring).
+    # over these keys (deliberate env exceptions, all listed in the module
+    # docstring).
     pg_pool_min_size: int = 2
     pg_pool_max_size: int = 30
 
@@ -1379,6 +1392,29 @@ class Settings(BaseModel):
     redis_password: str = ""
     redis_event_stream: str = "akb:events"
     redis_stream_maxlen: int = 100_000  # XADD MAXLEN ~ ceiling
+
+    # Vault Change Event Tail (`GET /api/v1/events/{vault}`). A waiting stream
+    # holds no database connection. To read its next batch, and to check its
+    # reader's access on that same connection, it borrows one from the pool
+    # within the tail's own budget below. Each of these keys has an
+    # environment override, listed in the module docstring.
+    #
+    # The most SSE streams one serving process keeps open at once. Past it a
+    # new stream gets 503 `event_tail_capacity` with Retry-After.
+    event_tail_max_streams: int = Field(default=256, ge=1)
+    # The most of those streams one account may hold open in one process, so
+    # that one client cannot take most of the cap. Past it the account's next
+    # stream gets 429 `event_tail_user_quota` with Retry-After. The status is
+    # a 4xx on purpose: the SDK's change channel retries a 5xx but stops on a
+    # 4xx, so a client over its quota stops opening streams.
+    event_tail_max_streams_per_user: int = Field(default=48, ge=1)
+    # The most pooled connections event tail work holds at once in one
+    # process, however many streams are open and however many events arrive:
+    # the open preflight, batch reads and access checks wait for a slot as
+    # coroutines, holding nothing. Keep it well under pg_pool_max_size (30)
+    # less write_lane_concurrency (8), so other requests and the readiness
+    # probe always find a connection.
+    event_tail_db_concurrency: int = Field(default=6, ge=1)
 
     # Audit log — its own nested section so the surface can grow without
     # littering the flat top level. See AuditSettings above.

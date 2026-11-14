@@ -717,6 +717,42 @@ async def test_health_omits_the_queue_head_age_when_nothing_is_pending(health_ap
     assert "oldest_pending_enqueued_at" not in result
 
 
+async def test_health_reports_event_tail_counts_without_naming_an_account(health_app, monkeypatch):
+    """Operators read the tail's load and limits from /health; nothing names who holds a stream."""
+    from app.services import delete_worker, embed_worker, event_tail_hub, event_tail_service
+
+    monkeypatch.setattr(embed_worker, "get_pool", _queue_pool(None))
+    monkeypatch.setattr(delete_worker, "delete_outbox_stats", _async_return({}))
+    for variable in (
+        "AKB_EVENT_TAIL_MAX_STREAMS",
+        "AKB_EVENT_TAIL_MAX_STREAMS_PER_USER",
+        "AKB_EVENT_TAIL_DB_CONCURRENCY",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    slots = event_tail_service._StreamSlots()
+    monkeypatch.setattr(event_tail_service, "_stream_slots", slots)
+    monkeypatch.setattr(event_tail_service, "_db_budget", None)
+    monkeypatch.setattr(event_tail_hub, "_hub", None)
+    account = str(uuid.uuid4())
+    held = [slots.acquire(account, limit=10, per_user_limit=10) for _ in range(2)]
+
+    result = await health_app.health(user=None)
+
+    assert result["event_tail"] == {
+        "open_streams": 2,
+        "accounts_with_streams": 1,
+        "max_streams": 256,
+        "max_streams_per_user": 48,
+        "budget_size": 6,
+        "budget_in_use": 0,
+        "budget_waiters": 0,
+        "hub_connected": False,
+    }
+    assert account not in json.dumps(result)
+    for slot in held:
+        slot.release()
+
+
 async def test_health_surfaces_native_file_projection_exhaustion_as_degraded(health_app, monkeypatch):
     """A terminal S3-to-Native intent must not look like a healthy projection."""
     from app.services import native_file_projection

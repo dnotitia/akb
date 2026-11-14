@@ -12,10 +12,11 @@ import logging
 import os
 from urllib.parse import urlsplit
 
-from app.db.postgres import close_pool, get_pool, init_db
+from app.db.postgres import _pool_sizes, close_pool, get_pool, init_db
 from app.config import settings
 from app.process_role import runtime_process_role
 from app.services._backfill import request_stop_all, runner_snapshots
+from app.services.event_tail_hub import close_event_tail_hub
 from app.services import (
     asset_gc_worker,
     account_deletion_worker,
@@ -24,6 +25,7 @@ from app.services import (
     app_rollout_worker,
     delete_worker,
     embed_worker,
+    event_tail_service,
     events_publisher,
     external_git_poller,
     http_pool,
@@ -55,6 +57,12 @@ from app.services.vector_store import decide_sparse_shape_for_settings, get_vect
 from app.stats import listener as stats_listener, sampler as stats_sampler
 
 logger = logging.getLogger("akb.lifecycle")
+
+# Pool connections that should stay free when git-committing writes and event
+# tail work both hold all they may: one for the readiness probe, and three so
+# that concurrent ordinary requests (reads, credential lookups) do not queue
+# behind each other for a single connection.
+MIN_POOL_HEADROOM = 4
 
 
 def _is_secure_browser_url(value: str) -> bool:
@@ -305,8 +313,45 @@ def stop_runtime_pools() -> None:
     write_lane.stop_commit_pool()
 
 
+def _warn_on_small_pool_headroom(tail_connections: int) -> None:
+    """Warn when writes and event tail work at their limits leave the pool too few connections.
+
+    The pool size comes from AKB_PG_POOL_MAX_SIZE when it is set, as it does
+    for the pool itself. A warning, not a refusal: a small pool still works,
+    but requests and the readiness probe can wait for a connection while
+    writes and streams are busy.
+    """
+    _, pool_max = _pool_sizes()
+    write_connections = write_lane.snapshot()["capacity"]
+    headroom = pool_max - tail_connections - write_connections
+    if headroom < MIN_POOL_HEADROOM:
+        logger.warning(
+            "the PostgreSQL pool holds %d connections; with %d for event tail work "
+            "(event_tail_db_concurrency) and %d for writes (write_lane_concurrency), "
+            "%d are left for other requests and the readiness probe, fewer than %d. "
+            "Raise pg_pool_max_size (AKB_PG_POOL_MAX_SIZE) or lower those limits.",
+            pool_max,
+            tail_connections,
+            write_connections,
+            headroom,
+            MIN_POOL_HEADROOM,
+        )
+
+
 def _start_api_local(started: list[str]) -> None:
     """Start sinks whose queues live in the serving process's memory."""
+    # Event tail streams are served here. Resolve their limits now so a
+    # malformed AKB_EVENT_TAIL_* override stops the boot instead of failing
+    # every stream request.
+    tail_connections = event_tail_service.configured_db_concurrency()
+    logger.info(
+        "event tail streams capped at %d per process and %d per account; "
+        "their database work holds at most %d pool connections",
+        event_tail_service.configured_max_streams(),
+        event_tail_service.configured_max_streams_per_user(),
+        tail_connections,
+    )
+    _warn_on_small_pool_headroom(tail_connections)
     if settings.audit.enabled:
         audit_log.init()
         if settings.audit.bucket:
@@ -600,4 +645,7 @@ async def shutdown_storage() -> None:
         from app.services.keycloak_oidc import get_keycloak_oidc
 
         await get_keycloak_oidc().aclose()
+    # The event tail listener holds its own connection outside the pool; close
+    # it first. A no-op in a process that never opened an event stream.
+    await close_event_tail_hub()
     await close_pool()

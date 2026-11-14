@@ -10,11 +10,17 @@ from starlette.responses import StreamingResponse
 from app.api.deps import get_current_user
 from app.exceptions import AKBError
 from app.services import event_tail_service
-from app.services.access_service import check_vault_access
 from app.services.auth_service import AuthenticatedUser
 
 
 router = APIRouter()
+
+# Every refusal of a new tail for capacity, quota or a slow access check
+# carries this header (the AKBError handler sets it from the error).
+_RETRY_AFTER_HEADER = {
+    "description": "Seconds to wait before retrying.",
+    "schema": {"type": "integer", "minimum": 0},
+}
 
 
 @router.get(
@@ -37,7 +43,25 @@ router = APIRouter()
                     },
                 }
             },
-        }
+        },
+        429: {
+            "description": (
+                "Too Many Requests: this account already holds its quota of open event streams on this "
+                "server (`event_tail_user_quota`). Close streams it no longer reads."
+            ),
+            "headers": {"Retry-After": _RETRY_AFTER_HEADER},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AkbError"}}},
+        },
+        503: {
+            "description": (
+                "Service Unavailable: this server already holds its maximum of open event streams "
+                "(`event_tail_capacity`), or the caller's access could not be confirmed in time to start "
+                "the stream (`event_tail_unavailable`). Retry after the Retry-After delay and resume from "
+                "the last cursor received."
+            ),
+            "headers": {"Retry-After": _RETRY_AFTER_HEADER},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AkbError"}}},
+        },
     },
 )
 async def events_tail(
@@ -60,14 +84,14 @@ async def events_tail(
     user: AuthenticatedUser = Depends(get_current_user),
 ) -> StreamingResponse:
     """Open a reader-gated stream whose source of truth is PostgreSQL."""
-    access = await check_vault_access(user.user_id, vault, required_role="reader")
+    # open_tail checks reader access before any event query, on a connection
+    # within the event tail's database budget, so reconnects cannot take more
+    # of the pool than that budget.
     try:
         return await event_tail_service.open_tail(
-            # The access check intentionally precedes all event queries.
             request=request,
             user_id=user.user_id,
             vault=vault,
-            vault_id=access["vault_id"],
             last_event_id=last_event_id,
             cursor=cursor,
             start=start,

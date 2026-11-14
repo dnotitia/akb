@@ -326,7 +326,13 @@ async def _process_once() -> int:
 
 async def _sweep_once() -> int:
     """Purge published rows older than SWEEP_GRACE_INTERVAL.
-    Rate-limited to once per SWEEP_INTERVAL_SECONDS."""
+    Rate-limited to once per SWEEP_INTERVAL_SECONDS.
+
+    The events table's delete trigger raises each affected Vault's retention
+    watermark in this statement, as it does for any delete (migration 133). An
+    event tail cursor below the watermark missed a deleted event and is
+    refused with 410.
+    """
     global _last_sweep_at
     now = time.monotonic()
     if now - _last_sweep_at < SWEEP_INTERVAL_SECONDS:

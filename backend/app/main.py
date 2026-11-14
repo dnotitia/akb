@@ -56,6 +56,7 @@ from app.services import (
     asset_gc_worker,
     audit_log,
     embed_worker,
+    event_tail_service,
     events_publisher,
     external_git_poller,
     external_git_service,
@@ -655,6 +656,14 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         # here rather than at startup, and for what it cannot see.
         "mcp_oauth": await _safe(mcp_oauth_preconditions.health_section),
     }
+    # Not a queue either: this process's open event tail streams, the
+    # database budget they share, and whether their LISTEN connection is up.
+    # Counts and limits only, no account or Vault, so it stays on the
+    # unauthenticated half.
+    try:
+        result["event_tail"] = event_tail_service.stats_snapshot()
+    except Exception as e:  # noqa: BLE001
+        result["event_tail"] = {"error": str(e)}
 
     # Top-level aggregate (#538): `degraded` when any queue section holds
     # terminal work, else `reconciling` while work is pending, else `ok`.
