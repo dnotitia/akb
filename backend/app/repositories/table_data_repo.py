@@ -1133,6 +1133,40 @@ def contains_unicode_escaped_identifier(sql: str) -> bool:
     return False
 
 
+_ADVISORY_LOCK_PREFIXES = ("pg_advisory_", "pg_try_advisory_")
+
+
+def contains_advisory_lock_call(sql: str) -> bool:
+    """Return True when SQL calls a PostgreSQL advisory lock function.
+
+    The backend serializes its own work on advisory locks (document paths,
+    role changes, table migrations); a raw statement holding one of those
+    keys would stall that work until its transaction ends. ``akb_sql``
+    therefore rejects calls to ``pg_advisory_*`` and ``pg_try_advisory_*``,
+    with the same token-aware scan as ``contains_set_config_call``.
+    """
+    pos = 0
+    n = len(sql)
+    while pos < n:
+        end = _scan_dollar_quote(sql, pos)
+        if end is not None:
+            pos = end
+            continue
+        m = _SQL_TOKEN_RE.match(sql, pos)
+        if not m:
+            pos += 1
+            continue
+        name = _token_identifier_name(m.lastgroup, m.group())
+        if (
+            name is not None
+            and name.startswith(_ADVISORY_LOCK_PREFIXES)
+            and _next_significant_token_is_open_paren(sql, m.end())
+        ):
+            return True
+        pos = m.end()
+    return False
+
+
 def contains_pg_settings_identifier(sql: str) -> bool:
     """Return True when SQL references PostgreSQL's ``pg_settings`` view."""
     pos = 0

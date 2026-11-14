@@ -1,4 +1,7 @@
 """Service-level wiring tests: guards fire before any repo access."""
+import contextlib
+from types import SimpleNamespace
+
 import pytest
 
 from app.exceptions import ForbiddenError
@@ -121,7 +124,8 @@ def _edit_harness(monkeypatch, path: str):
         # The invalidation must land AFTER this context exits (that is where
         # the transaction commits), never inside it.
         assert not seen, "invalidated before the commit"
-        yield None
+        # Statements are faked; only the savepoints run on the connection.
+        yield SimpleNamespace(transaction=contextlib.nullcontext)
 
     async def _edit_locked(**kwargs):
         return "RESPONSE"

@@ -22,7 +22,7 @@ from app.exceptions import (
 )
 from app.models.vault_scope import VaultScope, current_token_uuid, current_vault_scope
 from app.repositories import vault_write_policy_repo as write_policy_repo
-from app.repositories.events_repo import emit_event
+from app.repositories.events_repo import EventBuffer, deferred_events, emit_event
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services.access_contributions import (
     DIRECT_SOURCE_KEY,
@@ -302,9 +302,15 @@ async def _access_connection(existing_conn=None):
 async def check_vault_access(
     user_id: str, vault_name: str, required_role: str = "reader",
     *, allow_archived: bool = False, write_action: str | None = None,
-    _conn=None,
+    _conn=None, _events: EventBuffer | None = None,
 ) -> dict:
     """Authorize `user_id` on `vault_name`, then RECORD that authorization.
+
+    A caller that runs a mutating check on its own transaction (`_conn`)
+    passes `_events` and inserts it after its last locking statement: an
+    admin override is recorded as an event, and an event insert holds the
+    Vault's event lock until commit (migration 132). A check that records
+    nothing, such as a reader check, needs no buffer.
 
     Thin wrapper over `_check_vault_access_impl` purely so the contextvar is
     set at ONE place: the implementation has six distinct success returns
@@ -316,7 +322,7 @@ async def check_vault_access(
 
     See `_authorized_vault` for who consumes this and why.
     """
-    connection_args = {"_conn": _conn} if _conn is not None else {}
+    connection_args = {"_conn": _conn, "_events": _events} if _conn is not None else {}
     result = await _check_vault_access_impl(
         user_id, vault_name, required_role,
         allow_archived=allow_archived, write_action=write_action, **connection_args,
@@ -329,7 +335,7 @@ async def check_vault_access(
 async def _check_vault_access_impl(
     user_id: str, vault_name: str, required_role: str = "reader",
     *, allow_archived: bool = False, write_action: str | None = None,
-    _conn=None,
+    _conn=None, _events: EventBuffer | None = None,
 ) -> dict:
     """Check if user has at least the required role on a vault.
 
@@ -432,8 +438,15 @@ async def _check_vault_access_impl(
                     }
                 if await _is_unscoped_system_admin(uid, conn):
                     # A3: bypass, but LOUDLY — never a silent escape hatch.
-                    await emit_event(
-                        conn, "vault.write_policy_admin_bypass",
+                    # On a caller's transaction the event waits for its end,
+                    # so that caller must have handed over its buffer.
+                    if _conn is not None and _events is None:
+                        raise ValueError(
+                            "an admin override on a caller's transaction needs its event buffer"
+                        )
+                    override = EventBuffer() if _events is None else _events
+                    override.add(
+                        "vault.write_policy_admin_bypass",
                         vault_id=vault["id"],
                         actor_id=str(uid),
                         payload={
@@ -442,6 +455,8 @@ async def _check_vault_access_impl(
                             "vault": vault_name,
                         },
                     )
+                    if _events is None:
+                        await override.flush(conn)
                     return {
                         "vault_id": vault["id"],
                         "role": "owner",
@@ -637,10 +652,12 @@ async def grant_access(
                 conn, vault["id"], target["id"], role,
                 source_key=source_key, granted_by=granter_uid, revision=revision,
             )
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
             # "the writer basis was recorded" and "this user is now a writer"
             # are different facts once bases can coexist, and only both
             # effective roles separate them. A subscriber that reads `role`
-            # alone would act on a change that did not happen.
+            # alone would act on a change that did not happen. The event is
+            # the last locking statement (Vault event lock, migration 132).
             await emit_event(
                 conn, "access.grant",
                 vault_id=vault["id"],
@@ -660,7 +677,6 @@ async def grant_access(
                     "applied": outcome.applied,
                 },
             )
-            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
 
     logger.info("Granted %s role to %s on vault %s", role, resolved_username, vault_name)
     return {
@@ -751,8 +767,10 @@ async def revoke_access(
                     conn, vault["id"], target["id"],
                     source_key=source_key, revision=revision,
                 )
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
             # `source_key: null` means every basis went — an administrator
             # removing the person, not a rule withdrawing its own reason.
+            # The event is the last locking statement (Vault event lock).
             await emit_event(
                 conn, "access.revoke",
                 vault_id=vault["id"],
@@ -771,7 +789,6 @@ async def revoke_access(
                     "applied": outcome.applied,
                 },
             )
-            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], target["id"])
 
     logger.info("Revoked access for %s on vault %s", resolved_username, vault_name)
     return {
@@ -1307,6 +1324,9 @@ async def transfer_ownership(
                 source_key=DIRECT_SOURCE_KEY, granted_by=new_owner["id"],
             )
             await remove_all_contributions(conn, vault["id"], new_owner["id"])
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], new_owner["id"])
+            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], vault["owner_id"])
+            # Last locking statement (Vault event lock, migration 132).
             await emit_event(
                 conn, "access.transfer_ownership",
                 vault_id=vault["id"],
@@ -1319,8 +1339,6 @@ async def transfer_ownership(
                     "to_user_id": str(new_owner["id"]),
                 },
             )
-            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], new_owner["id"])
-            await get_role_sync().sync_vault_user_in_conn(conn, vault["id"], vault["owner_id"])
 
     logger.info("Transferred ownership of %s to %s", vault_name, resolved_username)
     return {
@@ -1512,9 +1530,11 @@ async def update_vault_metadata(
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with role_authority_transaction(conn):
+        async with role_authority_transaction(conn), deferred_events(conn) as events:
             # Ownership may change while waiting for the shared authority guard.
-            await check_vault_access(user_id, vault_name, required_role="owner", _conn=conn)
+            await check_vault_access(
+                user_id, vault_name, required_role="owner", _conn=conn, _events=events,
+            )
             await conn.execute(sql, *args)
             if public_access is not None:
                 vault_id = await conn.fetchval("SELECT id FROM vaults WHERE name=$1", vault_name)
@@ -1542,9 +1562,12 @@ async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with role_authority_transaction(conn):
+        # Events go in after the Vault row update and role DDL.
+        async with role_authority_transaction(conn), deferred_events(conn) as events:
             # Ownership may change while waiting for the shared authority guard.
-            await check_vault_access(user_id, vault_name, required_role="owner", _conn=conn)
+            await check_vault_access(
+                user_id, vault_name, required_role="owner", _conn=conn, _events=events,
+            )
             vault = await conn.fetchrow(
                 "SELECT id, status FROM vaults WHERE name = $1", vault_name,
             )
@@ -1557,8 +1580,8 @@ async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
                 level, vault["id"],
             )
             await get_role_sync().on_public_access_change_in_conn(conn, vault["id"], level)
-            await emit_event(
-                conn, "vault.public_access",
+            events.add(
+                "vault.public_access",
                 vault_id=vault["id"],
                 resource_uri=vault_uri(vault_name),
                 actor_id=user_id,

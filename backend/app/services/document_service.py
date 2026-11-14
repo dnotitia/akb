@@ -137,10 +137,12 @@ from app.models.document import (
 )
 from app.repositories.document_repo import (
     CollectionRepository,
+    CollectionVanishedError,
     DocumentRepository,
     acquire_path_lock,
+    lock_collection_rows,
 )
-from app.repositories.events_repo import emit_event
+from app.repositories.events_repo import emit_event, lock_vault_events
 from app.repositories.vault_files_repo import DocumentAssetOwner
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
@@ -157,6 +159,7 @@ from app.services.index_service import (
 )
 from app.services.kg_service import (
     delete_document_relations,
+    lock_resource_edges,
     relink_resource_edges,
     store_document_relations,
     validate_new_structured_relation_refs,
@@ -411,6 +414,11 @@ def validate_vault_name(name: str) -> None:
         )
 
 
+class _StaleRead(Exception):
+    """What a lock attempt read without a lock changed before it was locked:
+    the document's path or collection, or a move's destination collection."""
+
+
 class DocumentService:
     def __init__(self, git: GitService | None = None):
         # The Git arm's storage handle, NOT part of the service interface.
@@ -573,6 +581,74 @@ class DocumentService:
                         await acquire_path_lock(lock_conn, vault_id, p)
                     yield lock_conn
 
+    async def _lock_document(
+        self, doc_repo, conn, vault_id: uuid.UUID, doc_ref: str, *, share_collection: bool,
+    ) -> dict:
+        """Lock the document's collection row, then the document row.
+
+        A recursive collection delete locks the collection first and the
+        documents in it afterwards, so a write that held the document while it
+        asked for the collection would deadlock with it. The collection is read
+        without a lock, locked (``FOR KEY SHARE`` with ``share_collection``,
+        otherwise ``FOR NO KEY UPDATE``), and checked again once the document
+        row is locked. Each attempt runs in a savepoint: if the document
+        changed collection meanwhile, rolling it back releases both locks, and
+        the next attempt starts from a fresh read, so a retry never asks for a
+        collection while it holds the document.
+        """
+        for _ in range(3):
+            try:
+                async with conn.transaction():
+                    current = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
+                    if not current:
+                        raise NotFoundError("Document", doc_ref)
+                    await lock_collection_rows(
+                        conn, [current.get("collection_id")],
+                        strength="key share" if share_collection else "no key update",
+                    )
+                    row = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref, for_update=True)
+                    if not row:
+                        raise NotFoundError("Document", doc_ref)
+                    if (row.get("id"), row.get("collection_id")) != (
+                        current.get("id"), current.get("collection_id")
+                    ):
+                        raise _StaleRead
+                    return row
+            except _StaleRead:
+                continue
+        raise ConflictError(f"Document {doc_ref} changed collection during this write; retry it")
+
+    async def _collection_for_write(
+        self, coll_repo, vault_id: uuid.UUID, path: str, conn, *,
+        also_lock: uuid.UUID | None = None,
+    ) -> uuid.UUID:
+        """Get or create the collection at ``path`` and lock its row, together
+        with ``also_lock``, for a write that will change its counts.
+
+        The lock comes before the Vault's event lock and the Git commit. A
+        collection delete that commits between finding the row and locking it,
+        or between get_or_create's insert and its read, leaves nothing to lock.
+        A put holds no other collection lock here, so it creates the
+        collection again and retries in place. A move (``also_lock`` given)
+        may then already hold its source collection, and asking for the
+        recreated destination, whose id may sort below the source's, would
+        break the id order of collection locks; it raises ``_StaleRead``
+        instead, so the move's savepoint releases every collection lock before
+        it reads again.
+        """
+        for _ in range(1 if also_lock is not None else 3):
+            try:
+                collection_id = await coll_repo.get_or_create(vault_id, path, conn=conn)
+            except CollectionVanishedError:
+                continue
+            if conn is None:
+                return collection_id
+            if collection_id in await lock_collection_rows(conn, [collection_id, also_lock]):
+                return collection_id
+        if also_lock is not None:
+            raise _StaleRead
+        raise ConflictError(f"Collection {path!r} was deleted during this write; retry it")
+
     async def _resolve_free_path(
         self, doc_repo, vault_id: uuid.UUID, base_path: str,
         doc_id: uuid.UUID, conn, *, self_id: uuid.UUID | None = None,
@@ -703,6 +779,21 @@ class DocumentService:
             )
         else:
             file_path = base_path
+        # Use the *normalized* path so the `collections` row's `path`
+        # matches the document's stored `path`. Passing the raw
+        # `req.collection` here would create rows with leading/trailing
+        # slashes or whitespace, diverging from the doc path under it.
+        # Empty (== vault root) maps to NULL FK, matching the convention
+        # used by file_service / table_service / external_git_service —
+        # never insert a `path=""` phantom collection row.
+        # Locked first, in the order a recursive collection delete takes the
+        # collection and then the rows under it (aliases, attachments).
+        collection_id = (
+            await self._collection_for_write(coll_repo, vault_id, normalized_collection, conn)
+            if normalized_collection
+            else None
+        )
+
         # Refuse a claimed path BEFORE the git write, not after. `doc_repo.create`
         # runs this same check as the structural backstop — it is the chokepoint
         # every creation goes through — but raising there would leave a commit in
@@ -742,7 +833,12 @@ class DocumentService:
             strict=not allow_unavailable_asset_refs,
         )
 
-        # Git commit
+        # A Git commit does not roll back with this transaction: with the rows
+        # this write changes later locked, take the Vault's event lock, so a
+        # busy Vault fails it before Git changes and it holds the event lock
+        # only while it waits for nothing else.
+        if conn is not None:
+            await lock_vault_events(conn, vault_id)
         commit_msg = f"[put] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: create\nsummary: {req.title}"
         commit_hash = await run_git_write(
             self.git.commit_file,
@@ -753,18 +849,6 @@ class DocumentService:
         logger.info("Document created: %s (commit: %s)", file_path, commit_hash[:8])
 
         # DB
-        # Use the *normalized* path so the `collections` row's `path`
-        # matches the document's stored `path`. Passing the raw
-        # `req.collection` here would create rows with leading/trailing
-        # slashes or whitespace, diverging from the doc path under it.
-        # Empty (== vault root) maps to NULL FK, matching the convention
-        # used by file_service / table_service / external_git_service —
-        # never insert a `path=""` phantom collection row.
-        collection_id = (
-            await coll_repo.get_or_create(vault_id, normalized_collection, conn=conn)
-            if normalized_collection
-            else None
-        )
         # No `id` key — canonical handle is the akb:// URI built from
         # (vault, path), not a short hash. The `metadata` JSONB column is
         # reserved for internal writers (external-git import, LLM auto-tagging)
@@ -808,6 +892,10 @@ class DocumentService:
             req.depends_on, req.related_to, [],
             req.content,
         )
+        await coll_repo.increment_count(collection_id, now, conn=conn)
+
+        # The Vault's event lock is already held, taken before the Git
+        # commit, so this insert does not wait for it.
         await emit_event(
             conn, "document.put",
             vault_id=vault_id,
@@ -824,8 +912,6 @@ class DocumentService:
                 "collection": normalized_collection,
             },
         )
-
-        await coll_repo.increment_count(collection_id, now, conn=conn)
 
         return DocumentPutResponse(
             uri=doc_uri(req.vault, file_path),
@@ -1061,11 +1147,8 @@ class DocumentService:
             # Re-read under the lock so we observe any commit that landed
             # between the initial resolution and lock acquisition. Uses the
             # lock connection so the whole update holds one pool connection.
-            row = await doc_repo.find_by_ref_with_conn(
-                conn, vault_id, doc_ref, for_update=True,
-            )
-            if not row:
-                raise NotFoundError("Document", doc_ref)
+            # The collection is locked before the document (see _lock_document).
+            row = await self._lock_document(doc_repo, conn, vault_id, doc_ref, share_collection=True)
 
             # Optimistic concurrency: if caller pinned expected_commit, refuse
             # the write when the row has moved on. Caller should re-read and
@@ -1179,6 +1262,25 @@ class DocumentService:
             previous_markdown=current_body,
         )
 
+        # The document's implicit edges are rewritten before the Vault's event
+        # lock: the rewrite needs nothing from the Git commit, and any edge or
+        # insert it has to wait for is then waited for without holding that
+        # lock and before Git changes.
+        if req.content is not None or req.depends_on is not None or req.related_to is not None:
+            depends = current_fm.get("depends_on", []) or []
+            related = current_fm.get("related_to", []) or []
+            implements = current_fm.get("implements", []) or []
+            await store_document_relations(
+                conn, vault_id, vault, file_path,
+                depends, related, implements,
+                new_body,
+            )
+
+        # A Git commit does not roll back with this transaction: take the
+        # Vault's event lock first, so a busy Vault fails the write before Git
+        # changes. The collection and document rows are already locked.
+        if conn is not None:
+            await lock_vault_events(conn, vault_id)
         message = req.message or f"Update {file_path}"
         commit_msg = f"[update] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: update\nsummary: {message}"
         commit_hash = await run_git_write(
@@ -1225,16 +1327,6 @@ class DocumentService:
                 conn, "document", str(pg_doc_id),
                 vault_id=vault_id,
                 chunks=chunks,
-            )
-
-        if req.content is not None or req.depends_on is not None or req.related_to is not None:
-            depends = current_fm.get("depends_on", []) or []
-            related = current_fm.get("related_to", []) or []
-            implements = current_fm.get("implements", []) or []
-            await store_document_relations(
-                conn, vault_id, vault, file_path,
-                depends, related, implements,
-                new_body,
             )
 
         await emit_event(
@@ -1318,11 +1410,42 @@ class DocumentService:
 
         async with self._move_lock(vault_id, old_path, est_new_path, vault_name=vault) as conn:
             # Re-read under the lock and recompute the target from fresh state.
-            row = await doc_repo.find_by_ref_with_conn(
-                conn, vault_id, doc_ref, for_update=True,
-            )
-            if not row:
-                raise NotFoundError("Document", doc_ref)
+            # Both collections are locked before the document, in the order a
+            # recursive collection delete takes them (see _lock_document); the
+            # destination is created here if it is new. Each attempt runs in a
+            # savepoint: a document that moved meanwhile rolls it back,
+            # releasing the collection and document locks, and the next
+            # attempt starts from a fresh read.
+            for _ in range(3):
+                try:
+                    async with conn.transaction():
+                        current = await doc_repo.find_by_ref_with_conn(conn, vault_id, doc_ref)
+                        if not current:
+                            raise NotFoundError("Document", doc_ref)
+                        target_coll, _, _ = _target(current["path"], current["id"])
+                        new_collection_id = (
+                            await self._collection_for_write(
+                                coll_repo, vault_id, target_coll, conn,
+                                also_lock=current.get("collection_id"),
+                            )
+                            if target_coll else None
+                        )
+                        if new_collection_id is None:
+                            await lock_collection_rows(conn, [current.get("collection_id")])
+                        row = await doc_repo.find_by_ref_with_conn(
+                            conn, vault_id, doc_ref, for_update=True,
+                        )
+                        if not row:
+                            raise NotFoundError("Document", doc_ref)
+                        if (row.get("id"), row["path"], row.get("collection_id")) != (
+                            current.get("id"), current["path"], current.get("collection_id")
+                        ):
+                            raise _StaleRead
+                except _StaleRead:
+                    continue
+                break
+            else:
+                raise ConflictError(f"Document {doc_ref} moved during this write; retry it")
             old_path = row["path"]
             pg_doc_id = row["id"]
             old_collection_id = row["collection_id"]
@@ -1384,10 +1507,6 @@ class DocumentService:
                 conn, vault_name=vault, path=new_path,
             )
 
-            new_collection_id = (
-                await coll_repo.get_or_create(vault_id, new_coll, conn=conn)
-                if new_coll else None
-            )
             now = datetime.now(timezone.utc)
             live_asset_ids = await asset_service.list_live_document_asset_ids(
                 conn, owner=DocumentAssetOwner(vault_id=vault_id, document_id=pg_doc_id),
@@ -1397,6 +1516,13 @@ class DocumentService:
                 f"[move] {old_path} -> {new_path}\n\n"
                 f"agent: {agent_id or 'unknown'}\naction: move\nsummary: {summary}"
             )
+            # A Git commit does not roll back with this transaction. Lock the
+            # rows this move changes later (both collections above, the edges
+            # here), then the Vault's event lock, so a busy Vault fails it
+            # before Git changes and it holds the event lock only while it
+            # waits for nothing else.
+            await lock_resource_edges(conn, doc_uri(vault, old_path))
+            await lock_vault_events(conn, vault_id)
             try:
                 commit_hash = await run_git_write(
                     self.git.move_file,
@@ -1562,11 +1688,7 @@ class DocumentService:
         skill_policy.check_update(file_path, None, internal=skill_internal)
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
-            row = await doc_repo.find_by_ref_with_conn(
-                conn, vault_id, doc_ref, for_update=True,
-            )
-            if not row:
-                raise NotFoundError("Document", doc_ref)
+            row = await self._lock_document(doc_repo, conn, vault_id, doc_ref, share_collection=True)
             if base_commit is not None and row["current_commit"] != base_commit:
                 raise ConflictError(
                     f"current_commit moved: expected {base_commit}, "
@@ -1654,6 +1776,22 @@ class DocumentService:
             previous_markdown=current_body,
         )
 
+        # The document's implicit edges are rewritten before the Vault's event
+        # lock, as in `_update_locked`.
+        depends = current_fm.get("depends_on", []) or []
+        related = current_fm.get("related_to", []) or []
+        implements = current_fm.get("implements", []) or []
+        await store_document_relations(
+            conn, vault_id, vault, file_path,
+            depends, related, implements,
+            new_body,
+        )
+
+        # A Git commit does not roll back with this transaction: take the
+        # Vault's event lock first, so a busy Vault fails the write before Git
+        # changes. The collection and document rows are already locked.
+        if conn is not None:
+            await lock_vault_events(conn, vault_id)
         msg = message or f"Edit {file_path}"
         commit_msg = f"[edit] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: edit\nsummary: {msg}"
         commit_hash = await run_git_write(
@@ -1688,9 +1826,6 @@ class DocumentService:
             doc_type=row["doc_type"],
         )
         chunks = chunk_markdown(new_body, metadata_header=meta_header)
-        depends = current_fm.get("depends_on", []) or []
-        related = current_fm.get("related_to", []) or []
-        implements = current_fm.get("implements", []) or []
 
         # chunks + relations + event run on the lock connection's existing
         # transaction (opened in `_path_lock`) so a crash between them can't
@@ -1700,11 +1835,6 @@ class DocumentService:
             conn, "document", str(pg_doc_id),
             vault_id=vault_id,
             chunks=chunks,
-        )
-        await store_document_relations(
-            conn, vault_id, vault, file_path,
-            depends, related, implements,
-            new_body,
         )
         await emit_event(
             conn, "document.update",
@@ -1750,11 +1880,9 @@ class DocumentService:
 
         async with self._path_lock(vault_id, file_path, vault_name=vault) as conn:
             # Re-resolve under the lock — a concurrent delete may have run.
-            row = await doc_repo.find_by_ref_with_conn(
-                conn, vault_id, doc_ref, for_update=True,
-            )
-            if not row:
-                raise NotFoundError("Document", doc_ref)
+            # The collection is locked before the document (see _lock_document);
+            # this delete changes its count.
+            row = await self._lock_document(doc_repo, conn, vault_id, doc_ref, share_collection=False)
             return await self._delete_locked(
                 vault=vault, vault_id=vault_id, row=row, agent_id=agent_id,
                 doc_repo=doc_repo, coll_repo=coll_repo, conn=conn,
@@ -1765,6 +1893,14 @@ class DocumentService:
         file_path = row["path"]
         collection_id = row["collection_id"]
 
+        # A Git commit does not roll back with this transaction. Lock the
+        # edges this delete removes later (the collection and document rows
+        # are already locked), then the Vault's event lock, so a busy Vault
+        # fails it before Git changes and it holds the event lock only while
+        # it waits for nothing else.
+        if conn is not None:
+            await lock_resource_edges(conn, doc_uri(vault, file_path))
+            await lock_vault_events(conn, vault_id)
         commit_msg = f"[delete] {file_path}\n\nagent: {agent_id or 'unknown'}\naction: delete"
         # Idempotent: if the git file is already gone (crash-recovery
         # state, manual cleanup, etc.) the DB cleanup below still runs.
@@ -1792,17 +1928,6 @@ class DocumentService:
         # resolves to itself, not a tombstone).
         from app.repositories.document_repo import drop_aliases_for_resource
         await drop_aliases_for_resource(conn, vault_id, "document", pg_doc_id)
-        await emit_event(
-            conn, "document.delete",
-            vault_id=vault_id,
-            resource_uri=doc_uri(vault, file_path),
-            actor_id=agent_id,
-            payload={
-                "vault": vault,
-                "path": file_path,
-                "resource_id": str(pg_doc_id),
-            },
-        )
         # The row delete and the publication cascade are ONE call. That
         # cascade used to be an inline DELETE here (between migrations 022
         # and 058 publications had no `document_id`, so nothing cascaded),
@@ -1821,6 +1946,20 @@ class DocumentService:
 
         if collection_id:
             await coll_repo.decrement_count(collection_id, datetime.now(timezone.utc), conn=conn)
+
+        # The Vault's event lock is already held, taken before the Git
+        # commit, so this insert does not wait for it.
+        await emit_event(
+            conn, "document.delete",
+            vault_id=vault_id,
+            resource_uri=doc_uri(vault, file_path),
+            actor_id=agent_id,
+            payload={
+                "vault": vault,
+                "path": file_path,
+                "resource_id": str(pg_doc_id),
+            },
+        )
 
         logger.info("Document deleted: %s", file_path)
         return True

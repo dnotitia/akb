@@ -210,3 +210,54 @@ async def test_executor_transient_error_bypasses_sql_enrichment(main, monkeypatc
                                         sql="SELECT 1", is_admin=True)
     assert caught.value.code == "service_unavailable"
     assert len(metadata_acquires) == 1  # No second connection for SQL-error hints.
+
+
+def test_the_vault_event_lock_timeout_is_a_retryable_busy_write(main):
+    """The wait for a Vault's event lock ends with SQLSTATE 55P03 and the
+    constraint name `akb_event_lock_timeout` (migration 132). Writes take that
+    lock before any work they cannot undo, so even a write may be retried
+    after Retry-After."""
+    failure = asyncpg.PostgresError.new(
+        {"C": "55P03", "M": "private-host/query", "n": "akb_event_lock_timeout"},
+    )
+    assert isinstance(failure, asyncpg.LockNotAvailableError)
+    app = FastAPI(exception_handlers=dict(main.app.exception_handlers))
+
+    @app.post("/write")
+    async def write():
+        raise failure
+
+    response = TestClient(app, raise_server_exceptions=False).post("/write")
+    assert response.status_code == 429
+    assert response.json()["code"] == "write_busy"
+    assert response.headers["Retry-After"] == "1"
+    assert "private-host" not in response.text
+
+    body = exception_envelope(failure)
+    assert body["code"] == "write_busy"
+    assert body["details"] == {"retry_after_secs": 1}
+    assert "private-host" not in str(body)
+
+
+@pytest.mark.parametrize("failure", [
+    # Any other lock wait past its limit, such as a role's `lock_timeout`.
+    asyncpg.LockNotAvailableError("private-host/query"),
+    asyncpg.PostgresError.new({"C": "55P03", "M": "private-host/query", "n": "another_constraint"}),
+    asyncpg.DeadlockDetectedError("private-host/query"),
+])
+def test_other_lock_failures_are_not_reported_as_a_write_that_changed_nothing(main, failure):
+    """Another lock wait past its limit, or a deadlock (40P01), can end a Bare
+    Git write after its Git commit, so the error is not a retryable
+    `write_busy`."""
+    assert transient_error(failure) is None
+
+    app = FastAPI(exception_handlers=dict(main.app.exception_handlers))
+
+    @app.post("/write")
+    async def write():
+        raise failure
+
+    response = TestClient(app, raise_server_exceptions=False).post("/write")
+    assert response.status_code == 500
+    assert "Retry-After" not in response.headers
+    assert "private-host" not in response.text

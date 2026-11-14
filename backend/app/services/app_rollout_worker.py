@@ -18,6 +18,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, ValidationError
 from app.repositories import table_data_repo, table_registry_repo
+from app.repositories.events_repo import EventBuffer, deferred_events
 from app.services import app_rollout_service, table_service
 from app.services._backfill import BackfillRunner
 from app.services.app_inventory_service import expected_schema_fingerprint
@@ -297,7 +298,10 @@ async def _run_backfill(conn: Any, target: dict[str, Any], step: dict[str, Any],
     return False
 
 
-async def _execute_step(conn: Any, target: dict[str, Any], step: dict[str, Any], manifest_step: dict[str, Any]) -> bool:
+async def _execute_step(
+    conn: Any, target: dict[str, Any], step: dict[str, Any], manifest_step: dict[str, Any],
+    events: EventBuffer,
+) -> bool:
     payload = manifest_step["payload"]
     table_name = _safe_identifier(payload["table"])
     operation = manifest_step["operation"]
@@ -317,6 +321,7 @@ async def _execute_step(conn: Any, target: dict[str, Any], step: dict[str, Any],
             add_columns=[payload["column"]],
             _conn=conn,
             _defer_index=True,
+            _events=events,
             _ownership_context=TableOwnershipContext(
                 installation_id=target["installation_id"],
                 app_id=target["app_id"],
@@ -339,6 +344,7 @@ async def _execute_step(conn: Any, target: dict[str, Any], step: dict[str, Any],
             ],
             _conn=conn,
             _defer_index=True,
+            _events=events,
             _ownership_context=TableOwnershipContext(
                 installation_id=target["installation_id"],
                 app_id=target["app_id"],
@@ -357,6 +363,7 @@ async def _execute_step(conn: Any, target: dict[str, Any], step: dict[str, Any],
             ],
             _conn=conn,
             _defer_index=True,
+            _events=events,
             _ownership_context=TableOwnershipContext(
                 installation_id=target["installation_id"],
                 app_id=target["app_id"],
@@ -378,6 +385,7 @@ async def _execute_step(conn: Any, target: dict[str, Any], step: dict[str, Any],
             alter_columns=[{"name": payload["column"], "set_not_null": True}],
             _conn=conn,
             _defer_index=True,
+            _events=events,
             _ownership_context=TableOwnershipContext(
                 installation_id=target["installation_id"],
                 app_id=target["app_id"],
@@ -413,7 +421,13 @@ async def _schema_fingerprint(conn: Any, vault_id: uuid.UUID, installation_id: u
 async def _process_target(target: dict[str, Any]) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with role_authority_transaction(conn):
+        # One transaction applies every step of the target. Step events are
+        # inserted when it ends, on every exit: an event insert holds the
+        # Vault's event lock until commit (migration 132), and a later step's
+        # DDL waiting for a table must not hold it. A backfill batch's
+        # row-change event comes from the table trigger at its UPDATE; only
+        # this target's own step and target rows are written after it.
+        async with role_authority_transaction(conn), deferred_events(conn) as events:
             await conn.fetchval("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", f"app-installation-rollout:{target['installation_id']}")
             ok, reason = await _preflight_target(conn, target)
             if not ok:
@@ -473,8 +487,10 @@ async def _process_target(target: dict[str, Any]) -> None:
                     # Keep a failed DDL/data statement inside a savepoint so
                     # the enclosing target transaction remains usable for the
                     # bounded failure ledger update below.
-                    async with conn.transaction():
-                        done = await _execute_step(conn, target, dict(step), manifest_step)
+                    # A failed step's events go with its savepoint.
+                    with events.savepoint():
+                        async with conn.transaction():
+                            done = await _execute_step(conn, target, dict(step), manifest_step, events)
                 except Exception:
                     logger.exception("rollout step failed")
                     await _mark_job_blocked(conn, target, "step_failed")

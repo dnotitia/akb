@@ -24,6 +24,7 @@ import ast
 from pathlib import Path
 
 from app.repositories.table_data_repo import (
+    contains_advisory_lock_call,
     contains_pg_settings_identifier,
     contains_set_config_call,
     contains_unicode_escaped_identifier,
@@ -125,6 +126,26 @@ def test_pg_settings_identifier_detector_ignores_literals_comments_and_prefixes(
     assert not contains_pg_settings_identifier("SELECT pg_settings_value FROM metrics")
 
 
+def test_advisory_lock_calls_are_detected_in_every_spelling():
+    assert contains_advisory_lock_call(
+        "SELECT pg_advisory_xact_lock(hashtextextended('akb-events:' || 'v', 0))"
+    )
+    assert contains_advisory_lock_call("SELECT pg_catalog.pg_advisory_lock(1)")
+    assert contains_advisory_lock_call('SELECT "pg_try_advisory_xact_lock" (1, 2)')
+    assert contains_advisory_lock_call("SELECT PG_ADVISORY_UNLOCK_ALL()")
+    assert contains_advisory_lock_call(
+        "WITH held AS (SELECT pg_try_advisory_lock_shared(7)) SELECT * FROM held"
+    )
+
+
+def test_advisory_lock_detector_ignores_literals_comments_and_identifiers():
+    assert not contains_advisory_lock_call("SELECT 'pg_advisory_lock(1)' AS note")
+    assert not contains_advisory_lock_call("SELECT 1 -- pg_advisory_lock(1)")
+    assert not contains_advisory_lock_call("SELECT /* pg_try_advisory_lock(1) */ 1")
+    assert not contains_advisory_lock_call("SELECT pg_advisory_note FROM metrics")
+    assert not contains_advisory_lock_call("SELECT $$pg_advisory_lock(1)$$")
+
+
 # ── 2. execute_sql wiring (AST; no heavy imports) ───────────────
 
 _TABLE_SERVICE = (
@@ -193,3 +214,7 @@ def test_execute_sql_keeps_trailing_semicolon_tolerance():
         'execute_sql no longer rstrip(";")s before the separator count — '
         "trailing-semicolon tolerance lost"
     )
+
+
+def test_execute_sql_refuses_advisory_lock_calls():
+    assert "contains_advisory_lock_call" in _called_names(_execute_sql_fn())

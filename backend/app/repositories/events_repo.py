@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 
 
@@ -68,6 +70,90 @@ async def emit_event(
         payload=payload or {},
     )
     return event_id
+
+
+async def lock_vault_events(conn, vault_id: uuid.UUID | str) -> None:
+    """Take the Vault's event-order lock now, in ``conn``'s transaction.
+
+    A write that does work its transaction cannot undo, such as a bare Git
+    commit, takes the lock before that work: a busy Vault then fails here,
+    before anything changed, instead of at the later event insert. The wait
+    ends after 5 seconds with SQLSTATE 55P03 (``asyncpg.LockNotAvailableError``)
+    and the constraint name ``akb_event_lock_timeout``, which the API reports
+    as a retryable ``write_busy``. Rows the write will lock after its Git
+    commit must be locked before this call, so that it holds this lock only
+    while it waits for nothing else. The event insert's own trigger finds the
+    lock already held.
+    """
+    await conn.execute(
+        "SELECT public.akb_lock_vault_events($1)", _to_uuid_or_none(vault_id),
+    )
+
+
+class EventBuffer:
+    """Events a transaction inserts after its last other locking statement.
+
+    Inserting an event with a Vault takes that Vault's event lock and holds it
+    until the transaction ends (migration 132). A transaction that still has
+    work to do after an event — DDL, row updates, another service's checks —
+    collects the event here and inserts it at the end, so it never waits for
+    another lock while other writers of the Vault wait for it.
+    """
+
+    def __init__(self) -> None:
+        self._pending: list[tuple[str, dict[str, Any]]] = []
+
+    def __len__(self) -> int:
+        return len(self._pending)
+
+    def add(
+        self,
+        kind: str,
+        *,
+        vault_id: uuid.UUID | str | None = None,
+        resource_uri: str | None = None,
+        actor_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Collect one event; the arguments are those of `emit_event`."""
+        self._pending.append((kind, {
+            "vault_id": vault_id,
+            "resource_uri": resource_uri,
+            "actor_id": actor_id,
+            "payload": payload,
+        }))
+
+    @contextmanager
+    def savepoint(self) -> Iterator[None]:
+        """Drop the events collected in the block when it raises.
+
+        Pair it with a database savepoint: a rolled-back step's events must
+        not outlive the work they describe.
+        """
+        mark = len(self._pending)
+        try:
+            yield
+        except BaseException:
+            del self._pending[mark:]
+            raise
+
+    async def flush(self, conn) -> list[int]:
+        """Insert the collected events in the order they were collected."""
+        pending, self._pending = self._pending, []
+        return [await emit_event(conn, kind, **event) for kind, event in pending]
+
+
+@asynccontextmanager
+async def deferred_events(conn) -> AsyncIterator[EventBuffer]:
+    """Collect a transaction body's events and insert them as it completes.
+
+    Enter it inside the transaction, around the whole body. Every normal exit,
+    a ``return`` included, inserts the events as the transaction's last
+    statements; an exception discards them along with the rolled-back work.
+    """
+    events = EventBuffer()
+    yield events
+    await events.flush(conn)
 
 
 async def get_vault_event_bounds(

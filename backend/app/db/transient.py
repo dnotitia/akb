@@ -8,7 +8,25 @@ errors as availability faults. The same timeout code includes PostgreSQL's
 import asyncpg
 
 from app.exceptions import TransientDependencyError
-from app.util.errors import OPERATION_TIMEOUT, SERVICE_UNAVAILABLE
+from app.util.errors import OPERATION_TIMEOUT, SERVICE_UNAVAILABLE, WRITE_BUSY
+
+# The constraint name the deadline of a Vault's event lock carries, with
+# SQLSTATE 55P03 (migration 132, `akb_lock_vault_events`). Only that error is a
+# retryable `write_busy`. A write that does work its transaction cannot undo,
+# such as a Bare Git commit, takes the Vault's event lock before that work, so
+# the failed request changed nothing. Any other lock wait past its limit, for
+# example a `lock_timeout` set on a role, can end a transaction after such work,
+# and a deadlock (40P01) can too; both stay internal errors.
+EVENT_LOCK_TIMEOUT = "akb_event_lock_timeout"
+
+
+def is_event_lock_timeout(exc: BaseException) -> bool:
+    """True for the timeout of the wait for a Vault's event lock."""
+    return (
+        isinstance(exc, asyncpg.PostgresError)
+        and getattr(exc, "sqlstate", None) == "55P03"
+        and getattr(exc, "constraint_name", None) == EVENT_LOCK_TIMEOUT
+    )
 
 
 def transient_error(exc: Exception) -> TransientDependencyError | None:
@@ -31,6 +49,20 @@ def transient_error(exc: Exception) -> TransientDependencyError | None:
     # credentials, or localized text. Protocol/auth/configuration faults are
     # deliberately not folded into this list.
     sqlstate = getattr(exc, "sqlstate", None)
+    if is_event_lock_timeout(exc):
+        return TransientDependencyError(
+            code=WRITE_BUSY,
+            message=(
+                "Another write of this Vault held its event lock past the limit; "
+                "this request's transaction was rolled back."
+            ),
+            status_code=429,
+            hint=(
+                "Retry after a short delay. The failed transaction wrote nothing; if the "
+                "request made several writes, check which earlier ones completed."
+            ),
+            retry_after_secs=1,
+        )
     unavailable = isinstance(exc, ConnectionError) or (
         isinstance(exc, asyncpg.PostgresError)
         and sqlstate in {

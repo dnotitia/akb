@@ -389,13 +389,19 @@ async def test_failed_inspection_only_cleans_failed_pending_upload(
 async def test_confirmation_event_failure_rolls_back_transition(pool, vault_id, service, objects, monkeypatch):
     _, fid, _ = await seed(pool, vault_id, objects, state="pending")
     monkeypatch.setattr(fs, "emit_event", AsyncMock(side_effect=RuntimeError("event write failed")))
+    # The event is the transaction's last write, so the projection intent is
+    # written before it — inside the transaction the failed event rolls back.
+    projection_in_transaction: list[bool] = []
+    fs.enqueue_native_file_projection.side_effect = (
+        lambda conn, **_kw: projection_in_transaction.append(conn.is_in_transaction())
+    )
     with pytest.raises(RuntimeError, match="event write failed"):
         await service.confirm_upload(vault_id, str(fid), actor_id="tester")
     async with pool.acquire() as conn:
         row = await vault_files_repo.find_by_id(conn, vault_id, fid)
     assert row["upload_state"] == "pending"
     assert row["content_hash"] is None
-    fs.enqueue_native_file_projection.assert_not_awaited()
+    assert projection_in_transaction == [True]
     fs.index_file_metadata.assert_not_awaited()
 
 
@@ -443,3 +449,34 @@ async def test_collection_delete_rollback_preserves_file_and_cleanup_ownership(
         assert not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM s3_delete_outbox WHERE s3_key=$1)", key)
         assert await conn.fetchval("SELECT EXISTS(SELECT 1 FROM collections WHERE id=$1)", cid)
     assert objects[key] == OLD
+
+
+async def test_file_writes_insert_their_event_after_the_projection_intent(
+    pool, vault_id, service, objects, monkeypatch,
+):
+    """The event insert holds the Vault's event lock until commit (migration
+    132), so it follows the projection outbox upsert of its transaction."""
+    order: list[str] = []
+    real_emit = fs.emit_event
+
+    async def emit(conn, kind, **kwargs):
+        order.append(kind)
+        return await real_emit(conn, kind, **kwargs)
+
+    async def projection_delete(*_args, **_kwargs):
+        order.append("projection_delete")
+
+    monkeypatch.setattr(fs, "emit_event", emit)
+    monkeypatch.setattr(fs, "enqueue_native_file_projection_delete", projection_delete)
+    fs.enqueue_native_file_projection.side_effect = lambda *_a, **_k: order.append("projection")
+
+    name, fid, _ = await seed(pool, vault_id, objects, state="pending")
+    await service.confirm_upload(vault_id, str(fid), actor_id="tester")
+    assert order == ["projection", "file.put"]
+    order.clear()
+    rid = await replacement(service, name, vault_id, fid, objects)
+    await publish(service, name, vault_id, fid, rid)
+    assert order == ["projection", "file.update"]
+    order.clear()
+    await service.delete(vault_id, str(fid), actor_id="tester")
+    assert order == ["projection_delete", "file.delete"]

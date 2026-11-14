@@ -7,6 +7,51 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- The SSE event tail (`GET /api/v1/events/{vault}`) no longer skips an event
+  whose transaction committed after an event with a larger id. Within a Vault,
+  event ids now follow commit order, so the tail delivers every committed event
+  of the Vault in commit order. Migration 132 adds a `BEFORE INSERT` trigger on
+  `events` that locks the event's Vault until commit and then assigns the id.
+  `events.id` loses its column default (an INSERT that names no id still
+  works) and its sequence cache is set to 1. Events without a Vault take no
+  lock. A dynamic table's `table.rows_changed` event is now inserted when its
+  transaction commits. The cursor format, `Last-Event-ID` resume and
+  `410 event_gap` are unchanged, and the Redis stream still makes no order
+  promise.
+
+  The cost: transactions that write events for the same Vault run one at a
+  time from taking the Vault's lock to their commit, so writes insert their
+  events after their other locking statements. Bare Git document writes
+  instead lock their collection, then their document (the order of a
+  recursive collection delete), then the edges they change (an update or edit
+  rewrites its implicit edges here), then the Vault's lock, then commit to
+  Git, so a busy Vault fails them before Git changes; they hold the lock
+  through the Git work. Moves and recursive collection deletes lock several
+  collections in id order, and a write whose document moved meanwhile
+  retries from a released savepoint. A
+  transaction waits at most 5 seconds in total for its Vault, also when the
+  Vault's lock row has to be created; every Vault gets its row when it is
+  created (and existing Vaults in the migration) and loses it when it is
+  deleted. Past 5 seconds the wait fails with SQLSTATE 55P03 and the
+  constraint name `akb_event_lock_timeout`, which alone returns a retryable
+  `write_busy` (HTTP 429, `Retry-After: 1`) instead of an internal error.
+  Other lock timeouts and deadlocks (`40P01`) stay internal errors. The
+  Vault's lock is a row lock that no SQL role can take, and `akb_sql` refuses
+  PostgreSQL's advisory lock functions. Waiting transactions keep their
+  database connections for up to 5 seconds; the number of waiters is not
+  bounded.
+
+  The migration takes its table lock in short attempts, so event inserts keep
+  flowing while a transaction of the previous release is open, and stops the
+  start with an error after 40 attempts. During a rolling deployment,
+  processes still on the previous release take the Vault lock too, their Bare
+  Git document writes only after the Git commit, so until they are replaced
+  a busy Vault can leave such a commit in Git and not in the database. An
+  image rollback keeps the trigger and that exposure. A data-only restore
+  needs writes stopped and `pg_restore --data-only --disable-triggers
+  --single-transaction`; `docs/operations/change-events.md` lists the checks
+  to run afterwards.
+
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain
   their existing receipts and policy errors. A pending call observes a grant

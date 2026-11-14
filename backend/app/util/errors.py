@@ -90,7 +90,7 @@ CONFLICT = "conflict"  # version / expected-state mismatch
 NATIVE_REVISION_SELECTOR_AMBIGUOUS = "native_revision_selector_ambiguous"
 NATIVE_REVISION_SURFACE_UNSUPPORTED = "native_revision_surface_unsupported"
 DOCUMENT_IDEMPOTENCY_UNSUPPORTED = "document_idempotency_unsupported"
-WRITE_BUSY = "write_busy"  # write-lane admission timed out — retry after backoff
+WRITE_BUSY = "write_busy"  # a write could not get its turn (write lane or a lock wait) — retry after backoff
 UNIQUE_VIOLATION = "unique_violation"  # PG 23505 — INSERT/UPDATE breaks a unique key
 EDIT_FAILED = "edit_failed"  # akb_edit: old_string match / uniqueness failure
 # A reader-authorized first write is intentionally not dispatched until the
@@ -185,6 +185,13 @@ def exception_envelope(e: Exception) -> dict:
     if transient is not None:
         if transient.code == OPERATION_TIMEOUT:
             return err(str(transient), code=OPERATION_TIMEOUT, hint=transient.hint)
+        if transient.code == WRITE_BUSY:
+            return err(
+                str(transient),
+                code=WRITE_BUSY,
+                hint=transient.hint,
+                retry_after_secs=transient.retry_after_secs,
+            )
         return err(str(transient), code=SERVICE_UNAVAILABLE, hint=transient.hint)
     if isinstance(e, ReservedSystemPathError):
         return err(str(e), code=RESERVED_SYSTEM_PATH_CODE)
