@@ -17,6 +17,7 @@ from app.config import settings
 from app.process_role import runtime_process_role
 from app.services._backfill import request_stop_all, runner_snapshots
 from app.services import (
+    ai_connections,
     asset_gc_worker,
     account_deletion_worker,
     sso_account_sync,
@@ -325,6 +326,13 @@ def _start_api_local(started: list[str]) -> None:
     search_degradation_stats.start()
     started.append("search_degradation_flusher")
 
+    # MCP requests are answered here, so the connections they reveal are
+    # observed in this process's memory and flushed on a timer, exactly like
+    # the counters above. A worker process serves no MCP and has nothing to see.
+    ai_connections.reset()
+    ai_connections.start()
+    started.append("ai_connections_flusher")
+
     tool_usage.start()
     started.append("tool_usage_maintenance")
     if settings.tool_usage.enabled:
@@ -504,6 +512,7 @@ async def stop_workers(*, include_api_local: bool = True) -> None:
             # no counts; an ungraceful kill still loses up to one flush
             # interval, which `pending_flush` on `/health` makes visible.
             ("search_degradation", lambda: search_degradation_stats.stop()),
+            ("ai_connections", lambda: ai_connections.stop()),
             ("stats_listener", stats_listener.stop),
             ("stats_sampler", stats_sampler.stop),
         ])
@@ -555,6 +564,10 @@ async def stop_api_runtime() -> None:
         asyncio.create_task(
             _stop_component("search_degradation", lambda: search_degradation_stats.stop()),
             name="stop:search_degradation",
+        ),
+        asyncio.create_task(
+            _stop_component("ai_connections", lambda: ai_connections.stop()),
+            name="stop:ai_connections",
         ),
         asyncio.create_task(
             _stop_component("stats_listener", stats_listener.stop),

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from app.config import settings
 from app.exceptions import AKBError
+from app.services.ai_connections import user_agent_product
 from app.services.uri_service import doc_uri
 
 # Shared by delivery, list, count, and subscription listing. Content from a
@@ -25,7 +26,9 @@ def document_source():
 
 
 def visible():
-    return f"(n.kind LIKE 'access.%' OR ({ACCESS} AND (n.kind='document.delete' OR EXISTS(SELECT 1 FROM {document_source()} d WHERE d.id=n.resource_id))))"
+    # Account notices concern the recipient's own account, not a Vault, so they
+    # are always visible to that recipient, like access notices.
+    return f"(n.kind LIKE 'access.%' OR n.kind LIKE 'account.%' OR ({ACCESS} AND (n.kind='document.delete' OR EXISTS(SELECT 1 FROM {document_source()} d WHERE d.id=n.resource_id))))"
 LABELS = {
     "document.update": "A watched document was updated",
     "document.move": "A watched document was moved",
@@ -37,6 +40,7 @@ LABELS = {
     "access.revoked": "Your vault access was removed",
     "access.membership_removed": "Your direct vault membership was removed",
     "access.ownership": "Your vault ownership changed",
+    "account.ai_connection": "A new AI app connected to your account",
 }
 
 
@@ -117,9 +121,11 @@ async def list_notifications(conn, uid, state, cursor, limit, category="all"):
     if category not in {"all", "documents", "access"}:
         raise AKBError("Invalid notification category", status_code=400)
     meta = await metadata(conn, uid)
-    rows = await conn.fetch(f"""SELECT n.*,v.name vault,d.path,d.title,({ACCESS}) allowed
+    rows = await conn.fetch(f"""SELECT n.*,v.name vault,d.path,d.title,({ACCESS}) allowed,
+       ac.client_name ai_client_name,ac.user_agent ai_user_agent
        FROM user_notifications n LEFT JOIN vaults v ON v.id=n.vault_id
        LEFT JOIN {document_source()} d ON d.id=n.resource_id
+       LEFT JOIN ai_connections ac ON n.kind='account.ai_connection' AND ac.id=n.resource_id AND ac.user_id=n.user_id
        WHERE n.user_id=$1 AND {visible()} AND ($2::bigint IS NULL OR n.version<$2)
        AND ($3='all' OR n.read_version<n.version)
        AND ($5='all' OR ($5='documents' AND n.kind LIKE 'document.%')
@@ -137,6 +143,12 @@ async def list_notifications(conn, uid, state, cursor, limit, category="all"):
         if row["allowed"] and row["path"] and row["kind"] != "document.delete":
             title = row["title"] or title
             target = {"uri": doc_uri(row["vault"], row["path"]), "vault": row["vault"]}
+        if row["kind"] == "account.ai_connection":
+            # The client names itself; once its connection is removed the
+            # notice keeps only the generic sentence.
+            client = row["ai_client_name"] or user_agent_product(row["ai_user_agent"])[0]
+            if client:
+                title = f"{title}: {client}"
         items.append({"id": str(row["id"]), "kind": row["kind"], "title": title,
             "message": LABELS.get(row["kind"], "Your access changed"),
             "created_at": row["created_at"].isoformat(), "updated_at": row["updated_at"].isoformat(),

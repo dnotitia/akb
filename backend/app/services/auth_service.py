@@ -96,6 +96,12 @@ class AuthenticatedUser:
     # caller that presented a valid token with zero scopes is rejected by the
     # dispatcher's `vault:read|write` requirement.
     oauth_scopes: list[str] | None = None
+    # The verified access token's authorized party (`azp`): which OAuth client
+    # registration presented it. Under MCP dynamic client registration each
+    # AI app registers its own client, so this identifies the app, never the
+    # person. None for every non-OAuth path. Identification only; it is not
+    # an authorization input.
+    oauth_client_id: str | None = None
     # Token-table class for PAT/service-key paths. None for JWT/OAuth.
     key_class: str | None = None
     # Coarse read/write/admin scopes carried by tokens.scopes. None means
@@ -1020,6 +1026,7 @@ async def _project_keycloak_principal(
             is_admin=resolved["is_admin"],
             auth_method="oauth",
             oauth_scopes=scopes,
+            oauth_client_id=claims.get("azp") if isinstance(claims.get("azp"), str) else None,
         )
     )
 

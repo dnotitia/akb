@@ -16,6 +16,8 @@ import { ConnectionSetup } from "@/components/connection-setup";
 import { LoadingState, InlineLoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SettingsHeading } from "./settings-ui";
+import { ConnectedApps } from "./connected-apps";
+import type { AIConnection } from "@/lib/api-connections";
 
 export type PAT = PatMetadata;
 interface Props {
@@ -23,8 +25,9 @@ interface Props {
   onDirtyChange?: (dirty: boolean) => void; onBusyChange?: (busy: boolean) => void;
   ownsOperation?: () => boolean;
   visible?: boolean;
-  initialView?: "setup" | "keys";
+  initialView?: ConnectionView;
 }
+export type ConnectionView = "setup" | "apps" | "keys";
 export function TokensSection({ pats, patsError, patsLoading = false, mcpOauthEnabled, onReloadPats, onDirtyChange, onBusyChange, ownsOperation, visible = true, initialView = "setup" }: Props) {
   const [view, setView] = useState(initialView);
   const [revokedIds, setRevokedIds] = useState<string[]>([]);
@@ -42,6 +45,12 @@ export function TokensSection({ pats, patsError, patsLoading = false, mcpOauthEn
   const [revoking, setRevoking] = useState(false);
   const revokePending = useRef(false);
   const [notice, setNotice] = useState("");
+  const [connectionsRevision, setConnectionsRevision] = useState(0);
+  const patForConnection = (connection: AIConnection) => connection.auth_kind === "pat" && connection.token_id ? visiblePats?.find(token => token.token_id === connection.token_id) : undefined;
+  function disconnect(connection: AIConnection) {
+    const token = patForConnection(connection);
+    if (token) setPendingRevoke({ token, snapshot: authSessionSnapshot() });
+  }
   useEffect(() => { onDirtyChange?.(setupDirty || replacementDirty); }, [setupDirty, replacementDirty, onDirtyChange]);
   useEffect(() => { onBusyChange?.(setupBusy || replacementBusy || revoking); }, [setupBusy, replacementBusy, revoking, onBusyChange]);
   useEffect(() => () => { onDirtyChange?.(false); onBusyChange?.(false); }, [onDirtyChange, onBusyChange]);
@@ -65,6 +74,7 @@ export function TokensSection({ pats, patsError, patsLoading = false, mcpOauthEn
       setInvalidatedTokenId(pendingRevoke.token.token_id);
       if (replacement?.token.token_id === pendingRevoke.token.token_id) setOriginalRevoked(true);
       setRevokedIds(ids => [...ids, pendingRevoke.token.token_id]);
+      setConnectionsRevision(value => value + 1);
       setNotice("Token revoked.");
       const refreshed = await onReloadPats();
       if (ownsOperation?.() !== false && isCurrentAuthSession(pendingRevoke.snapshot) && refreshed === false) setNotice("Token revoked. The token list could not be updated; retry the list below.");
@@ -74,10 +84,13 @@ export function TokensSection({ pats, patsError, patsLoading = false, mcpOauthEn
     <div className="settings-connections space-y-7">
       {notice && <Alert variant="warning">{notice}</Alert>}
       <SettingsHeading id="connection-heading" title="AI connections" description="Use your AI tool with the knowledge your account can access." />
-      <Tabs value={view} onValueChange={value => setView(value === "keys" ? "keys" : "setup")}>
-        <TabsList aria-label="AI connection views"><TabsTrigger value="setup" disabled={setupBusy || replacementBusy}>Connection setup</TabsTrigger><TabsTrigger value="keys" disabled={setupBusy || replacementBusy}>Connection keys</TabsTrigger></TabsList>
+      <Tabs value={view} onValueChange={value => setView(value === "keys" || value === "apps" ? value : "setup")}>
+        <TabsList aria-label="AI connection views" className="max-w-full flex-wrap"><TabsTrigger value="setup" disabled={setupBusy || replacementBusy}>Connection setup</TabsTrigger><TabsTrigger value="apps" disabled={setupBusy || replacementBusy}>Connected apps</TabsTrigger><TabsTrigger value="keys" disabled={setupBusy || replacementBusy}>Connection keys</TabsTrigger></TabsList>
         <TabsContent value="setup" forceMount hidden={view !== "setup"} inert={view !== "setup"}>
         <div id="setup-guide-body"><ConnectionSetup ownsOperation={ownsOperation} layout="settings" mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onReloadPats} onDirtyChange={setSetupDirty} onBusyChange={setSetupBusy} invalidatedTokenId={invalidatedTokenId} /></div>
+        </TabsContent>
+        <TabsContent value="apps" forceMount hidden={view !== "apps"} inert={view !== "apps"}>
+          <ConnectedApps active={visible && view === "apps"} revision={connectionsRevision} revokedTokenIds={revokedIds} canDisconnect={connection => patForConnection(connection) !== undefined} onDisconnect={disconnect} busy={setupBusy || replacementBusy || revoking} />
         </TabsContent>
         <TabsContent value="keys" forceMount hidden={view !== "keys"} inert={view !== "keys"}>
       <section aria-labelledby="tokens-heading" aria-busy={patsLoading}><header className="mb-3 flex items-start justify-between gap-4 border-b border-border pb-3"><div><h2 id="tokens-heading" className="text-base font-semibold">Connection keys</h2><p className="mt-1 text-sm text-foreground-muted">Manage the personal keys used by your tools. Recent use does not confirm a live connection.</p></div><Badge variant="default">{visiblePats?.length ?? "··"}</Badge></header>

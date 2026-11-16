@@ -3,6 +3,7 @@
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from typing import Literal
 from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, status
@@ -22,6 +23,7 @@ from app.exceptions import (
 from app.models.pat_issuance import NAME_MAX_LENGTH, PATIssuanceRequest
 from app.models.user_avatar import CurrentUserProfile
 from app.services.token_issuer_policy import require_issuer_carrier, validate_locked_issuer
+from app.services import ai_connections
 from app.services.access_service import VALID_WRITE_ACTIONS, check_vault_access
 from app.services.auth_service import (
     AuthenticatedUser,
@@ -139,6 +141,28 @@ class VerifyAuthorityResponse(NFCModel):
     token_id: uuid.UUID
     vault_scope: AuthorityVaultScopeRequest
     authorities: list[VerifiedWriterAuthority]
+
+
+class AIConnection(NFCModel):
+    """One AI app seen using this account over MCP. No IP, no request content."""
+
+    id: uuid.UUID
+    # Self-reported by the client (MCP clientInfo), else read from its
+    # User-Agent. None when the client reported neither.
+    client_name: str | None
+    client_version: str | None
+    auth_kind: Literal["oauth", "pat"]
+    # PAT connections only; None for OAuth.
+    token_id: uuid.UUID | None
+    token_prefix: str | None
+    token_name: str | None
+    first_seen_at: datetime
+    # Written at most once a minute per connection.
+    last_seen_at: datetime
+
+
+class AIConnectionList(NFCModel):
+    connections: list[AIConnection]
 
 
 class ChangePasswordRequest(NFCModel):
@@ -814,6 +838,34 @@ async def issue_token(req: PATIssuanceRequest, user: AuthenticatedUser = Depends
 @router.get("/auth/tokens", summary="List your PATs")
 async def list_tokens(user: AuthenticatedUser = Depends(get_current_user)):
     return {"tokens": await list_pats(user.user_id)}
+
+
+@router.get(
+    "/auth/connections",
+    summary="List the AI apps connected to your account",
+    response_model=AIConnectionList,
+)
+async def list_connections(
+    response: Response,
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> AIConnectionList:
+    """AI apps observed at the MCP endpoint for the calling human account.
+
+    One entry per OAuth client registration or PAT, most recently seen first.
+    A revoked PAT's entry is removed with it. Recording happens off the
+    request path, so a brand-new connection appears within seconds.
+    """
+    if user.account_kind != "human":
+        raise ForbiddenError(
+            "Connected apps are listed for personal accounts only",
+            code="connections_human_only",
+        )
+    response.headers["Cache-Control"] = "private, no-store"
+    return AIConnectionList(
+        connections=[
+            AIConnection(**row) for row in await ai_connections.list_connections(user.user_id)
+        ]
+    )
 
 
 @router.post(

@@ -15,7 +15,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { ProfileSection, type ProfileUserPatch, type User } from "./profile-section";
-import { TokensSection, type PAT } from "./tokens-section";
+import { TokensSection, type ConnectionView, type PAT } from "./tokens-section";
 import { PreferencesSection } from "./preferences-section";
 import { AdminSection } from "./admin-section";
 import { NotificationsSection } from "./notifications-section";
@@ -29,7 +29,8 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
   initialTab?: string; onClose: () => void; onNavigate?: () => void; onRestoreFocus?: () => void;
 }) {
   const settingsLocation = useLocation();
-  const connectionView = settingsLocation.pathname === "/settings" && new URLSearchParams(settingsLocation.search).get("connectionView") === "keys" ? "keys" : "setup";
+  const requestedConnectionView = settingsLocation.pathname === "/settings" ? new URLSearchParams(settingsLocation.search).get("connectionView") : null;
+  const connectionView: ConnectionView = requestedConnectionView === "keys" || requestedConnectionView === "apps" ? requestedConnectionView : "setup";
   const navigate = useNavigate();
   const { completeSessionNavigation } = useResourceNavigation();
   const { checking, revision } = useAccessVerification();

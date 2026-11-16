@@ -6,7 +6,7 @@ import uuid
 
 from app.config import settings
 
-KINDS = frozenset({"document.update", "document.move", "document.archive", "document.restore", "document.delete", "access.granted", "access.changed", "access.revoked", "access.membership_removed", "access.ownership"})
+KINDS = frozenset({"document.update", "document.move", "document.archive", "document.restore", "document.delete", "access.granted", "access.changed", "access.revoked", "access.membership_removed", "access.ownership", "account.ai_connection"})
 
 
 async def enqueue_notification_event(conn, kind, *, source_key: str, vault_id=None,
