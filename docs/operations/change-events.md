@@ -251,7 +251,9 @@ leave the Vault's content unchanged:
   ran. The consequence of first in, first out: a refused target waits behind
   every target that became ready before its deferral ended, including a
   backlog of other rollouts of one Vault, and goes before those that became
-  ready after.
+  ready after. A target whose claim expired, its worker gone, is made pending
+  again with its batch's readiness, not the time it was reclaimed, so it
+  goes ahead of the targets that became ready after its batch did.
 - External Git synchronization fetches the remote into its mirror before it
   records each changed file, admitted per file.
 - A raw SQL write reads its plan on a pool connection before its admission,
