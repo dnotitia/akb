@@ -52,7 +52,7 @@ from app.services.s3_delete_worker import REPLACEMENT_STAGING_PREFIX, REPLACEMEN
 from app.services.s3_delete_worker import enqueue_pending_upload_delete
 from app.services import skill_policy
 from app.services.uri_service import file_uri
-from app.services.vault_write_admission import vault_write_admission
+from app.services.vault_write_admission import admitted_connection
 from app.services.m1_file_measurement import MeasurementFileService, measurement_enabled
 from app.services.native_file_projection import (
     enqueue_native_file_projection,
@@ -912,7 +912,7 @@ class FileService:
         ready_to_commit = False
 
         try:
-            async with vault_write_admission(vault_id, vault=vault_name), pool.acquire() as conn:
+            async with admitted_connection(pool, vault_id, vault=vault_name) as conn:
                 async with conn.transaction():
                     locked = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
                     if not locked:
@@ -1093,7 +1093,7 @@ class FileService:
 
         # The lease waits for the File's row, which a confirmation of the same
         # File holds while it waits for the Vault's event lock: admitted too.
-        async with vault_write_admission(vault_id), pool.acquire() as conn:
+        async with admitted_connection(pool, vault_id) as conn:
             async with conn.transaction():
                 row = await vault_files_repo.lease_file_upload_confirmation(
                     conn, vault_id, fid,
@@ -1123,7 +1123,7 @@ class FileService:
             ):
                 inspection_error = ConflictError("Uploaded file hash mismatch; file record was cleaned up.")
 
-        async with vault_write_admission(vault_id), pool.acquire() as conn:
+        async with admitted_connection(pool, vault_id) as conn:
             async with conn.transaction():
                 locked = await vault_files_repo.find_by_id_for_update(conn, vault_id, fid)
                 if locked is None:
@@ -1220,7 +1220,7 @@ class FileService:
         # Admitted before the connection, as a confirmation is: the delete
         # waits for the File's row, which a confirmation holds while it waits
         # for the Vault's event lock, and must not hold a connection meanwhile.
-        async with vault_write_admission(vault_id), pool.acquire() as conn:
+        async with admitted_connection(pool, vault_id) as conn:
             async with conn.transaction():
                 deleted = await vault_files_repo.delete_pending_file(conn, vault_id, fid)
                 if deleted:
@@ -1495,7 +1495,7 @@ class FileService:
         # s3_delete_worker after the TX commits, so a crash between
         # commit and S3 cannot leave us with an orphan blob (or a
         # missing-blob row). The outbox row carries the s3_key.
-        async with vault_write_admission(vault_id), pool.acquire() as conn:
+        async with admitted_connection(pool, vault_id) as conn:
             async with conn.transaction():
                 # Serialize with confirm_replace.  Reading the key before this
                 # transaction can enqueue a stale object if a replacement wins

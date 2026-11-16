@@ -84,7 +84,7 @@ from app.services.native_revision_service import (
 from app.services.resource_hash import HASH_ALGORITHM
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
-from app.services.vault_write_admission import vault_write_admission
+from app.services.vault_write_admission import admitted_connection
 from app.util.errors import NATIVE_REVISION_SURFACE_UNSUPPORTED
 from app.util.text import (
     doc_path,
@@ -1727,7 +1727,7 @@ class NativeDocumentService(DocumentService):
         try:
             # Admitted before its connection like every event write; nothing
             # else can reach the Vault before this transaction commits.
-            async with vault_write_admission(new_vault_id, vault=name), pool.acquire() as conn:
+            async with admitted_connection(pool, new_vault_id, vault=name) as conn:
                 async with role_authority_transaction(conn):
                     vault_id = await vault_repo.create(
                         name=name,

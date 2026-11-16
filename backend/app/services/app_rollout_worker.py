@@ -29,7 +29,7 @@ from app.services.app_resource_service import (
 from app.services.table_service import alter_table
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import table_uri
-from app.services.vault_write_admission import vault_write_admission
+from app.services.vault_write_admission import admitted_connection
 
 logger = logging.getLogger("akb.app_rollout_worker")
 LEASE_SECONDS = 120
@@ -46,14 +46,15 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
     # are applied/replayed.  This keeps the canary and 10-wide order durable.
     #
     # The eligible targets are claimed first in, first out, in the order
-    # they became ready, then by job, batch and ordinal: a target refused by
-    # its Vault's admission rejoins the queue at the end of its deferral
-    # (lease_expires_at), and a backfill that makes its target pending again
-    # after a batch sets that time to the moment it did; any other target is
-    # ready from when its batch became claimable, the job's request for the
-    # first batch, or the completion of the batch before it, recorded with
+    # they became ready, then by job, batch and ordinal. A target is ready
+    # from when its batch became claimable, the job's request for the first
+    # batch or the completion of the batch before it, recorded with
     # clock_timestamp() so that a long transaction counts from when it
-    # finished. A refused target therefore waits behind the targets that
+    # finished; a deferral moves that later, to its end (lease_expires_at),
+    # and never earlier: a target deferred with its Vault's others before its
+    # batch was claimable is ready only once both have passed. A backfill that
+    # makes its target pending again after a batch sets that time to the
+    # moment it did. A refused target therefore waits behind the targets that
     # became ready before its deferral ended, and goes before those that
     # became ready after.
     row = await conn.fetchrow(
@@ -78,12 +79,13 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
                       AND same_batch.batch_no=t.batch_no
                       AND same_batch.state='running'
                )
-             ORDER BY COALESCE(
-                          t.lease_expires_at,
-                          GREATEST(j.created_at, (
+             ORDER BY GREATEST(
+                          COALESCE(t.lease_expires_at, '-infinity'::timestamptz),
+                          j.created_at,
+                          (
                               SELECT max(earlier.completed_at) FROM app_rollout_targets earlier
                                WHERE earlier.job_id=t.job_id AND earlier.batch_no < t.batch_no
-                          ))
+                          )
                       ),
                       t.job_id, t.batch_no, t.ordinal
              FOR UPDATE OF t SKIP LOCKED
@@ -446,9 +448,9 @@ async def _process_target(target: dict[str, Any]) -> None:
     pool = await get_pool()
     # A short wait: a busy Vault's targets are deferred, and other Vaults'
     # targets taken meanwhile (see _process_once).
-    async with vault_write_admission(
-        target["vault_id"], timeout=settings.app_rollout_admission_wait_secs,
-    ), pool.acquire() as conn:
+    async with admitted_connection(
+        pool, target["vault_id"], timeout=settings.app_rollout_admission_wait_secs,
+    ) as conn:
         # One transaction applies every step of the target. Step events are
         # inserted when it ends, on every exit: an event insert holds the
         # Vault's event lock until commit (migration 132), and a later step's

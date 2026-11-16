@@ -469,19 +469,19 @@ async def test_sql_whose_plan_writes_an_undeclared_vault_is_refused_before_it_ru
         writes: list[bool] = []
         admissions: list[tuple] = []
         run_statement = user_sql_executor._run_statement
-        admission = user_sql_executor.vault_write_admission
+        admitted_connection = user_sql_executor.admitted_connection
 
         async def record(conn, *args, **kwargs):
             if await conn.fetchval("SHOW transaction_read_only") == "off":
                 writes.append(is_admitted(target))
             return await run_statement(conn, *args, **kwargs)
 
-        def recorded_admission(*vault_ids, **kwargs):
+        def recorded_admission(pool, *vault_ids, **kwargs):
             admissions.append(vault_ids)
-            return admission(*vault_ids, **kwargs)
+            return admitted_connection(pool, *vault_ids, **kwargs)
 
         monkeypatch.setattr(user_sql_executor, "_run_statement", record)
-        monkeypatch.setattr(user_sql_executor, "vault_write_admission", recorded_admission)
+        monkeypatch.setattr(user_sql_executor, "admitted_connection", recorded_admission)
 
         def insert(vaults: list[str]):
             return table_service.execute_sql(
@@ -1233,6 +1233,167 @@ async def test_upload_cancels_behind_a_waiting_confirmation_leave_connections_fo
         assert await admin_pool.fetchval(
             "SELECT upload_state FROM vault_files WHERE id = $1", fid,
         ) == "confirmed"
+
+
+async def test_cancelled_writes_hold_their_admission_until_their_connection_is_back(monkeypatch):
+    """Limit 1 and a pool of four connections. Giving back a connection
+    taken under a Vault's admission waits two seconds in its reset (the
+    pool's reset waits in the database). A collection create of one Vault is
+    cancelled while its admitted connection is being reset, five times in a
+    row, the next one sent at once. Each keeps the Vault's admission until
+    its connection is back, which closing it ends, so the Vault never has
+    more than one admitted connection in use, being reset or not, and a
+    reader of another Vault keeps getting a connection. The admission used
+    to be given back while the cancelled release went on resetting, the next
+    create took another connection, and the resets filled the pool."""
+    from app.services.vault_write_admission import _admitted
+
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0, raising=False)
+    async with _fresh_database() as admin_pool:
+        await _make_vault(admin_pool, "reset-busy")
+        quiet = await _make_vault(admin_pool, "reset-quiet")
+        database = await admin_pool.fetchval("SELECT current_database()")
+        resetting = asyncio.Event()
+        admitted_conns: set = set()
+
+        async def slow_reset(conn) -> None:
+            if conn in admitted_conns:
+                admitted_conns.discard(conn)
+                resetting.set()
+                await conn.execute("SELECT pg_sleep(2)")
+
+        app_pool = await asyncpg.create_pool(
+            _database_dsn(database), min_size=1, max_size=4, reset=slow_reset,
+        )
+
+        class _Acquire:
+            """The pool's own acquisition; a connection taken while the task
+            is admitted gets the slow reset."""
+
+            def __init__(self) -> None:
+                self._acquired = app_pool.acquire()
+
+            async def __aenter__(self):
+                conn = await self._acquired.__aenter__()
+                if _admitted.get():
+                    admitted_conns.add(conn._con)
+                return conn
+
+            async def __aexit__(self, *exc):
+                return await self._acquired.__aexit__(*exc)
+
+        class _Pool:
+            def acquire(self):
+                return _Acquire()
+
+            def __getattr__(self, name):
+                return getattr(app_pool, name)
+
+        previous_pool = postgres_module._pool
+        postgres_module._pool = _Pool()
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+        waits: list[float] = []
+        peak = 0
+
+        async def reader() -> None:
+            nonlocal peak
+            while not stop.is_set():
+                peak = max(peak, app_pool.get_size() - app_pool.get_idle_size())
+                started = loop.time()
+                try:
+                    async with app_pool.acquire(timeout=3) as conn:
+                        await conn.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", quiet)
+                except TimeoutError:
+                    waits.append(loop.time() - started)
+                    return
+                waits.append(loop.time() - started)
+                await asyncio.sleep(0.05)
+
+        service = CollectionService(git=object())
+        creates: list[asyncio.Task] = []
+        reading = asyncio.create_task(reader())
+        try:
+            for number in range(5):
+                resetting.clear()
+                task = asyncio.create_task(service.create(
+                    vault="reset-busy", path=f"c{number}", summary=None, agent_id="tester",
+                ))
+                creates.append(task)
+                await asyncio.wait_for(resetting.wait(), timeout=30)
+                task.cancel()
+            await asyncio.wait_for(asyncio.gather(*creates, return_exceptions=True), timeout=60)
+            await asyncio.sleep(0.2)
+        finally:
+            stop.set()
+            await asyncio.gather(reading, return_exceptions=True)
+            for task in creates:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*creates, return_exceptions=True)
+            postgres_module._pool = previous_pool
+            await app_pool.close()
+
+        print(f"\npool in use at most {peak}; reader wait max {max(waits):.3f}s over {len(waits)} reads")
+        assert max(waits) < 1.0, waits
+        # One admitted connection and the reader's, at most.
+        assert peak <= 2, peak
+
+
+async def test_a_target_deferred_before_its_batch_was_ready_waits_for_its_batch(monkeypatch):
+    """Vault `pre-v` holds rollout A's target and the second-batch target X
+    of rollout J, whose canary is in `pre-w`. A is refused by `pre-v`'s full
+    admission, which defers every pending target of the Vault for a second,
+    X too, though X's batch is not claimable yet. Meanwhile J's canary runs
+    for two and a half seconds, and rollout B, in `pre-u`, is refused and
+    deferred. Once the canary is applied, A, B and X are claimable: A and B
+    since their deferrals ended, X only since its canary finished. The
+    worker claims A, B and then X. X's deferral used to count as when it
+    became ready, ahead of B."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "app_rollout_admission_wait_secs", 0.3, raising=False)
+    monkeypatch.setattr(rollout_worker, "BUSY_RETRY_SECONDS", 1)
+    async with _fresh_database() as pool:
+        v_vault, a_job, _items = await _installation(
+            pool, own_items=True, vault="pre-v", app_key="pre-a", job_id=_job(1),
+        )
+        w_vault, j_job, _items = await _installation(
+            pool, own_items=True, vault="pre-w", app_key="pre-j", prefix="j_",
+            also_in_existing=(("pre-v", v_vault),), job_id=_job(2),
+        )
+        assert await pool.fetchval(
+            "SELECT vault_id FROM app_rollout_targets WHERE job_id = $1 AND batch_no = 1", j_job,
+        ) == v_vault
+        u_vault, b_job, _items = await _installation(
+            pool, own_items=True, vault="pre-u", app_key="pre-b", job_id=_job(3),
+        )
+        claimed: list[uuid.UUID] = []
+        process = rollout_worker._process_target
+
+        async def record(target):
+            if target["vault_id"] == w_vault:
+                await asyncio.sleep(2.5)
+            claimed.append(target["job_id"])
+            return await process(target)
+
+        monkeypatch.setattr(rollout_worker, "_process_target", record)
+        async with _vault_full(v_vault):
+            # A, refused; `pre-v`'s pending targets, X included, deferred.
+            assert await rollout_worker.run_once() == 1
+        assert await pool.fetchval(
+            "SELECT lease_expires_at > NOW() FROM app_rollout_targets WHERE job_id = $1 AND batch_no = 1", j_job,
+        )
+        canary = asyncio.create_task(rollout_worker.run_once())
+        await asyncio.sleep(0.1)
+        async with _vault_full(u_vault):
+            # B, refused and deferred while the canary runs.
+            assert await rollout_worker.run_once() == 1
+        assert await asyncio.wait_for(canary, timeout=30) == 1
+        assert claimed == [a_job, b_job, j_job]
+        for _ in range(3):
+            assert await rollout_worker.run_once() == 1
+        assert claimed[3:] == [a_job, b_job, j_job], claimed
 
 
 def _manifest_with_backfill(app_key: str = "rollout-order", prefix: str = "") -> tuple[dict, str, str]:

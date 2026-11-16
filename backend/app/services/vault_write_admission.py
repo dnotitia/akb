@@ -46,13 +46,16 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import sys
 import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar
+
+import asyncpg
 
 from app.exceptions import ConflictError, WriteBusyError
 
@@ -214,6 +217,96 @@ async def vault_write_admission(
     finally:
         _admitted.reset(token)
         state.give_back(wanted, limit)
+
+
+# How long giving a connection back to the pool may take, its reset included,
+# before the connection is closed instead.
+GIVE_BACK_GRACE_SECS = 0.5
+
+
+def close_pooled_connection(conn: Any) -> bool:
+    """Close a connection taken from a pool, so that the pool takes it back
+    without a reset. False when there is nothing to close: a connection
+    without ``terminate``, or one already back in the pool, which asyncpg's
+    pool proxy refuses to touch once it is released."""
+    terminate = getattr(conn, "terminate", None)
+    if terminate is None:
+        return False
+    try:
+        terminate()
+    except asyncpg.InterfaceError:
+        return False
+    return True
+
+
+async def give_back_connection(
+    acquire: Any, conn: Any, exc_info: tuple = (None, None, None), *, grace: float | None = None,
+) -> bool:
+    """Give ``conn``, taken with ``acquire`` (a ``pool.acquire()`` context),
+    back to the pool, and return only once the pool has it.
+
+    The release, the pool's reset included, runs shielded from cancellation,
+    as asyncpg's own does. Still running after the grace
+    (``GIVE_BACK_GRACE_SECS`` by default), or when this task is cancelled
+    meanwhile, the connection is closed through the pool's proxy, which ends
+    the reset, and the release is awaited until the pool has the connection
+    back; a further cancellation does not cut that wait short. A cancellation
+    is raised once the connection is back. A release that fails on its own
+    raises its error, as leaving ``async with pool.acquire()`` does; one that
+    fails after the connection was closed here does not. Returns whether the
+    connection was closed here.
+    """
+    loop = asyncio.get_running_loop()
+    release = asyncio.ensure_future(acquire.__aexit__(*exc_info))
+    deadline = loop.time() + (GIVE_BACK_GRACE_SECS if grace is None else grace)
+    past_grace = False
+    closed = False
+    cancelled: asyncio.CancelledError | None = None
+    while not release.done():
+        try:
+            if past_grace:
+                await asyncio.wait({release})
+            else:
+                await asyncio.wait({release}, timeout=max(0.0, deadline - loop.time()))
+                if not release.done():
+                    past_grace = True
+                    closed = close_pooled_connection(conn) or closed
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
+            if not past_grace:
+                past_grace = True
+                closed = close_pooled_connection(conn) or closed
+    error = None if release.cancelled() else release.exception()
+    if cancelled is not None:
+        raise cancelled
+    if error is not None and not closed:
+        raise error
+    return closed
+
+
+@asynccontextmanager
+async def admitted_connection(
+    pool: Any, *vault_ids: uuid.UUID | str | None, vault: str | None = None,
+    timeout: float | None = None,
+) -> AsyncIterator[Any]:
+    """Admit the current task for ``vault_ids`` (``vault_write_admission``),
+    then take a connection from ``pool``.
+
+    On the way out, cancellation included, the connection goes back to the
+    pool first (``give_back_connection``) and the admission after it, so a
+    Vault never has more of the pool's connections in use, being reset or
+    not, than its admitted transactions. Every transaction that is admitted
+    and then takes a pool connection goes through here.
+    """
+    async with vault_write_admission(*vault_ids, vault=vault, timeout=timeout):
+        acquire = pool.acquire()
+        conn = await acquire.__aenter__()
+        try:
+            yield conn
+        except BaseException:
+            await give_back_connection(acquire, conn, sys.exc_info())
+            raise
+        await give_back_connection(acquire, conn)
 
 
 def is_admitted(vault_id: uuid.UUID | str | None) -> bool:

@@ -25,7 +25,6 @@ import logging
 import uuid
 import weakref
 from collections.abc import AsyncIterator
-import contextlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -46,9 +45,11 @@ from app.util.errors import VAULT_ARCHIVED, VAULT_WRITE_MANAGED, err
 from app.services.role_sync import token_role_name, user_role_name
 from app.services.vault_write_admission import (
     VaultReplacedError,
+    admitted_connection,
+    close_pooled_connection,
+    give_back_connection,
     is_admitted,
     retry_if_vault_replaced,
-    vault_write_admission,
 )
 
 logger = logging.getLogger("akb.user_sql")
@@ -263,50 +264,8 @@ async def _run_statement(conn, sql: str, params: list, fetch: bool, vault_names:
 
 
 # How long a plan's connection may take to go back to the pool, its reset
-# included, before it is closed instead.
+# included, before it is closed instead (`give_back_connection`).
 _PLAN_CLEANUP_SECS = 0.5
-
-
-def _close_connection(conn: Any) -> bool:
-    """Close a plan's connection now, so that the pool takes it back without
-    a reset. False when there is nothing to close: a connection without
-    ``terminate``, or one already back in the pool, which asyncpg's pool
-    proxy refuses to touch once it is released."""
-    terminate = getattr(conn, "terminate", None)
-    if terminate is None:
-        return False
-    try:
-        terminate()
-    except asyncpg.InterfaceError:
-        return False
-    return True
-
-
-async def _give_back(acquire: Any, conn: Any, closed: list[bool]) -> None:
-    """Give a plan's connection back to the pool through ``acquire``, and
-    return once the pool has it.
-
-    The release, the pool's reset included, runs outside the plan's deadline
-    and shielded from cancellation, as asyncpg's own is. Still running after
-    `_PLAN_CLEANUP_SECS`, or when the read is cancelled meanwhile, the
-    connection is closed, which ends the reset, and the pool takes it back
-    without one. A failure to give it back is logged: the pool deals with the
-    connection.
-    """
-    release = asyncio.ensure_future(acquire.__aexit__(None, None, None))
-    try:
-        await asyncio.wait_for(asyncio.shield(release), _PLAN_CLEANUP_SECS)
-    except TimeoutError:
-        if _close_connection(conn):
-            closed.append(True)
-        with contextlib.suppress(Exception):
-            await release
-    except asyncio.CancelledError:
-        if _close_connection(conn):
-            closed.append(True)
-        raise
-    except Exception:
-        logger.warning("a plan's connection could not be given back to the pool", exc_info=True)
 
 
 class UserSqlExecutor:
@@ -391,8 +350,7 @@ class UserSqlExecutor:
                 undeclared = await self._planned(statement) - admitted
                 if undeclared:
                     raise UndeclaredVaultWriteError(await self._vault_names(undeclared), ran=False)
-            async with vault_write_admission(*admitted):
-                return await self._run(statement, read_only=False, admitted=admitted)
+            return await self._run(statement, read_only=False, admitted=admitted)
         except asyncpg.exceptions.ReadOnlySQLTransactionError as e:
             raise PermissionDeniedError(str(e), pg_sqlstate="25006") from e
         except asyncpg.exceptions.InsufficientPrivilegeError as e:
@@ -474,41 +432,38 @@ class UserSqlExecutor:
         connection was closed on the way.
 
         Everything after the plan slot, from the wait for a connection to the
-        catalog lookups, runs under ``deadline``, in the event loop's clock.
-        At the deadline the connection is closed, and then the read is
-        cancelled with ``TimeoutError``, so that neither a rollback nor the
-        pool's reset waits for the cancelled statement; a read cancelled
-        otherwise closes its connection too. A lock's timeout raises
-        ``LockNotAvailableError``, and the server's own statement timeout, a
-        backstop, ``QueryCanceledError``.
+        catalog lookups, runs under ``deadline``, in the event loop's clock;
+        the read itself (``_explain``) runs in a task of its own. When the
+        read is cancelled, at the deadline (as ``TimeoutError``) or by the
+        caller, the connection is closed first, before anything waits on it,
+        and only then is that task cancelled: neither a rollback nor the
+        pool's reset waits for the cancelled statement. A lock's timeout
+        raises ``LockNotAvailableError``, and the server's own statement
+        timeout, a backstop, ``QueryCanceledError``.
 
-        The connection then goes back to the pool outside the deadline, and
-        the read returns only once the pool has it (`_give_back`), so the plan
-        keeps its slot until then.
+        The connection then goes back to the pool outside the deadline
+        (``give_back_connection``), and the read returns only once the pool
+        has it, so the plan keeps its slot until then.
         """
-        loop = asyncio.get_running_loop()
         acquire = self.pool.acquire()
         held: list[Any] = []
-
-        def close_at_deadline() -> None:
-            if held and _close_connection(held[0]):
-                closed.append(True)
-
-        # Scheduled before the timeout below, so it runs first at the deadline.
-        watchdog = loop.call_at(deadline, close_at_deadline)
         try:
             async with asyncio.timeout_at(deadline):
                 held.append(await acquire.__aenter__())
-                return await self._explain(held[0], statement, deadline)
-        except BaseException as exc:
-            if held and isinstance(exc, (TimeoutError, asyncio.CancelledError)):
-                if _close_connection(held[0]):
-                    closed.append(True)
-            raise
+                reading = asyncio.ensure_future(self._explain(held[0], statement, deadline))
+                try:
+                    return await asyncio.shield(reading)
+                except asyncio.CancelledError:
+                    if close_pooled_connection(held[0]):
+                        closed.append(True)
+                    reading.cancel()
+                    await asyncio.wait({reading})
+                    if not reading.cancelled():
+                        reading.exception()
+                    raise
         finally:
-            watchdog.cancel()
-            if held:
-                await _give_back(acquire, held[0], closed)
+            if held and await give_back_connection(acquire, held[0], grace=_PLAN_CLEANUP_SECS):
+                closed.append(True)
 
     async def _explain(
         self, conn: Any, statement: _Statement, deadline: float,
@@ -563,7 +518,12 @@ class UserSqlExecutor:
         overrides = EventBuffer()
         outcome: dict = {}
         statement_error: asyncpg.PostgresError | None = None
-        async with self.pool.acquire() as conn:
+        # A write is admitted for its Vaults, and holds the admission until
+        # its connection is back in the pool.
+        connection = (
+            self.pool.acquire() if admitted is None else admitted_connection(self.pool, *admitted)
+        )
+        async with connection as conn:
             async with conn.transaction():
                 admin_bypass = await _admin_bypass(conn, statement)
                 if statement.check_policy and not (read_only and should_fetch):
@@ -612,7 +572,7 @@ class UserSqlExecutor:
             # statement wrote nothing, so the event commits alone, admitted
             # for its Vaults like any event write, on a connection taken after
             # the statement's was given back.
-            async with vault_write_admission(*overrides.vault_ids()), self.pool.acquire() as conn:
+            async with admitted_connection(self.pool, *overrides.vault_ids()) as conn:
                 async with conn.transaction():
                     await overrides.flush(conn)
         if statement_error is not None:

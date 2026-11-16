@@ -14,6 +14,7 @@ import asyncio
 import logging
 import uuid
 
+import asyncpg
 import pytest
 
 from app.config import settings
@@ -429,4 +430,115 @@ async def test_a_request_finding_the_queue_full_is_refused_at_once(monkeypatch):
     await asyncio.gather(*waiters, return_exceptions=True)
     release.set()
     await asyncio.gather(*holders)
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
+
+
+class _ResettingPool:
+    """A pool of ``size`` connections whose release resets a connection the
+    way asyncpg's does, shielded from the caller's cancellation, for
+    ``reset_secs`` or until the connection is closed. ``in_use`` counts the
+    connections taken and not yet back, being reset or not; a reader's
+    acquisition (``reader=True``) is released without a reset."""
+
+    def __init__(self, size: int, reset_secs: float) -> None:
+        self._free = asyncio.Semaphore(size)
+        self.reset_secs = reset_secs
+        self.in_use = 0
+        self.peak = 0
+        self.resetting = asyncio.Event()
+
+    def acquire(self, *, reader: bool = False) -> "_ResettingAcquire":
+        return _ResettingAcquire(self, reader)
+
+
+class _PooledProxy:
+    def __init__(self) -> None:
+        self.released = False
+        self.closed = asyncio.Event()
+
+    def terminate(self) -> None:
+        if self.released:
+            raise asyncpg.InterfaceError(
+                "cannot call Connection.terminate(): connection has been released back to the pool",
+            )
+        self.closed.set()
+
+
+class _ResettingAcquire:
+    def __init__(self, pool: _ResettingPool, reader: bool) -> None:
+        self._pool = pool
+        self._reader = reader
+        self._proxy = _PooledProxy()
+
+    async def __aenter__(self) -> _PooledProxy:
+        await self._pool._free.acquire()
+        self._pool.in_use += 1
+        self._pool.peak = max(self._pool.peak, self._pool.in_use)
+        return self._proxy
+
+    async def __aexit__(self, *_exc) -> None:
+        await asyncio.shield(self._release())
+
+    async def _release(self) -> None:
+        if not self._reader:
+            self._pool.resetting.set()
+            closed = asyncio.ensure_future(self._proxy.closed.wait())
+            await asyncio.wait({closed}, timeout=self._pool.reset_secs)
+            closed.cancel()
+        self._proxy.released = True
+        self._pool.in_use -= 1
+        self._pool._free.release()
+
+
+async def test_a_cancelled_write_gives_its_admission_back_once_its_connection_is_back(monkeypatch):
+    """Limit 1, a pool of three connections whose reset takes two seconds.
+    A write of Vault A is cancelled while its connection is being reset, five
+    times in a row, the next one sent at once. Each keeps A's admission until
+    its connection is back, closed after the half-second grace, which ends
+    the reset, so A never has more than one connection in use, being reset
+    or not, and a reader of Vault B keeps getting a connection. The
+    admission used to be given back as soon as the cancelled release left
+    the reset running, the next write of A took another connection, and the
+    resets filled the pool."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0)
+    pool = _ResettingPool(size=3, reset_secs=2.0)
+    a = uuid.uuid4()
+    stop = asyncio.Event()
+    waits: list[float] = []
+    loop = asyncio.get_running_loop()
+
+    async def reader() -> None:
+        while not stop.is_set():
+            started = loop.time()
+            try:
+                async with asyncio.timeout(1.5):
+                    async with pool.acquire(reader=True):
+                        waits.append(loop.time() - started)
+            except TimeoutError:
+                waits.append(loop.time() - started)
+                return
+            await asyncio.sleep(0.02)
+
+    async def write() -> None:
+        async with admission.admitted_connection(pool, a):
+            pass
+
+    reading = asyncio.create_task(reader())
+    writes = []
+    try:
+        for _ in range(5):
+            pool.resetting.clear()
+            task = asyncio.create_task(write())
+            writes.append(task)
+            await asyncio.wait_for(pool.resetting.wait(), timeout=10)
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(*writes, return_exceptions=True), timeout=20)
+    finally:
+        stop.set()
+        await asyncio.gather(reading, return_exceptions=True)
+    assert pool.peak <= 2, pool.peak
+    assert waits and max(waits) < 1.0, max(waits)
+    assert all(task.cancelled() for task in writes)
+    assert pool.in_use == 0
     assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}

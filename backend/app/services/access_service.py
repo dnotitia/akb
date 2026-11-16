@@ -42,9 +42,9 @@ from app.services.edge_boundary import edge_scope_sql, vault_uri_prefix
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
 from app.services.vault_write_admission import (
+    admitted_connection,
     check_admitted_vault,
     retry_if_vault_replaced,
-    vault_write_admission,
 )
 from app.services.write_lane import run_compensation, run_git_write
 from app.util.errors import NOT_FOUND, err
@@ -348,7 +348,7 @@ async def check_vault_access(
     )
     if own_events:
         pool = await get_pool()
-        async with vault_write_admission(result["vault_id"], vault=vault_name), pool.acquire() as conn:
+        async with admitted_connection(pool, result["vault_id"], vault=vault_name) as conn:
             async with conn.transaction():
                 await own_events.flush(conn)
     _authorized_vault.set(vault_name)
@@ -642,7 +642,7 @@ async def grant_access(
     access = await check_vault_access(granter_id, vault_name, required_role="admin")
 
     pool = await get_pool()
-    async with vault_write_admission(access["vault_id"], vault=vault_name), pool.acquire() as conn:
+    async with admitted_connection(pool, access["vault_id"], vault=vault_name) as conn:
         async with role_authority_transaction(conn):
             vault = await conn.fetchrow(
                 "SELECT id, owner_id, status, public_access FROM vaults WHERE name = $1 FOR UPDATE",
@@ -746,7 +746,7 @@ async def revoke_access(
             raise ValidationError(str(e)) from e
 
     pool = await get_pool()
-    async with vault_write_admission(access["vault_id"], vault=vault_name), pool.acquire() as conn:
+    async with admitted_connection(pool, access["vault_id"], vault=vault_name) as conn:
         async with role_authority_transaction(conn):
             vault = await conn.fetchrow(
                 "SELECT id, owner_id, status, public_access FROM vaults WHERE name = $1 FOR UPDATE",
@@ -1313,7 +1313,7 @@ async def transfer_ownership(
     )
 
     pool = await get_pool()
-    async with vault_write_admission(access["vault_id"], vault=vault_name), pool.acquire() as conn:
+    async with admitted_connection(pool, access["vault_id"], vault=vault_name) as conn:
         async with role_authority_transaction(conn):
             vault = await conn.fetchrow(
                 "SELECT id, owner_id FROM vaults WHERE name = $1 FOR UPDATE",
@@ -1561,7 +1561,7 @@ async def update_vault_metadata(
 
     pool = await get_pool()
     admitted_id = await _vault_id_for_admission(pool, vault_name)
-    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
+    async with admitted_connection(pool, admitted_id, vault=vault_name) as conn:
         async with role_authority_transaction(conn), deferred_events(conn) as events:
             # Ownership may change while waiting for the shared authority guard.
             found = await check_vault_access(
@@ -1596,7 +1596,7 @@ async def set_public_access(user_id: str, vault_name: str, level: str) -> dict:
 
     pool = await get_pool()
     admitted_id = await _vault_id_for_admission(pool, vault_name)
-    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
+    async with admitted_connection(pool, admitted_id, vault=vault_name) as conn:
         # Events go in after the Vault row update and role DDL.
         async with role_authority_transaction(conn), deferred_events(conn) as events:
             # Ownership may change while waiting for the shared authority guard.
@@ -1666,7 +1666,7 @@ async def set_vault_write_policy(
 
     pool = await get_pool()
     admitted_id = await _vault_id_for_admission(pool, vault_name)
-    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
+    async with admitted_connection(pool, admitted_id, vault=vault_name) as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
@@ -1768,7 +1768,7 @@ async def bootstrap_vault_write_policy(
 
     pool = await get_pool()
     admitted_id = await _vault_id_for_admission(pool, vault_name)
-    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
+    async with admitted_connection(pool, admitted_id, vault=vault_name) as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
@@ -1872,7 +1872,7 @@ async def remove_vault_write_policy(actor_id: str, vault_name: str) -> dict:
     """
     pool = await get_pool()
     admitted_id = await _vault_id_for_admission(pool, vault_name)
-    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
+    async with admitted_connection(pool, admitted_id, vault=vault_name) as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
@@ -1927,7 +1927,7 @@ async def add_vault_write_grant(
 
     pool = await get_pool()
     admitted_id = await _vault_id_for_admission(pool, vault_name)
-    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
+    async with admitted_connection(pool, admitted_id, vault=vault_name) as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,
@@ -2011,7 +2011,7 @@ async def remove_vault_write_grant(actor_id: str, vault_name: str, token_id: str
 
     pool = await get_pool()
     admitted_id = await _vault_id_for_admission(pool, vault_name)
-    async with vault_write_admission(admitted_id, vault=vault_name), pool.acquire() as conn:
+    async with admitted_connection(pool, admitted_id, vault=vault_name) as conn:
         async with conn.transaction():
             vault = await conn.fetchrow(
                 "SELECT id FROM vaults WHERE name = $1 FOR UPDATE", vault_name,

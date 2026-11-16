@@ -43,7 +43,7 @@ from app.services.app_resource_service import (
 from app.services.role_sync import get_role_sync
 from app.services import skill_policy
 from app.services.uri_service import table_uri
-from app.services.vault_write_admission import vault_write_admission
+from app.services.vault_write_admission import admitted_connection
 from app.services.user_sql_executor import (
     PermissionDeniedError,
     UndeclaredVaultWriteError,
@@ -101,7 +101,7 @@ async def _existing_or_pooled_conn(
         yield existing_conn
         return
     pool = await get_pool()
-    async with vault_write_admission(admit_vault), pool.acquire() as conn:
+    async with admitted_connection(pool, admit_vault) as conn:
         yield conn
 
 
@@ -921,7 +921,7 @@ async def create_table(
     now = datetime.now(timezone.utc)
     collection_path = _normalize_collection_path(collection)
 
-    async with vault_write_admission(vault_id), pool.acquire() as conn:
+    async with admitted_connection(pool, vault_id) as conn:
         # READ COMMITTED explicitly: the advisory lock only helps if the
         # loser can SEE the winner's row after the wait. Under REPEATABLE
         # READ the vault lookup below would fix a snapshot BEFORE the lock
@@ -1232,7 +1232,7 @@ async def drop_table(
     """Drop a vault-scoped table: registry row + dynamic PG table +
     edges referencing the table URI + metadata chunk."""
     pool = await get_pool()
-    async with vault_write_admission(vault_id), pool.acquire() as conn:
+    async with admitted_connection(pool, vault_id) as conn:
         async with role_authority_transaction(conn):
             vault = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
             if not vault:

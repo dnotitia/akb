@@ -141,7 +141,7 @@ async def _install(
 async def _installation(
     pool: asyncpg.Pool, *, own_items: bool, vault: str = _VAULT, app_key: str = "rollout-order",
     prefix: str = "", vault_id: uuid.UUID | None = None, job_id: uuid.UUID | None = None,
-    also_in: tuple[str, ...] = (),
+    also_in: tuple[str, ...] = (), also_in_existing: tuple[tuple[str, uuid.UUID], ...] = (),
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     """An installed app owning `orders` and `items`, with a pending upgrade.
 
@@ -151,7 +151,8 @@ async def _installation(
     names its tables apart from another app's there. `job_id` sets the
     rollout job's id, which orders the worker's claims. `also_in` names new
     Vaults the app is installed in after `vault`, so the rollout has a
-    target in each, in later batches.
+    target in each, in later batches; `also_in_existing` gives existing
+    Vaults, by name and id, for the same.
     """
     manifest, checksum, current_fingerprint = _manifest(app_key, prefix)
     async with pool.acquire() as conn:
@@ -175,6 +176,8 @@ async def _installation(
             other_id = await conn.fetchval(
                 "INSERT INTO vaults(name,git_path) VALUES($1,$2) RETURNING id", other, f"/tmp/{other}.git",
             )
+            await _install(conn, app_id, old_id, other, other_id, prefix, current_fingerprint)
+        for other, other_id in also_in_existing:
             await _install(conn, app_id, old_id, other, other_id, prefix, current_fingerprint)
     if job_id is not None:
         # The job's id comes from the column default: set it for this job.

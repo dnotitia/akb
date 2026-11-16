@@ -629,6 +629,40 @@ def _vault_event_writers() -> set[str]:
     return found
 
 
+def _admission_then_acquire() -> list[str]:
+    """Places that enter a Vault's admission and then take a pool connection
+    in one ``async with``, rather than through ``admitted_connection``."""
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    found: list[str] = []
+    for path in sorted(app_dir.rglob("*.py")):
+        if "migrations" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.AsyncWith):
+                continue
+            names = []
+            for item in node.items:
+                call = item.context_expr
+                if isinstance(call, ast.Call):
+                    func = call.func
+                    names.append(func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None))
+            if "acquire" in names and any(
+                name in {"vault_write_admission", "_vault_write_admission"} for name in names
+            ):
+                found.append(f"{path.relative_to(app_dir)}:{node.lineno}")
+    return found
+
+
+def test_every_admitted_connection_is_given_back_before_its_admission():
+    """A connection taken under a Vault's admission is given back through
+    ``admitted_connection``, which returns the admission only once the pool
+    has the connection back. Entering the admission and ``pool.acquire()``
+    in one ``async with`` gave the admission back while a cancelled
+    release still held the connection."""
+    assert _admission_then_acquire() == []
+
+
 def test_every_vault_event_writer_is_registered():
     found = _vault_event_writers() - _HELPERS
     unregistered = sorted(found - set(_EMITTERS))

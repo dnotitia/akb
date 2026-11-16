@@ -168,7 +168,7 @@ from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
 from app.services.user_directory import resolve_display_names
-from app.services.vault_write_admission import vault_write_admission
+from app.services.vault_write_admission import admitted_connection, vault_write_admission
 from app.services.write_lane import run_compensation, run_git_write, vault_gate, write_lane
 from app.repositories import table_data_repo
 from app.utils import ensure_list
@@ -558,7 +558,7 @@ class DocumentService:
         """
         async with write_lane(vault_name):
             pool = await get_pool()
-            async with vault_write_admission(vault_id, vault=vault_name), pool.acquire() as lock_conn:
+            async with admitted_connection(pool, vault_id, vault=vault_name) as lock_conn:
                 async with lock_conn.transaction():
                     # Canonical lifecycle order is vault -> document -> asset.
                     # Taking the parent lock before any path/document/attachment
@@ -577,7 +577,7 @@ class DocumentService:
         Same write-lane and Vault write admission as ``_path_lock``."""
         async with write_lane(vault_name):
             pool = await get_pool()
-            async with vault_write_admission(vault_id, vault=vault_name), pool.acquire() as lock_conn:
+            async with admitted_connection(pool, vault_id, vault=vault_name) as lock_conn:
                 async with lock_conn.transaction():
                     if not await lock_vault_for_child_write(lock_conn, vault_id):
                         raise NotFoundError("Vault", vault_name)

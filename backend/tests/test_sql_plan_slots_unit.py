@@ -364,6 +364,13 @@ class _Txn:
             # A rollback that does not finish until the connection closes.
             await self._conn.terminated.wait()
             raise RuntimeError("connection is closed")
+        if exc_type is not None and self._conn.slow_rollback:
+            # A rollback that takes its time, unless the connection closes.
+            closed = asyncio.ensure_future(self._conn.terminated.wait())
+            await asyncio.wait({closed}, timeout=self._conn.slow_rollback)
+            closed.cancel()
+            if self._conn.terminated.is_set():
+                raise RuntimeError("connection is closed")
         return False
 
 
@@ -374,18 +381,22 @@ class _SlowConn:
 
     def __init__(
         self, *, settings_secs: float = 0.0, explain_secs: float = 0.0, slow_start: float = 0.0,
-        stuck_rollback: bool = False,
+        stuck_rollback: bool = False, slow_rollback: float = 0.0,
     ) -> None:
         self.settings_secs = settings_secs
         self.explain_secs = explain_secs
         self.slow_start = slow_start
         self.stuck_rollback = stuck_rollback
+        self.slow_rollback = slow_rollback
         self.terminated = asyncio.Event()
+        self.terminated_at: float | None = None
 
     def transaction(self) -> _Txn:
         return _Txn(self)
 
     def terminate(self) -> None:
+        if not self.terminated.is_set():
+            self.terminated_at = asyncio.get_running_loop().time()
         self.terminated.set()
 
     async def execute(self, sql: str, *args) -> str:
@@ -659,4 +670,29 @@ async def test_a_connection_back_in_the_pool_is_never_closed(monkeypatch):
     plan, _second_started = await _a_plan_then_another(pool)
     assert plan == frozenset()
     assert not pool.raw.terminated.is_set()
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+async def test_a_cancelled_plan_closes_its_connection_before_any_rollback(monkeypatch):
+    """A plan's EXPLAIN is under way when its request is cancelled, and the
+    rollback of its transaction would take two seconds on an open
+    connection. The plan closes its connection first, so the rollback ends at
+    once, and gives up its slot promptly. The transaction used to roll back
+    first, and the connection was closed only then."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 5000)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    slow = _SlowConn(explain_secs=5.0, slow_rollback=2.0)
+    executor = user_sql_executor.UserSqlExecutor(_ConnPool(slow))
+    loop = asyncio.get_running_loop()
+    plan = asyncio.create_task(executor._planned(_statement("x", slow=True)))
+    await asyncio.sleep(0.1)
+    cancelled_at = loop.time()
+    plan.cancel()
+    done, _pending = await asyncio.wait({plan}, timeout=0.5)
+    if not done:
+        await asyncio.wait({plan})
+        pytest.fail("the cancelled plan waited for its rollback")
+    assert plan.cancelled()
+    assert slow.terminated_at is not None and slow.terminated_at - cancelled_at < 0.1
     assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
