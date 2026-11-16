@@ -1419,6 +1419,40 @@ async def test_a_committed_write_whose_reset_runs_past_the_grace_still_succeeds(
         ) == 1
 
 
+async def test_a_reset_that_times_out_before_the_grace_is_the_releases_error():
+    """The pool's statements have a 0.1 s `command_timeout`, and its reset
+    of a connection given back inside an admission waits 0.3 s in the
+    database. The reset's statement times out at 0.1 s, long before the
+    release's half-second bound, so its `TimeoutError`, which carries no
+    errno, is an error of the release: the write raises it, at about 0.1 s.
+    Every errno-less `TimeoutError` used to be taken for the bound's expiry,
+    and the write answered as if nothing had gone wrong."""
+    from app.services import vault_write_admission as admission
+    from app.services.vault_write_admission import _admitted
+
+    async with _fresh_database() as admin_pool:
+        database = await admin_pool.fetchval("SELECT current_database()")
+
+        async def slow_reset(conn) -> None:
+            if _admitted.get():
+                await conn.execute("SELECT pg_sleep(0.3)")
+
+        app_pool = await asyncpg.create_pool(
+            _database_dsn(database), min_size=1, max_size=2, command_timeout=0.1, reset=slow_reset,
+        )
+        loop = asyncio.get_running_loop()
+        try:
+            started = loop.time()
+            with pytest.raises(TimeoutError) as raised:
+                async with admission.admitted_connection(app_pool, uuid.uuid4()) as conn:
+                    assert await conn.fetchval("SELECT 1") == 1
+            elapsed = loop.time() - started
+        finally:
+            app_pool.terminate()
+        assert raised.value.errno is None
+        assert elapsed < admission.GIVE_BACK_GRACE_SECS, elapsed
+
+
 class _CancelsSwallowed:
     """A TCP proxy in front of PostgreSQL that passes connections through but
     swallows cancel requests: it takes them and never answers, as a server

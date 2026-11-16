@@ -810,3 +810,49 @@ async def test_a_socket_timeout_before_the_bound_reaches_the_writer():
     with pytest.raises(TimeoutError) as raised:
         await asyncio.wait_for(write(), timeout=5)
     assert raised.value is failure and raised.value.errno == errno.ETIMEDOUT
+
+
+async def test_a_write_cancelled_in_its_block_ends_cancelled_though_its_release_fails(caplog):
+    """A write is cancelled inside its admitted connection block, before its
+    connection goes back, and the release then fails, before its bound, with
+    a socket's `ETIMEDOUT`. The cancellation, delivered by the block, still
+    wins: the write ends cancelled, and the release's error is logged with
+    its traceback. Only a cancellation arriving while the release ran used to
+    win; this one gave way to the release's error."""
+    failure = _socket_timeout()
+    pool = _ResettingPool(size=2, reset_secs=0.05, fail_with=failure)
+    caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
+    inside = asyncio.Event()
+
+    async def write() -> None:
+        async with admission.admitted_connection(pool, uuid.uuid4()):
+            inside.set()
+            await asyncio.sleep(30)
+
+    writing = asyncio.create_task(write())
+    await asyncio.wait_for(inside.wait(), timeout=5)
+    writing.cancel()
+    # Not awaited directly: a cancelled await would cancel the write.
+    await asyncio.wait({writing}, timeout=5)
+    assert writing.done() and writing.cancelled()
+    logged = [r for r in caplog.records if "while its request was being cancelled" in r.getMessage()]
+    assert logged and logged[0].exc_info is not None and logged[0].exc_info[1] is failure, caplog.records
+    assert pool.in_use == 0
+
+
+async def test_a_timeout_well_before_the_bound_is_the_releases_error():
+    """A release fails with a `TimeoutError` that carries no errno, as a
+    reset statement's own `command_timeout` raises one, long before the
+    release's bound. It came from inside the release, not from the bound, so
+    the write raises it rather than taking it for the bound's expiry. Every
+    errno-less `TimeoutError` used to count as the bound's."""
+    failure = TimeoutError()
+    pool = _ResettingPool(size=2, reset_secs=0.05, fail_with=failure)
+
+    async def write() -> None:
+        async with admission.admitted_connection(pool, uuid.uuid4()):
+            pass
+
+    with pytest.raises(TimeoutError) as raised:
+        await asyncio.wait_for(write(), timeout=5)
+    assert raised.value is failure
