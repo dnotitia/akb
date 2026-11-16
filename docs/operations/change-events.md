@@ -224,7 +224,10 @@ leave the Vault's content unchanged:
 - A File upload confirmation is admitted twice: to renew the upload's lease,
   and, after it read the upload from object storage, to publish the File. A
   refusal of the publication leaves the renewed lease committed and the File
-  pending; the same confirmation sent again publishes it.
+  pending; the same confirmation sent again publishes it. A cancel of a
+  pending upload is admitted too, before it takes a connection: it waits for
+  the File's row, which a confirmation holds while it waits for the Vault's
+  event lock.
 - A File replacement copies the uploaded bytes and schedules the copy's
   removal before its publication is admitted. A refusal removes the copy,
   leaves its scheduled removal, and keeps the upload, so the same confirmation
@@ -235,16 +238,20 @@ leave the Vault's content unchanged:
   with every other pending target of its Vault, for 5 seconds, in one
   statement, and the worker claims again at once rather than sleep its idle
   interval, so it takes other Vaults' targets meanwhile. Batches keep their
-  order. Among the eligible targets, the Vault that has waited longest for
-  the worker goes first: a Vault the worker has served, by claiming,
-  finishing or deferring one of its targets in a running rollout, has waited
-  since it last did; one it has not served yet, since its target became
-  claimable, when its rollout was requested or when the batch before it
-  finished. Targets inserted with a rollout are not service until touched.
-  Several busy Vaults therefore do not take turns ahead of another Vault's
-  rollout, a target whose deferral ended does not wait for every batch of
-  another Vault's backfill, and a later batch of another rollout does not
-  go before a target whose deferral ended while the batch before it ran.
+  order. The eligible targets are claimed first in, first out, in the order
+  they became ready: a refused target at the end of its deferral, which is
+  where it rejoins the queue; a target a backfill made pending again after a
+  batch at that moment; and any other target when its batch became
+  claimable, the rollout's request for the first batch, or the moment the
+  batch before it finished, recorded when the work really finished rather
+  than when its transaction began. Several busy Vaults therefore do not take
+  turns ahead of another Vault's rollout, a target whose deferral ended does
+  not wait for every batch of another Vault's backfill, and a later batch
+  does not go before a target that became ready while the batch before it
+  ran. The consequence of first in, first out: a refused target waits behind
+  every target that became ready before its deferral ended, including a
+  backlog of other rollouts of one Vault, and goes before those that became
+  ready after.
 - External Git synchronization fetches the remote into its mirror before it
   records each changed file, admitted per file.
 - A raw SQL write reads its plan on a pool connection before its admission,
@@ -331,15 +338,18 @@ for a connection, the transaction's start, its settings and role, the
 administrator check, `EXPLAIN` and the catalog lookups; and each wait for a
 table's lock may take `akb_sql_plan_lock_timeout_ms` (default 500). Past
 either, the write fails with a retryable `write_busy` and gives its slot back,
-rather than hold its connection. A plan cancelled at its deadline rolls back
-and gives its connection back; one that still holds it half a second later,
-rolling back or being reset, closes it instead, so the pool does not get it
-back in an unknown state. A plan whose statements each finish within their
-own limits, or that waits for one lock after another, each wait shorter than
-the lock timeout, therefore keeps its slot for at most the plan's timeout
-and that half second, and so does a statement that declares one Vault but
-writes another, holding the first one's token, not the second's, before it
-is refused.
+rather than hold its connection. At the deadline, or when the request is
+cancelled, the plan closes its connection, so that neither a rollback nor the
+pool's reset waits for the cancelled statement. The connection then goes
+back to the pool outside the deadline, and the plan keeps its slot until the
+pool has it: a reset still running half a second later is ended by closing
+the connection, which the pool then takes back without one. A connection
+already back in the pool is never closed. A plan whose statements each
+finish within their own limits, or that waits for one lock after another,
+each wait shorter than the lock timeout, therefore keeps its slot for at
+most the plan's timeout and that half second, and so does a statement that
+declares one Vault but writes another, holding the first one's token, not
+the second's, before it is refused.
 Before the write commits, its transaction checks the dynamic-table row changes
 it queued for `table.rows_changed` events; a change of a Vault it was not
 admitted for rolls it back with an `invalid_argument` error that names that
@@ -646,9 +656,12 @@ also under the worker's own runner, which sleeps after an iteration without
 work, with two busy targets of one Vault, and with six busy Vaults ahead of
 a quiet one, under the default deadlines; that a deferred target is claimed
 between the batches of another Vault's backfill once its deferral ended, and
-before another rollout's later batch that became claimable after it; that a
-rollout target is admitted beside transactions waiting on another, full
-Vault;
+before another rollout's later batch that became claimable after it, also
+when the batch before ran a long transaction; that a deferred target waits
+behind the targets that became ready before its deferral ended and goes
+before those that became ready after; that a rollout target is admitted
+beside transactions waiting on another, full Vault; that upload cancels
+behind a waiting confirmation leave connections for another Vault;
 that raw SQL runs read-only without admission only when asked to, and
 otherwise as a write that waits; that raw SQL writes waiting for a table lock
 while they read their plans leave connections for another Vault, and, sixty
@@ -677,8 +690,10 @@ request finding the queue full is refused at once.
 Vault with every declared Vault's token taken at once, and that waits that
 time out or are cancelled leave the queue at once and take no slot; that a
 plan's deadline bounds statements that each finish within their own limits,
-and a slow start of its transaction; and that a plan that cannot roll back in
-time closes its connection;
+and a slow start of its transaction; that a plan that cannot roll back in
+time closes its connection; that a plan keeps its slot until its connection
+is back in the pool, closing it once its reset runs past the grace; and that
+a connection already back in the pool is never closed;
 `test_write_busy_rest_unit.py` checks the REST response to a refused write and
 to one refused part-way.
 `test_vault_write_admission_paths_postgres.py` fills a Vault's admission and

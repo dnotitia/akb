@@ -64,8 +64,10 @@ specifically; the proxy has its own log in
   plan. Past either the write fails with `write_busy` and gives its plan slot
   back, so a plan waiting for one lock after another, or whose statements
   each finish within their own limits, cannot keep the slots from other
-  Vaults; a plan that cannot roll back within half a second of its deadline
-  closes its connection rather than give it back. The plan slots and the
+  Vaults. At its deadline, or when cancelled, a plan closes its connection
+  rather than wait for a rollback or a reset; it keeps its slot until its
+  connection is back in the pool, closing it when the reset runs half a
+  second past, and never closes a connection already back in the pool. The plan slots and the
   admission alike serve waiters first come, first served, by capacity: the
   first waiter blocked on a Vault reserves one slot of each of its Vaults
   against later requests, which use the slots left, so waiters blocked on a
@@ -90,13 +92,14 @@ specifically; the proxy has its own log in
   `app_rollout_admission_wait_secs` (default 1 second) for a target's Vault;
   a refusal defers every pending target of that Vault for 5 seconds, and the
   worker claims the next eligible target at once instead of sleeping.
-  Among eligible targets, the Vault that has waited longest for the worker
-  goes first: since the worker last claimed, finished or deferred one of its
-  targets, or, for a Vault it has not served yet, since its target became
-  claimable. Busy Vaults therefore do not take turns ahead of another
-  Vault's rollout, and a deferred target waits neither for every batch of
-  another Vault's backfill nor for another rollout's later batch that became
-  claimable after it.
+  Eligible targets are claimed first in, first out, by when they became
+  ready: a refused target at the end of its deferral, a backfill's target
+  when it was made pending again, any other when its batch became claimable,
+  the request or the end of the batch before, recorded when that batch
+  really finished. A refused target therefore waits behind every target that
+  became ready before its deferral ended, and goes before the rest. A File
+  upload cancel is admitted for its Vault before it takes a connection, as a
+  confirmation is.
 
 - On the Native authority a recursive collection delete is now atomic per
   document and completes when run again. Each document's delete commits with
