@@ -196,7 +196,13 @@ back to the pool before its admission, also when its request is cancelled:
 the release, the pool's reset included, is awaited for half a second, and a
 reset still running then, or one interrupted by a cancellation, is ended by
 closing the connection, which the pool takes back without one; a
-connection already back in the pool is never closed. Code that runs inside
+connection already back in the pool is never closed. The release is asyncpg's
+own with that bound, so a connection whose cancelled statement's cancellation
+does not complete in time, such as one the server never answers, is closed
+too. A release still running half a second after its connection was closed,
+when its place is already back in the pool, is left to finish in the
+background with a warning, so the admission, and Vault creation's lane gate,
+never wait for it longer. Code that runs inside
 an admission entered without a connection gives each connection it takes back
 the same way before the code after it runs: a Native mutation, admitted before
 it prepares its payload, and Vault creation, which holds the new Vault's
@@ -688,7 +694,11 @@ behind a waiting confirmation leave connections for another Vault; that
 cancelled writes hold their admission until their connection is back, so a
 slow reset does not fill the pool, a collection create's transaction and a
 Native create's payload connection taken inside its admission alike; that a
-target deferred before its batch
+Vault creation cancelled while its seed's statement waits, through a proxy
+that swallows the cancellation, reaches its compensation within the grace
+and then gives back its admission, lane gate and connections; that a
+committed write whose reset runs past the grace still answers with its
+result; that a target deferred before its batch
 was claimable waits for its batch;
 that raw SQL runs read-only without admission only when asked to, and
 otherwise as a write that waits; that raw SQL writes waiting for a table lock
@@ -726,13 +736,18 @@ plan closes its connection before any rollback;
 `test_vault_write_admission_unit.py` also checks that a write cancelled
 during a slow reset keeps its admission until its connection is back, taken
 with `admitted_connection` or inside an admission with `acquire_given_back`,
-and that outside an admission `acquire_given_back` is the pool's own
-acquisition; `test_vault_write_admission_paths_postgres.py` fails when a
-connection is taken inside an admission other than through these helpers: in
-the same `with` as the admission, or in code that runs inside an admission
-entered without a connection, followed through the application functions it
-calls as far as annotations, assignments and arguments tell what each call
-reaches;
+that a release that never ends after its connection was closed keeps the
+admission no more than a grace longer, and that outside an admission
+`acquire_given_back` is the pool's own acquisition;
+`test_vault_write_admission_paths_postgres.py` fails when a connection is
+taken inside an admission other than through these helpers: in the same
+`with` as the admission, in code that runs inside an admission entered
+without a connection, or in an admitted transaction, besides its own
+connection, followed through the application functions it calls as far as
+annotations, assignments and arguments tell what each call reaches, and
+leaving out the branch of a helper that a passed connection rules out; it
+also checks that a plain `pool.acquire()`, or a helper called without the
+connection, inside an admitted transaction fails it;
 `test_write_busy_rest_unit.py` checks the REST response to a refused write and
 to one refused part-way.
 `test_vault_write_admission_paths_postgres.py` fills a Vault's admission and
