@@ -261,6 +261,11 @@ async def _run_statement(conn, sql: str, params: list, fetch: bool, vault_names:
     return out
 
 
+# How long a plan read past its deadline may still take to roll back and give
+# its connection back to the pool; after that the connection is closed.
+_PLAN_CLEANUP_SECS = 0.5
+
+
 class UserSqlExecutor:
     """Run user-supplied SQL under the caller's PG role.
 
@@ -404,57 +409,89 @@ class UserSqlExecutor:
             loop = asyncio.get_running_loop()
             started = loop.time()
             deadline = started + max(1, settings.akb_sql_plan_timeout_ms) / 1000
+            closed: list[bool] = []
             try:
-                return await self._read_plan(statement, deadline)
-            except (
-                TimeoutError,
-                asyncpg.exceptions.LockNotAvailableError,
-                asyncpg.exceptions.QueryCanceledError,
-            ):
-                raise WriteBusyError(
-                    ", ".join(statement.vault_names) or "akb_sql", loop.time() - started,
-                    retry_after_secs=1,
-                ) from None
+                return await self._read_plan(statement, deadline, closed)
+            except Exception as exc:
+                if closed or isinstance(exc, (
+                    TimeoutError,
+                    asyncpg.exceptions.LockNotAvailableError,
+                    asyncpg.exceptions.QueryCanceledError,
+                )):
+                    raise WriteBusyError(
+                        ", ".join(statement.vault_names) or "akb_sql", loop.time() - started,
+                        retry_after_secs=1,
+                    ) from None
+                raise
 
-    async def _read_plan(self, statement: _Statement, deadline: float) -> frozenset[uuid.UUID]:
+    async def _read_plan(
+        self, statement: _Statement, deadline: float, closed: list[bool],
+    ) -> frozenset[uuid.UUID]:
         """Read the plan of ``_planned`` by ``deadline``, in the event loop's
-        clock: ``TimeoutError`` when no connection is free in time,
-        ``LockNotAvailableError`` past a lock's timeout, and
-        ``QueryCanceledError`` past the deadline."""
+        clock, which bounds everything after the plan slot: the wait for a
+        connection, the transaction's start, its settings and role, the
+        administrator check, ``EXPLAIN`` and the catalog lookups. Past it the
+        read is cancelled with ``TimeoutError``; a lock's timeout raises
+        ``LockNotAvailableError``, and the server's own statement timeout,
+        a backstop, ``QueryCanceledError``.
+
+        A cancelled read rolls back and gives the connection back to the
+        pool. If it still holds the connection `_PLAN_CLEANUP_SECS` after the
+        deadline, rolling back or being reset, the connection is closed
+        instead, so the pool does not get it back in an unknown state, and
+        ``closed`` says so.
+        """
         loop = asyncio.get_running_loop()
-        async with AsyncExitStack() as stack:
-            async with asyncio.timeout_at(deadline):
+        held: list[Any] = []
+
+        def close_held() -> None:
+            for conn in held:
+                terminate = getattr(conn, "terminate", None)
+                if terminate is not None:
+                    closed.append(True)
+                    terminate()
+
+        watchdog = loop.call_at(deadline + _PLAN_CLEANUP_SECS, close_held)
+        try:
+            async with asyncio.timeout_at(deadline), AsyncExitStack() as stack:
+                # Last on the way out: once the pool has the connection back,
+                # the watchdog leaves it alone.
+                stack.callback(held.clear)
                 conn = await stack.enter_async_context(self.pool.acquire())
-            async with conn.transaction():
-                left_ms = int((deadline - loop.time()) * 1000)
-                if left_ms < 1:
-                    raise TimeoutError
-                await conn.execute(
-                    "SELECT set_config('lock_timeout', $1, true), "
-                    "set_config('statement_timeout', $2, true)",
-                    f"{max(1, settings.akb_sql_plan_lock_timeout_ms)}ms", f"{left_ms}ms",
-                )
-                try:
-                    async with conn.transaction():
-                        admin_bypass = await _admin_bypass(conn, statement, lock=False)
-                        await _enter_statement_role(conn, statement, admin_bypass)
-                        await conn.execute("SET TRANSACTION READ ONLY")
-                        plan = await conn.fetchval(
-                            "EXPLAIN (VERBOSE, FORMAT JSON) " + statement.sql, *statement.params,
-                        )
-                except (asyncpg.exceptions.LockNotAvailableError, asyncpg.exceptions.QueryCanceledError):
-                    raise
-                except asyncpg.PostgresError:
-                    return frozenset()
-                relations = _modified_relations(
-                    json.loads(plan) if isinstance(plan, str) else plan,
-                )
-                if not relations:
-                    return frozenset()
-                # The trigger catalog is read under the backend role.
-                await conn.execute("SET LOCAL ROLE NONE")
-                schemas, tables = zip(*sorted(relations))
-                rows = await conn.fetch(_VAULTS_OF_TABLES, list(schemas), list(tables))
+                held.append(conn)
+                async with conn.transaction():
+                    left_ms = int((deadline - loop.time()) * 1000)
+                    if left_ms < 1:
+                        raise TimeoutError
+                    await conn.execute(
+                        "SELECT set_config('lock_timeout', $1, true), "
+                        "set_config('statement_timeout', $2, true)",
+                        f"{max(1, settings.akb_sql_plan_lock_timeout_ms)}ms",
+                        f"{left_ms + int(_PLAN_CLEANUP_SECS * 1000)}ms",
+                    )
+                    try:
+                        async with conn.transaction():
+                            admin_bypass = await _admin_bypass(conn, statement, lock=False)
+                            await _enter_statement_role(conn, statement, admin_bypass)
+                            await conn.execute("SET TRANSACTION READ ONLY")
+                            plan = await conn.fetchval(
+                                "EXPLAIN (VERBOSE, FORMAT JSON) " + statement.sql, *statement.params,
+                            )
+                    except (asyncpg.exceptions.LockNotAvailableError, asyncpg.exceptions.QueryCanceledError):
+                        raise
+                    except asyncpg.PostgresError:
+                        return frozenset()
+                    relations = _modified_relations(
+                        json.loads(plan) if isinstance(plan, str) else plan,
+                    )
+                    if not relations:
+                        return frozenset()
+                    # The trigger catalog is read under the backend role.
+                    await conn.execute("SET LOCAL ROLE NONE")
+                    schemas, tables = zip(*sorted(relations))
+                    rows = await conn.fetch(_VAULTS_OF_TABLES, list(schemas), list(tables))
+        finally:
+            watchdog.cancel()
         return frozenset(uuid.UUID(row["vault_id"]) for row in rows if row["vault_id"])
 
     async def _run(
@@ -592,11 +629,13 @@ class _PlanSlots:
     served, by capacity (``grant``), as in the Vault write admission: a
     waiter whose Vaults are not all free reserves their tokens against the
     waiters behind it, which take the slots and the other Vaults' tokens
-    left. Plans of a Vault whose table is locked therefore wait one behind
+    left. A Vault has one token, so a reservation is at most one per Vault.
+    Plans of a Vault whose table is locked therefore wait one behind
     another, whatever other Vaults they declare with it, a statement of a
     Vault no earlier waiter declares takes the next free slot, and
     single-Vault statements cannot keep a statement of several Vaults
-    waiting until its deadline by taking its Vaults in turn.
+    waiting until its deadline by taking its Vaults in turn. At most
+    `akb_sql_plan_max_waiters` statements wait; one more is refused at once.
     """
 
     def __init__(self) -> None:
@@ -647,7 +686,8 @@ async def _plan_slot(vaults: list[str]) -> AsyncIterator[None]:
     plan tokens of the declared ``vaults``, holding no connection, for at
     most `vault_write_queue_timeout_secs`. A wait that ends without them,
     refused or cancelled, leaves the queue at once, and the waiters its
-    reservation held back go on."""
+    reservation held back go on. A statement that finds
+    `akb_sql_plan_max_waiters` already waiting is refused at once."""
     loop = asyncio.get_running_loop()
     slots = _plan_slots.get(loop)
     if slots is None:
@@ -659,6 +699,13 @@ async def _plan_slot(vaults: list[str]) -> AsyncIterator[None]:
     slots.waiters.append(waiter)
     slots.grant(limit)
     if not waiter.granted.done():
+        if len(slots.waiters) > max(1, settings.akb_sql_plan_max_waiters):
+            # The queue is full: refuse at once rather than wait, so that the
+            # queue, and each walk of it, stays bounded. The new waiter is
+            # last, so leaving changes nothing for the others.
+            waiter.granted.cancel()
+            slots.waiters.remove(waiter)
+            raise WriteBusyError(", ".join(vaults) or "akb_sql", 0.0, retry_after_secs=1)
         try:
             async with asyncio.timeout(timeout):
                 await asyncio.shield(waiter.granted)

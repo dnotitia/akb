@@ -313,3 +313,190 @@ async def test_a_waiting_plan_leaves_the_free_slots_to_other_vaults(monkeypatch)
     await asyncio.gather(holder, both, only_a)
     assert order == ["a+b", "a"], order
     assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+async def test_a_statement_finding_the_plan_queue_full_is_refused_at_once(monkeypatch):
+    """At most `akb_sql_plan_max_waiters` statements wait for a plan slot.
+    One plan holds the only slot and three statements wait; a fourth is
+    refused at once with a retryable write_busy, and the three are read in
+    turn once the slot is free."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    monkeypatch.setattr(settings, "akb_sql_plan_max_waiters", 3)
+    holding, release = asyncio.Event(), asyncio.Event()
+    holder = asyncio.create_task(_hold(["busy"], holding, release))
+    await holding.wait()
+    read: list[str] = []
+
+    async def plan(vault: str) -> None:
+        async with user_sql_executor._plan_slot([vault]):
+            read.append(vault)
+
+    waiting = [asyncio.create_task(plan(f"w{i}")) for i in range(3)]
+    await asyncio.sleep(0.01)
+    assert len(_slots().waiters) == 3
+    started = time.monotonic()
+    with pytest.raises(WriteBusyError) as refused:
+        await plan("late")
+    assert time.monotonic() - started < 0.1
+    assert refused.value.retry_after_secs == 1
+    assert len(_slots().waiters) == 3
+    release.set()
+    await asyncio.gather(holder, *waiting)
+    assert read == ["w0", "w1", "w2"]
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+class _Txn:
+    """A transaction of the fake connection below; its start can be slow."""
+
+    def __init__(self, conn: "_SlowConn") -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> "_Txn":
+        if self._conn.slow_start:
+            await asyncio.sleep(self._conn.slow_start)
+        return self
+
+    async def __aexit__(self, exc_type, *_exc) -> bool:
+        if exc_type is not None and self._conn.stuck_rollback:
+            # A rollback that does not finish until the connection closes.
+            await self._conn.terminated.wait()
+            raise RuntimeError("connection is closed")
+        return False
+
+
+class _SlowConn:
+    """A connection whose statements take the time a test gives them: the
+    caller's settings (``set_config('akb.actor_id', …)``) and ``EXPLAIN``
+    for statements of a slow actor, and a transaction's start."""
+
+    def __init__(
+        self, *, settings_secs: float = 0.0, explain_secs: float = 0.0, slow_start: float = 0.0,
+        stuck_rollback: bool = False,
+    ) -> None:
+        self.settings_secs = settings_secs
+        self.explain_secs = explain_secs
+        self.slow_start = slow_start
+        self.stuck_rollback = stuck_rollback
+        self.terminated = asyncio.Event()
+
+    def transaction(self) -> _Txn:
+        return _Txn(self)
+
+    def terminate(self) -> None:
+        self.terminated.set()
+
+    async def execute(self, sql: str, *args) -> str:
+        if "akb.actor_id" in sql and args and args[0] == "slow":
+            await asyncio.sleep(self.settings_secs)
+        return "OK"
+
+    async def fetchval(self, sql: str, *args):
+        if sql.startswith("EXPLAIN"):
+            if "slow_table" in sql:
+                await asyncio.sleep(self.explain_secs)
+            return [{"Plan": {"Node Type": "Result"}}]
+        return True  # a live human administrator
+
+    async def fetch(self, sql: str, *args) -> list:
+        return []
+
+
+class _Acquire:
+    def __init__(self, conn: _SlowConn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> _SlowConn:
+        return self._conn
+
+    async def __aexit__(self, *_exc) -> bool:
+        return False
+
+
+class _ConnPool:
+    """Hands out the given connections in turn, then plain ones."""
+
+    def __init__(self, *conns: _SlowConn) -> None:
+        self._conns = list(conns)
+
+    def acquire(self) -> _Acquire:
+        return _Acquire(self._conns.pop(0) if self._conns else _SlowConn())
+
+
+def _statement(vault: str, *, slow: bool) -> "user_sql_executor._Statement":
+    return user_sql_executor._Statement(
+        user_id="00000000-0000-0000-0000-000000000001", actor_id="slow" if slow else vault,
+        sql=f"INSERT INTO {'slow_table' if slow else 'quick_table'} VALUES (1)", params=[],
+        fetch=False, is_admin=True, vault_names=[vault], check_policy=False,
+    )
+
+
+async def _two_slow_plans_and_a_third(pool: _ConnPool) -> tuple[list, float]:
+    """Plans of `x` and `y` take both slots; a plan of `z` waits behind
+    them. Returns the outcomes of the first two and how long `z` took."""
+    executor = user_sql_executor.UserSqlExecutor(pool)
+    slow = [asyncio.create_task(executor._planned(_statement(v, slow=True))) for v in ("x", "y")]
+    await asyncio.sleep(0.01)
+    started = time.monotonic()
+    assert await asyncio.wait_for(executor._planned(_statement("z", slow=False)), timeout=5) == frozenset()
+    took = time.monotonic() - started
+    outcomes = await asyncio.gather(*slow, return_exceptions=True)
+    return outcomes, took
+
+
+async def test_plan_statements_each_within_their_limit_cannot_pass_the_plan_deadline_together(monkeypatch):
+    """Plans of `x` and `y` hold both plan slots. Each spends 0.3 s on its
+    settings and 0.3 s on EXPLAIN, each within its own limit and together
+    past the plan's 0.4 s deadline. Both fail with write_busy at the
+    deadline and give their slots back, so the plan of `z` behind them is
+    read soon after. The deadline used to bound only the wait for a
+    connection, and each plan kept its slot for 0.6 s."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 2)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 400)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    pool = _ConnPool(*(_SlowConn(settings_secs=0.3, explain_secs=0.3) for _ in range(2)))
+    outcomes, took = await _two_slow_plans_and_a_third(pool)
+    assert all(isinstance(o, WriteBusyError) for o in outcomes), outcomes
+    assert took < 0.5, took
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+async def test_a_plan_whose_transaction_is_slow_to_start_gives_its_slot_back_at_the_deadline(monkeypatch):
+    """Plans of `x` and `y` hold both plan slots, and their transactions
+    take a second to start. They fail with write_busy at the plan's 0.2 s
+    deadline, so the plan of `z` behind them is read soon after. A slow
+    start used to be outside the deadline."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 2)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 200)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    pool = _ConnPool(*(_SlowConn(slow_start=1.0) for _ in range(2)))
+    outcomes, took = await _two_slow_plans_and_a_third(pool)
+    assert all(isinstance(o, WriteBusyError) for o in outcomes), outcomes
+    assert took < 0.5, took
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+async def test_a_plan_that_cannot_roll_back_in_time_closes_its_connection(monkeypatch):
+    """A plan's EXPLAIN runs past the plan's 0.2 s deadline, and its
+    rollback then does not finish. A moment after the deadline the plan
+    closes its connection instead of waiting to give it back, and fails
+    with write_busy; its slot is free again."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 200)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    monkeypatch.setattr(user_sql_executor, "_PLAN_CLEANUP_SECS", 0.1)
+    stuck = _SlowConn(explain_secs=5.0, stuck_rollback=True)
+    executor = user_sql_executor.UserSqlExecutor(_ConnPool(stuck))
+    plan = asyncio.create_task(executor._planned(_statement("x", slow=True)))
+    done, _pending = await asyncio.wait({plan}, timeout=0.6)
+    if not done:
+        # Unblock the stuck read so that the failure does not hang.
+        stuck.terminate()
+        plan.cancel()
+        await asyncio.gather(plan, return_exceptions=True)
+        pytest.fail("the plan still held its connection 0.4 s past its deadline")
+    assert stuck.terminated.is_set()
+    with pytest.raises(WriteBusyError):
+        plan.result()
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])

@@ -1345,6 +1345,10 @@ class Settings(BaseModel):
     # How long a transaction waits for admission before it fails with a
     # retryable write_busy (HTTP 429, Retry-After), having done no work.
     vault_write_queue_timeout_secs: float = 10.0
+    # Transactions that may wait for admission at once, per process, over all
+    # Vaults: a backstop that keeps the queue, and each pass over it,
+    # bounded. One more fails at once with write_busy.
+    vault_write_max_waiters: int = 1000
     # A raw SQL write reads its plan (EXPLAIN) on a pool connection before its
     # admission, to admit the Vaults it writes. At most this many plans are
     # read at once per process, and at most one for each Vault a statement
@@ -1358,6 +1362,9 @@ class Settings(BaseModel):
     # with a retryable write_busy and gives the slot back: a plan waiting for
     # one table lock after another cannot keep the slots from other Vaults.
     akb_sql_plan_timeout_ms: int = 2000
+    # Raw SQL writes that may wait for a plan slot at once, per process: a
+    # backstop like vault_write_max_waiters. One more fails at once.
+    akb_sql_plan_max_waiters: int = 1000
     # How long the app rollout worker waits for a target's Vault admission.
     # A busy Vault's targets are then deferred, all of them, and the worker
     # takes other Vaults' targets, so keep it short.

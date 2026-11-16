@@ -45,20 +45,37 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
     # A later batch is eligible only after all targets in the preceding batch
     # are applied/replayed.  This keeps the canary and 10-wide order durable.
     #
-    # The eligible targets are claimed in the order they became claimable:
-    # a deferred target when its deferral ended (lease_expires_at), any other
-    # when it was last made pending (updated_at, which the row's touch
-    # trigger sets on every update), and then in job, batch and ordinal
-    # order. A busy Vault's targets, deferred and claimable again, used to
-    # come first again by job order, so several busy Vaults kept the worker
-    # cycling through them while another Vault's rollout waited; and a
-    # target whose deferral ended waited behind every batch of another
-    # Vault's backfill, which makes its target pending again after each.
+    # Among the eligible targets, the Vault that has waited longest without
+    # the worker's attention goes first, then job, batch and ordinal order.
+    # A Vault the worker has served, by claiming, finishing or deferring one
+    # of its targets in an active job, has waited since it last did (the
+    # latest updated_at of those targets, which the rows' touch trigger sets
+    # on every update); one it has not served yet, since its target became
+    # claimable: when its job was requested, or when the batch before it
+    # finished. Targets inserted with a job and not touched since are not
+    # service. A deferral still keeps its target from being claimed until it
+    # ends.
+    #
+    # Busy Vaults' targets, deferred and claimable again, used to come first
+    # by job order, so several busy Vaults kept the worker cycling through
+    # them while another Vault's rollout waited; a target whose deferral
+    # ended waited behind every batch of another Vault's backfill, which
+    # makes its target pending again after each; and a later batch's
+    # targets, inserted with their job, came before a target whose deferral
+    # had ended while the batch before them ran.
     row = await conn.fetchrow(
         """
-        WITH eligible AS (
+        WITH served AS (
+            SELECT o.vault_id, max(o.updated_at) AS at
+              FROM app_rollout_targets o
+              JOIN app_rollout_jobs j ON j.id=o.job_id AND j.status IN ('pending','running')
+             WHERE NOT (o.state='pending' AND o.attempts=0 AND o.lease_expires_at IS NULL)
+             GROUP BY o.vault_id
+        ),
+        eligible AS (
             SELECT t.id
               FROM app_rollout_targets t
+              LEFT JOIN served s ON s.vault_id=t.vault_id
              WHERE t.state='pending'
                -- A pending target's lease expiry is the time before which it
                -- is not retried (see _defer_vault_targets).
@@ -75,8 +92,15 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
                       AND same_batch.batch_no=t.batch_no
                       AND same_batch.state='running'
                )
-             ORDER BY COALESCE(t.lease_expires_at, t.updated_at), t.job_id, t.batch_no, t.ordinal
-             FOR UPDATE SKIP LOCKED
+             ORDER BY COALESCE(
+                          s.at,
+                          GREATEST(t.updated_at, (
+                              SELECT max(earlier.completed_at) FROM app_rollout_targets earlier
+                               WHERE earlier.job_id=t.job_id AND earlier.batch_no < t.batch_no
+                          ))
+                      ),
+                      t.job_id, t.batch_no, t.ordinal
+             FOR UPDATE OF t SKIP LOCKED
              LIMIT 1
         )
         UPDATE app_rollout_targets t

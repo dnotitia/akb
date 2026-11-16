@@ -975,6 +975,98 @@ async def test_six_busy_vaults_rollouts_do_not_hold_back_a_quiet_vaults(monkeypa
         ) == 0
 
 
+async def test_a_rollout_gets_in_beside_waiters_blocked_on_another_full_vault(monkeypatch):
+    """Limit 4. Vault `reserve-a`'s four slots are taken, and four
+    transactions for it and for `reserve-b` wait. A rollout target of
+    `reserve-b` is admitted within the rollout's short wait and applied: the
+    waiters reserve one slot of `reserve-b` between them. Each used to
+    reserve one, all four, so the target was refused and deferred though
+    nothing was using `reserve-b`."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 4, raising=False)
+    monkeypatch.setattr(settings, "app_rollout_admission_wait_secs", 1.0, raising=False)
+    async with _fresh_database() as pool:
+        b_vault, b_job, _items = await _installation(
+            pool, own_items=True, vault="reserve-b", app_key="reserve-b",
+        )
+        a_vault = await _make_vault(pool, "reserve-a")
+        release = asyncio.Event()
+        held = [asyncio.Event() for _ in range(4)]
+
+        async def hold(entered: asyncio.Event) -> None:
+            async with vault_write_admission(a_vault):
+                entered.set()
+                await release.wait()
+
+        async def both() -> None:
+            async with vault_write_admission(a_vault, b_vault, timeout=30):
+                pass
+
+        holders = [asyncio.create_task(hold(entered)) for entered in held]
+        waiting: list[asyncio.Task] = []
+        try:
+            await asyncio.wait_for(asyncio.gather(*(entered.wait() for entered in held)), timeout=5)
+            waiting = [asyncio.create_task(both()) for _ in range(4)]
+            await asyncio.sleep(0.05)
+            assert await rollout_worker.run_once() == 1
+            status = await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", b_job)
+        finally:
+            release.set()
+            await asyncio.gather(*holders, *waiting, return_exceptions=True)
+        assert status == "applied"
+
+
+async def test_a_deferred_target_goes_before_a_later_batch_that_became_claimable_after_it(monkeypatch):
+    """Vault `later-a`'s rollout target is refused by its full admission and
+    deferred for a second. Another rollout has a target in `later-b1`, its
+    canary batch, and one in `later-b2`, the batch after it, both inserted
+    with the job; the canary takes longer than the deferral. Once the canary
+    is applied, the deferred target, claimable since its deferral ended, is
+    claimed before the next batch's target, claimable only since the canary
+    finished. The next batch's target used to come first, by the time its
+    row was inserted."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "app_rollout_admission_wait_secs", 0.3, raising=False)
+    monkeypatch.setattr(rollout_worker, "BUSY_RETRY_SECONDS", 1)
+    async with _fresh_database() as pool:
+        a_vault, a_job, _items = await _installation(
+            pool, own_items=True, vault="later-a", app_key="later-a", job_id=_job(1),
+        )
+        canary_vault, b_job, _items = await _installation(
+            pool, own_items=True, vault="later-b1", app_key="later-b", also_in=("later-b2",),
+            job_id=_job(2),
+        )
+        assert [r["batch_no"] for r in await pool.fetch(
+            "SELECT batch_no FROM app_rollout_targets WHERE job_id = $1 ORDER BY ordinal", b_job,
+        )] == [0, 1]
+        process = rollout_worker._process_target
+
+        async def slow_canary(target):
+            if target["vault_id"] == canary_vault:
+                await asyncio.sleep(1.5)
+            return await process(target)
+
+        monkeypatch.setattr(rollout_worker, "_process_target", slow_canary)
+        async with _vault_full(a_vault):
+            # Claimed first, refused and deferred.
+            assert await rollout_worker.run_once() == 1
+        assert await pool.fetchval(
+            "SELECT state = 'pending' AND lease_expires_at > NOW() FROM app_rollout_targets WHERE job_id = $1",
+            a_job,
+        )
+        assert await rollout_worker.run_once() == 1
+        assert await pool.fetchval(
+            "SELECT state FROM app_rollout_targets WHERE job_id = $1 AND batch_no = 0", b_job,
+        ) == "applied"
+        # Both are claimable now.
+        assert await rollout_worker.run_once() == 1
+        assert await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", a_job) == "applied"
+        assert await pool.fetchval(
+            "SELECT state FROM app_rollout_targets WHERE job_id = $1 AND batch_no = 1", b_job,
+        ) == "pending"
+        assert await rollout_worker.run_once() == 1
+        assert await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", b_job) == "applied"
+
+
 def _manifest_with_backfill(app_key: str = "rollout-order", prefix: str = "") -> tuple[dict, str, str]:
     """The upgrade of ``_installation``'s manifest, with a backfill of the new
     `orders.extra` column, one row per batch, after the columns are added."""

@@ -14,16 +14,19 @@ admitted at a time in this process; the others wait as suspended coroutines
 that hold no connection. A wait longer than
 ``vault_write_queue_timeout_secs`` raises ``WriteBusyError`` (HTTP 429 with
 ``Retry-After``, MCP ``write_busy``) before the transaction, so retrying it is
-safe. The limit is per process: with several API processes a Vault can have
-that many admitted transactions in each, and the event lock still orders them.
+safe; so does a request that finds ``vault_write_max_waiters`` transactions
+already waiting, at once. The limit is per process: with several API
+processes a Vault can have that many admitted transactions in each, and the
+event lock still orders them.
 
 Admission is re-entrant within a task: a call nested in an admitted one for
 the same Vault does not wait again. A transaction that writes events for
 several Vaults is admitted for all of them at once, under one deadline, and
 holds none of them while it waits. Waiters are admitted first come, first
-served, by capacity: one that waits reserves a slot of each of its Vaults
+served, by capacity: the first one waiting on a Vault reserves one slot of it
 against later transactions, so a full Vault holds back another Vault's
-writes only by the slots that transactions waiting for both reserve there.
+writes by at most the one slot that transactions waiting for both reserve
+there.
 Code inside an admitted transaction must not wait for another
 admission, and must not take the Bare Git write lane, which is entered before
 this admission. Vault creation takes the new Vault's write-lane gate (not a
@@ -77,14 +80,14 @@ class _State:
 
     A transaction is admitted for all its Vaults at once or not at all: it
     never holds one Vault's slot while it waits for another's. Waiters are
-    served first come, first served, by capacity (``grant``): a waiter that
-    cannot be admitted yet reserves one slot of each of its Vaults against
-    the waiters behind it, and those use the slots left. A later
+    served first come, first served, by capacity (``grant``): the first
+    waiter that cannot be admitted yet on a Vault reserves one slot of it
+    against the waiters behind it, which use the slots left. A later
     transaction therefore never takes the last slot of a Vault that an
     earlier waiter needs, so single-Vault transactions arriving one after
     another cannot keep a transaction of several Vaults waiting until its
-    deadline, while a Vault no waiter needs, or one with slots to spare,
-    keeps admitting.
+    deadline; and waiters blocked on a full Vault hold at most one slot of
+    each other Vault they name, so that Vault keeps admitting with the rest.
     """
 
     def __init__(self) -> None:
@@ -109,20 +112,22 @@ class _State:
 
         Called whenever a slot is given back or a waiter leaves, and for each
         new waiter. A waiter is admitted when each of its Vaults has a slot
-        free beyond those reserved by the waiters before it; otherwise it
-        reserves a slot of each of its Vaults and the walk goes on.
+        free beyond the one a waiter before it may have reserved there;
+        otherwise it reserves a slot of each of its Vaults that no waiter
+        before it has reserved, and the walk goes on.
         """
-        reserved: dict[uuid.UUID, int] = {}
+        reserved: set[uuid.UUID] = set()
         for waiter in list(self.waiters):
             if waiter.granted.done():
                 self.waiters.remove(waiter)
-            elif all(self.admitted.get(v, 0) + reserved.get(v, 0) < limit for v in waiter.vault_ids):
+            elif all(
+                self.admitted.get(v, 0) + (1 if v in reserved else 0) < limit for v in waiter.vault_ids
+            ):
                 self.take(waiter.vault_ids)
                 waiter.granted.set_result(None)
                 self.waiters.remove(waiter)
             else:
-                for v in waiter.vault_ids:
-                    reserved[v] = reserved.get(v, 0) + 1
+                reserved.update(waiter.vault_ids)
 
 
 # asyncio futures belong to their loop, so the state is kept per loop (tests
@@ -173,6 +178,13 @@ async def vault_write_admission(
     state.waiters.append(waiter)
     state.grant(limit)
     if not waiter.granted.done():
+        if len(state.waiters) > max(1, settings.vault_write_max_waiters):
+            # The queue is full: refuse at once rather than wait, so that the
+            # queue, and each walk of it, stays bounded. The new waiter is
+            # last, so leaving changes nothing for the others.
+            waiter.granted.cancel()
+            state.waiters.remove(waiter)
+            raise WriteBusyError(vault or ", ".join(str(v) for v in wanted), 0.0, retry_after_secs=1)
         started = time.monotonic()
         try:
             async with asyncio.timeout(timeout):

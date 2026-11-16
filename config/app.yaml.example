@@ -21,12 +21,15 @@ db_user: akb
 # without a connection, then fail with a retryable write_busy after the timeout.
 # vault_write_concurrency: 4
 # vault_write_queue_timeout_secs: 10.0
+# At most this many transactions wait at once per process; one more fails at once.
+# vault_write_max_waiters: 1000
 # A raw SQL write reads its plan before its admission: at most this many at
 # once per process, each waiting this long for a table lock, and taking this
 # long in all, before write_busy.
 # akb_sql_plan_concurrency: 2
 # akb_sql_plan_lock_timeout_ms: 500
 # akb_sql_plan_timeout_ms: 2000
+# akb_sql_plan_max_waiters: 1000
 # The app rollout worker waits this long for a target's Vault; a busy Vault's
 # pending targets are then deferred and other Vaults' targets go first.
 # app_rollout_admission_wait_secs: 1.0

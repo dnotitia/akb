@@ -356,3 +356,77 @@ async def test_a_waiter_reserves_only_the_slots_it_needs(monkeypatch):
     release_a.set()
     await asyncio.gather(*a_holders, fourth)
     assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
+
+
+async def test_waiters_blocked_on_a_full_vault_reserve_one_slot_of_another(monkeypatch):
+    """Limit 4. A's four slots are taken, and four transactions for A and B
+    wait for A. Only the first reserves a slot of B, so a transaction for B
+    alone, waiting as long as a rollout does, is admitted at once to one of
+    the three left. Each of the four waiters used to reserve a slot of B,
+    all four together, and the transaction for B waited for a Vault none of
+    them was using. When A frees a slot, the first waiter for A and B is
+    admitted."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 4)
+    a, b = uuid.uuid4(), uuid.uuid4()
+    release_a = asyncio.Event()
+    a_held = [asyncio.Event() for _ in range(4)]
+    a_holders = [asyncio.create_task(_hold(a, e, release_a)) for e in a_held]
+    await asyncio.wait_for(asyncio.gather(*(e.wait() for e in a_held)), timeout=5)
+    order: list[int] = []
+
+    async def both(number: int) -> None:
+        async with admission.vault_write_admission(a, b, timeout=5.0):
+            order.append(number)
+
+    waiting = []
+    for number in range(4):
+        waiting.append(asyncio.create_task(both(number)))
+        await asyncio.sleep(0.01)
+    async with asyncio.timeout(0.2):
+        async with admission.vault_write_admission(b, timeout=settings.app_rollout_admission_wait_secs):
+            assert admission.is_admitted(b)
+    assert order == []
+    release_a.set()
+    await asyncio.gather(*a_holders, *waiting)
+    assert order == [0, 1, 2, 3], order
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
+
+
+async def test_a_request_finding_the_queue_full_is_refused_at_once(monkeypatch):
+    """At most `vault_write_max_waiters` transactions wait. A holds its only
+    slot and three transactions wait for it; a fourth, and one for another
+    full Vault, are refused at once with a retryable write_busy, holding
+    nothing, and the three waiting are admitted in turn when A frees. The
+    queue used to grow without bound, and every arrival and departure walked
+    all of it."""
+    import time
+
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1)
+    monkeypatch.setattr(settings, "vault_write_max_waiters", 3)
+    a, other = uuid.uuid4(), uuid.uuid4()
+    release = asyncio.Event()
+    held = [asyncio.Event(), asyncio.Event()]
+    holders = [asyncio.create_task(_hold(vault, e, release)) for vault, e in zip((a, other), held)]
+    await asyncio.wait_for(asyncio.gather(*(e.wait() for e in held)), timeout=5)
+    entered = [asyncio.Event() for _ in range(3)]
+    waiters = [asyncio.create_task(_hold(a, e, asyncio.Event())) for e in entered]
+    await asyncio.sleep(0.05)
+    assert admission.snapshot()["waiting"] == 3
+    for vault in (a, other):
+        started = time.monotonic()
+        with pytest.raises(WriteBusyError) as refused:
+            async with admission.vault_write_admission(vault):
+                pytest.fail("admitted past a full queue")
+        assert time.monotonic() - started < 0.1
+        assert refused.value.retry_after_secs == 1
+    assert admission.snapshot()["waiting"] == 3
+    # A free slot is still taken at once, whatever waits elsewhere.
+    async with asyncio.timeout(0.5):
+        async with admission.vault_write_admission(uuid.uuid4()):
+            pass
+    for waiter in waiters:
+        waiter.cancel()
+    await asyncio.gather(*waiters, return_exceptions=True)
+    release.set()
+    await asyncio.gather(*holders)
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}

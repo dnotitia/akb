@@ -94,9 +94,54 @@ def _manifest(app_key: str = "rollout-order", prefix: str = "") -> tuple[dict, s
     return manifest, rollout.manifest_checksum(manifest, version="2.0.0"), current_fingerprint
 
 
+async def _install(
+    conn: asyncpg.Connection, app_id: uuid.UUID, old_id: uuid.UUID, vault: str, vault_id: uuid.UUID,
+    prefix: str, current_fingerprint: str,
+) -> None:
+    """Install the app's release `old_id` in the Vault, owning `orders` and
+    `items` at the schema it observed."""
+    installation_id = await conn.fetchval(
+        "INSERT INTO vault_app_installations(app_id,vault_id,desired_release_id,current_release_id,lifecycle) "
+        "VALUES($1,$2,$3,$3,'active') RETURNING id",
+        app_id, vault_id, old_id,
+    )
+    await conn.execute(
+        "INSERT INTO installation_grants(installation_id,generation,capabilities,issuer) "
+        "VALUES($1,1,$2,'test')",
+        installation_id, ["rollout:read", "rollout:request"],
+    )
+    for name, column in ((f"{prefix}orders", "flag"), (f"{prefix}items", "note")):
+        columns = [{"name": column, "type": "text"}]
+        await table_data_repo.create_dynamic_table(
+            conn,
+            table_data_repo.pg_table_name(vault, name),
+            columns,
+            vault_name=vault,
+            vault_id=vault_id,
+            resource_uri=f"akb://{vault}/table/{name}",
+        )
+        await conn.execute(
+            "INSERT INTO vault_tables(id,vault_id,name,columns,unique_keys,indexes) "
+            "VALUES($1,$2,$3,$4::jsonb,'[]'::jsonb,'[]'::jsonb)",
+            uuid.uuid4(), vault_id, name, json.dumps(columns),
+        )
+        await conn.execute(
+            "INSERT INTO app_owned_resources(installation_id,vault_id,resource_kind,resource_key) "
+            "VALUES($1,$2,'table',$3)",
+            installation_id, vault_id, name,
+        )
+    await conn.execute(
+        "INSERT INTO app_installation_observed_states(installation_id,app_id,vault_id,observed_generation,"
+        "observed_at,observed_release_id,observed_release_version,schema_fingerprint,observed_grant_generation) "
+        "VALUES($1,$2,$3,1,NOW(),$4,'1.0.0',$5,1)",
+        installation_id, app_id, vault_id, old_id, current_fingerprint,
+    )
+
+
 async def _installation(
     pool: asyncpg.Pool, *, own_items: bool, vault: str = _VAULT, app_key: str = "rollout-order",
     prefix: str = "", vault_id: uuid.UUID | None = None, job_id: uuid.UUID | None = None,
+    also_in: tuple[str, ...] = (),
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     """An installed app owning `orders` and `items`, with a pending upgrade.
 
@@ -104,7 +149,9 @@ async def _installation(
     so the worker's second step fails its ownership check. With `vault_id`
     the app is installed in that existing Vault, named `vault`; `prefix`
     names its tables apart from another app's there. `job_id` sets the
-    rollout job's id, which orders the worker's claims.
+    rollout job's id, which orders the worker's claims. `also_in` names new
+    Vaults the app is installed in after `vault`, so the rollout has a
+    target in each, in later batches.
     """
     manifest, checksum, current_fingerprint = _manifest(app_key, prefix)
     async with pool.acquire() as conn:
@@ -123,42 +170,12 @@ async def _installation(
             vault_id = await conn.fetchval(
                 "INSERT INTO vaults(name,git_path) VALUES($1,$2) RETURNING id", vault, f"/tmp/{vault}.git",
             )
-        installation_id = await conn.fetchval(
-            "INSERT INTO vault_app_installations(app_id,vault_id,desired_release_id,current_release_id,lifecycle) "
-            "VALUES($1,$2,$3,$3,'active') RETURNING id",
-            app_id, vault_id, old_id,
-        )
-        await conn.execute(
-            "INSERT INTO installation_grants(installation_id,generation,capabilities,issuer) "
-            "VALUES($1,1,$2,'test')",
-            installation_id, ["rollout:read", "rollout:request"],
-        )
-        for name, column in ((f"{prefix}orders", "flag"), (f"{prefix}items", "note")):
-            columns = [{"name": column, "type": "text"}]
-            await table_data_repo.create_dynamic_table(
-                conn,
-                table_data_repo.pg_table_name(vault, name),
-                columns,
-                vault_name=vault,
-                vault_id=vault_id,
-                resource_uri=f"akb://{vault}/table/{name}",
+        await _install(conn, app_id, old_id, vault, vault_id, prefix, current_fingerprint)
+        for other in also_in:
+            other_id = await conn.fetchval(
+                "INSERT INTO vaults(name,git_path) VALUES($1,$2) RETURNING id", other, f"/tmp/{other}.git",
             )
-            await conn.execute(
-                "INSERT INTO vault_tables(id,vault_id,name,columns,unique_keys,indexes) "
-                "VALUES($1,$2,$3,$4::jsonb,'[]'::jsonb,'[]'::jsonb)",
-                uuid.uuid4(), vault_id, name, json.dumps(columns),
-            )
-            await conn.execute(
-                "INSERT INTO app_owned_resources(installation_id,vault_id,resource_kind,resource_key) "
-                "VALUES($1,$2,'table',$3)",
-                installation_id, vault_id, name,
-            )
-        await conn.execute(
-            "INSERT INTO app_installation_observed_states(installation_id,app_id,vault_id,observed_generation,"
-            "observed_at,observed_release_id,observed_release_version,schema_fingerprint,observed_grant_generation) "
-            "VALUES($1,$2,$3,1,NOW(),$4,'1.0.0',$5,1)",
-            installation_id, app_id, vault_id, old_id, current_fingerprint,
-        )
+            await _install(conn, app_id, old_id, other, other_id, prefix, current_fingerprint)
     if job_id is not None:
         # The job's id comes from the column default: set it for this job.
         await pool.execute(f"ALTER TABLE app_rollout_jobs ALTER COLUMN id SET DEFAULT '{job_id}'::uuid")
