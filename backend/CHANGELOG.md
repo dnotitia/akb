@@ -69,9 +69,12 @@ specifically; the proxy has its own log in
   connection is back in the pool, closing it when the reset runs half a
   second past, and never closes a connection already back in the pool. Every
   admitted transaction likewise gives its connection back before its
-  admission, cancelled or not, so a Vault never has more connections in use
-  than admitted transactions. The plan slots and the
-  admission alike serve waiters first come, first served, by capacity: the
+  admission, cancelled or not, and so does code that runs inside an admission
+  entered without a connection (a Native mutation preparing its payload,
+  Vault creation through its seed) with each connection it takes, so a Vault
+  never has more connections in use than admitted transactions. The plan
+  slots and the admission alike serve waiters first come, first served, by
+  capacity: the
   first waiter blocked on a Vault reserves one slot of each of its Vaults
   against later requests, which use the slots left, so waiters blocked on a
   full Vault hold at most one slot of another; and one that leaves the

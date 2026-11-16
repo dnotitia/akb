@@ -196,9 +196,15 @@ back to the pool before its admission, also when its request is cancelled:
 the release, the pool's reset included, is awaited for half a second, and a
 reset still running then, or one interrupted by a cancellation, is ended by
 closing the connection, which the pool takes back without one; a
-connection already back in the pool is never closed. A Vault therefore never
-has more of the pool's connections in use, being reset or not, than
-admitted transactions. A transaction that waits longer than
+connection already back in the pool is never closed. Code that runs inside
+an admission entered without a connection gives each connection it takes back
+the same way before the code after it runs: a Native mutation, admitted before
+it prepares its payload, and Vault creation, which holds the new Vault's
+admission through its seed, take theirs, and so do the repository and role
+functions they call, through `acquire_given_back`, which outside an admission
+is the pool's own acquisition. A Vault therefore never has more of the pool's
+connections in use, being reset or not, than admitted transactions. A
+transaction that waits longer than
 `vault_write_queue_timeout_secs` (default 10 seconds) fails with a retryable
 `write_busy`: over REST, HTTP 429
 with `Retry-After: 1` and a body whose `code` is `write_busy` and whose
@@ -680,7 +686,9 @@ before those that became ready after; that a rollout target is admitted
 beside transactions waiting on another, full Vault; that upload cancels
 behind a waiting confirmation leave connections for another Vault; that
 cancelled writes hold their admission until their connection is back, so a
-slow reset does not fill the pool; that a target deferred before its batch
+slow reset does not fill the pool, a collection create's transaction and a
+Native create's payload connection taken inside its admission alike; that a
+target deferred before its batch
 was claimable waits for its batch;
 that raw SQL runs read-only without admission only when asked to, and
 otherwise as a write that waits; that raw SQL writes waiting for a table lock
@@ -716,10 +724,15 @@ is back in the pool, closing it once its reset runs past the grace; that a
 connection already back in the pool is never closed; and that a cancelled
 plan closes its connection before any rollback;
 `test_vault_write_admission_unit.py` also checks that a write cancelled
-during a slow reset keeps its admission until its connection is back;
-`test_vault_write_admission_paths_postgres.py` fails when a place enters a
-Vault's admission and takes a pool connection other than through
-`admitted_connection`;
+during a slow reset keeps its admission until its connection is back, taken
+with `admitted_connection` or inside an admission with `acquire_given_back`,
+and that outside an admission `acquire_given_back` is the pool's own
+acquisition; `test_vault_write_admission_paths_postgres.py` fails when a
+connection is taken inside an admission other than through these helpers: in
+the same `with` as the admission, or in code that runs inside an admission
+entered without a connection, followed through the application functions it
+calls as far as annotations, assignments and arguments tell what each call
+reaches;
 `test_write_busy_rest_unit.py` checks the REST response to a refused write and
 to one refused part-way.
 `test_vault_write_admission_paths_postgres.py` fills a Vault's admission and
