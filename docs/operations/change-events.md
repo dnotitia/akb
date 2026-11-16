@@ -205,11 +205,15 @@ the place back. A release that has not ended a little after the half
 second, which only asyncpg's own paths can cause, is left to the pool, to
 finish in the background, with a warning: the one case where an admission
 comes back before the pool has the connection's place. A cancellation of the
-request while the release runs is raised once it ends; an error of that
-release, which the cancellation keeps from the caller, is logged, as is the
-error of a release left to the pool. The bound's expiry, a `TimeoutError`
-without an errno, is not such an error; a timeout from the operating
-system, such as a socket's `ETIMEDOUT`, is. A request cancelled
+request takes precedence over an error of the release, whether it arrives
+while the release runs or the block delivered it before the connection went
+back: the cancellation is raised once the release ends, and the release's
+error, which it keeps from the caller, is logged, as is the error of a
+release left to the pool. The bound's expiry is not such an error, and is
+told by its source: a `TimeoutError` without an errno once the whole bound
+has passed. A timeout that comes earlier, such as a reset statement's own
+`command_timeout`, or one from the operating system, such as a socket's
+`ETIMEDOUT`, is the release's error. A request cancelled
 while a statement of its transaction runs keeps its connection and
 admission, and Vault creation its lane gate, until the transaction's
 rollback ends; the rollback waits for that statement, which the server's
@@ -379,7 +383,12 @@ for a connection, the transaction's start, its settings and role, the
 administrator check, `EXPLAIN` and the catalog lookups; and each wait for a
 table's lock may take `akb_sql_plan_lock_timeout_ms` (default 500). Past
 either, the write fails with a retryable `write_busy` and gives its slot back,
-rather than hold its connection. At the deadline, or when the request is
+rather than hold its connection. Only the plan's own deadline, told by its
+source, and its statements' lock and statement timeouts are `write_busy`: a
+plan read whose connection's release then fails reports that error as such,
+as an error giving back a connection is reported elsewhere (a timeout as
+`operation_timeout`, a connection error as `service_unavailable`). At the
+deadline, or when the request is
 cancelled, the plan closes its connection before anything waits on it (the
 plan is read in a task of its own, cancelled only after), so that neither a
 rollback nor the pool's reset waits for the cancelled statement. The connection then goes
@@ -748,8 +757,9 @@ plan's deadline bounds statements that each finish within their own limits,
 and a slow start of its transaction; that a plan that cannot roll back in
 time closes its connection; that a plan keeps its slot until its connection
 is back in the pool, closing it once its reset runs past the grace; that a
-connection already back in the pool is never closed; and that a cancelled
-plan closes its connection before any rollback;
+connection already back in the pool is never closed; that a cancelled
+plan closes its connection before any rollback; and that a plan read whose
+connection's release then fails is not `write_busy`;
 `test_vault_write_admission_unit.py` also checks that a write cancelled
 during a slow reset keeps its admission until its connection is back, taken
 with `admitted_connection` or inside an admission with `acquire_given_back`,
@@ -757,9 +767,11 @@ that a release that does not end within its bound is left to the pool a
 little after the grace, without its connection being closed under it, that
 a cancelled request's release has its timeout retrieved and its connection
 error logged, as has a release left to the pool, that a socket's timeout
-before the bound is logged for a cancelled request and raised to one that
-is not, and that outside an admission `acquire_given_back` is the pool's
-own acquisition;
+before the bound is logged for a cancelled request, also one cancelled in
+its block before the connection went back, and raised to one that is not,
+that a timeout without an errno well before the bound is raised too, and
+that outside an admission `acquire_given_back` is the pool's own
+acquisition;
 `test_vault_write_admission_paths_postgres.py` fails when a connection is
 taken inside an admission other than through these helpers: in the same
 `with` as the admission, in code that runs inside an admission entered
@@ -769,11 +781,15 @@ annotations, assignments and arguments tell what each call reaches, and
 leaving out the branch of a helper that a passed connection rules out (the
 `with` target of a context manager known to give a value is known not to be
 None, and true only when it is a connection, inside its block and until the
-name is bound anew; any other is checked both ways); it also checks that a
-plain `pool.acquire()`, or a helper called without the connection, inside an
-admitted transaction fails it, also behind a test on an empty event buffer,
-on a transaction's `with` target, or on a name bound anew by another
-`with`, an assignment or a loop;
+name is bound anew; each item of a `with` is read with what the items before
+it made known; in a `try`, a name the body binds has lost what was known of
+it in the handlers, `else` and `finally`; any other target is checked both
+ways); it also checks that a plain `pool.acquire()`, or a helper called
+without the connection, inside an admitted transaction fails it, also
+behind a test on an empty event buffer, on a transaction's `with` target, or
+on a name bound anew by another `with`, an assignment or a loop, also in a
+`try`'s `finally` or `else`, and that a helper a later item of the
+admission's own `with` calls before that item's target is bound fails it;
 `test_write_busy_rest_unit.py` checks the REST response to a refused write and
 to one refused part-way.
 `test_vault_write_admission_paths_postgres.py` fills a Vault's admission and
