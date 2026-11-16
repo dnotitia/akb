@@ -1195,11 +1195,12 @@ file, and table under `P/`.
   pre-cutover documents reference keeps its row; the response counts it in
   `retained_collection_count`, with a `hint`, and lists it in
   `retained_collections` if you can read the Vault.
-- If a table appears under the prefix while a writer's recursive delete runs,
-  the documents already deleted stay deleted, and the `permission_denied`
-  error says so (`details.partially_applied`, `details.deleted_docs`, and
-  `details.deleted_uris` if you can read the Vault). Only an admin or owner
-  can finish that delete. A `conflict` after documents went says the same.
+- If a recursive delete fails after some documents went, those stay deleted
+  and the error says so, whatever its code (`details.partially_applied`,
+  `details.deleted_docs`, and `details.deleted_uris` if you can read the
+  Vault); act on its code as usual, and the same call continues with the
+  rest. If a table appears under the prefix while a writer's delete runs,
+  only an admin or owner can finish that delete.
 
 ## Parameters
 | Param | Required | Description |

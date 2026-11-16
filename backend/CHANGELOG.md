@@ -9,17 +9,21 @@ specifically; the proxy has its own log in
 
 - On the Native authority a recursive collection delete is now atomic per
   document and completes when run again. Each document's delete commits with
-  its `document.delete` event in a short transaction that locks only that
-  document; the collections, files and tables follow with `collection.delete`
+  its `document.delete` event in a short transaction that locks the Vault's
+  row and then only that document, in the order a Vault delete locks them;
+  the collections, files and tables follow with `collection.delete`
   once no live document is left under the prefix. The delete does not lock
   every document of the prefix before deleting the first. A failure part-way
   returns the error and leaves the documents deleted so far deleted, each with
-  its event; the same delete run again continues with the rest. A writer's
+  its event; the same delete run again continues with the rest. Whatever
+  error ends a delete after it deleted documents says which ones:
+  `partially_applied`, `deleted_docs` and `deleted_uris` in its details, with
+  a hint, while the error keeps its own code, status and retry information (a
+  busy Vault is still a retryable `write_busy`). `deleted_docs` counts a
+  document restored and deleted again by the same call once. A writer's
   delete refused at a table that another request created under the prefix
-  after the delete checked for one says which documents it already deleted:
-  `partially_applied`, `deleted_docs` and `deleted_uris` in the 403's
-  details; only an admin or owner can finish it. A delete that runs out of
-  rounds while documents keep arriving says the same in its 409. The paths
+  after the delete checked for one can be finished only by an admin or
+  owner. The paths
   (`deleted_uris`, `retained_collections`) go only to a caller who may read
   the Vault; a write-only caller gets the counts. A document that
   another request deletes or moves out of the collection meanwhile is left as
