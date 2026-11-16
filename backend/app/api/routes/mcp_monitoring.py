@@ -10,12 +10,13 @@ from pydantic import AwareDatetime, StringConstraints
 from app.api.routes.admin_auth import get_current_product_admin
 from app.mcp_monitoring.report import read_operation_calls, read_report
 from app.mcp_monitoring.trace_detail import load_trace
+from app.mcp_monitoring.usage import METRIC_KEY_PATTERN, TOOL_NAME_PATTERN
 from app.mcp_monitoring.schema import AuthKind, CallerKind, MonitoringReport, OperationDetails
 
 router = APIRouter(dependencies=[Depends(get_current_product_admin)])
 
 
-MetricView = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,128}/[a-zA-Z0-9_-]{1,64}/[a-zA-Z0-9_*-]{1,64}/[0-9]{1,6}$")]
+MetricView = Annotated[str, StringConstraints(pattern=rf"^{TOOL_NAME_PATTERN}/{METRIC_KEY_PATTERN}/(?:{METRIC_KEY_PATTERN}|\*)/[0-9]{{1,6}}$")]
 
 
 def report_window(

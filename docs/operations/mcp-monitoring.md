@@ -8,7 +8,7 @@ An MCP application can declare its client name and put its job ID in `params._me
 
 ## Rollout and coverage
 
-Ship the backend and frontend together. The backend installs migrations 130 through 136 at startup. Once every serving replica runs the new backend, both direct Streamable HTTP and existing stdio clients contribute their forwarded `tools/call` requests. History starts when the collectors start.
+Ship the backend and frontend together. The backend installs the monitoring schema at startup. Once every serving replica runs the new backend, both direct Streamable HTTP and existing stdio clients contribute their forwarded `tools/call` requests. History starts when the collectors start.
 
 One observation corresponds to one authenticated tool request reaching the server MCP dispatcher, including a refusal returned with `isError`. Each independently processed client retry counts. The dashboard groups human calls by the verified AKB user ID. A revoked PAT keeps its historical row until the observations expire. The API stores the internal PAT ID and looks up its current display name. Local-only proxy activity, authentication failures, initialization, discovery, tool listing and service credentials are outside the human tool-call totals.
 
@@ -43,7 +43,7 @@ The API checks Tempo first. If the span is missing and the call is past the conf
 
 **Operations** shows one **Conversation** row for calls with the same verified AKB user, agent and conversation identifier, across prompts and credentials. The row shows the agent and a scoped operation ID. Expand it to inspect calls from the selected period. Each expanded row shows the start order, start times, durations, outcomes and individual **View trace** actions. Each action uses the observation’s own sampled span to query Tempo. Elapsed time runs from the earliest start to the latest completion among calls matching the window and filters. It includes gaps and counts overlapping time once. The operation list and call sequence each page through 50 rows.
 
-Conversation grouping uses the identifiers already present in MCP request metadata. Codex supplies `x-codex-turn-metadata.thread_id` and OpenCode supplies `ai.opencode/sessionID`. AKB also recognizes a declared Codex client’s `threadId`. For the AKB extension below, or an explicit `_meta["gen_ai.conversation.id"]`, the declared MCP client name identifies the agent. The collector stores the agent name and a derived, user-scoped grouping key. Conversation grouping starts with migration 136. Existing rows retain their original groups because the original conversation identifiers were not stored.
+Conversation grouping uses the identifiers already present in MCP request metadata. Codex supplies `x-codex-turn-metadata.thread_id` and OpenCode supplies `ai.opencode/sessionID`. AKB also recognizes a declared Codex client’s `threadId`. For the AKB extension below, or an explicit `_meta["gen_ai.conversation.id"]`, the declared MCP client name identifies the agent. The collector stores the agent name and a derived, user-scoped grouping key. Existing rows retain their original groups because the original conversation identifiers were not stored.
 
 When conversation context is unavailable, a valid MCP `_meta.traceparent` takes precedence, followed by a valid HTTP `traceparent` header. Any agent can propagate a W3C context with one trace ID per prompt. Alternatively, an agent can include this AKB extension on each `tools/call` request over stdio or Streamable HTTP:
 
@@ -53,7 +53,7 @@ When conversation context is unavailable, a valid MCP `_meta.traceparent` takes 
 
 Place `_meta` in `params`, alongside `name` and `arguments`. Generate a globally unique thread identifier per conversation and a fresh turn identifier per user prompt. Reuse the pair for all tool calls within that prompt, including concurrent calls. Each ID is 1–128 ASCII characters, starts with a letter or digit, and may also contain `.`, `_`, `:`, `@`, `/` and `-`. Client integrations should use identifiers from their agent runtime. Codex CLI already sends its native `x-codex-turn-metadata` object with these two fields. AKB checks the common extension first, then the Codex form, and stores a derived key scoped in reports to the authenticated user. A turn can contain independent Tempo traces or unsampled calls. Raw thread and turn IDs and prompt contents are never needed in the monitoring database.
 
-Requests with only a transport session, login session or per-call ID remain individual. Agents that omit a prompt boundary need their MCP integration to propagate one of the supported contexts. Turn grouping begins with migration 135. For records predating migration 134, shared sampled trace IDs can still recover a trace group and start times are estimated from completion time and duration.
+Requests with only a transport session, login session or per-call ID remain individual. Agents that omit a prompt boundary need their MCP integration to propagate one of the supported contexts. For older records without a start timestamp, shared sampled trace IDs can still recover a trace group and start times are estimated from completion time and duration.
 
 ### Agent integrations
 

@@ -421,13 +421,7 @@ async def _apply_pending_migrations(conn, applied: set[str]) -> None:
         "127_sso_operation_requests.py",  # human-approved, hash-bound service-key operation requests
         "128_approval_service_bootstrap.py",  # non-secret requester credential lineage
         "129_sso_request_recovery.py",  # permanent requester nonce and stable history paging
-        "130_mcp_monitoring.py",
-        "131_mcp_trace_reference.py",
-        "132_mcp_tool_usage.py",
-        "133_mcp_metric_declarations.py",
-        "134_mcp_operations.py",
-        "135_mcp_agent_turn.py",
-        "136_mcp_conversations.py",
+        "137_mcp_monitoring.py",
     ):
         if filename in applied:
             continue

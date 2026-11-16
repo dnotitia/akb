@@ -12,6 +12,42 @@ from app.mcp_monitoring.report import read_report
 from tests.test_event_tail_postgres import _fresh_database
 
 
+async def test_upgrade_preserves_existing_observations_and_metric_definitions():
+    from app.db import postgres
+
+    async with _fresh_database() as pool:
+        observation, actor, trace = uuid4(), uuid4(), uuid4()
+        await pool.execute("""
+            INSERT INTO mcp_monitoring.tool_calls
+                (observation_id, finished_at, actor_id, account_kind, auth_kind, tool,
+                 outcome, duration_ms, trace_id, span_id, search_returned)
+            VALUES ($1, now(), $2, 'human', 'oauth', 'akb_search', 'ok', 8, $3, $4, 0)
+        """, observation, actor, trace, b"12345678")
+        await pool.execute("""
+            INSERT INTO mcp_monitoring.metric_definitions VALUES
+                ('retired_tool', 'empty', '{"kind":"zero_rate","label":"Empty","dimensions":[]}')
+        """)
+        # The earlier schema has individual call data but no conversation columns
+        # and no receipt for the public migration.
+        await pool.execute("""
+            ALTER TABLE mcp_monitoring.tool_calls
+                DROP COLUMN conversation_key, DROP COLUMN conversation_agent;
+            DELETE FROM schema_migrations WHERE filename = '137_mcp_monitoring.py'
+        """)
+        await postgres._apply_migrations()
+        row = await pool.fetchrow("""
+            SELECT c.actor_id, c.trace_id, c.span_id, c.conversation_key, c.conversation_agent,
+                   (m.samples->>'empty_results')::boolean AS empty
+            FROM mcp_monitoring.tool_calls c JOIN mcp_monitoring.measured_calls m USING (observation_id)
+            WHERE c.observation_id = $1
+        """, observation)
+        assert tuple(row) == (actor, trace, b"12345678", None, None, True)
+        assert await pool.fetchval("""
+            SELECT descriptor->>'label' FROM mcp_monitoring.metric_definitions
+            WHERE tool='retired_tool' AND key='empty'
+        """) == "Empty"
+
+
 async def test_replica_flush_replay_and_retention():
     async with _fresh_database() as pool:
         now = datetime.now(UTC)
@@ -107,7 +143,7 @@ async def test_usage_groups_from_observations_and_old_rows():
     async with _fresh_database() as pool:
         since = datetime.now(UTC)
         user, pat = uuid4(), uuid4()
-        # Migration-132 replicas can still flush their own column layout during rollout.
+        # Older replicas can still flush their own column layout during rollout.
         for actor, tool, count, size, depth, followup, duration in [
             (user, "akb_search", None, None, None, None, 1),
             (user, "akb_search", 0, None, None, None, 1), (user, "akb_search", 3, None, None, None, 1),

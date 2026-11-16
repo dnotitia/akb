@@ -1,6 +1,7 @@
 """Server-only tool metric declarations. MCP tool schemas stay wire-compatible."""
 
 import logging
+import re
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -9,6 +10,8 @@ from mcp.types import Tool
 from pydantic import PrivateAttr
 
 logger = logging.getLogger(__name__)
+TOOL_NAME_PATTERN = r"[A-Za-z0-9_.-]{1,128}"
+METRIC_KEY_PATTERN = r"[A-Za-z0-9_-]{1,64}"
 
 
 @dataclass(frozen=True)
@@ -69,10 +72,21 @@ class MeasuredTool(Tool):
 
 def measured_tool(*metrics: Metric, **definition) -> MeasuredTool:
     tool = MeasuredTool(**definition)
+    if not re.fullmatch(TOOL_NAME_PATTERN, tool.name):
+        raise ValueError(f"Unsupported tool name for monitoring: {tool.name}")
+    _validate_keys([metric.key for metric in metrics], tool.name)
+    for metric in metrics:
+        if isinstance(metric, Latency):
+            _validate_keys([dimension.key for dimension in metric.dimensions], f"{tool.name}/{metric.key}")
     tool._metrics = metrics
-    if len({m.key for m in metrics}) != len(metrics):
-        raise ValueError(f"Duplicate metric on {tool.name}")
     return tool
+
+
+def _validate_keys(keys: list[str], owner: str) -> None:
+    if any(not re.fullmatch(METRIC_KEY_PATTERN, key) for key in keys):
+        raise ValueError(f"Invalid monitoring key on {owner}")
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"Duplicate monitoring key on {owner}")
 
 
 @dataclass

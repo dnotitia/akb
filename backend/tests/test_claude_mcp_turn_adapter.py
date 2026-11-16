@@ -12,7 +12,7 @@ from uuid import uuid4
 
 class ClaudeTurnTest(unittest.TestCase):
     def test_exact_call_binding_and_passthrough(self):
-        adapter = Path(__file__).with_name("claude_mcp_turn.py")
+        adapter = Path(__file__).resolve().parents[2] / "scripts/integrations/claude_mcp_turn.py"
         thread, first, second = (str(uuid4()) for _ in range(3))
         with tempfile.TemporaryDirectory() as tmp:
             env = {**os.environ, "XDG_CACHE_HOME": tmp}

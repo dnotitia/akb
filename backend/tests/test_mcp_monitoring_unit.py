@@ -166,6 +166,17 @@ def test_declared_metrics_project_only_bounded_values():
         assert usage.values == expected
 
 
+@pytest.mark.parametrize(("metric_key", "dimension_keys"), [
+    ("empty/results", ()), ("latency", ("page/size",)), ("latency", ("page", "page")),
+])
+def test_catalog_rejects_unaddressable_or_ambiguous_metrics(metric_key, dimension_keys):
+    from app.mcp_monitoring.usage import Dimension, Latency, measured_tool
+
+    dimensions = tuple(Dimension(key, key, lambda args, result: 1) for key in dimension_keys)
+    with pytest.raises(ValueError, match="monitoring key"):
+        measured_tool(Latency(metric_key, "Latency", dimensions), name="fixture", input_schema={"type": "object"})
+
+
 def test_operation_context_requires_valid_incoming_parent_and_ignores_sampling():
     from uuid import UUID
 
