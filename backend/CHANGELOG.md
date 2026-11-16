@@ -81,9 +81,10 @@ specifically; the proxy has its own log in
   A release that still has not ended is left to the pool with a warning,
   so it never keeps an admission or a Vault creation's lane gate; its error,
   and that of a release whose request was cancelled, before the connection
-  went back or meanwhile, is logged. Only the bound's own expiry, a timeout
-  once the whole bound has passed, is not an error, so a reset statement's
-  earlier timeout, or a socket's, is reported.
+  went back or meanwhile, is logged. A release ending in a timeout without
+  an errno, a slow reset whose connection asyncpg closed, is logged as a
+  warning and never raised, so a committed write keeps its result; a
+  socket's timeout, or any other release error, is reported.
   The plan slots and the admission alike serve waiters first come, first
   served, by capacity: the
   first waiter blocked on a Vault reserves one slot of each of its Vaults
