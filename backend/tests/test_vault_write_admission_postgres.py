@@ -14,7 +14,9 @@ import asyncio
 import contextlib
 import contextvars
 import hashlib
+import struct
 import time
+import urllib.parse
 import uuid
 
 import asyncpg
@@ -1400,6 +1402,191 @@ async def test_a_cancelled_native_write_keeps_its_admission_until_its_payload_co
         assert await admin_pool.fetchval(
             "SELECT count(*) FROM native_revisions WHERE namespace_id = $1", busy,
         ) == 0
+
+
+async def test_a_committed_write_whose_reset_runs_past_the_grace_still_succeeds():
+    """A collection create commits, and the pool's reset of its connection,
+    taken while the task was admitted, then takes two seconds. asyncpg's own
+    release, bounded by the grace, closes the connection at the grace, and
+    the create still answers with its result, about then: a reset is not the
+    write's failure."""
+    from app.services.vault_write_admission import _admitted
+
+    async with _fresh_database() as admin_pool:
+        await _make_vault(admin_pool, "reset-past-grace")
+        database = await admin_pool.fetchval("SELECT current_database()")
+
+        async def slow_reset(conn) -> None:
+            if _admitted.get():
+                await conn.execute("SELECT pg_sleep(2)")
+
+        app_pool = await asyncpg.create_pool(
+            _database_dsn(database), min_size=1, max_size=4, reset=slow_reset,
+        )
+        previous_pool = postgres_module._pool
+        postgres_module._pool = app_pool
+        loop = asyncio.get_running_loop()
+        try:
+            started = loop.time()
+            created = await CollectionService(git=object()).create(
+                vault="reset-past-grace", path="kept", summary=None, agent_id="tester",
+            )
+            elapsed = loop.time() - started
+        finally:
+            postgres_module._pool = previous_pool
+            await app_pool.close()
+        assert (created["created"], created["collection"]["path"]) == (True, "kept"), created
+        assert elapsed < 1.5, elapsed
+        assert await admin_pool.fetchval(
+            "SELECT count(*) FROM collections WHERE path = 'kept'",
+        ) == 1
+
+
+class _CancelsSwallowed:
+    """A TCP proxy in front of PostgreSQL that passes connections through but
+    swallows cancel requests: it takes them and never answers, as a server
+    that never acts on one would. A statement cancelled through it runs on
+    until it ends by itself."""
+
+    _CANCEL_REQUEST = 80877102
+
+    def __init__(self, host: str, port: int) -> None:
+        self._upstream = (host, port)
+        self.swallowed = 0
+        self._writers: list[asyncio.StreamWriter] = []
+
+    async def __aenter__(self) -> "_CancelsSwallowed":
+        self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        self._server.close()
+        for writer in self._writers:
+            writer.close()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._server.wait_closed(), timeout=5)
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._writers.append(writer)
+        try:
+            head = await reader.readexactly(8)
+        except (asyncio.IncompleteReadError, ConnectionError):
+            writer.close()
+            return
+        if struct.unpack("!ii", head)[1] == self._CANCEL_REQUEST:
+            self.swallowed += 1
+            with contextlib.suppress(ConnectionError):
+                await reader.read()  # until the client gives up on it
+            writer.close()
+            return
+        upstream_reader, upstream_writer = await asyncio.open_connection(*self._upstream)
+        self._writers.append(upstream_writer)
+        upstream_writer.write(head)
+        await asyncio.gather(_pipe(reader, upstream_writer), _pipe(upstream_reader, writer))
+
+
+async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+    except ConnectionError:
+        pass
+    finally:
+        writer.close()
+
+
+async def test_a_vault_creation_cancelled_mid_statement_reaches_its_compensation_though_the_cancel_goes_unanswered(
+    tmp_path, monkeypatch,
+):
+    """A new Bare Git Vault's seed reads the Vault's id while another
+    transaction holds the `vaults` table, and the creation is cancelled. The
+    application's pool reaches PostgreSQL through a proxy that swallows
+    cancel requests, so the statement's cancellation never completes. Its
+    connection's release still ends within the grace, asyncpg's own bound
+    closing the connection, and the creation reaches its compensation while
+    the table is still held; once the table is free it ends, with the Vault's
+    row and repository gone and its admission, write-lane gate and every
+    pool connection given back. The release used to wait for the
+    cancellation forever, after the connection was closed, so the creation
+    never reached its compensation and kept the Vault's admission and gate."""
+    from app.services import vault_write_admission as admission
+    from app.services import write_lane
+
+    async with _fresh_database() as admin_pool:
+        database = await admin_pool.fetchval("SELECT current_database()")
+        direct = urllib.parse.urlsplit(_database_dsn(database))
+        holder = await asyncpg.connect(_database_dsn(database))
+        held = holder.transaction()
+        holding: list[bool] = []
+        documents = DocumentService(git=GitService(storage_path=str(tmp_path)))
+        name = "cancel-unanswered"
+        loop = asyncio.get_running_loop()
+        compensating = asyncio.Event()
+        rollback = DocumentService._rollback_vault_create
+
+        async def observed_rollback(self, **kwargs):
+            compensating.set()
+            return await rollback(self, **kwargs)
+
+        class _TableTakingRoleSync(_AnyRoleSync):
+            async def on_public_access_change(self, _vault_id, _access) -> None:
+                # The row is in; the seed's read of the Vault's id waits.
+                await held.start()
+                holding.append(True)
+                await holder.execute("LOCK TABLE vaults IN ACCESS EXCLUSIVE MODE")
+
+        monkeypatch.setattr(DocumentService, "_rollback_vault_create", observed_rollback)
+        monkeypatch.setattr(document_service_module, "get_role_sync", lambda: _TableTakingRoleSync())
+        previous_pool = postgres_module._pool
+        async with _CancelsSwallowed(direct.hostname, direct.port) as proxy:
+            proxied = direct._replace(
+                netloc=f"{direct.username}:{direct.password}@127.0.0.1:{proxy.port}",
+            ).geturl()
+            app_pool = await asyncpg.create_pool(proxied, min_size=1, max_size=4, ssl=False)
+            postgres_module._pool = app_pool
+            creating = asyncio.create_task(documents.create_vault(name))
+            try:
+                async with asyncio.timeout(15):
+                    while not await admin_pool.fetchval(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                        "AND wait_event_type = 'Lock' AND query LIKE 'SELECT id FROM vaults WHERE name%'",
+                    ):
+                        await asyncio.sleep(0.02)
+                creating.cancel()
+                cancelled_at = loop.time()
+                await asyncio.wait_for(compensating.wait(), timeout=10)
+                reached = loop.time() - cancelled_at
+                assert proxy.swallowed >= 1
+                # The table is still held: nothing answered the cancellation.
+                assert await admin_pool.fetchval(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                    "AND wait_event_type = 'Lock'",
+                ) >= 1
+                await held.rollback()
+                holding.clear()
+                done, _ = await asyncio.wait({creating}, timeout=20)
+                assert creating in done and creating.cancelled()
+                print(f"\ncompensation reached {reached:.3f}s after the cancel; swallowed {proxy.swallowed}")
+                assert reached < 2.0, reached
+                assert await admin_pool.fetchval("SELECT count(*) FROM vaults WHERE name = $1", name) == 0
+                assert not documents.git.vault_exists(name)
+                assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
+                assert not write_lane._vault_gate(name).locked()
+                taken = [await app_pool.acquire(timeout=3) for _ in range(4)]
+                for conn in taken:
+                    await app_pool.release(conn)
+            finally:
+                if not creating.done():
+                    creating.cancel()
+                    await asyncio.wait({creating}, timeout=20)
+                if holding:
+                    with contextlib.suppress(Exception):
+                        await held.rollback()
+                await holder.close()
+                postgres_module._pool = previous_pool
+                app_pool.terminate()
 
 
 async def test_a_target_deferred_before_its_batch_was_ready_waits_for_its_batch(monkeypatch):

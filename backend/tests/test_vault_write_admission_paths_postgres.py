@@ -24,6 +24,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -633,9 +634,14 @@ def _vault_event_writers() -> set[str]:
 # ── Connections taken inside an admission ──────────────────────────────────
 
 _APP_DIR = Path(__file__).resolve().parents[1] / "app"
-# Entering one of these holds an admission, without a connection, for the
-# rest of its `with`: the items after it and the body.
-_ADMISSION_CONTEXTS = frozenset({"vault_write_admission", "_vault_write_admission", "vault_gate"})
+# Entering one of these holds an admission for the rest of its `with`: the
+# items after it and the body. `vault_write_admission` and `vault_gate` hold
+# it without a connection; `admitted_connection` with the transaction's own,
+# which the code inside passes on rather than take another.
+_ADMISSION_CONTEXTS = frozenset({
+    "vault_write_admission", "_vault_write_admission", "vault_gate",
+    "admitted_connection", "_admitted_connection",
+})
 # A method this decorates runs inside the admission the decorator enters.
 _ADMISSION_DECORATORS = frozenset({"_admitted_before_preparing"})
 # The helpers that give connections back (`admitted_connection`,
@@ -645,8 +651,13 @@ _HELPERS_MODULE = "services/vault_write_admission.py"
 _POOL_METHODS = frozenset({"acquire", "execute", "executemany", "fetch", "fetchrow", "fetchval"})
 # What the walk must reach from the roots, so that it cannot pass by
 # resolving nothing: the payload preparation and revision id of the Native
-# mutations, and the repositories and role hooks of Vault creation.
+# mutations, the repositories and role hooks of Vault creation, and the
+# connection-taking helpers that admitted transactions pass their own
+# connection to.
 _MUST_REACH = frozenset({
+    "services/access_service.py:_access_connection",
+    "repositories/vault_write_policy_repo.py:get_policy",
+    "repositories/document_repo.py:CollectionRepository.list_docs_under",
     "services/m1_pg_body_store.py:M1PgBodyStore.prepare_text",
     "services/m1_reference_payload_store.py:M1ReferencePayloadStore.prepare_text",
     "services/native_revision_service.py:NativeRevisionService._allocate_revision_id",
@@ -905,16 +916,68 @@ def _attribute_types(entry: tuple, attribute: str) -> tuple:
     return found
 
 
+def _known(test: ast.AST, present: frozenset[str]) -> bool | None:
+    """What an `if` test is when the names in `present` hold objects (not
+    None, and true), if that settles it."""
+    if isinstance(test, ast.Name):
+        return True if test.id in present else None
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        inner = _known(test.operand, present)
+        return None if inner is None else not inner
+    if (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.left, ast.Name)
+            and test.left.id in present and isinstance(test.ops[0], (ast.Is, ast.IsNot))
+            and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value is None):
+        return isinstance(test.ops[0], ast.IsNot)
+    if isinstance(test, ast.BoolOp):
+        values = [_known(value, present) for value in test.values]
+        settles, otherwise = (False, True) if isinstance(test.op, ast.And) else (True, False)
+        if settles in values:
+            return settles
+        if all(value is otherwise for value in values):
+            return otherwise
+    return None
+
+
+def _live(nodes: list, present: frozenset[str]):
+    """The nodes in and under `nodes` that can run when the names in
+    `present` hold objects: an `if` on them keeps only the branch they
+    leave, and that branch ending in `return` or `raise` drops what follows
+    it. A connection a caller passes in thus rules out the branch that takes
+    one when none was passed."""
+    for node in nodes:
+        if isinstance(node, ast.If):
+            known = _known(node.test, present)
+            if known is not None:
+                branch = node.body if known else node.orelse
+                yield from _live(branch, present)
+                if branch and isinstance(branch[-1], (ast.Return, ast.Raise)):
+                    return
+                continue
+        yield node
+        for _field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                yield from _live([item for item in value if isinstance(item, ast.AST)], present)
+            elif isinstance(value, ast.AST):
+                yield from _live([value], present)
+
+
 class _Reader:
     """One function read under an admission: the classes `self` may be an
     instance of, the types its names hold, as its annotations, assignments
-    and its caller's arguments tell, and the application functions each of
-    its calls may run."""
+    and its caller's arguments tell, the names that hold objects (`present`:
+    `with` targets, and parameters the caller passed one for), and the
+    application functions each of its calls may run."""
 
     def __init__(
         self, rel: str, owner: str | None, selves: tuple, fn: ast.AST, bound: dict | None = None,
+        passed: frozenset[str] = frozenset(),
     ) -> None:
         self.rel, self.owner, self.selves, self.fn = rel, owner, selves, fn
+        self.present = passed | {
+            item.optional_vars.id
+            for node in ast.walk(fn) if isinstance(node, (ast.With, ast.AsyncWith))
+            for item in node.items if isinstance(item.optional_vars, ast.Name)
+        }
         arguments = fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
         self.names: dict[str, tuple] = {a.arg: _annotation(rel, a.annotation) for a in arguments}
         self.names.update({name: types for name, types in (bound or {}).items() if types})
@@ -999,6 +1062,25 @@ class _Reader:
         bound.update({kw.arg: self.type_of(kw.value) for kw in call.keywords if kw.arg is not None})
         return bound
 
+    def passed(self, call: ast.Call, fn: ast.AST) -> frozenset[str]:
+        """The function's parameters the call passes an object for: a name
+        that holds one here, or a true constant."""
+        names = [a.arg for a in fn.args.posonlyargs + fn.args.args]
+        if names and names[0] in {"self", "cls"}:
+            names = names[1:]
+
+        def holds(argument: ast.AST) -> bool:
+            return (isinstance(argument, ast.Name) and argument.id in self.present) or (
+                isinstance(argument, ast.Constant) and bool(argument.value)
+            )
+
+        found = {
+            name for name, argument in zip(names, call.args)
+            if not isinstance(argument, ast.Starred) and holds(argument)
+        }
+        found |= {kw.arg for kw in call.keywords if kw.arg is not None and holds(kw.value)}
+        return frozenset(found)
+
 
 def _admission_roots():
     """Code that runs inside an admission entered without a connection: the
@@ -1043,30 +1125,77 @@ def _connections_taken_under_admission() -> tuple[dict[str, str], set[str]]:
     seen: set = set()
 
     def walk(reader: _Reader, nodes: list, path: str) -> None:
-        for top in nodes:
-            for node in ast.walk(top):
-                if not isinstance(node, ast.Call):
+        for node in _live(nodes, reader.present):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in _POOL_METHODS \
+                    and "pool" in ast.unparse(func.value).lower():
+                taken.setdefault(f"{reader.rel}:{node.lineno}", path)
+                continue
+            for rel, owner, fn, selves in reader.targets(node):
+                if rel == _HELPERS_MODULE:
                     continue
-                func = node.func
-                if isinstance(func, ast.Attribute) and func.attr in _POOL_METHODS \
-                        and "pool" in ast.unparse(func.value).lower():
-                    taken.setdefault(f"{reader.rel}:{node.lineno}", path)
+                bound = reader.bound(node, fn)
+                passed = reader.passed(node, fn)
+                key = (
+                    rel, fn.lineno, selves, passed,
+                    tuple(sorted((k, v) for k, v in bound.items() if v)),
+                )
+                if key in seen:
                     continue
-                for rel, owner, fn, selves in reader.targets(node):
-                    if rel == _HELPERS_MODULE:
-                        continue
-                    bound = reader.bound(node, fn)
-                    key = (rel, fn.lineno, selves, tuple(sorted((k, v) for k, v in bound.items() if v)))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    name = f"{rel}:{owner + '.' if owner else ''}{fn.name}"
-                    reached.add(name)
-                    walk(_Reader(rel, owner, selves, fn, bound), fn.body, f"{path} -> {name}")
+                seen.add(key)
+                name = f"{rel}:{owner + '.' if owner else ''}{fn.name}"
+                reached.add(name)
+                walk(_Reader(rel, owner, selves, fn, bound, passed), fn.body, f"{path} -> {name}")
 
     for rel, owner, selves, fn, nodes, where in _admission_roots():
         walk(_Reader(rel, owner, selves, fn), nodes, where)
     return taken, reached
+
+
+def _with_statement_in_an_admitted_transaction(rel: str, function: str, statement: str) -> dict:
+    """The application's modules, with `statement` added at the top of the
+    first `admitted_connection` block of `function` in module `rel`."""
+    tree = ast.parse((_APP_DIR / rel).read_text(encoding="utf-8"))
+    fn = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function
+    )
+    block = next(
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.AsyncWith) and any(
+            isinstance(call, ast.Call) and _name_of(call.func) == "admitted_connection"
+            for item in node.items for call in ast.walk(item.context_expr)
+        )
+    )
+    added = ast.parse(f"async def _():\n    {statement}\n").body[0].body
+    for node in added:
+        ast.increment_lineno(node, block.lineno - node.lineno)
+    block.body[:0] = added
+    modules = dict(_app_modules())
+    modules[rel] = _Module(rel, tree)
+    return modules
+
+
+@pytest.mark.parametrize("statement, site", [
+    # A second connection of the admitted transaction.
+    ("async with pool.acquire() as extra: await extra.execute('SELECT 1')", None),
+    # A helper that takes a connection when it is not given one.
+    ("await write_policy_repo.get_policy(admitted_id)", "repositories/vault_write_policy_repo.py"),
+])
+def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(monkeypatch, statement, site):
+    """`set_public_access` with a connection taken inside its admitted
+    transaction other than through the transaction's own: a plain
+    `pool.acquire()` there, or a helper called without the connection, which
+    then takes one. The check names it."""
+    rel = "services/access_service.py"
+    modules = _with_statement_in_an_admitted_transaction(rel, "set_public_access", statement)
+    monkeypatch.setattr(sys.modules[__name__], "_app_modules", lambda: modules)
+    taken, _reached = _connections_taken_under_admission()
+    flagged = [where for where, path in taken.items() if " in set_public_access" in path.split(" -> ")[0]]
+    assert flagged, taken
+    assert all(where.startswith(f"{site or rel}:") for where in flagged), flagged
 
 
 def test_every_admitted_connection_is_given_back_before_its_admission():
@@ -1079,7 +1208,10 @@ def test_every_admitted_connection_is_given_back_before_its_admission():
     the application functions they call, as far as annotations, assignments
     and arguments tell what those calls reach. A plain ``pool.acquire()``
     there, or one in the same ``async with`` as the admission, gave the
-    admission back while a cancelled release still reset the connection."""
+    admission back while a cancelled release still reset the connection.
+    Inside an ``admitted_connection`` block the transaction passes its own
+    connection on, and a helper given it does not take another: the walk
+    leaves out the branch a passed connection rules out."""
     taken, reached = _connections_taken_under_admission()
     unreached = sorted(_MUST_REACH - reached)
     assert not unreached, f"The walk no longer reaches these, so it cannot check them: {unreached}"

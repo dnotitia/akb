@@ -226,8 +226,12 @@ async def vault_write_admission(
 
 
 # How long giving a connection back to the pool may take, its reset included,
-# before the connection is closed instead.
+# before the connection is closed instead; and how much longer a release that
+# still runs after that is awaited before the caller goes on without it.
 GIVE_BACK_GRACE_SECS = 0.5
+# asyncpg's own bound closes a bounded release's connection at the grace; the
+# connection is closed here only if that release has not ended a little later.
+_BACKSTOP_MARGIN_SECS = 0.1
 
 
 def close_pooled_connection(conn: Any) -> bool:
@@ -245,46 +249,88 @@ def close_pooled_connection(conn: Any) -> bool:
     return True
 
 
+def _start_release(acquire: Any, exc_info: tuple, grace: float) -> tuple[asyncio.Future, bool]:
+    """Start giving back the connection taken with ``acquire``; and say
+    whether the release is bounded by the grace.
+
+    An asyncpg acquisition is released with asyncpg's own bound,
+    ``pool.release(conn, timeout=grace)``: a reset, or a wait for a cancelled
+    statement's cancellation to end, that runs past the grace closes the
+    connection, which the pool takes back without a reset, and raises
+    ``TimeoutError``. Another context is left as ``async with`` leaves it.
+    """
+    if isinstance(acquire, asyncpg.pool.PoolAcquireContext) and acquire.connection is not None:
+        conn, acquire.connection, acquire.done = acquire.connection, None, True
+        return asyncio.ensure_future(acquire.pool.release(conn, timeout=grace)), True
+    return asyncio.ensure_future(acquire.__aexit__(*exc_info)), False
+
+
+def _retrieve(release: asyncio.Future) -> None:
+    if not release.cancelled():
+        release.exception()
+
+
 async def give_back_connection(
     acquire: Any, conn: Any, exc_info: tuple = (None, None, None), *, grace: float | None = None,
 ) -> bool:
     """Give ``conn``, taken with ``acquire`` (a ``pool.acquire()`` context),
-    back to the pool, and return only once the pool has it.
+    back to the pool, and return once the pool has it back.
 
-    The release, the pool's reset included, runs shielded from cancellation,
-    as asyncpg's own does. Still running after the grace
-    (``GIVE_BACK_GRACE_SECS`` by default), or when this task is cancelled
-    meanwhile, the connection is closed through the pool's proxy, which ends
-    the reset, and the release is awaited until the pool has the connection
-    back; a further cancellation does not cut that wait short. A cancellation
-    is raised once the connection is back. A release that fails on its own
-    raises its error, as leaving ``async with pool.acquire()`` does; one that
-    fails after the connection was closed here does not. Returns whether the
-    connection was closed here.
+    The release runs shielded from cancellation, as asyncpg's own does, and
+    for an asyncpg pool within asyncpg's own bound (``_start_release``):
+    past the grace (``GIVE_BACK_GRACE_SECS`` by default) asyncpg closes the
+    connection. A release still running then (a little later for a bounded
+    one), or when this task is cancelled
+    meanwhile, has the connection closed through the pool's proxy, which
+    gives its place back to the pool at once, and is awaited one grace more;
+    a further cancellation does not cut that short. One still running after
+    that, such as one waiting for a cancellation that the closed connection
+    can no longer receive, is left to finish in the background with a
+    warning, since the pool already has the place back. A cancellation is
+    raised once the wait ends. A release that fails on its own raises its
+    error, as leaving ``async with pool.acquire()`` does; one that fails
+    after the connection was closed, by asyncpg at the bound it was given or
+    here, does not. Returns whether the connection was closed rather than
+    reset.
     """
     loop = asyncio.get_running_loop()
-    release = asyncio.ensure_future(acquire.__aexit__(*exc_info))
-    deadline = loop.time() + (GIVE_BACK_GRACE_SECS if grace is None else grace)
-    past_grace = False
+    grace = GIVE_BACK_GRACE_SECS if grace is None else grace
+    release, bounded = _start_release(acquire, exc_info, grace)
+    deadline = loop.time() + grace + (_BACKSTOP_MARGIN_SECS if bounded else 0.0)
+    closing = False
     closed = False
     cancelled: asyncio.CancelledError | None = None
     while not release.done():
         try:
-            if past_grace:
-                await asyncio.wait({release})
-            else:
-                await asyncio.wait({release}, timeout=max(0.0, deadline - loop.time()))
-                if not release.done():
-                    past_grace = True
-                    closed = close_pooled_connection(conn) or closed
+            await asyncio.wait({release}, timeout=max(0.0, deadline - loop.time()))
         except asyncio.CancelledError as exc:
             cancelled = cancelled or exc
-            if not past_grace:
-                past_grace = True
-                closed = close_pooled_connection(conn) or closed
-    error = None if release.cancelled() else release.exception()
+        if release.done():
+            break
+        if not closing:
+            if cancelled is None and loop.time() < deadline:
+                continue
+            closing = True
+            closed = close_pooled_connection(conn)
+            deadline = loop.time() + grace
+            continue
+        if loop.time() >= deadline:
+            logger.warning(
+                "A pool connection's release still ran %.1fs after the connection was "
+                "closed; going on without it",
+                grace,
+            )
+            release.add_done_callback(_retrieve)
+            closed = True
+            break
+    error = None
+    if release.done():
+        error = None if release.cancelled() else release.exception()
     if cancelled is not None:
         raise cancelled
+    if bounded and isinstance(error, TimeoutError):
+        # asyncpg's own bound: it closed the connection.
+        return True
     if error is not None and not closed:
         raise error
     return closed

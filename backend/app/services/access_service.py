@@ -339,12 +339,10 @@ async def check_vault_access(
     # own, and an admin override it records is inserted after that
     # connection is released, admitted like every event write of the Vault.
     own_events = EventBuffer() if _conn is None else None
-    connection_args = (
-        {"_conn": _conn, "_events": _events} if _conn is not None else {"_events": own_events}
-    )
     result = await _check_vault_access_impl(
         user_id, vault_name, required_role,
-        allow_archived=allow_archived, write_action=write_action, **connection_args,
+        allow_archived=allow_archived, write_action=write_action,
+        _conn=_conn, _events=_events if _conn is not None else own_events,
     )
     if own_events:
         pool = await get_pool()
