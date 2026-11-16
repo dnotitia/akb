@@ -13,6 +13,7 @@ vi.mock("@/lib/api", async (original) => ({
 
 const summary = { calls: 3, sso_calls: 1, pat_calls: 2, service_key_calls: 0, active_users: 1, errors: 0, decided: 3, p95_ms: 2 };
 const base: MonitoringRow = { ...summary, user_id: null, pat_id: null, tool: null, auth_kind: null, label: null };
+const noFailure = { error_code: null, error_reason: null };
 const report: MonitoringReport = {
   operations: [], has_more_operations: false,
   metrics: [
@@ -23,7 +24,7 @@ const report: MonitoringReport = {
       rows: [{ values: { page: true, depth: 1 }, calls: 3, p95_ms: 17 }], active: true, group: null, page: 0, has_more: false },
   ],
   recent_calls: [1, 2].map(i => ({
-    observation_id: String(i), finished_at: `2026-01-01T00:00:0${i}Z`, actor_id: "user-1", user_label: "Fixture user",
+    ...noFailure, observation_id: String(i), finished_at: `2026-01-01T00:00:0${i}Z`, actor_id: "user-1", user_label: "Fixture user",
     auth_kind: "pat", pat_id: "01234567-abcd", pat_label: "Desktop", tool: "akb_help", outcome: "ok", duration_ms: i, trace_available: false,
   })), summary, window: { from: "2026-01-01T00:00:00Z", to: "2026-01-02T00:00:00Z" },
   collection: { enabled: true, retention_days: 30, started_at: null, last_flush: null, dropped: 0, stale_writers: 0, disabled_writers: 0 },
@@ -129,19 +130,21 @@ it("shows the measured search denominator, handles missing data, and groups brow
 });
 
 it.each(["trace", "turn", "conversation"] as const)("expands a %s in start order with per-call traces", async kind => {
-  const op = { id: "12345678-parent", kind, actor_id: "actor", user_label: "Operator", calls: 2, correlated: true,
+  const op = { ...noFailure, succeeded: 1, errors: 1, cancelled: 0, trace_calls: 0, trace_observation_id: null, id: "12345678-parent", kind, actor_id: "actor", user_label: "Operator", calls: 2, correlated: true,
     started_at: report.window.from, finished_at: report.window.to, elapsed_ms: 250, tool: null,
     agent: kind === "conversation" ? "Codex" : null };
   vi.mocked(getMcpMonitoring).mockResolvedValue({ ...report, operations: [
-    op, ...["a", "b"].map(id => ({ ...op, id, kind: "individual" as const, calls: 1, correlated: false, tool: "akb_help", elapsed_ms: 1 })),
+    op, ...["a", "b"].map(id => ({ ...op, id, kind: "individual" as const, errors: 0, calls: 1, correlated: false, tool: "akb_help", elapsed_ms: 1 })),
   ] });
   vi.mocked(getMcpOperationCalls).mockResolvedValue({ has_more: false, calls: ["akb_browse", "akb_help"].map((tool, i) => ({
-    observation_id: String(i), tool, outcome: "ok", finished_at: report.window.to, started_at: report.window.from,
+    ...noFailure, observation_id: String(i), tool, outcome: "ok", finished_at: report.window.to, started_at: report.window.from,
     duration_ms: i ? 7 : 120, position: i + 1, trace_available: i === 1,
   })) });
   renderPage();
   const operations = within(await screen.findByRole("table", { name: "Operations" }));
   expect(operations.getAllByText("Individual call")).toHaveLength(2);
+  expect(operations.getByText("Has errors")).toBeVisible();
+  expect(operations.getByText("1 failed · 1 succeeded")).toBeVisible();
   expect(operations.getByText("250 ms")).toBeVisible();
   if (kind === "conversation") expect(operations.getByText("Codex")).toBeVisible();
   const label = { conversation: "Conversation", trace: "Trace", turn: "Agent turn" }[kind];
@@ -163,7 +166,7 @@ it.each(["trace", "turn", "conversation"] as const)("expands a %s in start order
 });
 
 it("switches from a human PAT to service jobs and scopes their call sequence", async () => {
-  const op = { id: "12345678-job", actor_id: "svc", user_label: "Importer", calls: 3, correlated: true,
+  const op = { ...noFailure, succeeded: 3, errors: 0, cancelled: 0, trace_calls: 0, trace_observation_id: null, id: "12345678-job", actor_id: "svc", user_label: "Importer", calls: 3, correlated: true,
     kind: "conversation" as const, agent: "import-app", tool: null, elapsed_ms: 14,
     started_at: report.window.from, finished_at: report.window.to };
   vi.mocked(getMcpMonitoring).mockImplementation(async params => params.get("caller_kind") === "service"
@@ -208,4 +211,30 @@ it.each([
     expect(dialog.queryByRole("button", { name: "Retry" })).toBeNull();
   }
   vi.mocked(getMcpCallTrace).mockReset();
+});
+
+it("drills from tool errors into a failed call and opens the single operation's Tempo trace", async () => {
+  const failure = { error_code: "permission_denied", error_reason: "The caller lacks permission for this resource." };
+  const call = { ...report.recent_calls[0], ...failure, outcome: "tool_error" as const, trace_available: true };
+  const op = { ...failure, succeeded: 0, cancelled: 0, errors: 1, calls: 1, correlated: false,
+    id: "single", tool: call.tool, kind: "individual" as const, agent: null, actor_id: call.actor_id,
+    started_at: report.window.from, finished_at: report.window.to, elapsed_ms: 1, user_label: call.user_label,
+    trace_calls: 1, trace_observation_id: call.observation_id };
+  vi.mocked(getMcpMonitoring).mockResolvedValue({ ...report, operations: [op], recent_calls: [call],
+    tools: [{ ...report.tools[0], errors: 1 }] });
+  vi.mocked(getMcpCallTrace).mockResolvedValue({ trace_id: "test-trace", spans: [] });
+  renderPage();
+  const operations = within(await screen.findByRole("table", { name: "Operations" }));
+  expect(operations.getByText("Failed")).toBeVisible();
+  await userEvent.click(operations.getByRole("button", { name: "View trace" }));
+  expect(await within(await screen.findByRole("dialog")).findByText("test-trace")).toBeVisible();
+  await userEvent.keyboard("{Escape}");
+  await userEvent.click(screen.getByRole("button", { name: "Inspect 1 error for akb_help" }));
+  const recent = within(await screen.findByRole("table", { name: "Recent calls" }));
+  expect(recent.getByText("permission_denied")).toBeVisible();
+  expect(recent.getByText(failure.error_reason)).toBeVisible();
+  expect(screen.getByRole("checkbox", { name: "Errors only" })).toBeChecked();
+  const params = vi.mocked(getMcpMonitoring).mock.lastCall![0];
+  expect(params.get("tool")).toBe("akb_help");
+  expect(params.get("history_errors_only")).toBe("true");
 });

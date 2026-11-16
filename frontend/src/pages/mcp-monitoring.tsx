@@ -1,13 +1,15 @@
 import { McpOperations } from "./mcp-operations";
-import { callTime, outcomes } from "@/lib/mcp-monitoring";
+import { McpTools } from "./mcp-tools";
+import { CallOutcome } from "./mcp-outcome";
+import { callTime } from "@/lib/mcp-monitoring";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { McpToolUsage } from "./mcp-tool-usage";
 import { CallTrace } from "./mcp-call-trace";
 import { CallTrend } from "./mcp-call-trend";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { ChevronLeft, RefreshCw, X } from "lucide-react";
+import { ChevronLeft, RefreshCw, Workflow, X } from "lucide-react";
 import { PageHeader } from "@/components/ui/page-header";
 import { Panel, PanelHeader } from "@/components/ui/panel";
 import { Button } from "@/components/ui/button";
@@ -18,9 +20,9 @@ import { SelectMenu } from "@/components/ui/select-menu";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, getMcpMonitoring } from "@/lib/api";
-import type { AuthKind, Breakdown, CallerKind, CredentialInfo, MonitoringReport, MonitoringRow } from "@/lib/mcp-monitoring";
+import type { AuthKind, CallerKind, CredentialInfo, MonitoringReport, MonitoringRow } from "@/lib/mcp-monitoring";
 
-const groups: Breakdown[] = ["users", "credentials", "tools"];
+const groups = ["users", "credentials"] as const;
 const firstPages = { users: 0, credentials: 0, tools: 0, operations: 0 };
 const callerOptions = [{ value: "human", label: "Users" }, { value: "service", label: "Service callers" }];
 const periods = [{ value: "1", label: "Last 24 hours" }, { value: "7", label: "Last 7 days" }, { value: "30", label: "Last 30 days" }];
@@ -66,7 +68,7 @@ function RecentCalls({ report, service }: { report: MonitoringReport; service: b
         </p>}
         <div className="overflow-x-auto"><table aria-label="Recent calls" className="w-full text-left text-sm tabular-nums">
           <thead className="text-xs text-foreground-muted"><tr>
-            {["Completed", service ? "Service caller" : "User", "Credential", "Current status", "Tool", "Outcome", "Duration", "Trace"].map(label =>
+            {["Completed", service ? "Service caller" : "User", "Credential", "Current status", "Tool", "Outcome", "Duration", "Tempo trace"].map(label =>
               <th key={label} scope="col" className="px-4 py-2">{label}</th>)}
           </tr></thead>
           <tbody className="divide-y divide-border">{calls.map(call =>
@@ -75,10 +77,10 @@ function RecentCalls({ report, service }: { report: MonitoringReport; service: b
               <td className="px-4">{call.user_label || `Former account · ${call.actor_id.slice(0, 8)}`}</td>
               <td className="px-4">{call.auth_kind === "service" ? "Service key" : call.auth_kind === "oauth" ? (service ? "OAuth" : "SSO") : `${call.pat_label || "PAT"} · ${call.pat_id?.slice(0, 8)}`}</td>
               <td className="px-4"><CredentialState info={call} /></td>
-              <td className="px-4">{call.tool}</td><td className="px-4">{outcomes[call.outcome]}</td>
+              <td className="px-4">{call.tool}</td><td className="px-4"><CallOutcome call={call} /></td>
               <td className="whitespace-nowrap px-4">{call.duration_ms} ms</td>
               <td className="whitespace-nowrap px-4">{call.trace_available
-                ? <Button variant="link" size="sm" onClick={() => setSelected(call)}>View trace</Button>
+                ? <Button variant="link" size="sm" onClick={() => setSelected(call)}><Workflow aria-hidden size={15} />View trace</Button>
                 : <span aria-label="No trace recorded" className="text-foreground-muted">—</span>}</td>
             </tr>)}</tbody>
         </table></div>
@@ -91,8 +93,12 @@ function RecentCalls({ report, service }: { report: MonitoringReport; service: b
 export default function McpMonitoringPage() {
   const [caller, setCaller] = useState<CallerKind>("human");
   const service = caller === "service";
-  const titles = { users: service ? "Service callers" : "Users", credentials: "Credentials", tools: "Tools" };
+  const titles = { users: service ? "Service callers" : "Users", credentials: "Credentials" };
   const [days, setDays] = useState("7");
+  const jumpToHistory = useRef(false);
+  const historyRef = useRef<HTMLDivElement>(null);
+  const [errorsOnly, setErrorsOnly] = useState(false);
+  const [toolSort, setToolSort] = useState("calls");
   const [historyView, setHistoryView] = useState("operations");
   const [until, setUntil] = useState(Date.now);
   const [filters, setFilters] = useState<Filters>({});
@@ -106,6 +112,8 @@ export default function McpMonitoringPage() {
   for (const [metric, view] of Object.entries(metricViews)) {
     params.append("metric_view", `${metric}/${view.group}/${view.page}`);
   }
+  if (errorsOnly) params.set("history_errors_only", "true");
+  if (toolSort !== "calls") params.set("tool_sort", toolSort);
   if (filters.user) params.set("user_id", filters.user.id);
   if (filters.auth) params.set("auth_kind", filters.auth);
   if (filters.pat) params.set("pat_id", filters.pat.id);
@@ -122,7 +130,20 @@ export default function McpMonitoringPage() {
     else if (row.tool) update({ ...filters, tool: row.tool });
     else if (row.auth_kind) update({ ...filters, auth: row.auth_kind, pat: row.pat_id ? { id: row.pat_id, label } : undefined });
   };
+  function inspectErrors(tool = filters.tool) {
+    update({ ...filters, tool });
+    setHistoryView("recent");
+    setErrorsOnly(true);
+    jumpToHistory.current = true;
+  }
   const report = query.data;
+  useEffect(() => {
+    if (report && jumpToHistory.current) {
+      jumpToHistory.current = false;
+      historyRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true });
+      historyRef.current?.scrollIntoView?.({ block: "start" });
+    }
+  }, [report, historyView, errorsOnly]);
   const measured = report?.series.some((point) => point.coverage !== "unmeasured");
   const denied = query.error instanceof ApiError && [401, 403].includes(query.error.status);
   return (
@@ -154,7 +175,10 @@ export default function McpMonitoringPage() {
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             <StatTile label="Observed calls" value={measured ? report.summary.calls : "—"} kind={measured && !service ? `SSO ${report.summary.sso_calls} · PAT ${report.summary.pat_calls}` : undefined} />
             <StatTile label={service ? "Active service callers" : "Active users"} value={measured ? report.summary.active_users : "—"} />
-            <StatTile label="Error rate" value={report.summary.decided ? `${(100 * report.summary.errors / report.summary.decided).toFixed(1)}%` : "—"} kind={measured ? `${report.summary.errors} ${report.summary.errors === 1 ? "error" : "errors"}` : undefined} />
+            <button type="button" className="rounded-[var(--radius-lg)] text-left focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default"
+              disabled={!report.summary.errors} onClick={() => inspectErrors()}>
+              <StatTile className={report.summary.errors ? "h-full border-destructive/50 text-destructive" : "h-full"} label="Error rate" value={report.summary.decided ? `${(100 * report.summary.errors / report.summary.decided).toFixed(1)}%` : "—"} kind={measured ? `${report.summary.errors} ${report.summary.errors === 1 ? "error" : "errors"}` : undefined} />
+            </button>
             <StatTile label="p95 duration" value={report.summary.p95_ms === null ? "—" : `${report.summary.p95_ms} ms`} />
           </div>
           <p className="text-sm text-foreground-muted" role="status">
@@ -167,6 +191,25 @@ export default function McpMonitoringPage() {
             {report.collection.dropped > 0 && ` Dropped by retained collectors: ${report.collection.dropped}.`}
           </p>
           <CallTrend series={report.series} end={report.window.to} />
+          <McpTools report={report} sort={toolSort} setSort={value => { setToolSort(value); setPages({ ...pages, tools: 0 }); }}
+            select={select} inspectErrors={inspectErrors} page={pages.tools} setPage={tools => setPages({ ...pages, tools })} />
+          <Tabs ref={historyRef} value={historyView} onValueChange={setHistoryView}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <TabsList aria-label="Call history views">
+                <TabsTrigger value="operations">Operations</TabsTrigger>
+                <TabsTrigger value="recent">Recent calls</TabsTrigger>
+              </TabsList>
+              <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-sm font-medium">
+                <input type="checkbox" checked={errorsOnly} className="size-4 accent-primary"
+                  onChange={event => { setErrorsOnly(event.target.checked); setPages({ ...pages, operations: 0 }); }} />Errors only
+              </label>
+            </div>
+            <TabsContent value="operations">
+              <McpOperations key={params.toString()} report={report} filters={params} page={pages.operations}
+                setPage={operations => setPages({ ...pages, operations })} />
+            </TabsContent>
+            <TabsContent value="recent"><RecentCalls report={report} service={service} /></TabsContent>
+          </Tabs>
           <McpToolUsage metrics={report.metrics} onView={(key, group, page) =>
             setMetricViews(previous => ({ ...previous, [key]: { group, page } }))} />
           {groups.map((group) => (
@@ -180,7 +223,7 @@ export default function McpMonitoringPage() {
                 <div className="overflow-x-auto"><table aria-label={titles[group]} className="w-full text-left text-sm tabular-nums">
                   <thead className="text-xs text-foreground-muted"><tr>
                     {(group === "users" ? [service ? "Service caller" : "User", "Calls", ...(service ? ["Service keys", "OAuth"] : ["SSO"]), "PAT", "Errors"] :
-                      [...(group === "tools" ? ["Tool"] : ["Credential", "Current status", "Last observed"]), "Calls", "Errors", "p95"]).map((label) =>
+                      ["Credential", "Current status", "Last observed", "Calls", "Errors", "p95"]).map((label) =>
                       <th key={label} scope="col" className="px-4 py-2">{label}</th>)}
                   </tr></thead>
                   <tbody className="divide-y divide-border">{report[group].map((row) => (
@@ -205,17 +248,7 @@ export default function McpMonitoringPage() {
               </div>}
             </Panel>
           ))}
-          <Tabs value={historyView} onValueChange={setHistoryView}>
-            <TabsList aria-label="Call history views">
-              <TabsTrigger value="operations">Operations</TabsTrigger>
-              <TabsTrigger value="recent">Recent calls</TabsTrigger>
-            </TabsList>
-            <TabsContent value="operations">
-              <McpOperations key={params.toString()} report={report} filters={params} page={pages.operations}
-                setPage={operations => setPages({ ...pages, operations })} />
-            </TabsContent>
-            <TabsContent value="recent"><RecentCalls report={report} service={service} /></TabsContent>
-          </Tabs>
+
         </>}
       </div>
     </main>

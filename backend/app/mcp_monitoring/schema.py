@@ -34,7 +34,12 @@ class BreakdownRow(Metrics, CredentialInfo):
     label: str | None
 
 
-class RecentCall(CredentialInfo):
+class FailureDetail(TypedDict):
+    error_code: str | None
+    error_reason: str | None
+
+
+class RecentCall(CredentialInfo, FailureDetail):
     observation_id: UUID
     finished_at: datetime
     actor_id: UUID
@@ -113,7 +118,12 @@ class MetricPanel(TypedDict):
     has_more: bool
 
 
-class Operation(TypedDict):
+class Operation(FailureDetail):
+    errors: int
+    succeeded: int
+    cancelled: int
+    trace_calls: int
+    trace_observation_id: UUID | None
     kind: Literal["conversation", "trace", "turn", "individual"]
     agent: str | None
     id: UUID
@@ -127,7 +137,7 @@ class Operation(TypedDict):
     tool: str | None
 
 
-class OperationCall(TypedDict):
+class OperationCall(FailureDetail):
     trace_available: bool
     position: int
     observation_id: UUID

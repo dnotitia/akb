@@ -15,7 +15,10 @@
     FROM bucketed
     GROUP BY GROUPING SETS ((), (bucket), (actor_id), (tool), (auth_kind, CASE WHEN $3::uuid IS NOT NULL THEN pat_id END))
 ), ranked AS (
-    SELECT *, row_number() OVER (PARTITION BY section ORDER BY calls DESC, actor_id, auth_kind, pat_id, tool) AS rn,
+    SELECT *, row_number() OVER (PARTITION BY section ORDER BY
+               CASE WHEN section='tools' AND $14::text='errors' THEN errors END DESC NULLS LAST,
+               CASE WHEN section='tools' AND $14::text='latency' THEN p95_ms END DESC NULLS LAST,
+               calls DESC, actor_id, auth_kind, pat_id, tool) AS rn,
            count(*) OVER (PARTITION BY section) AS group_count,
            CASE section WHEN 'users' THEN $11::int WHEN 'credentials' THEN $12::int
                         WHEN 'tools' THEN $13::int ELSE 0 END AS skip

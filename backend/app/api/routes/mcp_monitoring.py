@@ -39,6 +39,8 @@ Window = Annotated[tuple[datetime, datetime], Depends(report_window)]
 @router.get("/admin/mcp-monitoring", response_model=MonitoringReport, summary="Read the MCP monitoring dashboard")
 async def mcp_monitoring(
     window: Window,
+    history_errors_only: bool = False,
+    tool_sort: Literal["calls", "errors", "latency"] = "calls",
     operation_page: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     user_id: UUID | None = None,
     caller_kind: CallerKind = "human",
@@ -60,6 +62,7 @@ async def mcp_monitoring(
         views[f"{name}/{key}"] = {"group": group, "page": int(page)}
     return await read_report(
         *window, user_id, auth_kind, pat_id, tool, user_page, credential_page, tool_page, browse_group, browse_page, views, operation_page, caller_kind,
+        history_errors_only, tool_sort,
     )
 
 

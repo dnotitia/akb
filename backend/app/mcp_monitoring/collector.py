@@ -8,18 +8,21 @@ import logging
 import re
 import time
 from collections import deque
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from typing import Any, NamedTuple
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
+from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult
 from opentelemetry import trace
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from app.config import settings
 from app.db.postgres import get_pool
+from app.mcp_monitoring.errors import CallFailure, capture_error_code, current_failure
 from app.mcp_monitoring.usage import CallMeasurements, current_usage
 from app.services._backfill import BackfillRunner
 from app.services.auth_service import AuthenticatedUser
@@ -45,7 +48,7 @@ def _request_trace_id(ctx: ServerRequestContext) -> UUID | None:
     return None
 
 
-def _agent_turn_id(meta: dict) -> UUID | None:
+def _agent_turn_id(meta: Mapping[str, Any]) -> UUID | None:
     for key in ("com.dnotitia.akb/turn", "x-codex-turn-metadata"):
         turn = meta.get(key)
         if isinstance(turn, dict):
@@ -114,6 +117,7 @@ class Observation(NamedTuple):
     agent_turn_id: UUID | None = None
     conversation_key: UUID | None = None
     conversation_agent: str | None = None
+    error_code: str | None = None
 
 
 class Collector:
@@ -173,6 +177,7 @@ class Collector:
                 _agent_turn_id(ctx.meta or {}) if parent is None else None,
                 conversation,
                 agent,
+                failure.code if outcome in ("tool_error", "rpc_error") and (failure := current_failure.get()) else None,
             )
         )
 
@@ -204,8 +209,8 @@ class Collector:
                     """
                     INSERT INTO mcp_monitoring.tool_calls
                         (observation_id,finished_at,actor_id,account_kind,auth_kind,pat_id,tool,outcome,duration_ms,trace_id,span_id,
-                         usage,started_at,request_trace_id,agent_turn_id,conversation_key,conversation_agent)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT (observation_id) DO NOTHING
+                         usage,started_at,request_trace_id,agent_turn_id,conversation_key,conversation_agent,error_code)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT (observation_id) DO NOTHING
                 """,
                     batch,
                 )
@@ -290,8 +295,9 @@ async def observe_tool(ctx: ServerRequestContext[Any, Any], call_next: CallNext)
     from mcp_server.tools import TOOL_METRICS, catalog_tool_name
 
     tool = catalog_tool_name((ctx.params or {}).get("name"))
-    if collector.running and settings.mcp_monitoring.enabled and (metrics := TOOL_METRICS.get(tool)):
-        with current_usage.set(CallMeasurements(metrics)):
+    if collector.running and settings.mcp_monitoring.enabled:
+        metrics = TOOL_METRICS.get(tool)
+        with current_failure.set(CallFailure()), current_usage.set(CallMeasurements(metrics) if metrics else None):
             return await _observe_completion(ctx, call_next, user, tool)
     return await _observe_completion(ctx, call_next, user, tool)
 
@@ -313,7 +319,9 @@ async def _observe_completion(
     except asyncio.CancelledError:
         outcome = "cancelled"
         raise
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, MCPError):
+            capture_error_code(str(exc.code))
         outcome = "rpc_error"
         raise
     finally:

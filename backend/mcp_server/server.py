@@ -25,6 +25,7 @@ from typing import Any
 from pydantic import ValidationError as ModelValidationError
 
 from app.mcp_monitoring.collector import observe_tool
+from app.mcp_monitoring.errors import capture_error_code
 from app.mcp_monitoring.usage import measure_result
 from app.util.git_refs import HEX_COMMIT_RE
 
@@ -2001,10 +2002,10 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             encoded,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
-        return CallToolResult(
-            content=[TextContent(type="text", text=encoded)],
-            is_error=_is_error_envelope(result),
-        )
+        is_error = _is_error_envelope(result)
+        if is_error:
+            capture_error_code(result.get("code"))
+        return CallToolResult(content=[TextContent(type="text", text=encoded)], is_error=is_error)
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
         # introduced in 0.5.6 holds for every response path — including
@@ -2033,6 +2034,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 is_write=is_write,
             )
+        capture_error_code(envelope.get("code"))
         encoded = json.dumps(envelope, ensure_ascii=False, default=str)
         _log_response_size(
             name,

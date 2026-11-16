@@ -23,7 +23,7 @@ export function CallTrace({ call, close }: { call: { observation_id: string; too
   });
   return <Dialog open onOpenChange={open => { if (!open) close(); }}>
     <DialogContent>
-      <DialogHeader><DialogTitle>Call trace</DialogTitle><DialogDescription>{call.tool}</DialogDescription></DialogHeader>
+      <DialogHeader><DialogTitle>Call trace</DialogTitle><DialogDescription>Tempo · {call.tool}</DialogDescription></DialogHeader>
       {query.isPending && <p role="status">Loading trace…</p>}
       {query.isError && <TraceNotice error={query.error} retry={() => void query.refetch()} />}
       {query.data && !query.isError && <>

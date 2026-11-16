@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from mcp.shared.exceptions import MCPError
 from starlette.datastructures import Headers
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
@@ -43,6 +44,33 @@ async def test_middleware_records_and_propagates_failures(monkeypatch, failure, 
     with pytest.raises(failure):
         await module.observe_tool(ctx, failed)
     assert recorder.dropped == 1
+
+
+async def test_concurrent_failures_keep_only_their_own_catalog_codes(monkeypatch):
+    recorder = module.Collector()
+    monkeypatch.setattr(module, "collector", recorder)
+    recorder.running = True
+    user = AuthenticatedUser(str(uuid4()), "fixture", "", None, False, "oauth")
+    ctx = SimpleNamespace(request_id=1, method="tools/call", params={"name": "akb_help"}, meta=None,
+                          request=SimpleNamespace(scope={"akb.mcp.user": user}, headers=Headers()))
+
+    async def tool_failure(code):
+        async def complete(_ctx):
+            module.capture_error_code(code)
+            await asyncio.sleep(0)
+            return {"isError": True}
+        return await module.observe_tool(ctx, complete)
+
+    async def rpc_failure(_ctx):
+        raise MCPError(-32602, "sensitive error message")
+
+    await asyncio.gather(tool_failure("not_found"), tool_failure("sensitive-error-code"))
+    with pytest.raises(MCPError):
+        await module.observe_tool(ctx, rpc_failure)
+    assert {(r.outcome, r.error_code) for r in recorder.queue} == {
+        ("tool_error", "not_found"), ("tool_error", None), ("rpc_error", "-32602"),
+    }
+    assert "sensitive" not in repr(recorder.queue)
 
 
 def test_export_uses_only_catalog_values_and_trace_ids():

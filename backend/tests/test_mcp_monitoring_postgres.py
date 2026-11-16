@@ -377,3 +377,33 @@ async def test_service_jobs_and_details_stay_out_of_human_reports():
         # Revoked service-owned PATs have no live token row.
         filtered = await read_report(start, end, actor, "pat", pat, None, 0, 0, 0, caller_kind="service")
         assert filtered["summary"]["calls"] == 1
+
+
+async def test_failure_history_preserves_full_sequences_and_ranks_before_paging():
+    from app.mcp_monitoring.report import read_operation_calls
+
+    async with _fresh_database():
+        start = datetime.now(UTC) - timedelta(minutes=5)
+        actor, job = uuid4(), uuid4()
+        base = Observation(uuid4(), start, actor, "human", "oauth", None, "akb_browse", "tool_error", 22,
+                           started_at=start, conversation_key=job, conversation_agent="fixture",
+                           error_code="permission_denied")
+        writer = Collector()
+        writer.queue.append(base)
+        writer.queue.append(base._replace(observation_id=uuid4(), outcome="ok", error_code=None))
+        for i in range(55):
+            writer.queue.append(base._replace(observation_id=uuid4(), finished_at=start + timedelta(seconds=i + 1),
+                                              tool="akb_help", outcome="ok", duration_ms=1, error_code=None,
+                                              conversation_key=None, conversation_agent=None))
+        await writer.flush()
+        end = datetime.now(UTC)
+        args = (start, end, actor, None, None, None)
+        report = await read_report(*args, 0, 0, 0, history_errors_only=True, tool_sort="errors")
+        assert report["summary"]["calls"] == 57
+        assert [r["tool"] for r in report["tools"]] == ["akb_browse", "akb_help"]
+        [failed] = report["recent_calls"]
+        assert failed["error_code"] == "permission_denied" and failed["error_reason"]
+        [operation] = report["operations"]
+        assert (operation["id"], operation["calls"], operation["succeeded"], operation["errors"]) == (job, 2, 1, 1)
+        seq = await read_operation_calls(*args, job, 0, "conversation")
+        assert {r["error_code"] for r in seq["calls"]} == {"permission_denied", None}

@@ -29,7 +29,12 @@ export interface MonitoringRow extends MonitoringMetrics, CredentialInfo {
   auth_kind: AuthKind | null;
 }
 
-export interface RecentCall extends CredentialInfo {
+export interface FailureDetail {
+  error_code: string | null;
+  error_reason: string | null;
+}
+
+export interface RecentCall extends CredentialInfo, FailureDetail {
   observation_id: string;
   finished_at: string;
   actor_id: string;
@@ -43,7 +48,12 @@ export interface RecentCall extends CredentialInfo {
   trace_available: boolean;
 }
 
-export interface McpOperation {
+export interface McpOperation extends FailureDetail {
+  errors: number;
+  succeeded: number;
+  cancelled: number;
+  trace_calls: number;
+  trace_observation_id: string | null;
   kind: "conversation" | "trace" | "turn" | "individual";
   agent: string | null;
   id: string;
@@ -58,7 +68,7 @@ export interface McpOperation {
 }
 
 export interface OperationDetails {
-  calls: (Pick<RecentCall, "observation_id" | "tool" | "outcome" | "finished_at" | "duration_ms" | "trace_available"> & {
+  calls: (Pick<RecentCall, "observation_id" | "tool" | "error_code" | "error_reason" | "outcome" | "finished_at" | "duration_ms" | "trace_available"> & {
     position: number;
     started_at: string;
   })[];
