@@ -3,8 +3,9 @@
 No database: these check the gate itself. That transactions of one Vault
 beyond the limit wait without blocking another Vault, that a wait past the
 deadline is a retryable `write_busy` and leaves nothing behind, that admission
-is re-entrant within a task, that several Vaults are admitted together, and
-that an event written without admission is logged.
+is re-entrant within a task, that several Vaults are admitted together, that
+waiters are served first come, first served, by capacity, and that an event
+written without admission is logged.
 """
 
 from __future__ import annotations
@@ -118,15 +119,15 @@ async def test_several_vaults_are_admitted_together_or_not_at_all(monkeypatch):
 
 
 async def test_a_full_vault_does_not_delay_another_vaults_writes(monkeypatch):
-    """A transaction for A and B waits while B is full, without holding A's
-    slot: a transaction for A alone is admitted at once, and the A-and-B one
-    follows when B frees."""
-    monkeypatch.setattr(settings, "vault_write_concurrency", 1)
+    """Limit 2. A transaction for A and B waits while B is full. It holds no
+    slot of A meanwhile and reserves one: a transaction for A alone is
+    admitted at once to the other, and the A-and-B one follows when B
+    frees."""
     a, b = uuid.uuid4(), uuid.uuid4()
     release_b = asyncio.Event()
-    b_held = asyncio.Event()
-    holder = asyncio.create_task(_hold(b, b_held, release_b))
-    await asyncio.wait_for(b_held.wait(), timeout=5)
+    b_held = [asyncio.Event() for _ in range(2)]
+    holders = [asyncio.create_task(_hold(b, e, release_b)) for e in b_held]
+    await asyncio.wait_for(asyncio.gather(*(e.wait() for e in b_held)), timeout=5)
     both_entered, release_both = asyncio.Event(), asyncio.Event()
 
     async def both() -> None:
@@ -141,7 +142,7 @@ async def test_a_full_vault_does_not_delay_another_vaults_writes(monkeypatch):
         async with admission.vault_write_admission(a):
             assert not both_entered.is_set()
     release_b.set()
-    await holder
+    await asyncio.gather(*holders)
     await asyncio.wait_for(both_entered.wait(), timeout=5)
     release_both.set()
     await waiting
@@ -189,11 +190,11 @@ async def test_an_event_written_without_admission_is_logged_once(caplog, monkeyp
 
 async def test_a_transaction_of_two_vaults_is_not_starved_by_single_vault_ones(monkeypatch):
     """Transactions of Vault A alone and of Vault B alone keep arriving, one
-    slot each. A transaction of both waits: without ageing, each freed slot
-    went to the next single-Vault transaction, and it never found both free
-    before its deadline. Once it has waited half its deadline, the slots
-    freed on A and B are kept for it, and it is admitted in time; Vault C
-    keeps flowing meanwhile."""
+    slot each. A transaction of both waits: when each freed slot went to the
+    next single-Vault transaction, it never found both free before its
+    deadline. It reserves A and B against the transactions behind it, so it
+    is admitted once the ones before it are done; Vault C keeps flowing
+    meanwhile."""
     import time
 
     monkeypatch.setattr(settings, "vault_write_concurrency", 1)
@@ -230,3 +231,128 @@ async def test_a_transaction_of_two_vaults_is_not_starved_by_single_vault_ones(m
         await asyncio.gather(*traffic, return_exceptions=True)
     assert waited < 0.6, waited
     assert others and max(others) < 0.3, others
+
+
+async def _wait_out(task: asyncio.Task, ending: str) -> None:
+    """End a waiting task: let it reach its deadline, or cancel it."""
+    if ending == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(WriteBusyError):
+            await task
+
+
+@pytest.mark.parametrize("ending", ["timeout", "cancel"])
+async def test_a_waiter_leaving_admits_the_ones_its_reservation_held_back(monkeypatch, ending):
+    """Limit 1. A transaction holds A, and B is free. W, for A and B, waits
+    for A and reserves B; Q, for B alone, arrives after it, past half W's
+    deadline, and waits behind it. When W gives up at its deadline, or is
+    cancelled, Q is admitted at once, B being free all along. A waiter that
+    left the queue used to wake nobody, and Q waited until its own
+    deadline."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1)
+    a, b = uuid.uuid4(), uuid.uuid4()
+    release, held = asyncio.Event(), asyncio.Event()
+    holder = asyncio.create_task(_hold(a, held, release))
+    await asyncio.wait_for(held.wait(), timeout=5)
+
+    async def both() -> None:
+        async with admission.vault_write_admission(a, b, timeout=0.6):
+            pytest.fail("admitted while A was full")
+
+    waiting = asyncio.create_task(both())
+    await asyncio.sleep(0.35)
+    entered = asyncio.Event()
+
+    async def only_b() -> None:
+        async with admission.vault_write_admission(b, timeout=5.0):
+            entered.set()
+
+    queued = asyncio.create_task(only_b())
+    await asyncio.sleep(0.05)
+    assert not entered.is_set(), "a later transaction took a slot an earlier waiter reserved"
+    await _wait_out(waiting, ending)
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    await queued
+    release.set()
+    await holder
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
+
+
+@pytest.mark.parametrize("ending", ["timeout", "cancel"])
+async def test_a_waiter_reserves_the_last_slot_until_it_leaves(monkeypatch, ending):
+    """Limit 4. A has three transactions and B four. W, for A and B, waits
+    for B and reserves A's last slot, so Q, for A alone, waits behind it.
+    When W leaves the queue, at its deadline or cancelled, Q is admitted at
+    once to that slot."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 4)
+    a, b = uuid.uuid4(), uuid.uuid4()
+    release = asyncio.Event()
+    held = [asyncio.Event() for _ in range(7)]
+    holders = [
+        asyncio.create_task(_hold(vault, e, release))
+        for vault, e in zip([a] * 3 + [b] * 4, held)
+    ]
+    await asyncio.wait_for(asyncio.gather(*(e.wait() for e in held)), timeout=5)
+
+    async def both() -> None:
+        async with admission.vault_write_admission(a, b, timeout=0.6):
+            pytest.fail("admitted while B was full")
+
+    waiting = asyncio.create_task(both())
+    await asyncio.sleep(0.35)
+    entered = asyncio.Event()
+
+    async def only_a() -> None:
+        async with admission.vault_write_admission(a, timeout=5.0):
+            entered.set()
+
+    queued = asyncio.create_task(only_a())
+    await asyncio.sleep(0.05)
+    assert not entered.is_set(), "a later transaction took the slot an earlier waiter reserved"
+    await _wait_out(waiting, ending)
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    await queued
+    release.set()
+    await asyncio.gather(*holders)
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
+
+
+async def test_a_waiter_reserves_only_the_slots_it_needs(monkeypatch):
+    """Limit 4. B's four slots are taken, and A's are free. W, for A and B,
+    waits for B and reserves one slot of A: three transactions for A alone
+    are admitted at once, past half W's deadline, and a fourth waits behind
+    W. W is admitted when B frees, and then the fourth. A waiter past half
+    its deadline used to keep every free slot of its Vaults, and the
+    transactions for A waited although none of A's slots was in use."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 4)
+    a, b = uuid.uuid4(), uuid.uuid4()
+    release_b, release_a = asyncio.Event(), asyncio.Event()
+    b_held = [asyncio.Event() for _ in range(4)]
+    b_holders = [asyncio.create_task(_hold(b, e, release_b)) for e in b_held]
+    await asyncio.wait_for(asyncio.gather(*(e.wait() for e in b_held)), timeout=5)
+    both_entered = asyncio.Event()
+
+    async def both() -> None:
+        async with admission.vault_write_admission(a, b, timeout=1.0):
+            both_entered.set()
+
+    waiting = asyncio.create_task(both())
+    await asyncio.sleep(0.6)
+    a_held = [asyncio.Event() for _ in range(3)]
+    a_holders = [asyncio.create_task(_hold(a, e, release_a)) for e in a_held]
+    await asyncio.wait_for(asyncio.gather(*(e.wait() for e in a_held)), timeout=0.2)
+    fourth_entered = asyncio.Event()
+    fourth = asyncio.create_task(_hold(a, fourth_entered, release_a))
+    await asyncio.sleep(0.05)
+    assert not fourth_entered.is_set(), "a later transaction took the slot W reserved"
+    release_b.set()
+    await asyncio.gather(*b_holders)
+    await asyncio.wait_for(both_entered.wait(), timeout=1.0)
+    await waiting
+    await asyncio.wait_for(fourth_entered.wait(), timeout=1.0)
+    release_a.set()
+    await asyncio.gather(*a_holders, fourth)
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}

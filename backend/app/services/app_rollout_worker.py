@@ -45,11 +45,15 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
     # A later batch is eligible only after all targets in the preceding batch
     # are applied/replayed.  This keeps the canary and 10-wide order durable.
     #
-    # Among the eligible targets, those never deferred come first, in job,
-    # batch and ordinal order, then the deferred ones in the order their
-    # deferrals ended. A busy Vault's targets, deferred and claimable again,
-    # used to come first again by job order, so several busy Vaults kept the
-    # worker cycling through them while another Vault's rollout waited.
+    # The eligible targets are claimed in the order they became claimable:
+    # a deferred target when its deferral ended (lease_expires_at), any other
+    # when it was last made pending (updated_at, which the row's touch
+    # trigger sets on every update), and then in job, batch and ordinal
+    # order. A busy Vault's targets, deferred and claimable again, used to
+    # come first again by job order, so several busy Vaults kept the worker
+    # cycling through them while another Vault's rollout waited; and a
+    # target whose deferral ended waited behind every batch of another
+    # Vault's backfill, which makes its target pending again after each.
     row = await conn.fetchrow(
         """
         WITH eligible AS (
@@ -71,7 +75,7 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
                       AND same_batch.batch_no=t.batch_no
                       AND same_batch.state='running'
                )
-             ORDER BY t.lease_expires_at NULLS FIRST, t.job_id, t.batch_no, t.ordinal
+             ORDER BY COALESCE(t.lease_expires_at, t.updated_at), t.job_id, t.batch_no, t.ordinal
              FOR UPDATE SKIP LOCKED
              LIMIT 1
         )

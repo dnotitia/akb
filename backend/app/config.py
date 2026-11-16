@@ -1353,6 +1353,11 @@ class Settings(BaseModel):
     # How long reading a plan waits for a table lock before the write fails
     # with a retryable write_busy instead of holding its connection.
     akb_sql_plan_lock_timeout_ms: int = 500
+    # How long reading a plan may take in all once it has its slot, from the
+    # wait for a connection to the end of EXPLAIN, before the write fails
+    # with a retryable write_busy and gives the slot back: a plan waiting for
+    # one table lock after another cannot keep the slots from other Vaults.
+    akb_sql_plan_timeout_ms: int = 2000
     # How long the app rollout worker waits for a target's Vault admission.
     # A busy Vault's targets are then deferred, all of them, and the worker
     # takes other Vaults' targets, so keep it short.

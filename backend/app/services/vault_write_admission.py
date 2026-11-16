@@ -20,8 +20,11 @@ that many admitted transactions in each, and the event lock still orders them.
 Admission is re-entrant within a task: a call nested in an admitted one for
 the same Vault does not wait again. A transaction that writes events for
 several Vaults is admitted for all of them at once, under one deadline, and
-holds none of them while it waits, so a full Vault does not delay another
-Vault's writes. Code inside an admitted transaction must not wait for another
+holds none of them while it waits. Waiters are admitted first come, first
+served, by capacity: one that waits reserves a slot of each of its Vaults
+against later transactions, so a full Vault holds back another Vault's
+writes only by the slots that transactions waiting for both reserve there.
+Code inside an admitted transaction must not wait for another
 admission, and must not take the Bare Git write lane, which is entered before
 this admission. Vault creation takes the new Vault's write-lane gate (not a
 global lane slot) and then its admission and holds both through its seed
@@ -62,50 +65,31 @@ _admitted: ContextVar[frozenset[uuid.UUID]] = ContextVar(
 
 
 class _Waiter:
-    __slots__ = ("vault_ids", "granted", "since", "timeout")
+    __slots__ = ("vault_ids", "granted")
 
-    def __init__(self, vault_ids: list[uuid.UUID], granted: asyncio.Future, timeout: float) -> None:
+    def __init__(self, vault_ids: list[uuid.UUID], granted: asyncio.Future) -> None:
         self.vault_ids = vault_ids
         self.granted = granted
-        self.since = time.monotonic()
-        self.timeout = timeout
-
-    def aged(self, now: float) -> bool:
-        """Waited more than half its deadline."""
-        return now - self.since >= self.timeout / 2
 
 
 class _State:
     """The admitted and waiting transactions of one event loop.
 
     A transaction is admitted for all its Vaults at once or not at all: it
-    never holds one Vault's slot while it waits for another's, so a full
-    Vault does not delay the writes of another Vault that share a
-    transaction with it. Waiters are granted in arrival order among those
-    whose Vaults all have a free slot.
-
-    That alone let single-Vault transactions, arriving one after another,
-    take each Vault of a waiting multi-Vault transaction in turn, so that it
-    never found all of them free before its deadline. Ageing bounds it: once
-    a waiter has waited more than half its deadline, a slot freed on one of
-    its Vaults is kept for it rather than given to a later transaction,
-    until it has all its Vaults. Vaults no aged waiter needs keep flowing.
+    never holds one Vault's slot while it waits for another's. Waiters are
+    served first come, first served, by capacity (``grant``): a waiter that
+    cannot be admitted yet reserves one slot of each of its Vaults against
+    the waiters behind it, and those use the slots left. A later
+    transaction therefore never takes the last slot of a Vault that an
+    earlier waiter needs, so single-Vault transactions arriving one after
+    another cannot keep a transaction of several Vaults waiting until its
+    deadline, while a Vault no waiter needs, or one with slots to spare,
+    keeps admitting.
     """
 
     def __init__(self) -> None:
         self.admitted: dict[uuid.UUID, int] = {}
         self.waiters: list[_Waiter] = []
-
-    def free(self, vault_ids: list[uuid.UUID], limit: int) -> bool:
-        return all(self.admitted.get(v, 0) < limit for v in vault_ids)
-
-    def kept(self, now: float) -> set[uuid.UUID]:
-        """The Vaults whose freed slots are kept for an aged waiter."""
-        return {
-            v for waiter in self.waiters
-            if not waiter.granted.done() and waiter.aged(now)
-            for v in waiter.vault_ids
-        }
 
     def take(self, vault_ids: list[uuid.UUID]) -> None:
         for v in vault_ids:
@@ -118,18 +102,27 @@ class _State:
                 self.admitted[v] = left
             else:
                 del self.admitted[v]
-        now = time.monotonic()
-        kept: set[uuid.UUID] = set()
+        self.grant(limit)
+
+    def grant(self, limit: int) -> None:
+        """Admit the waiters that fit, in arrival order.
+
+        Called whenever a slot is given back or a waiter leaves, and for each
+        new waiter. A waiter is admitted when each of its Vaults has a slot
+        free beyond those reserved by the waiters before it; otherwise it
+        reserves a slot of each of its Vaults and the walk goes on.
+        """
+        reserved: dict[uuid.UUID, int] = {}
         for waiter in list(self.waiters):
             if waiter.granted.done():
                 self.waiters.remove(waiter)
-            elif self.free(waiter.vault_ids, limit) and kept.isdisjoint(waiter.vault_ids):
+            elif all(self.admitted.get(v, 0) + reserved.get(v, 0) < limit for v in waiter.vault_ids):
                 self.take(waiter.vault_ids)
                 waiter.granted.set_result(None)
                 self.waiters.remove(waiter)
-            elif waiter.aged(now):
-                # Later waiters do not take this waiter's Vaults.
-                kept.update(waiter.vault_ids)
+            else:
+                for v in waiter.vault_ids:
+                    reserved[v] = reserved.get(v, 0) + 1
 
 
 # asyncio futures belong to their loop, so the state is kept per loop (tests
@@ -176,11 +169,10 @@ async def vault_write_admission(
     limit = max(1, settings.vault_write_concurrency)
     if timeout is None:
         timeout = settings.vault_write_queue_timeout_secs
-    if state.free(wanted, limit) and state.kept(time.monotonic()).isdisjoint(wanted):
-        state.take(wanted)
-    else:
-        waiter = _Waiter(wanted, asyncio.get_running_loop().create_future(), timeout)
-        state.waiters.append(waiter)
+    waiter = _Waiter(wanted, asyncio.get_running_loop().create_future())
+    state.waiters.append(waiter)
+    state.grant(limit)
+    if not waiter.granted.done():
         started = time.monotonic()
         try:
             async with asyncio.timeout(timeout):
@@ -190,8 +182,11 @@ async def vault_write_admission(
                 # Granted as the wait ended: give the slots back.
                 state.give_back(wanted, limit)
             else:
+                # Leave the queue, and admit the waiters its reservation
+                # kept waiting.
                 waiter.granted.cancel()
                 state.waiters.remove(waiter)
+                state.grant(limit)
             if isinstance(exc, TimeoutError):
                 logger.warning(
                     "vault write admission timed out after %.1fs for %s",

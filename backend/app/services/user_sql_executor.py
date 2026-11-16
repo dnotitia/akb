@@ -22,11 +22,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -390,45 +389,72 @@ class UserSqlExecutor:
         taken before the statement's admission. Planning takes the locks the
         statement takes on its tables, so at most `akb_sql_plan_concurrency`
         plans are read at once in this process, and at most one per declared
-        Vault (`_PlanSlots`), and one that waits longer than
-        `akb_sql_plan_lock_timeout_ms` for a lock fails with a retryable
-        `write_busy` instead of holding its connection. A
-        statement that cannot be planned is admitted for the Vaults it
-        declares, and reports its own error when it runs. Foreign keys of a
-        dynamic table only reference tables of its own Vault, so a cascade
-        stays in a Vault the plan names.
+        Vault (`_PlanSlots`). Once a plan has its slot, reading it, from the
+        wait for a connection to the end of ``EXPLAIN``, may take
+        `akb_sql_plan_timeout_ms` in all and each wait for a lock
+        `akb_sql_plan_lock_timeout_ms`; past either the write fails with a
+        retryable `write_busy` and gives its slot back, so a plan that waits
+        for one lock after another cannot keep the slots from other Vaults'
+        statements. A statement that cannot be planned is admitted for the
+        Vaults it declares, and reports its own error when it runs. Foreign
+        keys of a dynamic table only reference tables of its own Vault, so a
+        cascade stays in a Vault the plan names.
         """
         async with _plan_slot(statement.vault_names):
-            async with self.pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.execute(
-                        "SELECT set_config('lock_timeout', $1, true)",
-                        f"{max(1, settings.akb_sql_plan_lock_timeout_ms)}ms",
-                    )
-                    try:
-                        async with conn.transaction():
-                            admin_bypass = await _admin_bypass(conn, statement, lock=False)
-                            await _enter_statement_role(conn, statement, admin_bypass)
-                            await conn.execute("SET TRANSACTION READ ONLY")
-                            plan = await conn.fetchval(
-                                "EXPLAIN (VERBOSE, FORMAT JSON) " + statement.sql, *statement.params,
-                            )
-                    except asyncpg.exceptions.LockNotAvailableError:
-                        waited = settings.akb_sql_plan_lock_timeout_ms / 1000
-                        raise WriteBusyError(
-                            ", ".join(statement.vault_names) or "akb_sql", waited, retry_after_secs=1,
-                        ) from None
-                    except asyncpg.PostgresError:
-                        return frozenset()
-                    relations = _modified_relations(
-                        json.loads(plan) if isinstance(plan, str) else plan,
-                    )
-                    if not relations:
-                        return frozenset()
-                    # The trigger catalog is read under the backend role.
-                    await conn.execute("SET LOCAL ROLE NONE")
-                    schemas, tables = zip(*sorted(relations))
-                    rows = await conn.fetch(_VAULTS_OF_TABLES, list(schemas), list(tables))
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            deadline = started + max(1, settings.akb_sql_plan_timeout_ms) / 1000
+            try:
+                return await self._read_plan(statement, deadline)
+            except (
+                TimeoutError,
+                asyncpg.exceptions.LockNotAvailableError,
+                asyncpg.exceptions.QueryCanceledError,
+            ):
+                raise WriteBusyError(
+                    ", ".join(statement.vault_names) or "akb_sql", loop.time() - started,
+                    retry_after_secs=1,
+                ) from None
+
+    async def _read_plan(self, statement: _Statement, deadline: float) -> frozenset[uuid.UUID]:
+        """Read the plan of ``_planned`` by ``deadline``, in the event loop's
+        clock: ``TimeoutError`` when no connection is free in time,
+        ``LockNotAvailableError`` past a lock's timeout, and
+        ``QueryCanceledError`` past the deadline."""
+        loop = asyncio.get_running_loop()
+        async with AsyncExitStack() as stack:
+            async with asyncio.timeout_at(deadline):
+                conn = await stack.enter_async_context(self.pool.acquire())
+            async with conn.transaction():
+                left_ms = int((deadline - loop.time()) * 1000)
+                if left_ms < 1:
+                    raise TimeoutError
+                await conn.execute(
+                    "SELECT set_config('lock_timeout', $1, true), "
+                    "set_config('statement_timeout', $2, true)",
+                    f"{max(1, settings.akb_sql_plan_lock_timeout_ms)}ms", f"{left_ms}ms",
+                )
+                try:
+                    async with conn.transaction():
+                        admin_bypass = await _admin_bypass(conn, statement, lock=False)
+                        await _enter_statement_role(conn, statement, admin_bypass)
+                        await conn.execute("SET TRANSACTION READ ONLY")
+                        plan = await conn.fetchval(
+                            "EXPLAIN (VERBOSE, FORMAT JSON) " + statement.sql, *statement.params,
+                        )
+                except (asyncpg.exceptions.LockNotAvailableError, asyncpg.exceptions.QueryCanceledError):
+                    raise
+                except asyncpg.PostgresError:
+                    return frozenset()
+                relations = _modified_relations(
+                    json.loads(plan) if isinstance(plan, str) else plan,
+                )
+                if not relations:
+                    return frozenset()
+                # The trigger catalog is read under the backend role.
+                await conn.execute("SET LOCAL ROLE NONE")
+                schemas, tables = zip(*sorted(relations))
+                rows = await conn.fetch(_VAULTS_OF_TABLES, list(schemas), list(tables))
         return frozenset(uuid.UUID(row["vault_id"]) for row in rows if row["vault_id"])
 
     async def _run(
@@ -549,17 +575,11 @@ class UndeclaredVaultWriteError(Exception):
 
 
 class _PlanWaiter:
-    __slots__ = ("vaults", "granted", "since", "timeout")
+    __slots__ = ("vaults", "granted")
 
-    def __init__(self, vaults: frozenset[str], granted: asyncio.Future, timeout: float) -> None:
+    def __init__(self, vaults: frozenset[str], granted: asyncio.Future) -> None:
         self.vaults = vaults
         self.granted = granted
-        self.since = time.monotonic()
-        self.timeout = timeout
-
-    def aged(self, now: float) -> bool:
-        """Waited more than half its deadline."""
-        return now - self.since >= self.timeout / 2
 
 
 class _PlanSlots:
@@ -568,27 +588,21 @@ class _PlanSlots:
     At most `akb_sql_plan_concurrency` plans are read at once, and at most
     one per Vault: a plan holds a token for every Vault its statement
     declares, taken all at once or not at all, as the Vault write admission
-    takes its slots. Waiters hold nothing and are served in arrival order
-    among those whose Vaults are all free. Plans of a Vault whose table is
-    locked therefore wait one behind another, whatever other Vaults they
-    declare with it, and a statement of another Vault takes the next free
-    slot. As in the Vault write admission, a waiter that has waited more
-    than half its deadline keeps the tokens freed for its Vaults from later
-    statements until it has all of them, so single-Vault statements taking
-    its Vaults in turn cannot keep it waiting past its deadline.
+    takes its slots. Waiters hold nothing and are served first come, first
+    served, by capacity (``grant``), as in the Vault write admission: a
+    waiter whose Vaults are not all free reserves their tokens against the
+    waiters behind it, which take the slots and the other Vaults' tokens
+    left. Plans of a Vault whose table is locked therefore wait one behind
+    another, whatever other Vaults they declare with it, a statement of a
+    Vault no earlier waiter declares takes the next free slot, and
+    single-Vault statements cannot keep a statement of several Vaults
+    waiting until its deadline by taking its Vaults in turn.
     """
 
     def __init__(self) -> None:
         self.running = 0
         self.busy: set[str] = set()
         self.waiters: list[_PlanWaiter] = []
-
-    def free(self, vaults: frozenset[str], limit: int) -> bool:
-        return self.running < limit and self.busy.isdisjoint(vaults)
-
-    def kept(self, now: float) -> set[str]:
-        """The Vaults whose freed tokens are kept for an aged waiter."""
-        return {vault for waiter in self.waiters if waiter.aged(now) for vault in waiter.vaults}
 
     def take(self, vaults: frozenset[str]) -> None:
         self.running += 1
@@ -597,18 +611,28 @@ class _PlanSlots:
     def give_back(self, vaults: frozenset[str], limit: int) -> None:
         self.running -= 1
         self.busy -= vaults
-        now = time.monotonic()
-        kept: set[str] = set()
+        self.grant(limit)
+
+    def grant(self, limit: int) -> None:
+        """Start the waiters that fit, in arrival order.
+
+        Called whenever a slot is given back or a waiter leaves, and for each
+        new waiter. A waiter starts when a slot is free and none of its
+        Vaults is busy or reserved by a waiter before it; otherwise it
+        reserves its Vaults and the walk goes on.
+        """
+        reserved: set[str] = set()
         for waiter in list(self.waiters):
-            if self.running >= limit:
+            if waiter.granted.done():
+                self.waiters.remove(waiter)
+            elif self.running >= limit:
                 break
-            if self.free(waiter.vaults, limit) and kept.isdisjoint(waiter.vaults):
+            elif self.busy.isdisjoint(waiter.vaults) and reserved.isdisjoint(waiter.vaults):
                 self.take(waiter.vaults)
                 waiter.granted.set_result(None)
                 self.waiters.remove(waiter)
-            elif waiter.aged(now):
-                # Later waiters do not take this waiter's Vaults.
-                kept |= waiter.vaults
+            else:
+                reserved |= waiter.vaults
 
 
 # Plan readers per event loop (tests run each in a loop of its own).
@@ -622,7 +646,8 @@ async def _plan_slot(vaults: list[str]) -> AsyncIterator[None]:
     """Wait for one of `akb_sql_plan_concurrency` plan readers and for the
     plan tokens of the declared ``vaults``, holding no connection, for at
     most `vault_write_queue_timeout_secs`. A wait that ends without them,
-    refused or cancelled, leaves the queue at once."""
+    refused or cancelled, leaves the queue at once, and the waiters its
+    reservation held back go on."""
     loop = asyncio.get_running_loop()
     slots = _plan_slots.get(loop)
     if slots is None:
@@ -630,14 +655,10 @@ async def _plan_slot(vaults: list[str]) -> AsyncIterator[None]:
     limit = max(1, settings.akb_sql_plan_concurrency)
     timeout = settings.vault_write_queue_timeout_secs
     wanted = frozenset(vaults)
-    # Every release grants the waiters that became free, so none of them is
-    # free now: a statement that finds a slot and its Vaults free, and kept
-    # for no aged waiter, goes first.
-    if slots.free(wanted, limit) and slots.kept(time.monotonic()).isdisjoint(wanted):
-        slots.take(wanted)
-    else:
-        waiter = _PlanWaiter(wanted, loop.create_future(), timeout)
-        slots.waiters.append(waiter)
+    waiter = _PlanWaiter(wanted, loop.create_future())
+    slots.waiters.append(waiter)
+    slots.grant(limit)
+    if not waiter.granted.done():
         try:
             async with asyncio.timeout(timeout):
                 await asyncio.shield(waiter.granted)
@@ -646,8 +667,11 @@ async def _plan_slot(vaults: list[str]) -> AsyncIterator[None]:
                 # Granted as the wait ended: give the tokens back.
                 slots.give_back(wanted, limit)
             else:
+                # Leave the queue, and start the waiters its reservation
+                # kept waiting.
                 waiter.granted.cancel()
                 slots.waiters.remove(waiter)
+                slots.grant(limit)
             if isinstance(exc, TimeoutError):
                 raise WriteBusyError(", ".join(vaults) or "akb_sql", timeout, retry_after_secs=1) from None
             raise

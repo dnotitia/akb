@@ -43,6 +43,8 @@ from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri
 from app.services.vault_write_admission import is_admitted, vault_write_admission
 from tests.test_app_rollout_event_lock_postgres import _installation
+from tests.test_app_rollout_event_lock_postgres import _manifest as _rollout_manifest
+from tests.test_app_rollout_event_lock_postgres import _step as _rollout_step
 from tests.test_events_commit_order_postgres import (
     _OpenTransaction,
     _database_dsn,
@@ -641,6 +643,74 @@ async def test_sql_plans_waiting_for_one_vaults_lock_do_not_hold_back_another_va
         ), outcomes
 
 
+async def test_plans_waiting_for_one_lock_after_another_give_their_slots_back_in_time(tmp_path, monkeypatch):
+    """Twelve tables of Vault `plans-held` are each locked by a transaction
+    that ends 0.35 s after the one before it. Two raw SQL writes, declaring
+    `plans-x` and `plans-y`, insert into all twelve tables in one statement:
+    each of their plans waits for the locks one after another, each wait
+    shorter than the half-second lock timeout, and together they hold both
+    plan slots. Reading a plan now has `akb_sql_plan_timeout_ms` (here one
+    second) in all, so both fail with write_busy and give their slots back,
+    and a write to a third Vault, sent behind them, commits soon after. The
+    plans used to keep their slots for as long as the locks took, over four
+    seconds."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 2, raising=False)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 10.0, raising=False)
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 2, raising=False)
+    monkeypatch.setattr(settings, "akb_sql_plan_lock_timeout_ms", 500, raising=False)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 1000, raising=False)
+    async with _fresh_database() as pool:
+        ctx = _Context(pool=pool, tmp_path=tmp_path, monkeypatch=monkeypatch)
+        monkeypatch.setattr(table_service, "get_role_sync", lambda: _AnyRoleSync())
+        held_id = await _make_vault(pool, "plans-held")
+        for name in ("plans-x", "plans-y"):
+            await _make_vault(pool, name)
+        quiet_id = await _make_vault(pool, "plans-z")
+        tables = [await ctx.table("plans-held", held_id, f"t{i:02d}") for i in range(12)]
+        quiet_table = await ctx.table("plans-z", quiet_id)
+        admin = await ctx.user("plans-chain-admin", admin=True)
+        monkeypatch.setattr(user_sql_executor, "_executor", user_sql_executor.UserSqlExecutor(pool))
+        chained = "WITH " + ", ".join(
+            f"w{i} AS (INSERT INTO {table} (value) VALUES ('row') RETURNING 1)"
+            for i, table in enumerate(tables)
+        ) + " SELECT 1"
+
+        def write(vault: str, sql: str):
+            return table_service.execute_sql(
+                vault_names=[vault], user_id=str(admin), actor_id=vault, sql=sql, is_admin=True,
+            )
+
+        async with contextlib.AsyncExitStack() as stack:
+            locks = []
+            for table in tables:
+                holder = await stack.enter_async_context(pool.acquire())
+                locks.append(await stack.enter_async_context(_OpenTransaction(holder)))
+                await holder.execute(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE")
+            chains = [asyncio.create_task(write(vault, chained)) for vault in ("plans-x", "plans-y")]
+            await asyncio.sleep(0.05)
+
+            async def release_one_after_another() -> None:
+                await asyncio.sleep(0.3)
+                for lock in locks:
+                    await lock.commit()
+                    await asyncio.sleep(0.35)
+
+            releasing = asyncio.create_task(release_one_after_another())
+            await asyncio.sleep(0.05)
+            started = time.monotonic()
+            quiet = await write("plans-z", f"INSERT INTO {quiet_table} (value) VALUES ('row')")
+            took = time.monotonic() - started
+            outcomes = await asyncio.wait_for(asyncio.gather(*chains, return_exceptions=True), timeout=30)
+            await releasing
+
+        print(f"\nother-Vault write behind two plans waiting for lock after lock: {took:.3f}s")
+        assert quiet.get("affected_rows") == 1, quiet
+        assert took < 2.5, took
+        assert all(isinstance(o, WriteBusyError) for o in outcomes), outcomes
+        for table in tables:
+            assert await pool.fetchval(f"SELECT count(*) FROM {table}") == 0
+
+
 async def test_a_statement_writing_an_undeclared_vault_is_rolled_back_not_run_again(tmp_path, monkeypatch):
     """No statement akb_sql accepts can create a function, but a function an
     administrator installed can write a dynamic table its caller's plan does
@@ -877,9 +947,10 @@ async def test_six_busy_vaults_rollouts_do_not_hold_back_a_quiet_vaults(monkeypa
     Vault, 5 seconds of deferral, a 10-second idle interval), the first busy
     target's deferral used to end as the sixth was refused, and it came first
     again by job order, so the six took turns and the quiet Vault's rollout
-    was never claimed. Targets never deferred are now claimed before deferred
-    ones, which go in the order their deferrals ended, and the quiet Vault's
-    rollout is applied after one turn of the six."""
+    was never claimed. Targets are now claimed in the order they became
+    claimable, a deferred one when its deferral ended, so the quiet Vault's
+    target, pending since before the deferrals, is claimed after one turn of
+    the six and applied."""
     from app.services import _backfill
 
     monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
@@ -902,6 +973,76 @@ async def test_six_busy_vaults_rollouts_do_not_hold_back_a_quiet_vaults(monkeypa
             "SELECT count(*) FROM app_rollout_targets WHERE vault_id = ANY($1::uuid[]) AND state = 'applied'",
             busy,
         ) == 0
+
+
+def _manifest_with_backfill(app_key: str = "rollout-order", prefix: str = "") -> tuple[dict, str, str]:
+    """The upgrade of ``_installation``'s manifest, with a backfill of the new
+    `orders.extra` column, one row per batch, after the columns are added."""
+    from app.services import app_rollout_service as rollout_service
+
+    manifest, _checksum, current_fingerprint = _rollout_manifest(app_key, prefix)
+    orders = f"{prefix}orders"
+    manifest["transition_plans"][1]["steps"].append(_rollout_step(
+        f"backfill_{orders}_extra", "backfill", "backfill_column",
+        {"table": orders, "column": "extra", "primary_key": "id", "where_null": True,
+         "batch_size": 1, "value": "filled"},
+    ))
+    return manifest, rollout_service.manifest_checksum(manifest, version="2.0.0"), current_fingerprint
+
+
+async def test_a_deferred_rollout_target_is_claimed_between_another_vaults_backfill_batches(monkeypatch):
+    """A busy Vault's rollout target is refused by its full admission and
+    deferred for a second. Another Vault's rollout then backfills a column of
+    twenty rows one row per batch, each batch taking a fifth of a second,
+    and makes its target pending again after each. Once the deferral has
+    ended, the first Vault's target is claimed before the next batch and
+    applied while most of the backfill is left: targets are claimed in the
+    order they became claimable. A target never deferred used to be claimed
+    first, so the deferred one waited for the whole backfill."""
+    from tests import test_app_rollout_event_lock_postgres as fixtures
+    from app.repositories import table_data_repo
+
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "app_rollout_admission_wait_secs", 0.3, raising=False)
+    monkeypatch.setattr(rollout_worker, "BUSY_RETRY_SECONDS", 1)
+    async with _fresh_database() as pool:
+        busy, busy_job, _items = await _installation(
+            pool, own_items=True, vault="deferred-busy", app_key="deferred-busy", job_id=_job(1),
+        )
+        with monkeypatch.context() as patched:
+            patched.setattr(fixtures, "_manifest", _manifest_with_backfill)
+            _long, long_job, _items = await _installation(
+                pool, own_items=True, vault="deferred-long", app_key="deferred-long", job_id=_job(2),
+            )
+        orders = table_data_repo.pg_table_name("deferred-long", "orders")
+        await pool.execute(f"INSERT INTO {orders} (flag) SELECT 'f' FROM generate_series(1, 20)")
+        backfill = rollout_worker._run_backfill
+
+        async def slow_backfill(*args, **kwargs):
+            await asyncio.sleep(0.2)
+            return await backfill(*args, **kwargs)
+
+        monkeypatch.setattr(rollout_worker, "_run_backfill", slow_backfill)
+        async with _vault_full(busy):
+            # The busy Vault's target is claimed first and deferred.
+            assert await rollout_worker.run_once() == 1
+        assert await pool.fetchval(
+            "SELECT lease_expires_at > NOW() FROM app_rollout_targets WHERE job_id = $1", busy_job,
+        )
+        deadline = time.monotonic() + 30
+        while await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", busy_job) != "applied":
+            assert time.monotonic() < deadline, "the deferred rollout was never applied"
+            if not await rollout_worker.run_once():
+                await asyncio.sleep(0.05)
+        left = await pool.fetchval(f"SELECT count(*) FROM {orders} WHERE extra IS NULL")
+        print(f"\ndeferred rollout applied with {left} of 20 backfill rows left")
+        assert left >= 10, left
+        assert await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", long_job) != "applied"
+        while await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", long_job) != "applied":
+            assert time.monotonic() < deadline, "the backfill never finished"
+            if not await rollout_worker.run_once():
+                await asyncio.sleep(0.05)
+        assert await pool.fetchval(f"SELECT count(*) FROM {orders} WHERE extra = 'filled'") == 20
 
 
 async def test_vault_creations_waiting_for_the_role_lock_leave_the_git_lane_to_other_vaults(tmp_path, monkeypatch):
