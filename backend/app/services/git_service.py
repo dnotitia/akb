@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from git import Blob, Repo
-from git.exc import BadName, BadObject, GitError
+from git.exc import BadName, BadObject, GitCommandError, GitError
 
 from app.config import settings
 from app.exceptions import AKBError, MirrorMarkerError
@@ -1425,6 +1425,21 @@ class GitService:
         if self._use_mirror_reader(vault_name):
             return self._read_file_mirror(vault_name, file_path, commit)
         with _managed_repo(self._get_repo(vault_name)) as repo:
+            if commit and re.fullmatch(r"[0-9a-f]{40}", commit):
+                # A current document row already pins both the commit and path.
+                # Resolve them together instead of walking commit, tree and blob
+                # through separate GitPython object-reader requests.
+                try:
+                    raw = repo.git(git_dir=repo.git_dir).cat_file(
+                        "blob", "--end-of-options", f"{commit}^{{commit}}:{file_path}",
+                        stdout_as_string=False,
+                        strip_newline_in_stdout=False,
+                    )
+                except GitCommandError:
+                    # A later rename may have put the file at another path at this commit.
+                    pass
+                else:
+                    return raw.decode("utf-8")
             try:
                 ref = repo.commit(commit) if commit else repo.head.commit
             except (ValueError, BadName, BadObject):
