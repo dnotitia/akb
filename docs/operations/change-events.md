@@ -176,14 +176,19 @@ override) is therefore admitted for that Vault before it takes a connection.
 Each API process admits at most `vault_write_concurrency` (default 4) such
 transactions of one Vault at a time; the others wait without a connection. A
 transaction that writes several Vaults' events is admitted for all of them at
-once or waits for all of them, holding none, so a full Vault does not delay
-another Vault's writes; among waiters whose Vaults all have room, the earliest
-goes first. A waiter that has waited more than half its deadline keeps the
-slots freed on its Vaults from later transactions until it has all of them, so
-single-Vault transactions arriving one after another cannot keep a transaction
-of several Vaults waiting past its deadline; Vaults no such waiter needs keep
-flowing. One that waits longer than `vault_write_queue_timeout_secs`
-(default 10 seconds) fails with a retryable `write_busy`: over REST, HTTP 429
+once or waits for all of them, holding none. Waiters are admitted first come,
+first served, by capacity: whenever a slot is given back or a waiter leaves
+the queue, at its deadline or cancelled, the waiters are taken in arrival
+order, and each is admitted if every one of its Vaults has a free slot beyond
+those reserved by the waiters before it; otherwise it reserves one slot of
+each of its Vaults and the next is taken. A later transaction therefore never
+takes the last slot of a Vault that an earlier waiter needs, so single-Vault
+transactions arriving one after another cannot keep a transaction of several
+Vaults waiting until its deadline. A full Vault holds back another Vault's
+writes only by the slots that transactions waiting for both reserve there, and
+a Vault no waiter needs keeps admitting. A transaction that waits longer than
+`vault_write_queue_timeout_secs` (default 10 seconds) fails with a retryable
+`write_busy`: over REST, HTTP 429
 with `Retry-After: 1` and a body whose `code` is `write_busy` and whose
 `details` carry `retry_after_secs`; over MCP, the same envelope. A Bare Git
 document write enters the Bare Git write lane first and then this admission.
@@ -225,9 +230,12 @@ leave the Vault's content unchanged:
   with every other pending target of its Vault, for 5 seconds, in one
   statement, and the worker claims again at once rather than sleep its idle
   interval, so it takes other Vaults' targets meanwhile. Batches keep their
-  order; among the eligible targets, those never deferred are claimed first,
-  then the deferred ones in the order their deferrals ended, so several busy
-  Vaults do not take turns ahead of another Vault's rollout.
+  order; the eligible targets are claimed in the order they became
+  claimable, a deferred target when its deferral ended and another when it
+  was last made pending, as a backfill does with its target after each
+  batch. Several busy Vaults therefore do not take turns ahead of another
+  Vault's rollout, and a target whose deferral ended does not wait for every
+  batch of another Vault's backfill.
 - External Git synchronization fetches the remote into its mirror before it
   records each changed file, admitted per file.
 - A raw SQL write reads its plan on a pool connection before its admission,
@@ -240,10 +248,14 @@ with `partially_applied` in its details:
 - A Native recursive collection delete is admitted for each document's
   transaction and then for the collections'. A refusal part-way, or the
   Vault's event lock timing out part-way, leaves the documents deleted so far
-  deleted, each with its event, and fails with a `write_busy` whose hint says
-  that the same request sent again continues it. Its details count the
+  deleted, each with its event, and fails with a retryable `write_busy`; the
+  same request sent again continues the delete. As for any error that ends
+  that delete after documents went (see below), its details count the
   documents this request deleted (`deleted_docs`) and, for a caller who may
-  read the Vault, list them (`deleted_uris`), over MCP as over REST.
+  read the Vault, list them (`deleted_uris`), over MCP as over REST, and its
+  hint opens with them. A refusal by the admission, whose hint otherwise says
+  that nothing was written, says instead that part of the request may have
+  completed.
 - A grep replacement (`akb_grep` with `replace`) writes each document as a
   write of its own and stops at the first failure. A refusal, or any other
   failure, after some replacements committed leaves those documents replaced
@@ -295,18 +307,22 @@ at most
 `akb_sql_plan_concurrency` (default 2) plans are read at once per process,
 and at most one for each Vault: a plan holds a token for every Vault its
 statement declares, taken all at once or not at all, as the admission takes
-its slots. The others wait without a connection or a token, and are served in
-arrival order among those whose Vaults are all free. The plans of a Vault
-whose table is locked therefore wait one behind another, whatever other Vaults
-they declare with it, and another Vault's statement takes the free slot. As
-in the admission, a waiter that has waited more than half its deadline keeps
-the tokens freed for its Vaults until it has all of them. A wait that ends
-without a slot, at its deadline or cancelled, leaves the queue at once. A
-statement that declares one Vault but writes another holds the first one's
-token, not the second's, for at most the plan's lock timeout before it is
-refused. A plan that waits longer than `akb_sql_plan_lock_timeout_ms` (default
-500) for a table's lock fails with a retryable `write_busy` rather than hold
-its connection.
+its slots. The others wait without a connection or a token, and are served
+first come, first served, by capacity, as in the admission: a waiter whose
+Vaults are not all free reserves their tokens against the statements behind
+it. The plans of a Vault whose table is locked therefore wait one behind
+another, whatever other Vaults they declare with it, and a statement of a
+Vault no earlier waiter declares takes the free slot. A wait that ends without
+a slot, at its deadline or cancelled, leaves the queue at once, and the
+statements its reservation held back go on. Once a plan has its slot, reading
+it may take `akb_sql_plan_timeout_ms` (default 2000) in all, from the wait for
+a connection to the end of `EXPLAIN`, and each wait for a table's lock
+`akb_sql_plan_lock_timeout_ms` (default 500); past either, the write fails
+with a retryable `write_busy` and gives its slot back, rather than hold its
+connection. A plan that waits for one lock after another, each wait shorter
+than the lock timeout, therefore keeps its slot for at most the plan's
+timeout, and so does a statement that declares one Vault but writes another,
+holding the first one's token, not the second's, before it is refused.
 Before the write commits, its transaction checks the dynamic-table row changes
 it queued for `table.rows_changed` events; a change of a Vault it was not
 admitted for rolls it back with an `invalid_argument` error that names that
@@ -611,7 +627,8 @@ access API and raw SQL; that an app rollout target refused by admission is
 released and applied by a later run, and does not hold back another rollout,
 also under the worker's own runner, which sleeps after an iteration without
 work, with two busy targets of one Vault, and with six busy Vaults ahead of
-a quiet one, under the default deadlines;
+a quiet one, under the default deadlines; that a deferred target is claimed
+between the batches of another Vault's backfill once its deferral ended;
 that raw SQL runs read-only without admission only when asked to, and
 otherwise as a write that waits; that raw SQL writes waiting for a table lock
 while they read their plans leave connections for another Vault, and, sixty
@@ -620,7 +637,9 @@ keep another Vault's statement from reading its plan; that a statement declared
 for one Vault whose plan writes another Vault's table is refused before its
 admission and does not run, an administrator's included, and runs once,
 admitted for both, when it declares both, while one that writes an undeclared
-Vault through an installed function is rolled back and not run again; that `akb_sql` refuses `CREATE FUNCTION`, `DO`
+Vault through an installed function is rolled back and not run again; that
+two plans waiting for one table lock after another give their slots back at
+the plan's timeout, so a third Vault's write commits soon after; that `akb_sql` refuses `CREATE FUNCTION`, `DO`
 and `SET CONSTRAINTS` and that no function a SQL role may call writes a table;
 that a Native recursive delete refused after its first document says it partly
 completed and, to a reader only, which document it deleted; that a grep replacement refused after its first document, on Native
@@ -628,9 +647,12 @@ and Bare Git, names the document it replaced and asks to replace only the
 rest; and that an admin override's audit event recorded before a refused write
 stays. `test_sql_plan_slots_unit.py` and `test_vault_write_admission_unit.py`
 check that alternating single-Vault requests do not starve a request of both
-Vaults while an unrelated Vault keeps flowing; `test_sql_plan_slots_unit.py`
-also checks the plan-slot limit, one plan per Vault with every declared
-Vault's token taken at once, and that waits that
+Vaults while an unrelated Vault keeps flowing; that a waiter that leaves the
+queue, at its deadline or cancelled, lets the requests its reservation held
+back go on at once; that a waiter reserves only the slots it needs, so other
+requests use the rest; and that waiters are served in arrival order.
+`test_sql_plan_slots_unit.py` also checks the plan-slot limit, one plan per
+Vault with every declared Vault's token taken at once, and that waits that
 time out or are cancelled leave the queue at once and take no slot;
 `test_write_busy_rest_unit.py` checks the REST response to a refused write and
 to one refused part-way.
