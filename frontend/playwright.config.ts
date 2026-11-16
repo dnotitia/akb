@@ -30,10 +30,9 @@ export default defineConfig({
   fullyParallel: false,                  // single backend, serialize
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
-  // Finish inside the repository runtime job's 60-minute budget, leaving room
-  // for API/setup work, cleanup, and failure-artifact upload. Per-test limits
-  // remain unchanged; an exhausted suite budget still fails the check.
-  globalTimeout: process.env.CI ? 40 * 60 * 1000 : undefined,
+  // The serial real-runtime suite shares a 75-minute job with API setup, checks
+  // and cleanup. Give the browser run its own deadline for diagnostic uploads.
+  globalTimeout: process.env.CI ? (mockMode ? 40 : 50) * 60 * 1000 : undefined,
   workers: 1,
   reporter: process.env.CI ? "github" : "list",
   use: {

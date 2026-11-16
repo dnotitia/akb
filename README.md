@@ -30,6 +30,8 @@ the AS — see [`docs/mcp-clients/web-connectors.md`](./docs/mcp-clients/web-con
 also accept Claude Code's `mcp add --transport http` + `mcp login` flow
 end-to-end, without a PAT.
 
+Product administrators can view server-observed calls by user, PAT and tool. [MCP monitoring](docs/operations/mcp-monitoring.md)
+
 ## MCP protocol compatibility
 
 AKB keeps one tool and authorization core behind two protocol adapters:

@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 from pydantic import ValidationError as ModelValidationError
 
+from app.mcp_monitoring.collector import observe_tool
+from app.mcp_monitoring.usage import measure_result
 from app.util.git_refs import HEX_COMMIT_RE
 
 # Add backend to path so we can import app modules
@@ -156,6 +158,7 @@ async def _find_doc(vault_name: str, doc_ref: str) -> dict | None:
 
 
 server = Server("akb", instructions=INSTRUCTIONS)
+server.middleware.append(observe_tool)
 
 
 class _MCPUser:
@@ -1933,6 +1936,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
 
         if result is None:
             result = await _dispatch(name, arguments, user)
+            measure_result(arguments, result)
         # Non-blocking: both calls only ENQUEUE (audit to its dedicated writer
         # thread, usage to a bounded deque drained by a worker). No disk I/O or
         # lock on the event loop, and neither touches the shared to_thread pool
