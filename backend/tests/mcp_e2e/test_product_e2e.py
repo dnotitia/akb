@@ -108,6 +108,52 @@ async def test_drill_down_outline_filters_before_the_heading_cap(
     assert [row["section_path"] for row in sections["sections"]] == ["# 설치법"]
 
 
+async def test_drill_down_pattern_spans_chunks_in_one_section(
+    mcp_client: Client, runtime_session: RuntimeContext,
+) -> None:
+    vault = await _create_vault(mcp_client, runtime_session, "drill-pattern")
+    # The first phrase straddles the 1,500-character source slice. The longer
+    # literal also spans multiple search-index chunks, including their overlap.
+    long_literal = "시작🚀" + "가나다라" * 800 + "🏁끝"
+    body = "앞" * 1498 + "승인절차" + long_literal + "뒤" * 3200
+    doc = await _call_json(mcp_client, runtime_session, "akb_put", {
+        "vault": vault, "title": "Procedure", "content": "# 절차\n" + body + "\n# 기타\n승인절차",
+    })
+    args = {"uri": doc["uri"], "section": "# 절차"}
+    for pattern, expected_indices in [(long_literal, [1, 2, 3]), ("승인절차", [0, 1])]:
+        result = await _call_json(mcp_client, runtime_session, "akb_drill_down", {
+            **args, "pattern": pattern,
+        })
+        rows = result["sections"]
+        assert result["returned"] == len(expected_indices)
+        assert all(row["section_path"] == "# 절차" for row in rows)
+        assert [row["chunk_index"] for row in rows] == expected_indices
+        excerpt = "".join(row["content"] for row in rows)
+        assert excerpt == body[expected_indices[0] * 1500:(expected_indices[-1] + 1) * 1500]
+        assert excerpt.count(pattern) == 1
+
+
+async def test_drill_down_pattern_stops_at_each_heading(
+    mcp_client: Client, runtime_session: RuntimeContext,
+) -> None:
+    vault = await _create_vault(mcp_client, runtime_session, "drill-heading")
+    doc = await _call_json(mcp_client, runtime_session, "akb_put", {
+        "vault": vault, "title": "Boundaries",
+        "content": "# 안내\nAlpha\n# 다음\nBeta\n# 다음\nGamma",
+    })
+    for pattern in ("alphabeta", "alpha\nbeta", "betagamma", "beta\ngamma"):
+        result = await _call_json(mcp_client, runtime_session, "akb_drill_down", {
+            "uri": doc["uri"], "pattern": pattern,
+        })
+        assert result["returned"] == 0 and result["sections"] == []
+        assert "# 안내" in result["outline"] and "# 다음" in result["outline"]
+    single = await _call_json(mcp_client, runtime_session, "akb_drill_down", {
+        "uri": doc["uri"], "pattern": "gAmMa",
+    })
+    assert single["returned"] == 1
+    assert single["sections"][0]["content"].strip() == "Gamma"
+
+
 async def test_documents_browse_search_and_versioned_reads(
     mcp_client: Client,
     runtime_session: RuntimeContext,

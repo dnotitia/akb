@@ -237,7 +237,7 @@ def drill_down_handler(monkeypatch):
     monkeypatch.setattr(mcp_server, "check_vault_access", allow)
 
     def configure(*, sections: list[dict], headings: list[str]):
-        async def fake_drill_down(_vault, _doc, section=None):
+        async def fake_drill_down(_vault, _doc, section=None, *, pattern=""):
             return list(sections)
 
         async def fake_headings(_vault, _doc, limit=None, *, section=None):

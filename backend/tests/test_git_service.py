@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-from git import Repo
+from git import Git, Repo
 
 from app.services.external_git_service import ExternalGitService
 from app.services.git_service import FixedRefHistoryError, GitService
@@ -1154,6 +1154,33 @@ def test_manual_fixed_ref_history_batch_rejects_invalid_fixed_or_current_oid(
                 }
             ],
         )
+
+
+@pytest.mark.parametrize("body", ["", "승인절차 🚀\n\n"])
+def test_pinned_read_returns_exact_blob_after_head_advances(git_service, vault, monkeypatch, body):
+    path = "notes/절차: 안내.md"
+    pinned = git_service.commit_file(vault, path, body, "original")
+    git_service.commit_file(vault, path, "later", "advance HEAD")
+
+    commands = []
+    execute = Git.execute
+
+    def record_command(git, command, **kwargs):
+        commands.append(command)
+        return execute(git, command, **kwargs)
+
+    monkeypatch.setattr(Git, "execute", record_command)
+    assert git_service.read_file(vault, path, pinned) == body
+    assert len(commands) == 1
+    assert "cat-file" in commands[0]
+
+
+def test_pinned_read_recovers_historical_path_after_rename(git_service, vault):
+    pinned = git_service.commit_file(vault, "first.md", "original\n", "original")
+    git_service.move_file(vault, "first.md", "renamed.md", "move")
+    git_service.commit_file(vault, "renamed.md", "new\n", "edit")
+    assert git_service.read_file(vault, "renamed.md", pinned) == "original\n"
+    assert git_service.read_file(vault, "absent.md", pinned) is None
 
 
 def test_read_file_closes_repo_while_caller_still_references_it(

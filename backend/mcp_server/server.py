@@ -1074,10 +1074,8 @@ async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
         return response
 
     section = args.get("section")
-    pattern = (args.get("pattern") or "").strip().lower()
-    sections = await search_service.drill_down(vault, doc_path, section=section)
-    if pattern:
-        sections = [s for s in sections if pattern in (s.get("content") or "").lower()]
+    pattern = args.get("pattern") or ""
+    sections = await search_service.drill_down(vault, doc_path, section=section, pattern=pattern)
 
     response = {
         "uri": args["uri"],
@@ -1120,8 +1118,10 @@ async def _handle_drill_down(args: dict, uid: str, user: _MCPUser) -> dict:
             "No sub-sections under this heading. To pick a sibling "
             "or another section, call again with `mode='outline'`."
         )
+    elif pattern.strip():
+        response["hint"] = "Returned the body chunks containing the matched text."
     else:
-        # `section` was not provided — caller got the whole doc back
+        # No filter was provided — caller got the whole doc back
         # as section chunks. Quiet hint about the partial-read pattern.
         response["hint"] = (
             "Returned every section. Use `section='Heading'` or "
