@@ -1690,6 +1690,8 @@ async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dic
             recursive=bool(args.get("recursive", False)),
             agent_id=uid,
             allow_table_delete=role_level(access.get("role")) >= role_level("admin"),
+            # Paths of what the delete did or left go only to a reader.
+            disclose_paths=await _can_read_vault(user, uid, args["vault"]),
         )
     except InvalidPathError as exc:
         return err(str(exc), code=INVALID_PATH)

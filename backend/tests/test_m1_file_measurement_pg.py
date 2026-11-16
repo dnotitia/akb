@@ -1284,7 +1284,10 @@ async def test_recursive_collection_delete_rolls_back_native_tombstone_on_later_
     async def fail_event(*_args, **_kwargs):
         raise RuntimeError("injected downstream collection failure")
 
-    monkeypatch.setattr(collections, "emit_event", fail_event)
+    # The delete inserts its events last, through the outbox's one insertion point.
+    from app.repositories import events_repo
+
+    monkeypatch.setattr(events_repo, "emit_event", fail_event)
     with pytest.raises(RuntimeError, match="injected downstream collection failure"):
         await collections.CollectionService().delete(
             vault=vault_name,

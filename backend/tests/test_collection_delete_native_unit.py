@@ -20,9 +20,14 @@ def _fixture(monkeypatch, *, native: bool, legacy: bool = False):
     conn = MagicMock()
     conn.fetchrow = AsyncMock(return_value={"id": uuid.uuid4()})
     conn.execute = AsyncMock()
+    # No Native cutover fence in this fixture.
+    conn.fetchval = AsyncMock(return_value=None)
+    native_deleted: list[uuid.UUID] = []
 
     async def fetch(sql, *args):
-        return native_rows if "FROM native_resources" in sql else []
+        if "FROM native_resources" in sql:
+            return [] if native_deleted else native_rows
+        return []
 
     conn.fetch = AsyncMock(side_effect=fetch)
 
@@ -64,12 +69,21 @@ def _fixture(monkeypatch, *, native: bool, legacy: bool = False):
     legacy_delete = AsyncMock(return_value=True)
     monkeypatch.setattr(collection_service.DocumentRepository, "delete_with_publications", legacy_delete)
     monkeypatch.setattr("app.services.notification_producer.enqueue_document_change", AsyncMock())
-    native_delete = AsyncMock()
+    # The collection's events are collected and inserted through events_repo.
+    monkeypatch.setattr("app.repositories.events_repo.emit_event", AsyncMock())
+    async def delete_resource(**kwargs):
+        native_deleted.append(kwargs["expected_resource_id"])
+
+    native_delete = AsyncMock(side_effect=delete_resource)
+    locked_row = {
+        "resource_id": resource_id, "namespace_id": vault_id, "surface": "document",
+        "lifecycle": "live", "current_path": "c/native.md", "head_revision_id": revision_id,
+    }
+    repository = SimpleNamespace(lock_resource=AsyncMock(return_value=locked_row))
     native_svc = SimpleNamespace(
-        _current=AsyncMock(return_value=(vault_id, SimpleNamespace(
-            path="c/native.md", resource_id=resource_id, revision_id=revision_id,
-        ))),
-        _native=AsyncMock(return_value=SimpleNamespace(delete_resource=native_delete)),
+        _native=AsyncMock(return_value=SimpleNamespace(
+            delete_resource=native_delete, repository=repository,
+        )),
     )
     monkeypatch.setattr("app.services.native_document_service.NativeDocumentService", lambda: native_svc)
 
@@ -130,3 +144,25 @@ async def test_bare_git_cascade_keeps_post_commit_cleanup(monkeypatch):
     assert f.git_write.call_args.args == (f.git.delete_paths_bulk,)
     assert f.git_write.call_args.kwargs["file_paths"] == ["c/legacy.md"]
     assert all("native_resources" not in call.args[0] for call in f.conn.fetch.call_args_list)
+
+
+async def test_a_native_delete_collects_its_event_only_in_the_callers_transaction():
+    """`events` defers the delete's event to the caller's transaction. Without
+    one the delete would commit in a transaction of its own while the event
+    waited in the caller's buffer, so the combination is refused before any
+    database work."""
+    from app.exceptions import ValidationError
+    from app.repositories.events_repo import EventBuffer
+    from app.services.native_revision_service import NativeRevisionService
+
+    class _NoPool:
+        def acquire(self):
+            raise AssertionError("refused before any database work")
+
+    events = EventBuffer()
+    with pytest.raises(ValidationError, match="caller's transaction"):
+        await NativeRevisionService(_NoPool(), payload_store=object()).delete_resource(
+            namespace_id=uuid.uuid4(), surface="document", path="c/native.md", actor="actor",
+            mutation_id=uuid.uuid4(), events=events,
+        )
+    assert not events

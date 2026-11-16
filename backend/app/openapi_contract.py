@@ -386,6 +386,24 @@ def _success_envelope_schemas() -> dict[str, dict[str, Any]]:
                 "deleted_files": {"type": "integer"},
                 "deleted_sub_collections": {"type": "integer"},
                 "deleted_tables": {"type": "integer"},
+                "retained_collection_count": {
+                    "type": "integer",
+                    "description": (
+                        "How many collections were left in place because documents preserved "
+                        "from before a Native cutover reference them; present only when there are any."
+                    ),
+                },
+                "retained_collections": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "The paths of those collections, for a caller who may read the Vault."
+                    ),
+                },
+                "hint": {
+                    "type": "string",
+                    "description": "Explains retained_collection_count; present only with it.",
+                },
             },
         },
         "AkbSuccessEnvelope": {

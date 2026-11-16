@@ -17,7 +17,7 @@ import pytest
 from starlette.requests import Request
 
 from app.exceptions import ConflictError, NotFoundError
-from app.repositories import vault_files_repo
+from app.repositories import events_repo, vault_files_repo
 from app.repositories.document_repo import CollectionRepository
 from app.services import collection_service as cs
 from app.services import file_service as fs
@@ -440,7 +440,8 @@ async def test_collection_delete_rollback_preserves_file_and_cleanup_ownership(
     coll = CollectionRepository(pool)
     cid = await coll.get_or_create(vault_id, "folder/nested")
     name, fid, key = await seed(pool, vault_id, objects, collection_id=cid)
-    monkeypatch.setattr(cs, "emit_event", AsyncMock(side_effect=RuntimeError("event write failed")))
+    # The delete inserts its events last, through the outbox's one insertion point.
+    monkeypatch.setattr(events_repo, "emit_event", AsyncMock(side_effect=RuntimeError("event write failed")))
     with pytest.raises(RuntimeError, match="event write failed"):
         await cs.CollectionService().delete(vault=name, path="folder", recursive=True, agent_id="tester")
     async with pool.acquire() as conn:

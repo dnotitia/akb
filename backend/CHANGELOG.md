@@ -7,6 +7,66 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- On the Native authority a recursive collection delete is now atomic per
+  document and completes when run again. Each document's delete commits with
+  its `document.delete` event in a short transaction that locks the Vault's
+  row and then only that document, in the order a Vault delete locks them;
+  the collections, files and tables follow with `collection.delete`
+  once no live document is left under the prefix. The delete does not lock
+  every document of the prefix before deleting the first. A failure part-way
+  returns the error and leaves the documents deleted so far deleted, each with
+  its event; the same delete run again continues with the rest. Whatever
+  error ends a delete after it deleted documents says which ones:
+  `partially_applied`, `deleted_docs` and `deleted_uris` in its details, with
+  a hint, while the error keeps its own code, status and retry information (a
+  busy Vault is still a retryable `write_busy`); an internal error, such as a
+  deadlock, is reported as `internal` with exactly the generic message and
+  the same details, MCP keeps them for any error, and the REST 404 keeps them
+  too. A deletion counts as soon as its transaction commits, even if the
+  connection then fails to reset; one whose COMMIT went unanswered is counted
+  apart as `uncertain_docs` (and `uncertain_uris` for a reader), with a hint
+  that its outcome is unknown, and a last transaction whose COMMIT went
+  unanswered adds `final_step_uncertain: true` and a hint naming what that
+  step deletes, with its Bare Git documents in `final_step_docs` (and
+  `final_step_uris`); the hint says that what the prefix holds does not
+  settle that step, which on a prefix an earlier delete emptied only records
+  `collection.delete`, and that the same request sent again is checked as
+  the first was: only if it succeeds does it finish the delete, a recursive
+  retry also deletes whatever was written under the prefix since and may
+  record `collection.delete` a second time, a non-recursive one is refused
+  if the collection is no longer empty, and either may answer not found once
+  the step went (a recursive one always on Bare Git, and on Native when no
+  recursive delete of the prefix deleted a document). Only a server error response counts as an answer; a
+  connection error (class 08) leaves the outcome unknown. Once the last transaction has committed, a failure while
+  giving its connection back is logged and the delete answers with its
+  result.
+  `deleted_docs` counts a document restored and deleted again by the same
+  call once. A writer's
+  delete refused at a table that another request created under the prefix
+  after the delete checked for one can be finished only by an admin or
+  owner. The paths
+  (`deleted_uris`, `retained_collections`) go only to a caller who may read
+  the Vault; a write-only caller gets the counts. A document that
+  another request deletes or moves out of the collection meanwhile is left as
+  it is and not counted in `deleted_docs`; such a document used to fail the
+  delete or be deleted at its new path. Run again after it deleted every
+  document but stopped before its last transaction, it succeeds with zero
+  counts and records `collection.delete`, instead of reporting the collection
+  as not found; that event is at least once and can repeat for one prefix. A
+  document's graph edges are removed in its own delete transaction, and its
+  chunks by the derived worker, which skips a document restored or moved again
+  since; the delete used to remove both right after its commit and could take
+  a restored document's new links with them. Abandoned derived intents whose
+  Revision is still the Head can be re-opened with
+  `native_derived_worker.requeue_abandoned`, which closes those of earlier
+  Revisions as superseded; a stalled claim of a re-opened intent can no
+  longer abandon it again or replace the new claim's work. In a database cut
+  over from Bare Git the delete used to fail every time on the preserved
+  `documents` rows; it now leaves them, and the collection rows they
+  reference, in place, and reports them in its response as
+  `retained_collection_count`, with a hint, and to a reader as
+  `retained_collections` (MCP, REST and the TypeScript client's type).
+
 - A recursive collection delete no longer deletes the documents of a
   sub-collection that another request created under its prefix while it ran
   and leaves that collection behind, with its count unchanged. Creating a

@@ -246,10 +246,182 @@ Known limits that predate the ordering change:
   write commits into an existing sub-collection after a recursive delete read
   the prefix's documents is not deleted, while its collection row is: the
   document stays without a collection row.
-- On the Native authority a recursive collection delete commits each
-  document's delete in its own transaction. If it fails partway, for any
-  reason including a `write_busy` from the Vault's event lock, the documents
-  deleted before the failure stay deleted; run the delete again.
+- In a database cut over from Bare Git, the `documents` rows stay as immutable
+  history, and a trigger refuses to change them, including the `SET NULL` that
+  deleting a collection they reference would perform. A recursive collection
+  delete therefore leaves those rows and the collection rows they reference in
+  place, while it deletes the Native documents, the other collections, files
+  and tables. Its response counts the collections left in place
+  (`retained_collection_count`), with a `hint` that says why, and lists their
+  paths (`retained_collections`) to a caller who may read the Vault, as the
+  `collection.delete` payload does; the same delete sent again answers the
+  same way, and browsing shows those collections, empty. Removing such a
+  collection row needs a schema change.
+- `akb_link` and the REST link endpoint resolve a document endpoint without
+  the lock a Native delete takes, and an edge's key accepts a deleted
+  Resource. A link that resolved a document before that document's delete
+  committed therefore inserts its edge after the delete removed the
+  document's edges, and a document restored before the derived worker runs
+  keeps that edge. A single-document delete behaves the same way.
+- A link from or to a document cut over from Bare Git resolves to the
+  document's preserved `documents` row and stores no Resource identity.
+  Neither a single-document nor a recursive delete removes it while that row
+  exists, and the document restored keeps it.
+- The derived worker keeps one pending intent per Resource, the one with the
+  latest `occurred_at`, which comes from the clock of the process that wrote
+  it. When processes' clocks disagree, an earlier Revision's intent can carry
+  the later time; the worker then closes the current Head's intent as
+  superseded, and the Head's derived state is not updated: a deleted
+  document's chunks stay. This holds for every Native write.
+
+On the Native authority a recursive collection delete removes the documents
+first, one at a time. Each document's delete and its `document.delete` commit
+together in a short transaction that locks the Vault's row (`FOR KEY SHARE`,
+as every write to a Vault's contents does) and then only that document's
+Resource, so the delete never waits for a second Resource while it holds one
+and takes its locks in the order a Vault delete takes them. It does not lock
+every document under the prefix before it deletes the first, which would hold
+all of them for the whole delete; a delete stopped part-way is completed by
+running it again instead. A document that
+another request deleted, or moved out of the prefix, meanwhile is left as that
+request left it and is not counted. The collections, files and tables under the
+prefix, with the `collection.delete`, follow in a last transaction, once no live
+document is left under the prefix; a document written there meanwhile is
+deleted in another round, up to three, before the delete gives up with a
+retryable conflict (HTTP 409, `conflict`). A failure part-way returns the
+error and leaves the documents deleted so far deleted, each with its event;
+running the same delete again continues with the documents that remain.
+Whatever error ends a delete that had deleted documents says so. The error
+keeps its own code, status and retry information, so a `write_busy` from the
+Vault's event lock is still a retryable `write_busy`, and its details add
+`partially_applied`, `deleted_docs` and, for a caller who may read the Vault,
+`deleted_uris`, with a hint that opens with them. This holds for the
+conflict above, for the refusals below, for a table drop that a dependent
+object refuses, and for collections that change after the documents went. An
+internal error, such as a deadlock or a lock timeout that is not the Vault's
+event lock, is reported as an internal error (HTTP 500, code `internal`) whose
+message is exactly the generic one, and says the same in its details and
+hint; the original error is logged. Over MCP an error keeps these details and
+hint whatever its code, and over REST a not-found error does too. A document's
+deletion is counted as soon as its transaction commits, before its connection
+goes back to the pool, so a connection the pool then fails to reset does not
+drop it from the count. When the COMMIT of a document's transaction fails
+without the database's answer, the deletion may or may not have committed.
+Only an error response from the server is an answer, after which the
+transaction rolled back; a connection error, SQLSTATE class 08 such as the
+`ConnectionDoesNotExistError` asyncpg raises when the connection closes
+mid-operation, or any other failure leaves the outcome unknown. The error
+then counts that attempt apart in `uncertain_docs`, with its URI in
+`uncertain_uris` for a caller who may read the Vault, even when an earlier
+deletion of the same document committed (it may have been restored and moved
+since), sets `partially_applied`, and its hint says that the outcome of those
+deletions is unknown; reading the documents tells. A COMMIT the database
+refused rolled back, and is not counted. When the COMMIT of the last
+transaction goes unanswered the same way, the error adds
+`final_step_uncertain: true` beside the documents' progress, and its hint
+says that the outcome of that step, which deletes the collections, Files and
+tables under the prefix and records `collection.delete`, is unknown; on the
+Bare Git authority that step deletes the documents too, which the error
+counts in `final_step_docs` and lists in `final_step_uris` for a reader.
+What the prefix holds afterwards does not settle that outcome, since later
+writes may have changed it; and when an earlier delete had already emptied
+the prefix, that step only records `collection.delete`, so the prefix looks
+the same either way and only the event differs. The hint says so. The same
+request sent again is checked as the first was, so it can be refused (by a
+table under the prefix that the caller may not delete, or, for a
+non-recursive delete, by a collection that is no longer empty); only if it
+succeeds does it finish the delete. A recursive retry that succeeds also
+deletes whatever was written under the prefix since, and the request and
+the retry together may record `collection.delete` twice. If the step went
+and nothing is under the prefix any more, a recursive retry answers not
+found (404) on a Bare Git Vault, and on a Native one when no recursive
+delete of the prefix ever deleted a document, and otherwise records
+`collection.delete` again; a non-recursive retry answers not found. Once
+the last transaction has committed, the
+delete is complete: a failure after it, such as one while the pool takes its
+connection back, is logged and the delete answers with its result. This
+holds for a delete that finds the prefix emptied by an earlier one, too.
+When nothing is left under the prefix because an earlier
+recursive delete of it deleted its documents, the delete succeeds with zero
+counts rather than reporting the prefix as not found, and records
+`collection.delete`; it tells this from a prefix nothing was deleted under by
+the Revisions that delete gave its documents, whose subject is
+`[delete-collection] <prefix>`, and which are kept. `deleted_docs` counts the
+documents that call deleted, each once: a document that another request
+restored and the same call deleted again counts once, and its URI is listed
+once.
+
+A caller that may not delete tables (a writer, not an admin or owner) is
+refused before any document goes when the prefix holds a table. A table that
+another request creates under the prefix after that check is found by the last
+transaction, which checks again under its locks, once the documents are
+deleted, or by the table check of a later round. The refusal (HTTP 403,
+`permission_denied`) says so: `partially_applied` and `deleted_docs` in its
+details, the deleted documents' `deleted_uris` for a caller who may read the
+Vault, and a hint. The URIs are those this request committed deletions for;
+later writes or restores may have changed them since. The same request from
+that caller is refused before anything else goes; only a caller who may delete
+the table can finish the delete.
+
+A caller who may write the Vault but not read it, such as a credential scoped
+to write only, is told how many documents and collections a delete deleted or
+left, never their paths: `deleted_uris` and `retained_collections` are given
+only to a caller with read authority on the Vault, over MCP as over REST.
+
+`collection.delete` is at least once. Every delete that finds the prefix
+empty records it, so one prefix can have it more than once: when a delete
+stopped after its documents and is run again, or when two deletes of the same
+prefix finish together. Consumers treat it as "this prefix is gone", which a
+repeat does not change. Within akb-oss only the event tail and the Redis
+publisher read it, and they pass every event on; the gardener schedulers
+ignore the kind or de-duplicate events without a resource by Vault and kind,
+and Reef reads only `table.rows_changed`.
+
+Each document's graph edges, keyed on its Resource, are removed in the
+document's own delete transaction, while its Resource is locked and before
+its event. A document restored afterwards therefore starts without the links
+it had when its delete committed and keeps the ones made after its restore,
+apart from the link races and the cut-over documents listed among the known
+limits above. Edges are
+rows that other writers, such as a move re-linking its document, lock in their
+own order, so that transaction can end in a deadlock (`40P01`); the request
+then fails, the document stays, and sending the same delete again continues.
+
+A deleted document's chunks are removed by the derived worker, from the
+invalidation intent the delete records; the worker also removes the
+document's edges once more. The worker locks the Resource and closes the
+intent as superseded once the Resource has a later Revision. Its transaction
+can also end in a deadlock, or fail otherwise; the worker then retries the
+intent with backoff: 1, 5, 15 and 30 minutes, then 1, 2 and 4 hours between
+its attempts. A claimed intent that is not finished, as when its process
+stopped, is claimed again once its 10-minute lease expires, except after the
+final attempt. When the eighth attempt (`MAX_RETRIES` in
+`app/services/_backfill.py`) fails too, the intent is abandoned: it is
+completed with `delivery_outcome = 'abandoned'`, and the derived state of that
+Revision, such as the deleted document's chunks, stays as it was. An intent
+whose eighth claim ends without an outcome is not claimed again; the queue
+rescuer, which runs every minute, marks it abandoned once that claim's lease
+expired. An abandoned intent's `last_error` is the exception class that ended
+its last failed attempt, or `claim lease expired after final attempt` when no
+attempt recorded one. Abandoned intents are counted as
+`native_derived.abandoned` by `GET /health`, and per Vault by
+`GET /health/vault/{name}`; the rows are those of `native_invalidation_intents`
+with `delivery_outcome = 'abandoned'`. Once the cause is fixed, an operator
+re-opens them with `app.services.native_derived_worker.requeue_abandoned(
+namespace_id=..., resource_id=...)` (the Resource is optional), which returns
+how many it re-opened. It re-opens an intent only while its Revision is still
+the Resource's Head, and closes the others as superseded: the work of an
+earlier Revision, re-opened, could close the Head's own pending intent (see the
+clock limit above). The worker then attempts the re-opened intents again from
+the first step.
+
+Each outcome a claim writes, applied, deleted, superseded, a retry or
+abandoned, is written only to the intent as that claim left it, and a claim
+applies derived state only while it holds the intent so, locked in its apply
+transaction. A claim that outlived its lease, after which the intent was
+abandoned and re-opened, or claimed again, therefore changes nothing: its
+failure does not abandon the re-opened intent, and its work does not replace
+the current claim's.
 
 ## Regression verification
 
@@ -283,6 +455,59 @@ remains under the prefix; it also checks that a creation locks its ancestors in
 id order, together with a move's source, and that a measurement File upload
 into a new sub-collection removes expired intents first, so none of them
 deadlocks with the delete.
+`test_collection_delete_native_atomic_postgres.py` holds the Vault's event lock
+after a Native recursive delete removed its first document and checks that the
+delete fails with a retryable `write_busy` whose details say what it deleted,
+over REST and MCP, that the first document stays deleted with its
+event committed in its own transaction, and that running the delete again
+completes it; that the delete holds one document at a time; that a document
+deleted or moved out by another request while the delete waits is left alone
+and not counted; on a database cut over from Bare Git, that the delete
+leaves the preserved `documents` rows and the collection they reference, says
+so in its response, and answers the same when run again, with browsing showing
+that collection; that a document restored while the delete is held right after
+that document's commit has lost its earlier link and keeps one made after the
+restore; that a delete stopped after its documents completes when run again,
+recording `collection.delete` at least once, while a prefix nothing was deleted
+under is not found; that a table created under the prefix after a writer's
+delete checked for one refuses the rest, listing the documents already
+deleted, and that an admin's delete finishes it; that the derived worker
+retries a cleanup that ended in a deadlock; that a cleanup failing on every
+attempt keeps the document's chunks, is abandoned after `MAX_RETRIES`
+attempts, and once re-opened removes the chunks and queues their vector
+deletes; that a final claim whose lease expired is abandoned by the queue
+rescuer with the `last_error` described above, and that once re-opened, the
+stalled claim's failure and work change nothing while a new claim applies it;
+that re-opening an abandoned intent of an earlier Revision, stamped later than
+the Head's, closes it as superseded and leaves the Head to be indexed; that a
+delete whose rounds run out as documents keep arriving says what it deleted;
+that a document restored after this request deleted it stays listed among the
+deletions it committed; that a caller who may not read the Vault is told
+counts, not paths; that collections changing after the documents went, and a
+table drop refused by a dependent table, say what the delete deleted; that a
+document restored and deleted again by one call counts once; that a
+recursive delete running alongside a Vault delete does not deadlock; that a
+plain lock timeout on the collection row and a deadlock after documents went
+are internal errors, over REST and MCP, with exactly the generic message, that
+say what went; that a deletion whose connection then fails to reset is still
+counted; that a File delete refused with a 503 after the documents went keeps
+its details over MCP; that a deletion whose COMMIT answer is lost is reported
+as uncertain, also with asyncpg's own connection error, and one the database
+refused is not; that a second deletion of a document restored and moved
+meanwhile, whose answer is lost, is reported as uncertain; that a last step
+whose COMMIT answer is lost is reported as `final_step_uncertain`, on the
+Bare Git authority with the documents it deletes; that a delete of an
+emptied prefix answers with its result when its reset fails and reports an
+uncertain last step when its answer is lost, with a hint that does not send
+the caller to browse the prefix; that the same request sent again after a
+last step whose answer was lost records `collection.delete` a second time
+where a recursive delete deleted Native documents under the prefix, and
+answers not found for an empty Native collection, on Bare Git and for a
+non-recursive delete, whose hint says a retry is refused if the collection
+is no longer empty; that a delete
+whose last transaction committed answers with its result, Files included,
+when the reset of its connection fails; and that a File whose Resource is gone, after the
+documents went, keeps the delete's progress in the REST 404.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native

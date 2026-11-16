@@ -20,7 +20,7 @@ from typing import Any, Final, Protocol, runtime_checkable
 import asyncpg
 
 from app.exceptions import ConflictError, NotFoundError, ValidationError
-from app.repositories.events_repo import emit_event
+from app.repositories.events_repo import EventBuffer, emit_event
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services import native_document_assets
 from app.services.m1_reference_payload_store import (
@@ -348,13 +348,15 @@ class NativeRevisionService:
         namespace_id: uuid.UUID, resource_id: uuid.UUID, path: str,
         revision_id: str, parent_revision_id: str | None, actor: str,
         old_path: str | None = None, previous_status: str | None = None,
-        status: str | None = None,
+        status: str | None = None, events: EventBuffer | None = None,
     ) -> None:
         """Publish at the authority boundary, including caller-owned TXs.
 
         File resources here can be searchable projections of catalog Files.
         Their public events belong to FileService, not projection rebuilds.
         A mutation replay returns before this hook; a rollback drops its event.
+        With ``events``, a caller-owned transaction that still has other work
+        to do collects the event and inserts it at its end.
         """
         if surface != "document":
             return
@@ -372,6 +374,12 @@ class NativeRevisionService:
             )
         if kind == "document.update":
             payload.update(previous_status=previous_status, status=status)
+        if events is not None:
+            events.add(
+                kind, vault_id=namespace_id, resource_uri=doc_uri(vault, path),
+                actor_id=actor, payload=payload,
+            )
+            return
         await emit_event(
             conn, kind, vault_id=namespace_id, resource_uri=doc_uri(vault, path),
             actor_id=actor, payload=payload,
@@ -1437,7 +1445,21 @@ class NativeRevisionService:
         subject: str | None = None,
         summary: str | None = None,
         retain_document_assets: bool = True,
+        conn: asyncpg.Connection | None = None,
+        events: EventBuffer | None = None,
     ) -> NativeMutationResult:
+        """Delete one live Resource.
+
+        With ``conn`` the delete runs in that caller-owned transaction, which
+        commits it, and ``events`` then collects its event for the caller to
+        insert at the end (see ``_emit_document_change``). ``events`` needs
+        ``conn``: without it the delete would commit in a transaction of its
+        own while its event waited in the caller's buffer.
+        """
+        if conn is not None and not conn.is_in_transaction():
+            raise ValidationError("Transaction-aware native deletion requires an active transaction")
+        if events is not None and conn is None:
+            raise ValidationError("Collecting a native delete's event requires the caller's transaction")
         self._validate_common(
             surface=surface,
             path=path,
@@ -1472,6 +1494,8 @@ class NativeRevisionService:
             summary=summary,
             fingerprint=fingerprint,
             retain_document_assets=retain_document_assets,
+            conn=conn,
+            events=events,
         )
         await self._hit("authority.after_commit_before_response")
         return result
@@ -1491,113 +1515,114 @@ class NativeRevisionService:
         summary: str | None,
         fingerprint: str,
         retain_document_assets: bool,
+        conn: asyncpg.Connection | None = None,
+        events: EventBuffer | None = None,
     ) -> NativeMutationResult:
-        revision_id = await self._allocate_revision_id()
+        revision_id = await self._allocate_revision_id(conn=conn)
         activity_id = uuid.uuid4()
         intent_id = uuid.uuid4()
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await self.repository.lock_mutation(conn, namespace_id, mutation_id)
-                prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
-                if prior is not None:
-                    if prior["request_fingerprint"] != fingerprint:
-                        raise ConflictError("Native idempotency key was reused with different input")
-                    return self._from_row(prior, replay=True)
+        async with self._authority_transaction(conn) as conn:
+            await self.repository.lock_mutation(conn, namespace_id, mutation_id)
+            prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
+            if prior is not None:
+                if prior["request_fingerprint"] != fingerprint:
+                    raise ConflictError("Native idempotency key was reused with different input")
+                return self._from_row(prior, replay=True)
 
-                resource = await self._lock_live_reference(
-                    conn,
-                    namespace_id=namespace_id,
-                    surface=surface,
-                    reference=path,
-                    expected_resource_id=expected_resource_id,
+            resource = await self._lock_live_reference(
+                conn,
+                namespace_id=namespace_id,
+                surface=surface,
+                reference=path,
+                expected_resource_id=expected_resource_id,
+            )
+            resource_id = resource["resource_id"]
+            current_path = resource["current_path"]
+            parent_revision_id = resource["head_revision_id"]
+            if expected_revision_id is not None and expected_revision_id != parent_revision_id:
+                raise ConflictError(
+                    "Native Revision conflict: expected "
+                    f"{expected_revision_id}, current Head is {parent_revision_id}"
                 )
-                resource_id = resource["resource_id"]
-                current_path = resource["current_path"]
-                parent_revision_id = resource["head_revision_id"]
-                if expected_revision_id is not None and expected_revision_id != parent_revision_id:
-                    raise ConflictError(
-                        "Native Revision conflict: expected "
-                        f"{expected_revision_id}, current Head is {parent_revision_id}"
-                    )
-                occurred_at = datetime.now(UTC)
-                await self.repository.insert_revision(
-                    conn,
-                    revision_id=revision_id,
-                    namespace_id=namespace_id,
-                    resource_id=resource_id,
-                    parent_revision_id=parent_revision_id,
-                    action="delete",
-                    path=current_path,
-                    path_from=None,
-                    path_to=None,
-                    payload_manifest_id=None,
-                    mutation_id=mutation_id,
-                    request_fingerprint=fingerprint,
-                    message=message,
-                    subject=subject,
-                    summary=summary,
-                    actor=actor,
-                    occurred_at=occurred_at,
-                    activity_event_id=activity_id,
-                    invalidation_intent_id=intent_id,
+            occurred_at = datetime.now(UTC)
+            await self.repository.insert_revision(
+                conn,
+                revision_id=revision_id,
+                namespace_id=namespace_id,
+                resource_id=resource_id,
+                parent_revision_id=parent_revision_id,
+                action="delete",
+                path=current_path,
+                path_from=None,
+                path_to=None,
+                payload_manifest_id=None,
+                mutation_id=mutation_id,
+                request_fingerprint=fingerprint,
+                message=message,
+                subject=subject,
+                summary=summary,
+                actor=actor,
+                occurred_at=occurred_at,
+                activity_event_id=activity_id,
+                invalidation_intent_id=intent_id,
+            )
+            await self._hit("authority.after_revision")
+            if surface == "document" and retain_document_assets:
+                asset_ids = await native_document_assets.locked_head_image_ids(conn, self.repository, resource_id)
+                await native_document_assets.retain_for_delete(
+                    conn, namespace_id=namespace_id, resource_id=resource_id,
+                    path=current_path, revision_id=parent_revision_id, asset_ids=asset_ids,
                 )
-                await self._hit("authority.after_revision")
-                if surface == "document" and retain_document_assets:
-                    asset_ids = await native_document_assets.locked_head_image_ids(conn, self.repository, resource_id)
-                    await native_document_assets.retain_for_delete(
-                        conn, namespace_id=namespace_id, resource_id=resource_id,
-                        path=current_path, revision_id=parent_revision_id, asset_ids=asset_ids,
-                    )
-                await self.repository.set_head(
-                    conn,
-                    resource_id=resource_id,
-                    revision_id=revision_id,
-                    path=current_path,
-                    lifecycle="deleted",
-                    occurred_at=occurred_at,
-                )
-                await self._hit("authority.after_head")
-                await self._hit("authority.after_path")
-                await self.repository.retire_resource_aliases(
-                    conn,
-                    namespace_id=namespace_id,
-                    surface=surface,
-                    resource_id=resource_id,
-                    retired_revision_id=revision_id,
-                    occurred_at=occurred_at,
-                )
-                await self._hit("authority.after_alias")
-                await self.repository.insert_activity(
-                    conn,
-                    activity_event_id=activity_id,
-                    namespace_id=namespace_id,
-                    resource_id=resource_id,
-                    revision_id=revision_id,
-                    action="delete",
-                    actor=actor,
-                    subject=subject,
-                    summary=summary,
-                    path_from=None,
-                    path_to=None,
-                    occurred_at=occurred_at,
-                )
-                await self._emit_document_change(
-                    conn, "document.delete", surface=surface, namespace_id=namespace_id,
-                    resource_id=resource_id, path=current_path, revision_id=revision_id,
-                    parent_revision_id=parent_revision_id, actor=actor,
-                )
-                await self._hit("authority.after_activity")
-                await self.repository.insert_invalidation_intent(
-                    conn,
-                    intent_id=intent_id,
-                    namespace_id=namespace_id,
-                    resource_id=resource_id,
-                    revision_id=revision_id,
-                    reason="delete",
-                    occurred_at=occurred_at,
-                )
-                await self._hit("authority.after_invalidation")
-                await self._hit("authority.before_commit")
+            await self.repository.set_head(
+                conn,
+                resource_id=resource_id,
+                revision_id=revision_id,
+                path=current_path,
+                lifecycle="deleted",
+                occurred_at=occurred_at,
+            )
+            await self._hit("authority.after_head")
+            await self._hit("authority.after_path")
+            await self.repository.retire_resource_aliases(
+                conn,
+                namespace_id=namespace_id,
+                surface=surface,
+                resource_id=resource_id,
+                retired_revision_id=revision_id,
+                occurred_at=occurred_at,
+            )
+            await self._hit("authority.after_alias")
+            await self.repository.insert_activity(
+                conn,
+                activity_event_id=activity_id,
+                namespace_id=namespace_id,
+                resource_id=resource_id,
+                revision_id=revision_id,
+                action="delete",
+                actor=actor,
+                subject=subject,
+                summary=summary,
+                path_from=None,
+                path_to=None,
+                occurred_at=occurred_at,
+            )
+            await self._emit_document_change(
+                conn, "document.delete", surface=surface, namespace_id=namespace_id,
+                resource_id=resource_id, path=current_path, revision_id=revision_id,
+                parent_revision_id=parent_revision_id, actor=actor, events=events,
+            )
+            await self._hit("authority.after_activity")
+            await self.repository.insert_invalidation_intent(
+                conn,
+                intent_id=intent_id,
+                namespace_id=namespace_id,
+                resource_id=resource_id,
+                revision_id=revision_id,
+                reason="delete",
+                occurred_at=occurred_at,
+            )
+            await self._hit("authority.after_invalidation")
+            await self._hit("authority.before_commit")
         return NativeMutationResult(
             resource_id=resource_id,
             revision_id=revision_id,

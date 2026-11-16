@@ -33,6 +33,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.exceptions import (
+    AKBError,
     ConflictError,
     DOCUMENT_TITLE_CONFLICT,
     ForbiddenError,
@@ -183,22 +184,27 @@ def exception_envelope(e: Exception) -> dict:
 
     transient = transient_error(e)
     if transient is not None:
+        # Details an operation added, such as what a recursive delete did
+        # before this error, are kept.
+        extra = transient.details or {}
         if transient.code == OPERATION_TIMEOUT:
-            return err(str(transient), code=OPERATION_TIMEOUT, hint=transient.hint)
+            return err(str(transient), code=OPERATION_TIMEOUT, hint=transient.hint, **extra)
         if transient.code == WRITE_BUSY:
             return err(
                 str(transient),
                 code=WRITE_BUSY,
                 hint=transient.hint,
-                retry_after_secs=transient.retry_after_secs,
+                **{"retry_after_secs": transient.retry_after_secs, **extra},
             )
-        return err(str(transient), code=SERVICE_UNAVAILABLE, hint=transient.hint)
+        return err(str(transient), code=SERVICE_UNAVAILABLE, hint=transient.hint, **extra)
     if isinstance(e, ReservedSystemPathError):
         return err(str(e), code=RESERVED_SYSTEM_PATH_CODE)
     if isinstance(e, ForbiddenError):
-        return err(str(e), code=PERMISSION_DENIED)
+        # A refusal that says more, such as a recursive delete refused after
+        # some of its documents went, keeps its hint and details.
+        return err(str(e), code=PERMISSION_DENIED, hint=e.hint, **(e.details or {}))
     if isinstance(e, NotFoundError):
-        return err(str(e), code=NOT_FOUND)
+        return err(str(e), code=NOT_FOUND, hint=e.hint, **(e.details or {}))
     if isinstance(e, ConflictError):
         if e.code == VAULT_NAME_UNAVAILABLE:
             return err(str(e), code=VAULT_NAME_UNAVAILABLE)
@@ -211,7 +217,10 @@ def exception_envelope(e: Exception) -> dict:
             )
         if e.code == NATIVE_REVISION_SELECTOR_AMBIGUOUS:
             return err(str(e), code=NATIVE_REVISION_SELECTOR_AMBIGUOUS)
-        return err(str(e), code=CONFLICT)
+        # A conflict that says more, such as a recursive delete that ran out
+        # of rounds after some of its documents went, keeps its hint and
+        # details.
+        return err(str(e), code=CONFLICT, hint=e.hint, **(e.details or {}))
     if isinstance(e, InvalidColumnTypeError):
         return err(
             str(e),
@@ -242,4 +251,8 @@ def exception_envelope(e: Exception) -> dict:
         return err(str(e), code=GREP_SCOPE_TOO_LARGE, hint=e.hint, **(e.details or {}))
     if isinstance(e, ValidationError):
         return err(str(e), code=INVALID_ARGUMENT)
+    if isinstance(e, AKBError):
+        # Still an internal error, keeping the hint and details it carries,
+        # such as what a recursive delete did before it.
+        return err(str(e), code=INTERNAL, hint=e.hint, **(e.details or {}))
     return err(str(e), code=INTERNAL)

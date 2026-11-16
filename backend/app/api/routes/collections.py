@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user
+from app.api.routes.tables import _can_read_vault
 from app.exceptions import NotFoundError
 from app.models.document import BrowseResponse
 from app.services.access_service import check_vault_access
@@ -51,6 +52,11 @@ class AkbCollectionDeleteEnvelope(BaseModel):
     deleted_files: int
     deleted_sub_collections: int
     deleted_tables: int
+    # After a Native cutover: collections the delete left in place, and why.
+    # Their paths only for a caller who may read the Vault.
+    retained_collection_count: int | None = None
+    retained_collections: list[str] | None = None
+    hint: str | None = None
 
 
 @router.get(
@@ -122,6 +128,7 @@ async def create_collection(
 @router.delete(
     "/collections/{vault}/{path:path}",
     response_model=AkbCollectionDeleteEnvelope,
+    response_model_exclude_none=True,
     summary="Delete a collection",
     operation_id="collectionsDeleteCollection",
     tags=["collections"],
@@ -152,12 +159,15 @@ async def delete_collection(
             recursive=recursive,
             agent_id=user.user_id,
             allow_table_delete=role_level(access.get("role")) >= role_level("admin"),
+            # Paths of what the delete did or left go only to a reader.
+            disclose_paths=await _can_read_vault(user, vault),
         )
         return {"kind": "collection_delete", **result}
     except InvalidPathError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    # A NotFoundError reaches the AKBError handler, which answers 404 as
+    # HTTPException did and keeps the hint and details of one raised after
+    # some documents went.
     except CollectionNotEmptyError as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT,

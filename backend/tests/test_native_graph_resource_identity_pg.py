@@ -184,7 +184,9 @@ async def test_a_delete_removes_both_directions_when_the_path_is_free(monkeypatc
 
 
 async def test_a_retried_delete_intent_is_idempotent(monkeypatch):
-    """Delivery is at-least-once, so the cleanup has to survive a second run."""
+    """Delivery is at-least-once, so the cleanup has to survive a second run:
+    here the same intent, applied once, is open again (as a re-opened intent
+    is) and applied by a new claim after a replacement took its path."""
     async with _fresh_database() as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         doomed = await native.create_text(**_args(vault_id, "a.md"), payload="body")
@@ -204,7 +206,12 @@ async def test_a_retried_delete_intent_is_idempotent(monkeypatch):
             pool, vault_id, source=_doc("source.md"), target=_doc("a.md"),
             resource_ids=(None, replacement.resource_id),
         )
-        await worker._apply_delete(intent)
+        await pool.execute(
+            "UPDATE native_invalidation_intents SET completed_at = NULL, delivery_outcome = NULL "
+            "WHERE intent_id = $1",
+            intent["intent_id"],
+        )
+        await worker._apply_delete(await _intent(pool, deleted.revision_id))
 
         assert await _edges(pool) == [(_doc("source.md"), _doc("a.md"))]
 
@@ -587,6 +594,9 @@ async def test_a_collection_delete_clears_a_native_documents_edges_by_identity(m
     reproducible single-threaded. What IS reproducible is the other half of
     the same change: an edge carrying this resource's identity is cleared
     whatever URI it names, which the path-keyed cleanup could not see.
+
+    The derived worker clears them, from the intent each document's delete
+    records; the delete itself no longer does after its commit.
     """
     from app.repositories.document_repo import CollectionRepository
     from app.services import collection_service as coll_mod
@@ -626,6 +636,7 @@ async def test_a_collection_delete_clears_a_native_documents_edges_by_identity(m
             vault=VAULT, path="specs", recursive=True, agent_id="review",
         )
         assert result["deleted_docs"] == 1, result
+        await NativeDerivedWorker(pool).settle(namespace_id=vault_id, timeout_seconds=15)
 
         assert await _edges(pool) == []
 

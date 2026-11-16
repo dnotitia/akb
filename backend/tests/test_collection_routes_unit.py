@@ -29,7 +29,11 @@ def client(monkeypatch):
     async def _writer(*_args, **_kwargs):
         return {"role": "writer"}
 
+    async def _reader(*_args, **_kwargs):
+        return True
+
     monkeypatch.setattr(collections, "check_vault_access", _writer)
+    monkeypatch.setattr(collections, "_can_read_vault", _reader)
     app.dependency_overrides[get_current_user] = lambda: _FakeUser()
     try:
         yield TestClient(app)
@@ -84,6 +88,7 @@ def test_delete_adds_only_literal_kind_and_preserves_all_counts(client, monkeypa
             "recursive": True,
             "agent_id": "u-collections",
             "allow_table_delete": False,
+            "disclose_paths": True,
         }
         return {
             "ok": True,
@@ -159,3 +164,129 @@ def test_non_empty_409_keeps_legacy_detail_and_normalized_details(client, monkey
         "message": "Collection has 2 document(s), 1 sub-collection(s)",
         **expected_counts,
     }
+
+
+def test_delete_reports_the_collections_a_cutover_keeps(client, monkeypatch):
+    """After a Native cutover a recursive delete can leave collections that
+    preserved documents reference; the REST body lists them, with the hint
+    that explains why. Without them, neither key appears."""
+    hint = "p keeps its row: preserved documents reference it"
+
+    async def _delete(**_kwargs):
+        return {
+            "ok": True,
+            "collection": "p",
+            "deleted_docs": 0,
+            "deleted_files": 0,
+            "deleted_sub_collections": 0,
+            "deleted_tables": 0,
+            "retained_collections": ["p"],
+            "hint": hint,
+        }
+
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/p", params={"recursive": "true"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["retained_collections"], body["hint"]) == (["p"], hint)
+
+
+def test_a_table_refusal_after_documents_went_keeps_its_details(client, monkeypatch):
+    """A writer's recursive delete refused at a table that appeared after some
+    documents were deleted answers 403 with the documents it deleted."""
+    from app.exceptions import ForbiddenError
+
+    details = {
+        "partially_applied": True,
+        "deleted_docs": 1,
+        "deleted_uris": ["akb://reef/coll/notes/doc/a.md"],
+    }
+
+    async def _delete(**_kwargs):
+        raise ForbiddenError("refused", hint="only an admin can finish", details=details)
+
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/notes", params={"recursive": "true"})
+
+    assert response.status_code == 403
+    body = response.json()
+    assert (body["code"], body["details"], body["hint"]) == (
+        "permission_denied", details, "only an admin can finish",
+    )
+
+
+def test_delete_discloses_paths_only_to_a_reader(client, monkeypatch):
+    """A write-only credential's delete is told counts, not paths."""
+    seen = {}
+
+    async def _cannot_read(*_args, **_kwargs):
+        return False
+
+    async def _delete(**kwargs):
+        seen.update(kwargs)
+        return {"ok": True, "collection": "p", "deleted_docs": 0, "deleted_files": 0,
+                "deleted_sub_collections": 0, "deleted_tables": 0}
+
+    monkeypatch.setattr(collections, "_can_read_vault", _cannot_read)
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/p", params={"recursive": "true"})
+    assert response.status_code == 200
+    assert seen["disclose_paths"] is False
+
+
+def test_a_conflict_after_documents_went_keeps_its_details(client, monkeypatch):
+    """A recursive delete that ran out of rounds after documents went answers
+    409 with what it did."""
+    from app.exceptions import ConflictError
+
+    details = {"partially_applied": True, "deleted_docs": 2}
+
+    async def _delete(**_kwargs):
+        raise ConflictError("kept arriving", hint="send it again", details=details)
+
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/notes", params={"recursive": "true"})
+    assert response.status_code == 409
+    body = response.json()
+    assert (body["code"], body["details"], body["hint"]) == ("conflict", details, "send it again")
+
+
+def test_a_busy_vault_after_documents_went_keeps_its_details_and_retry(client, monkeypatch):
+    """The Vault's event lock timing out after documents went answers 429
+    with Retry-After and what the delete did."""
+    from app.exceptions import TransientDependencyError
+
+    error = TransientDependencyError(
+        code="write_busy", message="busy", status_code=429, hint="retry", retry_after_secs=1,
+    )
+    error.details = {"partially_applied": True, "deleted_docs": 1}
+
+    async def _delete(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/notes", params={"recursive": "true"})
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "1"
+    body = response.json()
+    assert (body["code"], body["details"]) == ("write_busy", {"partially_applied": True, "deleted_docs": 1})
+
+
+def test_an_internal_error_after_documents_went_keeps_its_details(client, monkeypatch):
+    """An internal error that ends a recursive delete after documents went
+    answers 500 with the generic message and code `internal`, and with what
+    the delete did."""
+    from app.exceptions import InternalError
+
+    details = {"partially_applied": True, "deleted_docs": 1}
+
+    async def _delete(**_kwargs):
+        raise InternalError(hint="This request committed deletions for 1 document(s).", details=details)
+
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/notes", params={"recursive": "true"})
+    assert response.status_code == 500
+    body = response.json()
+    assert (body["code"], body["details"], body["message"]) == ("internal", details, "Internal server error")
+    assert "committed deletions" in body["hint"]
