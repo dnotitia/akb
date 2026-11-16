@@ -59,14 +59,22 @@ specifically; the proxy has its own log in
   token taken at once, so plans waiting for one Vault's locked table do not
   hold back another Vault; by `akb_sql_plan_lock_timeout_ms` (default 500)
   for each table lock; and by `akb_sql_plan_timeout_ms` (default 2000) in
-  all, from the wait for a connection to the end of the plan. Past either
-  the write fails with `write_busy` and gives its plan slot back, so a plan
-  waiting for one lock after another cannot keep the slots from other
-  Vaults. The plan slots and the admission alike serve waiters first come,
-  first served, by capacity: a waiter reserves a slot of each of its Vaults
-  against later requests, which use the slots left, and one that leaves the
+  all, one deadline over everything after the plan slot, from the wait for a
+  connection through the transaction's start and settings to the end of the
+  plan. Past either the write fails with `write_busy` and gives its plan slot
+  back, so a plan waiting for one lock after another, or whose statements
+  each finish within their own limits, cannot keep the slots from other
+  Vaults; a plan that cannot roll back within half a second of its deadline
+  closes its connection rather than give it back. The plan slots and the
+  admission alike serve waiters first come, first served, by capacity: the
+  first waiter blocked on a Vault reserves one slot of each of its Vaults
+  against later requests, which use the slots left, so waiters blocked on a
+  full Vault hold at most one slot of another; and one that leaves the
   queue, at its deadline or cancelled, lets the requests behind it go on at
-  once; single-Vault requests therefore cannot starve a multi-Vault one. A write that changes rows of an undeclared Vault
+  once. Single-Vault requests therefore cannot starve a multi-Vault one. At
+  most `vault_write_max_waiters` and `akb_sql_plan_max_waiters` (default
+  1000 each) requests wait in each queue; one more fails at once with
+  `write_busy`. A write that changes rows of an undeclared Vault
   through a function is rolled back with an `invalid_argument` error naming
   it. An unscoped system administrator's raw SQL runs under the backend's
   role and is admitted only for those Vaults, not for another Vault whose
@@ -82,10 +90,13 @@ specifically; the proxy has its own log in
   `app_rollout_admission_wait_secs` (default 1 second) for a target's Vault;
   a refusal defers every pending target of that Vault for 5 seconds, and the
   worker claims the next eligible target at once instead of sleeping.
-  Eligible targets are claimed in the order they became claimable, a
-  deferred one when its deferral ended, so busy Vaults do not take turns
-  ahead of another Vault's rollout, and a deferred target does not wait for
-  every batch of another Vault's backfill.
+  Among eligible targets, the Vault that has waited longest for the worker
+  goes first: since the worker last claimed, finished or deferred one of its
+  targets, or, for a Vault it has not served yet, since its target became
+  claimable. Busy Vaults therefore do not take turns ahead of another
+  Vault's rollout, and a deferred target waits neither for every batch of
+  another Vault's backfill nor for another rollout's later batch that became
+  claimable after it.
 
 - On the Native authority a recursive collection delete is now atomic per
   document and completes when run again. Each document's delete commits with

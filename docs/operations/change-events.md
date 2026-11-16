@@ -180,13 +180,18 @@ once or waits for all of them, holding none. Waiters are admitted first come,
 first served, by capacity: whenever a slot is given back or a waiter leaves
 the queue, at its deadline or cancelled, the waiters are taken in arrival
 order, and each is admitted if every one of its Vaults has a free slot beyond
-those reserved by the waiters before it; otherwise it reserves one slot of
-each of its Vaults and the next is taken. A later transaction therefore never
-takes the last slot of a Vault that an earlier waiter needs, so single-Vault
-transactions arriving one after another cannot keep a transaction of several
-Vaults waiting until its deadline. A full Vault holds back another Vault's
-writes only by the slots that transactions waiting for both reserve there, and
-a Vault no waiter needs keeps admitting. A transaction that waits longer than
+the one a waiter before it may have reserved there; otherwise it reserves one
+slot of each of its Vaults that no waiter before it has reserved, and the next
+is taken. A later transaction therefore never takes the last slot of a Vault
+that an earlier waiter needs, so single-Vault transactions arriving one after
+another cannot keep a transaction of several Vaults waiting until its
+deadline. Waiters blocked on a full Vault reserve at most one slot of each
+other Vault they name, however many they are, so a full Vault holds back
+another Vault's writes by at most that one slot, and a Vault no waiter needs
+keeps admitting. At most `vault_write_max_waiters` (default 1000) transactions
+wait at once in a process, over all Vaults; one more that cannot be admitted
+at once fails at once with a retryable `write_busy`, which keeps the queue,
+and each pass over it, bounded. A transaction that waits longer than
 `vault_write_queue_timeout_secs` (default 10 seconds) fails with a retryable
 `write_busy`: over REST, HTTP 429
 with `Retry-After: 1` and a body whose `code` is `write_busy` and whose
@@ -230,12 +235,16 @@ leave the Vault's content unchanged:
   with every other pending target of its Vault, for 5 seconds, in one
   statement, and the worker claims again at once rather than sleep its idle
   interval, so it takes other Vaults' targets meanwhile. Batches keep their
-  order; the eligible targets are claimed in the order they became
-  claimable, a deferred target when its deferral ended and another when it
-  was last made pending, as a backfill does with its target after each
-  batch. Several busy Vaults therefore do not take turns ahead of another
-  Vault's rollout, and a target whose deferral ended does not wait for every
-  batch of another Vault's backfill.
+  order. Among the eligible targets, the Vault that has waited longest for
+  the worker goes first: a Vault the worker has served, by claiming,
+  finishing or deferring one of its targets in a running rollout, has waited
+  since it last did; one it has not served yet, since its target became
+  claimable, when its rollout was requested or when the batch before it
+  finished. Targets inserted with a rollout are not service until touched.
+  Several busy Vaults therefore do not take turns ahead of another Vault's
+  rollout, a target whose deferral ended does not wait for every batch of
+  another Vault's backfill, and a later batch of another rollout does not
+  go before a target whose deferral ended while the batch before it ran.
 - External Git synchronization fetches the remote into its mirror before it
   records each changed file, admitted per file.
 - A raw SQL write reads its plan on a pool connection before its admission,
@@ -314,15 +323,23 @@ it. The plans of a Vault whose table is locked therefore wait one behind
 another, whatever other Vaults they declare with it, and a statement of a
 Vault no earlier waiter declares takes the free slot. A wait that ends without
 a slot, at its deadline or cancelled, leaves the queue at once, and the
-statements its reservation held back go on. Once a plan has its slot, reading
-it may take `akb_sql_plan_timeout_ms` (default 2000) in all, from the wait for
-a connection to the end of `EXPLAIN`, and each wait for a table's lock
-`akb_sql_plan_lock_timeout_ms` (default 500); past either, the write fails
-with a retryable `write_busy` and gives its slot back, rather than hold its
-connection. A plan that waits for one lock after another, each wait shorter
-than the lock timeout, therefore keeps its slot for at most the plan's
-timeout, and so does a statement that declares one Vault but writes another,
-holding the first one's token, not the second's, before it is refused.
+statements its reservation held back go on; at most `akb_sql_plan_max_waiters`
+(default 1000) statements wait at once, and one more fails at once with a
+retryable `write_busy`. Once a plan has its slot, everything it does may take
+`akb_sql_plan_timeout_ms` (default 2000) in all, under one deadline: the wait
+for a connection, the transaction's start, its settings and role, the
+administrator check, `EXPLAIN` and the catalog lookups; and each wait for a
+table's lock may take `akb_sql_plan_lock_timeout_ms` (default 500). Past
+either, the write fails with a retryable `write_busy` and gives its slot back,
+rather than hold its connection. A plan cancelled at its deadline rolls back
+and gives its connection back; one that still holds it half a second later,
+rolling back or being reset, closes it instead, so the pool does not get it
+back in an unknown state. A plan whose statements each finish within their
+own limits, or that waits for one lock after another, each wait shorter than
+the lock timeout, therefore keeps its slot for at most the plan's timeout
+and that half second, and so does a statement that declares one Vault but
+writes another, holding the first one's token, not the second's, before it
+is refused.
 Before the write commits, its transaction checks the dynamic-table row changes
 it queued for `table.rows_changed` events; a change of a Vault it was not
 admitted for rolls it back with an `invalid_argument` error that names that
@@ -628,7 +645,10 @@ released and applied by a later run, and does not hold back another rollout,
 also under the worker's own runner, which sleeps after an iteration without
 work, with two busy targets of one Vault, and with six busy Vaults ahead of
 a quiet one, under the default deadlines; that a deferred target is claimed
-between the batches of another Vault's backfill once its deferral ended;
+between the batches of another Vault's backfill once its deferral ended, and
+before another rollout's later batch that became claimable after it; that a
+rollout target is admitted beside transactions waiting on another, full
+Vault;
 that raw SQL runs read-only without admission only when asked to, and
 otherwise as a write that waits; that raw SQL writes waiting for a table lock
 while they read their plans leave connections for another Vault, and, sixty
@@ -649,11 +669,16 @@ stays. `test_sql_plan_slots_unit.py` and `test_vault_write_admission_unit.py`
 check that alternating single-Vault requests do not starve a request of both
 Vaults while an unrelated Vault keeps flowing; that a waiter that leaves the
 queue, at its deadline or cancelled, lets the requests its reservation held
-back go on at once; that a waiter reserves only the slots it needs, so other
-requests use the rest; and that waiters are served in arrival order.
+back go on at once; that a waiter reserves only the slots it needs, and
+waiters blocked on a full Vault one slot of another between them, so other
+requests use the rest; that waiters are served in arrival order; and that a
+request finding the queue full is refused at once.
 `test_sql_plan_slots_unit.py` also checks the plan-slot limit, one plan per
 Vault with every declared Vault's token taken at once, and that waits that
-time out or are cancelled leave the queue at once and take no slot;
+time out or are cancelled leave the queue at once and take no slot; that a
+plan's deadline bounds statements that each finish within their own limits,
+and a slow start of its transaction; and that a plan that cannot roll back in
+time closes its connection;
 `test_write_busy_rest_unit.py` checks the REST response to a refused write and
 to one refused part-way.
 `test_vault_write_admission_paths_postgres.py` fills a Vault's admission and
