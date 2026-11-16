@@ -993,12 +993,14 @@ class _Known:
         return _Known(self.not_none - names, self.true - names)
 
     def entering(self, item: ast.withitem) -> "_Known":
-        """What is known once `item` has bound its target: a name loses what
-        was known of it, and is known again only as the context manager's
-        value, if that is known."""
+        """What is known once `item` has run and bound its target: a name its
+        expression binds (`tx := None`) or its target binds loses what was
+        known of it, and the target is known again only as the context
+        manager's value, if that is known."""
+        known = self.without(_rebound([item.context_expr]))
         if item.optional_vars is None:
-            return self
-        known = self.without(_rebound([item.optional_vars]))
+            return known
+        known = known.without(_rebound([item.optional_vars]))
         if not isinstance(item.optional_vars, ast.Name):
             return known
         name, context = item.optional_vars.id, _context(item.context_expr)
@@ -1025,7 +1027,9 @@ def _live(nodes: list, known: _Known):
     only, and a name bound anew, by an assignment, a loop, another `with`
     or otherwise, loses what was known of it from there on (and inside a
     loop that binds it, from the loop's start; in a `try`, a name its body
-    binds has lost them in its handlers, `else` and `finally`)."""
+    binds has lost them in its handlers, `else` and `finally`, a handler's
+    `as` name in that handler, and a name anything in the `try` binds in its
+    `finally`; a name a `with` item's expression binds, by the next item)."""
     for node in nodes:
         if isinstance(node, ast.If):
             settled = _known(node.test, known)
@@ -1055,7 +1059,10 @@ def _live(nodes: list, known: _Known):
                 yield handler, after
                 if handler.type is not None:
                     yield from _live([handler.type], after)
-                yield from _live(handler.body, after.without(_rebound([handler])))
+                # Entering a handler binds only its `as` name; what its own
+                # body binds counts from where it does.
+                named = frozenset({handler.name}) if handler.name else frozenset()
+                yield from _live(handler.body, after.without(named))
             yield from _live(node.orelse, after)
             yield from _live(node.finalbody, known.without(_rebound([*node.body, *node.handlers, *node.orelse])))
             known = known.without(_rebound([node]))
@@ -1364,6 +1371,27 @@ def _with_statement_in_an_admitted_transaction(
      "    async with vault_write_admission(vault_id), _access_connection(conn) as conn:\n"
      "        pass",
      "services/access_service.py", None),
+    # A name a `with` item's own expression binds anew, read by the next item.
+    ("async with admitted_connection(pool, vault_id) as tx, asyncio.timeout(tx := None), "
+     "_access_connection(tx):\n"
+     "        pass",
+     "services/access_service.py", "admitted_connection"),
+    # In a handler, its `as` name, and a name its body binds before using it.
+    ("async with _access_connection(conn) as tx:\n"
+     "        try:\n"
+     "            raise ValueError()\n"
+     "        except ValueError as tx:\n"
+     "            async with _access_connection(tx):\n"
+     "                pass",
+     "services/access_service.py", "admitted_connection"),
+    ("async with _access_connection(conn) as tx:\n"
+     "        try:\n"
+     "            raise ValueError()\n"
+     "        except ValueError:\n"
+     "            tx = None\n"
+     "            async with _access_connection(tx):\n"
+     "                pass",
+     "services/access_service.py", "admitted_connection"),
 ])
 def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
     monkeypatch, statement, site, block,
@@ -1374,9 +1402,10 @@ def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
     then takes one, also behind a test the walk cannot settle, on an event
     buffer that may be empty or a transaction's `with` target, which is
     None, or on a name a connection was known under until it was bound
-    anew, also in a `try`'s `finally` or `else`; or a helper that a later
-    item of the admission's own `with` calls before that item's target is
-    bound. The check names it."""
+    anew, also in a `try`'s `finally` or `else`, by a `with` item's own
+    expression, or in a handler, by its `as` name or its body; or a helper
+    that a later item of the admission's own `with` calls before that
+    item's target is bound. The check names it."""
     rel = "services/access_service.py"
     modules = _with_statement_in_an_admitted_transaction(rel, "set_public_access", statement, block)
     monkeypatch.setattr(sys.modules[__name__], "_app_modules", lambda: modules)
@@ -1384,6 +1413,28 @@ def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
     flagged = [where for where, path in taken.items() if " in set_public_access" in path.split(" -> ")[0]]
     assert flagged, taken
     assert all(where.startswith(f"{site or rel}:") for where in flagged), flagged
+
+
+def test_a_connection_used_in_a_handler_before_its_name_is_bound_anew_passes_the_check(monkeypatch):
+    """`set_public_access` with a handler that hands the connection it holds
+    to a helper and only afterwards binds that name anew. When the helper is
+    called the name still holds the connection, so the helper takes none of
+    its own and the check names nothing. The check used to drop what it knew
+    of every name the handler binds as soon as the handler was entered."""
+    rel = "services/access_service.py"
+    statement = (
+        "async with _access_connection(conn) as tx:\n"
+        "        try:\n"
+        "            raise ValueError()\n"
+        "        except ValueError:\n"
+        "            async with _access_connection(tx):\n"
+        "                pass\n"
+        "            tx = None"
+    )
+    modules = _with_statement_in_an_admitted_transaction(rel, "set_public_access", statement)
+    monkeypatch.setattr(sys.modules[__name__], "_app_modules", lambda: modules)
+    taken, _reached = _connections_taken_under_admission()
+    assert not taken, taken
 
 
 def test_every_admitted_connection_is_given_back_before_its_admission():

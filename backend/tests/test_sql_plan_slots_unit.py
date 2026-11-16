@@ -752,3 +752,46 @@ async def test_a_plan_read_whose_release_fails_is_not_write_busy(monkeypatch):
     mapped = transient_error(raised.value)
     assert mapped is not None and mapped.code == OPERATION_TIMEOUT
     assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+async def test_a_plan_whose_release_is_cancelled_by_the_server_is_not_write_busy(monkeypatch):
+    """A plan is read well within its deadline, and giving its connection
+    back then fails with the server's statement cancellation, the class a
+    plan's own statement timeout raises. Raised by the release, not by the
+    plan's statements, it is no sign of the plan running out of time: the
+    statement fails with it, reported as `operation_timeout`, and not as
+    `write_busy`. Every `QueryCanceledError` used to count as the plan's."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 2000)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    failure = asyncpg.exceptions.QueryCanceledError("canceling statement due to statement timeout")
+    pool = _ReleasingPool(reset_secs=0.05, bounded=True, fail_with=failure)
+    executor = user_sql_executor.UserSqlExecutor(pool)
+    with pytest.raises(asyncpg.exceptions.QueryCanceledError) as raised:
+        await asyncio.wait_for(executor._planned(_statement("x", slow=False)), timeout=5)
+    assert raised.value is failure
+    mapped = transient_error(raised.value)
+    assert mapped is not None and mapped.code == OPERATION_TIMEOUT
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+async def test_a_plan_read_in_a_callers_cancellation_handler_raises_its_release_error(monkeypatch):
+    """A plan is read from inside the caller's handler of a cancellation it
+    caught, and is read in time; giving its connection back then fails with a
+    socket's `ETIMEDOUT`. The caller's cancellation is not this read's: the
+    release's error is raised, not logged away as though the read had been
+    cancelled. The read used to pick up the caller's exception and return
+    its plan as if the release had gone well."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 2000)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    failure = TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+    pool = _ReleasingPool(reset_secs=0.05, bounded=True, fail_with=failure)
+    executor = user_sql_executor.UserSqlExecutor(pool)
+    try:
+        raise asyncio.CancelledError()
+    except asyncio.CancelledError:
+        with pytest.raises(TimeoutError) as raised:
+            await asyncio.wait_for(executor._planned(_statement("x", slow=False)), timeout=5)
+    assert raised.value is failure
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])

@@ -275,6 +275,12 @@ class _PlanTimedOut(TimeoutError):
     giving its connection back."""
 
 
+class _PlanRefused(Exception):
+    """A plan's own statements hit a lock's or the server's statement
+    timeout while the plan was read (the error is its cause), as opposed to
+    the same errors raised giving its connection back."""
+
+
 class UserSqlExecutor:
     """Run user-supplied SQL under the caller's PG role.
 
@@ -421,14 +427,10 @@ class UserSqlExecutor:
             try:
                 return await self._read_plan(statement, deadline, closed)
             except Exception as exc:
-                # Only the plan's own deadline and its statements' limits are
-                # the plan running out of time; an error giving its connection
-                # back after a plan was read is not, whatever its class.
-                if closed or isinstance(exc, (
-                    _PlanTimedOut,
-                    asyncpg.exceptions.LockNotAvailableError,
-                    asyncpg.exceptions.QueryCanceledError,
-                )):
+                # Only the plan's own deadline and its statements' limits, as
+                # the read marks them, are the plan running out of time; an
+                # error giving its connection back is not, whatever its class.
+                if closed or isinstance(exc, (_PlanTimedOut, _PlanRefused)):
                     raise WriteBusyError(
                         ", ".join(statement.vault_names) or "akb_sql", loop.time() - started,
                         retry_after_secs=1,
@@ -457,6 +459,11 @@ class UserSqlExecutor:
         """
         acquire = self.pool.acquire()
         held: list[Any] = []
+        # What leaves the read itself, for the connection's give-back: a
+        # cancellation of the read still wins over an error giving it back.
+        # Not `sys.exc_info()`, which would also return an exception the
+        # caller is handling around this read.
+        leaving: tuple = (None, None, None)
         try:
             try:
                 async with asyncio.timeout_at(deadline) as plan_deadline:
@@ -478,12 +485,19 @@ class UserSqlExecutor:
                 if plan_deadline.expired():
                     raise _PlanTimedOut from exc
                 raise
+            except (
+                asyncpg.exceptions.LockNotAvailableError,
+                asyncpg.exceptions.QueryCanceledError,
+            ) as exc:
+                # The plan's statements hit a limit; marked here, where the
+                # plan runs, so that the same errors raised giving the
+                # connection back are not taken for it.
+                raise _PlanRefused() from exc
+        except BaseException:
+            leaving = sys.exc_info()
+            raise
         finally:
-            # A cancellation of the read, delivered before the connection
-            # goes back, still wins over an error giving it back.
-            if held and await give_back_connection(
-                acquire, held[0], sys.exc_info(), grace=_PLAN_CLEANUP_SECS,
-            ):
+            if held and await give_back_connection(acquire, held[0], leaving, grace=_PLAN_CLEANUP_SECS):
                 closed.append(True)
 
     async def _explain(

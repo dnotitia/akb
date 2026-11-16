@@ -710,7 +710,7 @@ async def _cancelled_while_its_release_runs(pool: _ResettingPool) -> asyncio.Tas
     return writing
 
 
-async def test_a_cancelled_give_back_retrieves_the_releases_timeout(monkeypatch):
+async def test_a_cancelled_give_back_retrieves_the_releases_timeout(monkeypatch, caplog):
     """A write is cancelled while its connection's release resets the
     connection past the release's bound, which closes it and ends with
     `TimeoutError`. The write ends cancelled, and the release's
@@ -718,6 +718,7 @@ async def test_a_cancelled_give_back_retrieves_the_releases_timeout(monkeypatch)
     retrieved once the release is collected. The cancellation used to be
     raised before the release's exception was retrieved."""
     monkeypatch.setattr(admission, "GIVE_BACK_GRACE_SECS", 0.1)
+    caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
     loop = asyncio.get_running_loop()
     reported: list[dict] = []
     previous = loop.get_exception_handler()
@@ -734,6 +735,7 @@ async def test_a_cancelled_give_back_retrieves_the_releases_timeout(monkeypatch)
         loop.set_exception_handler(previous)
     assert not [c for c in reported if "never retrieved" in c.get("message", "")], reported
     assert pool.in_use == 0
+    assert any("timed out in its reset" in r.getMessage() for r in caplog.records), caplog.records
 
 
 async def test_a_cancelled_give_back_logs_the_releases_error(monkeypatch, caplog):
@@ -840,19 +842,20 @@ async def test_a_write_cancelled_in_its_block_ends_cancelled_though_its_release_
     assert pool.in_use == 0
 
 
-async def test_a_timeout_well_before_the_bound_is_the_releases_error():
-    """A release fails with a `TimeoutError` that carries no errno, as a
+async def test_a_reset_that_times_out_early_is_logged_and_the_write_keeps_its_result(caplog):
+    """A release ends with a `TimeoutError` that carries no errno, as a
     reset statement's own `command_timeout` raises one, long before the
-    release's bound. It came from inside the release, not from the bound, so
-    the write raises it rather than taking it for the bound's expiry. Every
-    errno-less `TimeoutError` used to count as the bound's."""
-    failure = TimeoutError()
-    pool = _ResettingPool(size=2, reset_secs=0.05, fail_with=failure)
+    release's bound. The reset was slow and the connection was closed, and
+    the write's work was done: the write ends with its result, and a warning
+    says the release timed out. The errno-less timeout used to be raised as
+    soon as it came before the bound."""
+    caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
+    pool = _ResettingPool(size=2, reset_secs=0.05, fail_with=TimeoutError())
 
-    async def write() -> None:
+    async def write() -> str:
         async with admission.admitted_connection(pool, uuid.uuid4()):
-            pass
+            return "written"
 
-    with pytest.raises(TimeoutError) as raised:
-        await asyncio.wait_for(write(), timeout=5)
-    assert raised.value is failure
+    assert await asyncio.wait_for(write(), timeout=5) == "written"
+    assert any("timed out in its reset" in r.getMessage() for r in caplog.records), caplog.records
+    assert pool.in_use == 0
