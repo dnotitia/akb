@@ -33,6 +33,12 @@ this admission. Vault creation takes the new Vault's write-lane gate (not a
 global lane slot) and then its admission and holds both through its seed
 document, whose write re-enters both.
 
+A transaction takes its connection with ``admitted_connection``, which gives
+it back to the pool before the admission. Code that runs inside an admission
+entered without a connection (a Native mutation admitted before it prepares
+its payload, and Vault creation) takes each connection with
+``acquire_given_back``, which does the same before the code after it runs.
+
 A write that resolves its Vault's name to an id for admission checks, in its
 transaction, that the name still names that Vault (``check_admitted_vault``);
 ``retry_if_vault_replaced`` then runs it once more for the Vault it found.
@@ -285,6 +291,20 @@ async def give_back_connection(
 
 
 @asynccontextmanager
+async def _given_back(pool: Any) -> AsyncIterator[Any]:
+    """A connection from ``pool`` that goes back through
+    ``give_back_connection`` when the block ends, cancellation included."""
+    acquire = pool.acquire()
+    conn = await acquire.__aenter__()
+    try:
+        yield conn
+    except BaseException:
+        await give_back_connection(acquire, conn, sys.exc_info())
+        raise
+    await give_back_connection(acquire, conn)
+
+
+@asynccontextmanager
 async def admitted_connection(
     pool: Any, *vault_ids: uuid.UUID | str | None, vault: str | None = None,
     timeout: float | None = None,
@@ -299,14 +319,27 @@ async def admitted_connection(
     and then takes a pool connection goes through here.
     """
     async with vault_write_admission(*vault_ids, vault=vault, timeout=timeout):
-        acquire = pool.acquire()
-        conn = await acquire.__aenter__()
-        try:
+        async with _given_back(pool) as conn:
             yield conn
-        except BaseException:
-            await give_back_connection(acquire, conn, sys.exc_info())
-            raise
-        await give_back_connection(acquire, conn)
+
+
+@asynccontextmanager
+async def acquire_given_back(pool: Any) -> AsyncIterator[Any]:
+    """Take a connection from ``pool`` in code that can run inside an
+    admission entered without a connection: a Native mutation admitted
+    before it prepares its payload, Vault creation, and what they call.
+
+    When the current task holds an admission, the connection goes back
+    through ``give_back_connection``, so it is back in the pool before the
+    admission is given back, cancellation included. Elsewhere this is
+    ``pool.acquire()`` itself.
+    """
+    if not _admitted.get():
+        async with pool.acquire() as conn:
+            yield conn
+        return
+    async with _given_back(pool) as conn:
+        yield conn
 
 
 def is_admitted(vault_id: uuid.UUID | str | None) -> bool:

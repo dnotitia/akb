@@ -9,6 +9,7 @@ import asyncpg
 
 from app.exceptions import ConflictError
 from app.repositories.vault_files_repo import DocumentAssetOwner
+from app.services.vault_write_admission import acquire_given_back
 from app.util.text import like_escape
 from app.utils import dumps_jsonb
 
@@ -187,7 +188,7 @@ class DocumentRepository:
         if conn is not None:
             await _insert(conn)
         else:
-            async with self.pool.acquire() as c:
+            async with acquire_given_back(self.pool) as c:
                 await _insert(c)
         return doc_id
 
@@ -279,7 +280,7 @@ class DocumentRepository:
         if conn is not None:
             row = await conn.fetchrow(sql, vault_id, path)
             return dict(row) if row else None
-        async with self.pool.acquire() as c:
+        async with acquire_given_back(self.pool) as c:
             row = await c.fetchrow(sql, vault_id, path)
             return dict(row) if row else None
 
@@ -314,7 +315,7 @@ class DocumentRepository:
         if conn is not None:
             row = await conn.fetchrow(sql, *args)
         else:
-            async with self.pool.acquire() as own_conn:
+            async with acquire_given_back(self.pool) as own_conn:
                 row = await own_conn.fetchrow(sql, *args)
         return dict(row) if row else None
 
@@ -900,7 +901,7 @@ class CollectionRepository:
         """Run ``work`` in ``conn``'s transaction, or in a new one: a created
         row must commit together with the locks taken for it."""
         if conn is None:
-            async with self.pool.acquire() as acq, acq.transaction():
+            async with acquire_given_back(self.pool) as acq, acq.transaction():
                 return await work(acq)
         if not conn.is_in_transaction():
             async with conn.transaction():
@@ -994,7 +995,7 @@ class CollectionRepository:
         if conn is not None:
             await conn.execute(sql, now, collection_id)
             return
-        async with self.pool.acquire() as acq:
+        async with acquire_given_back(self.pool) as acq:
             await acq.execute(sql, now, collection_id)
 
     async def decrement_count(self, collection_id: uuid.UUID, now: datetime, conn=None) -> None:

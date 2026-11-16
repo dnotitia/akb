@@ -83,6 +83,7 @@ from typing import Optional
 import asyncpg
 
 from app.services.role_authority import role_authority_transaction
+from app.services.vault_write_admission import acquire_given_back
 from app.models.vault_scope import VaultScope
 from app.repositories.table_data_repo import PG_IDENT_MAX_LEN
 
@@ -517,7 +518,7 @@ class RoleSync:
     ) -> None:
         """Best-effort wrapper for :meth:`on_vault_create_in_conn`."""
         try:
-            async with self.pool.acquire() as conn:
+            async with acquire_given_back(self.pool) as conn:
                 async with role_authority_transaction(conn):
                     row = await conn.fetchrow("SELECT owner_id FROM vaults WHERE id=$1", uuid.UUID(str(vault_id)))
                     if row is not None:
@@ -557,7 +558,7 @@ class RoleSync:
         """Drop the three group roles. Dependent GRANTs are cleared by
         `DROP OWNED BY`. Memberships of dropped roles auto-clean."""
         try:
-            async with self.pool.acquire() as conn:
+            async with acquire_given_back(self.pool) as conn:
                 async with role_authority_transaction(conn):
                     if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM vaults WHERE id=$1)", uuid.UUID(str(vault_id))):
                         return
@@ -644,7 +645,7 @@ class RoleSync:
         # failures are best-effort lifecycle events.
         _public_access_scope(level)
         try:
-            async with self.pool.acquire() as conn:
+            async with acquire_given_back(self.pool) as conn:
                 async with role_authority_transaction(conn):
                     current = await conn.fetchval("SELECT public_access FROM vaults WHERE id=$1", uuid.UUID(str(vault_id)))
                     if current is not None:

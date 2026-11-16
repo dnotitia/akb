@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import time
@@ -629,38 +630,462 @@ def _vault_event_writers() -> set[str]:
     return found
 
 
-def _admission_then_acquire() -> list[str]:
-    """Places that enter a Vault's admission and then take a pool connection
-    in one ``async with``, rather than through ``admitted_connection``."""
-    app_dir = Path(__file__).resolve().parents[1] / "app"
-    found: list[str] = []
-    for path in sorted(app_dir.rglob("*.py")):
+# ── Connections taken inside an admission ──────────────────────────────────
+
+_APP_DIR = Path(__file__).resolve().parents[1] / "app"
+# Entering one of these holds an admission, without a connection, for the
+# rest of its `with`: the items after it and the body.
+_ADMISSION_CONTEXTS = frozenset({"vault_write_admission", "_vault_write_admission", "vault_gate"})
+# A method this decorates runs inside the admission the decorator enters.
+_ADMISSION_DECORATORS = frozenset({"_admitted_before_preparing"})
+# The helpers that give connections back (`admitted_connection`,
+# `acquire_given_back`) live here; they are the rule, not what it checks.
+_HELPERS_MODULE = "services/vault_write_admission.py"
+# A pool's methods that take one of its connections.
+_POOL_METHODS = frozenset({"acquire", "execute", "executemany", "fetch", "fetchrow", "fetchval"})
+# What the walk must reach from the roots, so that it cannot pass by
+# resolving nothing: the payload preparation and revision id of the Native
+# mutations, and the repositories and role hooks of Vault creation.
+_MUST_REACH = frozenset({
+    "services/m1_pg_body_store.py:M1PgBodyStore.prepare_text",
+    "services/m1_reference_payload_store.py:M1ReferencePayloadStore.prepare_text",
+    "services/native_revision_service.py:NativeRevisionService._allocate_revision_id",
+    "repositories/vault_repo.py:VaultRepository.create",
+    "repositories/vault_repo.py:VaultRepository.get_id_by_name",
+    "repositories/document_repo.py:CollectionRepository.get_or_create",
+    "services/role_sync.py:RoleSync.on_vault_create",
+    "services/role_sync.py:RoleSync.on_public_access_change",
+    "services/document_service.py:DocumentService._rollback_vault_rows",
+})
+
+
+def _name_of(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _module_path(dotted: str) -> str | None:
+    """`app.services.x` as a path under `app/`, when it is a module there."""
+    if dotted != "app" and not dotted.startswith("app."):
+        return None
+    path = _APP_DIR.joinpath(*dotted.split(".")[1:])
+    if path.with_suffix(".py").is_file():
+        return str(path.with_suffix(".py").relative_to(_APP_DIR))
+    if (path / "__init__.py").is_file():
+        return str((path / "__init__.py").relative_to(_APP_DIR))
+    return None
+
+
+class _Module:
+    """An application module: its top-level functions and classes, and the
+    application modules and names its imports bind."""
+
+    def __init__(self, rel: str, tree: ast.Module) -> None:
+        self.rel = rel
+        self.functions = {
+            n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        self.imports: dict[str, tuple[str, str | None]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if node.level:
+                    package = ["app", *Path(rel).parent.parts]
+                    package = package[: len(package) - node.level + 1]
+                    base = ".".join(package + ([base] if base else []))
+                owner = _module_path(base)
+                for alias in node.names:
+                    local = alias.asname or alias.name
+                    submodule = _module_path(f"{base}.{alias.name}")
+                    if submodule is not None:
+                        self.imports[local] = (submodule, None)
+                    elif owner is not None:
+                        self.imports[local] = (owner, alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    target = _module_path(alias.name)
+                    if target is not None and alias.asname:
+                        self.imports[alias.asname] = (target, None)
+
+
+@functools.cache
+def _app_modules() -> dict[str, _Module]:
+    modules = {}
+    for path in sorted(_APP_DIR.rglob("*.py")):
         if "migrations" in path.parts:
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncWith):
-                continue
-            names = []
-            for item in node.items:
-                call = item.context_expr
-                if isinstance(call, ast.Call):
-                    func = call.func
-                    names.append(func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None))
-            if "acquire" in names and any(
-                name in {"vault_write_admission", "_vault_write_admission"} for name in names
-            ):
-                found.append(f"{path.relative_to(app_dir)}:{node.lineno}")
+        rel = str(path.relative_to(_APP_DIR))
+        modules[rel] = _Module(rel, ast.parse(path.read_text(encoding="utf-8")))
+    return modules
+
+
+def _lookup(rel: str, name: str, seen: frozenset = frozenset()) -> tuple | None:
+    """What `name` is in module `rel`: ("class", rel, node), ("func", rel,
+    node) or ("module", rel), following imports."""
+    module = _app_modules()[rel]
+    if name in module.classes:
+        return ("class", rel, module.classes[name])
+    if name in module.functions:
+        return ("func", rel, module.functions[name])
+    imported = module.imports.get(name)
+    if imported is None or (rel, name) in seen:
+        return None
+    target, attribute = imported
+    if attribute is None:
+        return ("module", target)
+    if target not in _app_modules():
+        return None
+    return _lookup(target, attribute, seen | {(rel, name)})
+
+
+# A type is ("class", module, class name) or ("tuple", (types of each item)).
+def _class_named(rel: str, node: ast.AST) -> tuple:
+    found = None
+    if isinstance(node, ast.Name):
+        found = _lookup(rel, node.id)
+    elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        owner = _lookup(rel, node.value.id)
+        if owner is not None and owner[0] == "module" and owner[1] in _app_modules():
+            found = _lookup(owner[1], node.attr)
+    if found is not None and found[0] == "class":
+        return (("class", found[1], found[2].name),)
+    return ()
+
+
+def _annotation(rel: str, node: ast.AST | None) -> tuple:
+    if node is None:
+        return ()
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        try:
+            node = ast.parse(node.value, mode="eval").body
+        except SyntaxError:
+            return ()
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _annotation(rel, node.left) + _annotation(rel, node.right)
+    if isinstance(node, ast.Subscript):
+        head = _name_of(node.value)
+        if head in {"tuple", "Tuple"} and isinstance(node.slice, ast.Tuple):
+            return (("tuple", tuple(_annotation(rel, item) for item in node.slice.elts)),)
+        return _annotation(rel, node.slice) if head == "Optional" else ()
+    return _class_named(rel, node)
+
+
+def _constructed(rel: str, node: ast.AST) -> tuple:
+    if isinstance(node, ast.Await):
+        node = node.value
+    return _class_named(rel, node.func) if isinstance(node, ast.Call) else ()
+
+
+def _returns(rel: str, fn: ast.AST) -> tuple:
+    """The types a function returns: its annotation, else the constructors
+    its return statements call."""
+    declared = _annotation(rel, fn.returns)
+    if declared:
+        return declared
+    found: tuple = ()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Return) and node.value is not None:
+            if isinstance(node.value, ast.Tuple):
+                found += (("tuple", tuple(_constructed(rel, item) for item in node.value.elts)),)
+            else:
+                found += _constructed(rel, node.value)
     return found
 
 
+def _class(entry: tuple) -> ast.ClassDef:
+    return _app_modules()[entry[1]].classes[entry[2]]
+
+
+def _bases(entry: tuple) -> tuple:
+    return tuple(t for base in _class(entry).bases for t in _class_named(entry[1], base))
+
+
+def _is_protocol(entry: tuple) -> bool:
+    return any(_name_of(base) == "Protocol" for base in _class(entry).bases) or any(
+        _is_protocol(base) for base in _bases(entry)
+    )
+
+
+def _method(entry: tuple, name: str) -> tuple | None:
+    for node in _class(entry).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return (entry[1], entry[2], node)
+    for base in _bases(entry):
+        found = _method(base, name)
+        if found is not None:
+            return found
+    return None
+
+
+def _method_names(entry: tuple) -> set[str]:
+    names = {n.name for n in _class(entry).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for base in _bases(entry):
+        names |= _method_names(base)
+    return names
+
+
+@functools.cache
+def _subclasses(entry: tuple) -> tuple:
+    direct = tuple(
+        ("class", rel, name)
+        for rel, module in _app_modules().items()
+        for name in module.classes
+        if entry in _bases(("class", rel, name))
+    )
+    return direct + tuple(t for sub in direct for t in _subclasses(sub))
+
+
+def _instances(types: tuple) -> tuple:
+    """The classes an object of these types may be an instance of: for a
+    protocol, every application class that has all its methods; for a class,
+    itself and its subclasses."""
+    found: tuple = ()
+    for entry in types:
+        if entry[0] != "class":
+            continue
+        if _is_protocol(entry):
+            wanted = _method_names(entry)
+            found += tuple(
+                ("class", rel, cls)
+                for rel, module in _app_modules().items()
+                for cls in module.classes
+                if not _is_protocol(("class", rel, cls)) and wanted <= _method_names(("class", rel, cls))
+            )
+        else:
+            found += (entry, *_subclasses(entry))
+    return tuple(dict.fromkeys(found))
+
+
+def _dispatch(instances: tuple, name: str) -> list[tuple]:
+    """(module, defining class, method, instances it runs for) for each
+    method `name` runs on instances of these classes."""
+    found: dict[int, tuple] = {}
+    for entry in instances:
+        method = _method(entry, name)
+        if method is not None:
+            rel, owner, fn, selves = found.get(id(method[2]), (*method, ()))
+            found[id(method[2])] = (rel, owner, fn, (*selves, entry))
+    return list(found.values())
+
+
+def _attribute_types(entry: tuple, attribute: str) -> tuple:
+    """The types `self.<attribute>` holds in a class: its annotations and
+    what its methods assign, the constructors called or the annotated
+    parameters passed."""
+    rel, found = entry[1], ()
+    for node in _class(entry).body:
+        if isinstance(node, ast.AnnAssign) and _name_of(node.target) == attribute:
+            found += _annotation(rel, node.annotation)
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        arguments = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+        parameters = {a.arg: _annotation(rel, a.annotation) for a in arguments}
+        for statement in ast.walk(node):
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                target, value, annotation = statement.targets[0], statement.value, None
+            elif isinstance(statement, ast.AnnAssign):
+                target, value, annotation = statement.target, statement.value, statement.annotation
+            else:
+                continue
+            if not (isinstance(target, ast.Attribute) and _name_of(target.value) == "self"
+                    and target.attr == attribute):
+                continue
+            found += _annotation(rel, annotation)
+            for part in value.values if isinstance(value, ast.BoolOp) else [value]:
+                if isinstance(part, ast.Name):
+                    found += parameters.get(part.id, ())
+                elif part is not None:
+                    found += _constructed(rel, part)
+    for base in _bases(entry):
+        found += _attribute_types(base, attribute)
+    return found
+
+
+class _Reader:
+    """One function read under an admission: the classes `self` may be an
+    instance of, the types its names hold, as its annotations, assignments
+    and its caller's arguments tell, and the application functions each of
+    its calls may run."""
+
+    def __init__(
+        self, rel: str, owner: str | None, selves: tuple, fn: ast.AST, bound: dict | None = None,
+    ) -> None:
+        self.rel, self.owner, self.selves, self.fn = rel, owner, selves, fn
+        arguments = fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
+        self.names: dict[str, tuple] = {a.arg: _annotation(rel, a.annotation) for a in arguments}
+        self.names.update({name: types for name, types in (bound or {}).items() if types})
+        # Twice: an assignment may use a name assigned further down.
+        for _ in range(2):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                    self._bind(node.targets[0], self.type_of(node.value))
+                elif isinstance(node, ast.AnnAssign):
+                    self._bind(node.target, _annotation(rel, node.annotation) or self.type_of(node.value))
+
+    def _bind(self, target: ast.AST, types: tuple) -> None:
+        if isinstance(target, ast.Name) and types:
+            self.names[target.id] = types
+        elif isinstance(target, ast.Tuple):
+            for entry in types:
+                if entry[0] == "tuple" and len(entry[1]) == len(target.elts):
+                    for item, item_types in zip(target.elts, entry[1]):
+                        self._bind(item, item_types)
+
+    def type_of(self, node: ast.AST | None) -> tuple:
+        if isinstance(node, ast.Await):
+            return self.type_of(node.value)
+        if isinstance(node, ast.Name):
+            if node.id in {"self", "cls"}:
+                return self.selves
+            return self.names.get(node.id, ())
+        if isinstance(node, ast.BoolOp):
+            return tuple(t for value in node.values for t in self.type_of(value))
+        if isinstance(node, ast.Attribute):
+            return tuple(
+                t for entry in self.type_of(node.value) if entry[0] == "class"
+                for t in _attribute_types(entry, node.attr)
+            )
+        if isinstance(node, ast.Call):
+            return _class_named(self.rel, node.func) or tuple(
+                t for rel, _owner, fn, _selves in self.targets(node) for t in _returns(rel, fn)
+            )
+        return ()
+
+    def targets(self, call: ast.Call) -> list[tuple]:
+        """(module, defining class or None, function, instances `self` may be
+        there) for each function the call may run."""
+        func = call.func
+        if isinstance(func, ast.Name):
+            for node in ast.walk(self.fn):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func.id \
+                        and node is not self.fn:
+                    return [(self.rel, self.owner, node, self.selves)]
+            found = _lookup(self.rel, func.id)
+            return [(found[1], None, found[2], ())] if found is not None and found[0] == "func" else []
+        if not isinstance(func, ast.Attribute):
+            return []
+        receiver = func.value
+        if isinstance(receiver, ast.Name) and receiver.id in {"self", "cls"}:
+            # Each class `self` may be runs the method its own lookup finds.
+            return _dispatch(self.selves, func.attr)
+        if isinstance(receiver, ast.Name) and receiver.id not in self.names:
+            found = _lookup(self.rel, receiver.id)
+            if found is not None and found[0] == "module":
+                inner = _lookup(found[1], func.attr) if found[1] in _app_modules() else None
+                return [(inner[1], None, inner[2], ())] if inner is not None and inner[0] == "func" else []
+            if found is not None and found[0] == "class":
+                return _dispatch(_instances((("class", found[1], found[2].name),)), func.attr)
+        if isinstance(receiver, ast.Call) and _name_of(receiver.func) == "super" and self.owner:
+            return [
+                (rel, owner, fn, self.selves)
+                for base in _bases(("class", self.rel, self.owner))
+                for rel, owner, fn, _ in _dispatch((base,), func.attr)
+            ]
+        return _dispatch(_instances(self.type_of(receiver)), func.attr)
+
+    def bound(self, call: ast.Call, fn: ast.AST) -> dict[str, tuple]:
+        """The types the call passes for the function's parameters."""
+        names = [a.arg for a in fn.args.posonlyargs + fn.args.args]
+        if names and names[0] in {"self", "cls"}:
+            names = names[1:]
+        bound = {
+            name: self.type_of(argument)
+            for name, argument in zip(names, call.args) if not isinstance(argument, ast.Starred)
+        }
+        bound.update({kw.arg: self.type_of(kw.value) for kw in call.keywords if kw.arg is not None})
+        return bound
+
+
+def _admission_roots():
+    """Code that runs inside an admission entered without a connection: the
+    methods `_ADMISSION_DECORATORS` decorate, and what follows an
+    `_ADMISSION_CONTEXTS` item in a `with`; with the classes `self` may be
+    an instance of there (the class and the subclasses that inherit the
+    method)."""
+    for rel, module in _app_modules().items():
+        if rel == _HELPERS_MODULE:
+            continue
+        functions = [(None, (), fn) for fn in module.functions.values()]
+        for cls in module.classes.values():
+            entry = ("class", rel, cls.name)
+            for fn in cls.body:
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    selves = tuple(
+                        sub for sub in (entry, *_subclasses(entry))
+                        if (method := _method(sub, fn.name)) is not None and method[2] is fn
+                    )
+                    functions.append((cls.name, selves, fn))
+        for owner, selves, fn in functions:
+            if any(_name_of(d) in _ADMISSION_DECORATORS for d in fn.decorator_list):
+                yield rel, owner, selves, fn, fn.body, f"{rel}:{fn.lineno} @{fn.name}"
+            for node in ast.walk(fn):
+                if not isinstance(node, (ast.With, ast.AsyncWith)):
+                    continue
+                for index, item in enumerate(node.items):
+                    if any(isinstance(c, ast.Call) and _name_of(c.func) in _ADMISSION_CONTEXTS
+                           for c in ast.walk(item.context_expr)):
+                        later = [i.context_expr for i in node.items[index + 1:]]
+                        yield rel, owner, selves, fn, later + node.body, f"{rel}:{node.lineno} in {fn.name}"
+                        break
+
+
+def _connections_taken_under_admission() -> tuple[dict[str, str], set[str]]:
+    """Each pool connection taken other than through the helpers by code that
+    runs inside an admission entered without a connection, directly or
+    through the application functions it calls, with a path that reaches it;
+    and the functions reached."""
+    taken: dict[str, str] = {}
+    reached: set[str] = set()
+    seen: set = set()
+
+    def walk(reader: _Reader, nodes: list, path: str) -> None:
+        for top in nodes:
+            for node in ast.walk(top):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if isinstance(func, ast.Attribute) and func.attr in _POOL_METHODS \
+                        and "pool" in ast.unparse(func.value).lower():
+                    taken.setdefault(f"{reader.rel}:{node.lineno}", path)
+                    continue
+                for rel, owner, fn, selves in reader.targets(node):
+                    if rel == _HELPERS_MODULE:
+                        continue
+                    bound = reader.bound(node, fn)
+                    key = (rel, fn.lineno, selves, tuple(sorted((k, v) for k, v in bound.items() if v)))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    name = f"{rel}:{owner + '.' if owner else ''}{fn.name}"
+                    reached.add(name)
+                    walk(_Reader(rel, owner, selves, fn, bound), fn.body, f"{path} -> {name}")
+
+    for rel, owner, selves, fn, nodes, where in _admission_roots():
+        walk(_Reader(rel, owner, selves, fn), nodes, where)
+    return taken, reached
+
+
 def test_every_admitted_connection_is_given_back_before_its_admission():
-    """A connection taken under a Vault's admission is given back through
-    ``admitted_connection``, which returns the admission only once the pool
-    has the connection back. Entering the admission and ``pool.acquire()``
-    in one ``async with`` gave the admission back while a cancelled
-    release still held the connection."""
-    assert _admission_then_acquire() == []
+    """A connection taken inside a Vault's admission goes back to the pool
+    before the admission does. A transaction takes it with
+    ``admitted_connection``; code that runs inside an admission entered
+    without a connection takes each with ``acquire_given_back``: what a
+    Native mutation admitted before it prepares its payload runs, and what
+    Vault creation runs inside the new Vault's gate and admission, through
+    the application functions they call, as far as annotations, assignments
+    and arguments tell what those calls reach. A plain ``pool.acquire()``
+    there, or one in the same ``async with`` as the admission, gave the
+    admission back while a cancelled release still reset the connection."""
+    taken, reached = _connections_taken_under_admission()
+    unreached = sorted(_MUST_REACH - reached)
+    assert not unreached, f"The walk no longer reaches these, so it cannot check them: {unreached}"
+    assert not taken, "Connections taken inside an admission without acquire_given_back:\n" + "\n".join(
+        f"  {site}  (reached from {path})" for site, path in sorted(taken.items())
+    )
 
 
 def test_every_vault_event_writer_is_registered():

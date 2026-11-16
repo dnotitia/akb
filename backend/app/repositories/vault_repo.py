@@ -7,6 +7,7 @@ import uuid
 import asyncpg
 
 from app.services.role_authority import role_authority_transaction
+from app.services.vault_write_admission import acquire_given_back
 from app.exceptions import VaultNameUnavailableError
 
 
@@ -35,7 +36,7 @@ class VaultRepository:
             return dict(row) if row else None
 
     async def get_id_by_name(self, name: str) -> uuid.UUID | None:
-        async with self.pool.acquire() as conn:
+        async with acquire_given_back(self.pool) as conn:
             row = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", name)
             return row["id"] if row else None
 
@@ -73,7 +74,7 @@ class VaultRepository:
                 async with role_authority_transaction(conn):
                     await conn.execute(sql, *args)
             else:
-                async with self.pool.acquire() as acq:
+                async with acquire_given_back(self.pool) as acq:
                     async with role_authority_transaction(acq):
                         await acq.execute(sql, *args)
         except asyncpg.UniqueViolationError as exc:

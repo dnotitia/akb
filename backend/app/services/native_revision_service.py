@@ -31,7 +31,11 @@ from app.services.m1_reference_payload_store import (
 )
 from app.services.native_payload_verification import payload_store_for_placement
 from app.services.uri_service import doc_uri
-from app.services.vault_write_admission import admitted_connection, vault_write_admission
+from app.services.vault_write_admission import (
+    acquire_given_back,
+    admitted_connection,
+    vault_write_admission,
+)
 
 
 Failpoint = Callable[[str], Awaitable[None] | None]
@@ -336,7 +340,7 @@ class NativeRevisionService:
         for _ in range(3):
             candidate = self._opaque_revision_id()
             if conn is None:
-                async with self.pool.acquire() as acquired:
+                async with acquire_given_back(self.pool) as acquired:
                     exists = await acquired.fetchval(
                         "SELECT EXISTS(SELECT 1 FROM native_revisions WHERE revision_id = $1)",
                         candidate,

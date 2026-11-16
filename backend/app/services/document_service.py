@@ -168,7 +168,11 @@ from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri, vault_uri
 from app.services.user_directory import resolve_display_names
-from app.services.vault_write_admission import admitted_connection, vault_write_admission
+from app.services.vault_write_admission import (
+    acquire_given_back,
+    admitted_connection,
+    vault_write_admission,
+)
 from app.services.write_lane import run_compensation, run_git_write, vault_gate, write_lane
 from app.repositories import table_data_repo
 from app.utils import ensure_list
@@ -2655,7 +2659,7 @@ class DocumentService:
         """
         try:
             pool = await get_pool()
-            async with pool.acquire() as conn:
+            async with acquire_given_back(pool) as conn:
                 async with role_authority_transaction(conn):
                     locked = await conn.fetchrow(
                         "SELECT id FROM vaults WHERE id = $1 FOR UPDATE", vault_id,

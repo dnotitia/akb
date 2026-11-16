@@ -490,20 +490,10 @@ class _ResettingAcquire:
         self._pool._free.release()
 
 
-async def test_a_cancelled_write_gives_its_admission_back_once_its_connection_is_back(monkeypatch):
-    """Limit 1, a pool of three connections whose reset takes two seconds.
-    A write of Vault A is cancelled while its connection is being reset, five
-    times in a row, the next one sent at once. Each keeps A's admission until
-    its connection is back, closed after the half-second grace, which ends
-    the reset, so A never has more than one connection in use, being reset
-    or not, and a reader of Vault B keeps getting a connection. The
-    admission used to be given back as soon as the cancelled release left
-    the reset running, the next write of A took another connection, and the
-    resets filled the pool."""
-    monkeypatch.setattr(settings, "vault_write_concurrency", 1)
-    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0)
-    pool = _ResettingPool(size=3, reset_secs=2.0)
-    a = uuid.uuid4()
+async def _cancelled_while_resetting(pool: _ResettingPool, write) -> list[float]:
+    """Send ``write()`` five times, each cancelled once its connection's reset
+    starts, the next one sent at once, while a reader of another Vault takes
+    connections. Returns the reader's waits."""
     stop = asyncio.Event()
     waits: list[float] = []
     loop = asyncio.get_running_loop()
@@ -520,10 +510,6 @@ async def test_a_cancelled_write_gives_its_admission_back_once_its_connection_is
                 return
             await asyncio.sleep(0.02)
 
-    async def write() -> None:
-        async with admission.admitted_connection(pool, a):
-            pass
-
     reading = asyncio.create_task(reader())
     writes = []
     try:
@@ -537,8 +523,82 @@ async def test_a_cancelled_write_gives_its_admission_back_once_its_connection_is
     finally:
         stop.set()
         await asyncio.gather(reading, return_exceptions=True)
+    assert all(task.cancelled() for task in writes)
+    return waits
+
+
+async def test_a_cancelled_write_gives_its_admission_back_once_its_connection_is_back(monkeypatch):
+    """Limit 1, a pool of three connections whose reset takes two seconds.
+    A write of Vault A is cancelled while its connection is being reset, five
+    times in a row, the next one sent at once. Each keeps A's admission until
+    its connection is back, closed after the half-second grace, which ends
+    the reset, so A never has more than one connection in use, being reset
+    or not, and a reader of Vault B keeps getting a connection. The
+    admission used to be given back as soon as the cancelled release left
+    the reset running, the next write of A took another connection, and the
+    resets filled the pool."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0)
+    pool = _ResettingPool(size=3, reset_secs=2.0)
+    a = uuid.uuid4()
+
+    async def write() -> None:
+        async with admission.admitted_connection(pool, a):
+            pass
+
+    waits = await _cancelled_while_resetting(pool, write)
     assert pool.peak <= 2, pool.peak
     assert waits and max(waits) < 1.0, max(waits)
-    assert all(task.cancelled() for task in writes)
     assert pool.in_use == 0
     assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
+
+
+async def test_a_connection_taken_inside_an_admission_is_back_before_the_admission(monkeypatch):
+    """The same pool and limit. A write of Vault A is admitted without a
+    connection and then takes one with ``acquire_given_back``, as a Native
+    mutation does to prepare its payload; it is cancelled while that
+    connection is being reset, five times in a row, the next one sent at
+    once. Each keeps A's admission until the connection is back, so A never
+    has more than one connection in use and a reader of Vault B keeps getting
+    one. Taken with ``pool.acquire()``, the connection was still being reset
+    when the admission went back."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0)
+    pool = _ResettingPool(size=3, reset_secs=2.0)
+    a = uuid.uuid4()
+
+    async def write() -> None:
+        async with admission.vault_write_admission(a):
+            async with admission.acquire_given_back(pool):
+                pass
+
+    waits = await _cancelled_while_resetting(pool, write)
+    assert pool.peak <= 2, pool.peak
+    assert waits and max(waits) < 1.0, max(waits)
+    assert pool.in_use == 0
+    assert admission.snapshot() == {"vaults": 0, "admitted": 0, "waiting": 0}
+
+
+async def test_outside_an_admission_acquire_given_back_is_the_pools_own():
+    """With no admission to give back, ``acquire_given_back`` is
+    ``pool.acquire()``: a task cancelled while its connection is being reset
+    ends at once, and the reset goes on, its connection neither closed nor
+    back yet."""
+    pool = _ResettingPool(size=3, reset_secs=0.3)
+    taken: list[_PooledProxy] = []
+
+    async def read() -> None:
+        async with admission.acquire_given_back(pool) as conn:
+            taken.append(conn)
+
+    task = asyncio.create_task(read())
+    await asyncio.wait_for(pool.resetting.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert pool.in_use == 1
+    assert not taken[0].closed.is_set()
+    async with asyncio.timeout(5):
+        while pool.in_use:
+            await asyncio.sleep(0.02)
+    assert not taken[0].closed.is_set()

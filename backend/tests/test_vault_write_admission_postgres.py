@@ -38,6 +38,7 @@ from app.services import document_service as document_service_module
 from app.services.collection_service import CollectionService
 from app.services.document_service import DocumentService
 from app.services.git_service import GitService
+from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri
@@ -1235,6 +1236,107 @@ async def test_upload_cancels_behind_a_waiting_confirmation_leave_connections_fo
         ) == "confirmed"
 
 
+@contextlib.asynccontextmanager
+async def _admitted_resets_take_two_seconds(admin_pool):
+    """The application's pool for the block: four connections, and giving
+    back one taken while the task was admitted waits two seconds in its
+    reset (the pool's reset waits in the database). Yields the asyncpg pool,
+    the pool the application sees, and an event set when such a reset
+    starts."""
+    from app.services.vault_write_admission import _admitted
+
+    database = await admin_pool.fetchval("SELECT current_database()")
+    resetting = asyncio.Event()
+    admitted_conns: set = set()
+
+    async def slow_reset(conn) -> None:
+        if conn in admitted_conns:
+            admitted_conns.discard(conn)
+            resetting.set()
+            await conn.execute("SELECT pg_sleep(2)")
+
+    app_pool = await asyncpg.create_pool(
+        _database_dsn(database), min_size=1, max_size=4, reset=slow_reset,
+    )
+
+    class _Acquire:
+        """The pool's own acquisition; a connection taken while the task
+        is admitted gets the slow reset."""
+
+        def __init__(self) -> None:
+            self._acquired = app_pool.acquire()
+
+        async def __aenter__(self):
+            conn = await self._acquired.__aenter__()
+            if _admitted.get():
+                admitted_conns.add(conn._con)
+            return conn
+
+        async def __aexit__(self, *exc):
+            return await self._acquired.__aexit__(*exc)
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+        def __getattr__(self, name):
+            return getattr(app_pool, name)
+
+    pool = _Pool()
+    previous_pool = postgres_module._pool
+    postgres_module._pool = pool
+    try:
+        yield app_pool, pool, resetting
+    finally:
+        postgres_module._pool = previous_pool
+        await app_pool.close()
+
+
+async def _cancelled_while_resetting(app_pool, resetting: asyncio.Event, quiet: uuid.UUID, write) -> tuple[int, list]:
+    """Send ``write(number)`` five times, each cancelled once the reset of a
+    connection it took while admitted starts, the next one sent at once,
+    while a reader of the Vault ``quiet`` takes connections. Returns the most
+    connections in use at once and the reader's waits."""
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    waits: list[float] = []
+    peak = 0
+
+    async def reader() -> None:
+        nonlocal peak
+        while not stop.is_set():
+            peak = max(peak, app_pool.get_size() - app_pool.get_idle_size())
+            started = loop.time()
+            try:
+                async with app_pool.acquire(timeout=3) as conn:
+                    await conn.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", quiet)
+            except TimeoutError:
+                waits.append(loop.time() - started)
+                return
+            waits.append(loop.time() - started)
+            await asyncio.sleep(0.05)
+
+    writes: list[asyncio.Task] = []
+    reading = asyncio.create_task(reader())
+    try:
+        for number in range(5):
+            resetting.clear()
+            task = asyncio.create_task(write(number))
+            writes.append(task)
+            await asyncio.wait_for(resetting.wait(), timeout=30)
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(*writes, return_exceptions=True), timeout=60)
+        await asyncio.sleep(0.2)
+    finally:
+        stop.set()
+        await asyncio.gather(reading, return_exceptions=True)
+        for task in writes:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*writes, return_exceptions=True)
+    return peak, waits
+
+
 async def test_cancelled_writes_hold_their_admission_until_their_connection_is_back(monkeypatch):
     """Limit 1 and a pool of four connections. Giving back a connection
     taken under a Vault's admission waits two seconds in its reset (the
@@ -1246,99 +1348,58 @@ async def test_cancelled_writes_hold_their_admission_until_their_connection_is_b
     reader of another Vault keeps getting a connection. The admission used
     to be given back while the cancelled release went on resetting, the next
     create took another connection, and the resets filled the pool."""
-    from app.services.vault_write_admission import _admitted
-
     monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0, raising=False)
     async with _fresh_database() as admin_pool:
         await _make_vault(admin_pool, "reset-busy")
         quiet = await _make_vault(admin_pool, "reset-quiet")
-        database = await admin_pool.fetchval("SELECT current_database()")
-        resetting = asyncio.Event()
-        admitted_conns: set = set()
-
-        async def slow_reset(conn) -> None:
-            if conn in admitted_conns:
-                admitted_conns.discard(conn)
-                resetting.set()
-                await conn.execute("SELECT pg_sleep(2)")
-
-        app_pool = await asyncpg.create_pool(
-            _database_dsn(database), min_size=1, max_size=4, reset=slow_reset,
-        )
-
-        class _Acquire:
-            """The pool's own acquisition; a connection taken while the task
-            is admitted gets the slow reset."""
-
-            def __init__(self) -> None:
-                self._acquired = app_pool.acquire()
-
-            async def __aenter__(self):
-                conn = await self._acquired.__aenter__()
-                if _admitted.get():
-                    admitted_conns.add(conn._con)
-                return conn
-
-            async def __aexit__(self, *exc):
-                return await self._acquired.__aexit__(*exc)
-
-        class _Pool:
-            def acquire(self):
-                return _Acquire()
-
-            def __getattr__(self, name):
-                return getattr(app_pool, name)
-
-        previous_pool = postgres_module._pool
-        postgres_module._pool = _Pool()
-        loop = asyncio.get_running_loop()
-        stop = asyncio.Event()
-        waits: list[float] = []
-        peak = 0
-
-        async def reader() -> None:
-            nonlocal peak
-            while not stop.is_set():
-                peak = max(peak, app_pool.get_size() - app_pool.get_idle_size())
-                started = loop.time()
-                try:
-                    async with app_pool.acquire(timeout=3) as conn:
-                        await conn.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", quiet)
-                except TimeoutError:
-                    waits.append(loop.time() - started)
-                    return
-                waits.append(loop.time() - started)
-                await asyncio.sleep(0.05)
-
-        service = CollectionService(git=object())
-        creates: list[asyncio.Task] = []
-        reading = asyncio.create_task(reader())
-        try:
-            for number in range(5):
-                resetting.clear()
-                task = asyncio.create_task(service.create(
+        async with _admitted_resets_take_two_seconds(admin_pool) as (app_pool, _pool, resetting):
+            service = CollectionService(git=object())
+            peak, waits = await _cancelled_while_resetting(
+                app_pool, resetting, quiet,
+                lambda number: service.create(
                     vault="reset-busy", path=f"c{number}", summary=None, agent_id="tester",
-                ))
-                creates.append(task)
-                await asyncio.wait_for(resetting.wait(), timeout=30)
-                task.cancel()
-            await asyncio.wait_for(asyncio.gather(*creates, return_exceptions=True), timeout=60)
-            await asyncio.sleep(0.2)
-        finally:
-            stop.set()
-            await asyncio.gather(reading, return_exceptions=True)
-            for task in creates:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*creates, return_exceptions=True)
-            postgres_module._pool = previous_pool
-            await app_pool.close()
+                ),
+            )
 
         print(f"\npool in use at most {peak}; reader wait max {max(waits):.3f}s over {len(waits)} reads")
         assert max(waits) < 1.0, waits
         # One admitted connection and the reader's, at most.
         assert peak <= 2, peak
+
+
+async def test_a_cancelled_native_write_keeps_its_admission_until_its_payload_connection_is_back(monkeypatch):
+    """The same pool and limit. A Native create is admitted before it
+    prepares its payload, which it writes on a connection of its own, taken
+    inside the admission; giving that connection back waits two seconds in
+    its reset. The create is cancelled while it is being reset, five times in
+    a row, the next one sent at once. Each keeps the Vault's admission until
+    the connection is back, so the Vault never has more than one connection
+    in use, being reset or not, and a reader of another Vault keeps getting
+    one. The admission used to be given back while the cancelled release went
+    on resetting, the next create prepared on another connection, and the
+    resets filled the pool."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0, raising=False)
+    async with _fresh_database() as admin_pool:
+        busy = await _make_vault(admin_pool, "native-reset-busy")
+        quiet = await _make_vault(admin_pool, "native-reset-quiet")
+        async with _admitted_resets_take_two_seconds(admin_pool) as (app_pool, pool, resetting):
+            native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+            peak, waits = await _cancelled_while_resetting(
+                app_pool, resetting, quiet,
+                lambda number: native.create_text(
+                    namespace_id=busy, surface="document", path=f"notes/n{number}.md",
+                    payload=f"body {number}", actor="tester", mutation_id=uuid.uuid4(),
+                ),
+            )
+
+        print(f"\npool in use at most {peak}; reader wait max {max(waits):.3f}s over {len(waits)} reads")
+        assert max(waits) < 1.0, waits
+        assert peak <= 2, peak
+        assert await admin_pool.fetchval(
+            "SELECT count(*) FROM native_revisions WHERE namespace_id = $1", busy,
+        ) == 0
 
 
 async def test_a_target_deferred_before_its_batch_was_ready_waits_for_its_batch(monkeypatch):
