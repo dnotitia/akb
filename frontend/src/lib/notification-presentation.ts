@@ -1,4 +1,4 @@
-import { Archive, ArchiveRestore, ArrowRightLeft, FilePenLine, KeyRound, Trash2, UserRoundCheck, UserRoundKey, UserRoundMinus, Bell, type LucideIcon } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRightLeft, Bot, FilePenLine, KeyRound, Trash2, UserRoundCheck, UserRoundKey, UserRoundMinus, Bell, type LucideIcon } from "lucide-react";
 import type { TonalIconTone } from "@/components/ui/tonal-icon";
 import type { NotificationItem } from "@/lib/api-notifications";
 
@@ -14,6 +14,7 @@ const events: Record<string, { label: string; icon: LucideIcon; tone: TonalIconT
   "access.revoked": { label: "Access removed", icon: UserRoundMinus, tone: "people" },
   "access.membership_removed": { label: "Membership removed", icon: UserRoundMinus, tone: "people" },
   "access.ownership": { label: "Ownership changed", icon: UserRoundKey, tone: "people" },
+  "account.ai_connection": { label: "New AI app", icon: Bot, tone: "people" },
 };
 
 export function notificationPresentation(kind: string) {

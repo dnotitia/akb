@@ -7,6 +7,14 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- AI connection registry. The MCP endpoint records one row per account and AI
+  client credential (OAuth client registration or PAT), with the client's
+  reported name and version and first/last seen times. It stores no IP address
+  and no request content. `GET /api/v1/auth/connections` lists them for the
+  signed-in human account, and the first sighting of a connection adds an
+  `account.ai_connection` notification. Recording runs off the request path and
+  writes `last_seen_at` at most once a minute. Requires migration 135.
+
 - SQL queries over a declared archived Vault or a managed Vault without write
   authority run in a PostgreSQL read-only transaction. Ordinary writes retain
   their existing receipts and policy errors. A pending call observes a grant

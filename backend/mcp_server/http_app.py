@@ -29,6 +29,7 @@ from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSI
 from app.config import settings
 from app.api.bounded_body import read_bounded_body
 from app.exceptions import AKBError
+from app.services import ai_connections
 from app.services.auth_service import (
     AuthenticatedUser as AKBAuthenticatedUser,
     resolve_mcp_authorization,
@@ -405,6 +406,16 @@ class MCPApp:
             # whichever replica happened to serve `initialize`.
 
             routed_receive = _replay_body(body, receive)
+
+            # The stateless transport keeps no session, so the request body is
+            # the only place a client names itself (`initialize` clientInfo or
+            # the 2026-07-28 `_meta` clientInfo). Memory-only and never raises:
+            # recording a connection cannot fail or delay this request.
+            ai_connections.observe(
+                user,
+                body=decoded,
+                user_agent=request.headers.get("user-agent"),
+            )
 
         manager_send = send
         if (

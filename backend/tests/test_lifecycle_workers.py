@@ -71,6 +71,11 @@ def _stub_workers(monkeypatch, lifecycle, started: list[str]) -> None:
     monkeypatch.setattr(
         lifecycle.search_degradation_stats, "start", rec("search_degradation_flusher"),
     )
+    # The AI connection registry is the fourth: MCP requests are answered in
+    # the serving process, so that is where their connections are observed.
+    monkeypatch.setattr(
+        lifecycle.ai_connections, "start", rec("ai_connections_flusher"),
+    )
 
 
 def _settings(
@@ -165,6 +170,8 @@ def test_worker_role_excludes_api_local_in_memory_sinks(monkeypatch, tmp_path):
     # A worker process never answers a search, so it has nothing to count and
     # must not run a flusher that would only ever write empty deltas.
     assert "search_degradation_flusher" not in started
+    # A worker process serves no MCP request, so it observes no connection.
+    assert "ai_connections_flusher" not in started
 
 
 def test_api_role_starts_no_durable_queue_consumer(monkeypatch, tmp_path):
@@ -179,6 +186,7 @@ def test_api_role_starts_no_durable_queue_consumer(monkeypatch, tmp_path):
     # The counters live in this process's memory because this is the process
     # that produces the responses being counted (akb#612).
     assert "search_degradation_flusher" in started
+    assert "ai_connections_flusher" in started
     assert "embed_worker" not in started
     assert "delete_worker" not in started
 

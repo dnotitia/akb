@@ -53,6 +53,7 @@ from app.openapi_contract import install_openapi_contract
 from app.process_role import runtime_process_role
 from app.http_middleware import CancelDisconnectedReadMiddleware, NoStorePublicSurfacesMiddleware
 from app.services import (
+    ai_connections,
     asset_gc_worker,
     audit_log,
     embed_worker,
@@ -710,6 +711,7 @@ async def health(user: AuthenticatedUser | None = Depends(get_optional_user)):
         result["sso_account_sync"] = await _safe(sso_account_sync_stats)
         result["audit"] = audit_log.stats()
         result["tool_usage"] = tool_usage.stats()
+        result["ai_connections"] = ai_connections.stats()
 
     return result
 
