@@ -1201,9 +1201,12 @@ file, and table under `P/`.
   `details.deleted_uris` if you can read the Vault); act on its code as
   usual, and the same call continues with the rest. `details.uncertain_docs`
   (and `uncertain_uris`) counts deletions whose commit went unanswered:
-  read those documents to see whether they went; `final_step_uncertain`
-  says the same of the last step (collections, files, tables, and the
-  documents in `final_step_uris` on a Bare Git Vault). If a table appears
+  read those documents to see whether they went. `final_step_uncertain`
+  says the last step's commit went unanswered (collections, files, tables,
+  and the documents in `final_step_uris` on a Bare Git Vault); what the
+  prefix holds now does not settle it, and sending the same call again
+  records `collection.delete` at least once, maybe twice, and deletes
+  anything written under the prefix meanwhile. If a table appears
   under the prefix while a writer's delete runs, only an admin or owner can
   finish that delete.
 

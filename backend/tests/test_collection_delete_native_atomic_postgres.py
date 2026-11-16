@@ -1720,7 +1720,9 @@ async def test_a_last_step_whose_commit_answer_is_lost_is_reported_as_uncertain(
     plain connection reset or with asyncpg's ConnectionDoesNotExistError. The
     error says, beside the documents the request deleted, that the last
     step's outcome is unknown (`final_step_uncertain`), and its hint says
-    what that step covers. It used to report only the documents."""
+    what that step covers, that what the prefix holds now does not settle
+    it, and what sending the request again does. It used to report only the
+    documents."""
     async with _fresh_database() as pool:
         vault = "native-last-commit-unanswered"
         vault_id = await _native_vault(pool, monkeypatch, vault)
@@ -1746,6 +1748,8 @@ async def test_a_last_step_whose_commit_answer_is_lost_is_reported_as_uncertain(
         }
         hint = failure.value.hint
         assert "last step" in hint and "collection.delete" in hint and "Files and tables" in hint, hint
+        assert "does not settle whether it went" in hint and "browse" not in hint, hint
+        assert "records collection.delete at least once" in hint, hint
         envelope = exception_envelope(failure.value)
         assert envelope["details"]["final_step_uncertain"] is True
         # It did commit.
@@ -1948,7 +1952,11 @@ async def test_an_emptied_prefix_whose_commit_answer_is_lost_is_reported_as_unce
     answer to the COMMIT of its `collection.delete` is lost (asyncpg's
     ConnectionDoesNotExistError). The error says the last step's outcome is
     unknown. That branch used to skip the mark that its statements were done,
-    so the error said nothing of it."""
+    so the error said nothing of it. Its hint says the prefix looks the same
+    whether that step went or not, so browsing it cannot tell, and that
+    sending the same request again records `collection.delete` at least once,
+    maybe twice, and deletes anything written under the prefix meanwhile; it
+    used to say browsing the prefix would tell."""
     async with _fresh_database() as pool:
         vault_id = await _documents_gone_before_the_last_transaction(
             pool, monkeypatch, "native-emptied-unanswered",
@@ -1965,6 +1973,11 @@ async def test_an_emptied_prefix_whose_commit_answer_is_lost_is_reported_as_unce
             "partially_applied": True, "deleted_docs": 0, "deleted_uris": [],
             "final_step_uncertain": True,
         }
+        hint = failure.value.hint
+        assert "already emptied the prefix" in hint, hint
+        assert "looks the same whether it went or not" in hint and "browse" not in hint, hint
+        assert "Sending the same request again records collection.delete at least once" in hint, hint
+        assert "record it twice" in hint and "written under the prefix in the meantime" in hint, hint
         # It did commit.
         assert (await _state(pool, vault_id))["events"] == [
             "document.delete", "document.delete", "collection.delete",

@@ -323,7 +323,13 @@ says that the outcome of that step, which deletes the collections, Files and
 tables under the prefix and records `collection.delete`, is unknown; on the
 Bare Git authority that step deletes the documents too, which the error
 counts in `final_step_docs` and lists in `final_step_uris` for a reader.
-Browsing the prefix tells. Once the last transaction has committed, the
+What the prefix holds afterwards does not settle that outcome, since later
+writes may have changed it; and when an earlier delete had already emptied
+the prefix, that step only records `collection.delete`, so the prefix looks
+the same either way and only the event differs. The hint says so, and that
+sending the same request again records `collection.delete` at least once:
+it may record it twice, and it also deletes anything written under the
+prefix in the meantime. Once the last transaction has committed, the
 delete is complete: a failure after it, such as one while the pool takes its
 connection back, is logged and the delete answers with its result. This
 holds for a delete that finds the prefix emptied by an earlier one, too.
@@ -484,7 +490,8 @@ meanwhile, whose answer is lost, is reported as uncertain; that a last step
 whose COMMIT answer is lost is reported as `final_step_uncertain`, on the
 Bare Git authority with the documents it deletes; that a delete of an
 emptied prefix answers with its result when its reset fails and reports an
-uncertain last step when its answer is lost; that a delete
+uncertain last step when its answer is lost, with a hint that does not send
+the caller to browse the prefix; that a delete
 whose last transaction committed answers with its result, Files included,
 when the reset of its connection fails; and that a File whose Resource is gone, after the
 documents went, keeps the delete's progress in the REST 404.

@@ -143,13 +143,16 @@ class _Deletions:
     ``final_step_uncertain`` says the same of the last transaction, which
     deletes the collections, Files and tables under the prefix and records
     ``collection.delete``, and on the Bare Git authority the documents in
-    ``final_step_paths`` as well.
+    ``final_step_paths`` as well. ``final_step_found_empty`` says that last
+    transaction found the prefix emptied by an earlier delete, so it only
+    records ``collection.delete``.
     """
 
     committed: list[tuple[uuid.UUID, str]] = field(default_factory=list)
     uncertain: list[tuple[uuid.UUID, str]] = field(default_factory=list)
     final_step_uncertain: bool = False
     final_step_paths: list[str] = field(default_factory=list)
+    final_step_found_empty: bool = False
 
     def __bool__(self) -> bool:
         return bool(self.committed or self.uncertain or self.final_step_uncertain)
@@ -230,9 +233,23 @@ def committed_deletions(
                 documents = f"{len(final_docs)} document(s), "
         opening += (
             " The outcome of the delete's last step is unknown: its commit failed before "
-            f"the database answered. That step deletes {documents}the collections, Files and "
-            "tables under the prefix and records collection.delete; browse the prefix to see "
-            "whether it went."
+            "the database answered."
+        )
+        if deletions.final_step_found_empty:
+            opening += (
+                " An earlier delete had already emptied the prefix, so that step only records "
+                "collection.delete, and the prefix looks the same whether it went or not."
+            )
+        else:
+            opening += (
+                f" That step deletes {documents}the collections, Files and tables under the "
+                "prefix and records collection.delete; what the prefix holds now does not "
+                "settle whether it went, since later writes may have changed it."
+            )
+        opening += (
+            " Sending the same request again records collection.delete at least once; it may "
+            "record it twice, and it also deletes anything written under the prefix in the "
+            "meantime."
         )
     return details, opening
 
@@ -813,6 +830,7 @@ class CollectionService:
                 # earlier recursive delete of this prefix deleted its Native
                 # documents and stopped before this point: then the prefix is
                 # deleted already, and this one completes it.
+                found_empty = False
                 if (
                     target_row is None
                     and not sub_rows
@@ -832,6 +850,7 @@ class CollectionService:
                     # once: every delete that finds the prefix empty records
                     # it, whether or not an earlier one did.
                     logger.info("Collection delete: vault=%s path=%s already emptied", vault, norm)
+                    found_empty = True
 
                 # ── Empty-mode reject ───────────────────────────
                 # `recursive=False` succeeds ONLY when the target row
@@ -1044,6 +1063,7 @@ class CollectionService:
                 # Every statement is done; a failure from here is the commit's,
                 # whose outcome covers the Bare Git documents deleted here too.
                 progress.final_step_paths = [d["path"] for d in legacy_docs]
+                progress.final_step_found_empty = found_empty
                 done.append(True)
             # The delete is complete from here: a failure while the pool
             # takes the connection back does not undo it.
