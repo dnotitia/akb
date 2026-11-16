@@ -191,7 +191,14 @@ another Vault's writes by at most that one slot, and a Vault no waiter needs
 keeps admitting. At most `vault_write_max_waiters` (default 1000) transactions
 wait at once in a process, over all Vaults; one more that cannot be admitted
 at once fails at once with a retryable `write_busy`, which keeps the queue,
-and each pass over it, bounded. A transaction that waits longer than
+and each pass over it, bounded. An admitted transaction gives its connection
+back to the pool before its admission, also when its request is cancelled:
+the release, the pool's reset included, is awaited for half a second, and a
+reset still running then, or one interrupted by a cancellation, is ended by
+closing the connection, which the pool takes back without one; a
+connection already back in the pool is never closed. A Vault therefore never
+has more of the pool's connections in use, being reset or not, than
+admitted transactions. A transaction that waits longer than
 `vault_write_queue_timeout_secs` (default 10 seconds) fails with a retryable
 `write_busy`: over REST, HTTP 429
 with `Retry-After: 1` and a body whose `code` is `write_busy` and whose
@@ -239,12 +246,14 @@ leave the Vault's content unchanged:
   statement, and the worker claims again at once rather than sleep its idle
   interval, so it takes other Vaults' targets meanwhile. Batches keep their
   order. The eligible targets are claimed first in, first out, in the order
-  they became ready: a refused target at the end of its deferral, which is
-  where it rejoins the queue; a target a backfill made pending again after a
-  batch at that moment; and any other target when its batch became
-  claimable, the rollout's request for the first batch, or the moment the
-  batch before it finished, recorded when the work really finished rather
-  than when its transaction began. Several busy Vaults therefore do not take
+  they became ready. A target is ready when its batch became claimable, the
+  rollout's request for the first batch or the moment the batch before it
+  finished, recorded when the work really finished rather than when its
+  transaction began; a deferral, which is how a refused target rejoins the
+  queue, makes it ready at the deferral's end instead when that is later,
+  and never earlier, so a target deferred with the rest of its Vault before
+  its batch was claimable waits for both. A target a backfill made pending
+  again after a batch is ready from that moment. Several busy Vaults therefore do not take
   turns ahead of another Vault's rollout, a target whose deferral ended does
   not wait for every batch of another Vault's backfill, and a later batch
   does not go before a target that became ready while the batch before it
@@ -253,7 +262,12 @@ leave the Vault's content unchanged:
   backlog of other rollouts of one Vault, and goes before those that became
   ready after. A target whose claim expired, its worker gone, is made pending
   again with its batch's readiness, not the time it was reclaimed, so it
-  goes ahead of the targets that became ready after its batch did.
+  goes ahead of the targets that became ready after its batch did. The
+  order is a fairness rule, not a correctness one, and its times are taken
+  when the statement that completes a batch, or yields a backfill's target,
+  runs, not when its transaction commits: a commit that waits for the
+  Vault's event lock, at most its 5-second deadline, can order a later
+  batch up to that long early.
 - External Git synchronization fetches the remote into its mirror before it
   records each changed file, admitted per file.
 - A raw SQL write reads its plan on a pool connection before its admission,
@@ -341,8 +355,9 @@ administrator check, `EXPLAIN` and the catalog lookups; and each wait for a
 table's lock may take `akb_sql_plan_lock_timeout_ms` (default 500). Past
 either, the write fails with a retryable `write_busy` and gives its slot back,
 rather than hold its connection. At the deadline, or when the request is
-cancelled, the plan closes its connection, so that neither a rollback nor the
-pool's reset waits for the cancelled statement. The connection then goes
+cancelled, the plan closes its connection before anything waits on it (the
+plan is read in a task of its own, cancelled only after), so that neither a
+rollback nor the pool's reset waits for the cancelled statement. The connection then goes
 back to the pool outside the deadline, and the plan keeps its slot until the
 pool has it: a reset still running half a second later is ended by closing
 the connection, which the pool then takes back without one. A connection
@@ -663,7 +678,10 @@ when the batch before ran a long transaction; that a deferred target waits
 behind the targets that became ready before its deferral ended and goes
 before those that became ready after; that a rollout target is admitted
 beside transactions waiting on another, full Vault; that upload cancels
-behind a waiting confirmation leave connections for another Vault;
+behind a waiting confirmation leave connections for another Vault; that
+cancelled writes hold their admission until their connection is back, so a
+slow reset does not fill the pool; that a target deferred before its batch
+was claimable waits for its batch;
 that raw SQL runs read-only without admission only when asked to, and
 otherwise as a write that waits; that raw SQL writes waiting for a table lock
 while they read their plans leave connections for another Vault, and, sixty
@@ -694,8 +712,14 @@ time out or are cancelled leave the queue at once and take no slot; that a
 plan's deadline bounds statements that each finish within their own limits,
 and a slow start of its transaction; that a plan that cannot roll back in
 time closes its connection; that a plan keeps its slot until its connection
-is back in the pool, closing it once its reset runs past the grace; and that
-a connection already back in the pool is never closed;
+is back in the pool, closing it once its reset runs past the grace; that a
+connection already back in the pool is never closed; and that a cancelled
+plan closes its connection before any rollback;
+`test_vault_write_admission_unit.py` also checks that a write cancelled
+during a slow reset keeps its admission until its connection is back;
+`test_vault_write_admission_paths_postgres.py` fails when a place enters a
+Vault's admission and takes a pool connection other than through
+`admitted_connection`;
 `test_write_busy_rest_unit.py` checks the REST response to a refused write and
 to one refused part-way.
 `test_vault_write_admission_paths_postgres.py` fills a Vault's admission and

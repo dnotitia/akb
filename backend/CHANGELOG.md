@@ -65,9 +65,12 @@ specifically; the proxy has its own log in
   back, so a plan waiting for one lock after another, or whose statements
   each finish within their own limits, cannot keep the slots from other
   Vaults. At its deadline, or when cancelled, a plan closes its connection
-  rather than wait for a rollback or a reset; it keeps its slot until its
+  before any rollback or reset waits on it; it keeps its slot until its
   connection is back in the pool, closing it when the reset runs half a
-  second past, and never closes a connection already back in the pool. The plan slots and the
+  second past, and never closes a connection already back in the pool. Every
+  admitted transaction likewise gives its connection back before its
+  admission, cancelled or not, so a Vault never has more connections in use
+  than admitted transactions. The plan slots and the
   admission alike serve waiters first come, first served, by capacity: the
   first waiter blocked on a Vault reserves one slot of each of its Vaults
   against later requests, which use the slots left, so waiters blocked on a
@@ -93,10 +96,9 @@ specifically; the proxy has its own log in
   a refusal defers every pending target of that Vault for 5 seconds, and the
   worker claims the next eligible target at once instead of sleeping.
   Eligible targets are claimed first in, first out, by when they became
-  ready: a refused target at the end of its deferral, a backfill's target
-  when it was made pending again, any other when its batch became claimable,
-  the request or the end of the batch before, recorded when that batch
-  really finished. A refused target therefore waits behind every target that
+  ready: when its batch became claimable, the request or the end of the
+  batch before, recorded when that batch really finished, or a deferral's
+  end when later; a backfill's target when it was made pending again. A refused target therefore waits behind every target that
   became ready before its deferral ended, and goes before the rest. A File
   upload cancel is admitted for its Vault before it takes a connection, as a
   confirmation is.
