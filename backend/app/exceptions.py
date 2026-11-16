@@ -52,6 +52,23 @@ class TransientDependencyError(AKBError):
         )
 
 
+class InternalError(AKBError):
+    """An internal error → HTTP 500, code ``internal``, with the generic
+    message an unhandled error gets.
+
+    For a request that must still say what it did when an internal error
+    ends it, such as a recursive delete that had committed deletions: its
+    hint and details carry that. The original error is its ``__cause__``
+    and is logged where it is raised.
+    """
+
+    def __init__(self, *, hint: str | None = None, details: dict | None = None):
+        # app.util.errors.INTERNAL; that module imports this one.
+        super().__init__(
+            "Internal server error", status_code=500, code="internal", hint=hint, details=details,
+        )
+
+
 class NotFoundError(AKBError):
     def __init__(self, resource: str, identifier: str):
         super().__init__(f"{resource} not found: {identifier}", status_code=404)

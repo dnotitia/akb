@@ -17,7 +17,7 @@ import asyncpg
 from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
 from app.db.transient import transient_error
-from app.exceptions import AKBError, ConflictError, ForbiddenError, NotFoundError
+from app.exceptions import AKBError, ConflictError, ForbiddenError, InternalError, NotFoundError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import (
     CollectionRepository,
@@ -170,7 +170,7 @@ def committed_deletions(
 def _with_progress(
     exc: Exception, *, vault: str, prefix: str, deleted: list[tuple[uuid.UUID, str]],
     disclose_paths: bool,
-) -> Exception:
+) -> AKBError:
     """The error to report for ``exc``, raised after this request committed
     deletions for some documents: the same error, with what the request did.
 
@@ -179,11 +179,17 @@ def _with_progress(
     them, and its code, status and retry information stay its own. A database
     error that the API reports as a transient error (such as the Vault's
     event lock timing out) is reported as that error. Any other exception is
-    an internal error and is returned as it is.
+    an internal error and is reported as one, an ``InternalError`` with the
+    generic message, carrying the same details and hint; the original is
+    logged here and becomes its cause.
     """
     reported = exc if isinstance(exc, AKBError) else transient_error(exc)
     if reported is None:
-        return exc
+        logger.error(
+            "recursive delete of %r in vault %s failed after committed deletions",
+            prefix, vault, exc_info=exc,
+        )
+        reported = InternalError()
     details, opening = committed_deletions(vault=vault, deleted=deleted, disclose_paths=disclose_paths)
     reported.details = {**(reported.details or {}), **details}
     reported.hint = f"{opening} {reported.hint}" if reported.hint else opening
@@ -218,9 +224,12 @@ async def _live_native_documents_under(conn, vault_id: uuid.UUID, prefix: str) -
 
 async def _delete_native_document(
     native, *, vault: str, vault_id: uuid.UUID, prefix: str, resource_id: uuid.UUID, actor: str,
-) -> str | None:
+    deleted: list[tuple[uuid.UUID, str]],
+) -> None:
     """Delete one live Native document under ``prefix``, with its event, and
-    return the path it was deleted at.
+    append its Resource and the path it was deleted at to ``deleted`` as soon
+    as the transaction has committed, before the connection goes back to the
+    pool: a failure while the pool resets the connection does not lose it.
 
     The delete, the document's graph edges and its ``document.delete`` commit
     together in one short transaction that locks only this document's Resource
@@ -230,8 +239,8 @@ async def _delete_native_document(
     ones made after its restore (a link racing the delete is a known limit;
     see docs/operations/change-events.md). A document deleted, or moved out of
     the prefix, by
-    another request since it was listed is left as it is, and None is
-    returned.
+    another request since it was listed is left as it is, and nothing is
+    appended.
 
     Its chunks are removed by the derived worker, from the invalidation intent
     the delete records; the worker locks the Resource and skips the intent once
@@ -254,7 +263,7 @@ async def _delete_native_document(
                 or row["lifecycle"] != "live"
                 or not _under(row["current_path"], prefix)
             ):
-                return None
+                return
             events = EventBuffer()
             await native.delete_resource(
                 namespace_id=vault_id,
@@ -274,7 +283,8 @@ async def _delete_native_document(
             await delete_native_document_edges(conn, vault_id, vault, resource_id, row["current_path"])
             # The event is the transaction's last statement.
             await events.flush(conn)
-    return row["current_path"]
+        # Committed: recorded before the pool takes the connection back.
+        deleted.append((resource_id, row["current_path"]))
 
 
 async def _delete_native_documents_under(
@@ -293,12 +303,10 @@ async def _delete_native_documents_under(
     async with pool.acquire() as conn:
         listed = await _live_native_documents_under(conn, vault_id, prefix)
     for doc in listed:
-        path = await _delete_native_document(
+        await _delete_native_document(
             native, vault=vault, vault_id=vault_id, prefix=prefix,
-            resource_id=doc["resource_id"], actor=actor,
+            resource_id=doc["resource_id"], actor=actor, deleted=deleted,
         )
-        if path is not None:
-            deleted.append((doc["resource_id"], path))
 
 
 async def _earlier_recursive_delete(conn, vault_id: uuid.UUID, prefix: str) -> bool:

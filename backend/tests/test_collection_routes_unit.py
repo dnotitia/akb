@@ -271,3 +271,22 @@ def test_a_busy_vault_after_documents_went_keeps_its_details_and_retry(client, m
     assert response.headers["Retry-After"] == "1"
     body = response.json()
     assert (body["code"], body["details"]) == ("write_busy", {"partially_applied": True, "deleted_docs": 1})
+
+
+def test_an_internal_error_after_documents_went_keeps_its_details(client, monkeypatch):
+    """An internal error that ends a recursive delete after documents went
+    answers 500 with the generic message and code `internal`, and with what
+    the delete did."""
+    from app.exceptions import InternalError
+
+    details = {"partially_applied": True, "deleted_docs": 1}
+
+    async def _delete(**_kwargs):
+        raise InternalError(hint="This request committed deletions for 1 document(s).", details=details)
+
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/notes", params={"recursive": "true"})
+    assert response.status_code == 500
+    body = response.json()
+    assert (body["code"], body["details"], body["message"]) == ("internal", details, "Internal server error")
+    assert "committed deletions" in body["hint"]

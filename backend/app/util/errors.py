@@ -33,6 +33,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.exceptions import (
+    AKBError,
     ConflictError,
     DOCUMENT_TITLE_CONFLICT,
     ForbiddenError,
@@ -250,4 +251,8 @@ def exception_envelope(e: Exception) -> dict:
         return err(str(e), code=GREP_SCOPE_TOO_LARGE, hint=e.hint, **(e.details or {}))
     if isinstance(e, ValidationError):
         return err(str(e), code=INVALID_ARGUMENT)
+    if isinstance(e, AKBError):
+        # Still an internal error, keeping the hint and details it carries,
+        # such as what a recursive delete did before it.
+        return err(str(e), code=INTERNAL, hint=e.hint, **(e.details or {}))
     return err(str(e), code=INTERNAL)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 import uuid
 
@@ -24,11 +25,18 @@ import asyncpg
 import pytest
 from git import Repo
 
-from app.exceptions import ConflictError, ForbiddenError, NotFoundError, TransientDependencyError
+from app.exceptions import (
+    AKBError,
+    ConflictError,
+    ForbiddenError,
+    InternalError,
+    NotFoundError,
+    TransientDependencyError,
+)
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
 from app.services import collection_service as collection_service_module
-from app.services import document_counters, kg_service, native_derived_worker, queue_rescuer
+from app.services import document_counters, kg_service, m1_file_measurement, native_derived_worker, queue_rescuer
 from app.services.collection_service import CollectionService
 from app.services.git_service import GitService
 from app.services.m1_pg_body_store import M1PgBodyStore
@@ -40,7 +48,7 @@ from app.services.native_derived_worker import NativeDerivedWorker
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri
-from app.util.errors import PERMISSION_DENIED, WRITE_BUSY, exception_envelope
+from app.util.errors import INTERNAL, OPERATION_TIMEOUT, PERMISSION_DENIED, WRITE_BUSY, exception_envelope
 from tests.test_events_commit_order_postgres import (
     _EVENT_LOCK_WAIT_SECONDS,
     _OpenTransaction,
@@ -507,8 +515,11 @@ async def test_a_delete_stopped_after_its_documents_is_completed_by_a_retry(monk
                 vault=vault, path=path, recursive=True, agent_id="tester",
             )
 
-        with pytest.raises(RuntimeError):
+        # An internal error, which says what went.
+        with pytest.raises(InternalError) as stopped:
             await delete()
+        assert isinstance(stopped.value.__cause__, RuntimeError)
+        assert stopped.value.details["deleted_docs"] == 2
         assert await _state(pool, vault_id) == {
             "documents": [(path, "deleted") for path in _PATHS],
             "collections": [],
@@ -1196,3 +1207,213 @@ async def test_a_recursive_delete_alongside_a_vault_delete_does_not_deadlock(tmp
         assert not isinstance(outcomes[0], BaseException), outcomes[0]
         assert await pool.fetchval("SELECT count(*) FROM vaults WHERE id = $1", vault_id) == 0
         assert isinstance(outcomes[1], ConflictError), outcomes[1]
+
+
+async def _rest_answer(exc: Exception, monkeypatch) -> tuple[int, dict]:
+    """The REST status and body the API gives for ``exc``."""
+    import sys
+    import tempfile
+
+    from starlette.requests import Request
+
+    from app.config import settings
+
+    if "app.main" not in sys.modules:
+        # Importing the app builds route services under the Git storage
+        # path, which must exist.
+        monkeypatch.setattr(settings, "git_storage_path", tempfile.mkdtemp(prefix="akb-rest-answer-"))
+    from app.main import akb_error_handler
+
+    request = Request({
+        "type": "http", "method": "DELETE", "path": "/api/v1/collections/v/notes",
+        "headers": [], "query_string": b"",
+    })
+    response = await akb_error_handler(request, exc)
+    return response.status_code, json.loads(response.body)
+
+
+async def _assert_internal_with_progress(
+    exc: Exception, vault: str, paths: tuple[str, ...], monkeypatch,
+) -> None:
+    """``exc`` is an internal error, HTTP 500 and code `internal` with the
+    generic message over REST and MCP, that says what the delete deleted."""
+    progress = {
+        "partially_applied": True, "deleted_docs": len(paths),
+        "deleted_uris": [doc_uri(vault, path) for path in paths],
+    }
+    assert isinstance(exc, InternalError)
+    assert (exc.status_code, exc.code, exc.details) == (500, "internal", progress)
+    status, body = await _rest_answer(exc, monkeypatch)
+    assert (status, body["code"], body["details"]) == (500, INTERNAL, progress), body
+    assert body["message"].startswith("Internal server error"), body
+    assert "committed deletions for" in body["hint"], body
+    envelope = exception_envelope(exc)
+    assert (envelope["code"], envelope["details"]) == (INTERNAL, progress), envelope
+    assert "committed deletions for" in envelope["hint"], envelope
+
+
+async def test_a_plain_lock_timeout_after_the_documents_went_is_internal_and_says_what_it_deleted(monkeypatch):
+    """Both documents went. The last transaction then waits for the `notes`
+    collection row, which another transaction holds, under a lock timeout
+    of its own, as a database role's lock_timeout would set: PostgreSQL ends
+    the wait with a plain 55P03, not the Vault's event lock, so it stays an
+    internal error. It is reported as one, with the generic message, over
+    REST and MCP, and says what the request deleted; the lock timeout is its
+    cause. Such an error used to be returned as it was, without saying what
+    had gone."""
+    async with _fresh_database() as pool:
+        vault = "native-plain-lock-timeout"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        lock_rows = collection_service_module.lock_collection_rows
+
+        async with pool.acquire() as holder:
+            async with _OpenTransaction(holder):
+                held: list[bool] = []
+
+                async def lock_with_a_timeout(conn, *args, **kwargs):
+                    if not held:
+                        # The documents are gone: hold the row now.
+                        await holder.execute(
+                            "SELECT 1 FROM collections WHERE vault_id = $1 AND path = 'notes' FOR UPDATE",
+                            vault_id,
+                        )
+                        held.append(True)
+                    await conn.execute("SET LOCAL lock_timeout = '200ms'")
+                    return await lock_rows(conn, *args, **kwargs)
+
+                monkeypatch.setattr(collection_service_module, "lock_collection_rows", lock_with_a_timeout)
+                with pytest.raises(AKBError) as failure:
+                    await CollectionService(git=object()).delete(
+                        vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+                    )
+        cause = failure.value.__cause__
+        assert isinstance(cause, asyncpg.LockNotAvailableError), repr(cause)
+        assert getattr(cause, "constraint_name", None) != "akb_event_lock_timeout"
+        await _assert_internal_with_progress(failure.value, vault, _PATHS, monkeypatch)
+        assert await _state(pool, vault_id) == {
+            "documents": [(path, "deleted") for path in _PATHS],
+            "collections": ["notes"],
+            "events": ["document.delete", "document.delete"],
+        }
+
+
+async def test_a_deadlock_after_the_first_document_is_internal_and_says_what_it_deleted(monkeypatch):
+    """The first document went; the second's delete then ends in a
+    deadlock (40P01). The request answers with an internal error, with the
+    generic message, over REST and MCP, that says the first document went;
+    the deadlock is its cause."""
+    async with _fresh_database() as pool:
+        vault = "native-deadlock"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        delete_document = collection_service_module._delete_native_document
+        calls: list[bool] = []
+
+        async def deadlock_on_the_second(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 2:
+                raise asyncpg.exceptions.DeadlockDetectedError("deadlock detected")
+            return await delete_document(*args, **kwargs)
+
+        monkeypatch.setattr(collection_service_module, "_delete_native_document", deadlock_on_the_second)
+        with pytest.raises(AKBError) as failure:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert isinstance(failure.value.__cause__, asyncpg.exceptions.DeadlockDetectedError)
+        await _assert_internal_with_progress(failure.value, vault, _PATHS[:1], monkeypatch)
+        assert (await _state(pool, vault_id))["documents"] == [(_PATHS[0], "deleted"), (_PATHS[1], "live")]
+
+
+async def test_a_deletion_is_recorded_once_committed_though_the_connection_reset_fails(monkeypatch):
+    """The first document's delete commits, and then the pool fails to reset
+    the connection it ran on, as a reset that times out does. The error
+    still says the document went: each deletion is recorded as soon as its
+    transaction commits, before the connection goes back. It used to be
+    recorded after that, so this error said nothing of it."""
+    async with _fresh_database() as pool:
+        vault = "native-reset-fails"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        in_delete: list[bool] = []
+        failed: list[bool] = []
+        edges = collection_service_module.delete_native_document_edges
+
+        async def delete_edges(*args, **kwargs):
+            in_delete.append(True)
+            return await edges(*args, **kwargs)
+
+        class _ResetFails:
+            """The pool's own acquisition, whose release then fails once,
+            after the first document's delete transaction."""
+
+            def __init__(self) -> None:
+                self._acquired = pool.acquire()
+
+            async def __aenter__(self):
+                return await self._acquired.__aenter__()
+
+            async def __aexit__(self, *exc):
+                outcome = await self._acquired.__aexit__(*exc)
+                if in_delete and not failed and exc[0] is None:
+                    failed.append(True)
+                    raise TimeoutError("timed out resetting the connection")
+                return outcome
+
+        class _Pool:
+            def acquire(self):
+                return _ResetFails()
+
+        async def get_pool():
+            return _Pool()
+
+        monkeypatch.setattr(collection_service_module, "delete_native_document_edges", delete_edges)
+        monkeypatch.setattr(collection_service_module, "get_pool", get_pool)
+        with pytest.raises(TransientDependencyError) as failure:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert failed
+        assert isinstance(failure.value.__cause__, TimeoutError)
+        assert (failure.value.code, failure.value.details) == (OPERATION_TIMEOUT, {
+            "partially_applied": True, "deleted_docs": 1, "deleted_uris": [doc_uri(vault, _PATHS[0])],
+        })
+        assert await _state(pool, vault_id) == {
+            "documents": [(_PATHS[0], "deleted"), (_PATHS[1], "live")],
+            "collections": ["notes"],
+            "events": ["document.delete"],
+        }
+
+
+async def test_a_file_delete_refused_after_the_documents_went_keeps_its_details_over_mcp(monkeypatch):
+    """`notes` holds the two documents and a native_text File, and no
+    native_text File delete service is registered in this process. The
+    documents go, and the last transaction's File delete then fails with a
+    503 AKB error. Over MCP, as over REST, the error keeps the details and
+    hint that say what the request deleted, and its code stays `internal`;
+    the MCP envelope used to drop them for an AKB error of no other kind."""
+    async with _fresh_database() as pool:
+        vault = "native-text-file"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        notes = await pool.fetchval(
+            "SELECT id FROM collections WHERE vault_id = $1 AND path = 'notes'", vault_id,
+        )
+        await pool.execute(
+            "INSERT INTO vault_files (vault_id, collection_id, name, s3_key, storage_driver, "
+            "storage_locator, native_resource_id, native_revision_id) "
+            "VALUES ($1, $2, 'n.txt', 'notes/n.txt', 'native_text', 'native-text:n', $3, $4)",
+            vault_id, notes, uuid.uuid4(), "a" * 40,
+        )
+        monkeypatch.setattr(m1_file_measurement, "_native_text_deleter", None)
+        with pytest.raises(AKBError) as failure:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        progress = {
+            "partially_applied": True, "deleted_docs": 2,
+            "deleted_uris": [doc_uri(vault, path) for path in _PATHS],
+        }
+        assert (failure.value.status_code, failure.value.details) == (503, progress)
+        envelope = exception_envelope(failure.value)
+        assert (envelope["code"], envelope["details"]) == (INTERNAL, progress), envelope
+        assert "committed deletions for" in envelope["hint"], envelope
+        status, body = await _rest_answer(failure.value, monkeypatch)
+        assert (status, body["details"]) == (503, progress), body
