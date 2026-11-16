@@ -297,7 +297,14 @@ Vault's event lock is still a retryable `write_busy`, and its details add
 `partially_applied`, `deleted_docs` and, for a caller who may read the Vault,
 `deleted_uris`, with a hint that opens with them. This holds for the
 conflict above, for the refusals below, for a table drop that a dependent
-object refuses, and for collections that change after the documents went.
+object refuses, and for collections that change after the documents went. An
+internal error, such as a deadlock or a lock timeout that is not the Vault's
+event lock, is reported as an internal error (HTTP 500, code `internal`) with
+the generic message, and says the same; the original error is logged. Over
+MCP an error keeps these details and hint whatever its code. A document's
+deletion is counted as soon as its transaction commits, before its connection
+goes back to the pool, so a connection the pool then fails to reset does not
+drop it from the count.
 When nothing is left under the prefix because an earlier
 recursive delete of it deleted its documents, the delete succeeds with zero
 counts rather than reporting the prefix as not found, and records
@@ -442,8 +449,12 @@ that a document restored after this request deleted it stays listed among the
 deletions it committed; that a caller who may not read the Vault is told
 counts, not paths; that collections changing after the documents went, and a
 table drop refused by a dependent table, say what the delete deleted; that a
-document restored and deleted again by one call counts once; and that a
-recursive delete running alongside a Vault delete does not deadlock.
+document restored and deleted again by one call counts once; that a
+recursive delete running alongside a Vault delete does not deadlock; that a
+plain lock timeout on the collection row and a deadlock after documents went
+are internal errors, over REST and MCP, that say what went; that a deletion
+whose connection then fails to reset is still counted; and that a File delete
+refused with a 503 after the documents went keeps its details over MCP.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
 suites create and remove their own databases. `REQUIRE_REAL_PG=1` makes the native

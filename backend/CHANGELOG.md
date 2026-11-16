@@ -19,8 +19,12 @@ specifically; the proxy has its own log in
   error ends a delete after it deleted documents says which ones:
   `partially_applied`, `deleted_docs` and `deleted_uris` in its details, with
   a hint, while the error keeps its own code, status and retry information (a
-  busy Vault is still a retryable `write_busy`). `deleted_docs` counts a
-  document restored and deleted again by the same call once. A writer's
+  busy Vault is still a retryable `write_busy`); an internal error, such as a
+  deadlock, is reported as `internal` with the generic message and the same
+  details, and MCP keeps them for any error. A deletion counts as soon as its
+  transaction commits, even if the connection then fails to reset.
+  `deleted_docs` counts a document restored and deleted again by the same
+  call once. A writer's
   delete refused at a table that another request created under the prefix
   after the delete checked for one can be finished only by an admin or
   owner. The paths
