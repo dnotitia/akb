@@ -382,7 +382,7 @@ async def test_service_jobs_and_details_stay_out_of_human_reports():
 async def test_failure_history_preserves_full_sequences_and_ranks_before_paging():
     from app.mcp_monitoring.report import read_operation_calls
 
-    async with _fresh_database():
+    async with _fresh_database() as pool:
         start = datetime.now(UTC) - timedelta(minutes=5)
         actor, job = uuid4(), uuid4()
         base = Observation(uuid4(), start, actor, "human", "oauth", None, "akb_browse", "tool_error", 22,
@@ -399,6 +399,8 @@ async def test_failure_history_preserves_full_sequences_and_ranks_before_paging(
         end = datetime.now(UTC)
         args = (start, end, actor, None, None, None)
         report = await read_report(*args, 0, 0, 0, history_errors_only=True, tool_sort="errors")
+        available = await pool.fetchval("SELECT applied_at FROM schema_migrations WHERE filename='138_mcp_call_error_code.py'")
+        assert available and report["collection"]["error_codes_supported_from"] == available
         assert report["summary"]["calls"] == 57
         assert [r["tool"] for r in report["tools"]] == ["akb_browse", "akb_help"]
         [failed] = report["recent_calls"]

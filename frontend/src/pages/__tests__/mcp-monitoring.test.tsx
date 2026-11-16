@@ -193,17 +193,20 @@ it("switches from a human PAT to service jobs and scopes their call sequence", a
 it.each([
   [404, "trace_export_pending", "Awaiting trace export", true],
   [410, "trace_expired", "Trace expired", false],
+  [410, "trace_outside_previous_retention", "Outside the previous Tempo retention window", false],
+  [404, "trace_span_not_found", "MCP span missing from trace", true],
   [404, "trace_not_found", "Trace not found", true],
   [503, "unavailable", "The trace store could not be reached.", true],
 ] as const)("displays the %s %s trace state", async (status, code, title, canRetry) => {
   vi.mocked(getMcpMonitoring).mockResolvedValue({ ...report, recent_calls: [{ ...report.recent_calls[0], trace_available: true }] });
-  vi.mocked(getMcpCallTrace).mockRejectedValueOnce(new ApiError("Status detail.", status, { code }))
+  vi.mocked(getMcpCallTrace).mockRejectedValueOnce(new ApiError("Status detail.", status, { code, trace_id: "recorded-id" }))
     .mockResolvedValueOnce({ trace_id: "abc123", spans: [] });
   renderPage();
   await userEvent.click(await screen.findByRole("tab", { name: "Recent calls" }));
   await userEvent.click(await screen.findByRole("button", { name: "View trace" }));
   const dialog = within(await screen.findByRole("dialog"));
   expect(await dialog.findByText(title)).toBeVisible();
+  if (status !== 503) expect(dialog.getByText("recorded-id")).toBeVisible();
   if (canRetry) {
     await userEvent.click(dialog.getByRole("button", { name: "Retry" }));
     expect(await dialog.findByText("abc123")).toBeVisible();
@@ -211,6 +214,17 @@ it.each([
     expect(dialog.queryByRole("button", { name: "Retry" })).toBeNull();
   }
   vi.mocked(getMcpCallTrace).mockReset();
+});
+
+it("dates failures that predate error-code support and leaves newer uncoded failures unexplained", async () => {
+  const since = "2026-01-02T00:00:00Z";
+  vi.mocked(getMcpMonitoring).mockResolvedValue({ ...report, collection: { ...report.collection, error_codes_supported_from: since },
+    recent_calls: report.recent_calls.map((call, index) => ({ ...call, outcome: "tool_error", finished_at: index ? since : report.window.from })) });
+  renderPage();
+  await userEvent.click(await screen.findByRole("tab", { name: "Recent calls" }));
+  const recent = within(await screen.findByRole("table", { name: "Recent calls" }));
+  expect(recent.getByText(/This call predates error-code collection/)).toHaveTextContent(new Date(since).toLocaleString());
+  expect(recent.getByText("AKB recorded the failure without an error code.")).toBeVisible();
 });
 
 it("drills from tool errors into a failed call and opens the single operation's Tempo trace", async () => {

@@ -237,6 +237,7 @@ async def read_report(
         state = await conn.fetchrow(
             """
             SELECT CURRENT_TIMESTAMP AS status_as_of, min(started_at) FILTER (WHERE collecting) AS started_at,
+                   (SELECT applied_at FROM schema_migrations WHERE filename = '138_mcp_call_error_code.py') AS error_codes_supported_from,
                    max(heartbeat_at) FILTER (WHERE collecting) AS last_flush,
                    count(*) FILTER (WHERE NOT stopped AND NOT collecting AND heartbeat_at >= now() - $1::interval) AS disabled_writers,
                    count(*) FILTER (WHERE NOT stopped AND heartbeat_at < now() - $1::interval) AS stale_writers,

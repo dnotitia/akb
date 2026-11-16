@@ -23,7 +23,7 @@ function Pages({ page, more, change }: { page: number; more: boolean; change: (p
   </div> : null;
 }
 
-function CallSequence({ operation, filters }: { operation: McpOperation; filters: URLSearchParams }) {
+function CallSequence({ operation, filters, codesSince }: { operation: McpOperation; filters: URLSearchParams; codesSince?: string | null }) {
   const [page, setPage] = useState(0);
   const [selected, setSelected] = useState<Pick<RecentCall, "observation_id" | "tool"> | null>(null);
   const params = new URLSearchParams({ page: String(page) });
@@ -58,7 +58,7 @@ function CallSequence({ operation, filters }: { operation: McpOperation; filters
               style={{ left: `${Math.min(99, Math.max(0, 100 * (Date.parse(call.started_at) - start) / span))}%`,
                 width: `${Math.min(100, 100 * call.duration_ms / span)}%` }} /></div>
         </td>
-        <td className={cell}><CallOutcome call={call} /></td>
+        <td className={cell}><CallOutcome call={call} codesSince={codesSince} /></td>
         <td className={cell}>{call.trace_available
           ? <Button variant="link" size="sm" aria-label={`View trace for call ${call.position}, ${call.tool}`}
               onClick={() => setSelected(call)}><Workflow aria-hidden size={15} />View trace</Button>
@@ -98,7 +98,7 @@ export function McpOperations({ report, filters, page, setPage }: {
                 </Button>
               : <><span className="font-medium">{op.tool}</span><span className="ml-2 text-xs text-foreground-muted">Individual call</span></>}
               {op.kind === "conversation" && <span className="ml-2 text-xs text-foreground-muted">{op.agent}</span>}</td>
-            <td className={cell}><OperationOutcome op={op} /></td>
+            <td className={cell}><OperationOutcome op={op} codesSince={report.collection.error_codes_supported_from} /></td>
             <td className={cell}>{op.user_label || `Former account · ${op.actor_id.slice(0, 8)}`}</td>
             <td className={cell}><Timestamp value={op.started_at} /></td><td className={cell}>{op.calls}</td><td className={cell}>{op.elapsed_ms} ms</td>
             <td className={cell}>{singleTrace
@@ -107,7 +107,7 @@ export function McpOperations({ report, filters, page, setPage }: {
                 ? <Button size="sm" variant="link" aria-expanded={open} aria-controls={open ? id : undefined}
                     onClick={() => setExpanded(open ? null : id)}><Workflow aria-hidden size={15} />{op.trace_calls} {op.trace_calls === 1 ? "trace" : "traces"}</Button>
                 : <span aria-label="No recorded trace to open" className="text-foreground-muted">—</span>}</td>
-          </tr>{open && <tr><td colSpan={7} className="p-0" id={id}><CallSequence operation={op} filters={filters} /></td></tr>}</Fragment>;
+          </tr>{open && <tr><td colSpan={7} className="p-0" id={id}><CallSequence operation={op} filters={filters} codesSince={report.collection.error_codes_supported_from} /></td></tr>}</Fragment>;
         })}</tbody>
       </table></div>
     </>}

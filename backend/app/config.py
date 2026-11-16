@@ -25,7 +25,7 @@ from typing import Literal, cast
 from urllib.parse import quote, urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from app.services.sparse_shapes import SparseShape, SparseShapeDecision, SparseShapeSetting
 
@@ -309,6 +309,13 @@ class AuditSettings(BaseModel):
     local_retention_days: int = 2
 
 
+class TempoRetentionPeriod(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ended_at: AwareDatetime
+    hours: float = Field(gt=0, allow_inf_nan=False)
+
+
 class McpMonitoringSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -316,7 +323,15 @@ class McpMonitoringSettings(BaseModel):
     export_traces: bool = False
     tempo_query_url: str = ""
     tempo_retention_hours: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    tempo_retention_history: list[TempoRetentionPeriod] = Field(default_factory=list)
     retention_days: int = Field(default=30, ge=1, le=365)
+
+    @model_validator(mode="after")
+    def ordered_retention_history(self):
+        ends = [period.ended_at for period in self.tempo_retention_history]
+        if ends != sorted(set(ends)):
+            raise ValueError("Tempo retention periods must have strictly increasing end times")
+        return self
 
 
 class ToolUsageSettings(BaseModel):

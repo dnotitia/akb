@@ -461,6 +461,7 @@ notification_retention_days: 90
 #   enabled: true
 #   tempo_query_url: ""   # Installation-local Tempo query origin for the admin call trace dialog.
 #   tempo_retention_hours: null  # Match the Tempo tenant's retention in hours (e.g. 720 for 30 days).
+#   tempo_retention_history: []  # Previous policies in chronological order, e.g. [{ended_at: "2025-01-15T12:00:00Z", hours: 48}]
 #   export_traces: false  # Opt in to OTLP/HTTP; configure OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.
 #   retention_days: 30
 

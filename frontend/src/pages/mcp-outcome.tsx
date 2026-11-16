@@ -10,20 +10,24 @@ function Status({ tone, label }: { tone: "ok" | "error" | "cancelled" | "unknown
   </Badge>;
 }
 
-function ErrorReason({ error_code, error_reason }: FailureDetail) {
+type CodeHistory = { codesSince?: string | null };
+
+function ErrorReason({ error_code, error_reason, finished_at, codesSince }: FailureDetail & CodeHistory & { finished_at: string }) {
+  const beforeCollection = codesSince && Date.parse(finished_at) < Date.parse(codesSince);
   return <div className="mt-1 max-w-72 whitespace-normal text-xs leading-5 text-foreground-muted">
     {error_code ? <><code className="break-all font-medium text-foreground">{error_code}</code>{error_reason && <p>{error_reason}</p>}</>
-      : "No error code recorded"}
+      : beforeCollection ? <>This call predates error-code collection, available from <time dateTime={codesSince}>{new Date(codesSince).toLocaleString()}</time>.</>
+        : "AKB recorded the failure without an error code."}
   </div>;
 }
 
-export function CallOutcome({ call }: { call: Pick<RecentCall, "outcome" | "error_code" | "error_reason"> }) {
+export function CallOutcome({ call, codesSince }: CodeHistory & { call: Pick<RecentCall, "finished_at" | "outcome" | "error_code" | "error_reason"> }) {
   const failed = call.outcome === "tool_error" || call.outcome === "rpc_error";
   return <><Status tone={failed ? "error" : call.outcome === "ok" ? "ok" : call.outcome === "cancelled" ? "cancelled" : "unknown"}
-    label={outcomes[call.outcome]} />{failed && <ErrorReason {...call} />}</>;
+    label={outcomes[call.outcome]} />{failed && <ErrorReason {...call} codesSince={codesSince} />}</>;
 }
 
-export function OperationOutcome({ op }: { op: McpOperation }) {
+export function OperationOutcome({ op, codesSince }: CodeHistory & { op: McpOperation }) {
   if (op.succeeded == null) return <Status tone="unknown" label="Outcome unavailable" />;
   const unknown = op.calls - op.succeeded - op.cancelled - op.errors;
   if (op.succeeded === op.calls) return <Status tone="ok" label="Success" />;
@@ -31,7 +35,7 @@ export function OperationOutcome({ op }: { op: McpOperation }) {
   if (unknown === op.calls) return <Status tone="unknown" label="Unknown" />;
   return <><Status tone={op.errors ? "error" : "unknown"}
     label={op.errors === op.calls ? "Failed" : op.errors ? "Has errors" : "Mixed outcomes"} />
-    {op.calls === 1 && op.errors > 0 && <ErrorReason {...op} />}
+    {op.calls === 1 && op.errors > 0 && <ErrorReason {...op} codesSince={codesSince} />}
     {op.calls > 1 && <div className="mt-1 text-xs text-foreground-muted">
       {[op.errors && `${op.errors} failed`, op.succeeded && `${op.succeeded} succeeded`,
         op.cancelled && `${op.cancelled} cancelled`, unknown && `${unknown} unknown`].filter(Boolean).join(" · ")}

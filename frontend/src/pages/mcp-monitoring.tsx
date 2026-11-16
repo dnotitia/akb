@@ -77,7 +77,7 @@ function RecentCalls({ report, service }: { report: MonitoringReport; service: b
               <td className="px-4">{call.user_label || `Former account · ${call.actor_id.slice(0, 8)}`}</td>
               <td className="px-4">{call.auth_kind === "service" ? "Service key" : call.auth_kind === "oauth" ? (service ? "OAuth" : "SSO") : `${call.pat_label || "PAT"} · ${call.pat_id?.slice(0, 8)}`}</td>
               <td className="px-4"><CredentialState info={call} /></td>
-              <td className="px-4">{call.tool}</td><td className="px-4"><CallOutcome call={call} /></td>
+              <td className="px-4">{call.tool}</td><td className="px-4"><CallOutcome call={call} codesSince={report.collection.error_codes_supported_from} /></td>
               <td className="whitespace-nowrap px-4">{call.duration_ms} ms</td>
               <td className="whitespace-nowrap px-4">{call.trace_available
                 ? <Button variant="link" size="sm" onClick={() => setSelected(call)}><Workflow aria-hidden size={15} />View trace</Button>

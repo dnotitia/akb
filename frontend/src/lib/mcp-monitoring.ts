@@ -98,7 +98,7 @@ export interface MonitoringReport extends Record<Breakdown, MonitoringRow[]> {
   recent_calls: RecentCall[];
   summary: MonitoringMetrics;
   window: { from: string; to: string };
-  collection: { enabled: boolean; retention_days: number; started_at: string | null; last_flush: string | null; dropped: number; stale_writers: number; disabled_writers: number };
+  collection: { enabled: boolean; retention_days: number; started_at: string | null; error_codes_supported_from?: string | null; last_flush: string | null; dropped: number; stale_writers: number; disabled_writers: number };
   series: { start: string; calls: number | null; coverage: "complete" | "partial" | "unmeasured" }[];
   has_more: Record<Breakdown, boolean>;
 }

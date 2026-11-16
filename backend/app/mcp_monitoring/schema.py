@@ -60,6 +60,7 @@ class Interval(TypedDict):
 
 
 class Collection(TypedDict):
+    error_codes_supported_from: datetime | None
     enabled: bool
     started_at: datetime | None
     last_flush: datetime | None
