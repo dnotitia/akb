@@ -1036,7 +1036,7 @@ Read specific sections of a document without loading everything.
 | uri | ✓ | Document AKB URI |
 | mode | | `sections` (default) reads body chunks. `outline` lists distinct heading paths. |
 | section | | In `sections`, match a heading substring. In `outline`, pass the exact path of a heading to include it and its descendants. |
-| pattern | | Case-insensitive substring in the body, used in `sections` only. |
+| pattern | | Case-insensitive literal within one section body. A match can span multiple source chunks. |
 
 ## Examples
 ```
@@ -1047,7 +1047,10 @@ akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API", pattern="token")
 
 Outline returns up to 50 matching paths in document order. When truncated,
 use a more specific heading path. An unmatched outline returns an empty list.
-In `sections` mode an empty match includes an outline to help you retry.""",
+In `sections` mode an empty match includes an outline to help you retry.
+With `pattern`, `returned` counts the source chunks that contain matching text.
+Each is returned once, in document order. Its `chunk_index` is the chunk's
+position in the source body, which can differ from its search-index position.""",
 
 
     "akb_create_table": """# akb_create_table — Create a Table

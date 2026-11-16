@@ -837,15 +837,14 @@ class DocumentService:
 
     # ── Get ───────────────────────────────────────────────────
 
-    async def get(self, vault: str, doc_ref: str) -> DocumentResponse:
+    async def _find_current_git_document(
+        self, vault: str, doc_ref: str,
+    ) -> tuple[DocumentRepository, dict | None]:
         vault_repo, doc_repo, _ = await self._repos()
-
         vault_id = checked_vault_id(vault, await vault_repo.get_id_by_name(vault))
+        return doc_repo, await doc_repo.find_by_ref(vault_id, doc_ref)
 
-        row = await doc_repo.find_by_ref(vault_id, doc_ref)
-        if not row:
-            raise NotFoundError("Document", doc_ref)
-
+    async def _read_git_body(self, vault: str, doc_ref: str, row: dict) -> str:
         # Read the body at the row's recorded commit, NOT the floating vault
         # HEAD. This GET assembles `content` (from git) and `current_commit`
         # (from the DB row) in two separate reads; reading the body at HEAD
@@ -857,10 +856,21 @@ class DocumentService:
         content = await asyncio.to_thread(
             self.git.read_file, vault, row["path"], row["current_commit"]
         )
-        body = ""
         if content is None:
             raise NotFoundError("Document", doc_ref)
         _, body = _parse_markdown(content)
+        return body
+
+    async def read_current_body(self, vault: str, doc_ref: str) -> str | None:
+        """Read the pinned body without backfilling its hash. None means no catalog row."""
+        _, row = await self._find_current_git_document(vault, doc_ref)
+        return await self._read_git_body(vault, doc_ref, row) if row else None
+
+    async def get(self, vault: str, doc_ref: str) -> DocumentResponse:
+        doc_repo, row = await self._find_current_git_document(vault, doc_ref)
+        if not row:
+            raise NotFoundError("Document", doc_ref)
+        body = await self._read_git_body(vault, doc_ref, row)
         content_hash, hash_algorithm = await self._ensure_document_hash(doc_repo, row, body)
 
         # Derive published state from the publications table, keyed on this

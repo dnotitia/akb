@@ -123,6 +123,8 @@ async def test_document_get_computes_body_hash_and_repairs_projection(monkeypatc
     monkeypatch.setattr(service, "_repos", fake_repos)
     monkeypatch.setattr(service, "_get_public_slug", fake_public_slug)
 
+    assert await service.read_current_body("hash-vault", "specs/hash-contract.md") == returned_body
+    assert doc_repo.hash_update is None
     result = await service.get("hash-vault", "specs/hash-contract.md")
 
     expected_hash = sha256(returned_body.encode("utf-8")).hexdigest()

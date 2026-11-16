@@ -833,6 +833,11 @@ class NativeDocumentService(DocumentService):
             entities_found=0,
         )
 
+    async def read_current_body(self, vault: str, doc_ref: str) -> str:
+        _, current = await self._current(vault, doc_ref)
+        _, body = _parse_markdown(current.text)
+        return body
+
     async def get(self, vault: str, doc_ref: str) -> DocumentResponse:
         vault_id, current = await self._current(vault, doc_ref)
         return await self._response(vault=vault, vault_id=vault_id, current=current)

@@ -712,7 +712,7 @@ TOOLS = [
                     "description": "'sections' for body content, 'outline' for heading paths only.",
                 },
                 "section": {"type": "string", "description": "Heading substring in sections mode. In outline mode, use the exact heading path, including Markdown heading markers, to select its subtree."},
-                "pattern": {"type": "string", "description": "Substring grep inside matched section bodies (case-insensitive). Used in `sections` mode."},
+                "pattern": {"type": "string", "description": "Case-insensitive literal in a single section body. Matches can span chunks. Returns the touched source chunks in document order; returned counts chunks. Used in `sections` mode."},
             },
             "required": ["uri"],
         },

@@ -31,6 +31,7 @@ from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
 from app.services.index_service import (
+    MAX_CHUNK_SIZE,
     OVERLAP,
     SOURCE_NATIVE_FILE,
     generate_embeddings,
@@ -754,14 +755,13 @@ def _decode_slice_prefix(raw: bytes) -> str | None:
     return None
 
 
-async def _native_section_body(vault: str, doc_id: str) -> str:
-    from app.services.native_document_service import NativeDocumentService
+async def _current_section_body(vault: str, doc_id: str) -> str | None:
+    from app.services.revision_backend import get_document_service
 
-    document = await NativeDocumentService(pool=await get_pool()).get(vault, doc_id)
-    return document.content or ""
+    return await get_document_service().read_current_body(vault, doc_id)
 
 
-def _native_section_spans(body: str) -> Iterator[tuple[str, int, int]]:
+def _section_spans(body: str) -> Iterator[tuple[str, int, int]]:
     """Yield heading paths with their source body bounds, including any preamble."""
     from app.services.index_service import _HEADING_RE
 
@@ -780,6 +780,38 @@ def _native_section_spans(body: str) -> Iterator[tuple[str, int, int]]:
         if body[start:start + 1] == "\n":
             start += 1
     yield path, start, len(body)
+
+
+def _section_body_rows(body: str, section: str | None, pattern: str) -> list[dict]:
+    """Emit bounded source slices touched by a literal, once in document order."""
+    rows = []
+    heading_filter = (section or "").casefold()
+    first_index = 0
+    for path, start, end in _section_spans(body):
+        offsets = range(start, max(start + 1, end), MAX_CHUNK_SIZE)
+        if heading_filter in path.casefold():
+            # Match each heading occurrence independently, including repeated
+            # headings with the same path. Index overlap is not authored text.
+            folded = body[start:end].lower() if pattern else ""
+            match = folded.find(pattern)
+            folded_start = 0
+            for index, offset in enumerate(offsets, first_index):
+                if pattern and match < 0:
+                    break
+                content = body[offset:min(offset + MAX_CHUNK_SIZE, end)]
+                if pattern:
+                    # Lowercasing can expand a character (e.g. İ). Compare
+                    # folded offsets while returning the original source.
+                    folded_end = folded_start + len(content.lower())
+                    if match + len(pattern) <= folded_start:
+                        # A later overlapping occurrence can still touch this slice.
+                        match = folded.find(pattern, folded_start - len(pattern) + 1)
+                    folded_start = folded_end
+                    if match < 0 or match >= folded_end:
+                        continue
+                rows.append({"section_path": path, "content": content, "chunk_index": index})
+        first_index += len(offsets)
+    return rows
 
 
 class SearchService:
@@ -2597,29 +2629,19 @@ class SearchService:
                 resp.update(replacement_error)
         return resp
 
-    async def drill_down(self, vault: str, doc_id: str, section: str | None = None) -> list[dict]:
+    async def drill_down(
+        self, vault: str, doc_id: str, section: str | None = None, *, pattern: str = "",
+    ) -> list[dict]:
         """Get L3 section-level content for a document."""
-        if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
-            from app.services.index_service import MAX_CHUNK_SIZE
-
-            body = await _native_section_body(vault, doc_id)
-
-            def native_sections() -> list[dict]:
-                rows: list[dict] = []
-                chunk_index = 0
-                for path, start, end in _native_section_spans(body):
-                    # Index chunks insert nested overlap and synthetic context.
-                    # Current-body reads instead slice source spans directly:
-                    # no content guessing, no duplicate bytes, bounded rows.
-                    for offset in range(start, max(start + 1, end), MAX_CHUNK_SIZE):
-                        if not section or section.casefold() in path.casefold():
-                            rows.append({"section_path": path,
-                                         "content": body[offset:min(offset + MAX_CHUNK_SIZE, end)],
-                                         "chunk_index": chunk_index})
-                        chunk_index += 1
-                return rows
-
-            return await asyncio.to_thread(native_sections)
+        pattern = pattern.strip().lower()
+        native = _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE
+        if native or pattern:
+            # Indexed Bare Git chunks contain synthetic overlap and paragraph
+            # breaks. Read the document at its recorded commit for literal search.
+            body = await _current_section_body(vault, doc_id)
+            if body is None:
+                return []
+            return await asyncio.to_thread(_section_body_rows, body, section, pattern)
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -2664,11 +2686,13 @@ class SearchService:
             delimiter = " > #" if section.startswith("#") else "/"
             child_prefix = section + delimiter
         if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
-            body = await _native_section_body(vault, doc_id)
+            body = await _current_section_body(vault, doc_id)
+            if body is None:
+                return []
 
             def native_headings() -> list[str]:
                 paths: dict[str, None] = {}
-                for path, _, _ in _native_section_spans(body):
+                for path, _, _ in _section_spans(body):
                     if not path or (child_prefix and path != section and not path.startswith(child_prefix)):
                         continue
                     paths[path] = None
