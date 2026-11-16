@@ -1217,7 +1217,10 @@ class FileService:
         if self._measurement is not None:
             return await self._measurement.cancel_upload(vault_id, file_id)
         pool = await get_pool()
-        async with pool.acquire() as conn:
+        # Admitted before the connection, as a confirmation is: the delete
+        # waits for the File's row, which a confirmation holds while it waits
+        # for the Vault's event lock, and must not hold a connection meanwhile.
+        async with vault_write_admission(vault_id), pool.acquire() as conn:
             async with conn.transaction():
                 deleted = await vault_files_repo.delete_pending_file(conn, vault_id, fid)
                 if deleted:

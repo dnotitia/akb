@@ -25,7 +25,8 @@ import logging
 import uuid
 import weakref
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager
+import contextlib
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -261,9 +262,51 @@ async def _run_statement(conn, sql: str, params: list, fetch: bool, vault_names:
     return out
 
 
-# How long a plan read past its deadline may still take to roll back and give
-# its connection back to the pool; after that the connection is closed.
+# How long a plan's connection may take to go back to the pool, its reset
+# included, before it is closed instead.
 _PLAN_CLEANUP_SECS = 0.5
+
+
+def _close_connection(conn: Any) -> bool:
+    """Close a plan's connection now, so that the pool takes it back without
+    a reset. False when there is nothing to close: a connection without
+    ``terminate``, or one already back in the pool, which asyncpg's pool
+    proxy refuses to touch once it is released."""
+    terminate = getattr(conn, "terminate", None)
+    if terminate is None:
+        return False
+    try:
+        terminate()
+    except asyncpg.InterfaceError:
+        return False
+    return True
+
+
+async def _give_back(acquire: Any, conn: Any, closed: list[bool]) -> None:
+    """Give a plan's connection back to the pool through ``acquire``, and
+    return once the pool has it.
+
+    The release, the pool's reset included, runs outside the plan's deadline
+    and shielded from cancellation, as asyncpg's own is. Still running after
+    `_PLAN_CLEANUP_SECS`, or when the read is cancelled meanwhile, the
+    connection is closed, which ends the reset, and the pool takes it back
+    without one. A failure to give it back is logged: the pool deals with the
+    connection.
+    """
+    release = asyncio.ensure_future(acquire.__aexit__(None, None, None))
+    try:
+        await asyncio.wait_for(asyncio.shield(release), _PLAN_CLEANUP_SECS)
+    except TimeoutError:
+        if _close_connection(conn):
+            closed.append(True)
+        with contextlib.suppress(Exception):
+            await release
+    except asyncio.CancelledError:
+        if _close_connection(conn):
+            closed.append(True)
+        raise
+    except Exception:
+        logger.warning("a plan's connection could not be given back to the pool", exc_info=True)
 
 
 class UserSqlExecutor:
@@ -398,9 +441,9 @@ class UserSqlExecutor:
         wait for a connection to the end of ``EXPLAIN``, may take
         `akb_sql_plan_timeout_ms` in all and each wait for a lock
         `akb_sql_plan_lock_timeout_ms`; past either the write fails with a
-        retryable `write_busy` and gives its slot back, so a plan that waits
-        for one lock after another cannot keep the slots from other Vaults'
-        statements. A statement that cannot be planned is admitted for the
+        retryable `write_busy` and gives its slot back once its connection is
+        back in the pool (`_read_plan`), so a plan that waits for one lock
+        after another cannot keep the slots from other Vaults' statements. A statement that cannot be planned is admitted for the
         Vaults it declares, and reports its own error when it runs. Foreign
         keys of a dynamic table only reference tables of its own Vault, so a
         cascade stays in a Vault the plan names.
@@ -427,71 +470,90 @@ class UserSqlExecutor:
     async def _read_plan(
         self, statement: _Statement, deadline: float, closed: list[bool],
     ) -> frozenset[uuid.UUID]:
-        """Read the plan of ``_planned`` by ``deadline``, in the event loop's
-        clock, which bounds everything after the plan slot: the wait for a
-        connection, the transaction's start, its settings and role, the
-        administrator check, ``EXPLAIN`` and the catalog lookups. Past it the
-        read is cancelled with ``TimeoutError``; a lock's timeout raises
-        ``LockNotAvailableError``, and the server's own statement timeout,
-        a backstop, ``QueryCanceledError``.
+        """Read the plan of ``_planned``; ``closed`` says whether its
+        connection was closed on the way.
 
-        A cancelled read rolls back and gives the connection back to the
-        pool. If it still holds the connection `_PLAN_CLEANUP_SECS` after the
-        deadline, rolling back or being reset, the connection is closed
-        instead, so the pool does not get it back in an unknown state, and
-        ``closed`` says so.
+        Everything after the plan slot, from the wait for a connection to the
+        catalog lookups, runs under ``deadline``, in the event loop's clock.
+        At the deadline the connection is closed, and then the read is
+        cancelled with ``TimeoutError``, so that neither a rollback nor the
+        pool's reset waits for the cancelled statement; a read cancelled
+        otherwise closes its connection too. A lock's timeout raises
+        ``LockNotAvailableError``, and the server's own statement timeout, a
+        backstop, ``QueryCanceledError``.
+
+        The connection then goes back to the pool outside the deadline, and
+        the read returns only once the pool has it (`_give_back`), so the plan
+        keeps its slot until then.
         """
         loop = asyncio.get_running_loop()
+        acquire = self.pool.acquire()
         held: list[Any] = []
 
-        def close_held() -> None:
-            for conn in held:
-                terminate = getattr(conn, "terminate", None)
-                if terminate is not None:
-                    closed.append(True)
-                    terminate()
+        def close_at_deadline() -> None:
+            if held and _close_connection(held[0]):
+                closed.append(True)
 
-        watchdog = loop.call_at(deadline + _PLAN_CLEANUP_SECS, close_held)
+        # Scheduled before the timeout below, so it runs first at the deadline.
+        watchdog = loop.call_at(deadline, close_at_deadline)
         try:
-            async with asyncio.timeout_at(deadline), AsyncExitStack() as stack:
-                # Last on the way out: once the pool has the connection back,
-                # the watchdog leaves it alone.
-                stack.callback(held.clear)
-                conn = await stack.enter_async_context(self.pool.acquire())
-                held.append(conn)
-                async with conn.transaction():
-                    left_ms = int((deadline - loop.time()) * 1000)
-                    if left_ms < 1:
-                        raise TimeoutError
-                    await conn.execute(
-                        "SELECT set_config('lock_timeout', $1, true), "
-                        "set_config('statement_timeout', $2, true)",
-                        f"{max(1, settings.akb_sql_plan_lock_timeout_ms)}ms",
-                        f"{left_ms + int(_PLAN_CLEANUP_SECS * 1000)}ms",
-                    )
-                    try:
-                        async with conn.transaction():
-                            admin_bypass = await _admin_bypass(conn, statement, lock=False)
-                            await _enter_statement_role(conn, statement, admin_bypass)
-                            await conn.execute("SET TRANSACTION READ ONLY")
-                            plan = await conn.fetchval(
-                                "EXPLAIN (VERBOSE, FORMAT JSON) " + statement.sql, *statement.params,
-                            )
-                    except (asyncpg.exceptions.LockNotAvailableError, asyncpg.exceptions.QueryCanceledError):
-                        raise
-                    except asyncpg.PostgresError:
-                        return frozenset()
-                    relations = _modified_relations(
-                        json.loads(plan) if isinstance(plan, str) else plan,
-                    )
-                    if not relations:
-                        return frozenset()
-                    # The trigger catalog is read under the backend role.
-                    await conn.execute("SET LOCAL ROLE NONE")
-                    schemas, tables = zip(*sorted(relations))
-                    rows = await conn.fetch(_VAULTS_OF_TABLES, list(schemas), list(tables))
+            async with asyncio.timeout_at(deadline):
+                held.append(await acquire.__aenter__())
+                return await self._explain(held[0], statement, deadline)
+        except BaseException as exc:
+            if held and isinstance(exc, (TimeoutError, asyncio.CancelledError)):
+                if _close_connection(held[0]):
+                    closed.append(True)
+            raise
         finally:
             watchdog.cancel()
+            if held:
+                await _give_back(acquire, held[0], closed)
+
+    async def _explain(
+        self, conn: Any, statement: _Statement, deadline: float,
+    ) -> frozenset[uuid.UUID]:
+        """``_read_plan``'s transaction: the plan, read under the statement's
+        role in a read-only transaction, and the Vaults of the tables it
+        modifies."""
+        loop = asyncio.get_running_loop()
+        async with conn.transaction():
+            left_ms = int((deadline - loop.time()) * 1000)
+            if left_ms < 1:
+                raise TimeoutError
+            await conn.execute(
+                "SELECT set_config('lock_timeout', $1, true), "
+                "set_config('statement_timeout', $2, true)",
+                f"{max(1, settings.akb_sql_plan_lock_timeout_ms)}ms",
+                f"{left_ms + int(_PLAN_CLEANUP_SECS * 1000)}ms",
+            )
+            try:
+                async with conn.transaction():
+                    admin_bypass = await _admin_bypass(conn, statement, lock=False)
+                    await _enter_statement_role(conn, statement, admin_bypass)
+                    await conn.execute("SET TRANSACTION READ ONLY")
+                    plan = await conn.fetchval(
+                        "EXPLAIN (VERBOSE, FORMAT JSON) " + statement.sql, *statement.params,
+                    )
+            except (
+                asyncpg.exceptions.LockNotAvailableError,
+                asyncpg.exceptions.QueryCanceledError,
+                # A lost or closed connection is not a statement that cannot
+                # be planned.
+                asyncpg.exceptions.PostgresConnectionError,
+            ):
+                raise
+            except asyncpg.PostgresError:
+                return frozenset()
+            relations = _modified_relations(
+                json.loads(plan) if isinstance(plan, str) else plan,
+            )
+            if not relations:
+                return frozenset()
+            # The trigger catalog is read under the backend role.
+            await conn.execute("SET LOCAL ROLE NONE")
+            schemas, tables = zip(*sorted(relations))
+            rows = await conn.fetch(_VAULTS_OF_TABLES, list(schemas), list(tables))
         return frozenset(uuid.UUID(row["vault_id"]) for row in rows if row["vault_id"])
 
     async def _run(

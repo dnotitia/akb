@@ -45,37 +45,23 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
     # A later batch is eligible only after all targets in the preceding batch
     # are applied/replayed.  This keeps the canary and 10-wide order durable.
     #
-    # Among the eligible targets, the Vault that has waited longest without
-    # the worker's attention goes first, then job, batch and ordinal order.
-    # A Vault the worker has served, by claiming, finishing or deferring one
-    # of its targets in an active job, has waited since it last did (the
-    # latest updated_at of those targets, which the rows' touch trigger sets
-    # on every update); one it has not served yet, since its target became
-    # claimable: when its job was requested, or when the batch before it
-    # finished. Targets inserted with a job and not touched since are not
-    # service. A deferral still keeps its target from being claimed until it
-    # ends.
-    #
-    # Busy Vaults' targets, deferred and claimable again, used to come first
-    # by job order, so several busy Vaults kept the worker cycling through
-    # them while another Vault's rollout waited; a target whose deferral
-    # ended waited behind every batch of another Vault's backfill, which
-    # makes its target pending again after each; and a later batch's
-    # targets, inserted with their job, came before a target whose deferral
-    # had ended while the batch before them ran.
+    # The eligible targets are claimed first in, first out, in the order
+    # they became ready, then by job, batch and ordinal: a target refused by
+    # its Vault's admission rejoins the queue at the end of its deferral
+    # (lease_expires_at), and a backfill that makes its target pending again
+    # after a batch sets that time to the moment it did; any other target is
+    # ready from when its batch became claimable, the job's request for the
+    # first batch, or the completion of the batch before it, recorded with
+    # clock_timestamp() so that a long transaction counts from when it
+    # finished. A refused target therefore waits behind the targets that
+    # became ready before its deferral ended, and goes before those that
+    # became ready after.
     row = await conn.fetchrow(
         """
-        WITH served AS (
-            SELECT o.vault_id, max(o.updated_at) AS at
-              FROM app_rollout_targets o
-              JOIN app_rollout_jobs j ON j.id=o.job_id AND j.status IN ('pending','running')
-             WHERE NOT (o.state='pending' AND o.attempts=0 AND o.lease_expires_at IS NULL)
-             GROUP BY o.vault_id
-        ),
-        eligible AS (
+        WITH eligible AS (
             SELECT t.id
               FROM app_rollout_targets t
-              LEFT JOIN served s ON s.vault_id=t.vault_id
+              JOIN app_rollout_jobs j ON j.id=t.job_id
              WHERE t.state='pending'
                -- A pending target's lease expiry is the time before which it
                -- is not retried (see _defer_vault_targets).
@@ -93,8 +79,8 @@ async def _claim_target(conn: Any) -> dict[str, Any] | None:
                       AND same_batch.state='running'
                )
              ORDER BY COALESCE(
-                          s.at,
-                          GREATEST(t.updated_at, (
+                          t.lease_expires_at,
+                          GREATEST(j.created_at, (
                               SELECT max(earlier.completed_at) FROM app_rollout_targets earlier
                                WHERE earlier.job_id=t.job_id AND earlier.batch_no < t.batch_no
                           ))
@@ -539,9 +525,12 @@ async def _process_target(target: dict[str, Any]) -> None:
                     return
                 if not done:
                     # A bounded backfill commits its cursor and yields the
-                    # target so the next claim resumes from that cursor.
+                    # target so the next claim resumes from that cursor. It
+                    # is ready again from now: it rejoins the queue behind
+                    # the targets that became ready before.
                     await conn.execute(
-                        "UPDATE app_rollout_targets SET state='pending', lease_owner=NULL, lease_expires_at=NULL WHERE id=$1",
+                        "UPDATE app_rollout_targets SET state='pending', lease_owner=NULL, "
+                        "lease_expires_at=clock_timestamp() WHERE id=$1",
                         target["id"],
                     )
                     return
@@ -558,7 +547,13 @@ async def _process_target(target: dict[str, Any]) -> None:
             if actual.lower() != expected.lower():
                 await _mark_job_blocked(conn, target, "schema_mismatch")
                 return
-            await conn.execute("UPDATE app_rollout_targets SET state='applied', lease_owner=NULL, lease_expires_at=NULL, completed_at=NOW() WHERE id=$1", target["id"])
+            # clock_timestamp(), not the transaction's start: the next batch
+            # becomes ready when this target really finished.
+            await conn.execute(
+                "UPDATE app_rollout_targets SET state='applied', lease_owner=NULL, lease_expires_at=NULL, "
+                "completed_at=clock_timestamp() WHERE id=$1",
+                target["id"],
+            )
             await conn.execute("UPDATE vault_app_installations SET lifecycle='active', current_release_id=desired_release_id, blocked_reason=NULL WHERE id=$1 AND app_id=$2", target["installation_id"], target["app_id"])
             observed = await conn.fetchrow("SELECT observed_generation, observed_at, observed_grant_generation FROM app_installation_observed_states WHERE installation_id=$1", target["installation_id"])
             if observed:

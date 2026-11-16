@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+import asyncpg
 import pytest
 
 from app.config import settings
@@ -479,9 +480,9 @@ async def test_a_plan_whose_transaction_is_slow_to_start_gives_its_slot_back_at_
 
 async def test_a_plan_that_cannot_roll_back_in_time_closes_its_connection(monkeypatch):
     """A plan's EXPLAIN runs past the plan's 0.2 s deadline, and its
-    rollback then does not finish. A moment after the deadline the plan
-    closes its connection instead of waiting to give it back, and fails
-    with write_busy; its slot is free again."""
+    rollback would not finish while the connection is open. The plan closes
+    its connection at the deadline instead of waiting to roll back or give
+    it back, and fails with write_busy; its slot is free again."""
     monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
     monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 200)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
@@ -499,4 +500,163 @@ async def test_a_plan_that_cannot_roll_back_in_time_closes_its_connection(monkey
     assert stuck.terminated.is_set()
     with pytest.raises(WriteBusyError):
         plan.result()
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+class _PooledConnection:
+    """asyncpg's pool connection proxy, as far as a plan sees it: statements
+    of a plain fake, and a ``terminate`` that closes the connection under it
+    until the connection is released back to the pool, and refuses after."""
+
+    def __init__(self, raw: "_RawConnection") -> None:
+        self._raw: "_RawConnection | None" = raw
+
+    def _connection(self) -> "_RawConnection":
+        if self._raw is None:
+            raise asyncpg.InterfaceError(
+                "cannot call Connection.terminate(): connection has been released back to the pool",
+            )
+        return self._raw
+
+    def terminate(self) -> None:
+        self._connection().terminate()
+
+    def transaction(self) -> _Txn:
+        return _Txn(_SlowConn())
+
+    async def execute(self, sql: str, *args) -> str:
+        return "OK"
+
+    async def fetchval(self, sql: str, *args):
+        if sql.startswith("EXPLAIN"):
+            return [{"Plan": {"Node Type": "Result"}}]
+        return True
+
+    async def fetch(self, sql: str, *args) -> list:
+        return []
+
+
+class _RawConnection:
+    def __init__(self) -> None:
+        self.terminated = asyncio.Event()
+
+    def terminate(self) -> None:
+        self.terminated.set()
+
+
+class _ReleasingPool:
+    """A pool whose release resets the connection the way asyncpg's does:
+    shielded from the caller's cancellation, for ``reset_secs`` or until the
+    connection is closed. With ``back_early`` the connection is back in the
+    pool, its proxy released, before the release returns."""
+
+    def __init__(self, *, reset_secs: float, back_early: bool = False) -> None:
+        self.reset_secs = reset_secs
+        self.back_early = back_early
+        self.raw = _RawConnection()
+        self.back_at: float | None = None
+
+    def acquire(self) -> "_ReleasingAcquire":
+        return _ReleasingAcquire(self)
+
+
+class _ReleasingAcquire:
+    def __init__(self, pool: _ReleasingPool) -> None:
+        self._pool = pool
+        self._proxy: _PooledConnection | None = None
+
+    async def __aenter__(self) -> _PooledConnection:
+        self._proxy = _PooledConnection(self._pool.raw)
+        return self._proxy
+
+    async def __aexit__(self, *_exc) -> None:
+        await asyncio.shield(self._release())
+
+    async def _release(self) -> None:
+        loop = asyncio.get_running_loop()
+        assert self._proxy is not None
+        if self._pool.back_early:
+            # Back in the pool, for another request to take, before the
+            # release has returned.
+            self._proxy._raw = None
+            self._pool.back_at = loop.time()
+        closed = asyncio.ensure_future(self._pool.raw.terminated.wait())
+        await asyncio.wait({closed}, timeout=self._pool.reset_secs)
+        closed.cancel()
+        self._proxy._raw = None
+        if self._pool.back_at is None:
+            self._pool.back_at = loop.time()
+
+
+async def _a_plan_then_another(pool: _ReleasingPool) -> tuple[frozenset, float]:
+    """A plan of `x` holds the only plan slot and gives its connection back
+    through ``pool``; a plan of `y` waits for the slot. Returns the first
+    plan and when the second one got the slot."""
+    executor = user_sql_executor.UserSqlExecutor(pool)
+    first = asyncio.create_task(executor._planned(_statement("x", slow=False)))
+    await asyncio.sleep(0.01)
+    second_started: list[float] = []
+
+    async def second() -> None:
+        async with user_sql_executor._plan_slot(["y"]):
+            second_started.append(asyncio.get_running_loop().time())
+
+    waiting = asyncio.create_task(second())
+    plan = await asyncio.wait_for(first, timeout=5)
+    await asyncio.wait_for(waiting, timeout=5)
+    return plan, second_started[0]
+
+
+async def test_a_plan_keeps_its_slot_until_its_slow_reset_is_done(monkeypatch):
+    """A plan is read well within its 0.2 s deadline, and the pool's reset
+    of its connection then takes 0.35 s, past that deadline and within the
+    half-second grace. The plan is returned, and keeps its slot until the
+    connection is back in the pool: the statement waiting for the slot
+    starts only then. The deadline used to cancel the wait for the release,
+    whose shielded reset went on while the slot went to the next statement."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 200)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    pool = _ReleasingPool(reset_secs=0.35)
+    plan, second_started = await _a_plan_then_another(pool)
+    assert plan == frozenset()
+    assert pool.back_at is not None and second_started >= pool.back_at
+    assert not pool.raw.terminated.is_set()
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+async def test_a_reset_past_the_grace_closes_the_connection(monkeypatch):
+    """A plan is read at once, and the pool's reset of its connection would
+    not end. After the grace, 0.1 s here, the plan closes the connection,
+    which ends the reset, and gives up its slot once the pool has the
+    connection back; the plan is returned. There used to be no grace: the
+    slot was held until the plan's deadline and then given up with the
+    reset still running."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 2000)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    monkeypatch.setattr(user_sql_executor, "_PLAN_CLEANUP_SECS", 0.1)
+    pool = _ReleasingPool(reset_secs=30.0)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    plan, second_started = await _a_plan_then_another(pool)
+    assert plan == frozenset()
+    assert pool.raw.terminated.is_set()
+    assert pool.back_at is not None and second_started >= pool.back_at
+    assert second_started - started < 0.6, second_started - started
+
+
+async def test_a_connection_back_in_the_pool_is_never_closed(monkeypatch):
+    """The pool has the plan's connection back, its proxy released and free
+    for another request, while the release has not returned yet, and the
+    grace runs out then. The plan does not close the connection, which is
+    no longer its own, and gives up its slot."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 2000)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    monkeypatch.setattr(user_sql_executor, "_PLAN_CLEANUP_SECS", 0.1)
+    pool = _ReleasingPool(reset_secs=0.3, back_early=True)
+    plan, _second_started = await _a_plan_then_another(pool)
+    assert plan == frozenset()
+    assert not pool.raw.terminated.is_set()
     assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])

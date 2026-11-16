@@ -1067,6 +1067,174 @@ async def test_a_deferred_target_goes_before_a_later_batch_that_became_claimable
         assert await pool.fetchval("SELECT status FROM app_rollout_jobs WHERE id = $1", b_job) == "applied"
 
 
+async def test_a_long_canary_transaction_makes_the_next_batch_ready_when_it_finishes(monkeypatch):
+    """Rollout B's canary, in `canary-b1`, spends a second and a half in its
+    transaction; meanwhile a rollout is requested for `canary-c`, ready from
+    then. B's next batch, in `canary-b2`, is ready only once the canary has
+    finished, so C's target is claimed first. The canary's completion used
+    to be recorded as its transaction's start, which put B's next batch
+    first."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    async with _fresh_database() as pool:
+        canary_vault, b_job, _items = await _installation(
+            pool, own_items=True, vault="canary-b1", app_key="canary-b", also_in=("canary-b2",),
+            job_id=_job(1),
+        )
+        execute_step = rollout_worker._execute_step
+        in_canary = asyncio.Event()
+
+        async def slow_canary_step(conn, target, *args, **kwargs):
+            if target["vault_id"] == canary_vault and not in_canary.is_set():
+                in_canary.set()
+                await asyncio.sleep(1.5)
+            return await execute_step(conn, target, *args, **kwargs)
+
+        monkeypatch.setattr(rollout_worker, "_execute_step", slow_canary_step)
+        canary = asyncio.create_task(rollout_worker.run_once())
+        await asyncio.wait_for(in_canary.wait(), timeout=10)
+        await asyncio.sleep(0.2)
+        # No job id of our own: setting the column default would wait for the
+        # canary's transaction.
+        _c, c_job, _items = await _installation(
+            pool, own_items=True, vault="canary-c", app_key="canary-c",
+        )
+        # C was requested while the canary's transaction ran.
+        assert not canary.done()
+        assert await asyncio.wait_for(canary, timeout=30) == 1
+        claimed: list[uuid.UUID] = []
+        process = rollout_worker._process_target
+
+        async def record(target):
+            claimed.append(target["job_id"])
+            return await process(target)
+
+        monkeypatch.setattr(rollout_worker, "_process_target", record)
+        assert await rollout_worker.run_once() == 1
+        assert await rollout_worker.run_once() == 1
+        assert claimed == [c_job, b_job]
+
+
+async def test_a_deferred_target_waits_only_behind_targets_ready_before_its_deferral_ended(monkeypatch):
+    """Vault `queue-b`'s rollout is refused by its full admission and
+    deferred for two seconds. Vault `queue-a` has a rollout requested before
+    that, one requested while B is deferred, and one requested after B's
+    deferral ended. The worker then claims first in, first out by readiness:
+    A's first two, B, and A's last. B used to be ordered by when its
+    deferral began, and went before A's second."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
+    monkeypatch.setattr(settings, "app_rollout_admission_wait_secs", 0.3, raising=False)
+    monkeypatch.setattr(rollout_worker, "BUSY_RETRY_SECONDS", 2)
+    async with _fresh_database() as pool:
+        b_vault, b_job, _items = await _installation(
+            pool, own_items=True, vault="queue-b", app_key="queue-b", job_id=_job(1),
+        )
+        a_vault, a1, _items = await _installation(
+            pool, own_items=True, vault="queue-a", app_key="queue-a1", prefix="a1_", job_id=_job(2),
+        )
+        claimed: list[uuid.UUID] = []
+        process = rollout_worker._process_target
+
+        async def record(target):
+            claimed.append(target["job_id"])
+            return await process(target)
+
+        monkeypatch.setattr(rollout_worker, "_process_target", record)
+        async with _vault_full(b_vault):
+            # Requested first, claimed first, refused and deferred.
+            assert await rollout_worker.run_once() == 1
+        assert claimed == [b_job]
+        await asyncio.sleep(0.5)
+        _a, a2, _items = await _installation(
+            pool, own_items=True, vault="queue-a", app_key="queue-a2", prefix="a2_", vault_id=a_vault,
+            job_id=_job(3),
+        )
+        while not await pool.fetchval(
+            "SELECT lease_expires_at <= clock_timestamp() FROM app_rollout_targets WHERE job_id = $1", b_job,
+        ):
+            await asyncio.sleep(0.05)
+        _a, a3, _items = await _installation(
+            pool, own_items=True, vault="queue-a", app_key="queue-a3", prefix="a3_", vault_id=a_vault,
+            job_id=_job(4),
+        )
+        for _ in range(4):
+            assert await rollout_worker.run_once() == 1
+        assert claimed == [b_job, a1, a2, b_job, a3]
+
+
+async def test_upload_cancels_behind_a_waiting_confirmation_leave_connections_for_another_vault(
+    tmp_path, monkeypatch,
+):
+    """While a transaction holds one Vault's event lock, a confirmation of a
+    pending File publishes it and waits for that lock, holding the File's
+    row. Then 23 cancels of that upload go to the Vault through a pool of 8
+    connections, and a reader of another Vault takes a connection every
+    0.1 s. Each cancel waits for the File's row. A cancel used to take its
+    connection before waiting, so the cancels took every connection and the
+    reader waited; it is now admitted first, as a confirmation is, and the
+    reader is served at once. Once the lock is free the File is published,
+    and every cancel finds it confirmed."""
+    monkeypatch.setattr(settings, "vault_write_concurrency", 2, raising=False)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0, raising=False)
+    async with _fresh_database() as admin_pool:
+        storm = await _make_vault(admin_pool, "storm-cancel")
+        quiet = await _make_vault(admin_pool, "quiet")
+        ctx = _Context(pool=admin_pool, tmp_path=tmp_path, monkeypatch=monkeypatch)
+        blobs = ctx.fake_objects()
+        fid = await ctx.file(storm, blobs, state="pending")
+        files = file_service.FileService()
+        database = await admin_pool.fetchval("SELECT current_database()")
+        app_pool = await asyncpg.create_pool(_database_dsn(database), min_size=1, max_size=_POOL_SIZE)
+        previous_pool = postgres_module._pool
+        postgres_module._pool = app_pool
+        tasks: list[asyncio.Task] = []
+        waits: list[float] = []
+        try:
+            async with admin_pool.acquire() as holder:
+                async with _OpenTransaction(holder):
+                    await emit_event(holder, "document.put", vault_id=storm, payload={"marker": "holder"})
+                    tasks.append(asyncio.create_task(files.confirm_upload(storm, str(fid), actor_id="storm")))
+                    # The confirmation locks the File's row and waits for the
+                    # event lock, which the holder keeps for less than the
+                    # lock's 5-second deadline in all.
+                    await asyncio.sleep(0.5)
+                    tasks += [
+                        asyncio.create_task(files.cancel_upload(storm, str(fid), actor_id="storm"))
+                        for _ in range(_WRITERS - 1)
+                    ]
+                    await asyncio.sleep(0.5)
+                    until = time.monotonic() + _FILE_HOLD_SECONDS
+                    while time.monotonic() < until:
+                        started = time.monotonic()
+                        try:
+                            # The lock is held until this loop ends, so a
+                            # pool the cancels took would not free up.
+                            async with app_pool.acquire(timeout=_OTHER_VAULT_WAIT_BOUND * 3) as reader:
+                                await reader.fetchval(
+                                    "SELECT count(*) FROM vault_files WHERE vault_id = $1", quiet,
+                                )
+                        except TimeoutError:
+                            waits.append(time.monotonic() - started)
+                            break
+                        waits.append(time.monotonic() - started)
+                        await asyncio.sleep(0.1)
+            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=60)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            postgres_module._pool = previous_pool
+            await app_pool.close()
+
+        print(f"\nother-Vault pool wait behind upload cancels: max {max(waits):.3f}s over {len(waits)} reads")
+        assert max(waits) < _OTHER_VAULT_WAIT_BOUND, waits
+        assert not isinstance(results[0], BaseException), results[0]
+        assert results[1:] == [{"cancelled": False, "state": "confirmed"}] * (_WRITERS - 1), results[1:]
+        assert await admin_pool.fetchval(
+            "SELECT upload_state FROM vault_files WHERE id = $1", fid,
+        ) == "confirmed"
+
+
 def _manifest_with_backfill(app_key: str = "rollout-order", prefix: str = "") -> tuple[dict, str, str]:
     """The upgrade of ``_installation``'s manifest, with a backfill of the new
     `orders.extra` column, one row per batch, after the columns are added."""
