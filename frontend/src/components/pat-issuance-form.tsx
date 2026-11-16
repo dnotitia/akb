@@ -10,14 +10,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SelectMenu } from "@/components/ui/select-menu";
 
-export function PatIssuanceForm({ initial, replacement = false, onCreated, onMetadataChanged, onDirtyChange, onBusyChange, ownsOperation }: {
+export function PatIssuanceForm({ initial, replacement = false, onCreated, onMetadataChanged, onDirtyChange, onBusyChange, ownsOperation, advancedOpen }: {
   initial?: PatDraft; replacement?: boolean; onCreated: (receipt: PatReceipt, snapshot: AuthSessionSnapshot) => void;
   onMetadataChanged?: () => void; onDirtyChange?: (dirty: boolean) => void; onBusyChange?: (busy: boolean) => void;
   ownsOperation?: () => boolean;
+  /** Start with advanced options expanded. Defaults to expanded when `initial` is given. */
+  advancedOpen?: boolean;
 }) {
   const id = useId();
   const [draft, setDraft] = useState<PatDraft>(() => initial ?? defaultPatDraft());
-  const [advanced, setAdvanced] = useState(!!initial);
+  const [advanced, setAdvanced] = useState(advancedOpen ?? !!initial);
   const [capability, setCapability] = useState<{ data: PatCapabilities | "legacy"; snapshot: AuthSessionSnapshot } | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);

@@ -2,7 +2,7 @@
 status: accepted
 stage: implemented
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-11-16
 ---
 
 # Home workspace summary — context without dashboard cards
@@ -94,7 +94,7 @@ After minimizing:      [Plug icon  Connect an agent ↗]
 | Observed state | Invitation |
 | --- | --- |
 | Verified empty PAT list, at least one accessible Vault, available setup, no prior dismissal | One initial expanded invitation on desktop; compact on small/short screens |
-| No Vaults yet | Compact launcher; do not compete with Create your first vault |
+| No Vaults yet | When setup is available, the in-page first-run guide replaces the launcher (see `docs/design/proposal/2026-11-16-home-first-run-ai-connect`); otherwise a compact launcher, and Create your first vault stays primary |
 | PAT exists, guide previously dismissed, or setup previously opened | Compact launcher, no automatic expansion |
 | PAT/auth lookup loading, failed, or unsupported | Neutral compact entry; never an incomplete/failed connection warning |
 
@@ -228,8 +228,9 @@ state is not used as proof of current access. Do not attach this inventory to th
   list error/retry flow; summary failures never block opening documents or Vaults.
 - Following permission/session invalidation, hide previous private totals until
   verification succeeds. A failed refresh must not present stale values as current.
-- When the verified directory has no Vaults, keep only `0 Vaults`; the existing
-  Create your first vault empty state remains the primary message, not four zeros.
+- When the verified directory has no Vaults, keep only `0 Vaults`, not four zeros.
+  The first-run AI connection guide leads when setup is available; otherwise the
+  Create your first vault empty state remains the primary message.
 
 ## Implementation and acceptance
 

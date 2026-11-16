@@ -24,9 +24,14 @@ export const MCP_AGENT_FILES: Record<McpAgent, string> = {
 /** The AKB MCP endpoint the local `akb-mcp` proxy connects to. */
 export const MCP_URL = `${window.location.origin}/mcp/`;
 
+/** Arguments for `npx`, wiring the local `akb-mcp` proxy to this instance with a PAT. */
+export function akbMcpArgs(pat: string): string[] {
+  return ["akb-mcp", "--url", MCP_URL, "--pat", pat, "--insecure"];
+}
+
 /** Per-agent install snippet wiring `akb-mcp` to this instance with a PAT. */
 export function mcpInstallSnippets(pat: string): Record<McpAgent, string> {
-  const args = ["akb-mcp", "--url", MCP_URL, "--pat", pat, "--insecure"];
+  const args = akbMcpArgs(pat);
   const cmd = `npx ${args.join(" ")}`;
   return {
     claude: `claude mcp add --scope user akb -- ${cmd}`,
@@ -55,6 +60,8 @@ export function mcpOAuthSnippets(): Partial<Record<McpAgent, string>> {
   return {
     // Register in the terminal; authenticate using /mcp inside Claude Code.
     claude: `claude mcp add --scope user --transport http akb ${MCP_URL}`,
+    // Codex detects OAuth while adding the server and opens the browser sign-in.
+    codex: `codex mcp add akb --url ${MCP_URL}`,
     cursor: JSON.stringify({ mcpServers: { akb: { url: MCP_URL } } }, null, 2),
     vscode: JSON.stringify({ servers: { akb: { type: "http", url: MCP_URL } } }, null, 2),
   };
