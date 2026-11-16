@@ -1199,7 +1199,9 @@ file, and table under `P/`.
   and the error says so, whatever its code, `internal` included
   (`details.partially_applied`, `details.deleted_docs`, and
   `details.deleted_uris` if you can read the Vault); act on its code as
-  usual, and the same call continues with the rest. If a table appears under
+  usual, and the same call continues with the rest. `details.uncertain_docs`
+  (and `uncertain_uris`) counts deletions whose commit went unanswered:
+  read those documents to see whether they went. If a table appears under
   the prefix while a writer's delete runs, only an admin or owner can finish
   that delete.
 

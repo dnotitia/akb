@@ -20,9 +20,14 @@ specifically; the proxy has its own log in
   `partially_applied`, `deleted_docs` and `deleted_uris` in its details, with
   a hint, while the error keeps its own code, status and retry information (a
   busy Vault is still a retryable `write_busy`); an internal error, such as a
-  deadlock, is reported as `internal` with the generic message and the same
-  details, and MCP keeps them for any error. A deletion counts as soon as its
-  transaction commits, even if the connection then fails to reset.
+  deadlock, is reported as `internal` with exactly the generic message and
+  the same details, MCP keeps them for any error, and the REST 404 keeps them
+  too. A deletion counts as soon as its transaction commits, even if the
+  connection then fails to reset; one whose COMMIT went unanswered is counted
+  apart as `uncertain_docs` (and `uncertain_uris` for a reader), with a hint
+  that its outcome is unknown. Once the last transaction has committed, a
+  failure while giving its connection back is logged and the delete answers
+  with its result.
   `deleted_docs` counts a document restored and deleted again by the same
   call once. A writer's
   delete refused at a table that another request created under the prefix
