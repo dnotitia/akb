@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Literal, NotRequired, TypedDict
 
 from mcp.types import Tool
+from app.mcp_monitoring.usage import Dimension, Latency, MeasuredTool, ZeroRate, measured_tool
 from pydantic import ConfigDict, Field, TypeAdapter, ValidateAs, with_config
 from app.config import settings
 from app.models.document import TitleConflictPolicy
@@ -427,7 +428,15 @@ TOOLS = [
             "required": ["uri"],
         },
     ),
-    Tool(
+    measured_tool(
+        Latency("latency", "Browse latency", (
+            Dimension("page_size", "Page size",
+                      lambda args, result: args.get("page_size", 100) if result.get("complete") is not None else None,
+                      {"null": "Legacy"}),
+            Dimension("depth", "Depth", lambda args, _: args.get("depth", 1), {"-1": "All (−1)"}),
+            Dimension("page", "Page position", lambda args, _: bool(args.get("cursor")) or int(args.get("offset") or 0) > 0,
+                      {"false": "First", "true": "Subsequent"}),
+        )),
         name="akb_browse",
         description=(
             "Browse ALL vault content — documents, tables, and files — under a browse "
@@ -530,7 +539,8 @@ TOOLS = [
             # to express in some MCP clients.
         },
     ),
-    Tool(
+    measured_tool(
+        ZeroRate("empty_results", "Empty search results", "returned"),
         name="akb_search",
         description=(
             "Search documents with hybrid retrieval — dense vector (semantic) fused with "
@@ -1544,6 +1554,15 @@ TOOLS = [
         },
     ),
 ]
+
+
+_TOOL_NAMES = frozenset(tool.name for tool in TOOLS)
+TOOL_METRICS = {tool.name: tool.metrics for tool in TOOLS if isinstance(tool, MeasuredTool)}
+
+
+def catalog_tool_name(name: object) -> str:
+    """Bound stored and exported tool names to the server catalog."""
+    return name if isinstance(name, str) and name in _TOOL_NAMES else "other"
 
 
 def available_tools() -> list[Tool]:

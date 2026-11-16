@@ -1,3 +1,4 @@
+import type { McpCallTrace, MonitoringReport, OperationDetails } from "./mcp-monitoring";
 import { changesInventory, notifyInventoryChanged } from "./inventory-refresh";
 
 const API_BASE = "/api/v1";
@@ -660,6 +661,32 @@ function adminCsrfCookieName(): string {
   return window.location.protocol === "https:"
     ? "__Host-akb_admin_csrf"
     : "akb_dev_admin_csrf";
+}
+
+export async function getMcpMonitoring(query: URLSearchParams, signal?: AbortSignal): Promise<MonitoringReport> {
+  const response = await fetch(`${API_BASE}/admin/mcp-monitoring?${query}`, {
+    credentials: "same-origin",
+    headers: adminHeaders(),
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json();
+}
+
+export async function getMcpOperationCalls(actor: string, operation: string, query: URLSearchParams, signal?: AbortSignal): Promise<OperationDetails> {
+  const path = `${API_BASE}/admin/mcp-monitoring/operations/${encodeURIComponent(actor)}/${encodeURIComponent(operation)}/calls`;
+  const response = await fetch(`${path}?${query}`, { credentials: "same-origin", headers: adminHeaders(), cache: "no-store", signal });
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json();
+}
+
+export async function getMcpCallTrace(id: string, signal?: AbortSignal): Promise<McpCallTrace> {
+  const response = await fetch(`${API_BASE}/admin/mcp-monitoring/calls/${encodeURIComponent(id)}/trace`, {
+    credentials: "same-origin", headers: adminHeaders(), cache: "no-store", signal,
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json();
 }
 
 export async function getAdminSession(): Promise<AdminSession | null> {

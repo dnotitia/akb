@@ -1,12 +1,13 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   ChevronDown,
   CircleHelp,
   LogOut,
   Settings as SettingsIcon,
+  ShieldCheck,
 } from "lucide-react";
 import { authSessionSnapshot, getMe, isCurrentAuthSession, logoutOrdinarySession, type CurrentUser } from "@/lib/api";
 import { useTheme, type Theme } from "@/hooks/use-theme";
@@ -182,6 +183,12 @@ export function UserMenu({ initialUser }: { initialUser?: CurrentUser | null }) 
             <SettingsIcon className="h-4 w-4 text-foreground-muted" aria-hidden />
             <span>Settings</span>
           </DropdownMenu.Item>
+          {!verification.checking && user?.is_admin && <DropdownMenu.Item asChild>
+            <Link to="/admin" className="flex min-h-11 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-3 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover">
+              <ShieldCheck className="h-4 w-4 text-foreground-muted" aria-hidden />
+              Product administration
+            </Link>
+          </DropdownMenu.Item>}
 
           <DropdownMenu.Separator className="h-px bg-border my-1" />
 

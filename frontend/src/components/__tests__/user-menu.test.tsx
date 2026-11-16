@@ -83,6 +83,21 @@ describe("UserMenu", () => {
     expect(document.body.style.pointerEvents).toBe("");
   });
 
+  it("links to product administration only for a verified administrator", async () => {
+    const admin: CurrentUser = { user_id: "admin", username: "admin", email: "", display_name: "Admin", is_admin: true, auth_method: "jwt", key_class: null };
+    const client = new QueryClient();
+    const menu = (user: CurrentUser, checking = false) =>
+      <QueryClientProvider client={client}><MemoryRouter><CurrentUserProvider user={user} checking={checking}><UserMenu /></CurrentUserProvider></MemoryRouter></QueryClientProvider>;
+    const view = render(menu(admin));
+    await userEvent.click(screen.getByRole("button", { name: /Account menu/ }));
+    const link = () => screen.queryByRole("menuitem", { name: "Product administration" });
+    expect(link()).toHaveAttribute("href", "/admin");
+    view.rerender(menu(admin, true));
+    expect(link()).not.toBeInTheDocument();
+    view.rerender(menu({ ...admin, is_admin: false }));
+    expect(link()).not.toBeInTheDocument();
+  });
+
   it("keeps a rejected sign-out visible inside the open menu", async () => {
     vi.mocked(logoutOrdinarySession).mockRejectedValueOnce(new Error("Sign-out unavailable"));
     const user = await open();

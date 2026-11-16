@@ -309,6 +309,16 @@ class AuditSettings(BaseModel):
     local_retention_days: int = 2
 
 
+class McpMonitoringSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    export_traces: bool = False
+    tempo_query_url: str = ""
+    tempo_retention_hours: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    retention_days: int = Field(default=30, ge=1, le=365)
+
+
 class ToolUsageSettings(BaseModel):
     """MCP tool-usage tracking — **analytics**, deliberately not the audit
     stream and not the `events` outbox.
@@ -1387,6 +1397,7 @@ class Settings(BaseModel):
     # MCP tool-usage analytics — separate sink, separate flag. See
     # ToolUsageSettings above for why it is not folded into `audit`.
     tool_usage: ToolUsageSettings = Field(default_factory=ToolUsageSettings)
+    mcp_monitoring: McpMonitoringSettings = Field(default_factory=McpMonitoringSettings)
 
     # Vault-skill auto-injection into MCP tool responses. See
     # VaultSkillSettings above; the state lives in `services/vault_skill_service`.

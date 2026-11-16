@@ -456,6 +456,14 @@ notification_retention_days: 90
 #   upload_interval_secs: 3600
 #   local_retention_days: 2
 
+# Product-admin MCP dashboard. Collects authenticated server tool calls.
+# mcp_monitoring:
+#   enabled: true
+#   tempo_query_url: ""   # Installation-local Tempo query origin for the admin call trace dialog.
+#   tempo_retention_hours: null  # Match the Tempo tenant's retention in hours (e.g. 720 for 30 days).
+#   export_traces: false  # Opt in to OTLP/HTTP; configure OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.
+#   retention_days: 30
+
 # === MCP tool-usage analytics ==================================
 # Answers "which MCP tool is actually used, by whom, in what order, and how
 # often does it fail" — questions neither of the other two streams can serve.

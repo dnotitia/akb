@@ -11,6 +11,7 @@ import { Layout } from "@/components/layout";
 import { VaultShell } from "@/components/vault-shell";
 import { DocumentPreviewDialog } from "@/components/document-preview-dialog";
 import AdminPage from "@/pages/admin";
+import McpMonitoringPage from "@/pages/mcp-monitoring";
 import AuthPage from "@/pages/auth";
 import AuthForgotPage from "@/pages/auth-forgot";
 import HomePage from "@/pages/home";
@@ -50,6 +51,7 @@ function SkillRedirect() {
 
 const routeComponents = {
   AdminPage,
+  McpMonitoringPage,
   AuthPage,
   AuthForgotPage,
   PublicationPage,
