@@ -73,9 +73,11 @@ specifically; the proxy has its own log in
   entered without a connection (a Native mutation preparing its payload,
   Vault creation through its seed) with each connection it takes, so a Vault
   never has more connections in use than admitted transactions. That release
-  is bounded too: a connection whose cancelled statement's cancellation does
-  not complete within the grace is closed, and a release still running a
-  grace after its connection was closed is left to finish in the background,
+  is asyncpg's own, bounded by the grace: a reset, or a cancelled statement's
+  cancellation that does not complete, runs no longer than that before
+  asyncpg closes the connection, and the connection is never closed under
+  its release, so a late release cannot close another request's connection.
+  A release that still has not ended is left to the pool with a warning,
   so it never keeps an admission or a Vault creation's lane gate. The plan
   slots and the admission alike serve waiters first come, first served, by
   capacity: the
