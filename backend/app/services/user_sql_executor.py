@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import uuid
 import weakref
 from collections.abc import AsyncIterator
@@ -268,6 +269,18 @@ async def _run_statement(conn, sql: str, params: list, fetch: bool, vault_names:
 _PLAN_CLEANUP_SECS = 0.5
 
 
+class _PlanTimedOut(TimeoutError):
+    """A plan read ran out of its own deadline (``akb_sql_plan_timeout_ms``),
+    as opposed to any other ``TimeoutError`` raised on its way, such as one
+    giving its connection back."""
+
+
+class _PlanRefused(Exception):
+    """A plan's own statements hit a lock's or the server's statement
+    timeout while the plan was read (the error is its cause), as opposed to
+    the same errors raised giving its connection back."""
+
+
 class UserSqlExecutor:
     """Run user-supplied SQL under the caller's PG role.
 
@@ -414,11 +427,10 @@ class UserSqlExecutor:
             try:
                 return await self._read_plan(statement, deadline, closed)
             except Exception as exc:
-                if closed or isinstance(exc, (
-                    TimeoutError,
-                    asyncpg.exceptions.LockNotAvailableError,
-                    asyncpg.exceptions.QueryCanceledError,
-                )):
+                # Only the plan's own deadline and its statements' limits, as
+                # the read marks them, are the plan running out of time; an
+                # error giving its connection back is not, whatever its class.
+                if closed or isinstance(exc, (_PlanTimedOut, _PlanRefused)):
                     raise WriteBusyError(
                         ", ".join(statement.vault_names) or "akb_sql", loop.time() - started,
                         retry_after_secs=1,
@@ -434,7 +446,7 @@ class UserSqlExecutor:
         Everything after the plan slot, from the wait for a connection to the
         catalog lookups, runs under ``deadline``, in the event loop's clock;
         the read itself (``_explain``) runs in a task of its own. When the
-        read is cancelled, at the deadline (as ``TimeoutError``) or by the
+        read is cancelled, at the deadline (as ``_PlanTimedOut``) or by the
         caller, the connection is closed first, before anything waits on it,
         and only then is that task cancelled: neither a rollback nor the
         pool's reset waits for the cancelled statement. A lock's timeout
@@ -447,22 +459,45 @@ class UserSqlExecutor:
         """
         acquire = self.pool.acquire()
         held: list[Any] = []
+        # What leaves the read itself, for the connection's give-back: a
+        # cancellation of the read still wins over an error giving it back.
+        # Not `sys.exc_info()`, which would also return an exception the
+        # caller is handling around this read.
+        leaving: tuple = (None, None, None)
         try:
-            async with asyncio.timeout_at(deadline):
-                held.append(await acquire.__aenter__())
-                reading = asyncio.ensure_future(self._explain(held[0], statement, deadline))
-                try:
-                    return await asyncio.shield(reading)
-                except asyncio.CancelledError:
-                    if close_pooled_connection(held[0]):
-                        closed.append(True)
-                    reading.cancel()
-                    await asyncio.wait({reading})
-                    if not reading.cancelled():
-                        reading.exception()
-                    raise
+            try:
+                async with asyncio.timeout_at(deadline) as plan_deadline:
+                    held.append(await acquire.__aenter__())
+                    reading = asyncio.ensure_future(self._explain(held[0], statement, deadline))
+                    try:
+                        return await asyncio.shield(reading)
+                    except asyncio.CancelledError:
+                        if close_pooled_connection(held[0]):
+                            closed.append(True)
+                        reading.cancel()
+                        await asyncio.wait({reading})
+                        if not reading.cancelled():
+                            reading.exception()
+                        raise
+            except TimeoutError as exc:
+                # The deadline's own expiry, told by its source; another
+                # timeout raised inside is not the plan running out of time.
+                if plan_deadline.expired():
+                    raise _PlanTimedOut from exc
+                raise
+            except (
+                asyncpg.exceptions.LockNotAvailableError,
+                asyncpg.exceptions.QueryCanceledError,
+            ) as exc:
+                # The plan's statements hit a limit; marked here, where the
+                # plan runs, so that the same errors raised giving the
+                # connection back are not taken for it.
+                raise _PlanRefused() from exc
+        except BaseException:
+            leaving = sys.exc_info()
+            raise
         finally:
-            if held and await give_back_connection(acquire, held[0], grace=_PLAN_CLEANUP_SECS):
+            if held and await give_back_connection(acquire, held[0], leaving, grace=_PLAN_CLEANUP_SECS):
                 closed.append(True)
 
     async def _explain(
@@ -475,7 +510,7 @@ class UserSqlExecutor:
         async with conn.transaction():
             left_ms = int((deadline - loop.time()) * 1000)
             if left_ms < 1:
-                raise TimeoutError
+                raise _PlanTimedOut
             await conn.execute(
                 "SELECT set_config('lock_timeout', $1, true), "
                 "set_config('statement_timeout', $2, true)",

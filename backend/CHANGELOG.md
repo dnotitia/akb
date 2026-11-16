@@ -62,10 +62,11 @@ specifically; the proxy has its own log in
   all, one deadline over everything after the plan slot, from the wait for a
   connection through the transaction's start and settings to the end of the
   plan. Past either the write fails with `write_busy` and gives its plan slot
-  back, so a plan waiting for one lock after another, or whose statements
-  each finish within their own limits, cannot keep the slots from other
-  Vaults. At its deadline, or when cancelled, a plan closes its connection
-  before any rollback or reset waits on it; it keeps its slot until its
+  back (a plan read whose connection's release then fails reports that
+  error instead), so a plan waiting for one lock after another, or whose
+  statements each finish within their own limits, cannot keep the slots
+  from other Vaults. At its deadline, or when cancelled, a plan closes its
+  connection before any rollback or reset waits on it; it keeps its slot until its
   connection is back in the pool, closing it when the reset runs half a
   second past, and never closes a connection already back in the pool. Every
   admitted transaction likewise gives its connection back before its
@@ -79,8 +80,11 @@ specifically; the proxy has its own log in
   its release, so a late release cannot close another request's connection.
   A release that still has not ended is left to the pool with a warning,
   so it never keeps an admission or a Vault creation's lane gate; its error,
-  and that of a release whose request was cancelled meanwhile, is logged,
-  a socket's timeout included: only the bound's own expiry is not an error.
+  and that of a release whose request was cancelled, before the connection
+  went back or meanwhile, is logged. A release ending in a timeout without
+  an errno, a slow reset whose connection asyncpg closed, is logged as a
+  warning and never raised, so a committed write keeps its result; a
+  socket's timeout, or any other release error, is reported.
   The plan slots and the admission alike serve waiters first come, first
   served, by capacity: the
   first waiter blocked on a Vault reserves one slot of each of its Vaults

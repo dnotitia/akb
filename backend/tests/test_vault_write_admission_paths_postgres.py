@@ -993,12 +993,14 @@ class _Known:
         return _Known(self.not_none - names, self.true - names)
 
     def entering(self, item: ast.withitem) -> "_Known":
-        """What is known once `item` has bound its target: a name loses what
-        was known of it, and is known again only as the context manager's
-        value, if that is known."""
+        """What is known once `item` has run and bound its target: a name its
+        expression binds (`tx := None`) or its target binds loses what was
+        known of it, and the target is known again only as the context
+        manager's value, if that is known."""
+        known = self.without(_rebound([item.context_expr]))
         if item.optional_vars is None:
-            return self
-        known = self.without(_rebound([item.optional_vars]))
+            return known
+        known = known.without(_rebound([item.optional_vars]))
         if not isinstance(item.optional_vars, ast.Name):
             return known
         name, context = item.optional_vars.id, _context(item.context_expr)
@@ -1024,7 +1026,10 @@ def _live(nodes: list, known: _Known):
     known follows the code: a `with` target's facts hold inside its block
     only, and a name bound anew, by an assignment, a loop, another `with`
     or otherwise, loses what was known of it from there on (and inside a
-    loop that binds it, from the loop's start)."""
+    loop that binds it, from the loop's start; in a `try`, a name its body
+    binds has lost them in its handlers, `else` and `finally`, a handler's
+    `as` name in that handler, and a name anything in the `try` binds in its
+    `finally`; a name a `with` item's expression binds, by the next item)."""
     for node in nodes:
         if isinstance(node, ast.If):
             settled = _known(node.test, known)
@@ -1042,6 +1047,24 @@ def _live(nodes: list, known: _Known):
                 yield from _live([item.context_expr], inside)
                 inside = inside.entering(item)
             yield from _live(node.body, inside)
+            known = known.without(_rebound([node]))
+            continue
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            # A handler, `else` and `finally` may run after any part of the
+            # body, so the names it binds have lost their facts there.
+            yield node, known
+            yield from _live(node.body, known)
+            after = known.without(_rebound(node.body))
+            for handler in node.handlers:
+                yield handler, after
+                if handler.type is not None:
+                    yield from _live([handler.type], after)
+                # Entering a handler binds only its `as` name; what its own
+                # body binds counts from where it does.
+                named = frozenset({handler.name}) if handler.name else frozenset()
+                yield from _live(handler.body, after.without(named))
+            yield from _live(node.orelse, after)
+            yield from _live(node.finalbody, known.without(_rebound([*node.body, *node.handlers, *node.orelse])))
             known = known.without(_rebound([node]))
             continue
         if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
@@ -1189,7 +1212,9 @@ def _admission_roots():
     methods `_ADMISSION_DECORATORS` decorate, and what follows an
     `_ADMISSION_CONTEXTS` item in a `with`; with the classes `self` may be
     an instance of there (the class and the subclasses that inherit the
-    method), and what that `with` makes known of its targets."""
+    method), and the code to read there with what is known at its start:
+    each later item of that `with` with what the items before it made known,
+    and its body with what all of them did."""
     for rel, module in _app_modules().items():
         if rel == _HELPERS_MODULE:
             continue
@@ -1205,18 +1230,21 @@ def _admission_roots():
                     functions.append((cls.name, selves, fn))
         for owner, selves, fn in functions:
             if any(_name_of(d) in _ADMISSION_DECORATORS for d in fn.decorator_list):
-                yield rel, owner, selves, fn, fn.body, f"{rel}:{fn.lineno} @{fn.name}", _Known()
+                yield rel, owner, selves, fn, [(fn.body, _Known())], f"{rel}:{fn.lineno} @{fn.name}"
             for node in ast.walk(fn):
                 if not isinstance(node, (ast.With, ast.AsyncWith)):
                     continue
                 for index, item in enumerate(node.items):
                     if any(isinstance(c, ast.Call) and _name_of(c.func) in _ADMISSION_CONTEXTS
                            for c in ast.walk(item.context_expr)):
-                        later = [i.context_expr for i in node.items[index + 1:]]
-                        yield (
-                            rel, owner, selves, fn, later + node.body, f"{rel}:{node.lineno} in {fn.name}",
-                            _entered(node.items),
-                        )
+                        # Each later item runs with what the items before it
+                        # made known, and the body with what all of them did.
+                        segments = [
+                            ([item.context_expr], _entered(node.items[:position]))
+                            for position, item in enumerate(node.items) if position > index
+                        ]
+                        segments.append((node.body, _entered(node.items)))
+                        yield rel, owner, selves, fn, segments, f"{rel}:{node.lineno} in {fn.name}"
                         break
 
 
@@ -1255,23 +1283,26 @@ def _connections_taken_under_admission() -> tuple[dict[str, str], set[str]]:
                 callee = _Reader(rel, owner, selves, fn, bound, passed)
                 walk(callee, fn.body, f"{path} -> {name}", callee.known)
 
-    for rel, owner, selves, fn, nodes, where, known in _admission_roots():
-        walk(_Reader(rel, owner, selves, fn), nodes, where, known)
+    for rel, owner, selves, fn, segments, where in _admission_roots():
+        reader = _Reader(rel, owner, selves, fn)
+        for nodes, known in segments:
+            walk(reader, nodes, where, known)
     return taken, reached
 
 
 def _with_statement_in_an_admitted_transaction(
-    rel: str, function: str, statement: str, block: str = "admitted_connection",
+    rel: str, function: str, statement: str, block: str | None = "admitted_connection",
 ) -> dict:
     """The application's modules, with `statement` added at the top of the
     first `async with` block of `function` in module `rel` that enters a
-    call named `block`."""
+    call named `block`, or at the top of the function's body when `block`
+    is None."""
     tree = ast.parse((_APP_DIR / rel).read_text(encoding="utf-8"))
     fn = next(
         node for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function
     )
-    block = next(
+    into = fn if block is None else next(
         node for node in ast.walk(fn)
         if isinstance(node, ast.AsyncWith) and any(
             isinstance(call, ast.Call) and _name_of(call.func) == block
@@ -1280,8 +1311,8 @@ def _with_statement_in_an_admitted_transaction(
     )
     added = ast.parse(f"async def _():\n    {statement}\n").body[0].body
     for node in added:
-        ast.increment_lineno(node, block.lineno - node.lineno)
-    block.body[:0] = added
+        ast.increment_lineno(node, into.lineno - node.lineno)
+    into.body[:0] = added
     modules = dict(_app_modules())
     modules[rel] = _Module(rel, tree)
     return modules
@@ -1317,6 +1348,50 @@ def _with_statement_in_an_admitted_transaction(
      "        for tx in (None,):\n"
      "            if tx is None: await write_policy_repo.get_policy(admitted_id)",
      "repositories/vault_write_policy_repo.py", "admitted_connection"),
+    # A name a `try` body binds anew, read in its `finally` or its `else`.
+    ("async with acquire_given_back(pool) as tx:\n"
+     "        try:\n"
+     "            tx = None\n"
+     "        finally:\n"
+     "            if tx is None: await write_policy_repo.get_policy(admitted_id)",
+     "repositories/vault_write_policy_repo.py", "admitted_connection"),
+    ("async with acquire_given_back(pool) as tx:\n"
+     "        try:\n"
+     "            tx = None\n"
+     "        except Exception:\n"
+     "            pass\n"
+     "        else:\n"
+     "            if tx is None: await write_policy_repo.get_policy(admitted_id)",
+     "repositories/vault_write_policy_repo.py", "admitted_connection"),
+    # A later item of the admission's own `with`, which runs before its
+    # target is bound: `conn` is still None there, so the helper takes a
+    # connection of its own. Added outside any admitted block, so that this
+    # `with` is the only one that reads it.
+    ("conn = None\n"
+     "    async with vault_write_admission(vault_id), _access_connection(conn) as conn:\n"
+     "        pass",
+     "services/access_service.py", None),
+    # A name a `with` item's own expression binds anew, read by the next item.
+    ("async with admitted_connection(pool, vault_id) as tx, asyncio.timeout(tx := None), "
+     "_access_connection(tx):\n"
+     "        pass",
+     "services/access_service.py", "admitted_connection"),
+    # In a handler, its `as` name, and a name its body binds before using it.
+    ("async with _access_connection(conn) as tx:\n"
+     "        try:\n"
+     "            raise ValueError()\n"
+     "        except ValueError as tx:\n"
+     "            async with _access_connection(tx):\n"
+     "                pass",
+     "services/access_service.py", "admitted_connection"),
+    ("async with _access_connection(conn) as tx:\n"
+     "        try:\n"
+     "            raise ValueError()\n"
+     "        except ValueError:\n"
+     "            tx = None\n"
+     "            async with _access_connection(tx):\n"
+     "                pass",
+     "services/access_service.py", "admitted_connection"),
 ])
 def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
     monkeypatch, statement, site, block,
@@ -1327,7 +1402,10 @@ def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
     then takes one, also behind a test the walk cannot settle, on an event
     buffer that may be empty or a transaction's `with` target, which is
     None, or on a name a connection was known under until it was bound
-    anew. The check names it."""
+    anew, also in a `try`'s `finally` or `else`, by a `with` item's own
+    expression, or in a handler, by its `as` name or its body; or a helper
+    that a later item of the admission's own `with` calls before that
+    item's target is bound. The check names it."""
     rel = "services/access_service.py"
     modules = _with_statement_in_an_admitted_transaction(rel, "set_public_access", statement, block)
     monkeypatch.setattr(sys.modules[__name__], "_app_modules", lambda: modules)
@@ -1335,6 +1413,28 @@ def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
     flagged = [where for where, path in taken.items() if " in set_public_access" in path.split(" -> ")[0]]
     assert flagged, taken
     assert all(where.startswith(f"{site or rel}:") for where in flagged), flagged
+
+
+def test_a_connection_used_in_a_handler_before_its_name_is_bound_anew_passes_the_check(monkeypatch):
+    """`set_public_access` with a handler that hands the connection it holds
+    to a helper and only afterwards binds that name anew. When the helper is
+    called the name still holds the connection, so the helper takes none of
+    its own and the check names nothing. The check used to drop what it knew
+    of every name the handler binds as soon as the handler was entered."""
+    rel = "services/access_service.py"
+    statement = (
+        "async with _access_connection(conn) as tx:\n"
+        "        try:\n"
+        "            raise ValueError()\n"
+        "        except ValueError:\n"
+        "            async with _access_connection(tx):\n"
+        "                pass\n"
+        "            tx = None"
+    )
+    modules = _with_statement_in_an_admitted_transaction(rel, "set_public_access", statement)
+    monkeypatch.setattr(sys.modules[__name__], "_app_modules", lambda: modules)
+    taken, _reached = _connections_taken_under_admission()
+    assert not taken, taken
 
 
 def test_every_admitted_connection_is_given_back_before_its_admission():

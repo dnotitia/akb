@@ -15,6 +15,7 @@ queue at once, and the statements its reservation held back go on.
 from __future__ import annotations
 
 import asyncio
+import errno
 from typing import Any
 import time
 
@@ -22,8 +23,10 @@ import asyncpg
 import pytest
 
 from app.config import settings
+from app.db.transient import transient_error
 from app.exceptions import WriteBusyError
 from app.services import user_sql_executor
+from app.util.errors import OPERATION_TIMEOUT
 
 
 def _slots() -> user_sql_executor._PlanSlots:
@@ -565,12 +568,17 @@ class _ReleasingPool:
     its acquisitions name it and their connection, as asyncpg's do, and its
     ``release(conn, timeout=...)`` is asyncpg's bounded one: past the
     timeout it closes the connection, which the pool then has back, and
-    raises ``TimeoutError``."""
+    raises ``TimeoutError``. With ``fail_with`` a release that ends within
+    its timeout raises that error once the pool has the connection back."""
 
-    def __init__(self, *, reset_secs: float, back_early: bool = False, bounded: bool = False) -> None:
+    def __init__(
+        self, *, reset_secs: float, back_early: bool = False, bounded: bool = False,
+        fail_with: BaseException | None = None,
+    ) -> None:
         self.reset_secs = reset_secs
         self.back_early = back_early
         self.bounded = bounded
+        self.fail_with = fail_with
         self.raw = _RawConnection()
         self.back_at: float | None = None
 
@@ -620,6 +628,8 @@ class _ReleasingAcquire:
             self._pool.back_at = loop.time()
         if timed_out:
             raise TimeoutError("timed out resetting the connection")
+        if self._pool.fail_with is not None:
+            raise self._pool.fail_with
 
 
 async def _a_plan_then_another(pool: _ReleasingPool) -> tuple[frozenset, float]:
@@ -718,4 +728,70 @@ async def test_a_cancelled_plan_closes_its_connection_before_any_rollback(monkey
         pytest.fail("the cancelled plan waited for its rollback")
     assert plan.cancelled()
     assert slow.terminated_at is not None and slow.terminated_at - cancelled_at < 0.1
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+async def test_a_plan_read_whose_release_fails_is_not_write_busy(monkeypatch):
+    """A plan is read well within its deadline, and giving its connection
+    back then fails, before the release's bound, with a socket's
+    `ETIMEDOUT`. The plan did not run out of time and nothing waited for
+    admission, so the statement fails with that error, which the API reports
+    as a transient dependency failure (`operation_timeout`), as an error
+    giving back a connection is reported on other paths, and not as
+    `write_busy`; the plan's slot is free again. The release's
+    `TimeoutError` used to be taken for the plan's deadline."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 2000)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    failure = TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+    pool = _ReleasingPool(reset_secs=0.05, bounded=True, fail_with=failure)
+    executor = user_sql_executor.UserSqlExecutor(pool)
+    with pytest.raises(TimeoutError) as raised:
+        await asyncio.wait_for(executor._planned(_statement("x", slow=False)), timeout=5)
+    assert raised.value is failure
+    mapped = transient_error(raised.value)
+    assert mapped is not None and mapped.code == OPERATION_TIMEOUT
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+async def test_a_plan_whose_release_is_cancelled_by_the_server_is_not_write_busy(monkeypatch):
+    """A plan is read well within its deadline, and giving its connection
+    back then fails with the server's statement cancellation, the class a
+    plan's own statement timeout raises. Raised by the release, not by the
+    plan's statements, it is no sign of the plan running out of time: the
+    statement fails with it, reported as `operation_timeout`, and not as
+    `write_busy`. Every `QueryCanceledError` used to count as the plan's."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 2000)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    failure = asyncpg.exceptions.QueryCanceledError("canceling statement due to statement timeout")
+    pool = _ReleasingPool(reset_secs=0.05, bounded=True, fail_with=failure)
+    executor = user_sql_executor.UserSqlExecutor(pool)
+    with pytest.raises(asyncpg.exceptions.QueryCanceledError) as raised:
+        await asyncio.wait_for(executor._planned(_statement("x", slow=False)), timeout=5)
+    assert raised.value is failure
+    mapped = transient_error(raised.value)
+    assert mapped is not None and mapped.code == OPERATION_TIMEOUT
+    assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])
+
+
+async def test_a_plan_read_in_a_callers_cancellation_handler_raises_its_release_error(monkeypatch):
+    """A plan is read from inside the caller's handler of a cancellation it
+    caught, and is read in time; giving its connection back then fails with a
+    socket's `ETIMEDOUT`. The caller's cancellation is not this read's: the
+    release's error is raised, not logged away as though the read had been
+    cancelled. The read used to pick up the caller's exception and return
+    its plan as if the release had gone well."""
+    monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
+    monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 2000)
+    monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
+    failure = TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+    pool = _ReleasingPool(reset_secs=0.05, bounded=True, fail_with=failure)
+    executor = user_sql_executor.UserSqlExecutor(pool)
+    try:
+        raise asyncio.CancelledError()
+    except asyncio.CancelledError:
+        with pytest.raises(TimeoutError) as raised:
+            await asyncio.wait_for(executor._planned(_statement("x", slow=False)), timeout=5)
+    assert raised.value is failure
     assert (_slots().running, _slots().busy, _slots().waiters) == (0, set(), [])

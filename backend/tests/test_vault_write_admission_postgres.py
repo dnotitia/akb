@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import contextvars
 import hashlib
+import logging
 import struct
 import time
 import urllib.parse
@@ -1417,6 +1418,54 @@ async def test_a_committed_write_whose_reset_runs_past_the_grace_still_succeeds(
         assert await admin_pool.fetchval(
             "SELECT count(*) FROM collections WHERE path = 'kept'",
         ) == 1
+
+
+@pytest.mark.parametrize("lag", [False, True])
+async def test_a_reset_timing_out_on_its_own_leaves_the_write_its_result(monkeypatch, caplog, lag):
+    """The pool's statements have a 0.1 s `command_timeout`, and its reset
+    of a connection given back inside an admission waits 0.3 s in the
+    database, so the reset's statement times out on its own, long before
+    the release's half-second bound; with `lag`, the event loop is held up
+    0.45 s before asyncpg's release starts, so the same timeout lands after
+    that half second. Either way the reset was slow, asyncpg closed the
+    connection, and the collection was already created: the create answers
+    with its result, and a warning says the release timed out. The timeout
+    used to be raised when it came early, and dropped without a word when
+    it came late."""
+    from app.services.vault_write_admission import _admitted
+
+    caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
+    async with _fresh_database() as admin_pool:
+        await _make_vault(admin_pool, "reset-command-timeout")
+        database = await admin_pool.fetchval("SELECT current_database()")
+
+        async def slow_reset(conn) -> None:
+            if _admitted.get():
+                await conn.execute("SELECT pg_sleep(0.3)")
+
+        if lag:
+            release = asyncpg.pool.PoolConnectionHolder.release
+
+            async def held_up(self, timeout):
+                time.sleep(0.45)  # the event loop does nothing else meanwhile
+                return await release(self, timeout)
+
+            monkeypatch.setattr(asyncpg.pool.PoolConnectionHolder, "release", held_up)
+        app_pool = await asyncpg.create_pool(
+            _database_dsn(database), min_size=1, max_size=2, command_timeout=0.1, reset=slow_reset,
+        )
+        previous_pool = postgres_module._pool
+        postgres_module._pool = app_pool
+        try:
+            created = await CollectionService(git=object()).create(
+                vault="reset-command-timeout", path="kept", summary=None, agent_id="tester",
+            )
+        finally:
+            postgres_module._pool = previous_pool
+            app_pool.terminate()
+        assert (created["created"], created["collection"]["path"]) == (True, "kept"), created
+        assert any("timed out in its reset" in r.getMessage() for r in caplog.records), caplog.records
+        assert await admin_pool.fetchval("SELECT count(*) FROM collections WHERE path = 'kept'") == 1
 
 
 class _CancelsSwallowed:

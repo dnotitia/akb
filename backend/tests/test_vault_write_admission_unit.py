@@ -710,7 +710,7 @@ async def _cancelled_while_its_release_runs(pool: _ResettingPool) -> asyncio.Tas
     return writing
 
 
-async def test_a_cancelled_give_back_retrieves_the_releases_timeout(monkeypatch):
+async def test_a_cancelled_give_back_retrieves_the_releases_timeout(monkeypatch, caplog):
     """A write is cancelled while its connection's release resets the
     connection past the release's bound, which closes it and ends with
     `TimeoutError`. The write ends cancelled, and the release's
@@ -718,6 +718,7 @@ async def test_a_cancelled_give_back_retrieves_the_releases_timeout(monkeypatch)
     retrieved once the release is collected. The cancellation used to be
     raised before the release's exception was retrieved."""
     monkeypatch.setattr(admission, "GIVE_BACK_GRACE_SECS", 0.1)
+    caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
     loop = asyncio.get_running_loop()
     reported: list[dict] = []
     previous = loop.get_exception_handler()
@@ -734,6 +735,7 @@ async def test_a_cancelled_give_back_retrieves_the_releases_timeout(monkeypatch)
         loop.set_exception_handler(previous)
     assert not [c for c in reported if "never retrieved" in c.get("message", "")], reported
     assert pool.in_use == 0
+    assert any("timed out in its reset" in r.getMessage() for r in caplog.records), caplog.records
 
 
 async def test_a_cancelled_give_back_logs_the_releases_error(monkeypatch, caplog):
@@ -810,3 +812,50 @@ async def test_a_socket_timeout_before_the_bound_reaches_the_writer():
     with pytest.raises(TimeoutError) as raised:
         await asyncio.wait_for(write(), timeout=5)
     assert raised.value is failure and raised.value.errno == errno.ETIMEDOUT
+
+
+async def test_a_write_cancelled_in_its_block_ends_cancelled_though_its_release_fails(caplog):
+    """A write is cancelled inside its admitted connection block, before its
+    connection goes back, and the release then fails, before its bound, with
+    a socket's `ETIMEDOUT`. The cancellation, delivered by the block, still
+    wins: the write ends cancelled, and the release's error is logged with
+    its traceback. Only a cancellation arriving while the release ran used to
+    win; this one gave way to the release's error."""
+    failure = _socket_timeout()
+    pool = _ResettingPool(size=2, reset_secs=0.05, fail_with=failure)
+    caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
+    inside = asyncio.Event()
+
+    async def write() -> None:
+        async with admission.admitted_connection(pool, uuid.uuid4()):
+            inside.set()
+            await asyncio.sleep(30)
+
+    writing = asyncio.create_task(write())
+    await asyncio.wait_for(inside.wait(), timeout=5)
+    writing.cancel()
+    # Not awaited directly: a cancelled await would cancel the write.
+    await asyncio.wait({writing}, timeout=5)
+    assert writing.done() and writing.cancelled()
+    logged = [r for r in caplog.records if "while its request was being cancelled" in r.getMessage()]
+    assert logged and logged[0].exc_info is not None and logged[0].exc_info[1] is failure, caplog.records
+    assert pool.in_use == 0
+
+
+async def test_a_reset_that_times_out_early_is_logged_and_the_write_keeps_its_result(caplog):
+    """A release ends with a `TimeoutError` that carries no errno, as a
+    reset statement's own `command_timeout` raises one, long before the
+    release's bound. The reset was slow and the connection was closed, and
+    the write's work was done: the write ends with its result, and a warning
+    says the release timed out. The errno-less timeout used to be raised as
+    soon as it came before the bound."""
+    caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
+    pool = _ResettingPool(size=2, reset_secs=0.05, fail_with=TimeoutError())
+
+    async def write() -> str:
+        async with admission.admitted_connection(pool, uuid.uuid4()):
+            return "written"
+
+    assert await asyncio.wait_for(write(), timeout=5) == "written"
+    assert any("timed out in its reset" in r.getMessage() for r in caplog.records), caplog.records
+    assert pool.in_use == 0
