@@ -955,6 +955,31 @@ def _known(test: ast.AST, known: "_Known") -> bool | None:
     return None
 
 
+def _context(expr: ast.AST) -> str | None:
+    """The name of the context manager whose value a `with` item's target
+    takes, through `_PASS_THROUGH_CONTEXTS`."""
+    while isinstance(expr, ast.Call) and _name_of(expr.func) in _PASS_THROUGH_CONTEXTS and expr.args:
+        expr = expr.args[0]
+    return _name_of(expr.func) if isinstance(expr, ast.Call) else None
+
+
+def _rebound(nodes: list) -> frozenset[str]:
+    """The names that `nodes` bind anew, anywhere in them: assignments, loop
+    and `with` targets, `except … as`, imports, definitions and deletions."""
+    names: set[str] = set()
+    for top in nodes:
+        for node in ast.walk(top):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                names.add(node.id)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                names.add(node.name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                names.update((alias.asname or alias.name).split(".")[0] for alias in node.names)
+    return frozenset(names)
+
+
 @dataclass(frozen=True)
 class _Known:
     """Names known not to hold None, and names known to be true (a subset)."""
@@ -962,13 +987,44 @@ class _Known:
     not_none: frozenset[str] = frozenset()
     true: frozenset[str] = frozenset()
 
+    def without(self, names: frozenset[str]) -> "_Known":
+        if not names & (self.not_none | self.true):
+            return self
+        return _Known(self.not_none - names, self.true - names)
+
+    def entering(self, item: ast.withitem) -> "_Known":
+        """What is known once `item` has bound its target: a name loses what
+        was known of it, and is known again only as the context manager's
+        value, if that is known."""
+        if item.optional_vars is None:
+            return self
+        known = self.without(_rebound([item.optional_vars]))
+        if not isinstance(item.optional_vars, ast.Name):
+            return known
+        name, context = item.optional_vars.id, _context(item.context_expr)
+        if context in _CONNECTION_CONTEXTS:
+            return _Known(known.not_none | {name}, known.true | {name})
+        if context in _NOT_NONE_CONTEXTS:
+            return _Known(known.not_none | {name}, known.true)
+        return known
+
+
+def _entered(items: list, known: _Known = _Known()) -> _Known:
+    for item in items:
+        known = known.entering(item)
+    return known
+
 
 def _live(nodes: list, known: _Known):
-    """The nodes in and under `nodes` that can run, as far as what is known
-    of the names settles `if` tests: such an `if` keeps only the branch the
-    test leaves, and that branch ending in `return` or `raise` drops what
-    follows it. A connection a caller passes in thus rules out the branch
-    that takes one when none was passed."""
+    """(node, what is known there) for the nodes in and under `nodes` that
+    can run, as far as what is known settles `if` tests: such an `if` keeps
+    only the branch the test leaves, and that branch ending in `return` or
+    `raise` drops what follows it. A connection a caller passes in thus
+    rules out the branch that takes one when none was passed. What is
+    known follows the code: a `with` target's facts hold inside its block
+    only, and a name bound anew, by an assignment, a loop, another `with`
+    or otherwise, loses what was known of it from there on (and inside a
+    loop that binds it, from the loop's start)."""
     for node in nodes:
         if isinstance(node, ast.If):
             settled = _known(node.test, known)
@@ -977,48 +1033,50 @@ def _live(nodes: list, known: _Known):
                 yield from _live(branch, known)
                 if branch and isinstance(branch[-1], (ast.Return, ast.Raise)):
                     return
+                known = known.without(_rebound(branch))
                 continue
-        yield node
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            yield node, known
+            inside = known
+            for item in node.items:
+                yield from _live([item.context_expr], inside)
+                inside = inside.entering(item)
+            yield from _live(node.body, inside)
+            known = known.without(_rebound([node]))
+            continue
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            yield node, known
+            yield from _live([node.iter if isinstance(node, (ast.For, ast.AsyncFor)) else node.test], known)
+            looping = known.without(_rebound([node]))
+            yield from _live(node.body, looping)
+            yield from _live(node.orelse, looping)
+            known = looping
+            continue
+        yield node, known
         for _field, value in ast.iter_fields(node):
             if isinstance(value, list):
                 yield from _live([item for item in value if isinstance(item, ast.AST)], known)
             elif isinstance(value, ast.AST):
                 yield from _live([value], known)
+        if isinstance(node, ast.stmt):
+            known = known.without(_rebound([node]))
 
 
 class _Reader:
     """One function read under an admission: the classes `self` may be an
     instance of, the types its names hold, as its annotations, assignments
-    and its caller's arguments tell, what is known of its names (`known`:
-    the `with` target of a context manager in `_NOT_NONE_CONTEXTS` is not
-    None, and true when it is a connection; a parameter is as the caller's
-    argument was), and the application functions each of its calls may
-    run."""
+    and its caller's arguments tell, what is known of its parameters when
+    it starts (`known`: as the caller's arguments were), and the
+    application functions each of its calls may run. What is known of a
+    `with` target (the target of a context manager in `_NOT_NONE_CONTEXTS`
+    is not None, and true when it is a connection) is followed by `_live`."""
 
     def __init__(
         self, rel: str, owner: str | None, selves: tuple, fn: ast.AST, bound: dict | None = None,
         passed: _Known = _Known(),
     ) -> None:
         self.rel, self.owner, self.selves, self.fn = rel, owner, selves, fn
-        targets = [
-            item for node in ast.walk(fn) if isinstance(node, (ast.With, ast.AsyncWith))
-            for item in node.items if isinstance(item.optional_vars, ast.Name)
-        ]
-        def entered(names: frozenset[str]) -> set[str]:
-            found = set()
-            for item in targets:
-                call = item.context_expr
-                while isinstance(call, ast.Call) and _name_of(call.func) in _PASS_THROUGH_CONTEXTS and call.args:
-                    call = call.args[0]
-                if isinstance(call, ast.Call) and _name_of(call.func) in names:
-                    found.add(item.optional_vars.id)
-            return found
-
-        connections = entered(_CONNECTION_CONTEXTS)
-        self.known = _Known(
-            not_none=passed.not_none | passed.true | connections | entered(_NOT_NONE_CONTEXTS),
-            true=passed.true | connections,
-        )
+        self.known = _Known(passed.not_none | passed.true, passed.true)
         arguments = fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
         self.names: dict[str, tuple] = {a.arg: _annotation(rel, a.annotation) for a in arguments}
         self.names.update({name: types for name, types in (bound or {}).items() if types})
@@ -1103,9 +1161,9 @@ class _Reader:
         bound.update({kw.arg: self.type_of(kw.value) for kw in call.keywords if kw.arg is not None})
         return bound
 
-    def passed(self, call: ast.Call, fn: ast.AST) -> _Known:
+    def passed(self, call: ast.Call, fn: ast.AST, known: _Known) -> _Known:
         """What is known of the function's parameters from what the call
-        passes them: a name known here, or a constant."""
+        passes them: a name `known` at the call, or a constant."""
         names = [a.arg for a in fn.args.posonlyargs + fn.args.args]
         if names and names[0] in {"self", "cls"}:
             names = names[1:]
@@ -1115,12 +1173,12 @@ class _Reader:
         ] + [(kw.arg, kw.value) for kw in call.keywords if kw.arg is not None]
         not_none = {
             name for name, argument in arguments
-            if (isinstance(argument, ast.Name) and argument.id in self.known.not_none)
+            if (isinstance(argument, ast.Name) and argument.id in known.not_none)
             or (isinstance(argument, ast.Constant) and argument.value is not None)
         }
         true = {
             name for name, argument in arguments
-            if (isinstance(argument, ast.Name) and argument.id in self.known.true)
+            if (isinstance(argument, ast.Name) and argument.id in known.true)
             or (isinstance(argument, ast.Constant) and bool(argument.value))
         }
         return _Known(frozenset(not_none), frozenset(true))
@@ -1131,7 +1189,7 @@ def _admission_roots():
     methods `_ADMISSION_DECORATORS` decorate, and what follows an
     `_ADMISSION_CONTEXTS` item in a `with`; with the classes `self` may be
     an instance of there (the class and the subclasses that inherit the
-    method)."""
+    method), and what that `with` makes known of its targets."""
     for rel, module in _app_modules().items():
         if rel == _HELPERS_MODULE:
             continue
@@ -1147,7 +1205,7 @@ def _admission_roots():
                     functions.append((cls.name, selves, fn))
         for owner, selves, fn in functions:
             if any(_name_of(d) in _ADMISSION_DECORATORS for d in fn.decorator_list):
-                yield rel, owner, selves, fn, fn.body, f"{rel}:{fn.lineno} @{fn.name}"
+                yield rel, owner, selves, fn, fn.body, f"{rel}:{fn.lineno} @{fn.name}", _Known()
             for node in ast.walk(fn):
                 if not isinstance(node, (ast.With, ast.AsyncWith)):
                     continue
@@ -1155,7 +1213,10 @@ def _admission_roots():
                     if any(isinstance(c, ast.Call) and _name_of(c.func) in _ADMISSION_CONTEXTS
                            for c in ast.walk(item.context_expr)):
                         later = [i.context_expr for i in node.items[index + 1:]]
-                        yield rel, owner, selves, fn, later + node.body, f"{rel}:{node.lineno} in {fn.name}"
+                        yield (
+                            rel, owner, selves, fn, later + node.body, f"{rel}:{node.lineno} in {fn.name}",
+                            _entered(node.items),
+                        )
                         break
 
 
@@ -1168,8 +1229,8 @@ def _connections_taken_under_admission() -> tuple[dict[str, str], set[str]]:
     reached: set[str] = set()
     seen: set = set()
 
-    def walk(reader: _Reader, nodes: list, path: str) -> None:
-        for node in _live(nodes, reader.known):
+    def walk(reader: _Reader, nodes: list, path: str, known: _Known) -> None:
+        for node, here in _live(nodes, known):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
@@ -1181,7 +1242,7 @@ def _connections_taken_under_admission() -> tuple[dict[str, str], set[str]]:
                 if rel == _HELPERS_MODULE:
                     continue
                 bound = reader.bound(node, fn)
-                passed = reader.passed(node, fn)
+                passed = reader.passed(node, fn, here)
                 key = (
                     rel, fn.lineno, selves, passed,
                     tuple(sorted((k, v) for k, v in bound.items() if v)),
@@ -1191,10 +1252,11 @@ def _connections_taken_under_admission() -> tuple[dict[str, str], set[str]]:
                 seen.add(key)
                 name = f"{rel}:{owner + '.' if owner else ''}{fn.name}"
                 reached.add(name)
-                walk(_Reader(rel, owner, selves, fn, bound, passed), fn.body, f"{path} -> {name}")
+                callee = _Reader(rel, owner, selves, fn, bound, passed)
+                walk(callee, fn.body, f"{path} -> {name}", callee.known)
 
-    for rel, owner, selves, fn, nodes, where in _admission_roots():
-        walk(_Reader(rel, owner, selves, fn), nodes, where)
+    for rel, owner, selves, fn, nodes, where, known in _admission_roots():
+        walk(_Reader(rel, owner, selves, fn), nodes, where, known)
     return taken, reached
 
 
@@ -1240,6 +1302,21 @@ def _with_statement_in_an_admitted_transaction(
     ("async with conn.transaction() as tx:\n"
      "        if tx is None: await write_policy_repo.get_policy(admitted_id)",
      "repositories/vault_write_policy_repo.py", "admitted_connection"),
+    # A name a connection was known under, bound anew: by another `with`,
+    # an assignment or a loop. What was known of it no longer holds.
+    ("async with _access_connection(conn) as tx:\n"
+     "        pass\n"
+     "    async with conn.transaction() as tx:\n"
+     "        if not tx: await write_policy_repo.get_policy(admitted_id)",
+     "repositories/vault_write_policy_repo.py", "admitted_connection"),
+    ("async with acquire_given_back(pool) as tx:\n"
+     "        tx = None\n"
+     "        if tx is None: await write_policy_repo.get_policy(admitted_id)",
+     "repositories/vault_write_policy_repo.py", "admitted_connection"),
+    ("async with acquire_given_back(pool) as tx:\n"
+     "        for tx in (None,):\n"
+     "            if tx is None: await write_policy_repo.get_policy(admitted_id)",
+     "repositories/vault_write_policy_repo.py", "admitted_connection"),
 ])
 def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
     monkeypatch, statement, site, block,
@@ -1249,7 +1326,8 @@ def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
     `pool.acquire()` there, or a helper called without the connection, which
     then takes one, also behind a test the walk cannot settle, on an event
     buffer that may be empty or a transaction's `with` target, which is
-    None. The check names it."""
+    None, or on a name a connection was known under until it was bound
+    anew. The check names it."""
     rel = "services/access_service.py"
     modules = _with_statement_in_an_admitted_transaction(rel, "set_public_access", statement, block)
     monkeypatch.setattr(sys.modules[__name__], "_app_modules", lambda: modules)

@@ -11,6 +11,7 @@ written without admission is logged.
 from __future__ import annotations
 
 import asyncio
+import errno
 import gc
 import logging
 import uuid
@@ -772,3 +773,40 @@ async def test_a_release_left_to_the_pool_logs_its_error_when_it_ends(monkeypatc
     await asyncio.sleep(0)
     logged = [r for r in caplog.records if "after its caller had gone on" in r.getMessage()]
     assert logged and logged[0].exc_info is not None and logged[0].exc_info[1] is failure, caplog.records
+
+
+def _socket_timeout() -> TimeoutError:
+    return TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+
+
+async def test_a_cancelled_give_back_logs_a_socket_timeout_before_the_bound(caplog):
+    """A write is cancelled while its connection's release runs, and the
+    release then fails, before its bound, with a socket's `ETIMEDOUT`: an
+    operating-system `TimeoutError`, which carries an errno. That is the
+    release's error, not its bound's expiry, so it is logged with its
+    traceback while the write ends cancelled. Every `TimeoutError` of a
+    bounded release used to count as the bound's and went unreported."""
+    failure = _socket_timeout()
+    pool = _ResettingPool(size=2, reset_secs=0.05, fail_with=failure)
+    caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
+    writing = await _cancelled_while_its_release_runs(pool)
+    assert writing.done() and writing.cancelled()
+    logged = [r for r in caplog.records if "while its request was being cancelled" in r.getMessage()]
+    assert logged and logged[0].exc_info is not None and logged[0].exc_info[1] is failure, caplog.records
+
+
+async def test_a_socket_timeout_before_the_bound_reaches_the_writer():
+    """The same release failure, on a write that is not cancelled: the
+    write's admitted connection block raises it, as leaving `async with
+    pool.acquire()` would. It used to be taken for the bound's expiry and
+    dropped."""
+    failure = _socket_timeout()
+    pool = _ResettingPool(size=2, reset_secs=0.05, fail_with=failure)
+
+    async def write() -> None:
+        async with admission.admitted_connection(pool, uuid.uuid4()):
+            pass
+
+    with pytest.raises(TimeoutError) as raised:
+        await asyncio.wait_for(write(), timeout=5)
+    assert raised.value is failure and raised.value.errno == errno.ETIMEDOUT

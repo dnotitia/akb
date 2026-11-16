@@ -79,7 +79,8 @@ specifically; the proxy has its own log in
   its release, so a late release cannot close another request's connection.
   A release that still has not ended is left to the pool with a warning,
   so it never keeps an admission or a Vault creation's lane gate; its error,
-  and that of a release whose request was cancelled meanwhile, is logged.
+  and that of a release whose request was cancelled meanwhile, is logged,
+  a socket's timeout included: only the bound's own expiry is not an error.
   The plan slots and the admission alike serve waiters first come, first
   served, by capacity: the
   first waiter blocked on a Vault reserves one slot of each of its Vaults
