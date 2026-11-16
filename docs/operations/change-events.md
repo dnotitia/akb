@@ -306,19 +306,27 @@ hint whatever its code, and over REST a not-found error does too. A document's
 deletion is counted as soon as its transaction commits, before its connection
 goes back to the pool, so a connection the pool then fails to reset does not
 drop it from the count. When the COMMIT of a document's transaction fails
-without the database's answer, as when the connection is lost during it, the
-deletion may or may not have committed: the error counts it apart in
-`uncertain_docs`, with its URI in `uncertain_uris` for a caller who may read
-the Vault, sets `partially_applied`, and its hint says that the outcome of
-those deletions is unknown; reading the documents tells. A COMMIT the database
+without the database's answer, the deletion may or may not have committed.
+Only an error response from the server is an answer, after which the
+transaction rolled back; a connection error, SQLSTATE class 08 such as the
+`ConnectionDoesNotExistError` asyncpg raises when the connection closes
+mid-operation, or any other failure leaves the outcome unknown. The error
+then counts that attempt apart in `uncertain_docs`, with its URI in
+`uncertain_uris` for a caller who may read the Vault, even when an earlier
+deletion of the same document committed (it may have been restored and moved
+since), sets `partially_applied`, and its hint says that the outcome of those
+deletions is unknown; reading the documents tells. A COMMIT the database
 refused rolled back, and is not counted. When the COMMIT of the last
 transaction goes unanswered the same way, the error adds
 `final_step_uncertain: true` beside the documents' progress, and its hint
 says that the outcome of that step, which deletes the collections, Files and
-tables under the prefix and records `collection.delete`, is unknown;
-browsing the prefix tells. Once the last transaction has committed, the delete
-is complete: a failure after it, such as one while the pool takes its
-connection back, is logged and the delete answers with its result.
+tables under the prefix and records `collection.delete`, is unknown; on the
+Bare Git authority that step deletes the documents too, which the error
+counts in `final_step_docs` and lists in `final_step_uris` for a reader.
+Browsing the prefix tells. Once the last transaction has committed, the
+delete is complete: a failure after it, such as one while the pool takes its
+connection back, is logged and the delete answers with its result. This
+holds for a delete that finds the prefix emptied by an earlier one, too.
 When nothing is left under the prefix because an earlier
 recursive delete of it deleted its documents, the delete succeeds with zero
 counts rather than reporting the prefix as not found, and records
@@ -470,8 +478,13 @@ are internal errors, over REST and MCP, with exactly the generic message, that
 say what went; that a deletion whose connection then fails to reset is still
 counted; that a File delete refused with a 503 after the documents went keeps
 its details over MCP; that a deletion whose COMMIT answer is lost is reported
-as uncertain, and one the database refused is not; that a last step whose
-COMMIT answer is lost is reported as `final_step_uncertain`; that a delete
+as uncertain, also with asyncpg's own connection error, and one the database
+refused is not; that a second deletion of a document restored and moved
+meanwhile, whose answer is lost, is reported as uncertain; that a last step
+whose COMMIT answer is lost is reported as `final_step_uncertain`, on the
+Bare Git authority with the documents it deletes; that a delete of an
+emptied prefix answers with its result when its reset fails and reports an
+uncertain last step when its answer is lost; that a delete
 whose last transaction committed answers with its result, Files included,
 when the reset of its connection fails; and that a File whose Resource is gone, after the
 documents went, keeps the delete's progress in the REST 404.

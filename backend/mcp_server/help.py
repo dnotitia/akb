@@ -1202,9 +1202,10 @@ file, and table under `P/`.
   usual, and the same call continues with the rest. `details.uncertain_docs`
   (and `uncertain_uris`) counts deletions whose commit went unanswered:
   read those documents to see whether they went; `final_step_uncertain`
-  says the same of the last step (collections, files, tables). If a table
-  appears under the prefix while a writer's delete runs, only an admin or
-  owner can finish that delete.
+  says the same of the last step (collections, files, tables, and the
+  documents in `final_step_uris` on a Bare Git Vault). If a table appears
+  under the prefix while a writer's delete runs, only an admin or owner can
+  finish that delete.
 
 ## Parameters
 | Param | Required | Description |

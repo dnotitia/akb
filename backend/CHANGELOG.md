@@ -27,7 +27,9 @@ specifically; the proxy has its own log in
   apart as `uncertain_docs` (and `uncertain_uris` for a reader), with a hint
   that its outcome is unknown, and a last transaction whose COMMIT went
   unanswered adds `final_step_uncertain: true` and a hint naming what that
-  step deletes. Once the last transaction has committed, a failure while
+  step deletes, with its Bare Git documents in `final_step_docs` (and
+  `final_step_uris`). Only a server error response counts as an answer; a
+  connection error (class 08) leaves the outcome unknown. Once the last transaction has committed, a failure while
   giving its connection back is logged and the delete answers with its
   result.
   `deleted_docs` counts a document restored and deleted again by the same
