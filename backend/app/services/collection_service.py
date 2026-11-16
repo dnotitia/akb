@@ -16,7 +16,8 @@ import asyncpg
 
 from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
-from app.exceptions import ConflictError, ForbiddenError, NotFoundError
+from app.db.transient import transient_error
+from app.exceptions import AKBError, ConflictError, ForbiddenError, NotFoundError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import (
     CollectionRepository,
@@ -113,6 +114,14 @@ class _DocumentsRemain(Exception):
 # then tries its collections, when documents keep arriving meanwhile.
 _NATIVE_DELETE_ROUNDS = 3
 
+# The hint of a refusal to delete tables: the same request from an admin
+# deletes them with the rest.
+TABLES_NEED_ADMIN_HINT = (
+    "Only a caller with the 'admin' role on the Vault can delete a collection that holds "
+    "tables: the same request from such a caller deletes them with the rest. Sent again "
+    "without that role, it is refused before anything else is deleted."
+)
+
 # The hint of a delete that left collections in place after a Native cutover.
 RETAINED_COLLECTIONS_HINT = (
     "Some collections keep their rows (retained_collection_count): documents preserved from "
@@ -122,29 +131,68 @@ RETAINED_COLLECTIONS_HINT = (
 )
 
 
+def _distinct_documents(deleted: list[tuple[uuid.UUID, str]]) -> int:
+    """How many documents a list of committed deletions covers: a document
+    restored and deleted again by the same request counts once."""
+    return len({resource_id for resource_id, _path in deleted})
+
+
 def committed_deletions(
-    *, vault: str, deleted: list[str], disclose_paths: bool,
+    *, vault: str, deleted: list[tuple[uuid.UUID, str]], disclose_paths: bool,
 ) -> tuple[dict, str]:
     """The details, and the opening of the hint, of a recursive delete that
     stopped after it committed deletions for some documents.
 
-    The paths are given only to a caller who may read the Vault
-    (``disclose_paths``); another gets the count. They are the documents this
-    request deleted, which later writes or restores may have changed since.
+    ``deleted`` holds each committed deletion's Resource and path; a document
+    restored and deleted again counts once (``deleted_docs``), and each path
+    is listed once. The paths are given only to a caller who may read the
+    Vault (``disclose_paths``); another gets the count. They are the
+    documents this request deleted, which later writes or restores may have
+    changed since.
     """
-    details: dict = {"partially_applied": True, "deleted_docs": len(deleted)}
+    count = _distinct_documents(deleted)
+    details: dict = {"partially_applied": True, "deleted_docs": count}
     if disclose_paths:
-        details["deleted_uris"] = [doc_uri(vault, path) for path in deleted]
+        paths = list(dict.fromkeys(path for _resource_id, path in deleted))
+        details["deleted_uris"] = [doc_uri(vault, path) for path in paths]
         opening = (
             "details.deleted_uris lists the documents this request committed deletions for; "
             "later writes or restores may have changed them since."
         )
     else:
         opening = (
-            f"This request committed deletions for {len(deleted)} document(s); later writes or "
+            f"This request committed deletions for {count} document(s); later writes or "
             "restores may have changed them since."
         )
     return details, opening
+
+
+def _with_progress(
+    exc: Exception, *, vault: str, prefix: str, deleted: list[tuple[uuid.UUID, str]],
+    disclose_paths: bool,
+) -> Exception:
+    """The error to report for ``exc``, raised after this request committed
+    deletions for some documents: the same error, with what the request did.
+
+    Every error of the delete passes here, whatever raised it: the details of
+    ``committed_deletions`` are added to the error's own, its hint opens with
+    them, and its code, status and retry information stay its own. A database
+    error that the API reports as a transient error (such as the Vault's
+    event lock timing out) is reported as that error. Any other exception is
+    an internal error and is returned as it is.
+    """
+    reported = exc if isinstance(exc, AKBError) else transient_error(exc)
+    if reported is None:
+        return exc
+    details, opening = committed_deletions(vault=vault, deleted=deleted, disclose_paths=disclose_paths)
+    reported.details = {**(reported.details or {}), **details}
+    reported.hint = f"{opening} {reported.hint}" if reported.hint else opening
+    reported.message = (
+        f"{reported.message}; this request had committed deletions for "
+        f"{details['deleted_docs']} document(s) under {prefix!r}"
+    )
+    reported.args = (reported.message,)
+    return reported
 
 
 def _under(path: str, prefix: str) -> bool:
@@ -192,6 +240,12 @@ async def _delete_native_document(
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # The Vault first, as every child write and the Vault's own delete
+            # take it: locking the Resource first could deadlock with a Vault
+            # delete, which locks the Vault and then the Vault's edges before
+            # it cascades to the Resources.
+            if not await lock_vault_for_child_write(conn, vault_id):
+                raise ConflictError("Vault was deleted during collection deletion")
             row = await native.repository.lock_resource(conn, resource_id)
             if (
                 row is None
@@ -224,12 +278,14 @@ async def _delete_native_document(
 
 
 async def _delete_native_documents_under(
-    *, vault: str, vault_id: uuid.UUID, prefix: str, actor: str, deleted: list[str],
+    *, vault: str, vault_id: uuid.UUID, prefix: str, actor: str,
+    deleted: list[tuple[uuid.UUID, str]],
 ) -> None:
     """Delete the live Native documents under ``prefix`` one by one, appending
-    the path of each one this call deletes to ``deleted``. A failure part-way
-    leaves the documents deleted so far deleted, each with its event; running
-    the delete again continues from the documents that remain."""
+    the Resource and path of each one this call deletes to ``deleted``. A
+    failure part-way leaves the documents deleted so far deleted, each with
+    its event; running the delete again continues from the documents that
+    remain."""
     from app.services.native_document_service import NativeDocumentService
 
     native = await NativeDocumentService()._native()
@@ -242,55 +298,7 @@ async def _delete_native_documents_under(
             resource_id=doc["resource_id"], actor=actor,
         )
         if path is not None:
-            deleted.append(path)
-
-
-def _tables_refused_part_way(
-    refused: ForbiddenError, *, vault: str, prefix: str, deleted: list[str], disclose_paths: bool,
-) -> ForbiddenError:
-    """The table refusal of a recursive delete that already deleted documents.
-
-    A caller who may not delete tables is refused before any document goes
-    when the prefix holds a table. A table created under the prefix by
-    another request after that check is found by the last transaction, which
-    checks again under its locks, once documents were deleted, or by the
-    check of a later round. The refusal says so, as a busy Vault's
-    ``write_busy`` does (see ``committed_deletions``). The same request from
-    this caller is refused before deleting anything else; only a caller
-    allowed to delete the table can finish the delete.
-    """
-    details, opening = committed_deletions(vault=vault, deleted=deleted, disclose_paths=disclose_paths)
-    return ForbiddenError(
-        f"{refused.message}; this request had committed deletions for {len(deleted)} document(s) "
-        f"under {prefix!r} when the table was found",
-        code=refused.code,
-        hint=(
-            f"{opening} A table appeared under {prefix!r} after the delete checked for one. Only a "
-            "caller with the 'admin' role on the Vault can finish this delete: the same request "
-            "from such a caller deletes the rest, the table included. Sent again without that "
-            "role, it is refused before anything else is deleted."
-        ),
-        details=details,
-    )
-
-
-def _documents_kept_arriving(
-    *, vault: str, prefix: str, deleted: list[str], disclose_paths: bool,
-) -> ConflictError:
-    """The conflict of a recursive delete whose rounds ran out while documents
-    kept arriving under its prefix."""
-    message = f"Documents kept arriving under {prefix!r} during the delete; retry it"
-    if not deleted:
-        return ConflictError(message)
-    details, opening = committed_deletions(vault=vault, deleted=deleted, disclose_paths=disclose_paths)
-    return ConflictError(
-        f"{message}; this request had committed deletions for {len(deleted)} document(s)",
-        hint=(
-            f"{opening} Send the same request again to continue the delete once documents stop "
-            f"arriving under {prefix!r}."
-        ),
-        details=details,
-    )
+            deleted.append((doc["resource_id"], path))
 
 
 async def _earlier_recursive_delete(conn, vault_id: uuid.UUID, prefix: str) -> bool:
@@ -482,7 +490,7 @@ class CollectionService:
         from app.services import document_counters as _counters
 
         native_authority = _counters.native_documents_are_authoritative()
-        native_deleted: list[str] = []
+        native_deleted: list[tuple[uuid.UUID, str]] = []
         try:
             for _ in range(_NATIVE_DELETE_ROUNDS):
                 if native_authority and recursive:
@@ -499,29 +507,36 @@ class CollectionService:
                         vault=vault, vault_id=vault_id, norm=norm, path=path,
                         recursive=recursive, agent_id=agent_id,
                         allow_table_delete=allow_table_delete,
-                        native_authority=native_authority, native_deleted=len(native_deleted),
+                        native_authority=native_authority,
+                        native_deleted=_distinct_documents(native_deleted),
                         disclose_paths=disclose_paths,
                     )
                 except _DocumentsRemain:
                     continue
-        except ForbiddenError as exc:
-            # A table appeared under the prefix after some documents went.
-            if native_deleted:
-                raise _tables_refused_part_way(
-                    exc, vault=vault, prefix=norm, deleted=native_deleted,
-                    disclose_paths=disclose_paths,
-                ) from exc
-            raise
-        raise _documents_kept_arriving(
-            vault=vault, prefix=norm, deleted=native_deleted, disclose_paths=disclose_paths,
-        )
+            raise ConflictError(
+                f"Documents kept arriving under {norm!r} during the delete; retry it",
+                hint=f"Send the same request again to continue the delete once documents stop "
+                f"arriving under {norm!r}.",
+            )
+        except Exception as exc:
+            # Whatever ends the delete after some of its documents went says
+            # what the request did (see `_with_progress`).
+            if not native_deleted:
+                raise
+            reported = _with_progress(
+                exc, vault=vault, prefix=norm, deleted=native_deleted, disclose_paths=disclose_paths,
+            )
+            if reported is exc:
+                raise
+            raise reported from exc
 
     async def _refuse_tables_under(self, vault: str, vault_id: uuid.UUID, norm: str) -> None:
         _, coll_repo = await self._repos()
         if await coll_repo.list_tables_under(vault_id, norm):
             raise ForbiddenError(
                 "Deleting a collection that contains tables requires "
-                f"'admin' role on vault '{vault}'"
+                f"'admin' role on vault '{vault}'",
+                hint=TABLES_NEED_ADMIN_HINT,
             )
 
     async def _delete_collections(
@@ -710,7 +725,8 @@ class CollectionService:
                 if recursive and tables and not allow_table_delete:
                     raise ForbiddenError(
                         "Deleting a collection that contains tables requires "
-                        f"'admin' role on vault '{vault}'"
+                        f"'admin' role on vault '{vault}'",
+                        hint=TABLES_NEED_ADMIN_HINT,
                     )
 
                 # ── PG cleanup (same TX, locks still held) ──────

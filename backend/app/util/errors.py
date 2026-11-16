@@ -183,16 +183,19 @@ def exception_envelope(e: Exception) -> dict:
 
     transient = transient_error(e)
     if transient is not None:
+        # Details an operation added, such as what a recursive delete did
+        # before this error, are kept.
+        extra = transient.details or {}
         if transient.code == OPERATION_TIMEOUT:
-            return err(str(transient), code=OPERATION_TIMEOUT, hint=transient.hint)
+            return err(str(transient), code=OPERATION_TIMEOUT, hint=transient.hint, **extra)
         if transient.code == WRITE_BUSY:
             return err(
                 str(transient),
                 code=WRITE_BUSY,
                 hint=transient.hint,
-                retry_after_secs=transient.retry_after_secs,
+                **{"retry_after_secs": transient.retry_after_secs, **extra},
             )
-        return err(str(transient), code=SERVICE_UNAVAILABLE, hint=transient.hint)
+        return err(str(transient), code=SERVICE_UNAVAILABLE, hint=transient.hint, **extra)
     if isinstance(e, ReservedSystemPathError):
         return err(str(e), code=RESERVED_SYSTEM_PATH_CODE)
     if isinstance(e, ForbiddenError):
@@ -200,7 +203,7 @@ def exception_envelope(e: Exception) -> dict:
         # some of its documents went, keeps its hint and details.
         return err(str(e), code=PERMISSION_DENIED, hint=e.hint, **(e.details or {}))
     if isinstance(e, NotFoundError):
-        return err(str(e), code=NOT_FOUND)
+        return err(str(e), code=NOT_FOUND, hint=e.hint, **(e.details or {}))
     if isinstance(e, ConflictError):
         if e.code == VAULT_NAME_UNAVAILABLE:
             return err(str(e), code=VAULT_NAME_UNAVAILABLE)

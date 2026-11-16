@@ -250,3 +250,24 @@ def test_a_conflict_after_documents_went_keeps_its_details(client, monkeypatch):
     assert response.status_code == 409
     body = response.json()
     assert (body["code"], body["details"], body["hint"]) == ("conflict", details, "send it again")
+
+
+def test_a_busy_vault_after_documents_went_keeps_its_details_and_retry(client, monkeypatch):
+    """The Vault's event lock timing out after documents went answers 429
+    with Retry-After and what the delete did."""
+    from app.exceptions import TransientDependencyError
+
+    error = TransientDependencyError(
+        code="write_busy", message="busy", status_code=429, hint="retry", retry_after_secs=1,
+    )
+    error.details = {"partially_applied": True, "deleted_docs": 1}
+
+    async def _delete(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(collections.collection_service, "delete", _delete)
+    response = client.delete("/api/v1/collections/reef/notes", params={"recursive": "true"})
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "1"
+    body = response.json()
+    assert (body["code"], body["details"]) == ("write_busy", {"partially_applied": True, "deleted_docs": 1})

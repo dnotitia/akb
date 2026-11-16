@@ -24,8 +24,7 @@ import asyncpg
 import pytest
 from git import Repo
 
-from app.db.transient import transient_error
-from app.exceptions import ConflictError, ForbiddenError, NotFoundError
+from app.exceptions import ConflictError, ForbiddenError, NotFoundError, TransientDependencyError
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.events_repo import emit_event
 from app.services import collection_service as collection_service_module
@@ -100,8 +99,9 @@ async def _deletes_committed_with_their_events(pool, vault_id: uuid.UUID) -> boo
 async def test_a_failure_after_the_first_document_is_completed_by_a_retry(monkeypatch):
     """Once the delete has removed its first document, another transaction
     holds the Vault's event lock past the deadline. The second document's
-    delete rolls back with its event and the request fails with `write_busy`;
-    the first stays deleted, with its event. Run again after the lock is free,
+    delete rolls back with its event and the request fails with `write_busy`,
+    which says what this request deleted, over MCP as over REST; the first
+    document stays deleted, with its event. Run again after the lock is free,
     the delete removes the second document and the collection."""
     async with _fresh_database() as pool:
         vault = "native-converge-busy"
@@ -124,10 +124,11 @@ async def test_a_failure_after_the_first_document_is_completed_by_a_retry(monkey
 
                 monkeypatch.setattr(collection_service_module, "_delete_native_document", busy_after_the_first)
                 started = time.monotonic()
-                with pytest.raises(asyncpg.LockNotAvailableError) as failure:
+                with pytest.raises(TransientDependencyError) as failure:
                     await asyncio.wait_for(
                         CollectionService(git=object()).delete(
                             vault=vault, path="notes", recursive=True, agent_id="tester",
+                            disclose_paths=True,
                         ),
                         timeout=_EVENT_LOCK_WAIT_SECONDS * 3,
                     )
@@ -136,8 +137,15 @@ async def test_a_failure_after_the_first_document_is_completed_by_a_retry(monkey
                 await holding.__aexit__(None, None, None)
             monkeypatch.setattr(collection_service_module, "_delete_native_document", delete_document)
 
-        mapped = transient_error(failure.value)
-        assert mapped is not None and (mapped.status_code, mapped.code) == (429, WRITE_BUSY)
+        assert isinstance(failure.value.__cause__, asyncpg.LockNotAvailableError)
+        assert (failure.value.status_code, failure.value.code, failure.value.retry_after_secs) == (
+            429, WRITE_BUSY, 1,
+        )
+        progress = {"partially_applied": True, "deleted_docs": 1, "deleted_uris": [doc_uri(vault, "notes/a.md")]}
+        assert failure.value.details == progress
+        envelope = exception_envelope(failure.value)
+        assert (envelope["code"], envelope["details"]) == (WRITE_BUSY, {"retry_after_secs": 1, **progress})
+        assert "committed deletions for" in envelope["hint"]
         assert waited >= _EVENT_LOCK_WAIT_SECONDS - 0.5
         assert await _state(pool, vault_id) == {
             "documents": [("notes/a.md", "deleted"), ("notes/b.md", "live")],
@@ -1016,3 +1024,175 @@ async def test_a_stale_final_claim_does_not_abandon_the_reopened_intent(monkeypa
         await _drain(worker)
         assert await _last_outcome(pool, first) == "deleted"
         assert (await _derived(pool, first))["chunks"] == []
+
+
+async def test_collections_changing_after_the_documents_went_says_what_it_deleted(monkeypatch):
+    """`p` has no collection row; `p/old` holds a Native document. The delete
+    deletes the document, and then another request creates a collection under
+    `p` between each read and lock of the collections, three times: the
+    delete gives up with a conflict. The conflict says what this request
+    deleted, as every error after its first document does, and keeps its own
+    code."""
+    async with _fresh_database() as pool:
+        vault = "native-collections-churn"
+        monkeypatch.setattr(document_counters, "native_documents_are_authoritative", lambda: True)
+        vault_id = await _make_vault(pool, vault)
+        native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        await native.create_text(
+            namespace_id=vault_id, surface="document", path="p/old/a.md",
+            payload="body", actor="tester", mutation_id=uuid.uuid4(),
+        )
+        await CollectionRepository(pool).get_or_create(vault_id, "p/old")
+        lock_rows = collection_service_module.lock_collection_rows
+        created: list[str] = []
+
+        async def a_collection_appears(conn, ids, **kwargs):
+            locked = await lock_rows(conn, ids, **kwargs)
+            path = f"p/new-{len(created)}"
+            await CollectionRepository(pool).get_or_create(vault_id, path)
+            created.append(path)
+            return locked
+
+        monkeypatch.setattr(collection_service_module, "lock_collection_rows", a_collection_appears)
+        with pytest.raises(ConflictError) as churned:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="p", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert "kept changing" in str(churned.value)
+        assert churned.value.details == {
+            "partially_applied": True, "deleted_docs": 1, "deleted_uris": [doc_uri(vault, "p/old/a.md")],
+        }
+        envelope = exception_envelope(churned.value)
+        assert (envelope["code"], envelope["details"]["deleted_docs"]) == ("conflict", 1)
+        assert "committed deletions for" in envelope["hint"]
+
+
+async def test_a_table_drop_refused_by_a_dependency_says_what_it_deleted(monkeypatch):
+    """An admin's recursive delete of `notes` deletes its documents and then
+    cannot drop its table, which another table references: a conflict, which
+    says what this request deleted."""
+    async with _fresh_database() as pool:
+        vault = "native-dependent-table"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        await _late_table(pool, vault, vault_id, "notes")
+        target = table_data_repo.pg_table_name(vault, "late")
+        await pool.execute("CREATE TABLE dependent_rows (late_id uuid REFERENCES " + target + "(id))")
+        with pytest.raises(ConflictError) as refused:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", allow_table_delete=True,
+            )
+        assert "referenced by another vault table" in str(refused.value)
+        assert refused.value.details == {"partially_applied": True, "deleted_docs": 2}
+        assert "2 document(s)" in refused.value.hint
+        assert (await _state(pool, vault_id))["documents"] == [(path, "deleted") for path in _PATHS]
+
+
+async def test_a_document_restored_and_deleted_again_counts_once(monkeypatch):
+    """The delete deleted `notes/a.md` and `notes/b.md`; before its last
+    transaction another request restored `notes/a.md`, so the delete's next
+    round deleted it again. The response counts two documents, as does the
+    `collection.delete` event: the same document deleted twice counts once."""
+    async with _fresh_database() as pool:
+        vault = "native-deleted-twice"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        last_transaction = CollectionService._delete_collections
+        restored: list[bool] = []
+
+        async def restore_once(self, **kwargs):
+            if not restored:
+                restored.append(True)
+                row = await pool.fetchrow(
+                    "SELECT resource_id, head_revision_id FROM native_resources "
+                    "WHERE namespace_id = $1 AND current_path = $2",
+                    vault_id, _PATHS[0],
+                )
+                await native.restore_text(
+                    namespace_id=vault_id, surface="document", path=_PATHS[0], payload="restored",
+                    actor="other", mutation_id=uuid.uuid4(), expected_revision_id=row["head_revision_id"],
+                    expected_resource_id=row["resource_id"],
+                )
+            return await last_transaction(self, **kwargs)
+
+        monkeypatch.setattr(CollectionService, "_delete_collections", restore_once)
+        result = await CollectionService(git=object()).delete(
+            vault=vault, path="notes", recursive=True, agent_id="tester",
+        )
+        assert result["deleted_docs"] == 2
+        payload = await pool.fetchval(
+            "SELECT payload FROM events WHERE vault_id = $1 AND kind = 'collection.delete'", vault_id,
+        )
+        assert '"deleted_docs": 2' in payload
+
+
+async def test_a_recursive_delete_alongside_a_vault_delete_does_not_deadlock(tmp_path, monkeypatch):
+    """A Vault delete has locked the Vault and deleted its edges when a
+    recursive delete of `notes` starts; the Vault delete then deletes the Vault,
+    which cascades to its Resources. Each per-document transaction of the
+    recursive delete locks the Vault before the Resource, as every child
+    write does, so it waits for the Vault delete instead of holding a Resource
+    the cascade needs: the Vault delete completes, and the recursive delete
+    fails because the Vault is gone. Locking the Resource first made the two
+    wait for each other until PostgreSQL ended one with a deadlock."""
+    from app.config import settings
+    from app.services import access_service, index_service
+
+    monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
+    async with _fresh_database() as pool:
+        vault = "native-vault-delete-race"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        await native.create_text(
+            namespace_id=vault_id, surface="document", path="other/c.md",
+            payload="body of other/c.md", actor="tester", mutation_id=uuid.uuid4(),
+        )
+        await _link(vault, _PATHS[0], "other/c.md")
+        admin = await pool.fetchval(
+            "INSERT INTO users (id, username, email, password_hash, is_admin) "
+            "VALUES ($1, 'race-admin', 'race-admin@example.com', '!fixture!', TRUE) RETURNING id",
+            uuid.uuid4(),
+        )
+
+        class _NoRoles:
+            def __getattr__(self, _name):
+                async def nothing(*_args, **_kwargs):
+                    return None
+                return nothing
+
+        monkeypatch.setattr(access_service, "get_role_sync", lambda: _NoRoles())
+        edges_gone, resume = asyncio.Event(), asyncio.Event()
+        drop_chunks = index_service.delete_vault_chunks
+
+        async def pause_after_the_edges(conn, vid):
+            edges_gone.set()
+            await resume.wait()
+            return await drop_chunks(conn, vid)
+
+        monkeypatch.setattr(index_service, "delete_vault_chunks", pause_after_the_edges)
+        deleting_vault = asyncio.create_task(access_service.delete_vault(str(admin), vault))
+        await asyncio.wait_for(edges_gone.wait(), timeout=10)
+        deleting_notes = asyncio.create_task(CollectionService(git=object()).delete(
+            vault=vault, path="notes", recursive=True, agent_id="tester",
+        ))
+
+        async def waiting_for_a_lock() -> None:
+            # A row lock wait is on the holder's transaction id, which
+            # pg_locks does not tie to a database: read the waiter instead.
+            while not await pool.fetchval(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND wait_event_type = 'Lock'"
+            ):
+                await asyncio.sleep(0.02)
+
+        try:
+            await asyncio.wait_for(waiting_for_a_lock(), timeout=10)
+        finally:
+            resume.set()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(deleting_vault, deleting_notes, return_exceptions=True), timeout=30,
+        )
+        print(f"\nvault delete: {outcomes[0]!r}; recursive delete: {outcomes[1]!r}")
+        assert not any(isinstance(o, asyncpg.DeadlockDetectedError) for o in outcomes), outcomes
+        assert not isinstance(outcomes[0], BaseException), outcomes[0]
+        assert await pool.fetchval("SELECT count(*) FROM vaults WHERE id = $1", vault_id) == 0
+        assert isinstance(outcomes[1], ConflictError), outcomes[1]
