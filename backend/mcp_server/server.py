@@ -25,7 +25,7 @@ from typing import Any
 from pydantic import ValidationError as ModelValidationError
 
 from app.mcp_monitoring.collector import observe_tool
-from app.mcp_monitoring.errors import capture_error_code
+from app.mcp_monitoring.errors import capture_error_code, capture_missing_browse_target, capture_required_scope, capture_unknown_argument
 from app.mcp_monitoring.usage import measure_result
 from app.util.git_refs import HEX_COMMIT_RE
 
@@ -923,6 +923,7 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
     else:
         vault_arg = args.get("vault")
         if not vault_arg:
+            capture_missing_browse_target()
             return err("Either `vault` or `uri` is required for akb_browse.", code=INVALID_ARGUMENT)
         vault = vault_arg
         collection = args.get("collection")
@@ -2101,6 +2102,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     if user.oauth_scopes is not None:
         required = _call_scope(name, args, user)
         if required not in user.oauth_scopes:
+            capture_required_scope(required)
             return err(
                 f"OAuth token is missing required scope '{required}' for tool '{name}'",
                 code=INSUFFICIENT_SCOPE,
@@ -2111,6 +2113,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
         required = _call_scope(name, args, user)
         required_token_scope = "write" if required == _WRITE_SCOPE else "read"
         if not token_has_scope(user.token_scopes, required_token_scope):
+            capture_required_scope(required_token_scope)
             return err(
                 f"Token scope is missing required scope '{required_token_scope}' for tool '{name}'",
                 code=INSUFFICIENT_SCOPE,
@@ -2128,6 +2131,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
         unknown = [k for k in args if k not in allowed]
         if unknown:
             bad = unknown[0]
+            capture_unknown_argument(bad, allowed)
             return err(
                 f"Unknown argument '{bad}' for {name}",
                 code=UNKNOWN_ARGUMENT,

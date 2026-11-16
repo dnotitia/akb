@@ -32,6 +32,7 @@ export interface MonitoringRow extends MonitoringMetrics, CredentialInfo {
 export interface FailureDetail {
   error_code: string | null;
   error_reason: string | null;
+  error_diagnostic?: string | null;
 }
 
 export interface RecentCall extends CredentialInfo, FailureDetail {
@@ -68,7 +69,7 @@ export interface McpOperation extends FailureDetail {
 }
 
 export interface OperationDetails {
-  calls: (Pick<RecentCall, "observation_id" | "tool" | "error_code" | "error_reason" | "outcome" | "finished_at" | "duration_ms" | "trace_available"> & {
+  calls: (Pick<RecentCall, "observation_id" | "tool" | "error_code" | "error_reason" | "error_diagnostic" | "outcome" | "finished_at" | "duration_ms" | "trace_available"> & {
     position: number;
     started_at: string;
   })[];
@@ -99,7 +100,7 @@ export interface MonitoringReport extends Record<Breakdown, MonitoringRow[]> {
   summary: MonitoringMetrics;
   window: { from: string; to: string };
   collection: { enabled: boolean; retention_days: number; started_at: string | null; error_codes_supported_from?: string | null; last_flush: string | null; dropped: number; stale_writers: number; disabled_writers: number };
-  series: { start: string; calls: number | null; coverage: "complete" | "partial" | "unmeasured" }[];
+  series: { start: string; calls: number | null; succeeded?: number | null; failed?: number | null; coverage: "complete" | "partial" | "unmeasured" }[];
   has_more: Record<Breakdown, boolean>;
 }
 

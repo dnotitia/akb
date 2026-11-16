@@ -37,6 +37,7 @@ class BreakdownRow(Metrics, CredentialInfo):
 class FailureDetail(TypedDict):
     error_code: str | None
     error_reason: str | None
+    error_diagnostic: str | None
 
 
 class RecentCall(CredentialInfo, FailureDetail):
@@ -54,6 +55,8 @@ class RecentCall(CredentialInfo, FailureDetail):
 
 
 class Interval(TypedDict):
+    succeeded: int | None
+    failed: int | None
     start: datetime
     calls: int | None
     coverage: Literal["complete", "partial", "unmeasured"]

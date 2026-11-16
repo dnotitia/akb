@@ -12,16 +12,16 @@ function Status({ tone, label }: { tone: "ok" | "error" | "cancelled" | "unknown
 
 type CodeHistory = { codesSince?: string | null };
 
-function ErrorReason({ error_code, error_reason, finished_at, codesSince }: FailureDetail & CodeHistory & { finished_at: string }) {
+function ErrorReason({ error_code, error_reason, error_diagnostic, finished_at, codesSince }: FailureDetail & CodeHistory & { finished_at: string }) {
   const beforeCollection = codesSince && Date.parse(finished_at) < Date.parse(codesSince);
   return <div className="mt-1 max-w-72 whitespace-normal text-xs leading-5 text-foreground-muted">
-    {error_code ? <><code className="break-all font-medium text-foreground">{error_code}</code>{error_reason && <p>{error_reason}</p>}</>
+    {error_code ? <><code className="break-all font-medium text-foreground">{error_code}</code>{(error_diagnostic || error_reason) && <p>{error_diagnostic || error_reason}</p>}</>
       : beforeCollection ? <>This call predates error-code collection, available from <time dateTime={codesSince}>{new Date(codesSince).toLocaleString()}</time>.</>
         : "AKB recorded the failure without an error code."}
   </div>;
 }
 
-export function CallOutcome({ call, codesSince }: CodeHistory & { call: Pick<RecentCall, "finished_at" | "outcome" | "error_code" | "error_reason"> }) {
+export function CallOutcome({ call, codesSince }: CodeHistory & { call: Pick<RecentCall, "finished_at" | "outcome" | "error_code" | "error_reason" | "error_diagnostic"> }) {
   const failed = call.outcome === "tool_error" || call.outcome === "rpc_error";
   return <><Status tone={failed ? "error" : call.outcome === "ok" ? "ok" : call.outcome === "cancelled" ? "cancelled" : "unknown"}
     label={outcomes[call.outcome]} />{failed && <ErrorReason {...call} codesSince={codesSince} />}</>;

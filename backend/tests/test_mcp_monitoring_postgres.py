@@ -387,13 +387,13 @@ async def test_failure_history_preserves_full_sequences_and_ranks_before_paging(
         actor, job = uuid4(), uuid4()
         base = Observation(uuid4(), start, actor, "human", "oauth", None, "akb_browse", "tool_error", 22,
                            started_at=start, conversation_key=job, conversation_agent="fixture",
-                           error_code="permission_denied")
+                           error_code="invalid_argument", error_diagnostic="Provide either vault or uri.")
         writer = Collector()
         writer.queue.append(base)
-        writer.queue.append(base._replace(observation_id=uuid4(), outcome="ok", error_code=None))
+        writer.queue.append(base._replace(observation_id=uuid4(), outcome="ok", error_code=None, error_diagnostic=None))
         for i in range(55):
             writer.queue.append(base._replace(observation_id=uuid4(), finished_at=start + timedelta(seconds=i + 1),
-                                              tool="akb_help", outcome="ok", duration_ms=1, error_code=None,
+                                              tool="akb_help", outcome="ok", duration_ms=1, error_code=None, error_diagnostic=None,
                                               conversation_key=None, conversation_agent=None))
         await writer.flush()
         end = datetime.now(UTC)
@@ -402,10 +402,20 @@ async def test_failure_history_preserves_full_sequences_and_ranks_before_paging(
         available = await pool.fetchval("SELECT applied_at FROM schema_migrations WHERE filename='138_mcp_call_error_code.py'")
         assert available and report["collection"]["error_codes_supported_from"] == available
         assert report["summary"]["calls"] == 57
+        assert sum(i["succeeded"] or 0 for i in report["series"]) == 56
+        assert sum(i["failed"] or 0 for i in report["series"]) == 1
         assert [r["tool"] for r in report["tools"]] == ["akb_browse", "akb_help"]
         [failed] = report["recent_calls"]
-        assert failed["error_code"] == "permission_denied" and failed["error_reason"]
+        assert failed["error_code"] == "invalid_argument" and failed["error_reason"]
+        assert failed["error_diagnostic"] == base.error_diagnostic
         [operation] = report["operations"]
         assert (operation["id"], operation["calls"], operation["succeeded"], operation["errors"]) == (job, 2, 1, 1)
         seq = await read_operation_calls(*args, job, 0, "conversation")
-        assert {r["error_code"] for r in seq["calls"]} == {"permission_denied", None}
+        assert {(r["error_code"], r["error_diagnostic"]) for r in seq["calls"]} == {
+            ("invalid_argument", base.error_diagnostic), (None, None),
+        }
+        writer.queue.append(base._replace(observation_id=uuid4(), conversation_key=None, conversation_agent=None))
+        await writer.flush()
+        report = await read_report(*args, 0, 0, 0, history_errors_only=True)
+        single = next(op for op in report["operations"] if op["calls"] == 1)
+        assert single["error_diagnostic"] == base.error_diagnostic

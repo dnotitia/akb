@@ -2329,3 +2329,33 @@ input:focus-visible + .settings-theme-option { outline: 3px solid var(--color-ri
   .tab-manager-current > span { display: none; }
   .tab-manager-footer > span { display: none; }
 }
+
+/* Keep the trace action in the row, including when a tool name or diagnostic wraps. */
+.mcp-operations { container: mcp-operations / inline-size; }
+.mcp-operations table { table-layout: fixed; overflow-wrap: anywhere; }
+.mcp-failed-bar {
+  background-image: repeating-linear-gradient(135deg, transparent 0 4px, color-mix(in srgb, var(--color-surface) 34%, transparent) 4px 6px);
+}
+
+@container mcp-operations (max-width: 56rem) {
+  .mcp-operations :is(table, tbody, .mcp-expanded, .mcp-expanded > td) { display: block; }
+  .mcp-operations colgroup { display: none; }
+  .mcp-operations thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .mcp-operation-row, .mcp-call-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: .5rem .75rem;
+    padding: .875rem 1rem;
+  }
+  .mcp-call-row { border-top: 1px solid var(--color-border); }
+  .mcp-operations td[data-label] { min-width: 0; padding: 0; }
+  .mcp-operations td[data-label]::before {
+    display: block; content: attr(data-label); color: var(--color-foreground-muted);
+    font-size: .75rem; line-height: 1.25rem;
+  }
+  .mcp-operations td[data-label="Tempo trace"] { grid-area: 1 / 2; justify-self: end; }
+  .mcp-operation-row td[data-label="Operation"], .mcp-call-row td[data-label="Tool"] { grid-area: 1 / 1; font-weight: 600; }
+  .mcp-operations td[data-label="Outcome"] { grid-column: 1 / -1; }
+  .mcp-operations td[data-label="Outcome"] > div { max-width: none; }
+}

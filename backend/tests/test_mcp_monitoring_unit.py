@@ -73,6 +73,25 @@ async def test_concurrent_failures_keep_only_their_own_catalog_codes(monkeypatch
     assert "sensitive" not in repr(recorder.queue)
 
 
+def test_diagnostics_persist_only_schema_derived_corrections_and_required_scopes():
+    from app.mcp_monitoring.errors import (
+        CallFailure, capture_error_code, capture_required_scope, capture_unknown_argument, current_failure,
+    )
+    with current_failure.set(failure := CallFailure()):
+        capture_unknown_argument("secret-value-in-a-key", {"topic"})
+        capture_required_scope("secret-value-in-a-scope")
+        assert failure == CallFailure()
+        capture_unknown_argument("toipc", {"topic"})
+        capture_error_code("unknown_argument")
+        assert failure.diagnostic == "Suggested correction: toipc → topic."
+        capture_unknown_argument("topicXYZ", {"topic"})
+        assert failure.diagnostic == "Suggested argument: topic."
+        capture_error_code("internal")
+        assert failure.diagnostic is None
+        capture_required_scope("write")
+        assert failure.diagnostic == "Required token scope: write."
+
+
 def test_export_uses_only_catalog_values_and_trace_ids():
     ctx = SpanContext(1, 2, True, trace.TraceFlags(1), TraceState([("fixture", "private-input")]))
     span = ReadableSpan(

@@ -39,7 +39,7 @@ _REPORT = _FILTERED + _PAT_STATUS + Path(__file__).with_name("report.sql").read_
 _RECENT = """
 WITH recent AS (
     SELECT observation_id, finished_at, actor_id, auth_kind, pat_id, tool, outcome, duration_ms,
-           error_code, trace_id IS NOT NULL AS trace_available
+           error_code, error_diagnostic, trace_id IS NOT NULL AS trace_available
     FROM mcp_monitoring.tool_calls
 """ + _WHERE + """
       AND (NOT $10::boolean OR outcome IN ('tool_error','rpc_error'))
@@ -47,7 +47,7 @@ WITH recent AS (
 )
 """ + _PAT_STATUS + """
 SELECT r.observation_id, r.finished_at, r.actor_id, r.auth_kind, r.pat_id, r.tool, r.outcome, r.duration_ms,
-       r.error_code, r.trace_available, coalesce(nullif(u.display_name,''),u.username) AS user_label, t.name AS pat_label,
+       r.error_code, r.error_diagnostic, r.trace_available, coalesce(nullif(u.display_name,''),u.username) AS user_label, t.name AS pat_label,
        t.status AS credential_status, t.expires_at AS pat_expires_at
 FROM recent r
 LEFT JOIN users u ON u.id=r.actor_id
@@ -59,7 +59,7 @@ ORDER BY r.finished_at DESC, r.observation_id DESC
 # singleton has no evidence of a caller-supplied context and stays individual.
 _OPERATION_CALLS = """
 WITH operation_calls AS (
-    SELECT observation_id, actor_id, tool, outcome, error_code, duration_ms, finished_at,
+    SELECT observation_id, actor_id, tool, outcome, error_code, error_diagnostic, duration_ms, finished_at,
            coalesce(started_at, finished_at - duration_ms * interval '1 millisecond') AS call_start,
            coalesce(conversation_key, CASE WHEN started_at IS NULL THEN trace_id
                                           ELSE coalesce(request_trace_id, agent_turn_id) END) AS correlation_id,
@@ -80,6 +80,7 @@ _OPERATIONS = _OPERATION_CALLS + """
            count(*) FILTER (WHERE trace_available) AS trace_calls,
            count(*) FILTER (WHERE outcome='cancelled') AS cancelled,
            CASE WHEN count(*)=1 THEN min(error_code) END AS error_code,
+           CASE WHEN count(*)=1 THEN min(error_diagnostic) END AS error_diagnostic,
            CASE WHEN count(*)=1 AND bool_or(trace_available) THEN min(observation_id::text)::uuid END AS trace_observation_id,
            count(*) AS calls, min(call_start) AS started_at, max(finished_at) AS finished_at,
            bool_or(propagated) OR count(*) > 1 AS correlated, CASE WHEN count(*)=1 THEN min(tool) END AS tool
@@ -89,14 +90,14 @@ _OPERATIONS = _OPERATION_CALLS + """
     ORDER BY finished_at DESC, actor_id, correlation_id NULLS LAST, group_kind, individual_id LIMIT $9 OFFSET $10
 )
 SELECT p.id, p.actor_id, coalesce(nullif(u.display_name,''),u.username) AS user_label,
-       p.calls, p.errors, p.succeeded, p.cancelled, p.trace_calls, p.error_code, p.trace_observation_id, p.started_at, p.finished_at, p.correlated, p.tool,
+       p.calls, p.errors, p.succeeded, p.cancelled, p.trace_calls, p.error_code, p.error_diagnostic, p.trace_observation_id, p.started_at, p.finished_at, p.correlated, p.tool,
        CASE WHEN p.correlated THEN p.group_kind ELSE 'individual' END AS kind, p.agent,
        floor(extract(epoch FROM (p.finished_at - p.started_at))*1000)::bigint AS elapsed_ms
 FROM page p LEFT JOIN users u ON u.id=p.actor_id
 ORDER BY p.finished_at DESC, p.actor_id, p.correlation_id NULLS LAST, p.group_kind, p.individual_id
 """
 _OPERATION_DETAIL = _OPERATION_CALLS + """
-SELECT observation_id, tool, outcome, error_code, call_start AS started_at, finished_at, duration_ms, trace_available AND $13 AS trace_available,
+SELECT observation_id, tool, outcome, error_code, error_diagnostic, call_start AS started_at, finished_at, duration_ms, trace_available AND $13 AS trace_available,
        row_number() OVER (ORDER BY call_start, finished_at, observation_id) AS position
 FROM operation_calls WHERE correlation_id=$9 AND group_kind=$12
 ORDER BY call_start, finished_at, observation_id LIMIT $10 OFFSET $11
@@ -259,7 +260,7 @@ async def read_report(
         if kind == "summary":
             summary = metrics
         elif kind == "series":
-            series_by_time[row["bucket"]] = row["calls"]
+            series_by_time[row["bucket"]] = (row["calls"], row["decided"] - row["errors"], row["errors"])
         else:
             more[kind] = row["has_more"]
             groups[kind].append(
@@ -283,9 +284,11 @@ async def read_report(
         covered = sum(
             (max(timedelta(), min(r["hi"], upper) - max(r["lo"], bucket, retained)) for r in coverage), timedelta()
         )
-        count = series_by_time.get(bucket, 0)
+        count, succeeded, failed = series_by_time.get(bucket, (0, 0, 0))
         status = "complete" if covered == upper - bucket else "partial" if covered or count else "unmeasured"
-        series.append({"start": bucket, "calls": count if status != "unmeasured" else None, "coverage": status})
+        measured = status != "unmeasured"
+        series.append({"start": bucket, "coverage": status, "calls": count if measured else None,
+                       "succeeded": succeeded if measured else None, "failed": failed if measured else None})
         bucket = upper
     # Compatibility projections for clients using the original report response.
     search = panels.get(("akb_search", "empty_results"), {})

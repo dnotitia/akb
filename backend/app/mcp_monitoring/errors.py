@@ -1,7 +1,8 @@
-"""Store catalogued failure codes only. Messages and envelope details can contain user data."""
+"""Bounded monitoring diagnostics built from server-owned names and scope constants."""
 
 from contextvars import ContextVar
 from dataclasses import dataclass
+from difflib import get_close_matches
 
 from app.util import errors
 
@@ -62,6 +63,7 @@ REASONS = {
 @dataclass(slots=True)
 class CallFailure:
     code: str | None = None
+    diagnostic: str | None = None
 
 
 # The SDK may serialize the handler result or delegate to a child task before
@@ -69,7 +71,41 @@ class CallFailure:
 current_failure = ContextVar[CallFailure | None]("mcp_monitoring_failure", default=None)
 
 
-def capture_error_code(code: object) -> None:
+def _capture(code: object, diagnostic: str | None = None) -> None:
     failure = current_failure.get()
     if failure is not None and isinstance(code, str) and len(code) <= 64 and code in REASONS:
+        if failure.code != code or diagnostic is not None:
+            failure.diagnostic = diagnostic
         failure.code = code
+
+
+def capture_error_code(code: object) -> None:
+    _capture(code)
+
+
+def capture_missing_browse_target() -> None:
+    _capture(errors.INVALID_ARGUMENT, "Provide either vault or uri.")
+
+
+def capture_required_scope(scope: str) -> None:
+    if scope in ("read", "write"):
+        _capture(errors.INSUFFICIENT_SCOPE, f"Required token scope: {scope}.")
+    elif scope in ("akb:vault:read", "akb:vault:write"):
+        _capture(errors.INSUFFICIENT_SCOPE, f"Required OAuth scope: {scope}.")
+
+
+def capture_unknown_argument(bad: str, catalog_names: set[str]) -> None:
+    # Unknown keys are arbitrary client data. Reconstruct a recognized transposition
+    # from the schema. For other close matches, only the public schema name is safe.
+    if current_failure.get() is None or len(bad) > 64:
+        return
+    matches = get_close_matches(bad, sorted(name for name in catalog_names if len(name) <= 64), n=1, cutoff=0.6)
+    if not matches:
+        return
+    name = matches[0]
+    for i in range(len(name) - 1):
+        swapped = name[:i] + name[i + 1] + name[i] + name[i + 2:]
+        if swapped == bad:
+            _capture(errors.UNKNOWN_ARGUMENT, f"Suggested correction: {swapped} → {name}.")
+            return
+    _capture(errors.UNKNOWN_ARGUMENT, f"Suggested argument: {name}.")

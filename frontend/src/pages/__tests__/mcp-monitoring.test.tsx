@@ -28,7 +28,7 @@ const report: MonitoringReport = {
     auth_kind: "pat", pat_id: "01234567-abcd", pat_label: "Desktop", tool: "akb_help", outcome: "ok", duration_ms: i, trace_available: false,
   })), summary, window: { from: "2026-01-01T00:00:00Z", to: "2026-01-02T00:00:00Z" },
   collection: { enabled: true, retention_days: 30, started_at: null, last_flush: null, dropped: 0, stale_writers: 0, disabled_writers: 0 },
-  series: [{ start: "2026-01-01T00:00:00Z", calls: 3, coverage: "complete" }],
+  series: [{ start: "2026-01-01T00:00:00Z", calls: 3, succeeded: 2, failed: 1, coverage: "complete" }],
   users: [{ ...base, user_id: "user-1", label: "Fixture user" }],
   credentials: [{ ...base, auth_kind: "pat", pat_id: "01234567-abcd", label: "Desktop" }],
   tools: [{ ...base, tool: "akb_help" }], has_more: { users: false, tools: false, credentials: false },
@@ -85,6 +85,16 @@ it("shows current PAT state separately from the last authenticated SSO call", as
   await userEvent.click(screen.getByRole("tab", { name: "Recent calls" }));
   const recent = within(await screen.findByRole("table", { name: "Recent calls" }));
   expect(recent.getByRole("row", { name: /PAT · 01234567/ })).toHaveTextContent("Deleted");
+});
+
+it("exposes outcome counts on focus and rescales the chart to failures", async () => {
+  vi.mocked(getMcpMonitoring).mockResolvedValue(report);
+  renderPage();
+  const interval = within(await screen.findByRole("group", { name: "Call intervals" })).getByRole("button");
+  await userEvent.click(interval);
+  expect(screen.getByRole("tooltip")).toHaveTextContent("Succeeded: 2 · Failed: 1");
+  await userEvent.click(screen.getByRole("checkbox", { name: "Show failures only" }));
+  expect(screen.getByText("Scale 0–1 call")).toBeVisible();
 });
 
 it("shows an unmeasured interval separately from a measured zero", async () => {

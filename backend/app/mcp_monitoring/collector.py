@@ -118,6 +118,7 @@ class Observation(NamedTuple):
     conversation_key: UUID | None = None
     conversation_agent: str | None = None
     error_code: str | None = None
+    error_diagnostic: str | None = None
 
 
 class Collector:
@@ -158,6 +159,7 @@ class Collector:
         parent = _request_trace_id(ctx)
         actor = UUID(user.user_id)
         conversation, agent = _conversation(ctx, actor)
+        failure = current_failure.get() if outcome in ("tool_error", "rpc_error") else None
         self.queue.append(
             Observation(
                 uuid4(),
@@ -177,7 +179,8 @@ class Collector:
                 _agent_turn_id(ctx.meta or {}) if parent is None else None,
                 conversation,
                 agent,
-                failure.code if outcome in ("tool_error", "rpc_error") and (failure := current_failure.get()) else None,
+                failure.code if failure else None,
+                failure.diagnostic if failure else None,
             )
         )
 
@@ -209,8 +212,8 @@ class Collector:
                     """
                     INSERT INTO mcp_monitoring.tool_calls
                         (observation_id,finished_at,actor_id,account_kind,auth_kind,pat_id,tool,outcome,duration_ms,trace_id,span_id,
-                         usage,started_at,request_trace_id,agent_turn_id,conversation_key,conversation_agent,error_code)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT (observation_id) DO NOTHING
+                         usage,started_at,request_trace_id,agent_turn_id,conversation_key,conversation_agent,error_code,error_diagnostic)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) ON CONFLICT (observation_id) DO NOTHING
                 """,
                     batch,
                 )
