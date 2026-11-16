@@ -1684,3 +1684,63 @@ async def test_a_file_whose_resource_is_gone_keeps_the_delete_progress_over_rest
             "deleted_uris": [doc_uri(vault, path) for path in _PATHS],
         }), body
         assert "committed deletions for" in body["hint"], body
+
+
+async def test_a_last_step_whose_commit_answer_is_lost_is_reported_as_uncertain(monkeypatch):
+    """Both documents went. The delete's last transaction then commits the
+    collection's deletion with `collection.delete`, and the answer to its
+    COMMIT is lost with the connection: the transaction's exit raises. The
+    error says, beside the documents the request deleted, that the last
+    step's outcome is unknown (`final_step_uncertain`), and its hint says
+    what that step covers. It used to report only the documents."""
+    async with _fresh_database() as pool:
+        vault = "native-last-commit-unanswered"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        armed: list[bool] = []
+        fired: list[bool] = []
+        lock_rows = collection_service_module.lock_collection_rows
+
+        async def lock_in_the_last_transaction(*args, **kwargs):
+            armed.append(True)
+            return await lock_rows(*args, **kwargs)
+
+        class _Acquire:
+            def __init__(self) -> None:
+                self._acquired = pool.acquire()
+
+            async def __aenter__(self):
+                return _Connection(await self._acquired.__aenter__(), armed, fired)
+
+            async def __aexit__(self, *exc):
+                return await self._acquired.__aexit__(*exc)
+
+        class _Pool:
+            def acquire(self):
+                return _Acquire()
+
+        async def get_pool():
+            return _Pool()
+
+        monkeypatch.setattr(collection_service_module, "lock_collection_rows", lock_in_the_last_transaction)
+        monkeypatch.setattr(collection_service_module, "get_pool", get_pool)
+        with pytest.raises(TransientDependencyError) as failure:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert fired
+        assert isinstance(failure.value.__cause__, ConnectionResetError)
+        assert failure.value.details == {
+            "partially_applied": True, "deleted_docs": 2,
+            "deleted_uris": [doc_uri(vault, path) for path in _PATHS],
+            "final_step_uncertain": True,
+        }
+        hint = failure.value.hint
+        assert "last step" in hint and "collection.delete" in hint and "Files and tables" in hint, hint
+        envelope = exception_envelope(failure.value)
+        assert envelope["details"]["final_step_uncertain"] is True
+        # It did commit.
+        assert await _state(pool, vault_id) == {
+            "documents": [(path, "deleted") for path in _PATHS],
+            "collections": [],
+            "events": ["document.delete", "document.delete", "collection.delete"],
+        }

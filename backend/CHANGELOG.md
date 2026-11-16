@@ -25,9 +25,11 @@ specifically; the proxy has its own log in
   too. A deletion counts as soon as its transaction commits, even if the
   connection then fails to reset; one whose COMMIT went unanswered is counted
   apart as `uncertain_docs` (and `uncertain_uris` for a reader), with a hint
-  that its outcome is unknown. Once the last transaction has committed, a
-  failure while giving its connection back is logged and the delete answers
-  with its result.
+  that its outcome is unknown, and a last transaction whose COMMIT went
+  unanswered adds `final_step_uncertain: true` and a hint naming what that
+  step deletes. Once the last transaction has committed, a failure while
+  giving its connection back is logged and the delete answers with its
+  result.
   `deleted_docs` counts a document restored and deleted again by the same
   call once. A writer's
   delete refused at a table that another request created under the prefix

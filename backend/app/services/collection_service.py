@@ -134,19 +134,23 @@ RETAINED_COLLECTIONS_HINT = (
 
 @dataclass
 class _Deletions:
-    """What a recursive delete's document transactions did.
+    """What a recursive delete's transactions did.
 
-    ``committed`` holds the Resource and path of each deletion whose
+    ``committed`` holds the Resource and path of each document deletion whose
     transaction committed. ``uncertain`` holds those whose commit failed
     without an answer from the database, such as a connection lost during
     COMMIT: the deletion may or may not have committed.
+    ``final_step_uncertain`` says the same of the last transaction, which
+    deletes the collections, Files and tables under the prefix and records
+    ``collection.delete``.
     """
 
     committed: list[tuple[uuid.UUID, str]] = field(default_factory=list)
     uncertain: list[tuple[uuid.UUID, str]] = field(default_factory=list)
+    final_step_uncertain: bool = False
 
     def __bool__(self) -> bool:
-        return bool(self.committed or self.uncertain)
+        return bool(self.committed or self.uncertain or self.final_step_uncertain)
 
 
 def _distinct_documents(deleted: list[tuple[uuid.UUID, str]]) -> int:
@@ -200,6 +204,13 @@ def committed_deletions(
             "failed before the database answered; read those documents to see whether "
             "they went."
         )
+    if deletions.final_step_uncertain:
+        details["final_step_uncertain"] = True
+        opening += (
+            " The outcome of the delete's last step is unknown: its commit failed before "
+            "the database answered. That step deletes the collections, Files and tables under "
+            "the prefix and records collection.delete; browse the prefix to see whether it went."
+        )
     return details, opening
 
 
@@ -240,20 +251,37 @@ def _with_progress(
 
 
 class _ReleaseAfterCommit:
-    """``pool.acquire()`` for a transaction whose commit must stand: once
-    ``committed`` is set, after the transaction committed, a failure while the
-    pool takes the connection back, such as a reset that fails, is logged
-    instead of raised, so the caller still answers with what it committed."""
+    """``pool.acquire()`` for the delete's last transaction, whose body sets
+    ``done`` once its statements are done and ``committed`` once the
+    transaction has committed.
 
-    def __init__(self, acquire, committed: list[bool], what: str) -> None:
+    Once committed, a failure while the pool takes the connection back, such
+    as a reset that fails, is logged instead of raised, so the caller still
+    answers with what it committed. A failure after ``done`` and before
+    ``committed`` that is not the database's answer (after which it rolled
+    back) came from a COMMIT that went unanswered: the step may have
+    committed, which ``deletions.final_step_uncertain`` records before the
+    failure is raised.
+    """
+
+    def __init__(
+        self, acquire, *, done: list[bool], committed: list[bool], deletions: _Deletions, what: str,
+    ) -> None:
         self._acquire = acquire
+        self._done = done
         self._committed = committed
+        self._deletions = deletions
         self._what = what
 
     async def __aenter__(self):
         return await self._acquire.__aenter__()
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
+        if (
+            exc is not None and self._done and not self._committed
+            and not isinstance(exc, asyncpg.PostgresError)
+        ):
+            self._deletions.final_step_uncertain = True
         try:
             return bool(await self._acquire.__aexit__(exc_type, exc, tb))
         except Exception:
@@ -591,6 +619,7 @@ class CollectionService:
                         allow_table_delete=allow_table_delete,
                         native_authority=native_authority,
                         native_deleted=_distinct_documents(deletions.committed),
+                        deletions=deletions,
                         disclose_paths=disclose_paths,
                     )
                 except _DocumentsRemain:
@@ -633,6 +662,7 @@ class CollectionService:
         allow_table_delete: bool,
         native_authority: bool,
         native_deleted: int,
+        deletions: _Deletions | None = None,
         disclose_paths: bool = False,
     ) -> dict:
         """The delete's last transaction: the collections, files, tables and
@@ -657,10 +687,13 @@ class CollectionService:
         doc_paths_for_git: list[str] = []
         commit_msg_for_git: str = ""
         retained_paths: list[str] = []
+        done: list[bool] = []
         committed: list[bool] = []
 
         async with _ReleaseAfterCommit(
-            pool.acquire(), committed, f"collection delete of {norm!r} in vault {vault}",
+            pool.acquire(), done=done, committed=committed,
+            deletions=deletions if deletions is not None else _Deletions(),
+            what=f"collection delete of {norm!r} in vault {vault}",
         ) as conn:
             async with role_authority_transaction(conn):
                 if not await lock_vault_for_child_write(conn, vault_id):
@@ -1001,6 +1034,8 @@ class CollectionService:
                         f"agent: {agent_id or 'unknown'}\n"
                         f"action: delete-collection"
                     )
+                # Every statement is done; a failure from here is the commit's.
+                done.append(True)
             # The delete is complete from here: a failure while the pool
             # takes the connection back does not undo it.
             committed.append(True)

@@ -311,10 +311,14 @@ deletion may or may not have committed: the error counts it apart in
 `uncertain_docs`, with its URI in `uncertain_uris` for a caller who may read
 the Vault, sets `partially_applied`, and its hint says that the outcome of
 those deletions is unknown; reading the documents tells. A COMMIT the database
-refused rolled back, and is not counted. Once the last transaction has
-committed, the delete is complete: a failure after it, such as one while the
-pool takes its connection back, is logged and the delete answers with its
-result.
+refused rolled back, and is not counted. When the COMMIT of the last
+transaction goes unanswered the same way, the error adds
+`final_step_uncertain: true` beside the documents' progress, and its hint
+says that the outcome of that step, which deletes the collections, Files and
+tables under the prefix and records `collection.delete`, is unknown;
+browsing the prefix tells. Once the last transaction has committed, the delete
+is complete: a failure after it, such as one while the pool takes its
+connection back, is logged and the delete answers with its result.
 When nothing is left under the prefix because an earlier
 recursive delete of it deleted its documents, the delete succeeds with zero
 counts rather than reporting the prefix as not found, and records
@@ -466,9 +470,10 @@ are internal errors, over REST and MCP, with exactly the generic message, that
 say what went; that a deletion whose connection then fails to reset is still
 counted; that a File delete refused with a 503 after the documents went keeps
 its details over MCP; that a deletion whose COMMIT answer is lost is reported
-as uncertain, and one the database refused is not; that a delete whose last
-transaction committed answers with its result, Files included, when the reset
-of its connection fails; and that a File whose Resource is gone, after the
+as uncertain, and one the database refused is not; that a last step whose
+COMMIT answer is lost is reported as `final_step_uncertain`; that a delete
+whose last transaction committed answers with its result, Files included,
+when the reset of its connection fails; and that a File whose Resource is gone, after the
 documents went, keeps the delete's progress in the REST 404.
 
 Use a disposable PostgreSQL instance capable of creating test databases; these
