@@ -327,13 +327,17 @@ What the prefix holds afterwards does not settle that outcome, since later
 writes may have changed it; and when an earlier delete had already emptied
 the prefix, that step only records `collection.delete`, so the prefix looks
 the same either way and only the event differs. The hint says so. The same
-request sent again finishes the delete if the step did not go, and deletes
-anything written under the prefix in the meantime; the request and the
-retry together may record `collection.delete` twice. If the step went and
-nothing is under the prefix any more, the retry answers not found (404) on
-a Bare Git Vault, and on a Native one when no recursive delete of the
-prefix ever deleted a document; otherwise it records `collection.delete`
-again. Once the last transaction has committed, the
+request sent again is checked as the first was, so it can be refused (by a
+table under the prefix that the caller may not delete, or, for a
+non-recursive delete, by a collection that is no longer empty); only if it
+succeeds does it finish the delete. A recursive retry that succeeds also
+deletes whatever was written under the prefix since, and the request and
+the retry together may record `collection.delete` twice. If the step went
+and nothing is under the prefix any more, a recursive retry answers not
+found (404) on a Bare Git Vault, and on a Native one when no recursive
+delete of the prefix ever deleted a document, and otherwise records
+`collection.delete` again; a non-recursive retry answers not found. Once
+the last transaction has committed, the
 delete is complete: a failure after it, such as one while the pool takes its
 connection back, is logged and the delete answers with its result. This
 holds for a delete that finds the prefix emptied by an earlier one, too.
@@ -498,8 +502,9 @@ uncertain last step when its answer is lost, with a hint that does not send
 the caller to browse the prefix; that the same request sent again after a
 last step whose answer was lost records `collection.delete` a second time
 where a recursive delete deleted Native documents under the prefix, and
-answers not found for an empty Native collection and on Bare Git; that a
-delete
+answers not found for an empty Native collection, on Bare Git and for a
+non-recursive delete, whose hint says a retry is refused if the collection
+is no longer empty; that a delete
 whose last transaction committed answers with its result, Files included,
 when the reset of its connection fails; and that a File whose Resource is gone, after the
 documents went, keeps the delete's progress in the REST 404.

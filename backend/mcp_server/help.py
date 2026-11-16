@@ -1204,11 +1204,13 @@ file, and table under `P/`.
   read those documents to see whether they went. `final_step_uncertain`
   says the last step's commit went unanswered (collections, files, tables,
   and the documents in `final_step_uris` on a Bare Git Vault); what the
-  prefix holds now does not settle it. The same call sent again finishes
-  the delete if that step did not go and deletes anything written under the
-  prefix meanwhile; with the first call, `collection.delete` may then be
-  recorded twice. If the step went and the prefix is empty, it may answer
-  not found: always on a Bare Git Vault, and on a Native one when no
+  prefix holds now does not settle it. The same call sent again is checked
+  as the first was and may be refused; only if it succeeds does it finish
+  the delete. A recursive retry also deletes whatever was written under the
+  prefix since, and with the first call may record `collection.delete`
+  twice; a non-recursive one is refused if the collection is no longer
+  empty. If the step went, a retry may answer not found: a non-recursive
+  one, a recursive one on a Bare Git Vault, and on a Native one when no
   recursive delete of the prefix ever deleted a document. If a table appears
   under the prefix while a writer's delete runs, only an admin or owner can
   finish that delete.

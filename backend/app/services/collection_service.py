@@ -145,9 +145,11 @@ class _Deletions:
     ``collection.delete``, and on the Bare Git authority the documents in
     ``final_step_paths`` as well. ``final_step_found_empty`` says that last
     transaction found the prefix emptied by an earlier delete, so it only
-    records ``collection.delete``.
+    records ``collection.delete``. ``recursive`` is the request's own mode,
+    which a retry of it is checked under.
     """
 
+    recursive: bool = True
     committed: list[tuple[uuid.UUID, str]] = field(default_factory=list)
     uncertain: list[tuple[uuid.UUID, str]] = field(default_factory=list)
     final_step_uncertain: bool = False
@@ -239,22 +241,32 @@ def committed_deletions(
             opening += (
                 " An earlier delete had already emptied the prefix, so that step only records "
                 "collection.delete, and the prefix looks the same whether it went or not. The "
-                "same request sent again records collection.delete when it succeeds, so this "
-                "request and the retry together may record it twice; the retry also deletes "
-                "anything written under the prefix in the meantime."
+                "same request sent again is checked as this one was; if it succeeds, it records "
+                "collection.delete again, so the two together may record it twice, and it also "
+                "deletes whatever was written under the prefix since."
             )
         else:
             opening += (
                 f" That step deletes {documents}the collections, Files and tables under the "
                 "prefix and records collection.delete; what the prefix holds now does not "
                 "settle whether it went, since later writes may have changed it. The same "
-                "request sent again finishes the delete if that step did not go, and deletes "
-                "anything written under the prefix in the meantime; this request and the retry "
-                "together may record collection.delete twice. If the step went and nothing is "
-                "under the prefix any more, the retry may answer not found (404): it does on a "
-                "Bare Git Vault, and on a Native one when no recursive delete of the prefix "
-                "ever deleted a document."
+                "request sent again is checked as this one was, and only if it succeeds does it "
+                "finish the delete."
             )
+            if deletions.recursive:
+                opening += (
+                    " A recursive retry that succeeds also deletes whatever was written under "
+                    "the prefix since, and this request and the retry together may record "
+                    "collection.delete twice. If the step went and nothing is under the prefix "
+                    "any more, the retry may answer not found (404): it does on a Bare Git "
+                    "Vault, and on a Native one when no recursive delete of the prefix ever "
+                    "deleted a document."
+                )
+            else:
+                opening += (
+                    " A non-recursive retry is refused if the collection is no longer empty. If "
+                    "the step went, the retry may answer not found (404)."
+                )
     return details, opening
 
 
@@ -641,7 +653,7 @@ class CollectionService:
         from app.services import document_counters as _counters
 
         native_authority = _counters.native_documents_are_authoritative()
-        deletions = _Deletions()
+        deletions = _Deletions(recursive=recursive)
         try:
             for _ in range(_NATIVE_DELETE_ROUNDS):
                 if native_authority and recursive:
@@ -730,7 +742,7 @@ class CollectionService:
         retained_paths: list[str] = []
         done: list[bool] = []
         committed: list[bool] = []
-        progress = deletions if deletions is not None else _Deletions()
+        progress = deletions if deletions is not None else _Deletions(recursive=recursive)
 
         async with _ReleaseAfterCommit(
             pool.acquire(), done=done, committed=committed, deletions=progress,

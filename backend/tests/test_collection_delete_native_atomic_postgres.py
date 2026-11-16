@@ -1752,6 +1752,8 @@ async def test_a_last_step_whose_commit_answer_is_lost_is_reported_as_uncertain(
         hint = failure.value.hint
         assert "last step" in hint and "collection.delete" in hint and "Files and tables" in hint, hint
         assert "does not settle whether it went" in hint and "browse" not in hint, hint
+        assert "is checked as this one was, and only if it succeeds does it finish the delete" in hint, hint
+        assert "A recursive retry that succeeds also deletes whatever was written" in hint, hint
         assert "together may record collection.delete twice" in hint, hint
         assert "may answer not found (404)" in hint and "at least once" not in hint, hint
         envelope = exception_envelope(failure.value)
@@ -1876,6 +1878,7 @@ async def test_a_bare_git_last_step_whose_commit_answer_is_lost_names_its_docume
         }
         assert "details.final_step_uris" in failure.value.hint, failure.value.hint
         assert "may answer not found (404): it does on a Bare Git Vault" in failure.value.hint
+        assert "is checked as this one was" in failure.value.hint
         # It did commit.
         assert await pool.fetchval("SELECT count(*) FROM documents WHERE vault_id = $1", vault_id) == 0
         assert await pool.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", vault_id) == 0
@@ -1928,6 +1931,54 @@ async def test_a_retry_of_an_empty_native_collections_unanswered_delete_answers_
         with pytest.raises(NotFoundError):
             await CollectionService(git=object()).delete(
                 vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert (await _state(pool, vault_id))["events"] == ["collection.delete"]
+
+
+async def test_a_non_recursive_delete_whose_last_answer_is_lost_says_a_retry_is_checked_again(monkeypatch):
+    """A non-recursive delete of an empty Native collection, whose last
+    transaction deletes it and records `collection.delete`, loses the answer
+    to its COMMIT (asyncpg's ConnectionDoesNotExistError). The hint says the
+    same request sent again is checked as this one was, that a
+    non-recursive retry is refused if the collection is no longer empty, and
+    that it may answer not found; it says nothing of deleting what was
+    written under the prefix since. The retry does answer not found: the
+    step went."""
+    async with _fresh_database() as pool:
+        vault = "native-flat-unanswered"
+        monkeypatch.setattr(document_counters, "native_documents_are_authoritative", lambda: True)
+        vault_id = await _make_vault(pool, vault)
+        await CollectionRepository(pool).get_or_create(vault_id, "notes")
+        armed: list[bool] = []
+        lock_rows = collection_service_module.lock_collection_rows
+
+        async def lock_in_the_last_transaction(*args, **kwargs):
+            armed.append(True)
+            return await lock_rows(*args, **kwargs)
+
+        monkeypatch.setattr(collection_service_module, "lock_collection_rows", lock_in_the_last_transaction)
+        fired = _commit_goes_wrong(monkeypatch, pool, failure="closed", armed=armed)
+        with pytest.raises(TransientDependencyError) as failure:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=False, agent_id="tester", disclose_paths=True,
+            )
+        assert fired
+        assert failure.value.details == {
+            "partially_applied": True, "deleted_docs": 0, "deleted_uris": [],
+            "final_step_uncertain": True,
+        }
+        hint = failure.value.hint
+        assert "is checked as this one was, and only if it succeeds does it finish the delete" in hint, hint
+        assert "A non-recursive retry is refused if the collection is no longer empty" in hint, hint
+        assert "If the step went, the retry may answer not found (404)." in hint, hint
+        assert "written under the prefix since" not in hint, hint
+        # It did commit.
+        assert await _state(pool, vault_id) == {
+            "documents": [], "collections": [], "events": ["collection.delete"],
+        }
+        with pytest.raises(NotFoundError):
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=False, agent_id="tester", disclose_paths=True,
             )
         assert (await _state(pool, vault_id))["events"] == ["collection.delete"]
 
@@ -2022,11 +2073,12 @@ async def test_an_emptied_prefix_whose_commit_answer_is_lost_is_reported_as_unce
     unknown. That branch used to skip the mark that its statements were done,
     so the error said nothing of it. Its hint says the prefix looks the same
     whether that step went or not, so browsing it cannot tell, and that the
-    same request sent again records `collection.delete` when it succeeds, so
-    that both together may record it twice, and deletes anything written
-    under the prefix meanwhile; it used to say browsing the prefix would
-    tell. The same request sent again does answer with zero counts and
-    records the event a second time."""
+    same request sent again is checked as this one was and, if it
+    succeeds, records `collection.delete` again, so that both together may
+    record it twice, and deletes whatever was written under the prefix
+    since; it used to say browsing the prefix would tell. The same request
+    sent again does answer with zero counts and records the event a second
+    time."""
     async with _fresh_database() as pool:
         vault_id = await _documents_gone_before_the_last_transaction(
             pool, monkeypatch, "native-emptied-unanswered",
@@ -2046,8 +2098,9 @@ async def test_an_emptied_prefix_whose_commit_answer_is_lost_is_reported_as_unce
         hint = failure.value.hint
         assert "already emptied the prefix" in hint, hint
         assert "looks the same whether it went or not" in hint and "browse" not in hint, hint
-        assert "records collection.delete when it succeeds" in hint and "at least once" not in hint, hint
-        assert "may record it twice" in hint and "written under the prefix in the meantime" in hint, hint
+        assert "is checked as this one was; if it succeeds, it records" in hint, hint
+        assert "at least once" not in hint, hint
+        assert "may record it twice" in hint and "written under the prefix since" in hint, hint
         # It did commit.
         assert (await _state(pool, vault_id))["events"] == [
             "document.delete", "document.delete", "collection.delete",
