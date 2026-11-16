@@ -13,7 +13,15 @@ export interface MonitoringMetrics {
   p95_ms: number | null;
 }
 
-export interface MonitoringRow extends MonitoringMetrics {
+export type CredentialStatus = "active" | "expired" | "deleted" | "account_suspended" | "session_unverified";
+
+export interface CredentialInfo {
+  credential_status?: CredentialStatus | null;
+  pat_expires_at?: string | null;
+}
+
+export interface MonitoringRow extends MonitoringMetrics, CredentialInfo {
+  last_observed_at?: string | null;
   user_id: string | null;
   pat_id: string | null;
   tool: string | null;
@@ -21,7 +29,7 @@ export interface MonitoringRow extends MonitoringMetrics {
   auth_kind: AuthKind | null;
 }
 
-export interface RecentCall {
+export interface RecentCall extends CredentialInfo {
   observation_id: string;
   finished_at: string;
   actor_id: string;
@@ -73,6 +81,7 @@ export interface ToolMetric {
 }
 
 export interface MonitoringReport extends Record<Breakdown, MonitoringRow[]> {
+  credential_status_as_of?: string;
   operations: McpOperation[];
   has_more_operations: boolean;
   metrics: ToolMetric[];

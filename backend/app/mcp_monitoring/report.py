@@ -24,13 +24,24 @@ WITH filtered AS (
            samples, trace_id IS NOT NULL AS trace_available
     FROM mcp_monitoring.measured_calls
 """ + _WHERE + ")"
-_REPORT = _FILTERED + Path(__file__).with_name("report.sql").read_text()
-_RECENT = _FILTERED + """
+# Use the same snapshot and validity rules for grouped credentials and individual calls.
+_PAT_STATUS = """
+, pat_status AS NOT MATERIALIZED (
+    SELECT t.id, t.user_id, t.name, t.expires_at,
+           CASE WHEN t.expires_at <= CURRENT_TIMESTAMP THEN 'expired'
+                WHEN u.account_status = 'suspended' THEN 'account_suspended'
+                ELSE 'active' END AS status
+    FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.key_class = 'pat'
+)
+"""
+_REPORT = _FILTERED + _PAT_STATUS + Path(__file__).with_name("report.sql").read_text()
+_RECENT = _FILTERED + _PAT_STATUS + """
 SELECT r.observation_id, r.finished_at, r.actor_id, r.auth_kind, r.pat_id, r.tool, r.outcome, r.duration_ms,
-       r.trace_available, coalesce(nullif(u.display_name,''),u.username) AS user_label, t.name AS pat_label
+       r.trace_available, coalesce(nullif(u.display_name,''),u.username) AS user_label, t.name AS pat_label,
+       t.status AS credential_status, t.expires_at AS pat_expires_at
 FROM (SELECT * FROM filtered ORDER BY finished_at DESC, observation_id DESC LIMIT $9) r
 LEFT JOIN users u ON u.id=r.actor_id
-LEFT JOIN tokens t ON t.id=r.pat_id AND t.user_id=r.actor_id AND t.key_class='pat'
+LEFT JOIN pat_status t ON t.id=r.pat_id AND t.user_id=r.actor_id
 ORDER BY r.finished_at DESC, r.observation_id DESC
 """
 
@@ -144,6 +155,14 @@ SELECT lower(r) AS lo, upper(r) AS hi FROM verified,
 """
 
 
+def _credential_status(row):
+    if row["auth_kind"] == "oauth":
+        return "session_unverified"
+    if row["pat_id"] is not None:
+        return row["credential_status"] or "deleted"
+    return None
+
+
 async def read_report(
     start: datetime,
     end: datetime,
@@ -194,7 +213,7 @@ async def read_report(
         coverage = await conn.fetch(_COVERAGE, start, end)
         state = await conn.fetchrow(
             """
-            SELECT min(started_at) FILTER (WHERE collecting) AS started_at,
+            SELECT CURRENT_TIMESTAMP AS status_as_of, min(started_at) FILTER (WHERE collecting) AS started_at,
                    max(heartbeat_at) FILTER (WHERE collecting) AS last_flush,
                    count(*) FILTER (WHERE NOT stopped AND NOT collecting AND heartbeat_at >= now() - $1::interval) AS disabled_writers,
                    count(*) FILTER (WHERE NOT stopped AND heartbeat_at < now() - $1::interval) AS stale_writers,
@@ -227,6 +246,9 @@ async def read_report(
                     auth_kind=row["auth_kind"],
                     tool=row["tool"],
                     label=row["label"],
+                    credential_status=_credential_status(row),
+                    pat_expires_at=row["pat_expires_at"],
+                    last_observed_at=row["last_observed_at"] if kind == "credentials" else None,
                 )
             )
 
@@ -244,10 +266,13 @@ async def read_report(
     # Compatibility projections for clients using the original report response.
     search = panels.get(("akb_search", "empty_results"), {})
     browse = panels.get(("akb_browse", "latency"), {})
+    collection = dict(state)
+    status_as_of = collection.pop("status_as_of")
     return {
+        "credential_status_as_of": status_as_of,
         "window": {"from": start, "to": end},
         "collection": {
-            **dict(state),
+            **collection,
             "enabled": settings.mcp_monitoring.enabled,
             "retention_days": settings.mcp_monitoring.retention_days,
         },
@@ -263,7 +288,7 @@ async def read_report(
         "operations": [dict(row) for row in operations[:PAGE_SIZE]],
         "has_more_operations": len(operations) > PAGE_SIZE,
         "recent_calls": [
-            dict(call, trace_available=call["trace_available"] and bool(settings.mcp_monitoring.tempo_query_url))
+            dict(call, credential_status=_credential_status(call), trace_available=call["trace_available"] and bool(settings.mcp_monitoring.tempo_query_url))
             for call in recent
         ],
         **groups,

@@ -11,13 +11,14 @@ import { ChevronLeft, RefreshCw, X } from "lucide-react";
 import { PageHeader } from "@/components/ui/page-header";
 import { Panel, PanelHeader } from "@/components/ui/panel";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Alert } from "@/components/ui/alert";
 import { StatTile } from "@/components/ui/stat-tile";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, getMcpMonitoring } from "@/lib/api";
-import type { AuthKind, Breakdown, CallerKind, MonitoringReport, MonitoringRow } from "@/lib/mcp-monitoring";
+import type { AuthKind, Breakdown, CallerKind, CredentialInfo, MonitoringReport, MonitoringRow } from "@/lib/mcp-monitoring";
 
 const groups: Breakdown[] = ["users", "credentials", "tools"];
 const firstPages = { users: 0, credentials: 0, tools: 0, operations: 0 };
@@ -31,9 +32,26 @@ type Filters = { user?: Selection; pat?: Selection; tool?: string; auth?: AuthKi
 function rowLabel(row: MonitoringRow, service: boolean): string {
   if (row.user_id) return row.label || `Former account · ${row.user_id.slice(0, 8)}`;
   if (row.tool) return row.tool;
-  if (row.pat_id) return `${row.label || "Revoked PAT"} · ${row.pat_id.slice(0, 8)}`;
+  if (row.pat_id) return `${row.label || "PAT"} · ${row.pat_id.slice(0, 8)}`;
   if (row.auth_kind === "service") return "Service key";
   return row.auth_kind === "oauth" ? (service ? "OAuth" : "SSO") : "PAT";
+}
+
+const statusLabels = {
+  active: "Active", expired: "Expired", deleted: "Deleted", account_suspended: "Account suspended",
+  session_unverified: "Session unverified",
+} as const;
+
+function CredentialState({ info }: { info: CredentialInfo }) {
+  const state = info.credential_status;
+  if (!state) return <span className="text-foreground-muted" aria-label="No individual credential status">—</span>;
+  const variant = state === "active" ? "active" : state === "session_unverified" ? "default" : "archived";
+  return <div className="space-y-1 py-1">
+    <Badge variant={variant}>{statusLabels[state]}</Badge>
+    {info.pat_expires_at && <div className="whitespace-nowrap text-xs text-foreground-muted">
+      {state === "expired" ? "Expired" : "Expires"} <time dateTime={info.pat_expires_at}>{new Date(info.pat_expires_at).toLocaleString()}</time>
+    </div>}
+  </div>;
 }
 
 function RecentCalls({ report, service }: { report: MonitoringReport; service: boolean }) {
@@ -48,14 +66,15 @@ function RecentCalls({ report, service }: { report: MonitoringReport; service: b
         </p>}
         <div className="overflow-x-auto"><table aria-label="Recent calls" className="w-full text-left text-sm tabular-nums">
           <thead className="text-xs text-foreground-muted"><tr>
-            {["Completed", service ? "Service caller" : "User", "Credential", "Tool", "Outcome", "Duration", "Trace"].map(label =>
+            {["Completed", service ? "Service caller" : "User", "Credential", "Current status", "Tool", "Outcome", "Duration", "Trace"].map(label =>
               <th key={label} scope="col" className="px-4 py-2">{label}</th>)}
           </tr></thead>
           <tbody className="divide-y divide-border">{calls.map(call =>
             <tr key={call.observation_id}>
               <td className="whitespace-nowrap px-4 py-2"><time dateTime={call.finished_at}>{callTime.format(new Date(call.finished_at))}</time></td>
               <td className="px-4">{call.user_label || `Former account · ${call.actor_id.slice(0, 8)}`}</td>
-              <td className="px-4">{call.auth_kind === "service" ? "Service key" : call.auth_kind === "oauth" ? (service ? "OAuth" : "SSO") : `${call.pat_label || "Revoked PAT"} · ${call.pat_id?.slice(0, 8)}`}</td>
+              <td className="px-4">{call.auth_kind === "service" ? "Service key" : call.auth_kind === "oauth" ? (service ? "OAuth" : "SSO") : `${call.pat_label || "PAT"} · ${call.pat_id?.slice(0, 8)}`}</td>
+              <td className="px-4"><CredentialState info={call} /></td>
               <td className="px-4">{call.tool}</td><td className="px-4">{outcomes[call.outcome]}</td>
               <td className="whitespace-nowrap px-4">{call.duration_ms} ms</td>
               <td className="whitespace-nowrap px-4">{call.trace_available
@@ -153,18 +172,25 @@ export default function McpMonitoringPage() {
           {groups.map((group) => (
             <Panel key={group}>
               <PanelHeader label={titles[group]} />
+              {group === "credentials" && report.credential_status_as_of &&
+                <p className="px-4 pt-3 text-sm text-foreground-muted">Status as of <time dateTime={report.credential_status_as_of}>{new Date(report.credential_status_as_of).toLocaleString()}</time>. Last observed is the latest authenticated call in this selection. Current SSO session state is unknown.</p>}
               {group === "credentials" && !filters.user && report.summary.pat_calls > 0 &&
                 <p className="px-4 pt-3 text-sm text-foreground-muted">Select {service ? "a service caller" : "a user"} to see their individual PATs.</p>}
               {!report[group].length ? <p className="p-4 text-sm text-foreground-muted">No observed calls in this selection.</p> :
                 <div className="overflow-x-auto"><table aria-label={titles[group]} className="w-full text-left text-sm tabular-nums">
                   <thead className="text-xs text-foreground-muted"><tr>
                     {(group === "users" ? [service ? "Service caller" : "User", "Calls", ...(service ? ["Service keys", "OAuth"] : ["SSO"]), "PAT", "Errors"] :
-                      [group === "tools" ? "Tool" : "Credential", "Calls", "Errors", "p95"]).map((label) =>
+                      [...(group === "tools" ? ["Tool"] : ["Credential", "Current status", "Last observed"]), "Calls", "Errors", "p95"]).map((label) =>
                       <th key={label} scope="col" className="px-4 py-2">{label}</th>)}
                   </tr></thead>
                   <tbody className="divide-y divide-border">{report[group].map((row) => (
                     <tr key={row.user_id || row.pat_id || row.tool || row.auth_kind}>
                       <td className="px-4 py-1"><Button variant="link" onClick={() => select(row)}>{rowLabel(row, service)}</Button></td>
+                      {group === "credentials" && <>
+                        <td className="px-4"><CredentialState info={row} /></td>
+                        <td className="whitespace-nowrap px-4">{row.last_observed_at
+                          ? <time dateTime={row.last_observed_at}>{new Date(row.last_observed_at).toLocaleString()}</time> : "—"}</td>
+                      </>}
                       <td className="px-4">{row.calls}</td>
                       {group === "users" && <>{service && <td className="px-4">{row.service_key_calls}</td>}<td className="px-4">{row.sso_calls}</td><td className="px-4">{row.pat_calls}</td></>}
                       <td className="px-4">{row.errors}</td>

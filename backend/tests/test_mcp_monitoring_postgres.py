@@ -83,6 +83,50 @@ async def test_replica_flush_replay_and_retention():
         """)
 
 
+async def test_credential_status_uses_current_catalog_for_a_historical_window():
+    async with _fresh_database() as pool:
+        start = datetime.now(UTC) - timedelta(days=2)
+        end = start + timedelta(hours=1)
+        owner = await pool.fetchval(
+            "INSERT INTO users (username, email, password_hash) VALUES ('observer','observer@example.org','disabled') RETURNING id"
+        )
+        expired_at = end + timedelta(hours=1)
+        writer = Collector()
+        keys = {}
+        for name, expiry in [("active", None), ("expired", expired_at), ("deleted", None)]:
+            keys[name] = await pool.fetchval(
+                """INSERT INTO tokens (user_id,name,token_hash,token_prefix,expires_at)
+                   VALUES ($1,$2,$3,'fixture',$4) RETURNING id""",
+                owner, name, uuid4().hex, expiry,
+            )
+            writer.queue.append(Observation(uuid4(), start, owner, "human", "pat", keys[name], "akb_help", "ok", 2))
+        observed = end - timedelta(minutes=1)
+        writer.queue.append(Observation(uuid4(), observed, owner, "human", "oauth", None, "akb_help", "tool_error", 1))
+        await writer.flush(stopping=True)
+        await pool.execute("DELETE FROM tokens WHERE id=$1", keys["deleted"])
+
+        async def report(user):
+            return await read_report(start, end, user, None, None, None, 0, 0, 0)
+
+        grouped = await report(None)
+        assert {r["auth_kind"]: r["credential_status"] for r in grouped["credentials"]} == {
+            "pat": None, "oauth": "session_unverified",
+        }
+        result = await report(owner)
+        assert result["summary"]["calls"] == 4
+        assert result["credential_status_as_of"] > expired_at
+        statuses = {pat: name for name, pat in keys.items()} | {None: "session_unverified"}
+        for section in ("credentials", "recent_calls"):
+            assert {r["pat_id"]: r["credential_status"] for r in result[section]} == statuses
+            assert next(r["pat_expires_at"] for r in result[section] if r["pat_id"] == keys["expired"]) == expired_at
+        assert next(r["last_observed_at"] for r in result["credentials"] if r["auth_kind"] == "oauth") == observed
+        await pool.execute("UPDATE users SET account_status='suspended' WHERE id=$1", owner)
+        suspended = await report(owner)
+        assert {r["pat_id"]: r["credential_status"] for r in suspended["credentials"]} == {
+            **statuses, keys["active"]: "account_suspended",
+        }
+
+
 async def test_coverage_gaps_and_untruncated_totals():
     start = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=6)
     hour = timedelta(hours=1)

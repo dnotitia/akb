@@ -20,7 +20,13 @@ class Metrics(TypedDict):
     p95_ms: int | None
 
 
-class BreakdownRow(Metrics):
+class CredentialInfo(TypedDict):
+    credential_status: Literal["active", "expired", "deleted", "account_suspended", "session_unverified"] | None
+    pat_expires_at: datetime | None
+
+
+class BreakdownRow(Metrics, CredentialInfo):
+    last_observed_at: datetime | None
     user_id: UUID | None
     pat_id: UUID | None
     auth_kind: AuthKind | None
@@ -28,7 +34,7 @@ class BreakdownRow(Metrics):
     label: str | None
 
 
-class RecentCall(TypedDict):
+class RecentCall(CredentialInfo):
     observation_id: UUID
     finished_at: datetime
     actor_id: UUID
@@ -138,6 +144,7 @@ class OperationDetails(TypedDict):
 
 
 class MonitoringReport(TypedDict):
+    credential_status_as_of: datetime
     operations: list[Operation]
     has_more_operations: bool
     metrics: list[MetricPanel]

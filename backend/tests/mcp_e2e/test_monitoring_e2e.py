@@ -108,6 +108,9 @@ async def test_mcp_monitoring_by_actor_pat_and_tool(runtime_session: RuntimeCont
         assert sum(i["calls"] or 0 for i in result["series"]) == total
         credentials = (await report(user_id=actor))["credentials"]
         assert {r["pat_id"]: r["calls"] for r in credentials if r["pat_id"]} == {a["token_id"]: 2, b["token_id"]: 1}
+        assert all(r["credential_status"] == "active" and r["last_observed_at"] for r in credentials if r["pat_id"])
+        if sso_calls:
+            assert next(r["credential_status"] for r in credentials if r["auth_kind"] == "oauth") == "session_unverified"
         assert {r["tool"]: r["calls"] for r in result["tools"]} == {
             "akb_help": 2,
             "akb_browse": 1,
@@ -126,3 +129,4 @@ async def test_mcp_monitoring_by_actor_pat_and_tool(runtime_session: RuntimeCont
         ).raise_for_status()
         revoked = await report(user_id=actor, auth_kind="pat", pat_id=b["token_id"])
         assert revoked["summary"]["calls"] == 1 and revoked["credentials"][0]["label"] is None
+        assert revoked["credentials"][0]["credential_status"] == revoked["recent_calls"][0]["credential_status"] == "deleted"

@@ -63,6 +63,29 @@ it("pins the interval while drilling and clears private data when authorization 
   expect(screen.queryByText("Fixture user")).not.toBeInTheDocument();
 });
 
+it("shows current PAT state separately from the last authenticated SSO call", async () => {
+  const expiry = "2026-02-01T00:00:00Z";
+  vi.mocked(getMcpMonitoring).mockResolvedValue({
+    ...report, credential_status_as_of: expiry,
+    credentials: [
+      { ...report.credentials[0], credential_status: "expired", pat_expires_at: expiry },
+      { ...base, auth_kind: "oauth", credential_status: "session_unverified", last_observed_at: report.window.from },
+    ],
+    recent_calls: [{ ...report.recent_calls[0], pat_label: null, credential_status: "deleted" }],
+  });
+  renderPage();
+  const creds = within(await screen.findByRole("table", { name: "Credentials" }));
+  const pat = within(creds.getByRole("row", { name: /Desktop/ }));
+  expect(pat.getByRole("cell", { name: /^Expired/ })).toHaveTextContent("Expired");
+  expect(pat.getByText(new Date(expiry).toLocaleString())).toHaveAttribute("dateTime", expiry);
+  const sso = within(creds.getByRole("row", { name: /SSO/ }));
+  expect(sso.getByText("Session unverified")).toBeVisible();
+  expect(sso.getByText(new Date(report.window.from).toLocaleString())).toHaveAttribute("dateTime", report.window.from);
+  await userEvent.click(screen.getByRole("tab", { name: "Recent calls" }));
+  const recent = within(await screen.findByRole("table", { name: "Recent calls" }));
+  expect(recent.getByRole("row", { name: /PAT · 01234567/ })).toHaveTextContent("Deleted");
+});
+
 it("shows an unmeasured interval separately from a measured zero", async () => {
   vi.mocked(getMcpMonitoring).mockResolvedValue({
     ...report, users: [], tools: [], credentials: [], recent_calls: [],
