@@ -280,9 +280,26 @@ def _start_release(acquire: Any, exc_info: tuple, grace: float) -> tuple[asyncio
     return asyncio.ensure_future(acquire.__aexit__(*exc_info)), False
 
 
-def _retrieve(release: asyncio.Future) -> None:
-    if not release.cancelled():
-        release.exception()
+def _release_error(release: asyncio.Future, bounded: bool) -> BaseException | None:
+    """Retrieve a finished release's error, if any. The ``TimeoutError`` of
+    the bound it was given is not an error: asyncpg closed the connection,
+    and the work on it was done."""
+    error = None if release.cancelled() else release.exception()
+    if bounded and isinstance(error, TimeoutError):
+        return None
+    return error
+
+
+def _log_release_error(error: BaseException, situation: str) -> None:
+    logger.warning("Giving a pool connection back failed %s", situation, exc_info=error)
+
+
+def _retrieve(release: asyncio.Future, *, bounded: bool) -> None:
+    """For a release that was left to the pool, still running: retrieve its
+    error once it ends, and log it, since no caller is waiting for it."""
+    error = _release_error(release, bounded)
+    if error is not None:
+        _log_release_error(error, "after its caller had gone on")
 
 
 async def give_back_connection(
@@ -305,7 +322,9 @@ async def give_back_connection(
     release that fails on its own raises its error, as leaving ``async with
     pool.acquire()`` does, except for the ``TimeoutError`` of the bound it
     was given: asyncpg closed the connection, and the work on it was done.
-    Returns whether the connection was not given back reset.
+    A cancellation takes precedence over a release's error, which is then
+    logged; so is the error of a release left to the pool. Returns whether
+    the connection was not given back reset.
     """
     loop = asyncio.get_running_loop()
     grace = GIVE_BACK_GRACE_SECS if grace is None else grace
@@ -323,23 +342,27 @@ async def give_back_connection(
                 "without it and leaving the connection to the pool",
                 grace + _GIVE_BACK_MARGIN_SECS,
             )
-            release.add_done_callback(_retrieve)
+            release.add_done_callback(functools.partial(_retrieve, bounded=bounded))
             break
         try:
             await asyncio.wait({release}, timeout=left)
         except asyncio.CancelledError as exc:
             cancelled = cancelled or exc
-    if cancelled is not None:
-        raise cancelled
     if not release.done():
+        if cancelled is not None:
+            raise cancelled
         return True
-    error = None if release.cancelled() else release.exception()
-    if bounded and isinstance(error, TimeoutError):
-        # asyncpg's own bound: it closed the connection.
-        return True
+    # Retrieved first, whatever ends the wait: a cancellation takes
+    # precedence, and an error it keeps from the caller is logged instead.
+    timed_out = bounded and not release.cancelled() and isinstance(release.exception(), TimeoutError)
+    error = _release_error(release, bounded)
+    if cancelled is not None:
+        if error is not None:
+            _log_release_error(error, "while its request was being cancelled")
+        raise cancelled
     if error is not None:
         raise error
-    return False
+    return timed_out
 
 
 @asynccontextmanager

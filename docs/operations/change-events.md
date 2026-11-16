@@ -204,7 +204,10 @@ place then holds, which would be another request's once a close had given
 the place back. A release that has not ended a little after the half
 second, which only asyncpg's own paths can cause, is left to the pool, to
 finish in the background, with a warning: the one case where an admission
-comes back before the pool has the connection's place. A request cancelled
+comes back before the pool has the connection's place. A cancellation of the
+request while the release runs is raised once it ends; an error of that
+release, which the cancellation keeps from the caller, is logged, as is the
+error of a release left to the pool. A request cancelled
 while a statement of its transaction runs keeps its connection and
 admission, and Vault creation its lane gate, until the transaction's
 rollback ends; the rollback waits for that statement, which the server's
@@ -749,20 +752,22 @@ plan closes its connection before any rollback;
 during a slow reset keeps its admission until its connection is back, taken
 with `admitted_connection` or inside an admission with `acquire_given_back`,
 that a release that does not end within its bound is left to the pool a
-little after the grace, without its connection being closed under it, and
-that outside an admission `acquire_given_back` is the pool's own
-acquisition;
+little after the grace, without its connection being closed under it, that
+a cancelled request's release has its timeout retrieved and its connection
+error logged, as has a release left to the pool, and that outside an
+admission `acquire_given_back` is the pool's own acquisition;
 `test_vault_write_admission_paths_postgres.py` fails when a connection is
 taken inside an admission other than through these helpers: in the same
 `with` as the admission, in code that runs inside an admission entered
 without a connection, or in an admitted transaction, besides its own
 connection, followed through the application functions it calls as far as
 annotations, assignments and arguments tell what each call reaches, and
-leaving out the branch of a helper that a passed connection rules out (a
-`with` target is known not to be None, and true only when it is a
-connection); it also checks that a plain `pool.acquire()`, or a helper
-called without the connection, inside an admitted transaction fails it,
-also behind a test on an empty event buffer;
+leaving out the branch of a helper that a passed connection rules out (the
+`with` target of a context manager known to give a value is known not to be
+None, and true only when it is a connection; any other is checked both
+ways); it also checks that a plain `pool.acquire()`, or a helper called
+without the connection, inside an admitted transaction fails it, also
+behind a test on an empty event buffer or on a transaction's `with` target;
 `test_write_busy_rest_unit.py` checks the REST response to a refused write and
 to one refused part-way.
 `test_vault_write_admission_paths_postgres.py` fills a Vault's admission and

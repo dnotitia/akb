@@ -918,7 +918,18 @@ def _attribute_types(entry: tuple, attribute: str) -> tuple:
 
 # The context managers whose `with` target is a connection, which asyncpg
 # makes neither `__bool__` nor `__len__` for, so it is true.
-_CONNECTION_CONTEXTS = frozenset({"admitted_connection", "_admitted_connection", "acquire_given_back", "acquire"})
+# `_access_connection` gives the connection it is passed when there is one,
+# and one from the pool otherwise.
+_CONNECTION_CONTEXTS = frozenset({
+    "admitted_connection", "_admitted_connection", "acquire_given_back", "acquire", "_access_connection",
+})
+# The context managers whose `with` target is what the context they are
+# given, as their first argument, yields (`_ReleaseAfterCommit`).
+_PASS_THROUGH_CONTEXTS = frozenset({"_ReleaseAfterCommit"})
+# The context managers whose `with` target is known not to be None, though
+# it may be false: an event buffer is empty when it starts. The target of
+# any other is checked both ways (`conn.transaction()`, for one, gives None).
+_NOT_NONE_CONTEXTS = _CONNECTION_CONTEXTS | {"deferred_events"}
 
 
 def _known(test: ast.AST, known: "_Known") -> bool | None:
@@ -979,9 +990,10 @@ class _Reader:
     """One function read under an admission: the classes `self` may be an
     instance of, the types its names hold, as its annotations, assignments
     and its caller's arguments tell, what is known of its names (`known`:
-    a `with` target is not None, and true when it is a connection; a
-    parameter is as the caller's argument was), and the application
-    functions each of its calls may run."""
+    the `with` target of a context manager in `_NOT_NONE_CONTEXTS` is not
+    None, and true when it is a connection; a parameter is as the caller's
+    argument was), and the application functions each of its calls may
+    run."""
 
     def __init__(
         self, rel: str, owner: str | None, selves: tuple, fn: ast.AST, bound: dict | None = None,
@@ -992,13 +1004,19 @@ class _Reader:
             item for node in ast.walk(fn) if isinstance(node, (ast.With, ast.AsyncWith))
             for item in node.items if isinstance(item.optional_vars, ast.Name)
         ]
-        connections = {
-            item.optional_vars.id for item in targets
-            if isinstance(item.context_expr, ast.Call)
-            and _name_of(item.context_expr.func) in _CONNECTION_CONTEXTS
-        }
+        def entered(names: frozenset[str]) -> set[str]:
+            found = set()
+            for item in targets:
+                call = item.context_expr
+                while isinstance(call, ast.Call) and _name_of(call.func) in _PASS_THROUGH_CONTEXTS and call.args:
+                    call = call.args[0]
+                if isinstance(call, ast.Call) and _name_of(call.func) in names:
+                    found.add(item.optional_vars.id)
+            return found
+
+        connections = entered(_CONNECTION_CONTEXTS)
         self.known = _Known(
-            not_none=passed.not_none | passed.true | connections | {item.optional_vars.id for item in targets},
+            not_none=passed.not_none | passed.true | connections | entered(_NOT_NONE_CONTEXTS),
             true=passed.true | connections,
         )
         arguments = fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
@@ -1217,6 +1235,11 @@ def _with_statement_in_an_admitted_transaction(
     # false: a new event buffer is empty.
     ("if not events: await write_policy_repo.get_policy(admitted_id)",
      "repositories/vault_write_policy_repo.py", "deferred_events"),
+    # The same, behind a test on a `with` target that is None: asyncpg's
+    # `transaction()` gives None.
+    ("async with conn.transaction() as tx:\n"
+     "        if tx is None: await write_policy_repo.get_policy(admitted_id)",
+     "repositories/vault_write_policy_repo.py", "admitted_connection"),
 ])
 def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
     monkeypatch, statement, site, block,
@@ -1224,8 +1247,9 @@ def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
     """`set_public_access` with a connection taken inside its admitted
     transaction other than through the transaction's own: a plain
     `pool.acquire()` there, or a helper called without the connection, which
-    then takes one, also behind a test the walk cannot settle. The check
-    names it."""
+    then takes one, also behind a test the walk cannot settle, on an event
+    buffer that may be empty or a transaction's `with` target, which is
+    None. The check names it."""
     rel = "services/access_service.py"
     modules = _with_statement_in_an_admitted_transaction(rel, "set_public_access", statement, block)
     monkeypatch.setattr(sys.modules[__name__], "_app_modules", lambda: modules)

@@ -78,9 +78,10 @@ specifically; the proxy has its own log in
   asyncpg closes the connection, and the connection is never closed under
   its release, so a late release cannot close another request's connection.
   A release that still has not ended is left to the pool with a warning,
-  so it never keeps an admission or a Vault creation's lane gate. The plan
-  slots and the admission alike serve waiters first come, first served, by
-  capacity: the
+  so it never keeps an admission or a Vault creation's lane gate; its error,
+  and that of a release whose request was cancelled meanwhile, is logged.
+  The plan slots and the admission alike serve waiters first come, first
+  served, by capacity: the
   first waiter blocked on a Vault reserves one slot of each of its Vaults
   against later requests, which use the slots left, so waiters blocked on a
   full Vault hold at most one slot of another; and one that leaves the

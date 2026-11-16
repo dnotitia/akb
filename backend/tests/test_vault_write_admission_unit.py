@@ -11,6 +11,7 @@ written without admission is logged.
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import uuid
 
@@ -444,12 +445,16 @@ class _ResettingPool:
     connections taken and not yet back, being reset or not; a reader's
     acquisition (``reader=True``) is released without a reset. With ``hang``
     a release does not end, its bound notwithstanding, until ``unhang`` is
-    set, and then gives the place back."""
+    set, and then gives the place back. With ``fail_with`` a release that
+    ends within its bound gives the place back and raises that error."""
 
-    def __init__(self, size: int, reset_secs: float, *, hang: bool = False) -> None:
+    def __init__(
+        self, size: int, reset_secs: float, *, hang: bool = False, fail_with: BaseException | None = None,
+    ) -> None:
         self._free = asyncio.Semaphore(size)
         self.reset_secs = reset_secs
         self.hang = hang
+        self.fail_with = fail_with
         self.unhang = asyncio.Event()
         self.in_use = 0
         self.peak = 0
@@ -517,6 +522,8 @@ class _ResettingAcquire:
                     raise TimeoutError("timed out resetting the connection")
         self._proxy.released = True
         self.pool.give_back_place()
+        if not self._reader and self.pool.fail_with is not None:
+            raise self.pool.fail_with
 
 
 async def _cancelled_while_resetting(pool: _ResettingPool, write) -> list[float]:
@@ -685,3 +692,83 @@ async def test_a_release_that_does_not_end_is_left_to_the_pool_without_closing_i
         for task in writes:
             task.cancel()
         await asyncio.gather(*writes, return_exceptions=True)
+
+
+async def _cancelled_while_its_release_runs(pool: _ResettingPool) -> asyncio.Task:
+    """A write of a Vault whose connection's release is under way when the
+    write is cancelled; returns the ended write."""
+    async def write() -> None:
+        async with admission.admitted_connection(pool, uuid.uuid4()):
+            pass
+
+    writing = asyncio.create_task(write())
+    await asyncio.wait_for(pool.resetting.wait(), timeout=5)
+    writing.cancel()
+    # Not awaited directly: a cancelled await would cancel the write.
+    await asyncio.wait({writing}, timeout=5)
+    return writing
+
+
+async def test_a_cancelled_give_back_retrieves_the_releases_timeout(monkeypatch):
+    """A write is cancelled while its connection's release resets the
+    connection past the release's bound, which closes it and ends with
+    `TimeoutError`. The write ends cancelled, and the release's
+    `TimeoutError` is retrieved: nothing reports an exception that was never
+    retrieved once the release is collected. The cancellation used to be
+    raised before the release's exception was retrieved."""
+    monkeypatch.setattr(admission, "GIVE_BACK_GRACE_SECS", 0.1)
+    loop = asyncio.get_running_loop()
+    reported: list[dict] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+        pool = _ResettingPool(size=2, reset_secs=5.0)
+        writing = await _cancelled_while_its_release_runs(pool)
+        assert writing.done() and writing.cancelled()
+        del writing
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous)
+    assert not [c for c in reported if "never retrieved" in c.get("message", "")], reported
+    assert pool.in_use == 0
+
+
+async def test_a_cancelled_give_back_logs_the_releases_error(monkeypatch, caplog):
+    """A write is cancelled while its connection's release runs, and the
+    release then fails on its own, within its bound, with a connection
+    error. The write ends cancelled, as its request asked, and the
+    release's error, which the cancellation keeps from the caller, is
+    logged with its traceback. It used to be neither raised nor retrieved."""
+    failure = ConnectionResetError("the connection was lost while it was reset")
+    pool = _ResettingPool(size=2, reset_secs=0.05, fail_with=failure)
+    caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
+    writing = await _cancelled_while_its_release_runs(pool)
+    assert writing.done() and writing.cancelled()
+    logged = [r for r in caplog.records if "while its request was being cancelled" in r.getMessage()]
+    assert logged and logged[0].exc_info is not None and logged[0].exc_info[1] is failure, caplog.records
+
+
+async def test_a_release_left_to_the_pool_logs_its_error_when_it_ends(monkeypatch, caplog):
+    """A release that outlives the wait is left to the pool, and later fails
+    with a connection error. Its error is retrieved and logged then, since
+    no caller waits for it any more."""
+    monkeypatch.setattr(admission, "GIVE_BACK_GRACE_SECS", 0.05)
+    failure = ConnectionResetError("the connection was lost while it was reset")
+    pool = _ResettingPool(size=2, reset_secs=5.0, hang=True, fail_with=failure)
+    caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
+
+    async def write() -> None:
+        async with admission.admitted_connection(pool, uuid.uuid4()):
+            pass
+
+    await asyncio.wait_for(write(), timeout=5)
+    assert any("going on without it" in r.getMessage() for r in caplog.records)
+    pool.unhang.set()
+    async with asyncio.timeout(5):
+        while pool.in_use:
+            await asyncio.sleep(0.01)
+    await asyncio.sleep(0)
+    logged = [r for r in caplog.records if "after its caller had gone on" in r.getMessage()]
+    assert logged and logged[0].exc_info is not None and logged[0].exc_info[1] is failure, caplog.records
