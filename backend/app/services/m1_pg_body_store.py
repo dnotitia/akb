@@ -16,6 +16,7 @@ import asyncpg
 
 from app.exceptions import ValidationError
 from app.services.m1_reference_payload_store import PreparedReferencePayload
+from app.services.vault_write_admission import acquire_given_back
 
 
 class PgBodyIntegrityError(RuntimeError):
@@ -108,7 +109,7 @@ class M1PgBodyStore:
             expected_digest=expected_digest,
             expected_size=expected_size,
         )
-        async with self.pool.acquire() as conn:
+        async with acquire_given_back(self.pool) as conn:
             return await self._prepare_verified_in_conn(
                 conn,
                 namespace_id=namespace_id,

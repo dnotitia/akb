@@ -124,6 +124,7 @@ async def insert_rows(
     return await _execute_mutation(
         compiled,
         vault_name=vault_name,
+        vault_id=vault_id,
         table_name=table_name,
         user_id=user_id,
         actor_id=actor_id,
@@ -159,6 +160,7 @@ async def update_rows(
     return await _execute_mutation(
         compiled,
         vault_name=vault_name,
+        vault_id=vault_id,
         table_name=table_name,
         user_id=user_id,
         actor_id=actor_id,
@@ -192,6 +194,7 @@ async def delete_rows(
     return await _execute_mutation(
         compiled,
         vault_name=vault_name,
+        vault_id=vault_id,
         table_name=table_name,
         user_id=user_id,
         actor_id=actor_id,
@@ -227,6 +230,7 @@ async def query_rows(
     return await _execute_mutation(
         compiled,
         vault_name=vault_name,
+        vault_id=vault_id,
         table_name=table_name,
         user_id=user_id,
         actor_id=actor_id,
@@ -597,6 +601,7 @@ async def _execute_mutation(
     compiled: _CompiledMutation,
     *,
     vault_name: str,
+    vault_id: uuid.UUID,
     table_name: str,
     user_id: uuid.UUID | str,
     is_admin: bool,
@@ -611,6 +616,7 @@ async def _execute_mutation(
             fetch=compiled.fetch,
             is_admin=is_admin,
             vault_names=[vault_name],
+            vault_ids=[vault_id],
         )
     except PermissionDeniedError as e:
         return err(str(e), code=PERMISSION_DENIED, pg_sqlstate=e.pg_sqlstate)

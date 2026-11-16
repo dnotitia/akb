@@ -57,6 +57,8 @@ async def pool(monkeypatch):
         "015_events_outbox.py",
         "044_vault_write_policy.py",
         "045_vault_write_grant_actions.py",
+        # Raw SQL checks the row changes its transaction queued (132).
+        "132_events_commit_order.py",
     ):
         migration = _load_migration(filename)
         assert migration is not None

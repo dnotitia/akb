@@ -9,6 +9,7 @@ from typing import Protocol
 import asyncpg
 
 from app.exceptions import ConflictError
+from app.services.vault_write_admission import acquire_given_back
 from app.util.errors import NATIVE_REVISION_SELECTOR_AMBIGUOUS
 
 
@@ -252,7 +253,7 @@ class NativeRevisionRepository:
 
         if conn is not None:
             return await _resolve(conn)
-        async with self.pool.acquire() as acquired:
+        async with acquire_given_back(self.pool) as acquired:
             return await _resolve(acquired)
 
     @staticmethod
@@ -661,7 +662,7 @@ class NativeRevisionRepository:
         if conn is not None:
             row = await conn.fetchrow(sql, resource_id)
         else:
-            async with self.pool.acquire() as acquired:
+            async with acquire_given_back(self.pool) as acquired:
                 row = await acquired.fetchrow(sql, resource_id)
         return dict(row) if row is not None else None
 

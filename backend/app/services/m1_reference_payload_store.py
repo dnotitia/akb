@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import asyncpg
 
 from app.exceptions import ValidationError
+from app.services.vault_write_admission import acquire_given_back
 
 
 class ReferencePayloadIntegrityError(RuntimeError):
@@ -96,7 +97,7 @@ class M1ReferencePayloadStore:
             expected_digest=expected_digest,
             expected_size=expected_size,
         )
-        async with self.pool.acquire() as conn:
+        async with acquire_given_back(self.pool) as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO m1_reference_payloads (

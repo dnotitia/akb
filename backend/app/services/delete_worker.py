@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.db.postgres import get_pool
 from app.services._backfill import BackfillRunner, MAX_RETRIES, next_attempt_delay
+from app.services.vault_write_admission import acquire_given_back
 from app.services.vector_store import VectorStoreUnavailable, get_vector_store
 
 logger = logging.getLogger("akb.delete_worker")
@@ -188,7 +189,7 @@ async def enqueue_source_deletes(source_type: str, source_id: str, conn=None) ->
     # between the two doesn't leave the outbox partially populated.
     # Wrap in an explicit transaction.
     pool = await get_pool()
-    async with pool.acquire() as c:
+    async with acquire_given_back(pool) as c:
         async with c.transaction():
             return await _run(c)
 

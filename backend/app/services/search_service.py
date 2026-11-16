@@ -2540,6 +2540,7 @@ class SearchService:
                         exc,
                         failed_uri=doc_uri_str,
                         committed_replacements=len(replaced),
+                        completed=replaced,
                     )
                     break
 

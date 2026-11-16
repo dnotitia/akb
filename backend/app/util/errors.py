@@ -168,6 +168,12 @@ def err(
     return out
 
 
+def _write_busy_envelope(e: "WriteBusyError") -> dict:
+    # The error's own hint and details, as REST gives them: retry_after_secs,
+    # and for a refusal part-way what the operation says about what it did.
+    return err(str(e), code=WRITE_BUSY, hint=e.hint, **(e.details or {}))
+
+
 def exception_envelope(e: Exception) -> dict:
     """Map a bubbled-up exception to the canonical ``err()`` envelope.
 
@@ -229,12 +235,7 @@ def exception_envelope(e: Exception) -> dict:
             **(e.details or {}),
         )
     if isinstance(e, WriteBusyError):
-        return err(
-            str(e),
-            code=WRITE_BUSY,
-            hint="The vault is under heavy write load. Wait a few seconds and retry; no partial write occurred.",
-            retry_after_secs=e.retry_after_secs,
-        )
+        return _write_busy_envelope(e)
     if getattr(e, "code", None) == NATIVE_REVISION_SURFACE_UNSUPPORTED:
         return err(str(e), code=NATIVE_REVISION_SURFACE_UNSUPPORTED)
     if getattr(e, "code", None) == DOCUMENT_IDEMPOTENCY_UNSUPPORTED:

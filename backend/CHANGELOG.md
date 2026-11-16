@@ -7,6 +7,113 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- A burst of writes to one Vault no longer takes the whole database pool.
+  Transactions that write a Vault's events wait for that Vault's event lock,
+  and they used to wait holding their pool connection, so requests for other
+  Vaults waited for a connection until the writers gave up at the lock's
+  5-second deadline. Every event-writing path (documents, collections, Files,
+  tables and their rows, `akb_sql`, access and Vault settings, app rollouts,
+  external Git synchronization) is now admitted for its Vault before it takes
+  a connection: each process admits at most `vault_write_concurrency`
+  (default 4) transactions of one Vault at a time, and the others wait without
+  a connection. A transaction of several Vaults is admitted for all of them at
+  once. A wait longer than `vault_write_queue_timeout_secs` (default
+  10 seconds) fails with a retryable `write_busy` (HTTP 429, `Retry-After: 1`)
+  before the write's own event, Git commit, document or prepared Native
+  payload; a File upload confirmation refused at its publication keeps the
+  lease renewal it committed before, and a refused File replacement keeps its
+  upload for the same confirmation to be sent again. An admin override's
+  audit event, which the access check commits before the write, stays when the
+  write is refused. A Native recursive collection delete refused after some of
+  its documents went says so: `partially_applied`, `deleted_docs` and, to a
+  caller who may read the Vault, `deleted_uris`, and a hint that sending it
+  again continues it; MCP now keeps a `write_busy`'s details as REST does. A grep replacement refused after some documents were
+  replaced sets `partially_applied` too, and its hint names those documents
+  with their new revisions and asks to replace only the rest, not to send the
+  same request again.
+
+  A refused write's REST body now carries the `write_busy` code, with
+  `retry_after_secs` (and `partially_applied` when it applies) in its
+  details and a hint; it used to carry `internal`. Its legacy `detail` field
+  is therefore an object (`message`, `code`, `hint`, `details`), as for
+  other coded errors, where a plain refusal used to give the message as a
+  string; the top-level `message` and `error` are unchanged.
+
+  Contract change: raw SQL (`akb_sql`, `POST /api/v1/tables/{vault}/sql`)
+  may write only the Vaults its request declares. A statement whose plan
+  (`EXPLAIN`) modifies a dynamic table of an undeclared Vault is now refused
+  before it runs, with `invalid_argument` naming that Vault in
+  `undeclared_vaults`, administrators' statements included; it used to be
+  admitted for that Vault as well and run.
+
+  Compiled table reads (`GET /api/v1/tables/{vault}/{table}/rows` and its
+  `query` form) run in a read-only transaction and are not admitted, and
+  `akb_sql` and `POST /api/v1/tables/{vault}/sql` take a new `read_only`
+  option, false by default, that runs the statement in a read-only
+  transaction without admission. Without it a statement, a `SELECT`
+  included, is a write: it waits for admission and runs once, admitted for the
+  Vaults it declares.
+  An MCP `akb_sql` call whose credential has read but not write scope always
+  runs read-only. Reading the plan is limited by `akb_sql_plan_concurrency`
+  (default 2) and to one plan per declared Vault, every declared Vault's
+  token taken at once, so plans waiting for one Vault's locked table do not
+  hold back another Vault; by `akb_sql_plan_lock_timeout_ms` (default 500)
+  for each table lock; and by `akb_sql_plan_timeout_ms` (default 2000) in
+  all, one deadline over everything after the plan slot, from the wait for a
+  connection through the transaction's start and settings to the end of the
+  plan. Past either the write fails with `write_busy` and gives its plan slot
+  back, so a plan waiting for one lock after another, or whose statements
+  each finish within their own limits, cannot keep the slots from other
+  Vaults. At its deadline, or when cancelled, a plan closes its connection
+  before any rollback or reset waits on it; it keeps its slot until its
+  connection is back in the pool, closing it when the reset runs half a
+  second past, and never closes a connection already back in the pool. Every
+  admitted transaction likewise gives its connection back before its
+  admission, cancelled or not, and so does code that runs inside an admission
+  entered without a connection (a Native mutation preparing its payload,
+  Vault creation through its seed) with each connection it takes, so a Vault
+  never has more connections in use than admitted transactions. That release
+  is asyncpg's own, bounded by the grace: a reset, or a cancelled statement's
+  cancellation that does not complete, runs no longer than that before
+  asyncpg closes the connection, and the connection is never closed under
+  its release, so a late release cannot close another request's connection.
+  A release that still has not ended is left to the pool with a warning,
+  so it never keeps an admission or a Vault creation's lane gate; its error,
+  and that of a release whose request was cancelled meanwhile, is logged,
+  a socket's timeout included: only the bound's own expiry is not an error.
+  The plan slots and the admission alike serve waiters first come, first
+  served, by capacity: the
+  first waiter blocked on a Vault reserves one slot of each of its Vaults
+  against later requests, which use the slots left, so waiters blocked on a
+  full Vault hold at most one slot of another; and one that leaves the
+  queue, at its deadline or cancelled, lets the requests behind it go on at
+  once. Single-Vault requests therefore cannot starve a multi-Vault one. At
+  most `vault_write_max_waiters` and `akb_sql_plan_max_waiters` (default
+  1000 each) requests wait in each queue; one more fails at once with
+  `write_busy`. A write that changes rows of an undeclared Vault
+  through a function is rolled back with an `invalid_argument` error naming
+  it. An unscoped system administrator's raw SQL runs under the backend's
+  role and is admitted only for those Vaults, not for another Vault whose
+  `events` it writes or whose event lock it takes directly.
+
+  A new Bare Git Vault holds its write-lane gate and admission through its
+  seed document but takes a global write-lane slot only for each Git
+  operation; after its first Git commit, the seed and the compensation of a
+  failed creation wait for their slot without the lane's deadline, so a busy
+  lane no longer leaves a half-created Vault. A write whose Vault was replaced
+  under its name starts again for the new Vault, or fails with a conflict when
+  it was replaced twice. An app rollout waits at most
+  `app_rollout_admission_wait_secs` (default 1 second) for a target's Vault;
+  a refusal defers every pending target of that Vault for 5 seconds, and the
+  worker claims the next eligible target at once instead of sleeping.
+  Eligible targets are claimed first in, first out, by when they became
+  ready: when its batch became claimable, the request or the end of the
+  batch before, recorded when that batch really finished, or a deferral's
+  end when later; a backfill's target when it was made pending again. A refused target therefore waits behind every target that
+  became ready before its deferral ended, and goes before the rest. A File
+  upload cancel is admitted for its Vault before it takes a connection, as a
+  confirmation is.
+
 - On the Native authority a recursive collection delete is now atomic per
   document and completes when run again. Each document's delete commits with
   its `document.delete` event in a short transaction that locks the Vault's

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 import asyncpg
 import pytest
@@ -132,6 +133,7 @@ async def test_standard_git_race_rolls_back_and_returns_stable_conflict(monkeypa
             external_git=None,
             vault_repo=object(),
             coll_repo=object(),
+            vault_id=uuid.uuid4(),
         )
 
     assert caught.value.code == "vault_name_unavailable"

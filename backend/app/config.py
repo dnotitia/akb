@@ -1333,6 +1333,43 @@ class Settings(BaseModel):
     # the 60s idle-in-transaction reaper fires.
     git_write_timeout_secs: float = 30.0
 
+    # ── Vault write admission (services/vault_write_admission.py). Every
+    # transaction that writes a Vault's events is admitted for that Vault
+    # before it takes a pool connection. Such transactions of one Vault run
+    # one at a time on the Vault's event lock (migration 132), and a waiter
+    # would hold its connection, so a busy Vault could take the whole pool.
+    #
+    # Transactions of one Vault that may hold a pool connection at once, per
+    # process. The others wait without one. Keep well under pg_pool_max_size.
+    vault_write_concurrency: int = 4
+    # How long a transaction waits for admission before it fails with a
+    # retryable write_busy (HTTP 429, Retry-After), having done no work.
+    vault_write_queue_timeout_secs: float = 10.0
+    # Transactions that may wait for admission at once, per process, over all
+    # Vaults: a backstop that keeps the queue, and each pass over it,
+    # bounded. One more fails at once with write_busy.
+    vault_write_max_waiters: int = 1000
+    # A raw SQL write reads its plan (EXPLAIN) on a pool connection before its
+    # admission, to admit the Vaults it writes. At most this many plans are
+    # read at once per process, and at most one for each Vault a statement
+    # declares; the others wait without a connection.
+    akb_sql_plan_concurrency: int = 2
+    # How long reading a plan waits for a table lock before the write fails
+    # with a retryable write_busy instead of holding its connection.
+    akb_sql_plan_lock_timeout_ms: int = 500
+    # How long reading a plan may take in all once it has its slot, from the
+    # wait for a connection to the end of EXPLAIN, before the write fails
+    # with a retryable write_busy and gives the slot back: a plan waiting for
+    # one table lock after another cannot keep the slots from other Vaults.
+    akb_sql_plan_timeout_ms: int = 2000
+    # Raw SQL writes that may wait for a plan slot at once, per process: a
+    # backstop like vault_write_max_waiters. One more fails at once.
+    akb_sql_plan_max_waiters: int = 1000
+    # How long the app rollout worker waits for a target's Vault admission.
+    # A busy Vault's targets are then deferred, all of them, and the worker
+    # takes other Vaults' targets, so keep it short.
+    app_rollout_admission_wait_secs: float = 1.0
+
     # BM25 corpus tuning (driver-neutral; lives in main PG vocab).
     bm25_k1: float = 1.5
     bm25_b: float = 0.75

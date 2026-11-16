@@ -17,8 +17,9 @@ import asyncpg
 
 from app.services.role_authority import role_authority_transaction
 from app.db.postgres import get_pool
+from app.config import settings
 from app.db.transient import transient_error
-from app.exceptions import AKBError, ConflictError, ForbiddenError, InternalError, NotFoundError
+from app.exceptions import AKBError, ConflictError, ForbiddenError, InternalError, NotFoundError, WriteBusyError
 from app.repositories import table_data_repo, table_registry_repo, vault_files_repo
 from app.repositories.document_repo import (
     CollectionRepository,
@@ -37,6 +38,7 @@ from app.services.publication_service import delete_publications_for_file
 from app.services.s3_delete_worker import enqueue_delete as _enqueue_s3_delete
 from app.services import skill_policy
 from app.services.uri_service import doc_uri, file_uri, table_uri
+from app.services.vault_write_admission import admitted_connection
 from app.services.write_lane import run_git_write, write_lane
 
 logger = logging.getLogger("akb.collections")
@@ -280,11 +282,21 @@ def _with_progress(
     ``committed_deletions`` are added to the error's own, its hint opens with
     them, and its code, status and retry information stay its own. A database
     error that the API reports as a transient error (such as the Vault's
-    event lock timing out) is reported as that error. Any other exception is
-    an internal error and is reported as one, an ``InternalError`` whose
-    message stays the generic one, carrying the same details and hint; the
-    original is logged here and becomes its cause.
+    event lock timing out) is reported as that error. A refused admission,
+    whose plain form says that nothing was written, is reported as a
+    ``write_busy`` marked ``partially_applied``. Any other exception is an
+    internal error and is reported as one, an ``InternalError`` whose message
+    stays the generic one, carrying the same details and hint; the original
+    is logged here and becomes its cause.
     """
+    details, opening = committed_deletions(
+        vault=vault, deletions=deletions, disclose_paths=disclose_paths,
+    )
+    if isinstance(exc, WriteBusyError) and not exc.partially_applied:
+        return WriteBusyError(
+            vault, settings.vault_write_queue_timeout_secs, retry_after_secs=exc.retry_after_secs,
+            partially_applied=True, progress=details, progress_hint=opening,
+        )
     reported = exc if isinstance(exc, AKBError) else transient_error(exc)
     if reported is None:
         logger.error(
@@ -292,9 +304,6 @@ def _with_progress(
             prefix, vault, exc_info=exc,
         )
         reported = InternalError()
-    details, opening = committed_deletions(
-        vault=vault, deletions=deletions, disclose_paths=disclose_paths,
-    )
     reported.details = {**(reported.details or {}), **details}
     reported.hint = f"{opening} {reported.hint}" if reported.hint else opening
     if not isinstance(reported, InternalError):
@@ -395,7 +404,7 @@ async def _delete_native_document(
     the Resource has a later Revision.
     """
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with admitted_connection(pool, vault_id, vault=vault) as conn:
         committing = False
         try:
             async with conn.transaction():
@@ -537,7 +546,7 @@ class CollectionService:
             raise NotFoundError("Vault", vault)
 
         pool = await get_pool()
-        async with pool.acquire() as conn:
+        async with admitted_connection(pool, vault_id, vault=vault) as conn:
             async with conn.transaction():
                 if not await lock_vault_for_child_write(conn, vault_id):
                     raise ConflictError("Vault was deleted during collection creation")
@@ -615,15 +624,18 @@ class CollectionService:
         files and tables with `collection.delete` in a last transaction once
         no live document is left under `P`. A failure part-way leaves the
         documents deleted so far deleted and returns the error; running the
-        same delete again continues with the rest. When nothing is left under
-        `P` because an earlier recursive delete of `P` deleted its documents,
-        the delete succeeds with zero counts instead of `NotFoundError` and
-        records `collection.delete` (see `_earlier_recursive_delete`); the
-        event is at least once, so it can be recorded more than once for one
-        prefix. The counts are what this call deleted. Paths of documents and
-        collections (`deleted_uris`, `retained_collections`) are given only
-        with `disclose_paths`, which the caller's boundary sets when the
-        caller may read the Vault; counts are given always.
+        same delete again continues with the rest. A busy Vault (a refused
+        admission, or its event lock timing out) after some documents went
+        fails with a `write_busy` marked `partially_applied`. When nothing
+        is left under `P` because an earlier recursive delete of `P` deleted
+        its documents, the delete succeeds with zero counts instead of
+        `NotFoundError` and records `collection.delete` (see
+        `_earlier_recursive_delete`); the event is at least once, so it can be
+        recorded more than once for one prefix. The counts are what this call
+        deleted. Paths of documents and collections (`deleted_uris`,
+        `retained_collections`) are given only with `disclose_paths`, which
+        the caller's boundary sets when the caller may read the Vault; counts
+        are given always.
 
         Race-safety: the target row (if any) and all sub-collection
         rows are locked `FOR UPDATE` inside the same transaction, so a
@@ -744,8 +756,11 @@ class CollectionService:
         committed: list[bool] = []
         progress = deletions if deletions is not None else _Deletions(recursive=recursive)
 
+        # Admitted for the transaction only: the Git cleanup after it takes
+        # the write lane, which an admitted transaction must not wait for.
         async with _ReleaseAfterCommit(
-            pool.acquire(), done=done, committed=committed, deletions=progress,
+            admitted_connection(pool, vault_id, vault=vault),
+            done=done, committed=committed, deletions=progress,
             what=f"collection delete of {norm!r} in vault {vault}",
         ) as conn:
             async with role_authority_transaction(conn):

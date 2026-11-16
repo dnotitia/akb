@@ -12,9 +12,11 @@ from app.services.native_document_service import NativeDocumentService
 
 @pytest.mark.asyncio
 async def test_create_vault_uses_postgres_repository_and_rbac_without_git(monkeypatch):
-    vault_id = uuid.uuid4()
     owner_id = uuid.uuid4()
     calls: list[tuple] = []
+    # The creator chooses the new Vault's id, and is admitted for it, before
+    # it inserts the row.
+    created: list[uuid.UUID] = []
 
     class _Transaction:
         async def __aenter__(self):
@@ -53,8 +55,9 @@ async def test_create_vault_uses_postgres_repository_and_rbac_without_git(monkey
 
         async def create(self, **kwargs):
             assert kwargs.pop("conn") is connection
+            created.append(kwargs.pop("vault_id"))
             calls.append(("create", kwargs))
-            return vault_id
+            return created[-1]
 
     class _RoleSync:
         async def on_vault_create_in_conn(self, conn, created_vault_id, created_owner_id) -> None:
@@ -82,6 +85,7 @@ async def test_create_vault_uses_postgres_repository_and_rbac_without_git(monkey
         public_access="reader",
     )
 
+    vault_id, = created
     assert result == str(vault_id)
     assert calls == [
         ("get_by_name", "native-create"),
