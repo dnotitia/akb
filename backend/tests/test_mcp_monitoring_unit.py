@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from mcp.shared.exceptions import MCPError
 from starlette.datastructures import Headers
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
@@ -43,6 +44,52 @@ async def test_middleware_records_and_propagates_failures(monkeypatch, failure, 
     with pytest.raises(failure):
         await module.observe_tool(ctx, failed)
     assert recorder.dropped == 1
+
+
+async def test_concurrent_failures_keep_only_their_own_catalog_codes(monkeypatch):
+    recorder = module.Collector()
+    monkeypatch.setattr(module, "collector", recorder)
+    recorder.running = True
+    user = AuthenticatedUser(str(uuid4()), "fixture", "", None, False, "oauth")
+    ctx = SimpleNamespace(request_id=1, method="tools/call", params={"name": "akb_help"}, meta=None,
+                          request=SimpleNamespace(scope={"akb.mcp.user": user}, headers=Headers()))
+
+    async def tool_failure(code):
+        async def complete(_ctx):
+            module.capture_error_code(code)
+            await asyncio.sleep(0)
+            return {"isError": True}
+        return await module.observe_tool(ctx, complete)
+
+    async def rpc_failure(_ctx):
+        raise MCPError(-32602, "sensitive error message")
+
+    await asyncio.gather(tool_failure("not_found"), tool_failure("sensitive-error-code"))
+    with pytest.raises(MCPError):
+        await module.observe_tool(ctx, rpc_failure)
+    assert {(r.outcome, r.error_code) for r in recorder.queue} == {
+        ("tool_error", "not_found"), ("tool_error", None), ("rpc_error", "-32602"),
+    }
+    assert "sensitive" not in repr(recorder.queue)
+
+
+def test_diagnostics_persist_only_schema_derived_corrections_and_required_scopes():
+    from app.mcp_monitoring.errors import (
+        CallFailure, capture_error_code, capture_required_scope, capture_unknown_argument, current_failure,
+    )
+    with current_failure.set(failure := CallFailure()):
+        capture_unknown_argument("secret-value-in-a-key", {"topic"})
+        capture_required_scope("secret-value-in-a-scope")
+        assert failure == CallFailure()
+        capture_unknown_argument("toipc", {"topic"})
+        capture_error_code("unknown_argument")
+        assert failure.diagnostic == "Suggested correction: toipc → topic."
+        capture_unknown_argument("topicXYZ", {"topic"})
+        assert failure.diagnostic == "Suggested argument: topic."
+        capture_error_code("internal")
+        assert failure.diagnostic is None
+        capture_required_scope("write")
+        assert failure.diagnostic == "Required token scope: write."
 
 
 def test_export_uses_only_catalog_values_and_trace_ids():
@@ -108,6 +155,7 @@ def test_trace_detail_only_displays_this_observation_and_its_parent():
     (48 * 3600, 48, 404, 410, "trace_expired"),
     (90 * 3600, None, 404, 404, "trace_not_found"),
     (10, 48, 200, 404, "trace_export_pending"),  # Partial trace, missing this span.
+    (90 * 3600, 48, 200, 404, "trace_span_not_found"),
     (90 * 3600, 48, 503, 503, None),
     (90 * 3600, 48, 200, 200, None),  # Still readable during compaction.
 ])
@@ -145,6 +193,28 @@ async def test_trace_lookup_states(monkeypatch, age_seconds, retention, status, 
         assert exc.value.status_code == expected
         if code:
             assert exc.value.detail["code"] == code
+            assert exc.value.detail["trace_id"] == trace_id.hex
+
+
+def test_only_calls_already_outside_a_completed_policy_get_the_historical_notice():
+    from datetime import UTC, datetime, timedelta
+    from pydantic import ValidationError
+    from app.config import McpMonitoringSettings, TempoRetentionPeriod
+    from app.mcp_monitoring.trace_detail import _missing_span
+
+    end = datetime.now(UTC) - timedelta(days=1)
+    prior = TempoRetentionPeriod(ended_at=end, hours=48)
+    cfg = McpMonitoringSettings(tempo_retention_hours=720, tempo_retention_history=[prior])
+    trace = uuid4()
+    boundary = end - timedelta(hours=48)
+    old = _missing_span(boundary, trace, cfg, trace_found=False)
+    assert old.status_code == 410 and old.detail["code"] == "trace_outside_previous_retention"
+    assert "48-hour" in old.detail["message"] and old.detail["trace_id"] == trace.hex
+    for retained in (boundary + timedelta(microseconds=1), end):
+        assert _missing_span(retained, trace, cfg, trace_found=False).detail["code"] == "trace_not_found"
+    assert _missing_span(boundary, trace, cfg, trace_found=True).detail["code"] == "trace_span_not_found"
+    with pytest.raises(ValidationError):
+        McpMonitoringSettings(tempo_retention_history=[prior, prior])
 
 
 def test_declared_metrics_project_only_bounded_values():

@@ -25,6 +25,7 @@ from typing import Any
 from pydantic import ValidationError as ModelValidationError
 
 from app.mcp_monitoring.collector import observe_tool
+from app.mcp_monitoring.errors import capture_error_code, capture_missing_browse_target, capture_required_scope, capture_unknown_argument
 from app.mcp_monitoring.usage import measure_result
 from app.util.git_refs import HEX_COMMIT_RE
 
@@ -922,6 +923,7 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
     else:
         vault_arg = args.get("vault")
         if not vault_arg:
+            capture_missing_browse_target()
             return err("Either `vault` or `uri` is required for akb_browse.", code=INVALID_ARGUMENT)
         vault = vault_arg
         collection = args.get("collection")
@@ -2001,10 +2003,10 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             encoded,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
-        return CallToolResult(
-            content=[TextContent(type="text", text=encoded)],
-            is_error=_is_error_envelope(result),
-        )
+        is_error = _is_error_envelope(result)
+        if is_error:
+            capture_error_code(result.get("code"))
+        return CallToolResult(content=[TextContent(type="text", text=encoded)], is_error=is_error)
     except Exception as e:
         # Last-resort envelope so the canonical {error, code, ...} shape
         # introduced in 0.5.6 holds for every response path — including
@@ -2033,6 +2035,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 is_write=is_write,
             )
+        capture_error_code(envelope.get("code"))
         encoded = json.dumps(envelope, ensure_ascii=False, default=str)
         _log_response_size(
             name,
@@ -2099,6 +2102,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     if user.oauth_scopes is not None:
         required = _call_scope(name, args, user)
         if required not in user.oauth_scopes:
+            capture_required_scope(required)
             return err(
                 f"OAuth token is missing required scope '{required}' for tool '{name}'",
                 code=INSUFFICIENT_SCOPE,
@@ -2109,6 +2113,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
         required = _call_scope(name, args, user)
         required_token_scope = "write" if required == _WRITE_SCOPE else "read"
         if not token_has_scope(user.token_scopes, required_token_scope):
+            capture_required_scope(required_token_scope)
             return err(
                 f"Token scope is missing required scope '{required_token_scope}' for tool '{name}'",
                 code=INSUFFICIENT_SCOPE,
@@ -2126,6 +2131,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
         unknown = [k for k in args if k not in allowed]
         if unknown:
             bad = unknown[0]
+            capture_unknown_argument(bad, allowed)
             return err(
                 f"Unknown argument '{bad}' for {name}",
                 code=UNKNOWN_ARGUMENT,

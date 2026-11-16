@@ -85,7 +85,9 @@ async def test_mcp_monitoring_by_actor_pat_and_tool(runtime_session: RuntimeCont
             assert not (await client.call_tool("akb_help", {})).is_error
             assert (await client.call_tool("akb_put", {"file": str(tmp_path / "missing")})).is_error
 
-        assert (await call(b["token"], "akb_browse", {"vault": "ungranted-monitoring-fixture"}))["isError"]
+        refusal = await call(b["token"], "akb_browse", {"vault": "ungranted-monitoring-fixture"})
+        assert refusal["isError"]
+        refusal_code = json.loads(refusal["content"][0]["text"])["code"]
         assert (await http.get(report_path)).status_code == 401
         assert (await http.get(report_path, headers={"Authorization": "Bearer " + a["token"]})).status_code == 401
         window = {"from": start, "to": datetime.now(UTC).isoformat()}
@@ -106,6 +108,11 @@ async def test_mcp_monitoring_by_actor_pat_and_tool(runtime_session: RuntimeCont
         assert user["user_id"] == actor
         assert [user[k] for k in ("calls", "sso_calls", "pat_calls", "errors")] == [total, sso_calls, 3, 1]
         assert sum(i["calls"] or 0 for i in result["series"]) == total
+        errors = await report(user_id=actor, history_errors_only="true", tool_sort="errors")
+        [failed] = errors["recent_calls"]
+        assert failed["error_code"] == refusal_code and failed["error_reason"]
+        assert errors["tools"][0]["tool"] == "akb_browse"
+        assert "ungranted-monitoring-fixture" not in json.dumps(errors)
         credentials = (await report(user_id=actor))["credentials"]
         assert {r["pat_id"]: r["calls"] for r in credentials if r["pat_id"]} == {a["token_id"]: 2, b["token_id"]: 1}
         assert all(r["credential_status"] == "active" and r["last_observed_at"] for r in credentials if r["pat_id"])

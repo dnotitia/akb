@@ -9,6 +9,7 @@ from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import NotFoundError
 from app.mcp_monitoring.collector import STALE_SECONDS
+from app.mcp_monitoring.errors import REASONS
 from app.mcp_monitoring.schema import CallerKind
 
 PAGE_SIZE = 50
@@ -35,11 +36,20 @@ _PAT_STATUS = """
 )
 """
 _REPORT = _FILTERED + _PAT_STATUS + Path(__file__).with_name("report.sql").read_text()
-_RECENT = _FILTERED + _PAT_STATUS + """
+_RECENT = """
+WITH recent AS (
+    SELECT observation_id, finished_at, actor_id, auth_kind, pat_id, tool, outcome, duration_ms,
+           error_code, error_diagnostic, trace_id IS NOT NULL AS trace_available
+    FROM mcp_monitoring.tool_calls
+""" + _WHERE + """
+      AND (NOT $10::boolean OR outcome IN ('tool_error','rpc_error'))
+    ORDER BY finished_at DESC, observation_id DESC LIMIT $9
+)
+""" + _PAT_STATUS + """
 SELECT r.observation_id, r.finished_at, r.actor_id, r.auth_kind, r.pat_id, r.tool, r.outcome, r.duration_ms,
-       r.trace_available, coalesce(nullif(u.display_name,''),u.username) AS user_label, t.name AS pat_label,
+       r.error_code, r.error_diagnostic, r.trace_available, coalesce(nullif(u.display_name,''),u.username) AS user_label, t.name AS pat_label,
        t.status AS credential_status, t.expires_at AS pat_expires_at
-FROM (SELECT * FROM filtered ORDER BY finished_at DESC, observation_id DESC LIMIT $9) r
+FROM recent r
 LEFT JOIN users u ON u.id=r.actor_id
 LEFT JOIN pat_status t ON t.id=r.pat_id AND t.user_id=r.actor_id
 ORDER BY r.finished_at DESC, r.observation_id DESC
@@ -49,7 +59,7 @@ ORDER BY r.finished_at DESC, r.observation_id DESC
 # singleton has no evidence of a caller-supplied context and stays individual.
 _OPERATION_CALLS = """
 WITH operation_calls AS (
-    SELECT observation_id, actor_id, tool, outcome, duration_ms, finished_at,
+    SELECT observation_id, actor_id, tool, outcome, error_code, error_diagnostic, duration_ms, finished_at,
            coalesce(started_at, finished_at - duration_ms * interval '1 millisecond') AS call_start,
            coalesce(conversation_key, CASE WHEN started_at IS NULL THEN trace_id
                                           ELSE coalesce(request_trace_id, agent_turn_id) END) AS correlation_id,
@@ -65,22 +75,29 @@ _OPERATIONS = _OPERATION_CALLS + """
 , grouped AS (
     SELECT actor_id, correlation_id, group_kind, CASE WHEN correlation_id IS NULL THEN observation_id END AS individual_id,
            min(conversation_agent) AS agent,
+           count(*) FILTER (WHERE outcome IN ('tool_error','rpc_error')) AS errors,
+           count(*) FILTER (WHERE outcome='ok') AS succeeded,
+           count(*) FILTER (WHERE trace_available) AS trace_calls,
+           count(*) FILTER (WHERE outcome='cancelled') AS cancelled,
+           CASE WHEN count(*)=1 THEN min(error_code) END AS error_code,
+           CASE WHEN count(*)=1 THEN min(error_diagnostic) END AS error_diagnostic,
+           CASE WHEN count(*)=1 AND bool_or(trace_available) THEN min(observation_id::text)::uuid END AS trace_observation_id,
            count(*) AS calls, min(call_start) AS started_at, max(finished_at) AS finished_at,
            bool_or(propagated) OR count(*) > 1 AS correlated, CASE WHEN count(*)=1 THEN min(tool) END AS tool
     FROM operation_calls GROUP BY 1,2,3,4
 ), page AS (
-    SELECT *, coalesce(correlation_id, individual_id) AS id FROM grouped
+    SELECT *, coalesce(correlation_id, individual_id) AS id FROM grouped WHERE NOT $11::boolean OR errors>0
     ORDER BY finished_at DESC, actor_id, correlation_id NULLS LAST, group_kind, individual_id LIMIT $9 OFFSET $10
 )
 SELECT p.id, p.actor_id, coalesce(nullif(u.display_name,''),u.username) AS user_label,
-       p.calls, p.started_at, p.finished_at, p.correlated, p.tool,
+       p.calls, p.errors, p.succeeded, p.cancelled, p.trace_calls, p.error_code, p.error_diagnostic, p.trace_observation_id, p.started_at, p.finished_at, p.correlated, p.tool,
        CASE WHEN p.correlated THEN p.group_kind ELSE 'individual' END AS kind, p.agent,
        floor(extract(epoch FROM (p.finished_at - p.started_at))*1000)::bigint AS elapsed_ms
 FROM page p LEFT JOIN users u ON u.id=p.actor_id
 ORDER BY p.finished_at DESC, p.actor_id, p.correlation_id NULLS LAST, p.group_kind, p.individual_id
 """
 _OPERATION_DETAIL = _OPERATION_CALLS + """
-SELECT observation_id, tool, outcome, call_start AS started_at, finished_at, duration_ms, trace_available AND $13 AS trace_available,
+SELECT observation_id, tool, outcome, error_code, error_diagnostic, call_start AS started_at, finished_at, duration_ms, trace_available AND $13 AS trace_available,
        row_number() OVER (ORDER BY call_start, finished_at, observation_id) AS position
 FROM operation_calls WHERE correlation_id=$9 AND group_kind=$12
 ORDER BY call_start, finished_at, observation_id LIMIT $10 OFFSET $11
@@ -93,7 +110,7 @@ async def read_operation_calls(start, end, actor_id, auth_kind, pat_id, tool, op
     rows = await pool.fetch(_OPERATION_DETAIL, start, end, actor_id, auth_kind, pat_id, tool, retained, caller_kind,
                             operation_id, PAGE_SIZE + 1, page * PAGE_SIZE, kind,
                             bool(settings.mcp_monitoring.tempo_query_url))
-    return {"calls": [dict(row) for row in rows[:PAGE_SIZE]], "has_more": len(rows) > PAGE_SIZE}
+    return {"calls": [_with_error_reason(row) for row in rows[:PAGE_SIZE]], "has_more": len(rows) > PAGE_SIZE}
 
 
 _METRICS = _FILTERED + Path(__file__).with_name("metric_report.sql").read_text()
@@ -155,6 +172,10 @@ SELECT lower(r) AS lo, upper(r) AS hi FROM verified,
 """
 
 
+def _with_error_reason(row):
+    return dict(row, error_reason=REASONS.get(row["error_code"]))
+
+
 def _credential_status(row):
     if row["auth_kind"] == "oauth":
         return "session_unverified"
@@ -178,6 +199,8 @@ async def read_report(
     metric_views: dict | None = None,
     operation_page: int = 0,
     caller_kind: CallerKind = "human",
+    history_errors_only: bool = False,
+    tool_sort: str = "calls",
 ):
     pool = await get_pool()
     step = timedelta(hours=1) if end - start <= timedelta(days=1) else timedelta(days=1)
@@ -199,8 +222,8 @@ async def read_report(
         views = {"akb_browse/latency": {"group": browse_group, "page": browse_page}, **(metric_views or {})}
         records = await conn.fetch(_METRICS, *filters, json.dumps(views), PAGE_SIZE)
         panels = _metric_panels(records, tool, views)
-        recent = await conn.fetch(_RECENT, *filters, PAGE_SIZE)
-        operations = await conn.fetch(_OPERATIONS, *filters, PAGE_SIZE + 1, operation_page * PAGE_SIZE)
+        recent = await conn.fetch(_RECENT, *filters, PAGE_SIZE, history_errors_only)
+        operations = await conn.fetch(_OPERATIONS, *filters, PAGE_SIZE + 1, operation_page * PAGE_SIZE, history_errors_only)
         rows = await conn.fetch(
             _REPORT,
             *filters,
@@ -209,11 +232,13 @@ async def read_report(
             user_page * PAGE_SIZE,
             credential_page * PAGE_SIZE,
             tool_page * PAGE_SIZE,
+            tool_sort,
         )
         coverage = await conn.fetch(_COVERAGE, start, end)
         state = await conn.fetchrow(
             """
             SELECT CURRENT_TIMESTAMP AS status_as_of, min(started_at) FILTER (WHERE collecting) AS started_at,
+                   (SELECT applied_at FROM schema_migrations WHERE filename = '138_mcp_call_error_code.py') AS error_codes_supported_from,
                    max(heartbeat_at) FILTER (WHERE collecting) AS last_flush,
                    count(*) FILTER (WHERE NOT stopped AND NOT collecting AND heartbeat_at >= now() - $1::interval) AS disabled_writers,
                    count(*) FILTER (WHERE NOT stopped AND heartbeat_at < now() - $1::interval) AS stale_writers,
@@ -235,7 +260,7 @@ async def read_report(
         if kind == "summary":
             summary = metrics
         elif kind == "series":
-            series_by_time[row["bucket"]] = row["calls"]
+            series_by_time[row["bucket"]] = (row["calls"], row["decided"] - row["errors"], row["errors"])
         else:
             more[kind] = row["has_more"]
             groups[kind].append(
@@ -259,9 +284,11 @@ async def read_report(
         covered = sum(
             (max(timedelta(), min(r["hi"], upper) - max(r["lo"], bucket, retained)) for r in coverage), timedelta()
         )
-        count = series_by_time.get(bucket, 0)
+        count, succeeded, failed = series_by_time.get(bucket, (0, 0, 0))
         status = "complete" if covered == upper - bucket else "partial" if covered or count else "unmeasured"
-        series.append({"start": bucket, "calls": count if status != "unmeasured" else None, "coverage": status})
+        measured = status != "unmeasured"
+        series.append({"start": bucket, "coverage": status, "calls": count if measured else None,
+                       "succeeded": succeeded if measured else None, "failed": failed if measured else None})
         bucket = upper
     # Compatibility projections for clients using the original report response.
     search = panels.get(("akb_search", "empty_results"), {})
@@ -285,10 +312,15 @@ async def read_report(
                  followup=r["values"].get("page"), calls=r["calls"], p95_ms=r["p95_ms"]) for r in browse.get("rows", [])
         ],
         "has_more_browse": browse.get("has_more", False),
-        "operations": [dict(row) for row in operations[:PAGE_SIZE]],
+        "operations": [
+            dict(_with_error_reason(row),
+                 trace_calls=row["trace_calls"] if settings.mcp_monitoring.tempo_query_url else 0,
+                 trace_observation_id=row["trace_observation_id"] if settings.mcp_monitoring.tempo_query_url else None)
+            for row in operations[:PAGE_SIZE]
+        ],
         "has_more_operations": len(operations) > PAGE_SIZE,
         "recent_calls": [
-            dict(call, credential_status=_credential_status(call), trace_available=call["trace_available"] and bool(settings.mcp_monitoring.tempo_query_url))
+            dict(_with_error_reason(call), credential_status=_credential_status(call), trace_available=call["trace_available"] and bool(settings.mcp_monitoring.tempo_query_url))
             for call in recent
         ],
         **groups,
