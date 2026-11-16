@@ -142,15 +142,28 @@ class _Deletions:
     COMMIT: the deletion may or may not have committed.
     ``final_step_uncertain`` says the same of the last transaction, which
     deletes the collections, Files and tables under the prefix and records
-    ``collection.delete``.
+    ``collection.delete``, and on the Bare Git authority the documents in
+    ``final_step_paths`` as well.
     """
 
     committed: list[tuple[uuid.UUID, str]] = field(default_factory=list)
     uncertain: list[tuple[uuid.UUID, str]] = field(default_factory=list)
     final_step_uncertain: bool = False
+    final_step_paths: list[str] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return bool(self.committed or self.uncertain or self.final_step_uncertain)
+
+
+def _commit_answered(exc: BaseException) -> bool:
+    """Whether a failure at a transaction's exit is the database's answer to
+    COMMIT, after which the transaction rolled back: an error response from
+    the server. A connection error (SQLSTATE class 08, such as
+    ``ConnectionDoesNotExistError``) or any other failure leaves the commit's
+    outcome unknown."""
+    return isinstance(exc, asyncpg.PostgresError) and not isinstance(
+        exc, asyncpg.exceptions.PostgresConnectionError,
+    )
 
 
 def _distinct_documents(deleted: list[tuple[uuid.UUID, str]]) -> int:
@@ -169,9 +182,12 @@ def committed_deletions(
     and each path is listed once. The paths are given only to a caller who
     may read the Vault (``disclose_paths``); another gets the counts. They
     are the documents this request deleted, which later writes or restores
-    may have changed since. Deletions whose commit's outcome is unknown, and
-    which did not also commit once, are counted apart (``uncertain_docs``,
-    and ``uncertain_uris`` for a reader), and the hint says so.
+    may have changed since. Each deletion attempt whose commit's outcome is
+    unknown is counted apart (``uncertain_docs``, and ``uncertain_uris`` for a
+    reader), even of a document whose earlier deletion committed, and the
+    hint says so; so is a last step whose commit's outcome is unknown, with
+    the Bare Git documents it deletes (``final_step_docs``, and
+    ``final_step_uris`` for a reader).
     """
     count = _distinct_documents(deletions.committed)
     details: dict = {"partially_applied": True, "deleted_docs": count}
@@ -187,15 +203,12 @@ def committed_deletions(
             f"This request committed deletions for {count} document(s); later writes or "
             "restores may have changed them since."
         )
-    committed = {resource_id for resource_id, _path in deletions.committed}
-    uncertain = [(rid, path) for rid, path in deletions.uncertain if rid not in committed]
+    uncertain = deletions.uncertain
     if uncertain:
-        unknown = _distinct_documents(uncertain)
+        unknown = len(uncertain)
         details["uncertain_docs"] = unknown
         if disclose_paths:
-            details["uncertain_uris"] = [
-                doc_uri(vault, path) for path in dict.fromkeys(path for _rid, path in uncertain)
-            ]
+            details["uncertain_uris"] = [doc_uri(vault, path) for _rid, path in uncertain]
             listed = " (details.uncertain_uris)"
         else:
             listed = ""
@@ -206,10 +219,20 @@ def committed_deletions(
         )
     if deletions.final_step_uncertain:
         details["final_step_uncertain"] = True
+        final_docs = list(dict.fromkeys(deletions.final_step_paths))
+        documents = ""
+        if final_docs:
+            details["final_step_docs"] = len(final_docs)
+            if disclose_paths:
+                details["final_step_uris"] = [doc_uri(vault, path) for path in final_docs]
+                documents = "the documents in details.final_step_uris, "
+            else:
+                documents = f"{len(final_docs)} document(s), "
         opening += (
             " The outcome of the delete's last step is unknown: its commit failed before "
-            "the database answered. That step deletes the collections, Files and tables under "
-            "the prefix and records collection.delete; browse the prefix to see whether it went."
+            f"the database answered. That step deletes {documents}the collections, Files and "
+            "tables under the prefix and records collection.delete; browse the prefix to see "
+            "whether it went."
         )
     return details, opening
 
@@ -277,10 +300,7 @@ class _ReleaseAfterCommit:
         return await self._acquire.__aenter__()
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
-        if (
-            exc is not None and self._done and not self._committed
-            and not isinstance(exc, asyncpg.PostgresError)
-        ):
+        if exc is not None and self._done and not self._committed and not _commit_answered(exc):
             self._deletions.final_step_uncertain = True
         try:
             return bool(await self._acquire.__aexit__(exc_type, exc, tb))
@@ -382,7 +402,7 @@ async def _delete_native_document(
                 await events.flush(conn)
                 committing = True
         except BaseException as exc:
-            if committing and not isinstance(exc, asyncpg.PostgresError):
+            if committing and not _commit_answered(exc):
                 # The body is done and the commit failed without the
                 # database's answer: it may have committed.
                 deletions.uncertain.append((resource_id, row["current_path"]))
@@ -689,10 +709,10 @@ class CollectionService:
         retained_paths: list[str] = []
         done: list[bool] = []
         committed: list[bool] = []
+        progress = deletions if deletions is not None else _Deletions()
 
         async with _ReleaseAfterCommit(
-            pool.acquire(), done=done, committed=committed,
-            deletions=deletions if deletions is not None else _Deletions(),
+            pool.acquire(), done=done, committed=committed, deletions=progress,
             what=f"collection delete of {norm!r} in vault {vault}",
         ) as conn:
             async with role_authority_transaction(conn):
@@ -805,26 +825,13 @@ class CollectionService:
                         raise NotFoundError("Collection", norm)
                     if not await _earlier_recursive_delete(conn, vault_id, norm):
                         raise NotFoundError("Collection", norm)
-                    # `collection.delete` is at least once: it is recorded by
-                    # every delete that finds the prefix empty, whether or
-                    # not an earlier one recorded it already.
-                    nothing = {
-                        "deleted_docs": 0,
-                        "deleted_files": 0,
-                        "deleted_sub_collections": 0,
-                        "deleted_tables": 0,
-                    }
-                    completion = EventBuffer()
-                    completion.add(
-                        "collection.delete",
-                        vault_id=vault_id,
-                        resource_uri=None,
-                        actor_id=agent_id,
-                        payload={"vault": vault, "path": norm, **nothing},
-                    )
-                    await completion.flush(conn)
+                    # Deleted already. The common path below finds nothing to
+                    # delete, records `collection.delete` with zero counts and
+                    # answers with them, through the same end of the
+                    # transaction as any other delete. The event is at least
+                    # once: every delete that finds the prefix empty records
+                    # it, whether or not an earlier one did.
                     logger.info("Collection delete: vault=%s path=%s already emptied", vault, norm)
-                    return {"ok": True, "collection": norm, **nothing}
 
                 # ── Empty-mode reject ───────────────────────────
                 # `recursive=False` succeeds ONLY when the target row
@@ -1034,7 +1041,9 @@ class CollectionService:
                         f"agent: {agent_id or 'unknown'}\n"
                         f"action: delete-collection"
                     )
-                # Every statement is done; a failure from here is the commit's.
+                # Every statement is done; a failure from here is the commit's,
+                # whose outcome covers the Bare Git documents deleted here too.
+                progress.final_step_paths = [d["path"] for d in legacy_docs]
                 done.append(True)
             # The delete is complete from here: a failure while the pool
             # takes the connection back does not undo it.

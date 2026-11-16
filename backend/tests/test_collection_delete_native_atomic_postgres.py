@@ -1423,17 +1423,19 @@ async def test_a_file_delete_refused_after_the_documents_went_keeps_its_details_
 
 
 class _Connection:
-    """A pool connection whose outermost transaction's COMMIT can go wrong
-    once ``armed`` and not yet ``fired``: with ``refused`` False the exit
-    commits and then raises, as a connection lost before the database's
-    answer arrives would; with ``refused`` True it rolls back and raises the
-    error the database answered with."""
+    """A pool connection whose outermost transaction's COMMIT goes wrong once
+    ``armed`` and not yet ``fired``. With ``failure`` "lost" the exit commits
+    and then raises ConnectionResetError, as a connection lost before the
+    database's answer would; with "closed" it commits and raises asyncpg's
+    own ConnectionDoesNotExistError (SQLSTATE 08003), which asyncpg raises
+    when the connection closes mid-operation; with "refused" it rolls back
+    and raises the error the database answered with."""
 
-    def __init__(self, conn, armed: list[bool], fired: list[bool], refused: bool = False) -> None:
+    def __init__(self, conn, armed: list[bool], fired: list[bool], failure: str = "lost") -> None:
         self._conn = conn
         self._armed = armed
         self._fired = fired
-        self._refused = refused
+        self._failure = failure
         self._depth = 0
 
     def transaction(self, *args, **kwargs):
@@ -1441,6 +1443,14 @@ class _Connection:
 
     def __getattr__(self, name):
         return getattr(self._conn, name)
+
+
+# The error each ``failure`` raises at the transaction's exit.
+_COMMIT_FAILURES = {
+    "lost": ConnectionResetError,
+    "closed": asyncpg.exceptions.ConnectionDoesNotExistError,
+    "refused": asyncpg.exceptions.SerializationError,
+}
 
 
 class _AnswerLost:
@@ -1457,7 +1467,7 @@ class _AnswerLost:
         firing = (
             self._conn._depth == 0 and exc[0] is None and self._conn._armed and not self._conn._fired
         )
-        if firing and self._conn._refused:
+        if firing and self._conn._failure == "refused":
             self._conn._fired.append(True)
             refusal = asyncpg.exceptions.SerializationError("could not serialize access")
             await self._transaction.__aexit__(type(refusal), refusal, None)
@@ -1465,27 +1475,26 @@ class _AnswerLost:
         outcome = await self._transaction.__aexit__(*exc)
         if firing:
             self._conn._fired.append(True)
+            if self._conn._failure == "closed":
+                raise asyncpg.exceptions.ConnectionDoesNotExistError(
+                    "connection was closed in the middle of operation",
+                )
             raise ConnectionResetError("the connection was lost before COMMIT was answered")
         return outcome
 
 
-def _commit_goes_wrong_on_the_first_document(monkeypatch, pool, *, refused: bool) -> list[bool]:
-    """Make the first document's delete transaction's COMMIT go wrong (see
-    `_Connection`); returns the list that says it did."""
-    armed: list[bool] = []
+def _commit_goes_wrong(monkeypatch, pool, *, failure: str, armed: list[bool]) -> list[bool]:
+    """Route the delete's connections through `_Connection`, whose outermost
+    transaction's COMMIT goes wrong once ``armed`` is set; returns the list
+    that says it did."""
     fired: list[bool] = []
-    edges = collection_service_module.delete_native_document_edges
-
-    async def delete_edges(*args, **kwargs):
-        armed.append(True)
-        return await edges(*args, **kwargs)
 
     class _Acquire:
         def __init__(self) -> None:
             self._acquired = pool.acquire()
 
         async def __aenter__(self):
-            return _Connection(await self._acquired.__aenter__(), armed, fired, refused)
+            return _Connection(await self._acquired.__aenter__(), armed, fired, failure)
 
         async def __aexit__(self, *exc):
             return await self._acquired.__aexit__(*exc)
@@ -1497,28 +1506,45 @@ def _commit_goes_wrong_on_the_first_document(monkeypatch, pool, *, refused: bool
     async def get_pool():
         return _Pool()
 
-    monkeypatch.setattr(collection_service_module, "delete_native_document_edges", delete_edges)
     monkeypatch.setattr(collection_service_module, "get_pool", get_pool)
     return fired
 
 
-async def test_a_deletion_whose_commit_answer_is_lost_is_reported_as_uncertain(monkeypatch):
+def _commit_goes_wrong_on_the_first_document(monkeypatch, pool, *, failure: str) -> list[bool]:
+    """Make the first document's delete transaction's COMMIT go wrong (see
+    `_Connection`); returns the list that says it did."""
+    armed: list[bool] = []
+    edges = collection_service_module.delete_native_document_edges
+
+    async def delete_edges(*args, **kwargs):
+        armed.append(True)
+        return await edges(*args, **kwargs)
+
+    monkeypatch.setattr(collection_service_module, "delete_native_document_edges", delete_edges)
+    return _commit_goes_wrong(monkeypatch, pool, failure=failure, armed=armed)
+
+
+@pytest.mark.parametrize("lost", ["lost", "closed"])
+async def test_a_deletion_whose_commit_answer_is_lost_is_reported_as_uncertain(monkeypatch, lost):
     """The first document's delete commits, and the answer to its COMMIT is
-    then lost with the connection: the transaction's exit raises. The
+    then lost with the connection: the transaction's exit raises, with a
+    plain connection reset or with asyncpg's ConnectionDoesNotExistError (a
+    connection error, SQLSTATE class 08, not the database's answer). The
     deletion may have committed, and here it did. The error says the request
     partly applied, counts that document as uncertain and, to a reader,
     names it, and its hint says the outcome is unknown. It used to say
-    nothing at all of the request's progress."""
+    nothing at all of the request's progress, and asyncpg's error, a
+    PostgresError, was taken for the database refusing the commit."""
     async with _fresh_database() as pool:
         vault = "native-commit-unanswered"
         vault_id = await _native_vault(pool, monkeypatch, vault)
-        fired = _commit_goes_wrong_on_the_first_document(monkeypatch, pool, refused=False)
+        fired = _commit_goes_wrong_on_the_first_document(monkeypatch, pool, failure=lost)
         with pytest.raises(TransientDependencyError) as failure:
             await CollectionService(git=object()).delete(
                 vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
             )
         assert fired
-        assert isinstance(failure.value.__cause__, ConnectionResetError)
+        assert isinstance(failure.value.__cause__, _COMMIT_FAILURES[lost])
         assert failure.value.details == {
             "partially_applied": True, "deleted_docs": 0, "deleted_uris": [],
             "uncertain_docs": 1, "uncertain_uris": [doc_uri(vault, _PATHS[0])],
@@ -1542,7 +1568,7 @@ async def test_a_commit_the_database_refused_is_not_reported_as_uncertain(monkey
     async with _fresh_database() as pool:
         vault = "native-commit-refused"
         vault_id = await _native_vault(pool, monkeypatch, vault)
-        fired = _commit_goes_wrong_on_the_first_document(monkeypatch, pool, refused=True)
+        fired = _commit_goes_wrong_on_the_first_document(monkeypatch, pool, failure="refused")
         with pytest.raises(asyncpg.exceptions.SerializationError):
             await CollectionService(git=object()).delete(
                 vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
@@ -1686,10 +1712,12 @@ async def test_a_file_whose_resource_is_gone_keeps_the_delete_progress_over_rest
         assert "committed deletions for" in body["hint"], body
 
 
-async def test_a_last_step_whose_commit_answer_is_lost_is_reported_as_uncertain(monkeypatch):
+@pytest.mark.parametrize("lost", ["lost", "closed"])
+async def test_a_last_step_whose_commit_answer_is_lost_is_reported_as_uncertain(monkeypatch, lost):
     """Both documents went. The delete's last transaction then commits the
     collection's deletion with `collection.delete`, and the answer to its
-    COMMIT is lost with the connection: the transaction's exit raises. The
+    COMMIT is lost with the connection: the transaction's exit raises, with a
+    plain connection reset or with asyncpg's ConnectionDoesNotExistError. The
     error says, beside the documents the request deleted, that the last
     step's outcome is unknown (`final_step_uncertain`), and its hint says
     what that step covers. It used to report only the documents."""
@@ -1697,38 +1725,20 @@ async def test_a_last_step_whose_commit_answer_is_lost_is_reported_as_uncertain(
         vault = "native-last-commit-unanswered"
         vault_id = await _native_vault(pool, monkeypatch, vault)
         armed: list[bool] = []
-        fired: list[bool] = []
         lock_rows = collection_service_module.lock_collection_rows
 
         async def lock_in_the_last_transaction(*args, **kwargs):
             armed.append(True)
             return await lock_rows(*args, **kwargs)
 
-        class _Acquire:
-            def __init__(self) -> None:
-                self._acquired = pool.acquire()
-
-            async def __aenter__(self):
-                return _Connection(await self._acquired.__aenter__(), armed, fired)
-
-            async def __aexit__(self, *exc):
-                return await self._acquired.__aexit__(*exc)
-
-        class _Pool:
-            def acquire(self):
-                return _Acquire()
-
-        async def get_pool():
-            return _Pool()
-
         monkeypatch.setattr(collection_service_module, "lock_collection_rows", lock_in_the_last_transaction)
-        monkeypatch.setattr(collection_service_module, "get_pool", get_pool)
+        fired = _commit_goes_wrong(monkeypatch, pool, failure=lost, armed=armed)
         with pytest.raises(TransientDependencyError) as failure:
             await CollectionService(git=object()).delete(
                 vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
             )
         assert fired
-        assert isinstance(failure.value.__cause__, ConnectionResetError)
+        assert isinstance(failure.value.__cause__, _COMMIT_FAILURES[lost])
         assert failure.value.details == {
             "partially_applied": True, "deleted_docs": 2,
             "deleted_uris": [doc_uri(vault, path) for path in _PATHS],
@@ -1744,3 +1754,218 @@ async def test_a_last_step_whose_commit_answer_is_lost_is_reported_as_uncertain(
             "collections": [],
             "events": ["document.delete", "document.delete", "collection.delete"],
         }
+
+
+async def test_a_second_deletion_of_a_restored_and_moved_document_with_its_answer_lost_is_uncertain(
+    monkeypatch,
+):
+    """The delete deleted `notes/a.md` and `notes/b.md`. Before its last
+    transaction another request restored `notes/a.md` and moved it to
+    `notes/c.md`, so the delete's next round deleted that document again, at
+    its new path, and the answer to that COMMIT was lost. The error counts
+    the two committed deletions and, apart, the uncertain one at
+    `notes/c.md`. The uncertain attempt used to be dropped because the same
+    document's earlier deletion had committed."""
+    async with _fresh_database() as pool:
+        vault = "native-moved-then-unanswered"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
+        last_transaction = CollectionService._delete_collections
+        moved: list[bool] = []
+
+        async def restore_and_move_once(self, **kwargs):
+            if not moved:
+                moved.append(True)
+                row = await pool.fetchrow(
+                    "SELECT resource_id, head_revision_id FROM native_resources "
+                    "WHERE namespace_id = $1 AND current_path = $2",
+                    vault_id, _PATHS[0],
+                )
+                restored = await native.restore_text(
+                    namespace_id=vault_id, surface="document", path=_PATHS[0], payload="restored",
+                    actor="other", mutation_id=uuid.uuid4(), expected_revision_id=row["head_revision_id"],
+                    expected_resource_id=row["resource_id"],
+                )
+                await native.move_text(
+                    namespace_id=vault_id, surface="document", path=_PATHS[0], path_to="notes/c.md",
+                    actor="other", mutation_id=uuid.uuid4(), expected_revision_id=restored.revision_id,
+                    expected_resource_id=row["resource_id"],
+                )
+            return await last_transaction(self, **kwargs)
+
+        armed: list[bool] = []
+        edges = collection_service_module.delete_native_document_edges
+
+        async def delete_edges(*args, **kwargs):
+            if args[4] == "notes/c.md":
+                armed.append(True)
+            return await edges(*args, **kwargs)
+
+        monkeypatch.setattr(CollectionService, "_delete_collections", restore_and_move_once)
+        monkeypatch.setattr(collection_service_module, "delete_native_document_edges", delete_edges)
+        fired = _commit_goes_wrong(monkeypatch, pool, failure="closed", armed=armed)
+        with pytest.raises(TransientDependencyError) as failure:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert fired
+        assert failure.value.details == {
+            "partially_applied": True, "deleted_docs": 2,
+            "deleted_uris": [doc_uri(vault, path) for path in _PATHS],
+            "uncertain_docs": 1, "uncertain_uris": [doc_uri(vault, "notes/c.md")],
+        }
+        assert "is unknown" in failure.value.hint
+
+
+async def test_a_bare_git_last_step_whose_commit_answer_is_lost_names_its_documents(monkeypatch):
+    """On the Bare Git authority the delete's last transaction deletes the
+    documents under `notes` with the collection, and the answer to its COMMIT
+    is lost (asyncpg's ConnectionDoesNotExistError). The error says the last
+    step's outcome is unknown, counts the documents that step deletes in
+    `final_step_docs` and names them to a reader in `final_step_uris`, and
+    its hint mentions them. The hint used to name only collections, Files and
+    tables."""
+    async with _fresh_database() as pool:
+        vault = "bare-last-commit-unanswered"
+        monkeypatch.setattr(document_counters, "native_documents_are_authoritative", lambda: False)
+        vault_id = await _make_vault(pool, vault)
+        notes = await CollectionRepository(pool).get_or_create(vault_id, "notes")
+        for path in _PATHS:
+            await pool.execute(
+                "INSERT INTO documents (vault_id, collection_id, path, title) VALUES ($1, $2, $3, $3)",
+                vault_id, notes, path,
+            )
+        armed: list[bool] = []
+        lock_rows = collection_service_module.lock_collection_rows
+
+        async def lock_in_the_last_transaction(*args, **kwargs):
+            armed.append(True)
+            return await lock_rows(*args, **kwargs)
+
+        monkeypatch.setattr(collection_service_module, "lock_collection_rows", lock_in_the_last_transaction)
+        fired = _commit_goes_wrong(monkeypatch, pool, failure="closed", armed=armed)
+        with pytest.raises(TransientDependencyError) as failure:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert fired
+        assert failure.value.details == {
+            "partially_applied": True, "deleted_docs": 0, "deleted_uris": [],
+            "final_step_uncertain": True, "final_step_docs": 2,
+            "final_step_uris": [doc_uri(vault, path) for path in _PATHS],
+        }
+        assert "details.final_step_uris" in failure.value.hint, failure.value.hint
+        # It did commit.
+        assert await pool.fetchval("SELECT count(*) FROM documents WHERE vault_id = $1", vault_id) == 0
+        assert await pool.fetchval("SELECT count(*) FROM collections WHERE vault_id = $1", vault_id) == 0
+
+
+async def _documents_gone_before_the_last_transaction(pool, monkeypatch, vault: str) -> uuid.UUID:
+    """A Native Vault whose `notes` has no collection row and whose documents
+    a recursive delete deleted, stopping before its last transaction: the
+    next delete of `notes` finds it emptied."""
+    vault_id = await _native_vault(pool, monkeypatch, vault)
+    await pool.execute("DELETE FROM collections WHERE vault_id = $1", vault_id)
+    last_transaction = CollectionService._delete_collections
+
+    async def stop(self, **kwargs):
+        raise RuntimeError("the delete stopped before its last transaction")
+
+    monkeypatch.setattr(CollectionService, "_delete_collections", stop)
+    with pytest.raises(InternalError):
+        await CollectionService(git=object()).delete(
+            vault=vault, path="notes", recursive=True, agent_id="tester",
+        )
+    monkeypatch.setattr(CollectionService, "_delete_collections", last_transaction)
+    return vault_id
+
+
+def _arm_on_the_emptied_prefix(monkeypatch) -> list[bool]:
+    """Set the returned list when the last transaction finds the prefix
+    emptied by an earlier delete."""
+    armed: list[bool] = []
+    earlier = collection_service_module._earlier_recursive_delete
+
+    async def found_earlier(*args, **kwargs):
+        armed.append(True)
+        return await earlier(*args, **kwargs)
+
+    monkeypatch.setattr(collection_service_module, "_earlier_recursive_delete", found_earlier)
+    return armed
+
+
+async def test_an_emptied_prefix_answers_success_though_the_reset_fails(monkeypatch, caplog):
+    """The delete is run again on a prefix an earlier delete emptied. It
+    records `collection.delete` and commits, and then the pool fails to
+    reset its connection. It answers with its result, zero counts; the
+    failure is logged. That branch used to return from inside the
+    transaction, past the mark that the delete had committed, and answered
+    with an error."""
+    async with _fresh_database() as pool:
+        vault_id = await _documents_gone_before_the_last_transaction(pool, monkeypatch, "native-emptied-reset")
+        armed = _arm_on_the_emptied_prefix(monkeypatch)
+        failed: list[bool] = []
+
+        class _ResetFails:
+            def __init__(self) -> None:
+                self._acquired = pool.acquire()
+
+            async def __aenter__(self):
+                return await self._acquired.__aenter__()
+
+            async def __aexit__(self, *exc):
+                outcome = await self._acquired.__aexit__(*exc)
+                if armed and not failed and exc[0] is None:
+                    failed.append(True)
+                    raise TimeoutError("timed out resetting the connection")
+                return outcome
+
+        class _Pool:
+            def acquire(self):
+                return _ResetFails()
+
+        async def get_pool():
+            return _Pool()
+
+        monkeypatch.setattr(collection_service_module, "get_pool", get_pool)
+        with caplog.at_level("ERROR", logger="akb.collections"):
+            result = await CollectionService(git=object()).delete(
+                vault="native-emptied-reset", path="notes", recursive=True, agent_id="tester",
+            )
+        assert failed
+        assert result == {
+            "ok": True, "collection": "notes", "deleted_docs": 0, "deleted_files": 0,
+            "deleted_sub_collections": 0, "deleted_tables": 0,
+        }
+        assert any("giving its connection back failed" in r.getMessage() for r in caplog.records)
+        assert (await _state(pool, vault_id))["events"] == [
+            "document.delete", "document.delete", "collection.delete",
+        ]
+
+
+async def test_an_emptied_prefix_whose_commit_answer_is_lost_is_reported_as_uncertain(monkeypatch):
+    """The delete is run again on a prefix an earlier delete emptied, and the
+    answer to the COMMIT of its `collection.delete` is lost (asyncpg's
+    ConnectionDoesNotExistError). The error says the last step's outcome is
+    unknown. That branch used to skip the mark that its statements were done,
+    so the error said nothing of it."""
+    async with _fresh_database() as pool:
+        vault_id = await _documents_gone_before_the_last_transaction(
+            pool, monkeypatch, "native-emptied-unanswered",
+        )
+        armed = _arm_on_the_emptied_prefix(monkeypatch)
+        fired = _commit_goes_wrong(monkeypatch, pool, failure="closed", armed=armed)
+        with pytest.raises(TransientDependencyError) as failure:
+            await CollectionService(git=object()).delete(
+                vault="native-emptied-unanswered", path="notes", recursive=True, agent_id="tester",
+                disclose_paths=True,
+            )
+        assert fired
+        assert failure.value.details == {
+            "partially_applied": True, "deleted_docs": 0, "deleted_uris": [],
+            "final_step_uncertain": True,
+        }
+        # It did commit.
+        assert (await _state(pool, vault_id))["events"] == [
+            "document.delete", "document.delete", "collection.delete",
+        ]
