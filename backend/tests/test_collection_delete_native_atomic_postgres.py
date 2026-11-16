@@ -1243,12 +1243,15 @@ async def _assert_internal_with_progress(
     }
     assert isinstance(exc, InternalError)
     assert (exc.status_code, exc.code, exc.details) == (500, "internal", progress)
+    # The generic message, exactly; what went is in the hint and details.
+    assert str(exc) == "Internal server error"
     status, body = await _rest_answer(exc, monkeypatch)
     assert (status, body["code"], body["details"]) == (500, INTERNAL, progress), body
-    assert body["message"].startswith("Internal server error"), body
+    assert body["message"] == "Internal server error", body
     assert "committed deletions for" in body["hint"], body
     envelope = exception_envelope(exc)
     assert (envelope["code"], envelope["details"]) == (INTERNAL, progress), envelope
+    assert envelope["error"] == "Internal server error", envelope
     assert "committed deletions for" in envelope["hint"], envelope
 
 
@@ -1417,3 +1420,267 @@ async def test_a_file_delete_refused_after_the_documents_went_keeps_its_details_
         assert "committed deletions for" in envelope["hint"], envelope
         status, body = await _rest_answer(failure.value, monkeypatch)
         assert (status, body["details"]) == (503, progress), body
+
+
+class _Connection:
+    """A pool connection whose outermost transaction's COMMIT can go wrong
+    once ``armed`` and not yet ``fired``: with ``refused`` False the exit
+    commits and then raises, as a connection lost before the database's
+    answer arrives would; with ``refused`` True it rolls back and raises the
+    error the database answered with."""
+
+    def __init__(self, conn, armed: list[bool], fired: list[bool], refused: bool = False) -> None:
+        self._conn = conn
+        self._armed = armed
+        self._fired = fired
+        self._refused = refused
+        self._depth = 0
+
+    def transaction(self, *args, **kwargs):
+        return _AnswerLost(self, self._conn.transaction(*args, **kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class _AnswerLost:
+    def __init__(self, conn: _Connection, transaction) -> None:
+        self._conn = conn
+        self._transaction = transaction
+
+    async def __aenter__(self):
+        self._conn._depth += 1
+        return await self._transaction.__aenter__()
+
+    async def __aexit__(self, *exc):
+        self._conn._depth -= 1
+        firing = (
+            self._conn._depth == 0 and exc[0] is None and self._conn._armed and not self._conn._fired
+        )
+        if firing and self._conn._refused:
+            self._conn._fired.append(True)
+            refusal = asyncpg.exceptions.SerializationError("could not serialize access")
+            await self._transaction.__aexit__(type(refusal), refusal, None)
+            raise refusal
+        outcome = await self._transaction.__aexit__(*exc)
+        if firing:
+            self._conn._fired.append(True)
+            raise ConnectionResetError("the connection was lost before COMMIT was answered")
+        return outcome
+
+
+def _commit_goes_wrong_on_the_first_document(monkeypatch, pool, *, refused: bool) -> list[bool]:
+    """Make the first document's delete transaction's COMMIT go wrong (see
+    `_Connection`); returns the list that says it did."""
+    armed: list[bool] = []
+    fired: list[bool] = []
+    edges = collection_service_module.delete_native_document_edges
+
+    async def delete_edges(*args, **kwargs):
+        armed.append(True)
+        return await edges(*args, **kwargs)
+
+    class _Acquire:
+        def __init__(self) -> None:
+            self._acquired = pool.acquire()
+
+        async def __aenter__(self):
+            return _Connection(await self._acquired.__aenter__(), armed, fired, refused)
+
+        async def __aexit__(self, *exc):
+            return await self._acquired.__aexit__(*exc)
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    async def get_pool():
+        return _Pool()
+
+    monkeypatch.setattr(collection_service_module, "delete_native_document_edges", delete_edges)
+    monkeypatch.setattr(collection_service_module, "get_pool", get_pool)
+    return fired
+
+
+async def test_a_deletion_whose_commit_answer_is_lost_is_reported_as_uncertain(monkeypatch):
+    """The first document's delete commits, and the answer to its COMMIT is
+    then lost with the connection: the transaction's exit raises. The
+    deletion may have committed, and here it did. The error says the request
+    partly applied, counts that document as uncertain and, to a reader,
+    names it, and its hint says the outcome is unknown. It used to say
+    nothing at all of the request's progress."""
+    async with _fresh_database() as pool:
+        vault = "native-commit-unanswered"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        fired = _commit_goes_wrong_on_the_first_document(monkeypatch, pool, refused=False)
+        with pytest.raises(TransientDependencyError) as failure:
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert fired
+        assert isinstance(failure.value.__cause__, ConnectionResetError)
+        assert failure.value.details == {
+            "partially_applied": True, "deleted_docs": 0, "deleted_uris": [],
+            "uncertain_docs": 1, "uncertain_uris": [doc_uri(vault, _PATHS[0])],
+        }
+        assert "is unknown" in failure.value.hint
+        envelope = exception_envelope(failure.value)
+        assert envelope["details"]["uncertain_uris"] == [doc_uri(vault, _PATHS[0])]
+        # It did commit, with its event.
+        assert await _state(pool, vault_id) == {
+            "documents": [(_PATHS[0], "deleted"), (_PATHS[1], "live")],
+            "collections": ["notes"],
+            "events": ["document.delete"],
+        }
+
+
+async def test_a_commit_the_database_refused_is_not_reported_as_uncertain(monkeypatch):
+    """The first document's COMMIT is refused by the database, which rolls
+    the transaction back. That deletion did not happen, so it is not
+    uncertain: the request had done nothing yet, and the error is the
+    database's own."""
+    async with _fresh_database() as pool:
+        vault = "native-commit-refused"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        fired = _commit_goes_wrong_on_the_first_document(monkeypatch, pool, refused=True)
+        with pytest.raises(asyncpg.exceptions.SerializationError):
+            await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert fired
+        assert await _state(pool, vault_id) == {
+            "documents": [(path, "live") for path in _PATHS],
+            "collections": ["notes"],
+            "events": [],
+        }
+
+
+async def test_a_delete_whose_last_transaction_committed_answers_success_though_the_reset_fails(
+    monkeypatch, caplog,
+):
+    """`notes` holds the two documents and a File. The delete's last
+    transaction commits the File's and the collection's deletion, with
+    `collection.delete`, and then the pool fails to reset its connection. The
+    delete is complete and answers so, the File counted; the failure is
+    logged. It used to answer with an error that said only that the
+    documents went."""
+    async with _fresh_database() as pool:
+        vault = "native-last-reset-fails"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        notes = await pool.fetchval(
+            "SELECT id FROM collections WHERE vault_id = $1 AND path = 'notes'", vault_id,
+        )
+        await pool.execute(
+            "INSERT INTO vault_files (vault_id, collection_id, name, s3_key) "
+            "VALUES ($1, $2, 'n.bin', 'notes/n.bin')",
+            vault_id, notes,
+        )
+        in_last: list[bool] = []
+        failed: list[bool] = []
+        lock_rows = collection_service_module.lock_collection_rows
+
+        async def lock_in_the_last_transaction(*args, **kwargs):
+            in_last.append(True)
+            return await lock_rows(*args, **kwargs)
+
+        class _ResetFails:
+            def __init__(self) -> None:
+                self._acquired = pool.acquire()
+
+            async def __aenter__(self):
+                return await self._acquired.__aenter__()
+
+            async def __aexit__(self, *exc):
+                outcome = await self._acquired.__aexit__(*exc)
+                if in_last and not failed and exc[0] is None:
+                    failed.append(True)
+                    raise TimeoutError("timed out resetting the connection")
+                return outcome
+
+        class _Pool:
+            def acquire(self):
+                return _ResetFails()
+
+        async def get_pool():
+            return _Pool()
+
+        monkeypatch.setattr(collection_service_module, "lock_collection_rows", lock_in_the_last_transaction)
+        monkeypatch.setattr(collection_service_module, "get_pool", get_pool)
+        with caplog.at_level("ERROR", logger="akb.collections"):
+            result = await CollectionService(git=object()).delete(
+                vault=vault, path="notes", recursive=True, agent_id="tester", disclose_paths=True,
+            )
+        assert failed
+        assert result == {
+            "ok": True, "collection": "notes", "deleted_docs": 2, "deleted_files": 1,
+            "deleted_sub_collections": 0, "deleted_tables": 0,
+        }
+        assert any("giving its connection back failed" in r.getMessage() for r in caplog.records)
+        assert await _state(pool, vault_id) == {
+            "documents": [(path, "deleted") for path in _PATHS],
+            "collections": [],
+            "events": ["document.delete", "document.delete", "collection.delete"],
+        }
+        assert await pool.fetchval("SELECT count(*) FROM vault_files WHERE vault_id = $1", vault_id) == 0
+
+
+async def test_a_file_whose_resource_is_gone_keeps_the_delete_progress_over_rest(monkeypatch):
+    """`notes` holds the two documents and a native_text File whose Native
+    Resource is gone, so the File's delete raises not found after the
+    documents went. The REST delete answers 404 with the details and hint
+    that say what the request deleted. The route used to turn the error into
+    a bare 404 that kept only its message."""
+    import sys
+    import tempfile
+
+    import httpx
+    from fastapi import FastAPI
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    from app.config import settings
+
+    if "app.main" not in sys.modules or "app.api.routes.collections" not in sys.modules:
+        monkeypatch.setattr(settings, "git_storage_path", tempfile.mkdtemp(prefix="akb-rest-delete-"))
+    from app.api.deps import get_current_user
+    from app.api.routes import collections as collection_routes
+    from app.main import akb_error_handler, http_error_handler
+
+    async with _fresh_database() as pool:
+        vault = "native-file-resource-gone"
+        vault_id = await _native_vault(pool, monkeypatch, vault)
+        notes = await pool.fetchval(
+            "SELECT id FROM collections WHERE vault_id = $1 AND path = 'notes'", vault_id,
+        )
+        await pool.execute(
+            "INSERT INTO vault_files (vault_id, collection_id, name, s3_key, storage_driver, "
+            "storage_locator, native_resource_id, native_revision_id) "
+            "VALUES ($1, $2, 'n.txt', 'notes/n.txt', 'native_text', 'native-text:n', $3, $4)",
+            vault_id, notes, uuid.uuid4(), "b" * 40,
+        )
+
+        async def resource_gone(_conn, request):
+            raise NotFoundError("Native Resource", str(request.resource_id))
+
+        async def writer(*_args, **_kwargs):
+            return {"role": "writer"}
+
+        async def reader(*_args, **_kwargs):
+            return True
+
+        monkeypatch.setattr(m1_file_measurement, "_native_text_deleter", resource_gone)
+        monkeypatch.setattr(collection_routes, "check_vault_access", writer)
+        monkeypatch.setattr(collection_routes, "_can_read_vault", reader)
+        app = FastAPI()
+        app.include_router(collection_routes.router, prefix="/api/v1")
+        app.add_exception_handler(AKBError, akb_error_handler)
+        app.add_exception_handler(StarletteHTTPException, http_error_handler)
+        app.dependency_overrides[get_current_user] = lambda: type("User", (), {"user_id": "tester"})()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.delete(f"/api/v1/collections/{vault}/notes", params={"recursive": "true"})
+        assert response.status_code == 404, response.text
+        body = response.json()
+        assert (body["code"], body["details"]) == ("not_found", {
+            "partially_applied": True, "deleted_docs": 2,
+            "deleted_uris": [doc_uri(vault, path) for path in _PATHS],
+        }), body
+        assert "committed deletions for" in body["hint"], body

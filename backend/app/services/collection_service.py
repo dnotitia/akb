@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass, field
 
 import asyncpg
 
@@ -131,29 +132,47 @@ RETAINED_COLLECTIONS_HINT = (
 )
 
 
+@dataclass
+class _Deletions:
+    """What a recursive delete's document transactions did.
+
+    ``committed`` holds the Resource and path of each deletion whose
+    transaction committed. ``uncertain`` holds those whose commit failed
+    without an answer from the database, such as a connection lost during
+    COMMIT: the deletion may or may not have committed.
+    """
+
+    committed: list[tuple[uuid.UUID, str]] = field(default_factory=list)
+    uncertain: list[tuple[uuid.UUID, str]] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.committed or self.uncertain)
+
+
 def _distinct_documents(deleted: list[tuple[uuid.UUID, str]]) -> int:
-    """How many documents a list of committed deletions covers: a document
-    restored and deleted again by the same request counts once."""
+    """How many documents a list of deletions covers: a document restored and
+    deleted again by the same request counts once."""
     return len({resource_id for resource_id, _path in deleted})
 
 
 def committed_deletions(
-    *, vault: str, deleted: list[tuple[uuid.UUID, str]], disclose_paths: bool,
+    *, vault: str, deletions: _Deletions, disclose_paths: bool,
 ) -> tuple[dict, str]:
     """The details, and the opening of the hint, of a recursive delete that
-    stopped after it committed deletions for some documents.
+    stopped after its document transactions had done something.
 
-    ``deleted`` holds each committed deletion's Resource and path; a document
-    restored and deleted again counts once (``deleted_docs``), and each path
-    is listed once. The paths are given only to a caller who may read the
-    Vault (``disclose_paths``); another gets the count. They are the
-    documents this request deleted, which later writes or restores may have
-    changed since.
+    A document restored and deleted again counts once (``deleted_docs``),
+    and each path is listed once. The paths are given only to a caller who
+    may read the Vault (``disclose_paths``); another gets the counts. They
+    are the documents this request deleted, which later writes or restores
+    may have changed since. Deletions whose commit's outcome is unknown, and
+    which did not also commit once, are counted apart (``uncertain_docs``,
+    and ``uncertain_uris`` for a reader), and the hint says so.
     """
-    count = _distinct_documents(deleted)
+    count = _distinct_documents(deletions.committed)
     details: dict = {"partially_applied": True, "deleted_docs": count}
     if disclose_paths:
-        paths = list(dict.fromkeys(path for _resource_id, path in deleted))
+        paths = list(dict.fromkeys(path for _resource_id, path in deletions.committed))
         details["deleted_uris"] = [doc_uri(vault, path) for path in paths]
         opening = (
             "details.deleted_uris lists the documents this request committed deletions for; "
@@ -164,12 +183,28 @@ def committed_deletions(
             f"This request committed deletions for {count} document(s); later writes or "
             "restores may have changed them since."
         )
+    committed = {resource_id for resource_id, _path in deletions.committed}
+    uncertain = [(rid, path) for rid, path in deletions.uncertain if rid not in committed]
+    if uncertain:
+        unknown = _distinct_documents(uncertain)
+        details["uncertain_docs"] = unknown
+        if disclose_paths:
+            details["uncertain_uris"] = [
+                doc_uri(vault, path) for path in dict.fromkeys(path for _rid, path in uncertain)
+            ]
+            listed = " (details.uncertain_uris)"
+        else:
+            listed = ""
+        opening += (
+            f" The outcome of {unknown} more deletion(s){listed} is unknown: their commit "
+            "failed before the database answered; read those documents to see whether "
+            "they went."
+        )
     return details, opening
 
 
 def _with_progress(
-    exc: Exception, *, vault: str, prefix: str, deleted: list[tuple[uuid.UUID, str]],
-    disclose_paths: bool,
+    exc: Exception, *, vault: str, prefix: str, deletions: _Deletions, disclose_paths: bool,
 ) -> AKBError:
     """The error to report for ``exc``, raised after this request committed
     deletions for some documents: the same error, with what the request did.
@@ -179,9 +214,9 @@ def _with_progress(
     them, and its code, status and retry information stay its own. A database
     error that the API reports as a transient error (such as the Vault's
     event lock timing out) is reported as that error. Any other exception is
-    an internal error and is reported as one, an ``InternalError`` with the
-    generic message, carrying the same details and hint; the original is
-    logged here and becomes its cause.
+    an internal error and is reported as one, an ``InternalError`` whose
+    message stays the generic one, carrying the same details and hint; the
+    original is logged here and becomes its cause.
     """
     reported = exc if isinstance(exc, AKBError) else transient_error(exc)
     if reported is None:
@@ -190,15 +225,42 @@ def _with_progress(
             prefix, vault, exc_info=exc,
         )
         reported = InternalError()
-    details, opening = committed_deletions(vault=vault, deleted=deleted, disclose_paths=disclose_paths)
+    details, opening = committed_deletions(
+        vault=vault, deletions=deletions, disclose_paths=disclose_paths,
+    )
     reported.details = {**(reported.details or {}), **details}
     reported.hint = f"{opening} {reported.hint}" if reported.hint else opening
-    reported.message = (
-        f"{reported.message}; this request had committed deletions for "
-        f"{details['deleted_docs']} document(s) under {prefix!r}"
-    )
-    reported.args = (reported.message,)
+    if not isinstance(reported, InternalError):
+        reported.message = (
+            f"{reported.message}; this request had committed deletions for "
+            f"{details['deleted_docs']} document(s) under {prefix!r}"
+        )
+        reported.args = (reported.message,)
     return reported
+
+
+class _ReleaseAfterCommit:
+    """``pool.acquire()`` for a transaction whose commit must stand: once
+    ``committed`` is set, after the transaction committed, a failure while the
+    pool takes the connection back, such as a reset that fails, is logged
+    instead of raised, so the caller still answers with what it committed."""
+
+    def __init__(self, acquire, committed: list[bool], what: str) -> None:
+        self._acquire = acquire
+        self._committed = committed
+        self._what = what
+
+    async def __aenter__(self):
+        return await self._acquire.__aenter__()
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        try:
+            return bool(await self._acquire.__aexit__(exc_type, exc, tb))
+        except Exception:
+            if exc_type is not None or not self._committed:
+                raise
+            logger.exception("%s committed; giving its connection back failed", self._what)
+            return False
 
 
 def _under(path: str, prefix: str) -> bool:
@@ -224,12 +286,17 @@ async def _live_native_documents_under(conn, vault_id: uuid.UUID, prefix: str) -
 
 async def _delete_native_document(
     native, *, vault: str, vault_id: uuid.UUID, prefix: str, resource_id: uuid.UUID, actor: str,
-    deleted: list[tuple[uuid.UUID, str]],
+    deletions: _Deletions,
 ) -> None:
     """Delete one live Native document under ``prefix``, with its event, and
-    append its Resource and the path it was deleted at to ``deleted`` as soon
-    as the transaction has committed, before the connection goes back to the
-    pool: a failure while the pool resets the connection does not lose it.
+    record its Resource and the path it was deleted at in
+    ``deletions.committed`` as soon as the transaction has committed, before
+    the connection goes back to the pool: a failure while the pool resets the
+    connection does not lose it. When the commit itself fails without an
+    answer from the database, such as a connection lost during COMMIT, the
+    deletion may or may not have committed; it is recorded in
+    ``deletions.uncertain`` and the failure is raised. A commit the database
+    refused rolled back, and is not recorded.
 
     The delete, the document's graph edges and its ``document.delete`` commit
     together in one short transaction that locks only this document's Resource
@@ -248,54 +315,61 @@ async def _delete_native_document(
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            # The Vault first, as every child write and the Vault's own delete
-            # take it: locking the Resource first could deadlock with a Vault
-            # delete, which locks the Vault and then the Vault's edges before
-            # it cascades to the Resources.
-            if not await lock_vault_for_child_write(conn, vault_id):
-                raise ConflictError("Vault was deleted during collection deletion")
-            row = await native.repository.lock_resource(conn, resource_id)
-            if (
-                row is None
-                or row["namespace_id"] != vault_id
-                or row["surface"] != "document"
-                or row["lifecycle"] != "live"
-                or not _under(row["current_path"], prefix)
-            ):
-                return
-            events = EventBuffer()
-            await native.delete_resource(
-                namespace_id=vault_id,
-                surface="document",
-                path=row["current_path"],
-                actor=actor,
-                mutation_id=uuid.uuid4(),
-                expected_revision_id=row["head_revision_id"],
-                expected_resource_id=resource_id,
-                retain_document_assets=False,
-                message=f"[delete-collection] {prefix}\n\nagent: {actor}\naction: delete-collection",
-                subject=f"[delete-collection] {prefix}",
-                conn=conn,
-                events=events,
-            )
-            # Keyed on the resource, and on the path read under its row lock.
-            await delete_native_document_edges(conn, vault_id, vault, resource_id, row["current_path"])
-            # The event is the transaction's last statement.
-            await events.flush(conn)
+        committing = False
+        try:
+            async with conn.transaction():
+                # The Vault first, as every child write and the Vault's own delete
+                # take it: locking the Resource first could deadlock with a Vault
+                # delete, which locks the Vault and then the Vault's edges before
+                # it cascades to the Resources.
+                if not await lock_vault_for_child_write(conn, vault_id):
+                    raise ConflictError("Vault was deleted during collection deletion")
+                row = await native.repository.lock_resource(conn, resource_id)
+                if (
+                    row is None
+                    or row["namespace_id"] != vault_id
+                    or row["surface"] != "document"
+                    or row["lifecycle"] != "live"
+                    or not _under(row["current_path"], prefix)
+                ):
+                    return
+                events = EventBuffer()
+                await native.delete_resource(
+                    namespace_id=vault_id,
+                    surface="document",
+                    path=row["current_path"],
+                    actor=actor,
+                    mutation_id=uuid.uuid4(),
+                    expected_revision_id=row["head_revision_id"],
+                    expected_resource_id=resource_id,
+                    retain_document_assets=False,
+                    message=f"[delete-collection] {prefix}\n\nagent: {actor}\naction: delete-collection",
+                    subject=f"[delete-collection] {prefix}",
+                    conn=conn,
+                    events=events,
+                )
+                # Keyed on the resource, and on the path read under its row lock.
+                await delete_native_document_edges(conn, vault_id, vault, resource_id, row["current_path"])
+                # The event is the transaction's last statement.
+                await events.flush(conn)
+                committing = True
+        except BaseException as exc:
+            if committing and not isinstance(exc, asyncpg.PostgresError):
+                # The body is done and the commit failed without the
+                # database's answer: it may have committed.
+                deletions.uncertain.append((resource_id, row["current_path"]))
+            raise
         # Committed: recorded before the pool takes the connection back.
-        deleted.append((resource_id, row["current_path"]))
+        deletions.committed.append((resource_id, row["current_path"]))
 
 
 async def _delete_native_documents_under(
-    *, vault: str, vault_id: uuid.UUID, prefix: str, actor: str,
-    deleted: list[tuple[uuid.UUID, str]],
+    *, vault: str, vault_id: uuid.UUID, prefix: str, actor: str, deletions: _Deletions,
 ) -> None:
-    """Delete the live Native documents under ``prefix`` one by one, appending
-    the Resource and path of each one this call deletes to ``deleted``. A
-    failure part-way leaves the documents deleted so far deleted, each with
-    its event; running the delete again continues from the documents that
-    remain."""
+    """Delete the live Native documents under ``prefix`` one by one,
+    recording each one this call deletes in ``deletions``. A failure part-way
+    leaves the documents deleted so far deleted, each with its event;
+    running the delete again continues from the documents that remain."""
     from app.services.native_document_service import NativeDocumentService
 
     native = await NativeDocumentService()._native()
@@ -305,7 +379,7 @@ async def _delete_native_documents_under(
     for doc in listed:
         await _delete_native_document(
             native, vault=vault, vault_id=vault_id, prefix=prefix,
-            resource_id=doc["resource_id"], actor=actor, deleted=deleted,
+            resource_id=doc["resource_id"], actor=actor, deletions=deletions,
         )
 
 
@@ -498,7 +572,7 @@ class CollectionService:
         from app.services import document_counters as _counters
 
         native_authority = _counters.native_documents_are_authoritative()
-        native_deleted: list[tuple[uuid.UUID, str]] = []
+        deletions = _Deletions()
         try:
             for _ in range(_NATIVE_DELETE_ROUNDS):
                 if native_authority and recursive:
@@ -508,7 +582,7 @@ class CollectionService:
                         await self._refuse_tables_under(vault, vault_id, norm)
                     await _delete_native_documents_under(
                         vault=vault, vault_id=vault_id, prefix=norm,
-                        actor=agent_id or "unknown", deleted=native_deleted,
+                        actor=agent_id or "unknown", deletions=deletions,
                     )
                 try:
                     return await self._delete_collections(
@@ -516,7 +590,7 @@ class CollectionService:
                         recursive=recursive, agent_id=agent_id,
                         allow_table_delete=allow_table_delete,
                         native_authority=native_authority,
-                        native_deleted=_distinct_documents(native_deleted),
+                        native_deleted=_distinct_documents(deletions.committed),
                         disclose_paths=disclose_paths,
                     )
                 except _DocumentsRemain:
@@ -529,10 +603,10 @@ class CollectionService:
         except Exception as exc:
             # Whatever ends the delete after some of its documents went says
             # what the request did (see `_with_progress`).
-            if not native_deleted:
+            if not deletions:
                 raise
             reported = _with_progress(
-                exc, vault=vault, prefix=norm, deleted=native_deleted, disclose_paths=disclose_paths,
+                exc, vault=vault, prefix=norm, deletions=deletions, disclose_paths=disclose_paths,
             )
             if reported is exc:
                 raise
@@ -583,8 +657,11 @@ class CollectionService:
         doc_paths_for_git: list[str] = []
         commit_msg_for_git: str = ""
         retained_paths: list[str] = []
+        committed: list[bool] = []
 
-        async with pool.acquire() as conn:
+        async with _ReleaseAfterCommit(
+            pool.acquire(), committed, f"collection delete of {norm!r} in vault {vault}",
+        ) as conn:
             async with role_authority_transaction(conn):
                 if not await lock_vault_for_child_write(conn, vault_id):
                     raise ConflictError("Vault was deleted during collection deletion")
@@ -924,6 +1001,9 @@ class CollectionService:
                         f"agent: {agent_id or 'unknown'}\n"
                         f"action: delete-collection"
                     )
+            # The delete is complete from here: a failure while the pool
+            # takes the connection back does not undo it.
+            committed.append(True)
 
         # ── Git cleanup AFTER the TX commits ────────────────────
         # PG is the source of truth and is now consistent. Any

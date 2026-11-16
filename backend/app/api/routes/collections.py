@@ -165,8 +165,9 @@ async def delete_collection(
         return {"kind": "collection_delete", **result}
     except InvalidPathError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
-    except NotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    # A NotFoundError reaches the AKBError handler, which answers 404 as
+    # HTTPException did and keeps the hint and details of one raised after
+    # some documents went.
     except CollectionNotEmptyError as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
