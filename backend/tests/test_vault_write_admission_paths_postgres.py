@@ -916,20 +916,26 @@ def _attribute_types(entry: tuple, attribute: str) -> tuple:
     return found
 
 
-def _known(test: ast.AST, present: frozenset[str]) -> bool | None:
-    """What an `if` test is when the names in `present` hold objects (not
-    None, and true), if that settles it."""
+# The context managers whose `with` target is a connection, which asyncpg
+# makes neither `__bool__` nor `__len__` for, so it is true.
+_CONNECTION_CONTEXTS = frozenset({"admitted_connection", "_admitted_connection", "acquire_given_back", "acquire"})
+
+
+def _known(test: ast.AST, known: "_Known") -> bool | None:
+    """What an `if` test is, if what is known of the names settles it: an
+    `is None` test by the names known not to be None, a truth test by the
+    names known to be true."""
     if isinstance(test, ast.Name):
-        return True if test.id in present else None
+        return True if test.id in known.true else None
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-        inner = _known(test.operand, present)
+        inner = _known(test.operand, known)
         return None if inner is None else not inner
     if (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.left, ast.Name)
-            and test.left.id in present and isinstance(test.ops[0], (ast.Is, ast.IsNot))
+            and test.left.id in known.not_none and isinstance(test.ops[0], (ast.Is, ast.IsNot))
             and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value is None):
         return isinstance(test.ops[0], ast.IsNot)
     if isinstance(test, ast.BoolOp):
-        values = [_known(value, present) for value in test.values]
+        values = [_known(value, known) for value in test.values]
         settles, otherwise = (False, True) if isinstance(test.op, ast.And) else (True, False)
         if settles in values:
             return settles
@@ -938,46 +944,63 @@ def _known(test: ast.AST, present: frozenset[str]) -> bool | None:
     return None
 
 
-def _live(nodes: list, present: frozenset[str]):
-    """The nodes in and under `nodes` that can run when the names in
-    `present` hold objects: an `if` on them keeps only the branch they
-    leave, and that branch ending in `return` or `raise` drops what follows
-    it. A connection a caller passes in thus rules out the branch that takes
-    one when none was passed."""
+@dataclass(frozen=True)
+class _Known:
+    """Names known not to hold None, and names known to be true (a subset)."""
+
+    not_none: frozenset[str] = frozenset()
+    true: frozenset[str] = frozenset()
+
+
+def _live(nodes: list, known: _Known):
+    """The nodes in and under `nodes` that can run, as far as what is known
+    of the names settles `if` tests: such an `if` keeps only the branch the
+    test leaves, and that branch ending in `return` or `raise` drops what
+    follows it. A connection a caller passes in thus rules out the branch
+    that takes one when none was passed."""
     for node in nodes:
         if isinstance(node, ast.If):
-            known = _known(node.test, present)
-            if known is not None:
-                branch = node.body if known else node.orelse
-                yield from _live(branch, present)
+            settled = _known(node.test, known)
+            if settled is not None:
+                branch = node.body if settled else node.orelse
+                yield from _live(branch, known)
                 if branch and isinstance(branch[-1], (ast.Return, ast.Raise)):
                     return
                 continue
         yield node
         for _field, value in ast.iter_fields(node):
             if isinstance(value, list):
-                yield from _live([item for item in value if isinstance(item, ast.AST)], present)
+                yield from _live([item for item in value if isinstance(item, ast.AST)], known)
             elif isinstance(value, ast.AST):
-                yield from _live([value], present)
+                yield from _live([value], known)
 
 
 class _Reader:
     """One function read under an admission: the classes `self` may be an
     instance of, the types its names hold, as its annotations, assignments
-    and its caller's arguments tell, the names that hold objects (`present`:
-    `with` targets, and parameters the caller passed one for), and the
-    application functions each of its calls may run."""
+    and its caller's arguments tell, what is known of its names (`known`:
+    a `with` target is not None, and true when it is a connection; a
+    parameter is as the caller's argument was), and the application
+    functions each of its calls may run."""
 
     def __init__(
         self, rel: str, owner: str | None, selves: tuple, fn: ast.AST, bound: dict | None = None,
-        passed: frozenset[str] = frozenset(),
+        passed: _Known = _Known(),
     ) -> None:
         self.rel, self.owner, self.selves, self.fn = rel, owner, selves, fn
-        self.present = passed | {
-            item.optional_vars.id
-            for node in ast.walk(fn) if isinstance(node, (ast.With, ast.AsyncWith))
+        targets = [
+            item for node in ast.walk(fn) if isinstance(node, (ast.With, ast.AsyncWith))
             for item in node.items if isinstance(item.optional_vars, ast.Name)
+        ]
+        connections = {
+            item.optional_vars.id for item in targets
+            if isinstance(item.context_expr, ast.Call)
+            and _name_of(item.context_expr.func) in _CONNECTION_CONTEXTS
         }
+        self.known = _Known(
+            not_none=passed.not_none | passed.true | connections | {item.optional_vars.id for item in targets},
+            true=passed.true | connections,
+        )
         arguments = fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
         self.names: dict[str, tuple] = {a.arg: _annotation(rel, a.annotation) for a in arguments}
         self.names.update({name: types for name, types in (bound or {}).items() if types})
@@ -1062,24 +1085,27 @@ class _Reader:
         bound.update({kw.arg: self.type_of(kw.value) for kw in call.keywords if kw.arg is not None})
         return bound
 
-    def passed(self, call: ast.Call, fn: ast.AST) -> frozenset[str]:
-        """The function's parameters the call passes an object for: a name
-        that holds one here, or a true constant."""
+    def passed(self, call: ast.Call, fn: ast.AST) -> _Known:
+        """What is known of the function's parameters from what the call
+        passes them: a name known here, or a constant."""
         names = [a.arg for a in fn.args.posonlyargs + fn.args.args]
         if names and names[0] in {"self", "cls"}:
             names = names[1:]
-
-        def holds(argument: ast.AST) -> bool:
-            return (isinstance(argument, ast.Name) and argument.id in self.present) or (
-                isinstance(argument, ast.Constant) and bool(argument.value)
-            )
-
-        found = {
-            name for name, argument in zip(names, call.args)
-            if not isinstance(argument, ast.Starred) and holds(argument)
+        arguments = [
+            (name, argument) for name, argument in zip(names, call.args)
+            if not isinstance(argument, ast.Starred)
+        ] + [(kw.arg, kw.value) for kw in call.keywords if kw.arg is not None]
+        not_none = {
+            name for name, argument in arguments
+            if (isinstance(argument, ast.Name) and argument.id in self.known.not_none)
+            or (isinstance(argument, ast.Constant) and argument.value is not None)
         }
-        found |= {kw.arg for kw in call.keywords if kw.arg is not None and holds(kw.value)}
-        return frozenset(found)
+        true = {
+            name for name, argument in arguments
+            if (isinstance(argument, ast.Name) and argument.id in self.known.true)
+            or (isinstance(argument, ast.Constant) and bool(argument.value))
+        }
+        return _Known(frozenset(not_none), frozenset(true))
 
 
 def _admission_roots():
@@ -1125,7 +1151,7 @@ def _connections_taken_under_admission() -> tuple[dict[str, str], set[str]]:
     seen: set = set()
 
     def walk(reader: _Reader, nodes: list, path: str) -> None:
-        for node in _live(nodes, reader.present):
+        for node in _live(nodes, reader.known):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
@@ -1154,9 +1180,12 @@ def _connections_taken_under_admission() -> tuple[dict[str, str], set[str]]:
     return taken, reached
 
 
-def _with_statement_in_an_admitted_transaction(rel: str, function: str, statement: str) -> dict:
+def _with_statement_in_an_admitted_transaction(
+    rel: str, function: str, statement: str, block: str = "admitted_connection",
+) -> dict:
     """The application's modules, with `statement` added at the top of the
-    first `admitted_connection` block of `function` in module `rel`."""
+    first `async with` block of `function` in module `rel` that enters a
+    call named `block`."""
     tree = ast.parse((_APP_DIR / rel).read_text(encoding="utf-8"))
     fn = next(
         node for node in ast.walk(tree)
@@ -1165,7 +1194,7 @@ def _with_statement_in_an_admitted_transaction(rel: str, function: str, statemen
     block = next(
         node for node in ast.walk(fn)
         if isinstance(node, ast.AsyncWith) and any(
-            isinstance(call, ast.Call) and _name_of(call.func) == "admitted_connection"
+            isinstance(call, ast.Call) and _name_of(call.func) == block
             for item in node.items for call in ast.walk(item.context_expr)
         )
     )
@@ -1178,19 +1207,27 @@ def _with_statement_in_an_admitted_transaction(rel: str, function: str, statemen
     return modules
 
 
-@pytest.mark.parametrize("statement, site", [
+@pytest.mark.parametrize("statement, site, block", [
     # A second connection of the admitted transaction.
-    ("async with pool.acquire() as extra: await extra.execute('SELECT 1')", None),
+    ("async with pool.acquire() as extra: await extra.execute('SELECT 1')", None, "admitted_connection"),
     # A helper that takes a connection when it is not given one.
-    ("await write_policy_repo.get_policy(admitted_id)", "repositories/vault_write_policy_repo.py"),
+    ("await write_policy_repo.get_policy(admitted_id)", "repositories/vault_write_policy_repo.py",
+     "admitted_connection"),
+    # The same, behind a test on a `with` target that is not None but may be
+    # false: a new event buffer is empty.
+    ("if not events: await write_policy_repo.get_policy(admitted_id)",
+     "repositories/vault_write_policy_repo.py", "deferred_events"),
 ])
-def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(monkeypatch, statement, site):
+def test_a_connection_taken_inside_an_admitted_transaction_fails_the_check(
+    monkeypatch, statement, site, block,
+):
     """`set_public_access` with a connection taken inside its admitted
     transaction other than through the transaction's own: a plain
     `pool.acquire()` there, or a helper called without the connection, which
-    then takes one. The check names it."""
+    then takes one, also behind a test the walk cannot settle. The check
+    names it."""
     rel = "services/access_service.py"
-    modules = _with_statement_in_an_admitted_transaction(rel, "set_public_access", statement)
+    modules = _with_statement_in_an_admitted_transaction(rel, "set_public_access", statement, block)
     monkeypatch.setattr(sys.modules[__name__], "_app_modules", lambda: modules)
     taken, _reached = _connections_taken_under_admission()
     flagged = [where for where, path in taken.items() if " in set_public_access" in path.split(" -> ")[0]]

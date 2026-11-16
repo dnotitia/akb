@@ -434,15 +434,17 @@ async def test_a_request_finding_the_queue_full_is_refused_at_once(monkeypatch):
 
 
 class _ResettingPool:
-    """A pool of ``size`` connections whose release resets a connection the
-    way asyncpg's does, shielded from the caller's cancellation, for
-    ``reset_secs`` or until the connection is closed. ``in_use`` counts the
+    """A pool of ``size`` connections released the way asyncpg's are.
+
+    ``release(conn, timeout=...)`` runs shielded from the caller's
+    cancellation and resets the connection for ``reset_secs``, or until it is
+    closed; past ``timeout`` it closes the connection, gives its place back
+    and raises ``TimeoutError``, as asyncpg's bound does. Leaving ``async
+    with pool.acquire()`` releases without a bound. ``in_use`` counts the
     connections taken and not yet back, being reset or not; a reader's
-    acquisition (``reader=True``) is released without a reset. With
-    ``hang`` a release never ends, as asyncpg's waiting for a cancellation
-    that a closed connection can no longer receive, while closing the
-    connection gives its place back, as asyncpg's does; ``unhang`` ends
-    those releases."""
+    acquisition (``reader=True``) is released without a reset. With ``hang``
+    a release does not end, its bound notwithstanding, until ``unhang`` is
+    set, and then gives the place back."""
 
     def __init__(self, size: int, reset_secs: float, *, hang: bool = False) -> None:
         self._free = asyncio.Semaphore(size)
@@ -460,10 +462,13 @@ class _ResettingPool:
     def acquire(self, *, reader: bool = False) -> "_ResettingAcquire":
         return _ResettingAcquire(self, reader)
 
+    async def release(self, conn: "_PooledProxy", *, timeout: float | None = None) -> None:
+        await asyncio.shield(conn.acquired._release(timeout))
+
 
 class _PooledProxy:
-    def __init__(self, pool: _ResettingPool) -> None:
-        self._pool = pool
+    def __init__(self, acquired: "_ResettingAcquire") -> None:
+        self.acquired = acquired
         self.released = False
         self.closed = asyncio.Event()
 
@@ -473,37 +478,45 @@ class _PooledProxy:
                 "cannot call Connection.terminate(): connection has been released back to the pool",
             )
         self.closed.set()
-        if self._pool.hang:
-            self.released = True
-            self._pool.give_back_place()
 
 
 class _ResettingAcquire:
     def __init__(self, pool: _ResettingPool, reader: bool) -> None:
-        self._pool = pool
+        self.pool = pool
+        self.connection: _PooledProxy | None = None
+        self.done = False
         self._reader = reader
-        self._proxy = _PooledProxy(pool)
+        self._proxy = _PooledProxy(self)
 
     async def __aenter__(self) -> _PooledProxy:
-        await self._pool._free.acquire()
-        self._pool.in_use += 1
-        self._pool.peak = max(self._pool.peak, self._pool.in_use)
+        await self.pool._free.acquire()
+        self.pool.in_use += 1
+        self.pool.peak = max(self.pool.peak, self.pool.in_use)
+        self.connection = self._proxy
         return self._proxy
 
     async def __aexit__(self, *_exc) -> None:
-        await asyncio.shield(self._release())
+        conn, self.connection, self.done = self.connection, None, True
+        assert conn is not None
+        await self.pool.release(conn)
 
-    async def _release(self) -> None:
+    async def _release(self, timeout: float | None) -> None:
         if not self._reader:
-            self._pool.resetting.set()
-            if self._pool.hang:
-                await self._pool.unhang.wait()
-                return
-            closed = asyncio.ensure_future(self._proxy.closed.wait())
-            await asyncio.wait({closed}, timeout=self._pool.reset_secs)
-            closed.cancel()
+            self.pool.resetting.set()
+            if self.pool.hang:
+                await self.pool.unhang.wait()
+            else:
+                reset = self.pool.reset_secs
+                closed = asyncio.ensure_future(self._proxy.closed.wait())
+                await asyncio.wait({closed}, timeout=reset if timeout is None else min(reset, timeout))
+                closed.cancel()
+                if not self._proxy.closed.is_set() and timeout is not None and timeout < reset:
+                    self._proxy.closed.set()
+                    self._proxy.released = True
+                    self.pool.give_back_place()
+                    raise TimeoutError("timed out resetting the connection")
         self._proxy.released = True
-        self._pool.give_back_place()
+        self.pool.give_back_place()
 
 
 async def _cancelled_while_resetting(pool: _ResettingPool, write) -> list[float]:
@@ -547,9 +560,9 @@ async def test_a_cancelled_write_gives_its_admission_back_once_its_connection_is
     """Limit 1, a pool of three connections whose reset takes two seconds.
     A write of Vault A is cancelled while its connection is being reset, five
     times in a row, the next one sent at once. Each keeps A's admission until
-    its connection is back, closed after the half-second grace, which ends
-    the reset, so A never has more than one connection in use, being reset
-    or not, and a reader of Vault B keeps getting a connection. The
+    its connection is back, which the release's own bound closes at the
+    half-second grace, so A never has more than one connection in use, being
+    reset or not, and a reader of Vault B keeps getting a connection. The
     admission used to be given back as soon as the cancelled release left
     the reset running, the next write of A took another connection, and the
     resets filled the pool."""
@@ -620,18 +633,17 @@ async def test_outside_an_admission_acquire_given_back_is_the_pools_own():
     assert not taken[0].closed.is_set()
 
 
-async def test_a_release_that_never_ends_after_its_connection_is_closed_does_not_keep_the_admission(
+async def test_a_release_that_does_not_end_is_left_to_the_pool_without_closing_its_connection(
     monkeypatch, caplog,
 ):
-    """Limit 1, a pool whose release of a write's connection never ends, as
-    asyncpg's when it waits for a cancelled statement's cancellation that the
-    closed connection can no longer receive, though closing the connection
-    gives its place back. A write of Vault A ends, and its connection's
-    release runs past the grace: the connection is closed, and one grace
-    later the write goes on without the release, with a warning, so the next
-    write of A is admitted after about two graces, and the closed
-    connection's place is back in the pool. The write used to wait for the
-    release forever and keep A's admission."""
+    """Limit 1, a pool whose release of a write's connection does not end
+    within its bound, as only asyncpg's own paths could. A write of Vault A
+    ends, and its release is awaited until a little after the grace and then
+    left to finish in the background, with a warning, so the next write of
+    A is admitted then; the connection is not closed under its release, and
+    its place stays taken until the release ends. This is the one case where
+    the admission comes back before the pool has the place. The write used
+    to wait for such a release forever and keep A's admission."""
     monkeypatch.setattr(settings, "vault_write_concurrency", 1)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0)
     monkeypatch.setattr(admission, "GIVE_BACK_GRACE_SECS", 0.2)
@@ -639,10 +651,12 @@ async def test_a_release_that_never_ends_after_its_connection_is_closed_does_not
     a = uuid.uuid4()
     loop = asyncio.get_running_loop()
     admitted_at: list[float] = []
+    taken: list[_PooledProxy] = []
 
     async def write() -> None:
-        async with admission.admitted_connection(pool, a):
+        async with admission.admitted_connection(pool, a) as conn:
             admitted_at.append(loop.time())
+            taken.append(conn)
 
     caplog.set_level(logging.WARNING, logger="akb.vault_write_admission")
     writes: list[asyncio.Task] = []
@@ -650,14 +664,22 @@ async def test_a_release_that_never_ends_after_its_connection_is_closed_does_not
         writes.append(asyncio.create_task(write()))
         await asyncio.wait_for(pool.resetting.wait(), timeout=5)
         pool.resetting.clear()
+        # A connection under release is not closed, whoever asks.
+        assert admission.close_pooled_connection(taken[0]) is False
         writes.append(asyncio.create_task(write()))
         # Not awaited directly: a cancelled await would cancel the write.
         done, _ = await asyncio.wait({writes[0]}, timeout=5)
         assert writes[0] in done, "the first write still waits for its connection's release"
         await asyncio.wait_for(pool.resetting.wait(), timeout=5)
-        assert admitted_at[1] - admitted_at[0] < 0.2 * 2 + 0.3, admitted_at
-        assert pool.in_use == 1
+        assert admitted_at[1] - admitted_at[0] < 0.2 + 0.1 + 0.3, admitted_at
         assert any("going on without it" in r.getMessage() for r in caplog.records)
+        assert not taken[0].closed.is_set()
+        assert pool.in_use == 2
+        pool.unhang.set()
+        async with asyncio.timeout(5):
+            while pool.in_use:
+                await asyncio.sleep(0.01)
+        assert not taken[0].closed.is_set()
     finally:
         pool.unhang.set()
         for task in writes:

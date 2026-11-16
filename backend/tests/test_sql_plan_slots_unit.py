@@ -15,6 +15,7 @@ queue at once, and the statements its reservation held back go on.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 import time
 
 import asyncpg
@@ -521,6 +522,7 @@ class _PooledConnection:
 
     def __init__(self, raw: "_RawConnection") -> None:
         self._raw: "_RawConnection | None" = raw
+        self.acquired: Any = None
 
     def _connection(self) -> "_RawConnection":
         if self._raw is None:
@@ -559,31 +561,46 @@ class _ReleasingPool:
     """A pool whose release resets the connection the way asyncpg's does:
     shielded from the caller's cancellation, for ``reset_secs`` or until the
     connection is closed. With ``back_early`` the connection is back in the
-    pool, its proxy released, before the release returns."""
+    pool, its proxy released, before the release returns. With ``bounded``
+    its acquisitions name it and their connection, as asyncpg's do, and its
+    ``release(conn, timeout=...)`` is asyncpg's bounded one: past the
+    timeout it closes the connection, which the pool then has back, and
+    raises ``TimeoutError``."""
 
-    def __init__(self, *, reset_secs: float, back_early: bool = False) -> None:
+    def __init__(self, *, reset_secs: float, back_early: bool = False, bounded: bool = False) -> None:
         self.reset_secs = reset_secs
         self.back_early = back_early
+        self.bounded = bounded
         self.raw = _RawConnection()
         self.back_at: float | None = None
 
     def acquire(self) -> "_ReleasingAcquire":
         return _ReleasingAcquire(self)
 
+    async def release(self, conn: _PooledConnection, *, timeout: float | None = None) -> None:
+        await asyncio.shield(conn.acquired._release(timeout))
+
 
 class _ReleasingAcquire:
     def __init__(self, pool: _ReleasingPool) -> None:
         self._pool = pool
         self._proxy: _PooledConnection | None = None
+        if pool.bounded:
+            self.pool = pool
+            self.connection: _PooledConnection | None = None
+            self.done = False
 
     async def __aenter__(self) -> _PooledConnection:
         self._proxy = _PooledConnection(self._pool.raw)
+        self._proxy.acquired = self
+        if self._pool.bounded:
+            self.connection = self._proxy
         return self._proxy
 
     async def __aexit__(self, *_exc) -> None:
-        await asyncio.shield(self._release())
+        await asyncio.shield(self._release(None))
 
-    async def _release(self) -> None:
+    async def _release(self, timeout: float | None) -> None:
         loop = asyncio.get_running_loop()
         assert self._proxy is not None
         if self._pool.back_early:
@@ -591,12 +608,18 @@ class _ReleasingAcquire:
             # release has returned.
             self._proxy._raw = None
             self._pool.back_at = loop.time()
+        reset = self._pool.reset_secs
         closed = asyncio.ensure_future(self._pool.raw.terminated.wait())
-        await asyncio.wait({closed}, timeout=self._pool.reset_secs)
+        await asyncio.wait({closed}, timeout=reset if timeout is None else min(reset, timeout))
         closed.cancel()
+        timed_out = not self._pool.raw.terminated.is_set() and timeout is not None and timeout < reset
+        if timed_out:
+            self._pool.raw.terminate()
         self._proxy._raw = None
         if self._pool.back_at is None:
             self._pool.back_at = loop.time()
+        if timed_out:
+            raise TimeoutError("timed out resetting the connection")
 
 
 async def _a_plan_then_another(pool: _ReleasingPool) -> tuple[frozenset, float]:
@@ -638,16 +661,16 @@ async def test_a_plan_keeps_its_slot_until_its_slow_reset_is_done(monkeypatch):
 
 async def test_a_reset_past_the_grace_closes_the_connection(monkeypatch):
     """A plan is read at once, and the pool's reset of its connection would
-    not end. After the grace, 0.1 s here, the plan closes the connection,
-    which ends the reset, and gives up its slot once the pool has the
-    connection back; the plan is returned. There used to be no grace: the
-    slot was held until the plan's deadline and then given up with the
-    reset still running."""
+    not end. The release is given the grace, 0.1 s here, as its bound, which
+    closes the connection and ends the reset; the plan gives up its slot
+    once the pool has the connection back, and is returned. There used to be
+    no grace: the slot was held until the plan's deadline and then given up
+    with the reset still running."""
     monkeypatch.setattr(settings, "akb_sql_plan_concurrency", 1)
     monkeypatch.setattr(settings, "akb_sql_plan_timeout_ms", 2000)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 5.0)
     monkeypatch.setattr(user_sql_executor, "_PLAN_CLEANUP_SECS", 0.1)
-    pool = _ReleasingPool(reset_secs=30.0)
+    pool = _ReleasingPool(reset_secs=30.0, bounded=True)
     loop = asyncio.get_running_loop()
     started = loop.time()
     plan, second_started = await _a_plan_then_another(pool)

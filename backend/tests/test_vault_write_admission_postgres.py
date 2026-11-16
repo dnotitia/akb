@@ -1241,54 +1241,29 @@ async def test_upload_cancels_behind_a_waiting_confirmation_leave_connections_fo
 @contextlib.asynccontextmanager
 async def _admitted_resets_take_two_seconds(admin_pool):
     """The application's pool for the block: four connections, and giving
-    back one taken while the task was admitted waits two seconds in its
-    reset (the pool's reset waits in the database). Yields the asyncpg pool,
-    the pool the application sees, and an event set when such a reset
+    back one inside an admission waits two seconds in its reset (the pool's
+    reset waits in the database). Yields the pool twice, as the asyncpg pool
+    and the pool the application sees, and an event set when such a reset
     starts."""
     from app.services.vault_write_admission import _admitted
 
     database = await admin_pool.fetchval("SELECT current_database()")
     resetting = asyncio.Event()
-    admitted_conns: set = set()
 
     async def slow_reset(conn) -> None:
-        if conn in admitted_conns:
-            admitted_conns.discard(conn)
+        # The release runs in the context of the task giving the connection
+        # back, so whether it is admitted shows here.
+        if _admitted.get():
             resetting.set()
             await conn.execute("SELECT pg_sleep(2)")
 
     app_pool = await asyncpg.create_pool(
         _database_dsn(database), min_size=1, max_size=4, reset=slow_reset,
     )
-
-    class _Acquire:
-        """The pool's own acquisition; a connection taken while the task
-        is admitted gets the slow reset."""
-
-        def __init__(self) -> None:
-            self._acquired = app_pool.acquire()
-
-        async def __aenter__(self):
-            conn = await self._acquired.__aenter__()
-            if _admitted.get():
-                admitted_conns.add(conn._con)
-            return conn
-
-        async def __aexit__(self, *exc):
-            return await self._acquired.__aexit__(*exc)
-
-    class _Pool:
-        def acquire(self):
-            return _Acquire()
-
-        def __getattr__(self, name):
-            return getattr(app_pool, name)
-
-    pool = _Pool()
     previous_pool = postgres_module._pool
-    postgres_module._pool = pool
+    postgres_module._pool = app_pool
     try:
-        yield app_pool, pool, resetting
+        yield app_pool, app_pool, resetting
     finally:
         postgres_module._pool = previous_pool
         await app_pool.close()
@@ -1345,11 +1320,12 @@ async def test_cancelled_writes_hold_their_admission_until_their_connection_is_b
     pool's reset waits in the database). A collection create of one Vault is
     cancelled while its admitted connection is being reset, five times in a
     row, the next one sent at once. Each keeps the Vault's admission until
-    its connection is back, which closing it ends, so the Vault never has
-    more than one admitted connection in use, being reset or not, and a
-    reader of another Vault keeps getting a connection. The admission used
-    to be given back while the cancelled release went on resetting, the next
-    create took another connection, and the resets filled the pool."""
+    its connection is back, which the release's bound closes at the
+    half-second grace, so the Vault never has more than one admitted
+    connection in use, being reset or not, and a reader of another Vault
+    keeps getting a connection. The admission used to be given back while
+    the cancelled release went on resetting, the next create took another
+    connection, and the resets filled the pool."""
     monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
     monkeypatch.setattr(settings, "vault_write_queue_timeout_secs", 30.0, raising=False)
     async with _fresh_database() as admin_pool:
@@ -1376,9 +1352,10 @@ async def test_a_cancelled_native_write_keeps_its_admission_until_its_payload_co
     inside the admission; giving that connection back waits two seconds in
     its reset. The create is cancelled while it is being reset, five times in
     a row, the next one sent at once. Each keeps the Vault's admission until
-    the connection is back, so the Vault never has more than one connection
-    in use, being reset or not, and a reader of another Vault keeps getting
-    one. The admission used to be given back while the cancelled release went
+    the connection is back, which the release's bound closes at the grace, so
+    the Vault never has more than one connection in use, being reset or not,
+    and a reader of another Vault keeps getting one. The admission used to
+    be given back while the cancelled release went
     on resetting, the next create prepared on another connection, and the
     resets filled the pool."""
     monkeypatch.setattr(settings, "vault_write_concurrency", 1, raising=False)
@@ -1587,6 +1564,64 @@ async def test_a_vault_creation_cancelled_mid_statement_reaches_its_compensation
                 await holder.close()
                 postgres_module._pool = previous_pool
                 app_pool.terminate()
+
+
+async def test_a_release_waiting_for_an_unanswered_cancel_does_not_close_the_next_borrowers_connection():
+    """A pool of one connection reaches PostgreSQL through a proxy that
+    swallows cancel requests. A write of Vault A is cancelled during its
+    statement, so its connection's release waits for a cancellation that
+    never completes, and the write is cancelled once more meanwhile. A write
+    of Vault B then waits for the pool's only place, gets it once A's
+    release has ended at asyncpg's bound, and its transaction runs and
+    commits on a connection nothing closes. The second cancellation used to
+    close A's connection at once, which gave the place to B while A's
+    release still ran; at its bound that release closed the connection the
+    place then held, B's."""
+    from app.services import vault_write_admission as admission
+
+    async with _fresh_database() as admin_pool:
+        database = await admin_pool.fetchval("SELECT current_database()")
+        direct = urllib.parse.urlsplit(_database_dsn(database))
+        async with _CancelsSwallowed(direct.hostname, direct.port) as proxy:
+            proxied = direct._replace(
+                netloc=f"{direct.username}:{direct.password}@127.0.0.1:{proxy.port}",
+            ).geturl()
+            pool = await asyncpg.create_pool(proxied, min_size=1, max_size=1, ssl=False)
+            started = asyncio.Event()
+
+            async def write_a() -> None:
+                async with admission.admitted_connection(pool, uuid.uuid4()) as conn:
+                    started.set()
+                    await conn.execute("SELECT pg_sleep(30)")
+
+            writing = asyncio.create_task(write_a())
+            try:
+                await asyncio.wait_for(started.wait(), timeout=10)
+                await asyncio.sleep(0.2)
+                writing.cancel()
+                # A's release now waits for the swallowed cancellation.
+                await asyncio.sleep(0.1)
+                writing.cancel()
+                conn_b = await pool.acquire(timeout=5)
+                try:
+                    transaction = conn_b.transaction()
+                    await transaction.start()
+                    assert await conn_b.fetchval("SELECT 1") == 1
+                    # A's release reaches its bound, if it has not yet.
+                    done, _ = await asyncio.wait({writing}, timeout=5)
+                    assert writing in done and writing.cancelled()
+                    assert not conn_b.is_closed()
+                    assert await conn_b.fetchval("SELECT 2") == 2
+                    await transaction.commit()
+                finally:
+                    with contextlib.suppress(Exception):
+                        await pool.release(conn_b)
+                assert proxy.swallowed >= 1
+            finally:
+                if not writing.done():
+                    writing.cancel()
+                    await asyncio.wait({writing}, timeout=5)
+                pool.terminate()
 
 
 async def test_a_target_deferred_before_its_batch_was_ready_waits_for_its_batch(monkeypatch):

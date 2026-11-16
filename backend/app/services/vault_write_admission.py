@@ -225,20 +225,31 @@ async def vault_write_admission(
         state.give_back(wanted, limit)
 
 
-# How long giving a connection back to the pool may take, its reset included,
-# before the connection is closed instead; and how much longer a release that
-# still runs after that is awaited before the caller goes on without it.
+# How long giving a connection back to the pool may take, its reset included:
+# an asyncpg release is given this bound, past which asyncpg closes the
+# connection rather than reset it.
 GIVE_BACK_GRACE_SECS = 0.5
-# asyncpg's own bound closes a bounded release's connection at the grace; the
-# connection is closed here only if that release has not ended a little later.
-_BACKSTOP_MARGIN_SECS = 0.1
+# How much longer than the grace a release is awaited before the caller goes
+# on without it.
+_GIVE_BACK_MARGIN_SECS = 0.1
+
+# Connections whose release ``give_back_connection`` has started and that has
+# not ended; ``close_pooled_connection`` leaves them alone.
+_releasing: set[int] = set()
 
 
 def close_pooled_connection(conn: Any) -> bool:
-    """Close a connection taken from a pool, so that the pool takes it back
-    without a reset. False when there is nothing to close: a connection
-    without ``terminate``, or one already back in the pool, which asyncpg's
-    pool proxy refuses to touch once it is released."""
+    """Close a connection taken from a pool, before any release of it has
+    started, so that the pool takes it back without a reset: the plan reader
+    closes one whose statement it gave up on. False when there is nothing to
+    close: a connection without ``terminate``, one already back in the pool,
+    which asyncpg's pool proxy refuses to touch once it is released, or one
+    whose release has started. A connection must not be closed under its
+    release: asyncpg's release closes, when its bound expires, whatever
+    connection the pool's holder has then, and once a close had given the
+    holder back to the pool, that would be another request's."""
+    if id(conn) in _releasing:
+        return False
     terminate = getattr(conn, "terminate", None)
     if terminate is None:
         return False
@@ -253,15 +264,19 @@ def _start_release(acquire: Any, exc_info: tuple, grace: float) -> tuple[asyncio
     """Start giving back the connection taken with ``acquire``; and say
     whether the release is bounded by the grace.
 
-    An asyncpg acquisition is released with asyncpg's own bound,
-    ``pool.release(conn, timeout=grace)``: a reset, or a wait for a cancelled
-    statement's cancellation to end, that runs past the grace closes the
-    connection, which the pool takes back without a reset, and raises
-    ``TimeoutError``. Another context is left as ``async with`` leaves it.
+    An acquisition that names its pool and connection, as asyncpg's does, is
+    released with the pool's own bound, ``pool.release(conn, timeout=grace)``:
+    a reset, or a wait for a cancelled statement's cancellation to end, that
+    runs past the grace has asyncpg close the connection and raise
+    ``TimeoutError``, and the pool gets the connection's place back once,
+    when that release ends. Another context is left as ``async with`` leaves
+    it.
     """
-    if isinstance(acquire, asyncpg.pool.PoolAcquireContext) and acquire.connection is not None:
-        conn, acquire.connection, acquire.done = acquire.connection, None, True
-        return asyncio.ensure_future(acquire.pool.release(conn, timeout=grace)), True
+    release = getattr(getattr(acquire, "pool", None), "release", None)
+    conn = getattr(acquire, "connection", None)
+    if conn is not None and callable(release):
+        acquire.connection, acquire.done = None, True
+        return asyncio.ensure_future(release(conn, timeout=grace)), True
     return asyncio.ensure_future(acquire.__aexit__(*exc_info)), False
 
 
@@ -276,64 +291,55 @@ async def give_back_connection(
     """Give ``conn``, taken with ``acquire`` (a ``pool.acquire()`` context),
     back to the pool, and return once the pool has it back.
 
-    The release runs shielded from cancellation, as asyncpg's own does, and
-    for an asyncpg pool within asyncpg's own bound (``_start_release``):
-    past the grace (``GIVE_BACK_GRACE_SECS`` by default) asyncpg closes the
-    connection. A release still running then (a little later for a bounded
-    one), or when this task is cancelled
-    meanwhile, has the connection closed through the pool's proxy, which
-    gives its place back to the pool at once, and is awaited one grace more;
-    a further cancellation does not cut that short. One still running after
-    that, such as one waiting for a cancellation that the closed connection
-    can no longer receive, is left to finish in the background with a
-    warning, since the pool already has the place back. A cancellation is
-    raised once the wait ends. A release that fails on its own raises its
-    error, as leaving ``async with pool.acquire()`` does; one that fails
-    after the connection was closed, by asyncpg at the bound it was given or
-    here, does not. Returns whether the connection was closed rather than
-    reset.
+    The release runs shielded from cancellation; a cancellation meanwhile is
+    held back and raised once the wait ends. An asyncpg release carries
+    asyncpg's own bound (``_start_release``): past the grace
+    (``GIVE_BACK_GRACE_SECS`` by default) asyncpg closes the connection, and
+    the pool gets its place back when that release ends. The connection is
+    never closed here while its release runs (``close_pooled_connection``).
+    A release that has not ended a little after the grace, which only
+    asyncpg's own paths, or a context without that bound, can cause, is not
+    awaited further: it is left to the pool, to finish in the background,
+    with a warning, and the caller goes on. That is the one case where an
+    admission can come back before the pool has the connection's place. A
+    release that fails on its own raises its error, as leaving ``async with
+    pool.acquire()`` does, except for the ``TimeoutError`` of the bound it
+    was given: asyncpg closed the connection, and the work on it was done.
+    Returns whether the connection was not given back reset.
     """
     loop = asyncio.get_running_loop()
     grace = GIVE_BACK_GRACE_SECS if grace is None else grace
+    key = id(conn)
+    _releasing.add(key)
     release, bounded = _start_release(acquire, exc_info, grace)
-    deadline = loop.time() + grace + (_BACKSTOP_MARGIN_SECS if bounded else 0.0)
-    closing = False
-    closed = False
+    release.add_done_callback(lambda _release: _releasing.discard(key))
+    deadline = loop.time() + grace + _GIVE_BACK_MARGIN_SECS
     cancelled: asyncio.CancelledError | None = None
     while not release.done():
-        try:
-            await asyncio.wait({release}, timeout=max(0.0, deadline - loop.time()))
-        except asyncio.CancelledError as exc:
-            cancelled = cancelled or exc
-        if release.done():
-            break
-        if not closing:
-            if cancelled is None and loop.time() < deadline:
-                continue
-            closing = True
-            closed = close_pooled_connection(conn)
-            deadline = loop.time() + grace
-            continue
-        if loop.time() >= deadline:
+        left = deadline - loop.time()
+        if left <= 0:
             logger.warning(
-                "A pool connection's release still ran %.1fs after the connection was "
-                "closed; going on without it",
-                grace,
+                "A pool connection's release had not ended %.1fs after it started; going on "
+                "without it and leaving the connection to the pool",
+                grace + _GIVE_BACK_MARGIN_SECS,
             )
             release.add_done_callback(_retrieve)
-            closed = True
             break
-    error = None
-    if release.done():
-        error = None if release.cancelled() else release.exception()
+        try:
+            await asyncio.wait({release}, timeout=left)
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
     if cancelled is not None:
         raise cancelled
+    if not release.done():
+        return True
+    error = None if release.cancelled() else release.exception()
     if bounded and isinstance(error, TimeoutError):
         # asyncpg's own bound: it closed the connection.
         return True
-    if error is not None and not closed:
+    if error is not None:
         raise error
-    return closed
+    return False
 
 
 @asynccontextmanager
