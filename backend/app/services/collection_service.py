@@ -238,19 +238,23 @@ def committed_deletions(
         if deletions.final_step_found_empty:
             opening += (
                 " An earlier delete had already emptied the prefix, so that step only records "
-                "collection.delete, and the prefix looks the same whether it went or not."
+                "collection.delete, and the prefix looks the same whether it went or not. The "
+                "same request sent again records collection.delete when it succeeds, so this "
+                "request and the retry together may record it twice; the retry also deletes "
+                "anything written under the prefix in the meantime."
             )
         else:
             opening += (
                 f" That step deletes {documents}the collections, Files and tables under the "
                 "prefix and records collection.delete; what the prefix holds now does not "
-                "settle whether it went, since later writes may have changed it."
+                "settle whether it went, since later writes may have changed it. The same "
+                "request sent again finishes the delete if that step did not go, and deletes "
+                "anything written under the prefix in the meantime; this request and the retry "
+                "together may record collection.delete twice. If the step went and nothing is "
+                "under the prefix any more, the retry may answer not found (404): it does on a "
+                "Bare Git Vault, and on a Native one when no recursive delete of the prefix "
+                "ever deleted a document."
             )
-        opening += (
-            " Sending the same request again records collection.delete at least once; it may "
-            "record it twice, and it also deletes anything written under the prefix in the "
-            "meantime."
-        )
     return details, opening
 
 

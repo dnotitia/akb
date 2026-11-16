@@ -30,9 +30,11 @@ specifically; the proxy has its own log in
   step deletes, with its Bare Git documents in `final_step_docs` (and
   `final_step_uris`); the hint says that what the prefix holds does not
   settle that step, which on a prefix an earlier delete emptied only records
-  `collection.delete`, and that sending the same request again records
-  `collection.delete` at least once, maybe twice, and deletes anything
-  written under the prefix meanwhile. Only a server error response counts as an answer; a
+  `collection.delete`, and that the same request sent again finishes the
+  delete if the step did not go, deletes anything written under the prefix
+  meanwhile, may record `collection.delete` a second time, and on an emptied
+  prefix may answer not found (always on Bare Git, and on Native when no
+  recursive delete of it deleted a document). Only a server error response counts as an answer; a
   connection error (class 08) leaves the outcome unknown. Once the last transaction has committed, a failure while
   giving its connection back is logged and the delete answers with its
   result.

@@ -326,10 +326,14 @@ counts in `final_step_docs` and lists in `final_step_uris` for a reader.
 What the prefix holds afterwards does not settle that outcome, since later
 writes may have changed it; and when an earlier delete had already emptied
 the prefix, that step only records `collection.delete`, so the prefix looks
-the same either way and only the event differs. The hint says so, and that
-sending the same request again records `collection.delete` at least once:
-it may record it twice, and it also deletes anything written under the
-prefix in the meantime. Once the last transaction has committed, the
+the same either way and only the event differs. The hint says so. The same
+request sent again finishes the delete if the step did not go, and deletes
+anything written under the prefix in the meantime; the request and the
+retry together may record `collection.delete` twice. If the step went and
+nothing is under the prefix any more, the retry answers not found (404) on
+a Bare Git Vault, and on a Native one when no recursive delete of the
+prefix ever deleted a document; otherwise it records `collection.delete`
+again. Once the last transaction has committed, the
 delete is complete: a failure after it, such as one while the pool takes its
 connection back, is logged and the delete answers with its result. This
 holds for a delete that finds the prefix emptied by an earlier one, too.
@@ -491,7 +495,11 @@ whose COMMIT answer is lost is reported as `final_step_uncertain`, on the
 Bare Git authority with the documents it deletes; that a delete of an
 emptied prefix answers with its result when its reset fails and reports an
 uncertain last step when its answer is lost, with a hint that does not send
-the caller to browse the prefix; that a delete
+the caller to browse the prefix; that the same request sent again after a
+last step whose answer was lost records `collection.delete` a second time
+where a recursive delete deleted Native documents under the prefix, and
+answers not found for an empty Native collection and on Bare Git; that a
+delete
 whose last transaction committed answers with its result, Files included,
 when the reset of its connection fails; and that a File whose Resource is gone, after the
 documents went, keeps the delete's progress in the REST 404.
