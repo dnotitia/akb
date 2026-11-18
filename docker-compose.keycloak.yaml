@@ -45,30 +45,9 @@
 # additionally requires a distinct upstream IdP configured through /admin;
 # the broker realm cannot broker itself.
 #
-# === MCP OAuth path === additionally:
-#
-#   mcp_oauth_enabled: true
-#   public_base_url: "http://localhost:8000"
-#   mcp_oauth_audience: ""    # default → "http://localhost:8000/mcp"
-#                             # MUST match the audience baked into the
-#                             # akb:vault:* scope mappers in akb-realm.json
-#
-# To test MCP OAuth while keeping human login local, use `auth_mode: local`
-# with the same Keycloak authority + `mcp_oauth_enabled: true`; no human OIDC
-# redirect/client settings are required for that resource-server-only mode.
-#
-# For local E2E (`backend/tests/test_mcp_oauth_e2e.sh`), the `alice` fixture
-# uses the `akb-web` direct-access grant to mint a human access token without
-# a browser roundtrip. The realm's `akb-mcp-test` service-account client stays
-# available for legacy/manual experiments but is intentionally not accepted by
-# the human verifier profile.
-#
-# Real Claude Code / claude.ai validation: the local Keycloak overlay
-# works for headless E2E but Claude Code's OAuth discovery requires
-# the AS metadata URL to be HTTPS. Easiest path is to point a local
-# AKB backend at an already-deployed HTTPS Keycloak realm (e.g. a
-# staging instance). See `docs/mcp-clients/web-connectors.md` for the
-# walkthrough.
+# The imported realm exercises browser SSO and product-admin login. For isolated
+# browser code and PKCE tests of the MCP resource, use
+# deploy/keycloak-dev/native-oauth/README.md.
 #
 # The realm import ships FIXED dev client secrets ("local-akb-dev-secret",
 # "local-akb-mcp-test-secret", "local-akb-admin-client-secret"). Throwaway local values (same spirit as

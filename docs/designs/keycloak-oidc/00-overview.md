@@ -29,11 +29,11 @@ does not add a speculative realm-specific API scope: issuer, audience,
 authorized party, human token kind, and the complete claim policy are its
 boundary.
 
-MCP uses a distinct audience and route profile. It accepts token-store PAT or
-service credentials in both modes, and may accept `keycloak-access-v1` only
-when MCP OAuth is enabled. MCP scope enforcement remains authoritative and DCR
-client IDs are not constrained by the static human API `azp` list. Local AKB
-session JWTs are never MCP credentials.
+The tool resource uses the canonical public `/mcp` URL as its exact audience.
+When OAuth is enabled, admitted clients can use the resulting bearer for MCP
+and the approved file and image control operations. The resource verifies the
+signed client admission and the scope for each operation. Local session JWTs
+remain valid on the browser API. See the [tool resource contract](../mcp-oauth-dcr/00-overview.md).
 
 No token header selects an algorithm, issuer, key source, or fallback
 verifier. Token-supplied key URLs/material are rejected. An unknown `kid` may

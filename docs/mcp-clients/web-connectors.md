@@ -1,318 +1,84 @@
-# Connecting AKB to a Web LLM Client (OAuth + DCR)
+# Configure OAuth for AKB MCP clients
 
-This guide is for connecting AKB to an MCP client that speaks the
-**MCP OAuth Resource Server path** — Claude Code (HTTP transport),
-claude.ai Custom Connectors, and ChatGPT Custom Connectors. For
-stdio-based clients (Claude Desktop, Codex CLI via `akb-mcp`,
-Claude Code via the stdio proxy), see the project README: the PAT
-flow there is unchanged.
+Use this guide to enable the AKB tool resource on a Keycloak realm. For an
+individual stdio connection, follow the [proxy setup](../../packages/akb-mcp-client/README.md).
 
-Direct HTTP clients may use either the modern `2026-07-28` stateless surface
-(`server/discover`, per-request `_meta`, and the `Mcp-Protocol-Version` /
-`Mcp-Method` headers) or the legacy initialize/session surface. The backend
-keeps the four legacy revisions `2024-11-05`, `2025-03-26`, `2025-06-18`, and
-`2025-11-25`; a single connection must stay within one generation.
+## Configure Keycloak
 
-## What you need
+Use a Keycloak realm that AKB trusts. On the reference realm, enable the
+OpenID Connect client registration provider. Disable Keycloak's raw and
+SAML client registration providers with these startup options.
 
-| Piece | Why |
-|---|---|
-| AKB backend ≥ the version that ships `mcp_oauth_enabled` | Adds the Resource Server code path |
-| An OIDC IdP — Keycloak in the reference deployment | AKB does NOT host an Authorization Server; the IdP issues access tokens |
-| Realm configuration: `akb:vault:read`, `akb:vault:write` scopes (each with an audience mapper) + DCR trusted hosts + `offline_access` exposed | Lets clients DCR-register and request the scopes the consent screen presents |
-| `config/app.yaml`: explicit `auth_mode`, `mcp_oauth_enabled: true`, a non-empty `public_base_url` | Activates the new path without changing the chosen human-login mode. Default keeps it off so PAT-only deployments are bit-for-bit unchanged |
+```text
+--spi-client-registration--default--enabled=false
+--spi-client-registration--saml2-entity-descriptor--enabled=false
+```
 
-## Configure the IdP (one-shot)
-
-Either run the realm setup script (recommended) or hand-edit the realm
-in the Keycloak admin console. The script is idempotent — re-running
-it is a no-op.
-
-The script needs a Keycloak **admin credential**, and which kind you have
-depends on how Keycloak was started. Give it whichever pair matches; it
-reads them from the environment only, never from the command line.
-
-If you deployed Keycloak from this repo's Kubernetes manifests
-(`deploy/k8s/standalone-sso/`, or the Helm chart's `sso` templates), the
-bootstrap admin is a **service account** — `KC_BOOTSTRAP_ADMIN_CLIENT_ID`
-with a secret, and no admin user exists. Use client credentials:
+Supply the admin credential in `KC_ADMIN_CLIENT_ID` and
+`KC_ADMIN_CLIENT_SECRET`, or use `KC_ADMIN_USER` and `KC_ADMIN_PASS` for an
+admin user. Set `KC_ADMIN_REALM` if the credential belongs to a realm other
+than `master`. Run the provisioning script:
 
 ```bash
-KC_ADMIN_CLIENT_ID=akb-bootstrap-temporary KC_ADMIN_CLIENT_SECRET=<...> \
-    python3 scripts/keycloak/setup-akb-mcp-oauth.py \
-        --kc https://auth.example.com \
-        --realm akb \
-        --audience https://akb.example.com/mcp
+python3 scripts/keycloak/setup-akb-mcp-oauth.py \
+  --kc https://auth.example.com \
+  --realm akb \
+  --audience https://akb.example.com/mcp
 ```
 
-If you are running the local dev fixture
-(`deploy/keycloak-dev/broker-chain/compose.yaml`), the bootstrap admin is
-a **user**. Use the password grant:
+The script provisions the Vault scopes for the tool resource and the native
+client registration policy. Keep those scopes off the realm's default and
+default-optional scope lists. Keycloak assigns them to clients admitted by the
+registration policy. The scopes carry the signed tool admission marker and
+the canonical resource audience.
 
-```bash
-KC_ADMIN_USER=admin KC_ADMIN_PASS=<...> \
-    python3 scripts/keycloak/setup-akb-mcp-oauth.py \
-        --kc https://auth.example.com \
-        --realm akb \
-        --audience https://akb.example.com/mcp
-```
+The reference policy admits public authorization-code clients with S256 PKCE.
+The native redirect is `http://127.0.0.1/oauth/callback` in registration
+metadata. Keycloak permits a dynamic loopback port on the authorization
+request. Enable refresh-token rotation and restrict alternate grants according
+to the provisioned client policy. The CLI requests ordinary refresh tokens.
 
-Either way the credential lives in the `master` realm, which is not the
-realm being configured. If your admin service account was instead created
-inside the target realm, set `KC_ADMIN_REALM` to that realm's name.
+## Configure AKB
 
-Do not create an admin user just to satisfy the script — that adds an
-account the deployment deliberately did not create. Use the service-account
-form instead.
-
-It will:
-
-1. Add `localhost`, `127.0.0.1` to the realm's DCR `trusted-hosts`
-   policy (so Claude Code on the operator's laptop can DCR-register), and
-   turn OFF that policy's sender-host check.
-2. Delete the `Allowed Client Scopes` registration policy — **both**
-   subtypes, `anonymous` and `authenticated`. See the note on Protected
-   DCR below for why the authenticated one matters.
-3. Create `akb:vault:read` and `akb:vault:write` scopes with audience
-   mappers pinned to the AKB `/mcp` URL.
-4. Add both scopes to `defaultOptionalClientScopes` so DCR clients can
-   request them.
-
-If the realm already had any of the above, those steps no-op.
-
-### If you use Protected DCR (Initial Access Tokens)
-
-An Initial Access Token does **not** bypass client-registration policies.
-It switches which subtype applies: `anonymous` → `authenticated`. Keycloak
-ships `Allowed Client Scopes` on both, and both reject a spec-compliant DCR
-body for the same reason — it carries `scope=openid`, and `openid` is the
-OIDC sentinel rather than an entry in the realm's client-scope catalog, so
-no setting of the policy can permit it.
-
-Removing only the anonymous copy therefore leaves the *hardened* path
-broken while the open one works:
-
-```
-IAT + scope "openid profile email akb:vault:read akb:vault:write offline_access"
-  → 403 {"error":"insufficient_scope",
-         "error_description":"Policy 'Allowed Client Scopes' rejected request to
-          client-registration service. Details: Not permitted to use specified clientScope"}
-
-IAT, scope field omitted
-  → 201
-```
-
-The setup script removes both, so Protected DCR works after running it. The
-IAT is the gate on that path; `Consent Required`, `Trusted Hosts` (the
-redirect-URI check) and `Max Clients Limit` remain the other guards.
-
-### Hand-edit checklist (if you skip the script)
-
-In the Keycloak admin console, in your realm:
-
-- **Realm Settings → Client Registration → Policies → Trusted Hosts**:
-  - Add `localhost`, `127.0.0.1` to the trusted hosts list (the
-    redirect-URI guard).
-  - **Turn OFF** `Host sending registration request must match` —
-    MCP clients DCR from dynamic IPs (a laptop on the move,
-    claude.ai's egress) that can't be allowlisted upfront. The
-    redirect-URI guard is the meaningful check; the sender-IP check
-    rejects every legitimate registration if left on.
-- **Realm Settings → Client Registration → Policies → Allowed Client
-  Scopes**: **Delete this policy from BOTH the anonymous and the
-  authenticated policy set.** Keycloak does not list the OIDC sentinel
-  scope `openid` in its client-scope catalog, so the default policy
-  rejects every spec-compliant DCR request (Claude Code, claude.ai,
-  ChatGPT all include `openid` in the DCR scope field) — and no
-  configuration of the policy permits it, because the value it would have
-  to allow is not a client scope. The authenticated copy is the one an
-  Initial Access Token registration hits; see the Protected DCR note
-  above. The `Consent Required`, `Trusted Hosts` (URI), and
-  `Max Clients Limit` policies stay as the meaningful guards.
-- **Client Scopes → Create**: add `akb:vault:read` and `akb:vault:write`
-  with the listed display + consent text. Add an `oidc-audience-mapper`
-  protocol mapper to each, with `Included Custom Audience` set to your
-  AKB `/mcp` URL (e.g. `https://akb.example.com/mcp`).
-- **Realm Settings → Client Scopes → Default Client Scopes** (Optional
-  column): assign both new scopes as Optional.
-
-## Configure the backend
-
-In `config/app.yaml`:
+Use the browser `auth_mode` that your installation already uses. Set the
+Keycloak issuer and canonical AKB base URL in `config/app.yaml`.
 
 ```yaml
-# MCP OAuth needs an OIDC authority, but it does not require human SSO.
-# Keep local here unless this installation intentionally uses OIDC human login.
 auth_mode: local
 keycloak_enabled: true
-keycloak_server_url: "https://auth.example.com"      # browser-facing → token `iss`
-keycloak_internal_url: "https://auth.example.com"    # backend → IdP backchannel
+keycloak_server_url: "https://auth.example.com"
+keycloak_internal_url: "https://auth.example.com"
 keycloak_realm: "akb"
-
-# The new MCP OAuth path
 mcp_oauth_enabled: true
 public_base_url: "https://akb.example.com"
-# mcp_oauth_audience defaults to <public_base_url>/mcp — only set this
-# if the MCP endpoint lives on a different hostname than public_base_url.
 ```
 
-Restart the backend. Sanity check the metadata document:
+The same tool resource works with `auth_mode: sso`. Users need an admitted
+Keycloak identity and the appropriate AKB Vault access in either mode.
+PAT-only deployments can leave `mcp_oauth_enabled` off.
 
-```bash
-curl https://akb.example.com/.well-known/oauth-protected-resource
-```
+Use the exact same base URL when you configure Keycloak's audience.
+If the base contains a prefix, retain it in the audience and client setup.
+For example, a base of `https://akb.example.com/workspace` has a resource of
+`https://akb.example.com/workspace/mcp`. Check its metadata at
+`/.well-known/oauth-protected-resource/workspace/mcp`. The well-known path is
+relative to the origin. Route that path to AKB when you configure the ingress.
 
-Should return JSON with `resource`, `authorization_servers`, and
-`scopes_supported` (including `akb:vault:read`, `akb:vault:write`,
-`offline_access`).
+Check the authorization server's advertised configuration with
+`curl -s https://akb.example.com/health | jq .mcp_oauth`. Validate policy and
+token issuance by completing a browser login against the deployment.
 
-That document describes what AKB *expects*; it says nothing about whether
-the realm was actually configured. For that, check the `mcp_oauth` section
-of `/health`:
+## Connect a direct HTTP client
 
-```bash
-curl -s https://akb.example.com/health | jq .mcp_oauth
-```
+For a direct client with a known client ID, give it the Vault scopes it needs
+and configure its redirect URI in Keycloak. Set its client ID in
+`mcp_oauth_client_ids` in AKB. The resulting access token must carry the
+same exact single MCP resource audience and a verified human identity.
 
-- `"status": "ok"` — the realm advertises a DCR registration endpoint and
-  both vault scopes. The audience mappers and the DCR policies are
-  admin-API state that AKB cannot read, so this is not a full all-clear.
-- `"status": "unconfigured"` — `missing` names what the realm does not
-  advertise, and `detail` names the setup script. Registration or token
-  minting will fail until it is run.
-- `"status": "unknown"` — AKB could not read the IdP's discovery document.
-  That is a statement about reachability, not about the realm.
+Use `https://akb.example.com/mcp/` as the HTTP transport endpoint. Configure
+the client with that registration and use its OAuth sign-in flow. A
+cloud-hosted connector needs network access to both AKB and the authorization
+server. If the client requires its own dynamic registration, the operator
+must authorize that client's registration and callback in the realm.
 
-## Add AKB to Claude Code
-
-```bash
-claude mcp add --transport http akb https://akb.example.com/mcp/
-```
-
-> **Trailing slash matters.** Register with the trailing `/mcp/`, not
-> bare `/mcp`. Backend issues a 307 redirect from `/mcp` → `/mcp/`,
-> which drops the POST body and breaks the session/initialize
-> handshake — the connector then appears as "Failed to connect" in
-> `claude mcp list` even though OAuth succeeded.
-
-The command itself does **not** open a browser. `claude mcp list` will
-show:
-
-```
-akb   ! Needs authentication
-```
-
-Complete OAuth one of two ways:
-
-- **Up-front, before the session**:
-  ```bash
-  claude mcp login akb
-  ```
-  (requires Claude Code ≥ v2.1.186). A browser opens, prompts you to
-  log in to Keycloak, presents the consent screen, and stores the
-  resulting tokens on your machine (macOS keychain, or
-  `~/.claude/mcp-credentials` on other platforms).
-
-- **Lazily, inside a session**: run `/mcp` in the session, select `akb`,
-  and choose `Authenticate`. A browser opens for the same flow.
-
-Once authenticated, Claude Code calls `https://akb.example.com/mcp`
-with `Authorization: Bearer <access_token>`. The access token is
-auto-refreshed silently as long as the IdP advertises `offline_access`
-in its `scopes_supported` — which the AKB realm does.
-
-If the IdP fails to advertise `offline_access`, tokens expire (default
-Keycloak access TTL is 5 minutes) and Claude Code re-opens the browser
-mid-session. Verify with:
-```bash
-curl https://auth.example.com/realms/akb/.well-known/openid-configuration \
-  | python3 -c 'import sys,json; d=json.load(sys.stdin); print("scopes_supported:", d.get("scopes_supported"))'
-```
-
-## Add AKB to claude.ai or ChatGPT (Custom Connector)
-
-For claude.ai / ChatGPT, AKB must be reachable from the cloud LLM's
-egress — i.e. on a public hostname with TLS. If your deployment is
-internal-only, see the next section.
-
-Settings → Connectors → *Add custom connector* → URL
-`https://akb.example.com/mcp`. The client auto-discovers
-`/.well-known/oauth-protected-resource`, DCR-registers itself against
-Keycloak, and runs the consent flow on the next user interaction.
-
-## Internal-only deployments
-
-If AKB is not reachable from the public internet (which is the
-Dnotitia reference deployment), Claude Code is the right client:
-the OAuth flow runs entirely between **your laptop** ↔ **AKB backend
-on the internal network** ↔ **Keycloak on the internal network**.
-No tunnel, no public hostname. The browser that opens for consent
-runs on the same laptop, so it can reach the internal Keycloak just
-like the rest of your session.
-
-claude.ai and ChatGPT Custom Connectors cannot reach an internal-only
-backend — the discovery call originates from their cloud. Use Claude
-Code (or a stdio client + PAT) for those deployments.
-
-## Troubleshooting
-
-### Claude Code shows "Needs authentication" but `claude mcp login` says "Incompatible auth server"
-
-The realm does not have DCR enabled, or the requesting host is not in
-the `trusted-hosts` policy. Re-run `setup-akb-mcp-oauth.py` (or check
-that step in the hand-edit checklist).
-
-### Tokens expire and the browser keeps reopening mid-session
-
-The realm is not advertising `offline_access`. Check
-`/.well-known/openid-configuration` on the IdP — `scopes_supported`
-must include `offline_access`. Keycloak ships it by default; if it is
-missing, your realm export removed it.
-
-### `/.well-known/oauth-protected-resource` returns 404
-
-`mcp_oauth_enabled` is not true in the running backend's
-`config/app.yaml`. Check `curl https://akb.example.com/readyz` first
-to confirm you are hitting the right deployment, then check the
-ConfigMap / app.yaml the live backend is reading.
-
-### `/mcp` returns 401 with an OAuth token that worked yesterday
-
-Audience mismatch — the token was minted with `aud` baked from the
-scope-level mapper. If you changed `public_base_url` (or
-`mcp_oauth_audience`) without re-running `setup-akb-mcp-oauth.py`,
-the realm still emits the old audience and the backend rejects it.
-Re-run the setup script with the new `--audience` and have users
-`claude mcp logout akb && claude mcp login akb` to get a token with
-the corrected `aud`.
-
-## How the pieces fit (recap)
-
-```
-[Claude Code]                [AKB backend]               [Keycloak]
-
-claude mcp add http://akb/mcp
-                       (saves config; no browser)
-
-claude mcp login akb
-  ────────── GET /.well-known/oauth-protected-resource ─→
-  ←──────────── { authorization_servers: [...] } ──────────
-  ─────────────── GET .../openid-configuration ─────────────────→
-  ←─────────── { registration_endpoint, ... } ────────────────────
-  ──────────────────── POST .../clients-registrations (DCR) ────→
-  ←───────────────────── { client_id: ... } ───────────────────────
-  [browser opens]
-                                                     /authorize?…
-                                                     [user logs in + consents]
-  ────────────────────────── POST .../token (code + PKCE) ─────→
-  ←─────────────── { access_token, refresh_token } ────────────────
-                       (tokens stored locally)
-
-claude > "list my AKB vaults"
-  ───────────── POST http://akb/mcp  Bearer <access_token> ────→
-                                  verify_access_token (JWKS, aud, iss, exp)
-                                  resolve_or_provision_keycloak_user
-                                  scope check (akb:vault:read)
-                                  dispatch akb_list_vaults
-                              ←──── { vaults: [...] } ────
-```
+[OAuth tool resource and scope reference](../designs/mcp-oauth-dcr/00-overview.md)
