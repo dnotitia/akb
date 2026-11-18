@@ -68,6 +68,7 @@ class NativeOAuthFixture:
         self.registration: dict[str, object] = {}
         self.cleanup: dict[str, object] = {}
         self.admin_token = ""
+        self.admin_expires_at = 0.0
         self._stop_requested = threading.Event()
         self._active_process: subprocess.Popen | None = None
 
@@ -112,9 +113,22 @@ class NativeOAuthFixture:
         if process.returncode:
             raise RuntimeError(f"{label} failed with exit {process.returncode}")
 
+    def _authenticate_admin(self) -> None:
+        response = self.http.post(f"{self.service_origin}/realms/master/protocol/openid-connect/token", data={
+            "grant_type": "password", "client_id": "admin-cli",
+            "username": self.admin_username, "password": self.admin_password,
+        })
+        if response.status_code != 200:
+            raise RuntimeError(f"fixture admin authentication failed with HTTP {response.status_code}")
+        token = response.json()
+        self.admin_token = token["access_token"]
+        self.admin_expires_at = time.monotonic() + max(0, token["expires_in"] - 5)
+
     def _admin(self, method: str, path: str, *, body: object = None, expected: int = 200) -> httpx.Response:
         if self._stop_requested.is_set():
             raise InterruptedError("native authority startup interrupted")
+        if time.monotonic() >= self.admin_expires_at:
+            self._authenticate_admin()
         response = self.http.request(
             method, f"{self.service_origin}/admin/{path}", json=body,
             headers={"Authorization": f"Bearer {self.admin_token}"},
@@ -148,13 +162,6 @@ class NativeOAuthFixture:
             time.sleep(0.5)
         else:
             raise RuntimeError("real Keycloak readiness timed out")
-        response = self.http.post(f"{self.service_origin}/realms/master/protocol/openid-connect/token", data={
-            "grant_type": "password", "client_id": "admin-cli",
-            "username": self.admin_username, "password": self.admin_password,
-        })
-        if response.status_code != 200:
-            raise RuntimeError(f"fixture admin authentication failed with HTTP {response.status_code}")
-        self.admin_token = response.json()["access_token"]
         self._admin("POST", "realms", expected=201, body={
             "realm": self.realm, "enabled": True, "sslRequired": "none",
             "registrationAllowed": False, "accessTokenLifespan": 60,
