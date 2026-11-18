@@ -20,23 +20,20 @@
 #   6. A token with only `akb:vault:read` is refused at a write-grade
 #      tool with `insufficient_scope`
 #
-# Stack required:
-#   docker compose -f docker-compose.yaml -f docker-compose.keycloak.yaml up -d
-#   # config/app.yaml must have:
-#   #   auth_mode: local
-#   #   keycloak_enabled: true
-#   #   mcp_oauth_enabled: true
-#   #   public_base_url: http://localhost:8000
+# Run against a disposable AKB and Keycloak fixture with auth_mode: local,
+# keycloak_enabled: true, and mcp_oauth_enabled: true. Provision a dedicated
+# confidential client with password grant enabled and list it in
+# mcp_oauth_client_ids. Give it the two optional AKB vault scopes, each with
+# an access-token audience mapper for the exact <public_base_url>/mcp.
+# Use a verified fixture user with the claims required for AKB enrollment.
 #
-# Run:
-#   bash backend/tests/test_mcp_oauth_e2e.sh
+# Set KC_TEST_CLIENT_ID and KC_TEST_CLIENT_SECRET in the environment before
+# running bash backend/tests/test_mcp_oauth_e2e.sh.
 #
-# Tunable via env:
+# Optional environment overrides:
 #   AKB_URL=http://localhost:8000
 #   KC_URL=http://localhost:8080
 #   KC_REALM=akb
-#   KC_TEST_CLIENT_ID=akb-web
-#   KC_TEST_CLIENT_SECRET=local-akb-dev-secret
 #   KC_TEST_USERNAME=alice
 #   KC_TEST_PASSWORD=alice-password
 set -uo pipefail
@@ -44,8 +41,8 @@ set -uo pipefail
 AKB_URL="${AKB_URL:-http://localhost:8000}"
 KC_URL="${KC_URL:-http://localhost:8080}"
 KC_REALM="${KC_REALM:-akb}"
-KC_TEST_CLIENT_ID="${KC_TEST_CLIENT_ID:-akb-web}"
-KC_TEST_CLIENT_SECRET="${KC_TEST_CLIENT_SECRET:-local-akb-dev-secret}"
+: "${KC_TEST_CLIENT_ID:?Set KC_TEST_CLIENT_ID to the dedicated MCP password-grant fixture client}"
+: "${KC_TEST_CLIENT_SECRET:?Set KC_TEST_CLIENT_SECRET for the dedicated fixture client}"
 KC_TEST_USERNAME="${KC_TEST_USERNAME:-alice}"
 KC_TEST_PASSWORD="${KC_TEST_PASSWORD:-alice-password}"
 
@@ -63,11 +60,16 @@ section() { echo; echo "── $1 ──"; }
 mint_token() {
   # $1 = scope (space-delimited). Empty → realm-default scopes only.
   local scope="$1"
-  local data="grant_type=password&client_id=${KC_TEST_CLIENT_ID}&client_secret=${KC_TEST_CLIENT_SECRET}&username=${KC_TEST_USERNAME}&password=${KC_TEST_PASSWORD}"
-  if [ -n "$scope" ]; then data="${data}&scope=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$scope")"; fi
+  local fields=(
+    --data-urlencode "grant_type=password"
+    --data-urlencode "client_id=${KC_TEST_CLIENT_ID}"
+    --data-urlencode "client_secret=${KC_TEST_CLIENT_SECRET}"
+    --data-urlencode "username=${KC_TEST_USERNAME}"
+    --data-urlencode "password=${KC_TEST_PASSWORD}"
+  )
+  if [ -n "$scope" ]; then fields+=(--data-urlencode "scope=$scope"); fi
   curl -s -X POST "${KC_URL}/realms/${KC_REALM}/protocol/openid-connect/token" \
-       -H "Content-Type: application/x-www-form-urlencoded" \
-       -d "$data" \
+       "${fields[@]}" \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))"
 }
 
