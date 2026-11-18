@@ -35,6 +35,7 @@ async function createInstallation(t) {
     const path = new URL(req.url, origin).pathname;
     events.push([req.method, path, req.headers.authorization]);
     if (path === '/.well-known/oauth-protected-resource/prefix/mcp') {
+      await fixture.beforeDiscovery?.();
       return reply(res, 200, {
         resource: fixture.advertisedResource ?? resource,
         authorization_servers: [fixture.advertisedIssuer ?? issuer],
@@ -290,6 +291,25 @@ test('a login attempt times out without a callback and releases ownership for an
   assert.equal(count(fixture.events, 'POST', '/register'), 1);
 });
 
+test('cancellation during discovery prevents client registration and browser launch', async (t) => {
+  const fixture = await createInstallation(t);
+  const controller = new AbortController();
+  const discoveryStarted = Promise.withResolvers();
+  const respond = Promise.withResolvers();
+  let browserCalls = 0;
+  fixture.beforeDiscovery = async () => { discoveryStarted.resolve(); await respond.promise; };
+  const session = fixture.session({
+    signal: controller.signal,
+    openBrowser: () => { browserCalls++; },
+  });
+  const attempt = session.login();
+  await discoveryStarted.promise;
+  controller.abort();
+  try { await assert.rejects(attempt, { code: 'oauth_cancelled' }); } finally { respond.resolve(); }
+  assert.equal(browserCalls, 0);
+  assert.equal(count(fixture.events, 'POST', '/register'), 0);
+});
+
 test('discovery rejects altered resource, issuer, redirects and cross-origin AS endpoints without sending registration data', async (t) => {
   const fixture = await createInstallation(t);
   const session = fixture.session();
@@ -348,6 +368,31 @@ test('uncertain rotation reports transport failure and never reuses the refresh 
   assert.equal(count(fixture.events, 'POST', '/token'), 2);
   assert.equal((await session.login()).state, 'ready');
   assert.equal(count(fixture.events, 'POST', '/register'), 1);
+});
+
+test('stdio readers do not wait for a login that recovers an interrupted refresh', async (t) => {
+  const fixture = await createInstallation(t);
+  const owner = fixture.session();
+  await owner.login();
+  fixture.advance();
+  fixture.refreshResponse = (res) => { reply(res, 503, { error: 'server_error' }); return true; };
+  await assert.rejects(owner.credential(), { code: 'oauth_transport' });
+
+  const controller = new AbortController();
+  const consentStarted = Promise.withResolvers();
+  const recovering = fixture.session({
+    signal: controller.signal,
+    openBrowser: async () => { consentStarted.resolve(); return true; },
+  });
+  const attempt = recovering.login();
+  await consentStarted.promise;
+  try {
+    await assert.rejects(fixture.session({ refreshWaitMs: 200 }).credential(), { code: 'login_required' });
+  } finally {
+    controller.abort();
+    await assert.rejects(attempt, { code: 'oauth_cancelled' });
+  }
+  assert.equal(count(fixture.events, 'POST', '/token'), 2);
 });
 
 test('a suspended refresh owner blocks takeover and death leaves an unresumable durable intent', async (t) => {

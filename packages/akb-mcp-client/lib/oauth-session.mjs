@@ -222,7 +222,11 @@ export class OAuthSession {
     const signal = AbortSignal.any([this.#signal, deadline.signal]);
     let callback;
     try {
-      const current = this.#read();
+      let current = this.#read();
+      if (current?.grant?.state === 'refreshing') {
+        current = { ...current, grant: null };
+        this.#save(current);
+      }
       const discovered = await oauth.discover(this.#resource, signal, this.#options.fetchFn);
       const { binding } = discovered;
       let record = current;
