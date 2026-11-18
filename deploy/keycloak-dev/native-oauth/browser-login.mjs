@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 
-const [urlFile, reportFile, frontendProject] = process.argv.slice(2);
+const [urlFile, reportFile, frontendProject, pauseSeconds] = process.argv.slice(2);
 const require = createRequire(pathToFileURL(frontendProject));
 const { chromium } = require('@playwright/test');
 const report = { result: 'FAIL', stage: 'request' };
@@ -54,6 +55,14 @@ try {
     page.locator('[name="accept"]').waitFor({ state: 'visible', timeout: 30000 }),
   ]);
   report.consent_observed = await page.locator('[name="accept"]').isVisible();
+  const pause = Number(pauseSeconds);
+  if (pause > 0) {
+    assert.equal(report.consent_observed, true);
+    report.stage = 'consent_hold';
+    await writeFile(reportFile, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
+    await delay(pause * 1000);
+    report.consent_held_seconds = pause;
+  }
   if (report.consent_observed) {
     await page.locator('[name="accept"]').click();
   }

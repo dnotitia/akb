@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -217,8 +218,8 @@ class CliAcceptance:
 
     async def login(self, index: int, pause: float = 0) -> str:
         login = [*self.cli, "login", "--url", self.resource]
-        first = await StdioSession.start(self.runtime, f"login-{index}", login, self.environment)
         before_resource = len(self.resource_relay.events)
+        first = await StdioSession.start(self.runtime, f"login-{index}", login, self.environment)
         try:
             async with asyncio.timeout(20):
                 while not self.capture.exists():
@@ -236,15 +237,14 @@ class CliAcceptance:
                     await self.cold_start("cold-during-login")
                 finally:
                     await contender.close()
-                await asyncio.sleep(pause)
             assert not any(event["inner_path"].rstrip("/") == "/mcp"
                            for event in self.resource_relay.events[before_resource:]), "pending login made no MCP request"
             args = [
                 self.cli[0], str(Path(__file__).with_name("browser-login.mjs")),
                 str(self.capture), str(self.root / f"browser-{index}.json"),
-                str(self.runtime.config.checkout / "frontend/package.json"),
+                str(self.runtime.config.checkout / "frontend/package.json"), str(pause),
             ]
-            async with asyncio.timeout(75):
+            async with asyncio.timeout(75 + pause):
                 await self.runtime._run_logged_command(
                     args, log_path=self.root / f"browser-{index}.log", environment={
                         "AKB_NATIVE_OAUTH_USERNAME": self.authority.username,
@@ -524,8 +524,11 @@ def main() -> int:
     parser.add_argument("--files", action="store_true", help="reuse existing file suites and observe OAuth controls")
     parser.add_argument("--hosts", action="store_true", help="invoke the real Codex and Claude Code CLIs in private test homes")
     parser.add_argument("--prefix", default="", help="loopback installation prefix")
-    parser.add_argument("--consent-pause-seconds", type=float, default=0, help="delay before driving the real browser")
-    return asyncio.run(exercise(parser.parse_args()))
+    parser.add_argument("--consent-pause-seconds", type=float, default=0, help="hold the first Keycloak consent page open")
+    args = parser.parse_args()
+    if not math.isfinite(args.consent_pause_seconds) or args.consent_pause_seconds < 0:
+        parser.error("--consent-pause-seconds must be finite and nonnegative")
+    return asyncio.run(exercise(args))
 
 
 if __name__ == "__main__":

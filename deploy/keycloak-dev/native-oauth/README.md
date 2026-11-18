@@ -25,8 +25,8 @@ uv run --locked --project backend python deploy/keycloak-dev/native-oauth/run.py
 ```
 
 Omit `--prefix` for the origin-root resource. A longer consent separation check
-can use `--consent-pause-seconds 120`. The CLI's browser login has a bounded
-deadline which includes this pause.
+can use `--consent-pause-seconds 120` to hold the first real Keycloak consent
+page open. The CLI's login deadline includes this pause.
 
 The runner checks cold stdio startup, a competing login, two real PKCE logins
 through one registration, and a fresh stdio process listing and calling a normal
