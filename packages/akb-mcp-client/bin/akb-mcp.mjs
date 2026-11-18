@@ -35,10 +35,8 @@ try {
       });
       try {
         if (command === "stdio") {
-          await credentials.credential();
-          process.stderr.write(`[akb-mcp] Connecting to ${installation.endpointUrl} (${authentication.kind})\n`);
           const { AKBProxy } = await import("../lib/proxy.mjs");
-          await new AKBProxy({ url: installation.endpointUrl, credentials }).start(controller.signal);
+          await new AKBProxy({ url: installation.endpointUrl, credentials }).start(controller);
         } else {
           const status = await credentials[command]();
           if (command === "logout") {

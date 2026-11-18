@@ -537,12 +537,15 @@ export class AKBProxy {
     return Number(process.env.AKB_MCP_CONNECT_TIMEOUT_MS) || 10000;
   }
 
-  async start(signal) {
+  async start(controller = new AbortController()) {
+    const { signal } = controller;
     const rl = createInterface({ input: process.stdin, signal });
+    const lines = rl[Symbol.asyncIterator]();
     let inFlight;
     const cancel = () => this.shutdown.abort();
-    signal?.addEventListener("abort", cancel, { once: true });
-    rl.once("close", cancel);
+    const disconnect = () => controller.abort();
+    signal.addEventListener("abort", cancel, { once: true });
+    rl.once("close", disconnect);
     rl.on("line", (line) => {
       if (!inFlight || !line.includes("notifications/cancelled")) return;
       let notification;
@@ -554,7 +557,10 @@ export class AKBProxy {
     });
 
     try {
-      for await (const line of rl) {
+      const credential = await this.credentials.credential();
+      if (signal.aborted) return;
+      process.stderr.write(`[akb-mcp] Connecting to ${this.url.href} (${credential.kind})\n`);
+      for await (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
 
@@ -577,10 +583,13 @@ export class AKBProxy {
           inFlight = null;
         }
       }
+    } catch (error) {
+      if (!signal.aborted) throw error;
     } finally {
       this._closed = true;
       cancel();
-      signal?.removeEventListener("abort", cancel);
+      signal.removeEventListener("abort", cancel);
+      rl.removeListener("close", disconnect);
       rl.close();
     }
   }

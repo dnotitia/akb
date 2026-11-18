@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { chmod, mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { createServer, get } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { fsyncSync } from 'node:fs';
 import { OAuthSession } from '../lib/oauth-session.mjs';
@@ -364,7 +366,9 @@ test('uncertain rotation reports transport failure and never reuses the refresh 
   fixture.advance();
   fixture.refreshResponse = (res) => { reply(res, 503, { error: 'server_error' }); return true; };
   await assert.rejects(session.credential(), { code: 'oauth_transport' });
-  await assert.rejects(fixture.session().credential(), { code: 'login_required' });
+  const peer = fixture.session();
+  assert.equal(peer.status().state, 'login_required');
+  await assert.rejects(peer.credential(), { code: 'login_required' });
   assert.equal(count(fixture.events, 'POST', '/token'), 2);
   assert.equal((await session.login()).state, 'ready');
   assert.equal(count(fixture.events, 'POST', '/register'), 1);
@@ -393,6 +397,31 @@ test('stdio readers do not wait for a login that recovers an interrupted refresh
     await assert.rejects(attempt, { code: 'oauth_cancelled' });
   }
   assert.equal(count(fixture.events, 'POST', '/token'), 2);
+});
+
+test('stdio disconnect cancels the startup refresh', { timeout: 6000 }, async (t) => {
+  const fixture = await createInstallation(t);
+  await fixture.session().login();
+  const arrived = Promise.withResolvers();
+  const respond = Promise.withResolvers();
+  fixture.refreshResponse = async () => { arrived.resolve(); await respond.promise; return false; };
+  const cli = fileURLToPath(new URL('../bin/akb-mcp.mjs', import.meta.url));
+  const child = spawn(process.execPath, [cli, '--url', fixture.resource], {
+    env: { ...process.env, AKB_PAT: '', AKB_MCP_AUTH_DIR: fixture.directory },
+    stdio: ['pipe', 'ignore', 'ignore'],
+  });
+  const exited = once(child, 'exit');
+  t.after(() => { child.kill(); respond.resolve(); });
+  await Promise.race([
+    arrived.promise,
+    exited.then(() => assert.fail('The proxy exited before starting its refresh.')),
+  ]);
+  child.stdin.end();
+  const result = await Promise.race([exited, delay(1000)]);
+  assert.deepEqual(result, [0, null]);
+  assert.equal(fixture.session().status().state, 'login_required');
+  assert.equal(count(fixture.events, 'POST', '/token'), 2);
+  assert.equal(count(fixture.events, 'POST', '/register'), 1);
 });
 
 test('a suspended refresh owner blocks takeover and death leaves an unresumable durable intent', async (t) => {
@@ -441,3 +470,19 @@ test('a replacement that fails persistence never becomes usable and unsafe stora
   assert.throws(() => fixture.session(), { code: 'oauth_storage' });
   await chmod(fixture.directory, 0o700);
 });
+
+if (process.platform === 'darwin') {
+  test('macOS storage refuses inherited and direct ACL grants', async (t) => {
+    const fixture = await createInstallation(t);
+    execFileSync('/bin/chmod', ['+a', 'group:everyone allow list,search,file_inherit,directory_inherit', fixture.directory]);
+    assert.throws(() => fixture.session(), { code: 'oauth_storage' });
+    assert.deepEqual(await readdir(fixture.directory), []);
+    execFileSync('/bin/chmod', ['-N', fixture.directory]);
+
+    const session = fixture.session();
+    await session.login();
+    const record = (await readdir(fixture.directory)).find((file) => file.endsWith('.json'));
+    execFileSync('/bin/chmod', ['+a', 'group:everyone allow read', join(fixture.directory, record)]);
+    assert.throws(() => session.status(), { code: 'oauth_storage' });
+  });
+}

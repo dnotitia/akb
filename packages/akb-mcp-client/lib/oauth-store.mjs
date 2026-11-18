@@ -2,6 +2,7 @@ import { constants, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openS
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { oauthBusy } from './oauth-error.mjs';
 
@@ -14,7 +15,8 @@ function assertPrivate(info, directory) {
   if (info.isSymbolicLink() || (directory ? !info.isDirectory() : !info.isFile()) || info.uid !== BigInt(process.getuid()) || (info.mode & 0o077n)) {
     throw new Error('OAuth storage must be owned by the current user, private, and free of symlinks.');
   }
-  if (!directory && info.nlink !== 1n) throw new Error('OAuth storage must not contain hard-linked files.');
+  // A peer can replace the pathname while the previous inode is still open.
+  if (!directory && info.nlink > 1n) throw new Error('OAuth storage must not contain hard-linked files.');
   return info;
 }
 
@@ -22,17 +24,29 @@ function privatePath(path, directory = false) {
   return assertPrivate(lstatSync(path, { bigint: true }), directory);
 }
 
-function validateAncestry(path) {
+function rejectMacAclGrants(paths) {
+  if (process.platform !== 'darwin') return;
+  // On Darwin, ACL grants can override the file's POSIX mode.
+  const output = execFileSync('/bin/ls', ['-ldeq', ...paths], {
+    encoding: 'utf8', env: { LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'], timeout: 1000,
+  });
+  if (/^\s*\d+:\s+.*\ballow\s+/m.test(output)) {
+    throw new Error('OAuth storage requires paths without ACL grants.');
+  }
+}
+
+function validateAncestry(path, paths = []) {
   const parent = dirname(path);
-  const protectedRoot = parent === path || validateAncestry(parent);
+  const protectedRoot = parent === path || validateAncestry(parent, paths);
   const info = lstatSync(path);
   if (info.isSymbolicLink()) {
     if (info.uid !== 0 || !protectedRoot) throw new Error('OAuth storage ancestry must not contain mutable symlinks.');
-    return validateAncestry(realpathSync(path));
+    return validateAncestry(realpathSync(path), paths);
   }
   const writable = Boolean(info.mode & 0o022);
   const stickyRoot = info.uid === 0 && Boolean(info.mode & 0o1000);
   if (!info.isDirectory() || ![0, process.getuid()].includes(info.uid) || (writable && !stickyRoot)) throw new Error('OAuth storage ancestry must use trusted directories without shared writable parents.');
+  paths.push(path);
   return protectedRoot && info.uid === 0 && !writable;
 }
 
@@ -54,7 +68,9 @@ export class OAuthStore {
     this.directory = resolve(directory);
     privateDirectory(this.directory);
     this.directory = realpathSync(this.directory);
-    validateAncestry(this.directory);
+    const ancestry = [];
+    validateAncestry(this.directory, ancestry);
+    rejectMacAclGrants(ancestry);
     this.directoryIdentity = privatePath(this.directory, true);
     if (!LOCAL_FILESYSTEMS[process.platform].has(Number(statfsSync(this.directory).type) >>> 0)) throw new Error('OAuth storage requires a supported local filesystem. Network filesystems are not supported.');
     const key = createHash('sha256').update(resource).digest('hex');
@@ -62,6 +78,7 @@ export class OAuthStore {
     this.databasePath = join(this.directory, `${key}.sqlite`);
     try { closeSync(openSync(this.databasePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600)); } catch (error) { if (error.code !== 'EEXIST') throw error; }
     this.databaseIdentity = privatePath(this.databasePath);
+    rejectMacAclGrants([this.databasePath]);
     try {
       this.database = new DatabaseSync(this.databasePath, { timeout: 0 });
       this.database.exec(`
@@ -75,18 +92,20 @@ export class OAuthStore {
       throw error;
     }
   }
-  _checkPaths() {
-    validateAncestry(this.directory);
+  _checkPaths(recordPath) {
+    const ancestry = [];
+    validateAncestry(this.directory, ancestry);
     const directory = privatePath(this.directory, true);
     if (directory.dev !== this.directoryIdentity.dev || directory.ino !== this.directoryIdentity.ino) throw new Error('OAuth storage directory identity changed.');
     const database = privatePath(this.databasePath);
     if (database.dev !== this.databaseIdentity.dev || database.ino !== this.databaseIdentity.ino) throw new Error('OAuth storage database identity changed.');
+    rejectMacAclGrants([...ancestry, this.databasePath, ...(recordPath ? [recordPath] : [])]);
   }
   read() {
-    this._checkPaths();
     try {
       const fd = openSync(this.recordPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       try {
+        this._checkPaths(this.recordPath);
         const info = assertPrivate(fstatSync(fd, { bigint: true }), false);
         if (info.size > 128n * 1024n) throw new Error('OAuth credential record exceeds the size limit.');
         const text = readFileSync(fd, 'utf8');
@@ -94,7 +113,11 @@ export class OAuthStore {
         if (record.version !== 1 || !record.binding || typeof record.binding.resource !== 'string') throw new Error('Invalid OAuth credential record.');
         return record;
       } finally { closeSync(fd); }
-    } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      this._checkPaths();
+      return null;
+    }
   }
   isPublished(publicationId) {
     this._checkPaths();
@@ -130,6 +153,7 @@ export class OAuthStore {
     try { privatePath(temporary); unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
     try {
+      rejectMacAclGrants([temporary]);
       writeFileSync(fd, json);
       fsyncSync(fd);
     } catch (error) { try { unlinkSync(temporary); } catch {} throw error; }

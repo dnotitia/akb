@@ -94,12 +94,19 @@ export class OAuthSession {
 
   status() {
     checkCancelled(this.#signal);
-    const record = this.#read();
+    let record = this.#read();
+    let refreshPending = false;
+    if (record?.grant?.state === 'refreshing') {
+      refreshPending = Boolean(this.#task) || !this.#acquire();
+      if (!refreshPending) {
+        try { record = this.#read(); } finally { this.#release(); }
+      }
+    }
     const status = { mode: 'oauth', resource: this.#resource, state: 'login_required' };
     if (!record) return status;
     status.issuer = record.binding.issuer;
     if (record.registration) status.clientId = record.registration.client_id;
-    if (record.grant?.state === 'refreshing') {
+    if (refreshPending) {
       status.state = 'refresh_pending';
     } else if (this.#published(record.grant) && !matches(record.grant, this.#rejected)) {
       status.state = isUsable(record.grant, this.#options.now()) ? 'ready' : 'refresh_needed';
