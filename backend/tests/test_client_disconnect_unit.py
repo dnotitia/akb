@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.api.deps import get_current_user
+from app.api.deps import ToolControlUser
 from app.services.auth_service import AuthenticatedUser
 
 _HANDLER_MESSAGE = "Client disconnected before its request body was read: %s %s"
@@ -49,7 +49,7 @@ def _stub_mcp(main, monkeypatch) -> None:
 def _stub_asset_upload(main, monkeypatch) -> None:
     from app.api.routes import assets
 
-    monkeypatch.setitem(main.app.dependency_overrides, get_current_user, lambda: _USER)
+    monkeypatch.setitem(main.app.dependency_overrides, ToolControlUser("asset.upload"), lambda: _USER)
     monkeypatch.setattr(
         assets,
         "resolve_file_write_context",

@@ -24,11 +24,13 @@ Any agent client that speaks **MCP (Streamable HTTP or stdio)**:
   [`akb-mcp`](https://www.npmjs.com/package/akb-mcp) stdio proxy
 - Custom agents — direct HTTP `POST /mcp/` with a Bearer token
 
-The default flow uses a Personal Access Token. Deployments with the
-optional **MCP OAuth Resource Server** path turned on (via Keycloak as
-the AS — see [`docs/mcp-clients/web-connectors.md`](./docs/mcp-clients/web-connectors.md))
-also accept Claude Code's `mcp add --transport http` + `mcp login` flow
-end-to-end, without a PAT.
+The stdio proxy accepts an explicit Personal Access Token (PAT). On an
+OAuth-enabled installation, run `npx akb-mcp login --url <mcp-url>` once
+before starting the host with a URL-only configuration. One credential covers
+MCP and the proxy's local file tools. [Configure the stdio proxy](packages/akb-mcp-client/README.md).
+
+For direct HTTP OAuth, configure the client and authorization server.
+[Configure direct HTTP OAuth](docs/mcp-clients/web-connectors.md).
 
 Product administrators can view server-observed calls by user, PAT and tool. [MCP monitoring](docs/operations/mcp-monitoring.md)
 

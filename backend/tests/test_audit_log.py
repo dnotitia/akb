@@ -202,11 +202,11 @@ def test_read_only_set_agrees_with_the_mcp_scope_table(tmp_path, monkeypatch):
     from app.config import settings as _s
 
     monkeypatch.setattr(_s, "git_storage_path", str(tmp_path / "vaults"))
-    from mcp_server.server import _READ_SCOPE, _TOOL_SCOPES
+    from app.services.tool_resource_policy import READ_SCOPE, MCP_OPERATION_SCOPES
 
     write_but_audited_as_read = sorted(
         audit_log._READ_ONLY_TOOLS
-        - {n for n, scope in _TOOL_SCOPES.items() if scope == _READ_SCOPE}
+        - {n for n, scope in MCP_OPERATION_SCOPES.items() if scope == READ_SCOPE}
     )
     assert write_but_audited_as_read == [], (
         f"Tools audited as read-only but requiring the write scope: "

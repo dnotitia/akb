@@ -25,7 +25,7 @@ from typing import Literal, cast
 from urllib.parse import quote, urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from app.services.sparse_shapes import SparseShape, SparseShapeDecision, SparseShapeSetting
 
@@ -1170,40 +1170,11 @@ class Settings(BaseModel):
     # existing public-resource convention used by MCP, but stays distinct.
     api_oauth_audience: str = ""
 
-    # === MCP OAuth Resource Server (optional, separate from SSO) ===
-    # When true, AKB's /mcp endpoint accepts Keycloak-issued access tokens
-    # (RS256) in addition to token-store PAT/service credentials (`akb_*`).
-    # Local human-session JWTs are never MCP credentials. Web-hosted LLM
-    # clients (claude.ai / ChatGPT Custom Connectors,
-    # Claude Code's HTTP transport) discover the authorization server via
-    # `/.well-known/oauth-protected-resource` (RFC 9728), register
-    # themselves via DCR (RFC 7591) against Keycloak, and obtain an access
-    # token with the `akb:vault:read` / `akb:vault:write` scopes.
-    #
-    # Requires `keycloak_enabled = true` — AKB is a Resource Server only;
-    # the Authorization Server (DCR / authorize / consent / token /
-    # refresh) is the OIDC IdP. AKB never registers clients or issues
-    # OAuth access tokens itself.
-    #
-    # Disabled (the default) keeps /mcp on PAT-only behaviour
-    # bit-for-bit — stdio clients (Claude Desktop, Codex CLI via
-    # akb-mcp) are unaffected even when this is left off.
-    #
-    # Realm configuration is a precondition this flag does not create:
-    # the IdP needs the vault client scopes, their audience mappers, and
-    # a DCR policy that accepts an MCP client, or registration fails at
-    # the IdP with a 403 before any AKB code runs. Apply it with
-    # scripts/keycloak/setup-akb-mcp-oauth.py; /health reports the part
-    # of it AKB can observe (app/services/mcp_oauth_preconditions.py).
-    #
-    # See docs/mcp-clients/web-connectors.md for what to configure (it is
-    # the operational authority) and docs/designs/mcp-oauth-dcr/00-overview.md
-    # for why the design is shaped this way.
+    # OAuth for MCP and file/image controls, independent of browser auth.
     mcp_oauth_enabled: bool = False
-    # Audience claim the access token must carry to be usable at /mcp.
-    # Defaults to `<public_base_url>/mcp`; override only if you front the
-    # MCP endpoint at a separate hostname.
-    mcp_oauth_audience: str = ""
+    # Manually provisioned direct MCP clients. DCR clients prove admission
+    # through an authorization-server-issued claim instead.
+    mcp_oauth_client_ids: list[str] = Field(default_factory=list)
 
     # Server
     host: str = "0.0.0.0"
@@ -1520,6 +1491,33 @@ class Settings(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def validate_mcp_oauth(self) -> "Settings":
+        if not self.mcp_oauth_enabled:
+            return self
+        excluded_clients = self.keycloak_human_client_ids | {
+            self.keycloak_admin_client_id.strip(), self.keycloak_service_admin_client_id.strip(),
+        }
+        if any(
+            not client_id or client_id != client_id.strip() or client_id in excluded_clients
+            for client_id in self.mcp_oauth_client_ids
+        ):
+            raise ValueError("mcp_oauth_client_ids must name distinct MCP clients without surrounding whitespace")
+        if self.public_base_url:
+            base = self.public_base_url.rstrip("/")
+            try:
+                url = AnyHttpUrl(base)
+            except ValueError as error:
+                raise ValueError("MCP OAuth requires a canonical public_base_url") from error
+            if (
+                url.username is not None or url.password is not None
+                or url.query is not None or url.fragment is not None
+                or str(url).rstrip("/") != base
+                or (url.scheme != "https" and url.host not in {"localhost", "127.0.0.1", "[::1]"})
+            ):
+                raise ValueError("MCP OAuth requires a canonical HTTPS public_base_url or loopback HTTP")
+        return self
+
+    @model_validator(mode="after")
     def validate_sso_browser_session_lifetimes(self) -> "Settings":
         if self.sso_browser_session_idle_ttl_secs > self.sso_browser_session_absolute_ttl_secs:
             raise ValueError("sso_browser_session_idle_ttl_secs must be <= sso_browser_session_absolute_ttl_secs")
@@ -1677,16 +1675,14 @@ class Settings(BaseModel):
 
     @property
     def mcp_oauth_audience_effective(self) -> str:
-        """Resolved audience claim required on Keycloak access tokens
-        presented at /mcp. Empty string when MCP-OAuth is off."""
         if not self.mcp_oauth_enabled:
             return ""
-        if self.mcp_oauth_audience:
-            return self.mcp_oauth_audience
-        # Default: <public_base_url>/mcp. public_base_url is required at
-        # startup (lifecycle validates it), so by the time this property
-        # is read in a request path it will be non-empty.
         return f"{self.public_base_url.rstrip('/')}/mcp"
+
+    @property
+    def mcp_oauth_metadata_url(self) -> str:
+        resource = urlsplit(self.mcp_oauth_audience_effective)
+        return f"{resource.scheme}://{resource.netloc}/.well-known/oauth-protected-resource{resource.path}"
 
     @property
     def database_url(self) -> str:

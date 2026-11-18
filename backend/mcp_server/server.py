@@ -58,6 +58,9 @@ from app.services.access_service import (
     reset_authorized_vault, search_users, transfer_ownership, archive_vault,
 )
 from app.services.auth_service import resolve_mcp_authorization, token_has_scope
+from app.services.tool_resource_policy import (
+    READ_SCOPE, WRITE_SCOPE, operation_may_write, required_oauth_scope,
+)
 from app.util.errors import (
     err,
     exception_envelope,
@@ -287,99 +290,6 @@ search_service = SearchService()
 
 _HANDLERS: dict[str, Any] = {}
 
-# OAuth scope required to invoke each tool — checked in _dispatch when
-# the caller authenticated via the MCP OAuth Resource Server path (a
-# Keycloak access token with a non-None `oauth_scopes`). PAT and service
-# credentials carry `oauth_scopes is None` and skip this OAuth-layer check.
-#
-# The vocabulary is deliberately coarse — read vs write at the vault
-# level. Finer-grained access (per-vault role, public visibility,
-# collection ACL) stays in PG-RBAC + `vault_access`; surfacing those as
-# OAuth scopes would force users to consent to a list of vaults the
-# realm cannot know about. Two scopes are the right altitude for the
-# consent screen.
-#
-# Categorisation rule of thumb: any tool that mutates a vault, table,
-# document, file, edge, publication, vault membership, or vault
-# settings → `akb:vault:write`. Everything else (read / browse /
-# search / metadata / introspection) → `akb:vault:read`. SQL selects its
-# capability from the authenticated credential.
-_READ_SCOPE = "akb:vault:read"
-_WRITE_SCOPE = "akb:vault:write"
-_TOOL_SCOPES: dict[str, str] = {
-    # --- read ---
-    "akb_help": _READ_SCOPE,
-    "akb_whoami": _READ_SCOPE,
-    "akb_list_vaults": _READ_SCOPE,
-    "akb_vault_info": _READ_SCOPE,
-    "akb_vault_members": _READ_SCOPE,
-    # A read: it reports the reasons behind a role, and reporting a reason is
-    # never authority to change one.
-    "akb_explain_access": _READ_SCOPE,
-    "akb_search_users": _READ_SCOPE,
-    "akb_browse": _READ_SCOPE,
-    "akb_get": _READ_SCOPE,
-    "akb_search": _READ_SCOPE,
-    "akb_grep": _READ_SCOPE,
-    "akb_drill_down": _READ_SCOPE,
-    "akb_activity": _READ_SCOPE,
-    "akb_diff": _READ_SCOPE,
-    "akb_history": _READ_SCOPE,
-    "akb_relations": _READ_SCOPE,
-    "akb_graph": _READ_SCOPE,
-    "akb_provenance": _READ_SCOPE,
-    "akb_publications": _READ_SCOPE,
-    "akb_export": _READ_SCOPE,
-    # --- write ---
-    "akb_publication_snapshot": _WRITE_SCOPE,
-    "akb_put": _WRITE_SCOPE,
-    "akb_update": _WRITE_SCOPE,
-    "akb_move": _WRITE_SCOPE,
-    "akb_edit": _WRITE_SCOPE,
-    "akb_delete": _WRITE_SCOPE,
-    "akb_link": _WRITE_SCOPE,
-    "akb_unlink": _WRITE_SCOPE,
-    "akb_create_collection": _WRITE_SCOPE,
-    "akb_delete_collection": _WRITE_SCOPE,
-    "akb_create_vault": _WRITE_SCOPE,
-    "akb_delete_vault": _WRITE_SCOPE,
-    "akb_archive_vault": _WRITE_SCOPE,
-    "akb_create_table": _WRITE_SCOPE,
-    "akb_alter_table": _WRITE_SCOPE,
-    "akb_drop_table": _WRITE_SCOPE,
-    "akb_sql": _WRITE_SCOPE,
-    "akb_grant": _WRITE_SCOPE,
-    "akb_revoke": _WRITE_SCOPE,
-    "akb_publish": _WRITE_SCOPE,
-    "akb_unpublish": _WRITE_SCOPE,
-    "akb_set_public": _WRITE_SCOPE,
-    "akb_transfer_ownership": _WRITE_SCOPE,
-    "akb_import": _WRITE_SCOPE,
-}
-
-# Arguments that promote an otherwise read-grade tool to write-grade.
-#
-# `_TOOL_SCOPES` classifies a tool as a whole, which cannot express a
-# read tool that carries an optional mutating argument. `akb_grep` is
-# exactly that: a search tool whose `replace` rewrites EVERY matching
-# document across the scope (git commit + re-index per doc). Mapped flat
-# as read, a read-scoped token passed the gate and reached the rewrite.
-#
-# That was never privilege escalation — `_handle_grep` still requires
-# `check_vault_access(required_role="writer")` — but it defeated the
-# reason read-only tokens exist: handing an agent a read PAT is supposed
-# to mean it cannot change anything, and for a caller who *is* a vault
-# writer it did not.
-#
-# Declared here rather than branched inside `_dispatch` so the next tool
-# that grows a mutating argument has one obvious place to say so, and so
-# a test can assert every trigger names a real argument of that tool (a
-# typo would silently un-promote it — the exact failure this prevents).
-_ARG_WRITE_TRIGGERS: dict[str, tuple[str, ...]] = {
-    "akb_grep": ("replace",),
-}
-
-
 async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
     """Does this credential have READ authority on `vault`?
 
@@ -393,7 +303,7 @@ async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
     denied role check all resolve to False. This gates a PROJECTION, never
     an action, so refusing it can only under-disclose.
     """
-    if user.oauth_scopes is not None and _READ_SCOPE not in user.oauth_scopes:
+    if user.oauth_scopes is not None and READ_SCOPE not in user.oauth_scopes:
         return False
     if user.token_scopes is not None and not token_has_scope(
         user.token_scopes, "read"
@@ -406,30 +316,15 @@ async def _can_read_vault(user: "_MCPUser", uid: str, vault: str) -> bool:
     return True
 
 
-def _required_scope(name: str, args: dict) -> str:
-    """Scope a call needs: the tool's mapping, promoted to write when the
-    call carries a mutating argument.
-
-    Unmapped tools fail CLOSED to write (see `_dispatch`). A trigger
-    counts only when the argument is actually present and not None —
-    `replace=""` IS a rewrite (it deletes every match), so emptiness must
-    not be mistaken for absence.
-    """
-    if any(args.get(a) is not None for a in _ARG_WRITE_TRIGGERS.get(name, ())):
-        return _WRITE_SCOPE
-    return _TOOL_SCOPES.get(name, _WRITE_SCOPE)
-
-
-def _call_scope(name: str, args: dict, user: "_MCPUser") -> str:
-    if name != "akb_sql":
-        return _required_scope(name, args)
-    oauth_write = user.oauth_scopes is None or _WRITE_SCOPE in user.oauth_scopes
-    token_write = user.token_scopes is None or token_has_scope(user.token_scopes, "write")
-    if oauth_write and token_write:
-        return _WRITE_SCOPE
-    oauth_read = user.oauth_scopes is None or _READ_SCOPE in user.oauth_scopes
-    token_read = user.token_scopes is None or token_has_scope(user.token_scopes, "read")
-    return _READ_SCOPE if oauth_read and token_read else _WRITE_SCOPE
+def _call_scope(name: str, args: dict, user: "_MCPUser") -> str | None:
+    read_only_sql = False
+    if name == "akb_sql":
+        oauth_write = user.oauth_scopes is None or WRITE_SCOPE in user.oauth_scopes
+        token_write = token_has_scope(user.token_scopes, "write")
+        oauth_read = user.oauth_scopes is None or READ_SCOPE in user.oauth_scopes
+        token_read = token_has_scope(user.token_scopes, "read")
+        read_only_sql = not (oauth_write and token_write) and oauth_read and token_read
+    return required_oauth_scope(name, args, read_only_sql=read_only_sql)
 
 
 # Schema-derived: {tool_name: set(allowed_arg_names)}. Used by _dispatch
@@ -1361,7 +1256,7 @@ async def _handle_sql(args: dict, uid: str, user: _MCPUser) -> dict:
         actor_id=user.username,
         sql=sql,
         is_admin=user.is_admin,
-        read_only=_call_scope("akb_sql", args, user) == _READ_SCOPE,
+        read_only=_call_scope("akb_sql", args, user) == READ_SCOPE,
     )
 
 
@@ -1789,11 +1684,7 @@ async def list_tools():
     # clients keep the byte-for-byte schemas they already understand.
     decorated = []
     for tool in tools:
-        may_write = (
-            _TOOL_SCOPES.get(tool.name, _WRITE_SCOPE) == _WRITE_SCOPE
-            or tool.name in _ARG_WRITE_TRIGGERS
-        )
-        if not may_write:
+        if not operation_may_write(tool.name):
             decorated.append(tool)
             continue
         copied = tool.model_copy(deep=True)
@@ -1886,7 +1777,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
     # relabelled "error" because the response could not be encoded.
     recorded = False
     try:
-        is_write = _call_scope(name, arguments, user) == _WRITE_SCOPE
+        is_write = _call_scope(name, arguments, user) == WRITE_SCOPE
         result: dict | None = None
 
         # A guide cannot influence a write that has already committed.  For a
@@ -2023,7 +1914,7 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         # success path did not already record this invocation (a response-encode
         # failure lands here after a handler that actually succeeded).
         if not recorded:
-            is_write = _call_scope(name, arguments, user) == _WRITE_SCOPE
+            is_write = _call_scope(name, arguments, user) == WRITE_SCOPE
             audit_log.record_tool(
                 name, arguments, user, envelope, is_write=is_write, protocol=protocol
             )
@@ -2083,21 +1974,10 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
     if not handler:
         return err(f"Unknown tool: {name}", code=UNKNOWN_TOOL)
 
-    # OAuth scope enforcement — only when the caller's session is
-    # authenticated via a Keycloak access token (oauth_scopes is a
-    # concrete list, possibly empty). PAT and service credentials keep
-    # `oauth_scopes is None` so this check is a no-op for them, which
-    # preserves stdio/CLI behaviour bit-for-bit.
-    #
-    # Tools not present in `_TOOL_SCOPES` fail CLOSED to the write
-    # scope. A newly added tool that forgets a scope mapping is almost
-    # always a write tool (the new tools shipped this PR cycle are);
-    # writing for OAuth requires `akb:vault:write`, which the user has
-    # to have explicitly consented to, so the closed default is safe.
-    # A test in `test_mcp_oauth_unit` asserts every registered handler
-    # has an explicit mapping so CI catches the omission anyway.
+    required = _call_scope(name, args, user)
+    if required is None:
+        return err(f"Tool has no scope classification: {name}", code=UNKNOWN_TOOL)
     if user.oauth_scopes is not None:
-        required = _call_scope(name, args, user)
         if required not in user.oauth_scopes:
             return err(
                 f"OAuth token is missing required scope '{required}' for tool '{name}'",
@@ -2106,8 +1986,7 @@ async def _dispatch(name: str, args: dict, user: "_MCPUser"):
                 granted_scopes=list(user.oauth_scopes),
             )
     if user.token_scopes is not None:
-        required = _call_scope(name, args, user)
-        required_token_scope = "write" if required == _WRITE_SCOPE else "read"
+        required_token_scope = "write" if required == WRITE_SCOPE else "read"
         if not token_has_scope(user.token_scopes, required_token_scope):
             return err(
                 f"Token scope is missing required scope '{required_token_scope}' for tool '{name}'",

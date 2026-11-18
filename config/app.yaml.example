@@ -316,7 +316,8 @@ app_credential_overlap_seconds: 300
 #   "https://reef.example.com": "reef-web"
 # api_oauth_audience: ""               # default: <public_base_url>/api
 # mcp_oauth_enabled: false
-# mcp_oauth_audience: ""               # default: <public_base_url>/mcp
+# mcp_oauth_client_ids: []             # explicitly provisioned direct MCP clients
+# The OAuth audience is exactly <public_base_url>/mcp.
 # API and MCP audiences must remain distinct.
 # keycloak_client_secret, keycloak_admin_client_secret,
 # sso_browser_session_encryption_key, and the optional standalone

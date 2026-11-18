@@ -1,25 +1,14 @@
 # Changelog
 
-## Unreleased — safe retries after response loss
+## 2.4.0
 
-Forwarded tool calls now retry connection failures only for explicitly reviewed
-reads, including `akb_grep` when `replace` is omitted or null. A string replacement
-(even `""`), SQL, writes, and unclassified tools are dispatched at most once per
-proxy call. Tool names and advertised read-only hints do not grant replay safety.
-Session recovery and tools-list refresh continue independently.
-
-An unavailable backend before tool dispatch returns `isError: true`,
-`code: backend_unavailable`, and `details.operation_outcome: not_started`.
-A lost or malformed response after entering dispatch returns `operation_unknown`
-with outcome `unknown`; check current state before repeating the request. This
-also covers incomplete responses and non-protocol HTTP 5xx failures. Original
-MCP errors and explicit HTTP rejections retain their existing behavior. These
-errors omit raw upstream bodies and request arguments, and usage logging records
-the call once. Read retries that are exhausted use the same outcome contract.
-
-This limits automatic replay in this proxy, not duplicate calls from other
-clients. It does not add idempotency keys, operation lookup, rollback on timeout,
-or new retry behavior to the separate proxy-local REST/S3 file tools.
+- Run `akb-mcp login --url <mcp-url>` before starting a URL-only stdio
+  connection. The proxy uses the saved OAuth grant for MCP and file controls.
+- Use `--pat` or `AKB_PAT` to select PAT mode. The proxy requires verified TLS
+  outside loopback development.
+- Submit each caller operation once. The proxy reports unknown outcomes after
+  loss of a response and partial outcomes after a successful file transfer
+  stage. Reconnect probes can still restore the connection for new calls.
 
 ## Unreleased — document body input validation
 

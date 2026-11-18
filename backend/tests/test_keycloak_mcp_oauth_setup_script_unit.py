@@ -143,164 +143,63 @@ def test_describe_identifies_the_credential_without_leaking_it():
     assert "hunter2" not in password.describe()
 
 
-# ── the "Allowed Client Scopes" policy, both subtypes ──────────────
-#
-# Keycloak ships this policy twice. It rejects any spec-compliant DCR body
-# for the same reason in both: the body carries `scope=openid`, and `openid`
-# is the OIDC sentinel rather than an entry in the realm's client-scope
-# catalog, so no setting of the policy can permit it. The script used to
-# remove only the `anonymous` one.
-#
-# The `authenticated` one is what an Initial Access Token registration hits
-# — an IAT does not bypass registration policies, it switches which subtype
-# applies. So Protected DCR, the option the design offers for hostile
-# internet exposure, ran into the wall this script exists to remove, while
-# the open path worked. Measured on a realm the script had already
-# configured: IAT + a scope field → 403 "Policy 'Allowed Client Scopes'
-# rejected request … Not permitted to use specified clientScope"; the same
-# registration with the scope field omitted → 201.
-
-
-def _policy(subtype: str, provider: str = "allowed-client-templates") -> dict:
-    return {"id": f"id-{provider}-{subtype}", "providerId": provider, "subType": subtype}
-
-
-def test_both_policy_subtypes_are_selected_for_removal():
-    components = [
-        _policy("anonymous"),
-        _policy("authenticated"),
-        _policy("anonymous", provider="trusted-hosts"),
-        _policy("anonymous", provider="max-clients"),
+def test_dcr_scope_policy_limits_assignment_to_anonymous_registration(monkeypatch):
+    providers = [
+        "trusted-hosts", "consent-required", "scope", "allowed-protocol-mappers", "max-clients",
     ]
-    selected = setup_script.client_scope_policies(components)
-    assert [p["subType"] for p in selected] == ["anonymous", "authenticated"]
-
-
-def test_the_authenticated_policy_alone_is_still_selected():
-    """The state the old script left behind, and the one that traps Protected DCR.
-
-    A realm the previous version had "configured" has only the
-    authenticated policy left. Selecting nothing here is exactly the
-    regression: the open path works and the hardened path does not.
-    """
-    assert setup_script.client_scope_policies([_policy("authenticated")]) != []
-
-
-def test_other_registration_policies_are_left_alone():
-    # `consent-required`, `trusted-hosts` (URI) and `max-clients` are the
-    # meaningful guards and must survive.
     components = [
-        _policy("anonymous", provider="trusted-hosts"),
-        _policy("anonymous", provider="consent-required"),
-        _policy("anonymous", provider="max-clients"),
+        {"id": provider, "providerId": provider, "subType": "anonymous"}
+        for provider in providers
     ]
-    assert setup_script.client_scope_policies(components) == []
+    changes = []
 
+    def fake_api(method, url, token, *, body=None, statuses=()):
+        if method == "GET":
+            return components
+        changes.append((method, body))
+        return None
 
-def test_a_realm_already_cleaned_selects_nothing():
-    assert setup_script.client_scope_policies([]) == []
-
-
-@pytest.mark.parametrize("payload", [None, "error body", {"error": "nope"}, [None, "x", 3]])
-def test_a_non_list_or_ragged_response_selects_nothing_rather_than_raising(payload):
-    # `http()` hands back whatever the admin API said; an error body used to
-    # reach `.get()` on a string as an AttributeError.
-    assert setup_script.client_scope_policies(payload) == []
-
-
-# ── trusted-hosts: absence is a configuration, not a failure ──────────
-
-
-def _trusted_hosts(hosts=("localhost",), sender_check="true") -> dict:
-    return {
-        "id": "th-1",
-        "providerId": "trusted-hosts",
-        "config": {
-            "trusted-hosts": list(hosts),
-            "host-sending-registration-request-must-match": [sender_check],
-            "client-uris-must-match": ["true"],
-        },
+    monkeypatch.setattr(setup_script, "api", fake_api)
+    base = "https://kc.example/admin/realms/r"
+    policies = setup_script.read_registration_policies(base, "token")
+    setup_script.configure_registration(base, {"id": "realm-id"}, "token", policies)
+    created = {policy["subType"]: policy for method, policy in changes if method == "POST"}
+    assert created["anonymous"]["config"] == {
+        "allow-default-scopes": ["false"],
+        "allowed-client-scopes": ["basic", "email", "profile", "akb:vault:read", "akb:vault:write"],
     }
+    assert created["authenticated"]["config"]["allowed-client-scopes"] == []
+    assert all(method != "DELETE" for method, _ in changes)
 
 
-class _Recorder:
-    """Stands in for the script's HTTP call and remembers what it was asked."""
+def test_provisioning_refuses_to_stamp_a_realm_default_tool_scope(monkeypatch):
+    def fake_api(method, url, token, **kwargs):
+        assert method == "GET"
+        return [{"id": "scope-id", "name": "akb:vault:read"}]
 
-    def __init__(self, status: int = 204):
-        self.calls: list[tuple] = []
-        self.status = status
-
-    def __call__(self, method, url, token=None, body=None, **_):
-        self.calls.append((method, url, body))
-        return self.status, {}, {}
+    monkeypatch.setattr(setup_script, "api", fake_api)
+    with pytest.raises(setup_script.ProvisioningError, match="realm default client scope"):
+        setup_script.read_tool_scopes("https://kc.example/admin/realms/r", "token")
 
 
-def test_a_realm_without_the_policy_is_configured_not_broken():
-    """The regression. A realm that enforces redirects through a client policy
-    has no trusted-hosts policy, and it is exactly the realm that still needs
-    every later step. Stopping here skipped all of them."""
-    http = _Recorder()
-    outcome = setup_script.configure_trusted_hosts(
-        "https://kc.example/admin/realms/r", "tok", [_policy("anonymous")],
-        ["localhost"], request=http,
-    )
-    assert outcome == "absent"
-    assert http.calls == []
+@pytest.mark.parametrize("saml_status", [404, 405])
+def test_provisioning_checks_the_saml_registration_collection(monkeypatch, saml_status):
+    issuer = "https://kc.example/realms/r"
 
+    def http(method, url):
+        assert method == "GET"
+        return {
+            f"{issuer}/clients-registrations/default/akb-policy-probe": (404, "", {}),
+            f"{issuer}/clients-registrations/saml2-entity-descriptor": (saml_status, "", {}),
+            f"{issuer}/.well-known/openid-configuration": (200, {"grant_types_supported": ["authorization_code"]}, {}),
+        }[url]
 
-def test_a_present_policy_is_opened_for_moving_clients():
-    http = _Recorder()
-    outcome = setup_script.configure_trusted_hosts(
-        "https://kc.example/admin/realms/r", "tok", [_trusted_hosts()],
-        ["127.0.0.1"], request=http,
-    )
-    assert outcome == "updated"
-    assert len(http.calls) == 1
-    method, url, body = http.calls[0]
-    assert method == "PUT"
-    assert url.endswith("/components/th-1")
-    assert body["config"]["trusted-hosts"] == ["127.0.0.1", "localhost"]
-    assert body["config"]["host-sending-registration-request-must-match"] == ["false"]
-
-
-def test_a_policy_that_already_says_it_is_not_written_again():
-    http = _Recorder()
-    outcome = setup_script.configure_trusted_hosts(
-        "https://kc.example/admin/realms/r", "tok",
-        [_trusted_hosts(hosts=("localhost",), sender_check="false")],
-        ["localhost"], request=http,
-    )
-    assert outcome == "no-op"
-    assert http.calls == []
-
-
-def test_a_write_that_fails_still_stops_the_run():
-    """Absence is tolerated; a refused write is not."""
-    http = _Recorder(status=500)
-    with pytest.raises(SystemExit):
-        setup_script.configure_trusted_hosts(
-            "https://kc.example/admin/realms/r", "tok", [_trusted_hosts()],
-            ["127.0.0.1"], request=http,
-        )
-
-
-@pytest.mark.parametrize("payload", [None, {}, "nope", [None, 3, "x"]])
-def test_a_ragged_component_list_reads_as_absent_rather_than_raising(payload):
-    http = _Recorder()
-    assert setup_script.configure_trusted_hosts(
-        "https://kc.example/admin/realms/r", "tok", payload, ["localhost"],
-        request=http,
-    ) == "absent"
-    assert http.calls == []
-
-
-def test_verify_step_names_the_subtypes_still_present():
-    subtypes = setup_script._policy_subtypes([_policy("anonymous"), _policy("authenticated")])
-    assert sorted(subtypes) == ["anonymous", "authenticated"]
-    assert setup_script._policy_subtypes([]) == []
-
-
-# ── the manifest facts that make the above required ────────────────
+    monkeypatch.setattr(setup_script, "http", http)
+    if saml_status == 404:
+        setup_script.require_native_registration(issuer)
+    else:
+        with pytest.raises(setup_script.ProvisioningError, match="saml2-entity-descriptor"):
+            setup_script.require_native_registration(issuer)
 
 
 @pytest.mark.parametrize(
