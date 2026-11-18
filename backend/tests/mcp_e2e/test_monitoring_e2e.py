@@ -71,7 +71,7 @@ async def test_mcp_monitoring_by_actor_pat_and_tool(runtime_session: RuntimeCont
 
         a, b = await mint(), await mint()
         monitor = "monitor-" + uuid4().hex[:12]
-        password = "M1!" + secrets.token_urlsafe(24)
+        password = secrets.token_urlsafe(24)
         login = {"username": monitor, "password": password}
         account = (await http.post(
             "/api/v1/auth/register", json={**login, "email": monitor + "@example.org"},

@@ -17,7 +17,7 @@ test("monitoring signs in separately, shows PAT aliases, and clears the report a
   const admin = { Authorization: `Bearer ${(await login.json()).token}` };
 
   const username = `monitoring-web-${randomUUID().slice(0, 12)}`;
-  const password = `Aa1!${randomUUID()}`;
+  const password = randomUUID();
   const account = await request.post("/api/v1/auth/register", {
     data: { username, password, email: `${username}@example.invalid` },
   });
@@ -28,7 +28,7 @@ test("monitoring signs in separately, shows PAT aliases, and clears the report a
   const tokenIds: string[] = [];
   const actorName = `monitoring-actor-${randomUUID().slice(0, 12)}`;
   const actorAccount = await request.post("/api/v1/auth/register", {
-    data: { username: actorName, password: `Aa1!${randomUUID()}`, email: `${actorName}@example.invalid` },
+    data: { username: actorName, password: randomUUID(), email: `${actorName}@example.invalid` },
   });
   expect(actorAccount.status()).toBe(200);
   const target = (await actorAccount.json()).user_id;
