@@ -7,16 +7,21 @@
  *   - Uploads/downloads directly to/from S3 (AKB never touches file bytes)
  *   - Uploads bounded document images through AKB for validation and ACLs
  * - Auto-reconnects on server restart
- * - Zero dependencies (Node.js built-in only)
  */
 
 import { request as httpsRequest, Agent as httpsAgent } from "node:https";
 import { request as httpRequest, Agent as httpAgent } from "node:http";
 import { createInterface } from "node:readline";
 import { appendFileSync, createReadStream, createWriteStream, readFileSync, statSync } from "node:fs";
-import { mkdir, stat as fsStat } from "node:fs/promises";
+import { mkdir, rename, rm, stat as fsStat } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
+import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
+import { setTimeout as sleep } from "node:timers/promises";
+import manifest from "../package.json" with { type: "json" };
+
+const PROXY_VERSION = manifest.version;
 
 // ── Connection reuse ───────────────────────────────────────
 // Without keepAlive agents, every MCP tool call (search, browse, put,
@@ -72,24 +77,8 @@ const DOCUMENT_IMAGE_MIMES = new Set([
 ]);
 const VAULT_SKILL_ACK_ARGUMENT = "_vault_skill_ack";
 
-// Only reviewed reads may be replayed after a lost response. New tools,
-// plugins and SQL fail closed; names and readOnlyHint are not proof of safety.
-const REPLAY_SAFE_TOOLS = new Set([
-  "akb_list_vaults", "akb_get", "akb_browse", "akb_search", "akb_drill_down",
-  "akb_activity", "akb_diff", "akb_relations", "akb_graph", "akb_provenance",
-  "akb_publications", "akb_vault_info", "akb_vault_members", "akb_explain_access",
-  "akb_search_users", "akb_whoami", "akb_history", "akb_help", "akb_export",
-]);
-
-function canReplayRequest(msg) {
-  if (msg.method === "ping" || msg.method === "tools/list") return true;
-  if (msg.method !== "tools/call") return false;
-  const args = msg.params?.arguments ?? {};
-  if (!isObject(args)) return false;
-  if (msg.params?.name === "akb_grep") {
-    return !Object.hasOwn(args, "replace") || args.replace === null;
-  }
-  return REPLAY_SAFE_TOOLS.has(msg.params?.name);
+function invalidFileResponse(message) {
+  return Object.assign(new Error(message), { responseError: true, controlDispatched: true });
 }
 
 function isRpcError(value) {
@@ -442,7 +431,6 @@ const UNSUPPORTED_PROTOCOL_VERSION = -32022;
 // local `initialize` response, so it must not silently drift on a proxy
 // behaviour change. There is no import of package.json here to keep lib/
 // zero-dependency and load-safe across Node versions.
-const PROXY_VERSION = "2.3.2";
 const VAULT_SKILL_PREFLIGHT_CAPABILITY =
   "io.dnotitia.akb/vault-skill-preflight";
 const PROXY_INSTRUCTIONS =
@@ -498,10 +486,13 @@ function encodeMcpHeaderValue(value) {
 }
 
 export class AKBProxy {
-  constructor({ url, pat, insecure = false }) {
+  constructor({ url, credentials }) {
     this.url = new URL(url);
-    this.pat = pat;
-    this.insecure = insecure;
+    this.apiPrefix = this.url.pathname.replace(/\/mcp\/?$/, "");
+    this.credentials = credentials;
+    this.shutdown = new AbortController();
+    this._backendError = null;
+    this._grantId = null;
     this.sessionId = null;
     this._backendMode = null; // "modern" or legacy rolling-upgrade fallback
     this.msgId = 0;
@@ -535,7 +526,7 @@ export class AKBProxy {
   }
 
   _sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    return sleep(ms, undefined, { signal: this.shutdown.signal });
   }
 
   // Short timeout for backend liveness probes (initialize / tools-list) so
@@ -546,36 +537,55 @@ export class AKBProxy {
     return Number(process.env.AKB_MCP_CONNECT_TIMEOUT_MS) || 10000;
   }
 
-  async start() {
-    const rl = createInterface({ input: process.stdin });
-
-    for await (const line of rl) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      let msg;
-      try {
-        msg = JSON.parse(trimmed);
-      } catch {
-        this._writeError(null, -32700, "Parse error");
-        continue;
+  async start(signal) {
+    const rl = createInterface({ input: process.stdin, signal });
+    let inFlight;
+    const cancel = () => this.shutdown.abort();
+    signal?.addEventListener("abort", cancel, { once: true });
+    rl.once("close", cancel);
+    rl.on("line", (line) => {
+      if (!inFlight || !line.includes("notifications/cancelled")) return;
+      let notification;
+      try { notification = JSON.parse(line); } catch { return; }
+      if (notification?.method === "notifications/cancelled" && notification.id === undefined &&
+          notification.params?.requestId === inFlight.id) {
+        inFlight.controller.abort();
       }
+    });
 
-      try {
-        const result = await this._handle(msg);
-        if (result !== null) {
-          this._write(result);
+    try {
+      for await (const line of rl) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        let msg;
+        try {
+          msg = JSON.parse(trimmed);
+        } catch {
+          this._writeError(null, -32700, "Parse error");
+          continue;
         }
-      } catch (err) {
-        this._writeError(msg?.id ?? null, err.code || -32603, err.message, err.data);
+
+        const controller = new AbortController();
+        if (msg?.id != null) inFlight = { id: msg.id, controller };
+        try {
+          const result = await this._handle(msg, controller.signal);
+          if (result !== null) this._write(result);
+        } catch (err) {
+          this._writeError(msg?.id ?? null, Number.isInteger(err.code) ? err.code : -32603, err.message, err.data);
+        } finally {
+          inFlight = null;
+        }
       }
+    } finally {
+      this._closed = true;
+      cancel();
+      signal?.removeEventListener("abort", cancel);
+      rl.close();
     }
-    // stdin closed → client disconnected. Stop the background monitor so
-    // the process can exit cleanly instead of looping forever.
-    this._closed = true;
   }
 
-  async _handle(msg) {
+  async _handle(msg, signal) {
     // Normalize every inbound string to NFC before anything else sees it.
     // macOS-sourced paths enter here as NFD; letting them reach the
     // backend poisons the search index (see nfcDeep note).
@@ -640,6 +650,16 @@ export class AKBProxy {
     let response;
     let threw = false;
     try {
+      const credential = await this.credentials.credential();
+      const grantId = credential.grantId ?? null;
+      const operation = { grantId, signal };
+      if (grantId !== this._grantId) {
+        this._grantId = grantId;
+        this._vaultSkillRetryAcks.clear();
+        this._localVaultSkillPending.clear();
+        this._cachedTools = null;
+        if (this._backendMode === "legacy") this._backendReady = false;
+      }
       // Resolve `file` → `content` for akb_put / akb_update before forwarding
       if (method === "tools/call" && FILE_CONTENT_TOOLS.has(params?.name)) {
         const args = params.arguments ?? {};
@@ -682,11 +702,18 @@ export class AKBProxy {
 
       response =
         method === "tools/call" && FILE_TOOL_NAMES.has(msg.params?.name)
-          ? await this._handleFileTool(id, msg.params)
-          : await this._forward(msg);
+          ? await this._handleFileTool(id, msg.params, operation)
+          : await this._forward(msg, operation);
       if (callKey) this._recordVaultSkillOutcome(callKey, msg, response);
       return response;
     } catch (err) {
+      if (method === "tools/call") {
+        const failure = this._operationFailure(err, false);
+        if (failure) {
+          response = this._toolError(id, failure);
+          return response;
+        }
+      }
       threw = true;
       throw err;
     } finally {
@@ -978,15 +1005,18 @@ export class AKBProxy {
     // only — a valid (partial) response the client can register — and mark
     // the list stale so the monitor re-lists it on recovery. Never error
     // the whole tools/list on backend unreachability.
+    await this.credentials.credential();
     let resp = this._cachedTools;
     if (!resp) {
       const ok = await this._ensureBackend();
       if (ok) {
         try {
           resp = await this._syncTools();
-        } catch {
-          resp = null;
+        } catch (error) {
+          if (!this._isConnError(error)) throw error;
         }
+      } else if (this._backendError && !this._isConnError(this._backendError)) {
+        throw this._backendError;
       }
     }
 
@@ -1035,13 +1065,16 @@ export class AKBProxy {
 
   // ── File tool handlers ──────────────────────────────────
 
-  async _handleFileTool(id, params) {
+  async _handleFileTool(id, params, operation) {
     const { name, arguments: args } = params;
+    const context = { ...operation, receipt: {} };
     try {
       const vault = this._fileToolVault(name, args);
       const vaultSkill = await this._fileToolSkillPreflight(
         vault,
         args?.[VAULT_SKILL_ACK_ARGUMENT],
+        this._vaultSkillCallKey(params),
+        context,
       );
       if (vaultSkill && FILE_WRITE_TOOL_NAMES.has(name)) {
         return {
@@ -1064,22 +1097,22 @@ export class AKBProxy {
       let result;
       switch (name) {
         case "akb_put_file":
-          result = await this._putFile(args);
+          result = await this._putFile(args, context);
           break;
         case "akb_put_image":
-          result = await this._putImage(args);
+          result = await this._putImage(args, context);
           break;
         case "akb_discard_image":
-          result = await this._discardImage(args);
+          result = await this._discardImage(args, context);
           break;
         case "akb_get_file":
-          result = await this._getFile(args);
+          result = await this._getFile(args, context);
           break;
         case "akb_update_file":
-          result = await this._updateFile(args);
+          result = await this._updateFile(args, context);
           break;
         case "akb_delete_file":
-          result = await this._deleteFile(args);
+          result = await this._deleteFile(args, context);
           break;
       }
       return {
@@ -1095,17 +1128,18 @@ export class AKBProxy {
           isError: false,
         }),
       };
-    } catch (err) {
-      return {
-        jsonrpc: "2.0",
-        id,
-        result: this._clientResult({
-          content: [
-            { type: "text", text: JSON.stringify({ error: err.message }) },
-          ],
-          isError: true,
-        }),
-      };
+    } catch (error) {
+      const failure = this._operationFailure(error, error.controlDispatched === true)
+        ?? { error: error.message, ...(error.toolCode ? { code: error.toolCode } : {}) };
+      const { receipt } = context;
+      if (receipt.last_completed_stage) {
+        const stageOutcome = failure.details?.operation_outcome;
+        failure.details = { ...receipt, operation_outcome: "partial",
+          ...(stageOutcome ? { stage_outcome: stageOutcome } : {}) };
+      } else if (receipt.uri || receipt.url) {
+        failure.details = { ...failure.details, ...receipt };
+      }
+      return this._toolError(id, failure);
     }
   }
 
@@ -1125,14 +1159,14 @@ export class AKBProxy {
    * and therefore reuses the same version/session gate as every native tool.
    * A write-only credential receives no payload and remains usable.
    */
-  async _fileToolSkillPreflight(vault, acknowledgement = null) {
+  async _fileToolSkillPreflight(vault, acknowledgement, callKey, { grantId, signal }) {
     if (!vault) return null;
     const ok = await this._ensureBackend();
-    if (!ok) throw new Error("backend unreachable");
+    if (!ok) throw this._backendError ?? new Error("backend unreachable");
     const response = await this._rpc("tools/call", {
       name: "akb_help",
       arguments: { topic: "vault-skill", vault },
-    });
+    }, { expectedGrantId: grantId, signal });
     const text = response.content?.find((item) => item?.type === "text")?.text;
     let projected = null;
     try {
@@ -1142,35 +1176,45 @@ export class AKBProxy {
       projected = null;
     }
 
-    let pending = this._localVaultSkillPending.get(vault) || null;
-    if (projected) {
-      if (!pending || pending.guide.version !== projected.version) {
-        pending = {
-          token: randomBytes(24).toString("base64url"),
-          guide: null,
-        };
-        pending.guide = { ...projected, ack_token: pending.token };
-        this._localVaultSkillPending.set(vault, pending);
-        while (this._localVaultSkillPending.size > 256) {
-          this._localVaultSkillPending.delete(
-            this._localVaultSkillPending.keys().next().value,
-          );
-        }
-      } else {
-        this._localVaultSkillPending.delete(vault);
-        this._localVaultSkillPending.set(vault, pending);
+    let pending = this._localVaultSkillPending.get(vault);
+    if (projected && pending?.guide.version !== projected.version) {
+      pending = { guide: projected, tokens: new Map() };
+      this._localVaultSkillPending.set(vault, pending);
+      if (this._localVaultSkillPending.size > 256) {
+        this._localVaultSkillPending.delete(this._localVaultSkillPending.keys().next().value);
       }
     }
-
     if (!pending) return null;
-    if (typeof acknowledgement === "string" && acknowledgement === pending.token) {
+
+    let token = pending.tokens.get(callKey);
+    if (token && acknowledgement === token) {
       this._localVaultSkillPending.delete(vault);
       return null;
     }
-    return pending.guide;
+    if (!token) {
+      token = randomBytes(24).toString("base64url");
+      pending.tokens.set(callKey, token);
+      if (pending.tokens.size > 256) pending.tokens.delete(pending.tokens.keys().next().value);
+    }
+    return { ...pending.guide, ack_token: token };
   }
 
-  async _putFile(args) {
+  async _fileControl(context, method, path, body, headers) {
+    let response;
+    try {
+      response = await this._http(method, path, body, headers, { expectedGrantId: context.grantId, signal: context.signal });
+      const result = JSON.parse(response.text);
+      if (!isObject(result)) throw invalidFileResponse("AKB returned an invalid file control response.");
+      return result;
+    } catch (error) {
+      if (response || error instanceof SyntaxError) error.responseError = true;
+      error.controlDispatched = !error.beforeDispatch && method !== "GET";
+      if (error.statusCode === 409) error.toolCode = "conflict";
+      throw error;
+    }
+  }
+
+  async _putFile(args, context = { receipt: {} }) {
     const { file_path, description = "" } = args;
     // Resolve placement: either `parent` URI (vault root or coll URI)
     // or legacy `vault` + `collection`. Mirrors the backend's
@@ -1205,32 +1249,35 @@ export class AKBProxy {
       description,
       mime_type: mimeType,
     });
-    const initResp = await this._http(
-      "POST",
+    const reserved = await this._fileControl(context, "POST",
       `/api/v1/files/${encodeURIComponent(vault)}/upload?${params}`,
     );
-    const initBody = JSON.parse(initResp.text);
-    const { uri, upload_url } = initBody;
-    const { id: fileId } = parseFileUri(uri);
+    const { uri, upload_url } = reserved;
+    let fileId;
+    try {
+      ({ id: fileId } = parseFileUri(uri));
+    } catch {
+      throw invalidFileResponse("AKB returned an invalid upload reservation.");
+    }
+    Object.assign(context.receipt, { uri, file_id: fileId, last_completed_stage: "reserved" });
 
     // 2. Upload directly to S3 via presigned URL (streaming).
     //    Content-Type MUST match the mime_type sent to /upload above, since
     //    boto3 generate_presigned_url includes it in X-Amz-SignedHeaders.
-    await this._uploadToS3(upload_url, file_path, fileSize, mimeType);
+    await this._uploadToS3(upload_url, file_path, fileSize, mimeType, context.signal);
+    context.receipt.last_completed_stage = "bytes_uploaded";
 
     // 3. Confirm upload with AKB.
-    const confirmResp = await this._http(
-      "POST",
+    return this._fileControl(context, "POST",
       `/api/v1/files/${encodeURIComponent(vault)}/${fileId}/confirm?` +
         new URLSearchParams({
           content_hash: contentHash,
           hash_algorithm: "sha256",
         }),
     );
-    return JSON.parse(confirmResp.text);
   }
 
-  async _putImage(args) {
+  async _putImage(args, context = { receipt: {} }) {
     const { vault } = _resolveParent(args);
     const { file_path: filePath } = args;
     if (!filePath) throw new Error("file_path required");
@@ -1264,17 +1311,20 @@ export class AKBProxy {
     // decodes the image, verifies MIME/dimensions/frame limits, and writes a
     // hidden vault attachment. Unlike akb_put_file, no presigned S3 URL is
     // exposed and no unverified object can become a Markdown image.
-    const response = await this._http(
-      "POST",
+    const asset = await this._fileControl(context, "POST",
       `/api/v1/assets/${encodeURIComponent(vault)}?` +
         new URLSearchParams({ filename }),
       readFileSync(filePath),
       { "Content-Type": mimeType },
     );
-    const asset = JSON.parse(response.text);
-    const assetId = parseAssetUrl(asset.url);
+    let assetId;
+    try {
+      assetId = parseAssetUrl(asset.url);
+    } catch {
+      throw invalidFileResponse("AKB returned an invalid document image identifier.");
+    }
     if (asset.id !== assetId) {
-      throw new Error("AKB returned inconsistent document image identifiers.");
+      throw invalidFileResponse("AKB returned inconsistent document image identifiers.");
     }
 
     const defaultAlt = filename.slice(0, filename.length - extname(filename).length);
@@ -1292,7 +1342,7 @@ export class AKBProxy {
     };
   }
 
-  async _discardImage(args) {
+  async _discardImage(args, context = { receipt: {} }) {
     const { vault } = _resolveParent(args);
     if (!vault) {
       throw new Error(
@@ -1301,36 +1351,26 @@ export class AKBProxy {
     }
     if (!args.url) throw new Error("url required");
     const assetId = parseAssetUrl(args.url);
-    const response = await this._http(
-      "DELETE",
+    context.receipt.url = args.url;
+    const result = await this._fileControl(context, "DELETE",
       `/api/v1/assets/${encodeURIComponent(vault)}/${encodeURIComponent(assetId)}`,
     );
-    let discarded = null;
-    const responseText = response.text?.trim();
-    if (responseText) {
-      const body = JSON.parse(responseText);
-      if (typeof body.discarded === "boolean") discarded = body.discarded;
-    }
+    if (typeof result.discarded !== "boolean") throw invalidFileResponse("AKB returned an invalid image discard response.");
     return {
       kind: "document_image",
       vault,
       url: args.url,
-      // null is possible only with an older backend that returned an empty
-      // 204. Never claim deletion unless the backend confirmed the row change.
-      discarded,
+      discarded: result.discarded,
     };
   }
 
-  async _getFile(args) {
+  async _getFile(args, context = { receipt: {} }) {
     const { uri, save_to } = args;
     if (!uri || !save_to) throw new Error("uri and save_to required");
     const { vault, id: fileId } = parseFileUri(uri);
 
     // 1. Get presigned download URL from AKB
-    const resp = await this._http(
-      "GET",
-      `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/download`,
-    );
+    Object.assign(context.receipt, { uri, file_id: fileId });
     const {
       name: filename,
       download_url,
@@ -1340,7 +1380,14 @@ export class AKBProxy {
       etag,
       storage_version,
       version,
-    } = JSON.parse(resp.text);
+    } = await this._fileControl(context, "GET",
+      `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/download`,
+    );
+    context.receipt.last_completed_stage = "download_authorized";
+    if (typeof filename !== "string" || !filename || filename === "." ||
+        filename === ".." || /[\/\\]/.test(filename)) {
+      throw new Error("Invalid file name in download response.");
+    }
 
     // 2. Determine save path
     let savePath = save_to;
@@ -1353,7 +1400,9 @@ export class AKBProxy {
 
     // 3. Download directly from S3 (streaming to file)
     await mkdir(dirname(savePath), { recursive: true });
-    const bytesWritten = await this._downloadFromS3(download_url, savePath);
+    const bytesWritten = await this._downloadFromS3(
+      download_url, savePath, { size_bytes, content_hash, hash_algorithm }, context.signal,
+    );
 
     return {
       name: filename,
@@ -1368,7 +1417,7 @@ export class AKBProxy {
     };
   }
 
-  async _updateFile(args) {
+  async _updateFile(args, context = { receipt: {} }) {
     const { uri, file_path } = args;
     if (!uri || !file_path) throw new Error("uri and file_path required");
     const { vault, id: fileId } = parseFileUri(uri);
@@ -1389,19 +1438,20 @@ export class AKBProxy {
       initiateParams.set("expected_version", args.expected_version);
     }
 
-    const initiateResp = await this._http(
-      "POST",
+    Object.assign(context.receipt, { uri, file_id: fileId });
+    const initiated = await this._fileControl(context, "POST",
       `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}/replace?${initiateParams}`,
     );
-    const initiated = JSON.parse(initiateResp.text);
     if (initiated.unchanged) return initiated;
 
     const { replacement_id, upload_url } = initiated;
+    Object.assign(context.receipt, { replacement_id, last_completed_stage: "replacement_reserved" });
     if (!replacement_id || !upload_url) {
       throw new Error("Invalid file replacement response: missing replacement_id or upload_url");
     }
     const uploadMimeType = initiated.mime_type || args.mime_type || "application/octet-stream";
-    await this._uploadToS3(upload_url, file_path, fileSize, uploadMimeType);
+    await this._uploadToS3(upload_url, file_path, fileSize, uploadMimeType, context.signal);
+    context.receipt.last_completed_stage = "bytes_uploaded";
 
     const confirmParams = new URLSearchParams({ content_hash: contentHash });
     if (args.expected_content_hash) {
@@ -1410,24 +1460,21 @@ export class AKBProxy {
     if (args.expected_version) {
       confirmParams.set("expected_version", args.expected_version);
     }
-    const confirmResp = await this._http(
-      "POST",
+    return this._fileControl(context, "POST",
       `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}` +
         `/replace/${encodeURIComponent(replacement_id)}/confirm?${confirmParams}`,
     );
-    return JSON.parse(confirmResp.text);
   }
 
-  async _deleteFile(args) {
+  async _deleteFile(args, context = { receipt: {} }) {
     const { uri } = args;
     if (!uri) throw new Error("uri required");
     const { vault, id: fileId } = parseFileUri(uri);
 
-    const resp = await this._http(
-      "DELETE",
+    Object.assign(context.receipt, { uri, file_id: fileId });
+    return this._fileControl(context, "DELETE",
       `/api/v1/files/${encodeURIComponent(vault)}/${encodeURIComponent(fileId)}`,
     );
-    return JSON.parse(resp.text);
   }
 
   // ── S3 direct transfer ────────────────────────────────────
@@ -1442,106 +1489,112 @@ export class AKBProxy {
     });
   }
 
-  /**
-   * Stream a local file directly to S3 via presigned PUT URL.
-   * Content-Type MUST match the mime_type that was signed into the presigned URL,
-   * otherwise S3 rejects with SignatureDoesNotMatch.
-   */
-  _uploadToS3(presignedUrl, filePath, fileSize, contentType = "application/octet-stream") {
-    return new Promise((resolve, reject) => {
-      const url = new URL(presignedUrl);
-      const isHttps = url.protocol === "https:";
-      const doRequest = isHttps ? httpsRequest : httpRequest;
+  _transfer(capability, method, headers, source, operationSignal) {
+    const url = new URL(capability);
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if (url.username || url.password || url.href.includes("#") ||
+        !(url.protocol === "https:" || (url.protocol === "http:" && loopback && this.url.protocol === "http:"))) {
+      throw new Error("Unsafe file transfer URL.");
+    }
 
-      const opts = {
-        hostname: url.hostname,
-        port: url.port || (isHttps ? 443 : 80),
-        path: url.pathname + url.search,
-        method: "PUT",
-        headers: {
-          "Content-Type": contentType,
-          "Content-Length": fileSize,
-        },
-      };
-      if (isHttps && this.insecure) opts.rejectUnauthorized = false;
-
-      const req = doRequest(opts, (res) => {
-        let data = "";
-        res.setEncoding("utf8");
-        res.on("data", (c) => (data += c));
-        res.on("end", () => {
-          if (res.statusCode >= 400) {
-            reject(new Error(`S3 upload failed: HTTP ${res.statusCode} ${data.slice(0, 200)}`));
-          } else {
-            resolve();
-          }
-        });
-      });
-
-      req.on("error", reject);
-      req.setTimeout(600000, () => req.destroy(new Error("S3 upload timeout")));
-
-      const stream = createReadStream(filePath);
-      stream.pipe(req);
-      stream.on("error", (err) => req.destroy(err));
+    const signal = AbortSignal.any([
+      this.shutdown.signal,
+      AbortSignal.timeout(600000),
+      ...(operationSignal ? [operationSignal] : []),
+    ]);
+    const request = url.protocol === "https:" ? httpsRequest : httpRequest;
+    let req;
+    const response = new Promise((resolve, reject) => {
+      req = request(url, { method, headers, signal, rejectUnauthorized: true }, resolve);
+      req.once("error", reject);
+    });
+    const upload = source ? pipeline(createReadStream(source), req, { signal }) : (req.end(), null);
+    return Promise.all([response, upload]).then(([res]) => {
+      if (res.statusCode >= 200 && res.statusCode < 300) return res;
+      res.destroy();
+      const status = res.statusCode;
+      const expired = [401, 403, 404, 410].includes(status);
+      throw Object.assign(new Error(
+        expired ? "The file transfer capability expired or was rejected." : `File transfer failed with HTTP ${status}.`,
+      ), { toolCode: expired ? "transfer_capability_rejected" : "transfer_failed" });
     });
   }
 
-  /**
-   * Stream a file directly from S3 via presigned GET URL to local disk.
-   */
-  _downloadFromS3(presignedUrl, savePath) {
-    return new Promise((resolve, reject) => {
-      const url = new URL(presignedUrl);
-      const isHttps = url.protocol === "https:";
-      const doRequest = isHttps ? httpsRequest : httpRequest;
+  async _uploadToS3(url, filePath, fileSize, contentType, signal) {
+    const response = await this._transfer(url, "PUT", {
+      "Content-Type": contentType,
+      "Content-Length": fileSize,
+    }, filePath, signal);
+    await pipeline(response, async (body) => { for await (const _ of body) {} });
+  }
 
-      const opts = {
-        hostname: url.hostname,
-        port: url.port || (isHttps ? 443 : 80),
-        path: url.pathname + url.search,
-        method: "GET",
-      };
-      if (isHttps && this.insecure) opts.rejectUnauthorized = false;
-
-      const req = doRequest(opts, (res) => {
-        if (res.statusCode >= 400) {
-          let data = "";
-          res.setEncoding("utf8");
-          res.on("data", (c) => (data += c));
-          res.on("end", () =>
-            reject(new Error(`S3 download failed: HTTP ${res.statusCode} ${data.slice(0, 200)}`))
-          );
+  async _downloadFromS3(url, savePath, { size_bytes, content_hash, hash_algorithm }, signal) {
+    const temporary = `${savePath}.akb-${randomBytes(12).toString("hex")}`;
+    const hash = hash_algorithm === "sha256" && content_hash ? createHash("sha256") : null;
+    let bytesWritten = 0;
+    const measure = new Transform({
+      transform(chunk, encoding, callback) {
+        bytesWritten += chunk.length;
+        if (size_bytes != null && bytesWritten > size_bytes) {
+          callback(new Error("The download exceeded its declared size."));
           return;
         }
-
-        let bytesWritten = 0;
-        const ws = createWriteStream(savePath);
-        res.on("data", (chunk) => {
-          bytesWritten += chunk.length;
-          ws.write(chunk);
-        });
-        res.on("end", () => ws.end(() => resolve(bytesWritten)));
-        res.on("error", reject);
-        ws.on("error", reject);
-      });
-
-      req.on("error", reject);
-      req.setTimeout(600000, () => req.destroy(new Error("S3 download timeout")));
-      req.end();
+        hash?.update(chunk);
+        callback(null, chunk);
+      },
     });
+    try {
+      const response = await this._transfer(url, "GET", undefined, undefined, signal);
+      await pipeline(response, measure, createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
+      if ((size_bytes != null && bytesWritten !== size_bytes) ||
+          (hash && hash.digest("hex") !== content_hash)) {
+        throw new Error("The downloaded bytes do not match the file metadata.");
+      }
+      await rename(temporary, savePath);
+      return bytesWritten;
+    } finally {
+      await rm(temporary, { force: true });
+    }
   }
 
   // ── AKB HTTP helper ───────────────────────────────────────
 
-  _http(method, path, body = null, extraHeaders = {}, callOptions = {}) {
+  async _http(method, path, body = null, extraHeaders = {}, callOptions = {}) {
+    const credential = await this.credentials.credential();
+    const signal = callOptions.signal
+      ? AbortSignal.any([this.shutdown.signal, callOptions.signal])
+      : this.shutdown.signal;
+    if (signal.aborted) {
+      throw Object.assign(new Error("The request was cancelled."), { code: "ABORT_ERR", beforeDispatch: true });
+    }
+    if (callOptions.expectedGrantId && credential.grantId !== callOptions.expectedGrantId) {
+      throw Object.assign(new Error("The OAuth session changed. Submit a new request."), { code: "oauth_session_changed" });
+    }
+    const controlPath = path.startsWith("/api/") ? this.apiPrefix + path : path;
+    try {
+      return await this._request(method, controlPath, credential, body, extraHeaders, { ...callOptions, signal });
+    } catch (error) {
+      if (error.statusCode !== 401) throw error;
+      await this.credentials.rejected(credential);
+      if (credential.kind === "pat") {
+        throw Object.assign(new Error("The selected PAT was rejected. Replace --pat or AKB_PAT and restart."), {
+          code: "pat_rejected",
+        });
+      }
+      throw Object.assign(new Error(`The OAuth grant was rejected. Run npx akb-mcp login --url ${this.url.href} and submit a new request.`), {
+        code: "login_required",
+      });
+    }
+  }
+
+  _request(method, path, credential, body, extraHeaders, callOptions) {
     return new Promise((resolve, reject) => {
       const isHttps = this.url.protocol === "https:";
       const doRequest = isHttps ? httpsRequest : httpRequest;
 
       const headers = {
-        Authorization: `Bearer ${this.pat}`,
         ...extraHeaders,
+        Authorization: `Bearer ${credential.accessToken}`,
       };
       if (body && !extraHeaders["Content-Type"]) {
         headers["Content-Type"] = "application/json";
@@ -1551,14 +1604,15 @@ export class AKBProxy {
       }
 
       const requestOptions = {
-        hostname: this.url.hostname,
+        hostname: this.url.hostname.replace(/^\[|\]$/g, ""),
         port: this.url.port || (isHttps ? 443 : 80),
         path,
         method,
         headers,
         agent: isHttps ? httpsKeepAlive : httpKeepAlive,
+        signal: callOptions.signal,
+        rejectUnauthorized: true,
       };
-      if (isHttps && this.insecure) requestOptions.rejectUnauthorized = false;
 
       // Connect-phase timeout, separate from the (long) response timeout.
       // A VPN blackhole leaves a brand-new socket stuck in `connecting`;
@@ -1587,8 +1641,14 @@ export class AKBProxy {
         )));
         res.on("error", reject);
         res.on("end", () => {
-          if (res.statusCode >= 400) {
-            const error = new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`);
+          if (res.statusCode >= 300) {
+            const error = new Error(res.statusCode < 400 ? "AKB control redirects are refused." : `AKB request failed with HTTP ${res.statusCode}.`);
+            if (res.statusCode === 403) {
+              let detail;
+              try { detail = JSON.parse(data).detail; } catch { detail = null; }
+              error.scopeDenied = detail?.code === "insufficient_scope" ||
+                /insufficient_scope/.test(res.headers["www-authenticate"] || "");
+            }
             error.statusCode = res.statusCode;
             error.body = data;
             reject(error);
@@ -1701,6 +1761,7 @@ export class AKBProxy {
     this._connecting = (async () => {
       this._backendMode = null;
       this.sessionId = null;
+      this._backendError = null;
       try {
         const discovered = await this._rpc(
           "server/discover",
@@ -1718,6 +1779,7 @@ export class AKBProxy {
         return true;
       } catch (error) {
         if (!this._isLegacyBackendGap(error)) {
+          this._backendError = error;
           this._backendReady = false;
           return false;
         }
@@ -1730,7 +1792,8 @@ export class AKBProxy {
           );
           this._backendReady = true;
           return true;
-        } catch {
+        } catch (error) {
+          this._backendError = error;
           this._backendMode = null;
           this.sessionId = null;
           this._backendReady = false;
@@ -1747,6 +1810,9 @@ export class AKBProxy {
   // an established backend mode. Uses the short probe timeout.
   async _syncTools() {
     const resp = await this._rpc("tools/list", {}, { timeoutMs: this._probeTimeoutMs() });
+    if (!Array.isArray(resp.tools)) {
+      throw Object.assign(new Error("Backend tools/list response is incompatible with this proxy."), { protocolError: true });
+    }
     this._cachedTools = resp;
     return resp;
   }
@@ -1775,12 +1841,14 @@ export class AKBProxy {
               process.stderr.write("[akb-mcp] backend recovered — re-listing tools\n");
             }
             break; // connected + synced; idle until a forward detects a drop
-          } catch {
+          } catch (error) {
+            if (!this._isConnError(error)) break;
             // initialize succeeded but tools/list failed — treat as not
             // ready and keep retrying.
             this._backendReady = false;
           }
         }
+        if (this._backendError && !this._isConnError(this._backendError)) break;
         await this._sleep(delay);
         delay = Math.min(maxDelay, delay * 2);
       }
@@ -1794,62 +1862,69 @@ export class AKBProxy {
 
   // ── MCP RPC forwarding ────────────────────────────────────
 
-  async _forward(msg) {
-    const maxAttempts = canReplayRequest(msg) ? 3 : 1;
-    // Per invocation, not shared with concurrent requests or the reconnect
-    // monitor. Once dispatch is entered, an error cannot prove non-execution.
+  async _forward(msg, { grantId, signal } = {}) {
     let dispatched = false;
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      try {
-        if (!this._backendReady) {
-          const ok = await this._ensureBackend();
-          if (!ok) throw new Error("backend unreachable");
-        }
-        dispatched = true;
-        const resp = await this._rpc(msg.method, msg.params || {});
-        return { jsonrpc: "2.0", id: msg.id, result: this._clientResult(resp) };
-      } catch (err) {
-        const connectionFailure = this._isConnError(err);
-        if (connectionFailure) {
-          // Drop the dead session and let the background monitor restore
-          // it. The proxy process and the client-visible server stay
-          // alive, so calls recover once connectivity returns.
-          this._backendReady = false;
-          this._backendMode = null;
-          this.sessionId = null;
-          this._startBackendMonitor();
-
-          if (attempt + 1 < maxAttempts) {
-            process.stderr.write(
-              `[akb-mcp] backend unreachable, retrying (attempt ${attempt + 1})...\n`,
-            );
-            continue;
-          }
-        }
-        // Preserve explicit MCP errors and HTTP rejections. A transport loss,
-        // unreadable response or gateway/server failure leaves the result
-        // unknown; never expose its raw body, arguments, path or credentials.
-        if (msg.method === "tools/call" && (
-          connectionFailure || err?.responseError || (!err?.protocolError && err?.statusCode >= 500)
-        )) {
-          return {
-            jsonrpc: "2.0", id: msg.id,
-            result: this._clientResult({
-              isError: true,
-              content: [{ type: "text", text: JSON.stringify({
-                error: dispatched
-                  ? "The operation outcome is unknown. Check the current state before repeating the request."
-                  : "The backend is unavailable. The tool request was not sent.",
-                code: dispatched ? "operation_unknown" : "backend_unavailable",
-                details: { operation_outcome: dispatched ? "unknown" : "not_started" },
-              }) }],
-            }),
-          };
-        }
-        throw err;
+    try {
+      if (!this._backendReady && !await this._ensureBackend()) {
+        throw this._backendError ?? new Error("backend unreachable");
       }
+      dispatched = true;
+      const resp = await this._rpc(msg.method, msg.params || {}, { expectedGrantId: grantId, signal });
+      return { jsonrpc: "2.0", id: msg.id, result: this._clientResult(resp) };
+    } catch (error) {
+      const connectionFailure = this._isConnError(error);
+      if (connectionFailure) {
+        this._backendReady = false;
+        this._backendMode = null;
+        this.sessionId = null;
+        this._startBackendMonitor();
+      }
+      const failure = this._operationFailure(error, dispatched);
+      if (msg.method === "tools/call" && failure) return this._toolError(msg.id, failure);
+      throw error;
     }
+  }
+
+  _operationFailure(error, dispatched) {
+    if (["pat_rejected", "login_required"].includes(error.code) || error.code?.startsWith?.("oauth_")) {
+      return { error: error.message, code: error.code, details: { operation_outcome: "not_started" } };
+    }
+    if (error.statusCode === 403 && !error.protocolError && !error.responseError) {
+      return {
+        error: error.scopeDenied ? "The OAuth grant lacks the required scope." : "Access denied.",
+        code: error.scopeDenied ? "insufficient_scope" : "access_denied",
+        details: { operation_outcome: "not_started" },
+      };
+    }
+    if (error.code === "ABORT_ERR" && (!dispatched || error.beforeDispatch)) {
+      return { error: "The request was cancelled before dispatch.", code: "operation_cancelled",
+        details: { operation_outcome: "not_started" } };
+    }
+    if (this._isConnError(error) || error.responseError || error.code === "ABORT_ERR" ||
+        (!error.protocolError && (error.statusCode >= 500 || (error.statusCode >= 300 && error.statusCode < 400)))) {
+      return dispatched && !error.beforeDispatch
+        ? {
+            error: "The operation outcome is unknown. Check the current state before repeating the request.",
+            code: "operation_unknown",
+            details: { operation_outcome: "unknown" },
+          }
+        : {
+            error: "The backend is unavailable. The tool request was not sent.",
+            code: "backend_unavailable",
+            details: { operation_outcome: "not_started" },
+          };
+    }
+    return null;
+  }
+
+  _toolError(id, failure) {
+    return {
+      jsonrpc: "2.0", id,
+      result: this._clientResult({
+        isError: true,
+        content: [{ type: "text", text: JSON.stringify(failure) }],
+      }),
+    };
   }
 
   async _rpc(method, params, rpcOpts = {}) {
@@ -1864,7 +1939,6 @@ export class AKBProxy {
     });
 
     const headers = {
-      Authorization: `Bearer ${this.pat}`,
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
     };
@@ -1897,7 +1971,7 @@ export class AKBProxy {
         this.url.pathname,
         Buffer.from(body),
         headers,
-        { timeoutMs: rpcOpts.timeoutMs },
+        { timeoutMs: rpcOpts.timeoutMs, expectedGrantId: rpcOpts.expectedGrantId, signal: rpcOpts.signal },
       );
     } catch (error) {
       if (error?.body) {

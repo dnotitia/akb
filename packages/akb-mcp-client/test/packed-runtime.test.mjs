@@ -22,11 +22,17 @@ test("packed CLI rejects unpatched runtimes before connecting with default npm e
     const consumer = join(root, "consumer");
     await mkdir(consumer);
     await writeFile(join(consumer, "package.json"), '{"private":true}\n');
-    const env = { ...process.env, npm_config_engine_strict: "false" };
+    const env = {
+      ...process.env,
+      npm_config_engine_strict: "false",
+      npm_config_cache: join(root, "npm-cache"),
+      AKB_MCP_AUTH_DIR: join(root, "oauth"),
+      AKB_PAT: "",
+    };
     const options = { cwd: consumer, env, timeout: 30_000 };
     const packed = await exec("npm", ["pack", packageRoot, "--json", "--pack-destination", root, "--ignore-scripts"], options);
     const archive = join(root, JSON.parse(packed.stdout)[0].filename);
-    await exec("npm", ["install", archive, "--offline", "--ignore-scripts", "--no-audit", "--no-fund"], options);
+    await exec("npm", ["install", archive, "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], options);
     const installed = join(consumer, "node_modules", "akb-mcp");
     await assert.rejects(readFile(join(installed, ".npmrc")), { code: "ENOENT" });
     const cli = join(installed, "bin", "akb-mcp.mjs");
@@ -52,6 +58,29 @@ test("packed CLI rejects unpatched runtimes before connecting with default npm e
         },
       );
     }
+    if (["darwin", "linux"].includes(process.platform)) {
+      await assert.rejects(exec(process.execPath, [cli, "--url", url], options), (error) => {
+        assert.equal(error.code, 1);
+        assert.equal(error.stdout, "");
+        assert.match(error.stderr, /akb-mcp login --url/);
+        return true;
+      });
+    }
+    const patStatus = await exec(process.execPath, [cli, "status", "--url", url], {
+      ...options,
+      env: { ...env, AKB_PAT: "synthetic-test-token", AKB_MCP_AUTH_DIR: "/dev/null" },
+    });
+    assert.deepEqual(JSON.parse(patStatus.stdout), {
+      mode: "pat", state: "configured", resource: url.slice(0, -1),
+    });
+    assert.doesNotMatch(patStatus.stdout + patStatus.stderr, /synthetic-test-token/);
+    await assert.rejects(exec(process.execPath, [
+      cli, "--url", url, "--auth-mode", "oauth", "--pat", "synthetic-test-token",
+    ], options), (error) => {
+      assert.match(error.stderr, /OAuth mode conflicts/);
+      assert.doesNotMatch(error.stderr, /synthetic-test-token/);
+      return true;
+    });
     assert.equal(requests, 0);
   } finally {
     await new Promise((resolve) => server.close(resolve));

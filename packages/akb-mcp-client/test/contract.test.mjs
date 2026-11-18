@@ -1,3 +1,4 @@
+import { PatCredentials } from "../lib/credentials.mjs";
 // Contract test for the proxy's destructure patterns.
 // Runs against fixed JSON shapes the backend now returns post-envelope
 // adoption (kind/id/items/vault). No real network calls — we verify
@@ -165,7 +166,7 @@ itAsync("_putFile omits initiate hash, uploads bytes, and returns the canonical 
   };
   await writeFile(filePath, data);
   try {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
     const calls = [];
     proxy._http = async (method, path) => {
       calls.push({ method, path });
@@ -183,7 +184,7 @@ itAsync("_putFile omits initiate hash, uploads bytes, and returns the canonical 
 
     assert.deepEqual(result, canonical);
     assert.equal(uploads.length, 1);
-    assert.deepEqual(uploads[0], ["http://transfer.test/put", filePath, data.length, "application/octet-stream"]);
+    assert.deepEqual(uploads[0], ["http://transfer.test/put", filePath, data.length, "application/octet-stream", undefined]);
     assert.equal(calls[0].method, "POST");
     assert.match(calls[0].path, /^\/api\/v1\/files\/myvault\/upload\?/);
     assert.ok(!new URL(`http://test${calls[0].path}`).searchParams.has("content_hash"));
@@ -202,7 +203,7 @@ itAsync("_putImage proxies bounded bytes and returns ready-to-paste Markdown", a
   const assetId = "11111111-2222-4333-8444-555555555555";
   await writeFile(imagePath, data);
   try {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
     const calls = [];
     proxy._http = async (method, path, body, headers) => {
       calls.push({ method, path, body, headers });
@@ -265,7 +266,7 @@ itAsync("_updateFile stages bytes and forwards both optimistic-concurrency pins"
   };
   await writeFile(filePath, data);
   try {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
     const calls = [];
     proxy._http = async (method, path) => {
       calls.push({ method, path });
@@ -288,7 +289,7 @@ itAsync("_updateFile stages bytes and forwards both optimistic-concurrency pins"
 
     assert.deepEqual(result, canonical);
     assert.deepEqual(uploads, [[
-      "http://transfer.test/replace", filePath, data.length, "application/octet-stream",
+      "http://transfer.test/replace", filePath, data.length, "application/octet-stream", undefined,
     ]]);
     assert.equal(calls.length, 2);
     const initiate = new URL(`http://test${calls[0].path}`);
@@ -310,7 +311,7 @@ itAsync("_putImage rejects unsupported image types before network access", async
   const imagePath = join(directory, "vector.svg");
   await writeFile(imagePath, "<svg/>");
   try {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
     let networkTouched = false;
     proxy._http = async () => {
       networkTouched = true;
@@ -332,7 +333,7 @@ itAsync("_updateFile skips transfer when the backend reports identical content",
   const uri = "akb://myvault/file/11111111-2222-3333-4444-555555555555";
   await writeFile(filePath, Buffer.from("already current"));
   try {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
     let calls = 0;
     const unchanged = { kind: "file", uri, content_hash: "a".repeat(64), unchanged: true };
     proxy._http = async () => {
@@ -349,7 +350,7 @@ itAsync("_updateFile skips transfer when the backend reports identical content",
 });
 
 itAsync("_discardImage normalizes case variants of canonical asset URLs", async () => {
-  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
   const assetId = "11111111-2222-4333-8444-555555555555";
   const calls = [];
   proxy._http = async (method, path) => {
@@ -383,7 +384,7 @@ itAsync("_discardImage normalizes case variants of canonical asset URLs", async 
 });
 
 itAsync("_discardImage does not claim a backend no-op deleted anything", async () => {
-  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
   const assetId = "11111111-2222-4333-8444-555555555555";
   proxy._http = async () => ({ text: '{"discarded":false}' });
 
@@ -395,17 +396,16 @@ itAsync("_discardImage does not claim a backend no-op deleted anything", async (
   assert.equal(result.discarded, false);
 });
 
-itAsync("_discardImage tolerates an empty legacy response", async () => {
-  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
-  const assetId = "11111111-2222-4333-8444-555555555555";
-  proxy._http = async () => ({ text: "  \n" });
-
-  const result = await proxy._discardImage({
-    vault: "myvault",
-    url: `/api/assets/${assetId}`,
-  });
-
-  assert.equal(result.discarded, null);
+itAsync("_discardImage reports a missing receipt", async () => {
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
+  proxy._http = async () => ({ text: "" });
+  await assert.rejects(
+    () => proxy._discardImage({
+      vault: "myvault",
+      url: "/api/assets/11111111-2222-4333-8444-555555555555",
+    }),
+    (error) => error.responseError === true && error.controlDispatched === true,
+  );
 });
 
 itAsync("_http honors the per-call probe timeout", async () => {
@@ -416,7 +416,7 @@ itAsync("_http honors the per-call probe timeout", async () => {
     assert.equal(typeof address, "object");
     const proxy = new AKBProxy({
       url: `http://127.0.0.1:${address.port}/mcp`,
-      pat: "test",
+      credentials: new PatCredentials("test"),
     });
     const started = Date.now();
 
@@ -433,7 +433,7 @@ itAsync("_http honors the per-call probe timeout", async () => {
 });
 
 itAsync("_discardImage surfaces backend lookup failures", async () => {
-  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
   const assetId = "11111111-2222-4333-8444-555555555555";
   proxy._http = async () => {
     const error = new Error("HTTP 404: Asset not found");
@@ -451,7 +451,7 @@ itAsync("_discardImage surfaces backend lookup failures", async () => {
 });
 
 itAsync("proxy-local first write returns the vault guide before side effects", async () => {
-  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
   const guide = {
     vault: "myvault", version: "abc123", reason: "first_touch",
     body: "# Owner guide", truncated: false,
@@ -472,7 +472,7 @@ itAsync("proxy-local first write returns the vault guide before side effects", a
 });
 
 itAsync("proxy-local exact retry acknowledges the guide before writing", async () => {
-  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
   const guide = {
     vault: "myvault", version: "abc123", reason: "first_touch",
     body: "# Owner guide", truncated: false,
@@ -505,6 +505,18 @@ itAsync("proxy-local exact retry acknowledges the guide before writing", async (
   assert.equal(typeof firstBody.vault_skill.ack_token, "string");
   assert.equal(writes, 0);
 
+  const wrongOperation = await proxy._handle({
+    jsonrpc: "2.0", id: 3, method: "tools/call",
+    params: { ...params, arguments: {
+      ...params.arguments, file_path: "/tmp/other.png",
+      _vault_skill_ack: firstBody.vault_skill.ack_token,
+    }},
+  });
+  const wrongBody = JSON.parse(wrongOperation.result.content[0].text);
+  assert.equal(wrongBody.code, "vault_skill_required");
+  assert.notEqual(wrongBody.vault_skill.ack_token, firstBody.vault_skill.ack_token);
+  assert.equal(writes, 0);
+
   const second = await proxy._handle({
     jsonrpc: "2.0", id: 2, method: "tools/call", params,
   });
@@ -514,7 +526,7 @@ itAsync("proxy-local exact retry acknowledges the guide before writing", async (
 });
 
 itAsync("proxy-local read attaches the guide to the successful result", async () => {
-  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
   const guide = {
     vault: "myvault", version: "abc123", reason: "first_touch",
     body: "# Owner guide", truncated: false,

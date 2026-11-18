@@ -1,101 +1,60 @@
 #!/usr/bin/env node
-/**
- * akb-mcp — stdio proxy for connecting Claude Code to AKB.
- *
- * Usage:
- *   akb-mcp --url https://akb.example.com/mcp/ --pat akb_xxx
- *   akb-mcp --url https://akb.example.com/mcp/ --pat akb_xxx --insecure
- *
- * Claude Code config:
- *   claude mcp add akb -- akb-mcp --url https://akb.example.com/mcp/ --pat akb_xxx
- */
 
+import { parseConfiguration } from "../lib/config.mjs";
+import { createCredentials } from "../lib/credentials.mjs";
 import { requireSupportedNode } from "../lib/node-runtime.mjs";
+
+const help = `Usage:
+  akb-mcp login --url <mcp-url>
+  akb-mcp status --url <mcp-url>
+  akb-mcp logout --url <mcp-url>
+  akb-mcp --url <mcp-url> [--auth-mode oauth]
+  akb-mcp --url <mcp-url> [--auth-mode pat] --pat <token>
+
+Set AKB_MCP_URL and AKB_PAT to supply the URL and PAT through the environment.
+A URL without a PAT selects OAuth. Run login separately before starting the MCP host.`;
 
 try {
   requireSupportedNode();
-} catch (error) {
-  process.stderr.write(`[akb-mcp] ${error.message}\n`);
-  process.exit(1);
-}
-
-// Load the proxy only after rejecting unsupported runtimes.
-const { AKBProxy } = await import("../lib/proxy.mjs");
-
-function parseArgs(argv) {
-  const args = { url: null, pat: null, insecure: false };
-
-  for (let i = 2; i < argv.length; i++) {
-    switch (argv[i]) {
-      case "--url":
-        args.url = argv[++i];
-        break;
-      case "--pat":
-        args.pat = argv[++i];
-        break;
-      case "--insecure":
-      case "-k":
-        args.insecure = true;
-        break;
-      case "--help":
-      case "-h":
-        console.error(`akb-mcp — AKB MCP stdio client
-
-Usage:
-  akb-mcp --url <mcp-url> --pat <token> [--insecure]
-
-Options:
-  --url       AKB MCP endpoint (e.g. https://akb.example.com/mcp/)
-  --pat       Personal Access Token (akb_xxx)
-  --insecure  Skip TLS certificate verification
-  -h, --help  Show this help
-
-Setup by tool:
-
-  Claude Code:
-    claude mcp add --scope user akb -- npx akb-mcp --url <URL> --pat <TOKEN> --insecure
-
-  Cursor (~/.cursor/mcp.json):
-  Windsurf (~/.codeium/windsurf/mcp_config.json):
-  Gemini CLI (~/.gemini/settings.json):
-    {"mcpServers":{"akb":{"command":"npx","args":["akb-mcp","--url","<URL>","--pat","<TOKEN>","--insecure"]}}}
-
-  OpenAI Codex CLI (~/.codex/config.toml):
-    [mcp_servers.akb]
-    command = "npx"
-    args = ["akb-mcp", "--url", "<URL>", "--pat", "<TOKEN>", "--insecure"]
-
-  VS Code Copilot (.vscode/mcp.json):
-    {"servers":{"akb":{"type":"stdio","command":"npx","args":["akb-mcp","--url","<URL>","--pat","<TOKEN>","--insecure"]}}}
-
-  OpenClaw (~/.openclaw/openclaw.json):
-    {"mcp":{"servers":{"akb":{"command":"npx","args":["akb-mcp","--url","<URL>","--pat","<TOKEN>","--insecure"]}}}}`);
-        process.exit(0);
+  const argv = process.argv.slice(2);
+  if (argv.length === 1 && ["--help", "-h"].includes(argv[0])) {
+    process.stderr.write(help + "\n");
+  } else {
+    const { command, installation, authentication } = parseConfiguration(argv);
+    if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
+      throw new Error("Enable TLS certificate verification before running akb-mcp.");
+    }
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    process.once("SIGINT", abort);
+    process.once("SIGTERM", abort);
+    try {
+      const credentials = await createCredentials(authentication, installation, {
+        signal: controller.signal,
+        onAuthorizationUrl: (url) => process.stderr.write(`Open this URL to continue sign-in:\n${url}\n`),
+      });
+      try {
+        if (command === "stdio") {
+          await credentials.credential();
+          process.stderr.write(`[akb-mcp] Connecting to ${installation.endpointUrl} (${authentication.kind})\n`);
+          const { AKBProxy } = await import("../lib/proxy.mjs");
+          await new AKBProxy({ url: installation.endpointUrl, credentials }).start(controller.signal);
+        } else {
+          const status = await credentials[command]();
+          if (command === "logout") {
+            process.stderr.write("[akb-mcp] Cleared the local grant. Other proxies using this URL will require login.\n");
+          }
+          process.stdout.write(JSON.stringify({ resource: installation.resource, ...status }) + "\n");
+        }
+      } finally {
+        await credentials.close?.();
+      }
+    } finally {
+      process.removeListener("SIGINT", abort);
+      process.removeListener("SIGTERM", abort);
     }
   }
-
-  // Environment variable fallbacks
-  args.url = args.url || process.env.AKB_MCP_URL;
-  args.pat = args.pat || process.env.AKB_PAT;
-
-  if (!args.url || !args.pat) {
-    console.error(
-      "Error: --url and --pat are required (or set AKB_MCP_URL and AKB_PAT env vars)"
-    );
-    process.exit(1);
-  }
-
-  return args;
+} catch (error) {
+  process.stderr.write(`[akb-mcp] ${error.message}\n`);
+  process.exitCode = 1;
 }
-
-const args = parseArgs(process.argv);
-
-process.stderr.write(
-  `[akb-mcp] Connecting to ${args.url}${args.insecure ? " (insecure)" : ""}\n`
-);
-
-const proxy = new AKBProxy(args);
-proxy.start().catch((err) => {
-  process.stderr.write(`[akb-mcp] Fatal: ${err.message}\n`);
-  process.exit(1);
-});

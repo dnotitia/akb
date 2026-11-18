@@ -1,5 +1,9 @@
+import { PatCredentials } from "../lib/credentials.mjs";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -44,7 +48,7 @@ async function backend(t, generation, handler) {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   });
-  const proxy = new AKBProxy({ url: `http://127.0.0.1:${server.address().port}/mcp`, pat: "test" });
+  const proxy = new AKBProxy({ url: `http://127.0.0.1:${server.address().port}/mcp`, credentials: new PatCredentials("test") });
   const connect = async () => {
     proxy._backendReady = true;
     proxy._backendMode = generation;
@@ -84,7 +88,7 @@ for (const generation of ["legacy", "modern"]) {
     assert.equal(read.result.content[0].text, "1", "a later caller can inspect the committed state");
   });
 
-  test(`${generation}: reviewed reads and grep without replacement still recover`, async (t) => {
+  test(`${generation}: reads are sent only once after response loss`, async (t) => {
     const fx = await backend(t, generation, (res, body, count) => {
       if (count % 2) res.destroy();
       else reply(res, body);
@@ -96,8 +100,10 @@ for (const generation of ["legacy", "modern"]) {
     ]) {
       const before = fx.requests.length;
       const result = await fx.proxy._handle(call(name, args, generation));
-      assert.equal(result.result.content[0].text, "saved");
-      assert.equal(fx.requests.length - before, 2);
+      assert.equal(bodyOf(result).code, "operation_unknown");
+      assert.equal(fx.requests.length - before, 1);
+      const next = await fx.proxy._handle(call(name, args, generation));
+      assert.equal(next.result.content[0].text, "saved");
     }
   });
 
@@ -123,7 +129,7 @@ for (const generation of ["legacy", "modern"]) {
   });
 
   test(`${generation}: only failed preflight proves not_started`, async () => {
-    const proxy = new AKBProxy({ url: "http://127.0.0.1:1", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://127.0.0.1:1", credentials: new PatCredentials("test") });
     proxy._ensureBackend = async () => false;
     proxy._startBackendMonitor = () => {};
     proxy._rpc = async () => assert.fail("tool dispatch must not start");
@@ -176,7 +182,8 @@ for (const generation of ["legacy", "modern"]) {
       res.writeHead(403);
       res.end("timeout setting is forbidden");
     });
-    await assert.rejects(() => denied.proxy._handle(call("akb_search", {}, generation)), (err) => err.statusCode === 403);
+    const rejected = await denied.proxy._handle(call("akb_search", {}, generation));
+    assert.equal(bodyOf(rejected).code, "access_denied");
     assert.equal(denied.requests.length, 1);
   });
 
@@ -269,15 +276,6 @@ for (const generation of ["legacy", "modern"]) {
   });
 }
 
-test("a failed read retry cannot erase evidence of an earlier dispatch", async () => {
-  const proxy = new AKBProxy({ url: "http://127.0.0.1:1", pat: "test" });
-  proxy._backendReady = true;
-  proxy._startBackendMonitor = () => {};
-  proxy._rpc = async () => { throw new Error("ECONNRESET"); };
-  proxy._ensureBackend = async () => false;
-  assert.equal(bodyOf(await proxy._handle(call("akb_get"))).details.operation_outcome, "unknown");
-});
-
 test("legacy session loss never replays a mutation", async (t) => {
   for (const transportId of [undefined, null, "server-error"]) {
     const fx = await backend(t, "legacy", (res, body) => {
@@ -292,11 +290,84 @@ test("legacy session loss never replays a mutation", async (t) => {
 });
 
 test("concurrent calls keep dispatch evidence separate", async () => {
-  const proxy = new AKBProxy({ url: "http://127.0.0.1:1", pat: "test" });
+  const proxy = new AKBProxy({ url: "http://127.0.0.1:1", credentials: new PatCredentials("test") });
   let connections = 0;
   proxy._ensureBackend = async () => ++connections !== 1;
   proxy._startBackendMonitor = () => {};
   proxy._rpc = async () => { throw new Error("ECONNRESET"); };
   const responses = await Promise.all([proxy._forward(call("custom_write")), proxy._forward(call("custom_write"))]);
   assert.deepEqual(responses.map((response) => bodyOf(response).details.operation_outcome), ["not_started", "unknown"]);
+});
+
+test("a failed confirm reports the completed transfer and never replays it", async (t) => {
+  const temp = await mkdtemp(join(tmpdir(), "akb-file-receipt-"));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const filePath = join(temp, "upload.txt");
+  const bytes = "upload payload";
+  await writeFile(filePath, bytes);
+  const fileId = "11111111-2222-3333-4444-555555555555";
+  const uri = `akb://proof/file/${fileId}`;
+  let generation = 1;
+  const controls = [];
+  const capabilities = [];
+  const server = createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const path = new URL(req.url, "http://localhost").pathname;
+    if (path === "/capability") {
+      capabilities.push({ body, authorization: req.headers.authorization });
+      generation = 2;
+      res.writeHead(200).end();
+      return;
+    }
+    controls.push([path, req.headers.authorization]);
+    if (path === "/workspace/mcp/") {
+      const rpc = JSON.parse(body);
+      return reply(res, rpc, { content: [{ type: "text", text: "{}" }] });
+    }
+    if (path === "/workspace/api/v1/files/proof/upload") {
+      res.writeHead(201).end(JSON.stringify({ uri, upload_url: `http://127.0.0.1:${server.address().port}/capability` }));
+      return;
+    }
+    res.writeHead(401).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
+
+  const rejections = [];
+  const credentials = {
+    credential: () => ({ kind: "oauth", grantId: "test-grant", generation, accessToken: `fixture-${generation}` }),
+    rejected: (credential) => { rejections.push(credential.generation); },
+  };
+  const proxy = new AKBProxy({
+    url: `http://127.0.0.1:${server.address().port}/workspace/mcp/`,
+    credentials,
+  });
+  proxy._backendReady = true;
+  proxy._backendMode = "modern";
+  const result = await proxy._handle(call("akb_put_file", { vault: "proof", file_path: filePath }));
+  const failure = bodyOf(result);
+  assert.equal(failure.code, "login_required");
+  assert.deepEqual(failure.details, {
+    uri, file_id: fileId, last_completed_stage: "bytes_uploaded",
+    operation_outcome: "partial", stage_outcome: "not_started",
+  });
+  assert.deepEqual(controls, [
+    ["/workspace/mcp/", "Bearer fixture-1"],
+    ["/workspace/api/v1/files/proof/upload", "Bearer fixture-1"],
+    [`/workspace/api/v1/files/proof/${fileId}/confirm`, "Bearer fixture-2"],
+  ]);
+  assert.deepEqual(capabilities, [{ body: bytes, authorization: undefined }]);
+  assert.deepEqual(rejections, [2]);
+});
+
+test("cancellation after dispatch reports unknown without resubmitting", async (t) => {
+  const controller = new AbortController();
+  const fx = await backend(t, "modern", () => controller.abort());
+  const response = await fx.proxy._handle(call("akb_put", { title: "cancelled", content: "body" }, "modern"), controller.signal);
+  assert.equal(bodyOf(response).details.operation_outcome, "unknown");
+  assert.equal(fx.requests.length, 1);
 });
