@@ -160,7 +160,9 @@ def test_dcr_scope_policy_limits_assignment_to_anonymous_registration(monkeypatc
         return None
 
     monkeypatch.setattr(setup_script, "api", fake_api)
-    setup_script.configure_registration("https://kc.example/admin/realms/r", {"id": "realm-id"}, "token")
+    base = "https://kc.example/admin/realms/r"
+    policies = setup_script.read_registration_policies(base, "token")
+    setup_script.configure_registration(base, {"id": "realm-id"}, "token", policies)
     created = {policy["subType"]: policy for method, policy in changes if method == "POST"}
     assert created["anonymous"]["config"] == {
         "allow-default-scopes": ["false"],
@@ -177,7 +179,27 @@ def test_provisioning_refuses_to_stamp_a_realm_default_tool_scope(monkeypatch):
 
     monkeypatch.setattr(setup_script, "api", fake_api)
     with pytest.raises(setup_script.ProvisioningError, match="realm default client scope"):
-        setup_script.configure_scopes("https://kc.example/admin/realms/r", "token", "https://tools.example/mcp")
+        setup_script.read_tool_scopes("https://kc.example/admin/realms/r", "token")
+
+
+@pytest.mark.parametrize("saml_status", [404, 405])
+def test_provisioning_checks_the_saml_registration_collection(monkeypatch, saml_status):
+    issuer = "https://kc.example/realms/r"
+
+    def http(method, url):
+        assert method == "GET"
+        return {
+            f"{issuer}/clients-registrations/default/akb-policy-probe": (404, "", {}),
+            f"{issuer}/clients-registrations/saml2-entity-descriptor": (saml_status, "", {}),
+            f"{issuer}/.well-known/openid-configuration": (200, {"grant_types_supported": ["authorization_code"]}, {}),
+        }[url]
+
+    monkeypatch.setattr(setup_script, "http", http)
+    if saml_status == 404:
+        setup_script.require_native_registration(issuer)
+    else:
+        with pytest.raises(setup_script.ProvisioningError, match="saml2-entity-descriptor"):
+            setup_script.require_native_registration(issuer)
 
 
 @pytest.mark.parametrize(

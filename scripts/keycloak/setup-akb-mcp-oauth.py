@@ -4,7 +4,8 @@
 Run against a realm on Keycloak 26.7 with only the OpenID Connect client
 registration provider enabled. Configure the server with
 --spi-client-registration--default--enabled=false and
---spi-client-registration--saml2-entity-descriptor--enabled=false.
+--spi-client-registration--saml2-entity-descriptor--enabled=false and
+--features-disabled=device-flow.
 
 Use KC_ADMIN_CLIENT_ID / KC_ADMIN_CLIENT_SECRET or KC_ADMIN_USER /
 KC_ADMIN_PASS for the admin credential. KC_ADMIN_REALM defaults to master.
@@ -230,7 +231,7 @@ def upsert_by_name(collection, token, items, desired):
         api("PUT", f"{collection}/{current['id']}", token, body=current | desired, statuses=(200, 204))
 
 
-def configure_scopes(base, token, audience):
+def read_tool_scopes(base, token):
     for kind in ("default", "optional"):
         for scope in api("GET", f"{base}/default-{kind}-client-scopes", token):
             if scope["name"] in TOOL_SCOPES:
@@ -239,12 +240,17 @@ def configure_scopes(base, token, audience):
                     "Recreate explicit client grants after running the script."
                 )
 
+    current = api("GET", f"{base}/client-scopes", token)
+    for scope in current:
+        name = scope["name"]
+        if name in TOOL_SCOPES and scope.get("attributes", {}).get("akb.tool.scope") != "true":
+            raise ProvisioningError(f"Delete the legacy scope {name} before provisioning")
+    return current
+
+
+def configure_scopes(base, token, audience, current):
     for name, consent in TOOL_SCOPES.items():
         collection = f"{base}/client-scopes"
-        current = api("GET", collection, token)
-        existing = next((item for item in current if item["name"] == name), None)
-        if existing and existing.get("attributes", {}).get("akb.tool.scope") != "true":
-            raise ProvisioningError(f"Delete the legacy scope {name} before provisioning")
         upsert_by_name(collection, token, current, {
             "name": name,
             "protocol": "openid-connect",
@@ -279,11 +285,8 @@ def configure_scopes(base, token, audience):
             })
 
 
-def configure_registration(base, realm, token):
-    # Keep other anonymous registration safeguards, including the count and
-    # protocol-mapper policies. Non-OpenID registration providers are disabled.
-    collection = f"{base}/components"
-    policies = api("GET", f"{collection}?type={POLICY_TYPE}", token)
+def read_registration_policies(base, token):
+    policies = api("GET", f"{base}/components?type={POLICY_TYPE}", token)
     anonymous = [item for item in policies if item.get("subType") == "anonymous"]
     providers = {item.get("providerId") for item in anonymous}
     required_guards = {"allowed-protocol-mappers", "max-clients", "consent-required", "scope", "trusted-hosts"}
@@ -291,10 +294,17 @@ def configure_registration(base, realm, token):
         raise ProvisioningError("Keycloak anonymous DCR requires the default registration safeguards")
 
     for subtype in ("anonymous", "authenticated"):
+        if sum(item.get("providerId") == SCOPE_POLICY and item.get("subType") == subtype
+               for item in policies) > 1:
+            raise ProvisioningError(f"Multiple {subtype} client-scope policies")
+    return policies
+
+
+def configure_registration(base, realm, token, policies):
+    collection = f"{base}/components"
+    for subtype in ("anonymous", "authenticated"):
         matches = [item for item in policies if item.get("providerId") == SCOPE_POLICY
                    and item.get("subType") == subtype]
-        if len(matches) > 1:
-            raise ProvisioningError(f"Multiple {subtype} client-scope policies")
         allowed = DCR_SCOPES if subtype == "anonymous" else []
         desired = {
             "name": "Allowed Client Scopes",
@@ -319,7 +329,8 @@ def configure_registration(base, realm, token):
         else:
             api("POST", collection, token, body=desired, statuses=(201,))
 
-    trusted = [item for item in anonymous if item.get("providerId") == "trusted-hosts"]
+    trusted = [item for item in policies if item.get("subType") == "anonymous"
+               and item.get("providerId") == "trusted-hosts"]
     for current in trusted:
         desired = current | {"config": {
             "trusted-hosts": ["127.0.0.1"],
@@ -382,6 +393,23 @@ def configure_client_policies(base, token):
     ])
 
 
+def require_native_registration(issuer: str) -> None:
+    registration = f"{issuer}/clients-registrations"
+    # The SAML registration provider exposes only its collection endpoint.
+    probes = {"default": "default/akb-policy-probe", "saml2-entity-descriptor": "saml2-entity-descriptor"}
+    for provider, path in probes.items():
+        status, _, _ = http("GET", f"{registration}/{path}")
+        if status != 404:
+            raise ProvisioningError(f"Disable the alternate Keycloak registration provider {provider} before provisioning")
+    status, metadata, _ = http("GET", f"{issuer}/.well-known/openid-configuration")
+    if (
+        status != 200 or not isinstance(metadata, dict)
+        or "urn:ietf:params:oauth:grant-type:device_code" in metadata.get("grant_types_supported", ())
+        or metadata.get("device_authorization_endpoint")
+    ):
+        raise ProvisioningError("Use readable Keycloak discovery with the device-flow feature disabled")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--kc", required=True, help="Keycloak base URL")
@@ -403,22 +431,18 @@ def main() -> int:
             raise ProvisioningError("Audience must be the exact public MCP resource URL")
         kc = args.kc.rstrip("/")
         realm = urllib.parse.quote(args.realm, safe="")
-        registration = f"{kc}/realms/{realm}/clients-registrations"
-        for provider in ("default", "saml2-entity-descriptor"):
-            status, _, _ = http("GET", f"{registration}/{provider}/akb-policy-probe")
-            if status != 404:
-                raise ProvisioningError(
-                    f"Disable the alternate Keycloak registration provider {provider} before provisioning"
-                )
+        require_native_registration(f"{kc}/realms/{realm}")
         credential = resolve_admin_credential(os.environ)
         if credential.shadowed:
             print(f"Ignoring the alternative credential variables {' and '.join(credential.shadowed)}")
         token = get_admin_token(kc, credential)
         base = f"{kc}/admin/realms/{realm}"
         state = api("GET", base, token)
+        scopes = read_tool_scopes(base, token)
+        policies = read_registration_policies(base, token)
         configure_client_policies(base, token)
-        configure_scopes(base, token, args.audience)
-        configure_registration(base, state, token)
+        configure_scopes(base, token, args.audience, scopes)
+        configure_registration(base, state, token, policies)
         if not state.get("revokeRefreshToken") or state.get("refreshTokenMaxReuse") != 0:
             api("PUT", base, token, body={"revokeRefreshToken": True, "refreshTokenMaxReuse": 0},
                 statuses=(204,))

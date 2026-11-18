@@ -5,6 +5,7 @@ services:
       - start-dev
       - --spi-client-registration--default--enabled=false
       - --spi-client-registration--saml2-entity-descriptor--enabled=false
+      - --features-disabled=device-flow
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${AKB_NATIVE_OAUTH_ADMIN_USERNAME:?run through fixture.py}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${AKB_NATIVE_OAUTH_ADMIN_PASSWORD:?run through fixture.py}

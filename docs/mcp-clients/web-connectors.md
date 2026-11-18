@@ -7,11 +7,12 @@ individual stdio connection, follow the [proxy setup](../../packages/akb-mcp-cli
 
 Use a Keycloak realm that AKB trusts. On the reference realm, enable the
 OpenID Connect client registration provider. Disable Keycloak's raw and
-SAML client registration providers with these startup options.
+SAML client registration providers and Device Authorization with these startup options.
 
 ```text
 --spi-client-registration--default--enabled=false
 --spi-client-registration--saml2-entity-descriptor--enabled=false
+--features-disabled=device-flow
 ```
 
 Supply the admin credential in `KC_ADMIN_CLIENT_ID` and
@@ -70,10 +71,12 @@ token issuance by completing a browser login against the deployment.
 
 ## Connect a direct HTTP client
 
-For a direct client with a known client ID, give it the Vault scopes it needs
-and configure its redirect URI in Keycloak. Set its client ID in
-`mcp_oauth_client_ids` in AKB. The resulting access token must carry the
-same exact single MCP resource audience and a verified human identity.
+Configure the direct client's redirect URI in Keycloak. Assign only the Vault
+scopes that the client needs. Assigning a scope provisioned by the script
+also grants the signed tool admission marker. For a direct client that uses
+its own scope mappers, set its exact client ID in `mcp_oauth_client_ids` in
+AKB. Every tool access token must carry the exact single MCP resource audience
+and a verified human identity.
 
 Use `https://akb.example.com/mcp/` as the HTTP transport endpoint. Configure
 the client with that registration and use its OAuth sign-in flow. A
