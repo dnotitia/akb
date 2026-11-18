@@ -30,6 +30,8 @@ from relay import AuthorityRelay, ResourceRelay
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "scripts/ci"))
 from e2e_runtime import E2ERuntime, PROTOCOL_REVISION, RuntimeConfig  # noqa: E402
+sys.path.insert(0, str(REPO / "backend/tests"))
+from stdio_rpc_e2e import acknowledgement_retry  # noqa: E402
 
 
 class NativeOAuthRuntime(E2ERuntime):
@@ -129,14 +131,11 @@ class StdioSession:
     async def call(self, name, arguments=None, *, error=False):
         params = {"name": name, "arguments": arguments or {}}
         response = await self.request("tools/call", params)
+        retry = acknowledgement_retry("tools/call", params, response)
+        if retry is not None:
+            response = await self.request("tools/call", retry)
         result = response["result"]
         payload = json.loads(result["content"][0]["text"])
-        if payload.get("code") == "vault_skill_required":
-            guide = payload["vault_skill"]
-            assert guide["body"] and guide.get("truncated") is False, "fixture reads complete Vault write guide"
-            params["arguments"] = {**params["arguments"], "_vault_skill_ack": guide["ack_token"]}
-            result = (await self.request("tools/call", params))["result"]
-            payload = json.loads(result["content"][0]["text"])
         if bool(result.get("isError", False)) is not error:
             code = payload.get("code")
             diagnostic = code if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,60}", code) else "unknown"

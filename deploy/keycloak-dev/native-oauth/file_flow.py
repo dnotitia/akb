@@ -97,10 +97,11 @@ async def exercise_files(runtime, acceptance, session, active_grant, access_dige
     mcp_generations = {known_generations[event["bearer_sha256"]] for event in mcp}
     for name, control in controls.items():
         assert set(control["generations"]).issubset(mcp_generations), f"{name} shared MCP access token generations"
-    capabilities = [event for event in events if event["inner_path"].endswith("/[capability]") and event.get("status") == 200]
+    capabilities = [event for event in events if event["inner_path"].endswith("/[capability]")]
     assert capabilities and all(not event["authorization_present"] for event in capabilities)
-    uploaded = {event["request_sha256"] for event in capabilities if event["method"] == "PUT"}
-    downloaded = {event["response_sha256"] for event in capabilities if event["method"] == "GET"}
+    successful = [event for event in capabilities if event.get("status") == 200]
+    uploaded = {event["request_sha256"] for event in successful if event["method"] == "PUT"}
+    downloaded = {event["response_sha256"] for event in successful if event["method"] == "GET"}
     assert uploaded and downloaded and downloaded.issubset(uploaded)
     report.update({"controls": controls, "published_generations": sorted(set(known_generations.values())), "mcp_uses_published_bearer": True, "capability_requests": len(capabilities), "capabilities_without_bearer": True, "downloaded_bytes_match_uploaded": True})
     metadata_path = "/.well-known/oauth-protected-resource" + relay.prefix + "/mcp"

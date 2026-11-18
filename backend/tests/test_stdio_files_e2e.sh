@@ -9,7 +9,6 @@ BASE_URL="${AKB_URL:-http://localhost:8000}"
 PASS=0
 FAIL=0
 ERRORS=()
-MSGID=0
 
 pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
@@ -51,7 +50,8 @@ case "${AKB_E2E_AUTH_MODE:-pat}" in
     ;;
 esac
 
-PROXY_BIN="${AKB_MCP_BIN:-$(dirname "$0")/../../packages/akb-mcp-client/bin/akb-mcp.mjs}"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PROXY_BIN="${AKB_MCP_BIN:-$SCRIPT_DIR/../../packages/akb-mcp-client/bin/akb-mcp.mjs}"
 if [ ! -f "$PROXY_BIN" ] && [ -z "${AKB_MCP_BIN:-}" ]; then
   PROXY_BIN="$(command -v akb-mcp || true)"
 fi
@@ -76,25 +76,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Helper: send JSON-RPC and read response
-rpc() {
-  MSGID=$((MSGID+1))
-  echo "$1" >&3
-  read -r -t 15 RESPONSE <&4
-  echo "$RESPONSE"
-}
-
 rpc_call() {
-  local method="$1"
-  local params="$2"
-  MSGID=$((MSGID+1))
-  local msg="{\"jsonrpc\":\"2.0\",\"id\":$MSGID,\"method\":\"$method\",\"params\":$params}"
-  echo "$msg" >&3
-  read -r -t 15 RESPONSE <&4
-  echo "$RESPONSE"
+  python3 "$SCRIPT_DIR/stdio_rpc_e2e.py" "$1" "$2" "${3:-30}"
 }
 
-# Extract tool result text
 tool_result() {
   echo "$1" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["result"]["content"][0]["text"])' 2>/dev/null
 }

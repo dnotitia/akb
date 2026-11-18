@@ -9,7 +9,6 @@ BASE_URL="${AKB_URL:-http://localhost:8000}"
 PASS=0
 FAIL=0
 ERRORS=()
-MSGID=0
 
 pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
@@ -51,7 +50,8 @@ case "${AKB_E2E_AUTH_MODE:-pat}" in
     ;;
 esac
 
-PROXY_BIN="${AKB_MCP_BIN:-$(dirname "$0")/../../packages/akb-mcp-client/bin/akb-mcp.mjs}"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PROXY_BIN="${AKB_MCP_BIN:-$SCRIPT_DIR/../../packages/akb-mcp-client/bin/akb-mcp.mjs}"
 if [ ! -f "$PROXY_BIN" ] && [ -z "${AKB_MCP_BIN:-}" ]; then
   PROXY_BIN="$(command -v akb-mcp || true)"
 fi
@@ -76,12 +76,7 @@ cleanup() {
 trap cleanup EXIT
 
 rpc_call() {
-  MSGID=$((MSGID+1))
-  local msg="{\"jsonrpc\":\"2.0\",\"id\":$MSGID,\"method\":\"$1\",\"params\":$2}"
-  echo "$msg" >&3
-  RESPONSE=""
-  read -r -t 30 RESPONSE <&4 || true
-  echo "$RESPONSE"
+  python3 "$SCRIPT_DIR/stdio_rpc_e2e.py" "$1" "$2" "${3:-30}"
 }
 
 tool_result() {
@@ -229,7 +224,7 @@ for i in range(50):
 LARGE_SIZE=$(wc -c < "$TEST_LARGE" | tr -d ' ')
 
 # Large files need longer timeout for server-side chunking/embedding
-LARGE_RESP=$(MSGID=$((MSGID+1)); echo "{\"jsonrpc\":\"2.0\",\"id\":$MSGID,\"method\":\"tools/call\",\"params\":{\"name\":\"akb_put\",\"arguments\":{\"vault\":\"$VAULT\",\"collection\":\"test-docs\",\"title\":\"Large File Test\",\"file\":\"$TEST_LARGE\"}}}" >&3; RESPONSE=""; read -r -t 90 RESPONSE <&4 || true; echo "$RESPONSE")
+LARGE_RESP=$(rpc_call "tools/call" "{\"name\":\"akb_put\",\"arguments\":{\"vault\":\"$VAULT\",\"collection\":\"test-docs\",\"title\":\"Large File Test\",\"file\":\"$TEST_LARGE\"}}" 90)
 LARGE_DOC_URI=$(tool_result "$LARGE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uri",""))' 2>/dev/null)
 LARGE_CHUNKS=$(tool_result "$LARGE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("chunks_indexed",0))' 2>/dev/null)
 [ -n "$LARGE_DOC_URI" ] && pass "Large file ($LARGE_SIZE bytes): uri=$LARGE_DOC_URI, chunks=$LARGE_CHUNKS" || fail "Large file" "$(tool_result "$LARGE_RESP")"
