@@ -1,6 +1,16 @@
 # MCP monitoring
 
-From the main account menu select **Product administration**, or sign in at `/admin`. Open **MCP monitoring**. Select a user in the Users table to see their SSO calls and each PAT used during the selected period. Select a PAT and then a tool to see their intersection. Refresh advances the end of the reporting window.
+Open `/admin/mcp-monitoring` and sign in with your dedicated monitoring account. Select a user in **Users** to see their SSO calls and each PAT used during the selected period. Select a PAT and a tool to see their intersection. Refresh advances the end of the reporting window.
+
+## Grant and revoke access
+
+Provision a separate non-administrator human account with no API keys. In local mode, register the account with a password. In SSO mode, bind the account to its exact identity in the installation's identity provider before granting access.
+
+From the separate product-administrator session, send `PUT /api/v1/admin/mcp-monitoring/access/{user_id}` with `{"enabled":true}`. Use the local admin bearer or the SSO admin cookie and its session-bound CSRF proof. The account becomes dedicated to monitoring. Use a newly provisioned account if you need to replace a local monitor's password.
+
+Set `enabled` to `false` to revoke the grant and end its open monitoring sessions. The account stays dedicated after revocation. Grant access again to let the same account start a fresh session.
+
+Both sign-in modes issue a separate HttpOnly cookie with a hard expiry of at most 30 minutes. The report, operation details, and trace detail accept this session. The browser's product administration and workspace sessions have their own sign-in paths. Sign out from MCP monitoring to end its browser session.
 
 Use **Caller type → Service callers** to see service-account calls and calls authenticated with a service-class key. The default **Users** view covers human SSO and PAT calls. AKB classifies each request by its authenticated account and credential at call time. The selector applies to every breakdown, trend, recent call and operation detail, including retained observations from before this view was introduced.
 
@@ -8,9 +18,9 @@ An MCP application can declare its client name and put its job ID in `params._me
 
 ## Rollout and coverage
 
-Ship the backend and frontend together. The backend installs the monitoring schema at startup. Once every serving replica runs the new backend, both direct Streamable HTTP and existing stdio clients contribute their forwarded `tools/call` requests. History starts when the collectors start.
+Ship the backend and frontend together. The backend installs the monitoring schema at startup. Grant access after every API replica and the frontend run the new version. Suspend dedicated accounts before rolling back to a version that predates this feature. Once every serving replica runs the new backend, both direct Streamable HTTP and existing stdio clients contribute their forwarded `tools/call` requests. History starts when the collectors start.
 
-One observation corresponds to one authenticated tool request reaching the server MCP dispatcher, including a refusal returned with `isError`. Each independently processed client retry counts. The dashboard groups human calls by the verified AKB user ID. A revoked PAT keeps its historical row until the observations expire. The API stores the internal PAT ID and looks up its current display name. Local-only proxy activity, authentication failures, initialization, discovery, tool listing and service credentials are outside the human tool-call totals.
+One observation corresponds to one authenticated tool request reaching the server MCP dispatcher, including a refusal returned with `isError`. Each independently processed client retry counts. The dashboard groups human calls by the verified AKB user ID. A revoked PAT keeps its historical row until the observations expire. The collector uses the internal PAT ID to match a call to its monitoring reference. Local-only proxy activity, authentication failures, initialization, discovery, tool listing and service credentials are outside the human tool-call totals.
 
 The default settings in `config/app.yaml` are shown below.
 
@@ -23,15 +33,15 @@ mcp_monitoring:
 
 Each API process batches completions asynchronously. Replayed batches use the same observation IDs. A full queue drops new observations, and abrupt process termination can lose buffered events. Inspect the last flush, overdue heartbeats and retained writers' cumulative drops next to the report. An uncleanly stopped writer leaves subsequent coverage uncertain while its record is retained. A partially measured interval shows the observed count. A fully measured idle interval shows zero. An interval without observations or confirmed coverage shows a dash. Disabling collection stops new observations and keeps retention cleanup active.
 
-## Admin API
+## Monitoring API
 
-`GET /api/v1/admin/mcp-monitoring` uses the existing product-admin authentication. Pass timezone-aware ISO 8601 timestamps for `from` (inclusive) and `to` (exclusive). The default window is seven days and the maximum is 30 days. Set `caller_kind` to `human` (default) or `service`. Pass the same value on the operation detail endpoint. Filter by `user_id`, `auth_kind` (`oauth`, `pat` or `service`) and `tool`. Add `pat_id` with its `user_id` and `auth_kind=pat`. Each of `user_page`, `credential_page` and `tool_page` is zero-based, with 50 rows per page and continuation flags in `has_more`.
+`GET /api/v1/admin/mcp-monitoring` requires a monitoring session. Pass timezone-aware ISO 8601 timestamps for `from` (inclusive) and `to` (exclusive). The default window is seven days and the maximum is 30 days. Set `caller_kind` to `human` (default) or `service`. Pass the same value on the operation detail endpoint. Filter by `user_id`, `auth_kind` (`oauth`, `pat` or `service`) and `tool`. Add the report's `pat_ref` with its `user_id` and `auth_kind=pat`. Each of `user_page`, `credential_page` and `tool_page` is zero-based, with 50 rows per page and continuation flags in `has_more`.
 
 For a selected user, **Credentials** shows the current PAT status and its expiry date when set. The lookup uses the report snapshot even for a historical window. An elapsed expiry marks the PAT expired, a suspended owner blocks an unexpired PAT, and a missing token row is shown as deleted. A historical call keeps its original outcome. **Last observed** is the latest authenticated tool completion matching the selection, including tool errors. OAuth rows show **Session unverified** because the call record does not carry a live identity-provider session. Refresh to check current PAT status again.
 
-**Recent calls** shows the latest 50 matching completions with their time, user, credential, tool, outcome and server duration. A revoked key retains its historical identifier.
+**Recent calls** shows the latest 50 matching completions with their time, user, credential, tool, outcome and server duration. Each PAT has its own installation-scoped reference and label, such as **PAT 1**. The same reference and label persist after revocation for retained calls.
 
-The summary, recent calls, trend and breakdowns share one database snapshot. Error rate uses tool and RPC errors divided by decided outcomes. Duration p95 covers all matching completions, including cancellations. The monitoring tables store the verified actor, credential identifiers, tool and timing. Request bodies and bearer values are excluded.
+The summary, recent calls, trend and breakdowns share one database snapshot. Error rate uses tool and RPC errors divided by decided outcomes. Duration p95 covers all matching completions, including cancellations. The collector gets the actor and credential from authentication. The report exposes the user identity, monitoring reference, label, tool, and timing. PAT management identifiers, names, prefixes, hashes, and bearer values stay outside the response.
 
 ## Optional distributed traces
 
@@ -39,13 +49,13 @@ Set `export_traces: true` and configure the API process's `OTEL_EXPORTER_OTLP_TR
 
 The HTTP middleware covers the MCP mount, including authentication rejections. The Python MCP SDK supplies the protocol span. The AKB exporter keeps the trace IDs, timing, status code and a bounded set of method, tool, authentication and outcome attributes. It discards raw span names, request IDs, headers, events, links and status descriptions before export.
 
-Set `mcp_monitoring.tempo_query_url` to the installation's trusted Tempo query origin to enable **View trace** for sampled calls. The API returns the matching MCP server span and its HTTP parent when available. Set `mcp_monitoring.tempo_retention_hours` to the effective retention for that Tempo tenant and update it when the store policy changes. PostgreSQL call retention is configured separately with `retention_days`.
+Set `mcp_monitoring.tempo_query_url` to the installation's trusted Tempo query origin to enable **View trace** for sampled calls. The API returns the timing of the matching MCP server span and its HTTP parent when available. The dashboard identifies the call by its observation reference. Set `mcp_monitoring.tempo_retention_hours` to the effective retention for that Tempo tenant and update it when the store policy changes. PostgreSQL call retention is configured separately with `retention_days`.
 
 The API checks Tempo first. If the span is missing and the call is past the configured Tempo retention, the dialog shows **Trace expired**. During the first two minutes after a call completes, a missing span shows **Awaiting trace export** with a retry action. After that grace period a missing span shows **Trace not found** until the configured retention elapses. Leaving Tempo retention unset disables the expiry classification. Connection failures and store errors are reported separately. Historical and unsampled observations remain in Recent calls until PostgreSQL retention elapses.
 
 **Operations** shows one **Conversation** row for calls with the same verified AKB user, agent and conversation identifier, across prompts and credentials. The row shows the agent and a scoped operation ID. Expand it to inspect calls from the selected period. Each expanded row shows the start order, start times, durations, outcomes and individual **View trace** actions. Each action uses the observation’s own sampled span to query Tempo. Elapsed time runs from the earliest start to the latest completion among calls matching the window and filters. It includes gaps and counts overlapping time once. The operation list and call sequence each page through 50 rows.
 
-Conversation grouping uses the identifiers already present in MCP request metadata. Codex supplies `x-codex-turn-metadata.thread_id` and OpenCode supplies `ai.opencode/sessionID`. AKB also recognizes a declared Codex client’s `threadId`. For the AKB extension below, or an explicit `_meta["gen_ai.conversation.id"]`, the declared MCP client name identifies the agent. The collector stores the agent name and a derived, user-scoped grouping key. Existing rows retain their original groups because the original conversation identifiers were not stored.
+Conversation grouping uses the identifiers already present in MCP request metadata. Codex supplies `x-codex-turn-metadata.thread_id` and OpenCode supplies `ai.opencode/sessionID`. AKB also recognizes a declared Codex client’s `threadId`. For the AKB extension below, or an explicit `_meta["gen_ai.conversation.id"]`, the declared MCP client name identifies the agent. The collector uses the agent name in the derived, user-scoped grouping key. The report displays fixed labels for known agents and **MCP client** for other agents. Existing rows retain their original groups because the original conversation identifiers were not stored.
 
 When conversation context is unavailable, a valid MCP `_meta.traceparent` takes precedence, followed by a valid HTTP `traceparent` header. Any agent can propagate a W3C context with one trace ID per prompt. Alternatively, an agent can include this AKB extension on each `tools/call` request over stdio or Streamable HTTP:
 

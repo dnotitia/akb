@@ -27,7 +27,7 @@ def require_issuer_carrier(issuer: AuthenticatedUser, *, admin_route: bool = Fal
 async def validate_locked_issuer(conn, issuer: AuthenticatedUser, row, *, admin_route: bool, key_class: str) -> None:
     """User rows are already locked in UUID order by the mint transaction."""
     require_issuer_carrier(issuer, admin_route=admin_route)
-    if row is None or row["account_status"] != "active":
+    if row is None or row["account_status"] != "active" or row["monitoring_access"] is not None:
         raise AKBError("The token issuer is no longer active.", 403, code="token_issuer_inactive")
     if (admin_route or key_class != "pat") and not row["is_admin"]:
         raise AKBError("Administrator authorization is required.", 403, code="token_issuer_admin_required")

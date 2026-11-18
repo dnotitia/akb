@@ -20,6 +20,7 @@ from app.api.routes import (
     access,
     admin_auth,
     mcp_monitoring,
+    monitoring_auth,
     admin_sso,
     activity,
     assets,
@@ -219,6 +220,8 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/api/v1/admin/mcp-monitoring"):
+        return JSONResponse(status_code=422, content=_error_payload(422, "Invalid monitoring request"))
     details = exc.errors()
     if request.url.path == "/api/v1/auth/tokens/issuance":
         fields = [{"field": ".".join(str(part) for part in error["loc"] if part != "body") or "form",
@@ -372,6 +375,7 @@ app.add_middleware(CancelDisconnectedReadMiddleware)
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(user_avatar.router, prefix="/api/v1", tags=["auth"])
 app.include_router(mcp_monitoring.router, prefix="/api/v1", tags=["mcp-monitoring"])
+app.include_router(monitoring_auth.router, prefix="/api/v1", tags=["monitoring-auth"])
 app.include_router(admin_auth.router, prefix="/api/v1", tags=["admin-auth"])
 app.include_router(admin_sso.router, prefix="/api/v1", tags=["admin-sso"])
 app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])

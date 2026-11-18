@@ -48,11 +48,11 @@ def project_spans(data: TracesData, trace_id: bytes, span_id: bytes, tool: str):
     for name, item in (("/mcp", parent), (f"tools/call {tool}", call)):
         if item is not None:
             result.append({
-                "name": name, "span_id": item.span_id.hex(),
+                "name": name,
                 "start": datetime.fromtimestamp(item.start_time_unix_nano / 1e9, UTC),
                 "duration_ms": max(0, item.end_time_unix_nano - item.start_time_unix_nano) / 1e6,
             })
-    return {"trace_id": trace_id.hex(), "spans": result}
+    return {"spans": result}
 
 
 async def load_trace(observation_id: UUID):

@@ -4,6 +4,7 @@ import asyncio
 from datetime import UTC, datetime
 import json
 import os
+import secrets
 from pathlib import Path
 from urllib.parse import urljoin
 from uuid import uuid4
@@ -69,6 +70,39 @@ async def test_mcp_monitoring_by_actor_pat_and_tool(runtime_session: RuntimeCont
             return response.raise_for_status().json()
 
         a, b = await mint(), await mint()
+        monitor = "monitor-" + uuid4().hex[:12]
+        password = secrets.token_urlsafe(24)
+        login = {"username": monitor, "password": password}
+        account = (await http.post(
+            "/api/v1/auth/register", json={**login, "email": monitor + "@example.org"},
+        )).raise_for_status().json()["user_id"]
+        access = f"{report_path}/access/{account}"
+        (await http.put(access, json={"enabled": True}, headers=admin_headers)).raise_for_status()
+        assert (await http.post("/api/v1/auth/login", json=login)).status_code == 401
+        assert (await http.get(report_path, headers=admin_headers)).status_code == 401
+        assert (await http.get(report_path)).status_code == 401
+        assert (await http.get(report_path, headers={"Authorization": "Bearer " + a["token"]})).status_code == 401
+        (await http.post(f"{report_path}/auth/local/login", json=login)).raise_for_status()
+        monitoring_token = http.cookies["akb_dev_monitor_session"]
+        monitor_headers = {"Authorization": "Bearer " + monitoring_token}
+        assert (await http.get(report_path, headers={"Authorization": "Invalid"})).status_code == 401
+        assert (await http.get(report_path, headers=monitor_headers)).status_code == 200
+        token_path = f"/api/v1/admin/users/{actor}/tokens"
+        denied = [
+            ("GET", "/api/v1/my/vaults", None),
+            ("GET", "/api/v1/admin/auth/session", None),
+            ("POST", token_path, {"name": "refused-fixture"}),
+            ("POST", "/api/v1/auth/tokens", {"name": "refused-fixture"}),
+            ("PUT", f"/api/v1/admin/users/{account}/role", {"is_admin": True}),
+            ("POST", f"/api/v1/admin/users/{actor}/reset-password", {}),
+            ("PUT", access, {"enabled": False}),
+            ("POST", "/mcp/", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        ]
+        for method, path, body in denied:
+            response = await http.request(method, path, json=body, headers=monitor_headers)
+            assert response.status_code in (401, 403), (method, path, response.status_code)
+        assert (await http.get("/api/v1/my/vaults")).status_code == 401
+        assert (await http.post(token_path, json={"name": "denied"}, headers={"Authorization": "Bearer " + a["token"]})).status_code == 403
         assert not (await call(a["token"], "akb_help", {})).get("isError", False)
         cli = Path(__file__).resolve().parents[3] / "packages/akb-mcp-client/bin/akb-mcp.mjs"
         proxy = StdioServerParameters(
@@ -86,12 +120,10 @@ async def test_mcp_monitoring_by_actor_pat_and_tool(runtime_session: RuntimeCont
             assert (await client.call_tool("akb_put", {"file": str(tmp_path / "missing")})).is_error
 
         assert (await call(b["token"], "akb_browse", {"vault": "ungranted-monitoring-fixture"}))["isError"]
-        assert (await http.get(report_path)).status_code == 401
-        assert (await http.get(report_path, headers={"Authorization": "Bearer " + a["token"]})).status_code == 401
         window = {"from": start, "to": datetime.now(UTC).isoformat()}
 
         async def report(**filters):
-            response = await http.get(report_path, params={**window, **filters}, headers=admin_headers)
+            response = await http.get(report_path, params={**window, **filters})
             assert response.headers["Cache-Control"] == "no-store"
             return response.raise_for_status().json()
 
@@ -107,8 +139,15 @@ async def test_mcp_monitoring_by_actor_pat_and_tool(runtime_session: RuntimeCont
         assert [user[k] for k in ("calls", "sso_calls", "pat_calls", "errors")] == [total, sso_calls, 3, 1]
         assert sum(i["calls"] or 0 for i in result["series"]) == total
         credentials = (await report(user_id=actor))["credentials"]
-        assert {r["pat_id"]: r["calls"] for r in credentials if r["pat_id"]} == {a["token_id"]: 2, b["token_id"]: 1}
-        assert all(r["credential_status"] == "active" and r["last_observed_at"] for r in credentials if r["pat_id"])
+        pat_rows = [r for r in credentials if r["auth_kind"] == "pat"]
+        assert [r["calls"] for r in pat_rows] == [2, 1]
+        assert [r["errors"] for r in pat_rows] == [0, 1]
+        assert all(r["p95_ms"] is not None and r["credential_status"] == "active" and r["last_observed_at"] for r in pat_rows)
+        assert len({r["pat_ref"] for r in pat_rows}) == len({r["label"] for r in pat_rows}) == 2
+        assert all(r["label"].startswith("PAT ") for r in pat_rows)
+        snapshot = json.dumps([credentials, result])
+        for value in ("Device", a["token_id"], b["token_id"], a["token"], b["token"], "pat_id", "token_hash", "token_prefix"):
+            assert value not in snapshot
         if sso_calls:
             assert next(r["credential_status"] for r in credentials if r["auth_kind"] == "oauth") == "session_unverified"
         assert {r["tool"]: r["calls"] for r in result["tools"]} == {
@@ -116,17 +155,28 @@ async def test_mcp_monitoring_by_actor_pat_and_tool(runtime_session: RuntimeCont
             "akb_browse": 1,
             **({"akb_whoami": 1} if sso_calls else {}),
         }
-        filters = {"user_id": actor, "auth_kind": "pat", "pat_id": a["token_id"], "tool": "akb_help"}
+        filters = {"user_id": actor, "auth_kind": "pat", "pat_ref": pat_rows[0]["pat_ref"], "tool": "akb_help"}
         detail = await report(**filters)
         assert detail["summary"]["calls"] == len(detail["recent_calls"]) == 2
         assert len({c["observation_id"] for c in detail["recent_calls"]}) == 2
-        assert all(c["pat_id"] == a["token_id"] and c["tool"] == "akb_help" for c in detail["recent_calls"])
+        assert all(c["pat_ref"] == pat_rows[0]["pat_ref"] and c["tool"] == "akb_help" for c in detail["recent_calls"])
         assert (await report(**{**filters, "tool": "akb_browse"}))["summary"]["calls"] == 0
-        for params, status in [({"pat_id": b["token_id"]}, 422), ({**filters, "user_id": str(uuid4())}, 404)]:
-            assert (await http.get(report_path, params=params, headers=admin_headers)).status_code == status
+        for params, status in [
+            ({"pat_ref": pat_rows[1]["pat_ref"]}, 422),
+            ({**filters, "user_id": str(uuid4())}, 404),
+            ({**filters, "pat_ref": a["token_id"]}, 404),
+        ]:
+            assert (await http.get(report_path, params=params)).status_code == status
         (
             await http.delete(f"/api/v1/admin/users/{actor}/tokens/{b['token_id']}", headers=admin_headers)
         ).raise_for_status()
-        revoked = await report(user_id=actor, auth_kind="pat", pat_id=b["token_id"])
-        assert revoked["summary"]["calls"] == 1 and revoked["credentials"][0]["label"] is None
+        revoked = await report(user_id=actor, auth_kind="pat", pat_ref=pat_rows[1]["pat_ref"])
+        assert revoked["summary"]["calls"] == 1 and revoked["credentials"][0]["label"] == pat_rows[1]["label"]
         assert revoked["credentials"][0]["credential_status"] == revoked["recent_calls"][0]["credential_status"] == "deleted"
+
+        (await http.put(access, json={"enabled": False}, headers=admin_headers)).raise_for_status()
+        assert (await http.get(report_path)).status_code == 401
+        assert (await http.get(report_path, headers=monitor_headers)).status_code == 401
+        (await http.put(access, json={"enabled": True}, headers=admin_headers)).raise_for_status()
+        assert (await http.get(report_path, headers=monitor_headers)).status_code == 401
+        assert (await http.post("/api/v1/auth/login", json=login)).status_code == 401

@@ -16,7 +16,9 @@ _WHERE = """
     WHERE finished_at >= greatest($1,$7::timestamptz) AND finished_at < $2
       AND (account_kind = 'service' OR auth_kind = 'service') = ($8::text = 'service')
       AND ($3::uuid IS NULL OR actor_id=$3) AND ($4::text IS NULL OR auth_kind=$4)
-      AND ($5::uuid IS NULL OR pat_id=$5) AND ($6::text IS NULL OR tool=$6)
+      AND ($5::uuid IS NULL OR pat_id=(
+          SELECT pat_id FROM mcp_monitoring.pat_references WHERE ref=$5
+      )) AND ($6::text IS NULL OR tool=$6)
 """
 _FILTERED = """
 WITH filtered AS (
@@ -27,7 +29,7 @@ WITH filtered AS (
 # Use the same snapshot and validity rules for grouped credentials and individual calls.
 _PAT_STATUS = """
 , pat_status AS NOT MATERIALIZED (
-    SELECT t.id, t.user_id, t.name, t.expires_at,
+    SELECT t.id, t.user_id, t.expires_at,
            CASE WHEN t.expires_at <= CURRENT_TIMESTAMP THEN 'expired'
                 WHEN u.account_status = 'suspended' THEN 'account_suspended'
                 ELSE 'active' END AS status
@@ -36,12 +38,13 @@ _PAT_STATUS = """
 """
 _REPORT = _FILTERED + _PAT_STATUS + Path(__file__).with_name("report.sql").read_text()
 _RECENT = _FILTERED + _PAT_STATUS + """
-SELECT r.observation_id, r.finished_at, r.actor_id, r.auth_kind, r.pat_id, r.tool, r.outcome, r.duration_ms,
-       r.trace_available, coalesce(nullif(u.display_name,''),u.username) AS user_label, t.name AS pat_label,
+SELECT r.observation_id, r.finished_at, r.actor_id, r.auth_kind, p.ref AS pat_ref, r.tool, r.outcome, r.duration_ms,
+       r.trace_available, coalesce(nullif(u.display_name,''),u.username) AS user_label, 'PAT ' || p.alias_number AS pat_alias,
        t.status AS credential_status, t.expires_at AS pat_expires_at
 FROM (SELECT * FROM filtered ORDER BY finished_at DESC, observation_id DESC LIMIT $9) r
 LEFT JOIN users u ON u.id=r.actor_id
 LEFT JOIN pat_status t ON t.id=r.pat_id AND t.user_id=r.actor_id
+LEFT JOIN mcp_monitoring.pat_references p ON p.pat_id=r.pat_id
 ORDER BY r.finished_at DESC, r.observation_id DESC
 """
 
@@ -56,41 +59,50 @@ WITH operation_calls AS (
            CASE WHEN conversation_key IS NOT NULL THEN 'conversation'
                 WHEN started_at IS NOT NULL AND request_trace_id IS NULL AND agent_turn_id IS NOT NULL THEN 'turn'
                 ELSE 'trace' END AS group_kind,
-           conversation_agent,
+           CASE WHEN conversation_agent IN ('Codex', 'OpenCode') THEN conversation_agent
+                WHEN conversation_key IS NOT NULL THEN 'MCP client' END AS conversation_agent,
            conversation_key IS NOT NULL OR request_trace_id IS NOT NULL OR agent_turn_id IS NOT NULL AS propagated,
            trace_id IS NOT NULL AS trace_available
     FROM mcp_monitoring.tool_calls
-""" + _WHERE + ")"
+""" + _WHERE + """
+), identified_calls AS (
+    SELECT *, CASE WHEN correlation_id IS NOT NULL THEN
+        left(encode(sha256(convert_to(
+            concat('akb:monitoring:operation:', actor_id, ':', group_kind, ':', correlation_id), 'UTF8'
+        )), 'hex'), 32)::uuid END AS operation_ref
+    FROM operation_calls
+)
+"""
 _OPERATIONS = _OPERATION_CALLS + """
 , grouped AS (
-    SELECT actor_id, correlation_id, group_kind, CASE WHEN correlation_id IS NULL THEN observation_id END AS individual_id,
+    SELECT actor_id, operation_ref, group_kind, CASE WHEN operation_ref IS NULL THEN observation_id END AS individual_id,
            min(conversation_agent) AS agent,
            count(*) AS calls, min(call_start) AS started_at, max(finished_at) AS finished_at,
            bool_or(propagated) OR count(*) > 1 AS correlated, CASE WHEN count(*)=1 THEN min(tool) END AS tool
-    FROM operation_calls GROUP BY 1,2,3,4
+    FROM identified_calls GROUP BY 1,2,3,4
 ), page AS (
-    SELECT *, coalesce(correlation_id, individual_id) AS id FROM grouped
-    ORDER BY finished_at DESC, actor_id, correlation_id NULLS LAST, group_kind, individual_id LIMIT $9 OFFSET $10
+    SELECT *, coalesce(operation_ref, individual_id) AS id FROM grouped
+    ORDER BY finished_at DESC, actor_id, operation_ref NULLS LAST, group_kind, individual_id LIMIT $9 OFFSET $10
 )
 SELECT p.id, p.actor_id, coalesce(nullif(u.display_name,''),u.username) AS user_label,
        p.calls, p.started_at, p.finished_at, p.correlated, p.tool,
        CASE WHEN p.correlated THEN p.group_kind ELSE 'individual' END AS kind, p.agent,
        floor(extract(epoch FROM (p.finished_at - p.started_at))*1000)::bigint AS elapsed_ms
 FROM page p LEFT JOIN users u ON u.id=p.actor_id
-ORDER BY p.finished_at DESC, p.actor_id, p.correlation_id NULLS LAST, p.group_kind, p.individual_id
+ORDER BY p.finished_at DESC, p.actor_id, p.operation_ref NULLS LAST, p.group_kind, p.individual_id
 """
 _OPERATION_DETAIL = _OPERATION_CALLS + """
 SELECT observation_id, tool, outcome, call_start AS started_at, finished_at, duration_ms, trace_available AND $13 AS trace_available,
        row_number() OVER (ORDER BY call_start, finished_at, observation_id) AS position
-FROM operation_calls WHERE correlation_id=$9 AND group_kind=$12
+FROM identified_calls WHERE operation_ref=$9 AND group_kind=$12
 ORDER BY call_start, finished_at, observation_id LIMIT $10 OFFSET $11
 """
 
 
-async def read_operation_calls(start, end, actor_id, auth_kind, pat_id, tool, operation_id, page, kind="trace", caller_kind: CallerKind = "human"):
+async def read_operation_calls(start, end, actor_id, auth_kind, pat_ref, tool, operation_id, page, kind="trace", caller_kind: CallerKind = "human"):
     retained = datetime.now(UTC) - timedelta(days=settings.mcp_monitoring.retention_days)
     pool = await get_pool()
-    rows = await pool.fetch(_OPERATION_DETAIL, start, end, actor_id, auth_kind, pat_id, tool, retained, caller_kind,
+    rows = await pool.fetch(_OPERATION_DETAIL, start, end, actor_id, auth_kind, pat_ref, tool, retained, caller_kind,
                             operation_id, PAGE_SIZE + 1, page * PAGE_SIZE, kind,
                             bool(settings.mcp_monitoring.tempo_query_url))
     return {"calls": [dict(row) for row in rows[:PAGE_SIZE]], "has_more": len(rows) > PAGE_SIZE}
@@ -158,7 +170,7 @@ SELECT lower(r) AS lo, upper(r) AS hi FROM verified,
 def _credential_status(row):
     if row["auth_kind"] == "oauth":
         return "session_unverified"
-    if row["pat_id"] is not None:
+    if row["pat_ref"] is not None:
         return row["credential_status"] or "deleted"
     return None
 
@@ -168,7 +180,7 @@ async def read_report(
     end: datetime,
     user_id: UUID | None,
     auth_kind: str | None,
-    pat_id: UUID | None,
+    pat_ref: UUID | None,
     tool: str | None,
     user_page: int,
     credential_page: int,
@@ -183,19 +195,18 @@ async def read_report(
     step = timedelta(hours=1) if end - start <= timedelta(days=1) else timedelta(days=1)
     retained = datetime.now(UTC) - timedelta(days=settings.mcp_monitoring.retention_days)
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
-        if pat_id and not await conn.fetchval(
+        if pat_ref and not await conn.fetchval(
             """
-            SELECT EXISTS(SELECT 1 FROM tokens WHERE id=$1 AND user_id=$2 AND key_class='pat')
-                OR EXISTS(SELECT 1 FROM mcp_monitoring.tool_calls WHERE pat_id=$1 AND actor_id=$2
-                          AND finished_at >= $3 AND auth_kind='pat' AND account_kind=$4)
-        """,
-            pat_id,
-            user_id,
-            retained,
-            caller_kind,
+            SELECT EXISTS (
+                SELECT 1 FROM mcp_monitoring.tool_calls c
+                  JOIN mcp_monitoring.pat_references p ON p.pat_id=c.pat_id
+                 WHERE p.ref=$1 AND c.actor_id=$2 AND c.finished_at >= $3 AND c.account_kind=$4
+            )
+            """,
+            pat_ref, user_id, retained, caller_kind,
         ):
-            raise NotFoundError("PAT", str(pat_id))
-        filters = (start, end, user_id, auth_kind, pat_id, tool, retained, caller_kind)
+            raise NotFoundError("Monitoring credential", "selected reference")
+        filters = (start, end, user_id, auth_kind, pat_ref, tool, retained, caller_kind)
         views = {"akb_browse/latency": {"group": browse_group, "page": browse_page}, **(metric_views or {})}
         records = await conn.fetch(_METRICS, *filters, json.dumps(views), PAGE_SIZE)
         panels = _metric_panels(records, tool, views)
@@ -242,7 +253,7 @@ async def read_report(
                 dict(
                     metrics,
                     user_id=row["actor_id"],
-                    pat_id=row["pat_id"],
+                    pat_ref=row["pat_ref"],
                     auth_kind=row["auth_kind"],
                     tool=row["tool"],
                     label=row["label"],
