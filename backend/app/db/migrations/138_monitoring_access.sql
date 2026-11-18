@@ -1,4 +1,4 @@
-ALTER TABLE users ADD COLUMN monitoring_access boolean,
+ALTER TABLE users ADD COLUMN IF NOT EXISTS monitoring_access boolean,
     ADD CONSTRAINT monitoring_accounts_are_unprivileged CHECK (
         monitoring_access IS NULL OR (account_kind = 'human' AND NOT is_admin AND NOT is_recovery_admin)
     );

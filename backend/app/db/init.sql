@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS users (
     account_kind TEXT NOT NULL DEFAULT 'human'
         CONSTRAINT users_account_kind_check
         CHECK (account_kind IN ('human', 'service')),
+    monitoring_access BOOLEAN,
     -- Local counterpart to the identity provider's UPDATE_PASSWORD required
     -- action. TRUE while a credential that was issued to this account and
     -- handed over out-of-band has not yet been replaced by its holder; a

@@ -92,7 +92,6 @@ async def test_register_still_accepts_unrelated_email(monkeypatch):
 
 async def test_login_uses_canonical_handle_after_exact_legacy_lookup(monkeypatch):
     conn = MagicMock()
-    conn.fetchval = AsyncMock(return_value="newbie")
     conn.fetchrow = AsyncMock(
         return_value={
             "id": __import__("uuid").uuid4(),
@@ -106,6 +105,7 @@ async def test_login_uses_canonical_handle_after_exact_legacy_lookup(monkeypatch
             "auth_provider": "local",
             "account_status": "active",
             "account_kind": "human",
+            "monitoring_access": None,
         }
     )
 
@@ -128,9 +128,9 @@ async def test_login_uses_canonical_handle_after_exact_legacy_lookup(monkeypatch
     result = await auth_service.login("  NewBie  ", "pw12345678")
 
     assert result["user"]["username"] == "newbie"
-    assert conn.fetchrow.await_args.args[-2:] == ("NewBie", "newbie")
+    assert conn.fetchrow.await_args.args[1:] == ("NewBie",)
     statement = " ".join(conn.fetchrow.await_args.args[0].split())
-    assert "username = $1 OR username = $2" in statement
+    assert "WHEN username = $1 THEN 0 WHEN username = lower($1) THEN 1" in statement
 
 
 def test_migration_109_is_registered_in_the_runtime_applier():

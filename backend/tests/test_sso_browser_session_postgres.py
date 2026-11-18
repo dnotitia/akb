@@ -107,9 +107,10 @@ async def _fresh_database():
             await epoch_migration.migrate(conn=conn)
             assert await _schema_shape(conn) == fresh_shape
 
-            events_migration = _load_migration("015_events_outbox.py")
-            assert events_migration is not None
-            await events_migration.migrate(conn=conn)
+            for filename in ("015_events_outbox.py", "137_mcp_monitoring.py", "138_monitoring_access.py"):
+                dependency = _load_migration(filename)
+                assert dependency is not None
+                await dependency.migrate(conn=conn)
             await conn.execute(
                 """
                 INSERT INTO auth_runtime_state (

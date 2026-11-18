@@ -38,6 +38,7 @@ async def database(monkeypatch):
                 display_name TEXT, is_admin BOOLEAN DEFAULT false,
                 password_hash TEXT, auth_provider TEXT DEFAULT 'local',
                 account_status TEXT DEFAULT 'active', account_kind TEXT DEFAULT 'human',
+                monitoring_access BOOLEAN,
                 credential_change_required BOOLEAN DEFAULT false,
                 tokens_revoked_before TIMESTAMPTZ NOT NULL DEFAULT 'epoch',
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

@@ -407,6 +407,7 @@ async def test_first_keycloak_api_principal_is_never_bootstrap_admin(
                     auth_provider TEXT NOT NULL DEFAULT 'local',
                     account_status TEXT NOT NULL DEFAULT 'active',
                     account_kind TEXT NOT NULL DEFAULT 'human',
+                    monitoring_access BOOLEAN,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
