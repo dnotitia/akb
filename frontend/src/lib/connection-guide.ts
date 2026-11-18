@@ -10,11 +10,11 @@ export const CONNECTION_GUIDES: Record<McpAgent, { introduction: string; locatio
     check: "In Claude Code, enter /mcp and check that AKB is enabled. Then send the request below in the conversation.",
   },
   codex: {
-    introduction: "Use the Codex command-line app on this computer. This AKB setup provides a connection-key configuration for Codex.",
+    introduction: "Use Codex on this computer: the desktop app or the command-line app. Both read the same Codex settings.",
     location: "Open a terminal on the computer where you use Codex.",
     add: "Paste the command below and press Enter. It adds AKB to your Codex MCP settings.",
-    signIn: "Reopen the tool's MCP settings and complete its sign-in if requested.",
-    check: "Open Codex and check its MCP server list for AKB. Start a new conversation if needed, then send the request below.",
+    signIn: "Adding AKB opens the browser sign-in. Approve access, then start a new Codex chat.",
+    check: "Start a new Codex chat so it loads AKB, then send the request below.",
   },
   cursor: {
     introduction: "Connect the Cursor editor you use on this computer.",

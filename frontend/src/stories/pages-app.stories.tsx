@@ -11,6 +11,7 @@ import {
   localAuthConfig,
   nonAdminUser,
   recentChanges,
+  stagedSsoAuthConfig,
   vaultHealth,
 } from "./page-story-fixtures";
 import { AkbRouteTree } from "./page-route-shell";
@@ -111,6 +112,12 @@ export const HomeRecentExpandable: Story = {
   },
 };
 
+const patCapabilities = http.get(`${API}/auth/tokens/capabilities`, () => HttpResponse.json({
+  contract_version: 1, user_id: "00000000-0000-0000-0000-000000000001", name_max_length: 255,
+  permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"],
+  vault_scope_semantics: "write_restriction_sql_read_write",
+}));
+
 export const HomeEmptyWorkspace: Story = {
   name: "Home / empty workspace",
   parameters: {
@@ -118,6 +125,7 @@ export const HomeEmptyWorkspace: Story = {
     msw: {
       handlers: [
         ...chromeWithTokens,
+        patCapabilities,
         http.get(`${API}/my/vaults`, () => HttpResponse.json({ vaults: [] })),
         http.get(`${API}/recent`, () => HttpResponse.json({ changes: [] })),
       ],
@@ -128,8 +136,32 @@ export const HomeEmptyWorkspace: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText("Nothing updated yet")).toBeInTheDocument();
     await expect(await canvas.findByText("Create your first vault")).toBeInTheDocument();
+    await expect(await canvas.findByRole("heading", { name: "Use AKB from your AI app" })).toBeInTheDocument();
+    await expect(await canvas.findByLabelText("Connection key name")).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
+  },
+};
+
+export const HomeFirstRunSignIn: Story = {
+  name: "Home / first run with SSO sign-in",
+  parameters: {
+    router: { initialEntries: ["/"] },
+    msw: {
+      handlers: [
+        http.get(`${API}/auth/config`, () => HttpResponse.json(stagedSsoAuthConfig)),
+        ...chromeWithTokens,
+        http.get(`${API}/my/vaults`, () => HttpResponse.json({ vaults: [] })),
+        http.get(`${API}/recent`, () => HttpResponse.json({ changes: [] })),
+      ],
+    },
+  },
+  render: () => <AkbRouteTree />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(await canvas.findByRole("heading", { name: "Use AKB from your AI app" })).toBeInTheDocument();
+    await expect(await canvas.findByRole("link", { name: "Open in Claude Code" })).toBeInTheDocument();
+    await expect(canvas.getByRole("heading", { name: "Approve and sign in with Company SSO" })).toBeInTheDocument();
   },
 };
 

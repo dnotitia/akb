@@ -164,14 +164,16 @@ describe("Connection setup", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Enter your current full token again");
   });
 
-  it("explains the provided Codex preset without claiming the client lacks OAuth", async () => {
+  it("offers OAuth sign-in for Codex and keeps a key draft across tools", async () => {
     const user = userEvent.setup(); render(<ConnectionSetup mcpOauthEnabled />);
     await user.click(screen.getByRole("radio", { name: "Codex" })); await setup(user, "Codex");
-    expect(screen.queryByRole("radio", { name: "Sign in with AKB" })).toBeNull();
+    expect(screen.getByRole("radio", { name: "Sign in with AKB" })).toBeChecked();
+    expect(screen.getByText(/codex mcp add akb --url \S+\/mcp\//)).toBeInTheDocument();
+    await method(user);
     await user.type(screen.getByLabelText("Connection key name"), "retained draft");
     await backToTool(user); await user.click(screen.getByRole("radio", { name: "Claude Code" })); await setup(user);
-    expect(screen.getByRole("radio", { name: "Sign in with AKB" })).toBeChecked();
-    await method(user); expect(screen.getByLabelText("Connection key name")).toHaveValue("retained draft");
+    expect(screen.getByRole("radio", { name: "Use a connection key" })).toBeChecked();
+    expect(screen.getByLabelText("Connection key name")).toHaveValue("retained draft");
     expect(issuePat).not.toHaveBeenCalled();
   });
 

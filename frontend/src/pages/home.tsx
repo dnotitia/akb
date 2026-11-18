@@ -8,13 +8,14 @@ import { Alert } from "@/components/ui/alert";
 import { LoadingState } from "@/components/ui/loading-state";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { HomeConnectionInvitation } from "@/components/home-connection-invitation";
+import { HomeFirstRunConnect } from "@/components/home-first-run-connect";
 import { HomeWorkspaceSummary } from "@/components/home-workspace-summary";
 import { VaultCreateDialog } from "@/components/vault-create-dialog";
 import { HomeRecentUpdates } from "@/components/home-recent-updates";
 import type { VaultRow } from "@/components/vault-list";
 import { useVaultFavorites } from "@/hooks/use-vault-favorites";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
-import { listPATs, getAuthConfig } from "@/lib/api";
+import { listPATs, getAuthConfig, type AuthConfig } from "@/lib/api";
 import { useHomeVaultDirectory, useHomeVaultMetrics, type VaultMetrics } from "@/hooks/use-home-inventory";
 import { readRecentDocumentViews, type RecentDocumentView } from "@/lib/recent-document-views";
 
@@ -37,9 +38,12 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
   const [recentViews, setRecentViews] = useState<RecentDocumentView[]>([]);
   const { isFavorite, toggleFavorite, favOrder } = useVaultFavorites();
   const [connection, setConnection] = useState<"loading" | "unused" | "used" | "unknown">("loading");
-  const [oauthEnabled, setOauthEnabled] = useState(false);
-  const [setupAvailable, setSetupAvailable] = useState(false);
+  const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
+  const [firstRunStarted, setFirstRunStarted] = useState(false);
+  const [firstRunDismissed, setFirstRunDismissed] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const setupAvailable = authConfig?.available ?? false;
+  const oauthEnabled = setupAvailable && (authConfig?.mcp_oauth.enabled ?? false);
   const createTrigger = useRef<HTMLButtonElement | null>(null);
 
   function refreshVaults() {
@@ -57,10 +61,7 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
       setConnection(Array.isArray(data.tokens) ? data.tokens.length > 0 ? "used" : "unused" : "unknown");
     }).catch(() => { if (!cancelled) setConnection("unknown"); });
     getAuthConfig().then(config => {
-      if (!cancelled) {
-        setOauthEnabled(config.available && config.mcp_oauth.enabled);
-        setSetupAvailable(config.available);
-      }
+      if (!cancelled) setAuthConfig(config);
     }).catch(() => { /* Optional: token connection remains available. */ });
     return () => { cancelled = true; };
   }, []);
@@ -106,10 +107,18 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
 
   const noVaults = !loading && !error && vaults.length === 0;
   const verifyingDirectory = accessChecking || loading;
+  // A first-run account gets the AI connection guide; once a hand-off started in
+  // this visit, the guide stays to show the first vault and what to try next.
+  const showFirstRun = !!authConfig && setupAvailable && !verifyingDirectory && !error && !firstRunDismissed
+    && (noVaults || firstRunStarted);
 
   return <><h1 className="sr-only">Home</h1>
     <HomeWorkspaceSummary userId={userId} accessKey={`${accessRevision}:${summaryRevision}`} accessChecking={accessChecking} vaultCount={!verifyingDirectory && !error ? vaults.length : undefined} directoryLoading={verifyingDirectory} />
     <div className="w-full space-y-7 pb-[calc(5rem+env(safe-area-inset-bottom))] lg:space-y-8">
+
+    {showFirstRun && authConfig && <HomeFirstRunConnect authConfig={authConfig} vaults={vaults}
+      onRefreshVaults={() => { void directory.refetch(); }} onStarted={() => setFirstRunStarted(true)}
+      onDismiss={() => setFirstRunDismissed(true)} />}
 
     {recentlyViewed.length > 0 && <section aria-labelledby="home-viewed-heading">
       <SectionHeader id="home-viewed-heading" title="Recently viewed" accessory={<span className="text-xs text-foreground-muted">On this browser</span>} />
@@ -128,7 +137,8 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
         <FolderPlus className="mb-4 h-6 w-6 text-link" aria-hidden />
         <h3 className="text-lg font-semibold">Create your first vault</h3>
         <p className="mt-2 max-w-xl text-sm leading-relaxed text-foreground-muted">A vault keeps related documents, tables, and files together. You can invite your team after creating it.</p>
-        <Button ref={createTrigger} variant="accent" className="mt-5" onClick={() => setCreateOpen(true)}><Plus className="h-4 w-4" aria-hidden />Create a vault</Button>
+        {/* The first-run guide owns the view's marquee action when it is shown. */}
+        <Button ref={createTrigger} variant={showFirstRun ? "outline" : "accent"} className="mt-5" onClick={() => setCreateOpen(true)}><Plus className="h-4 w-4" aria-hidden />Create a vault</Button>
         <p className="mt-4 text-sm text-foreground-muted">Joining an existing team? Ask a vault owner to invite you.</p>
       </Panel> : <>
         {error && <Alert className="mb-4">Could not refresh your vaults. <Button variant="link" onClick={refreshVaults}>Retry</Button></Alert>}
@@ -143,7 +153,8 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
       <section className="min-w-0" aria-label="Watched document updates"><HomeRecentUpdates scope="watching" /></section>
     </div>
 
-    <HomeConnectionInvitation userId={userId} eligible={connection === "unused" && setupAvailable && !verifyingDirectory && !error && vaults.length > 0} oauthEnabled={oauthEnabled} onTokenCreated={() => setConnection("used")} />
+    {/* The first-run guide already offers every tool, including the full setup guide. */}
+    {!showFirstRun && <HomeConnectionInvitation userId={userId} eligible={connection === "unused" && setupAvailable && !verifyingDirectory && !error && vaults.length > 0} oauthEnabled={oauthEnabled} onTokenCreated={() => setConnection("used")} />}
     <VaultCreateDialog open={createOpen} onOpenChange={setCreateOpen} returnFocusRef={createTrigger}
       onCreated={name => navigate(`/vault/${encodeURIComponent(name)}`)} onOpenExisting={name => navigate(`/vault/${encodeURIComponent(name)}`)} />
   </div></>;

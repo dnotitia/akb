@@ -381,7 +381,12 @@ geometry, search and account controls; it adds no separate colored title band.
 Session-verification loading uses the same route surface and 56px header height
 so authentication does not flash a contrasting canvas or move that boundary.
 The optional floating connection
-guide uses the opaque `surface` with a restrained raised edge. Cards and updates stay on `surface`, bounded by
+guide uses the opaque `surface` with a restrained raised edge. A first-run
+account (no Vaults, setup available) instead sees an in-page AI connection guide
+above Your vaults: one `Panel` with an app `Segmented` control and numbered
+steps. It owns the view's single orange action, so Create a vault drops to an
+outline button, and after a hand-off the same place shows the first Vault and
+requests to try next. Cards and updates stay on `surface`, bounded by
 quiet hairlines. Teal/orange interaction semantics do not change. This
 Home canvas arrangement must not recolor Settings or Vault content surfaces.
 

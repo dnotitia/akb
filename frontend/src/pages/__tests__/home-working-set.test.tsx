@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
@@ -285,6 +285,42 @@ describe("Home working set", () => {
     renderPage();
     expect(await screen.findByRole("button", { name: "Connect an AI tool" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Use AKB with your AI tools" })).not.toBeInTheDocument();
+  });
+
+  it("leads a new account with the AI app guide when this AKB can connect apps", async () => {
+    getAuthConfigMock.mockResolvedValue({
+      available: true, schema_version: 2, auth_mode: "sso",
+      local_auth: { enabled: false }, keycloak: { enabled: true, browser_session_ready: true },
+      providers: [{ provider_type: "oidc", alias: "workforce", display_name: "Company SSO", login_url: "/api/v1/auth/sso/workforce/login" }],
+      mcp_oauth: { enabled: true },
+    });
+    listVaultsMock.mockResolvedValue({ vaults: [] });
+    listPATsMock.mockResolvedValue({ tokens: [] });
+    renderPage();
+
+    expect(await screen.findByRole("heading", { name: "Use AKB from your AI app" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open in Claude Code" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create a vault" })).toBeInTheDocument();
+    // The guide replaces the floating launcher; its Other tools choice opens the same setup.
+    expect(screen.queryByRole("button", { name: "Connect an AI tool" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the guide in this visit to show the first vault once it appears", async () => {
+    getAuthConfigMock.mockResolvedValue({
+      available: true, schema_version: 2, auth_mode: "sso",
+      local_auth: { enabled: false }, keycloak: { enabled: true, browser_session_ready: true },
+      providers: [], mcp_oauth: { enabled: true },
+    });
+    listVaultsMock.mockResolvedValue({ vaults: [] });
+    listPATsMock.mockResolvedValue({ tokens: [] });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("link", { name: "Open the vault request" }));
+    listVaultsMock.mockResolvedValue({ vaults: [{ id: "v-new", name: "home-user-notes", role: "owner", status: "active" }] });
+    fireEvent(window, new Event("focus"));
+
+    expect(await screen.findByRole("heading", { name: "Your first vault is ready" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open home-user-notes" })).toHaveAttribute("href", "/vault/home-user-notes");
   });
 
   it("opens the existing vault creation dialog from the first-run action", async () => {
