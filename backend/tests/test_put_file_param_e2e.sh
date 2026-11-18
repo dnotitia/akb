@@ -23,35 +23,46 @@ echo ""
 # ── 0. Setup ─────────────────────────────────────────────────
 echo "▸ 0. Setup"
 
-E2E_USER="put-file-$(date +%s)"
-curl -sk -X POST "$BASE_URL/api/v1/auth/register" \
-  -H 'Content-Type: application/json' \
-  -d "{\"username\":\"$E2E_USER\",\"email\":\"$E2E_USER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
+case "${AKB_E2E_AUTH_MODE:-pat}" in
+  pat)
+    E2E_USER="put-file-$(date +%s)-$$"
+    curl -sS -X POST "$BASE_URL/api/v1/auth/register" \
+      -H 'Content-Type: application/json' \
+      -d "{\"username\":\"$E2E_USER\",\"email\":\"$E2E_USER@test.dev\",\"password\":\"test1234\"}" >/dev/null 2>&1
 
-PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/login" \
-  -H 'Content-Type: application/json' \
-  -d "{\"username\":\"$E2E_USER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+    PAT=$(curl -sS -X POST "$BASE_URL/api/v1/auth/login" \
+      -H 'Content-Type: application/json' \
+      -d "{\"username\":\"$E2E_USER\",\"password\":\"test1234\"}" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 
-PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
-  -H "Authorization: Bearer $PAT" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"put-file-e2e"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+    PAT=$(curl -sS -X POST "$BASE_URL/api/v1/auth/tokens" \
+      -H "Authorization: Bearer $PAT" \
+      -H 'Content-Type: application/json' \
+      -d '{"name":"put-file-e2e"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
 
-[ -n "$PAT" ] && pass "PAT acquired" || { fail "PAT" "could not get PAT"; exit 1; }
+    [ -n "$PAT" ] && pass "PAT acquired" || { fail "PAT" "could not get PAT"; exit 1; }
+    ;;
+  oauth)
+    PAT=""
+    pass "Using a saved OAuth grant"
+    ;;
+  *)
+    echo "ERROR: AKB_E2E_AUTH_MODE must be pat or oauth"
+    exit 1
+    ;;
+esac
 
-# ── Start proxy ──────────────────────────────────────────────
-AKB_MCP_BIN="$(dirname "$0")/../../packages/akb-mcp-client/bin/akb-mcp.mjs"
-if [ ! -f "$AKB_MCP_BIN" ]; then
-  AKB_MCP_BIN="$(which akb-mcp 2>/dev/null || echo "")"
+PROXY_BIN="${AKB_MCP_BIN:-$(dirname "$0")/../../packages/akb-mcp-client/bin/akb-mcp.mjs}"
+if [ ! -f "$PROXY_BIN" ] && [ -z "${AKB_MCP_BIN:-}" ]; then
+  PROXY_BIN="$(command -v akb-mcp || true)"
 fi
-[ -z "$AKB_MCP_BIN" ] && { echo "ERROR: akb-mcp not found"; exit 1; }
+[ -f "$PROXY_BIN" ] || { echo "ERROR: akb-mcp binary not found"; exit 1; }
 
-FIFO_IN=$(mktemp -u /tmp/akb-mcp-in.XXXXXX)
-FIFO_OUT=$(mktemp -u /tmp/akb-mcp-out.XXXXXX)
-mkfifo "$FIFO_IN" "$FIFO_OUT"
+TEST_DIR=$(mktemp -d "${TMPDIR:-/tmp}/akb-put-file.XXXXXX") || exit 1
+FIFO_IN="$TEST_DIR/stdin"
+FIFO_OUT="$TEST_DIR/stdout"
+mkfifo "$FIFO_IN" "$FIFO_OUT" || exit 1
 
-NODE_TLS_REJECT_UNAUTHORIZED=0 node "$AKB_MCP_BIN" \
-  --url "$BASE_URL/mcp/" --pat "$PAT" --insecure \
+AKB_PAT="$PAT" node "$PROXY_BIN" --url "${BASE_URL%/}/mcp" \
   < "$FIFO_IN" > "$FIFO_OUT" 2>/dev/null &
 MCP_PID=$!
 
@@ -60,7 +71,7 @@ exec 3>"$FIFO_IN" 4<"$FIFO_OUT"
 cleanup() {
   exec 3>&- 4<&- 2>/dev/null
   kill $MCP_PID 2>/dev/null; wait $MCP_PID 2>/dev/null
-  rm -f "$FIFO_IN" "$FIFO_OUT" /tmp/akb-put-file-test*.md
+  rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
 
@@ -139,7 +150,7 @@ echo ""
 echo "▸ 4. akb_put with file param"
 
 # Create local markdown file
-TEST_MD="/tmp/akb-put-file-test1.md"
+TEST_MD="$TEST_DIR/akb-put-file-test1.md"
 cat > "$TEST_MD" << 'CONTENT'
 # Test Document from File
 
@@ -169,7 +180,7 @@ echo "$GOT_CONTENT" | grep -q "Test Document from File" && pass "Content from fi
 echo ""
 echo "▸ 5. akb_update with file param"
 
-TEST_MD2="/tmp/akb-put-file-test2.md"
+TEST_MD2="$TEST_DIR/akb-put-file-test2.md"
 cat > "$TEST_MD2" << 'CONTENT'
 # Updated Document from File
 
@@ -198,7 +209,7 @@ ERR_MSG=$(tool_result "$ERR_RESP" | python3 -c 'import sys,json; print(json.load
 echo "$ERR_MSG" | grep -qi "both" && pass "Rejected both file+content" || fail "Both params" "expected error about both, got: $ERR_MSG"
 
 # Error: file not found
-ERR_RESP2=$(rpc_call "tools/call" "{\"name\":\"akb_put\",\"arguments\":{\"vault\":\"$VAULT\",\"collection\":\"test-docs\",\"title\":\"Missing\",\"file\":\"/tmp/nonexistent-file-12345.md\"}}")
+ERR_RESP2=$(rpc_call "tools/call" "{\"name\":\"akb_put\",\"arguments\":{\"vault\":\"$VAULT\",\"collection\":\"test-docs\",\"title\":\"Missing\",\"file\":\"$TEST_DIR/nonexistent.md\"}}")
 ERR_MSG2=$(tool_result "$ERR_RESP2" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)
 echo "$ERR_MSG2" | grep -qi "read\|found\|ENOENT" && pass "Rejected nonexistent file" || fail "Missing file" "expected error, got: $ERR_MSG2"
 
@@ -206,7 +217,7 @@ echo "$ERR_MSG2" | grep -qi "read\|found\|ENOENT" && pass "Rejected nonexistent 
 echo ""
 echo "▸ 7. Large file test"
 
-TEST_LARGE="/tmp/akb-put-file-test-large.md"
+TEST_LARGE="$TEST_DIR/akb-put-file-test-large.md"
 python3 -c "
 print('# Large Document Test')
 print()
