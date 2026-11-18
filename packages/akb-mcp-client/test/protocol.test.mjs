@@ -1,3 +1,4 @@
+import { PatCredentials } from "../lib/credentials.mjs";
 // Source-neutral protocol matrix smoke test through the installed stdio
 // process. The fake backend only records the wire contract; it does not call
 // proxy internals.
@@ -347,7 +348,7 @@ async function testLegacyBackendFallback(transportErrorId) {
 async function testGenerationMixingIsFailClosed() {
   const legacy = new AKBProxy({
     url: "http://127.0.0.1/mcp/",
-    pat: "akb_test",
+    credentials: new PatCredentials("akb_test"),
   });
   legacy._startBackendMonitor = () => {};
   let forwarded = false;
@@ -372,7 +373,7 @@ async function testGenerationMixingIsFailClosed() {
 
   const modern = new AKBProxy({
     url: "http://127.0.0.1/mcp/",
-    pat: "akb_test",
+    credentials: new PatCredentials("akb_test"),
   });
   modern._startBackendMonitor = () => {};
   const discover = await modern._handle({
@@ -407,7 +408,7 @@ async function testLocalToolRefusalsAreFlaggedAsErrors() {
     params: { name: "akb_put_file", arguments: { vault: "v", file_path: "/nonexistent/akb-proxy-test.bin" } },
   });
 
-  const failing = new AKBProxy({ url: "http://127.0.0.1/mcp/", pat: "akb_test" });
+  const failing = new AKBProxy({ url: "http://127.0.0.1/mcp/", credentials: new PatCredentials("akb_test") });
   failing._startBackendMonitor = () => {};
   failing._fileToolSkillPreflight = async () => null;
   await failing._handle(legacyInit);
@@ -415,7 +416,7 @@ async function testLocalToolRefusalsAreFlaggedAsErrors() {
   assert.equal(failed.result.isError, true);
   assert.match(JSON.parse(failed.result.content[0].text).error, /not found/i);
 
-  const guided = new AKBProxy({ url: "http://127.0.0.1/mcp/", pat: "akb_test" });
+  const guided = new AKBProxy({ url: "http://127.0.0.1/mcp/", credentials: new PatCredentials("akb_test") });
   guided._startBackendMonitor = () => {};
   guided._fileToolSkillPreflight = async () => ({ ack_token: "challenge", body: "guide" });
   await guided._handle(legacyInit);

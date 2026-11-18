@@ -10,7 +10,7 @@ BASE_URL="${AKB_URL:-http://localhost:8000}"
 PASS=0
 FAIL=0
 ERRORS=()
-MSGID=0
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 pass() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 fail() { FAIL=$((FAIL+1)); ERRORS+=("$1: $2"); echo "  ✗ $1 — $2"; }
@@ -41,7 +41,7 @@ PAT=$(curl -sk -X POST "$BASE_URL/api/v1/auth/tokens" \
 [ -n "$PAT" ] && pass "PAT acquired" || { fail "PAT" "could not get PAT"; exit 1; }
 
 # ── Start proxy ──────────────────────────────────────────────
-AKB_MCP_BIN="$(dirname "$0")/../../packages/akb-mcp-client/bin/akb-mcp.mjs"
+AKB_MCP_BIN="$SCRIPT_DIR/../../packages/akb-mcp-client/bin/akb-mcp.mjs"
 if [ ! -f "$AKB_MCP_BIN" ]; then
   AKB_MCP_BIN="$(which akb-mcp 2>/dev/null || echo "")"
 fi
@@ -51,8 +51,8 @@ FIFO_IN=$(mktemp -u /tmp/akb-mcp-slug-in.XXXXXX)
 FIFO_OUT=$(mktemp -u /tmp/akb-mcp-slug-out.XXXXXX)
 mkfifo "$FIFO_IN" "$FIFO_OUT"
 
-NODE_TLS_REJECT_UNAUTHORIZED=0 node "$AKB_MCP_BIN" \
-  --url "$BASE_URL/mcp/" --pat "$PAT" --insecure \
+node "$AKB_MCP_BIN" \
+  --url "$BASE_URL/mcp/" --pat "$PAT" \
   < "$FIFO_IN" > "$FIFO_OUT" 2>/dev/null &
 MCP_PID=$!
 
@@ -66,12 +66,7 @@ cleanup() {
 trap cleanup EXIT
 
 rpc_call() {
-  MSGID=$((MSGID+1))
-  local msg="{\"jsonrpc\":\"2.0\",\"id\":$MSGID,\"method\":\"$1\",\"params\":$2}"
-  echo "$msg" >&3
-  RESPONSE=""
-  read -r -t 30 RESPONSE <&4 || true
-  echo "$RESPONSE"
+  python3 "$SCRIPT_DIR/stdio_rpc_e2e.py" "$1" "$2" 30
 }
 
 tool_result() {

@@ -1,3 +1,4 @@
+import { PatCredentials } from "../lib/credentials.mjs";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,7 +22,7 @@ function request(name, args, generation) {
 for (const generation of ["legacy", "modern"]) {
   for (const name of ["akb_put", "akb_update"]) {
     test(`${generation} ${name}: rejects invalid body inputs before file reads or forwarding`, async () => {
-      const proxy = new AKBProxy({ url: "http://127.0.0.1:1", pat: "test" });
+      const proxy = new AKBProxy({ url: "http://127.0.0.1:1", credentials: new PatCredentials("test") });
       proxy._resolveFileToContent = () => assert.fail("must not read a file");
       proxy._forward = async () => assert.fail("must not forward invalid input");
       const cases = [
@@ -46,7 +47,7 @@ for (const generation of ["legacy", "modern"]) {
   }
 
   test(`${generation}: metadata, null, empty body and original-read tokens survive forwarding`, async () => {
-    const proxy = new AKBProxy({ url: "http://127.0.0.1:1", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://127.0.0.1:1", credentials: new PatCredentials("test") });
     proxy._resolveFileToContent = () => assert.fail("must not read a file");
     const forwarded = [];
     proxy._forward = async (msg) => {
@@ -67,7 +68,7 @@ for (const generation of ["legacy", "modern"]) {
     const directory = await mkdtemp(join(tmpdir(), "akb-document-input-"));
     try {
       const file = join(directory, "draft.md");
-      const proxy = new AKBProxy({ url: "http://127.0.0.1:1", pat: "test" });
+      const proxy = new AKBProxy({ url: "http://127.0.0.1:1", credentials: new PatCredentials("test") });
       const forwarded = [];
       proxy._forward = async (msg) => {
         forwarded.push(msg.params.arguments);

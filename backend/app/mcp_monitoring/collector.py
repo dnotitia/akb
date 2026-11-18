@@ -8,6 +8,7 @@ import logging
 import re
 import time
 from collections import deque
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from typing import Any, NamedTuple
@@ -45,7 +46,7 @@ def _request_trace_id(ctx: ServerRequestContext) -> UUID | None:
     return None
 
 
-def _agent_turn_id(meta: dict) -> UUID | None:
+def _agent_turn_id(meta: Mapping[str, object]) -> UUID | None:
     for key in ("com.dnotitia.akb/turn", "x-codex-turn-metadata"):
         turn = meta.get(key)
         if isinstance(turn, dict):

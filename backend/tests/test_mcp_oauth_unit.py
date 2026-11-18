@@ -90,7 +90,8 @@ def _mint_access_token(
         "exp": now + exp_delta,
         "jti": "test-jti",
         "typ": "Bearer",
-        "azp": "test-browser-client",
+        "azp": "test-tool-client",
+        "akb_tool_client": "admitted",
         "sid": "test-human-session",
         "email": email,
         "email_verified": email_verified,
@@ -117,16 +118,14 @@ def test_audience_effective_off_returns_empty(monkeypatch):
 
 def test_audience_effective_default_derives_from_public_base_url(monkeypatch):
     monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "mcp_oauth_audience", "", raising=False)
     monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com", raising=False)
     assert settings.mcp_oauth_audience_effective == "https://akb.example.com/mcp"
 
 
-def test_audience_effective_explicit_override(monkeypatch):
-    monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "mcp_oauth_audience", "https://alt.example.com/mcp", raising=False)
-    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com", raising=False)
-    assert settings.mcp_oauth_audience_effective == "https://alt.example.com/mcp"
+def test_audience_preserves_public_prefix(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", True)
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com/prefix/")
+    assert settings.mcp_oauth_audience_effective == "https://akb.example.com/prefix/mcp"
 
 
 # ── KeycloakOIDC.verify_access_token ───────────────────────────────
@@ -138,6 +137,8 @@ async def test_verify_access_token_happy_path(monkeypatch, rsa_keypair):
 
     issuer = "https://kc.example.com/realms/akb"
     audience = "https://akb.example.com/mcp"
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", True)
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com")
     monkeypatch.setattr(settings, "keycloak_server_url", "https://kc.example.com", raising=False)
     monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
 
@@ -190,6 +191,8 @@ async def test_verify_access_token_wrong_issuer(monkeypatch, rsa_keypair):
     from app.services.keycloak_oidc import KeycloakOIDC
 
     audience = "https://akb.example.com/mcp"
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", True)
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com")
     monkeypatch.setattr(settings, "keycloak_server_url", "https://kc.example.com", raising=False)
     monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
 
@@ -212,6 +215,8 @@ async def test_verify_access_token_expired(monkeypatch, rsa_keypair):
 
     issuer = "https://kc.example.com/realms/akb"
     audience = "https://akb.example.com/mcp"
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", True)
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com")
     monkeypatch.setattr(settings, "keycloak_server_url", "https://kc.example.com", raising=False)
     monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
 
@@ -270,7 +275,6 @@ async def test_resolve_mcp_selects_keycloak_profile_without_alg_dispatch(monkeyp
     monkeypatch.setattr(settings, "keycloak_server_url", "https://kc.example.com", raising=False)
     monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
     monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com", raising=False)
-    monkeypatch.setattr(settings, "mcp_oauth_audience", "", raising=False)
 
     calls: list[tuple[str, str]] = []
     actor = auth_service.AuthenticatedUser(
@@ -316,12 +320,7 @@ async def test_mcp_oauth_maps_suspended_external_account_to_auth_failure(monkeyp
 
     monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
-    monkeypatch.setattr(
-        settings,
-        "mcp_oauth_audience",
-        "https://akb.example.com/mcp",
-        raising=False,
-    )
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com")
 
     principal = VerifiedPrincipal(
         profile_id="keycloak-access-v1",
@@ -383,7 +382,7 @@ async def test_resolve_mcp_rs256_rejected_when_mcp_oauth_off(monkeypatch, rsa_ke
 
 
 @pytest.mark.asyncio
-async def test_dispatch_skips_scope_check_when_oauth_scopes_none():
+async def test_dispatch_skips_scope_check_when_oauth_scopes_none(monkeypatch):
     """PAT and service callers carry ``oauth_scopes is None`` and must
     NOT be gated by the OAuth scope check — only by PG-RBAC downstream."""
     from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
@@ -394,14 +393,11 @@ async def test_dispatch_skips_scope_check_when_oauth_scopes_none():
         captured.append((uid, args))
         return {"ok": True}
 
-    _HANDLERS["__test_tool__"] = _stub_handler
-    try:
-        user = _MCPUser(user_id="u-1", oauth_scopes=None)
-        result = await _dispatch("__test_tool__", {}, user)
-        assert result == {"ok": True}
-        assert captured == [("u-1", {})]
-    finally:
-        _HANDLERS.pop("__test_tool__", None)
+    monkeypatch.setitem(_HANDLERS, "akb_help", _stub_handler)
+    user = _MCPUser(user_id="u-1", oauth_scopes=None)
+    result = await _dispatch("akb_help", {}, user)
+    assert result == {"ok": True}
+    assert captured == [("u-1", {})]
 
 
 @pytest.mark.asyncio
@@ -473,9 +469,9 @@ async def test_dispatch_read_only_pat_scope_rejects_write_tool():
 
 
 def test_publication_snapshot_is_write_scoped():
-    from mcp_server.server import _TOOL_SCOPES, _WRITE_SCOPE
+    from app.services.tool_resource_policy import MCP_OPERATION_SCOPES, WRITE_SCOPE
 
-    assert _TOOL_SCOPES["akb_publication_snapshot"] == _WRITE_SCOPE
+    assert MCP_OPERATION_SCOPES["akb_publication_snapshot"] == WRITE_SCOPE
 
 
 @pytest.mark.asyncio
@@ -504,7 +500,6 @@ async def test_dispatch_read_only_pat_scope_allows_read_tool():
 
 # ── akb_grep: scope depends on the arguments, not just the tool ────
 #
-# Rationale lives with the rule, at `_ARG_WRITE_TRIGGERS` in server.py.
 
 
 @pytest.mark.asyncio
@@ -567,10 +562,10 @@ async def test_grep_with_replace_passes_when_write_scope_present(monkeypatch):
 def test_arg_sensitive_scope_rule_is_declared_not_hardcoded_in_dispatch():
     """The rule must live in one reviewable place so the next tool that
     grows a mutating argument has somewhere obvious to declare it."""
-    from mcp_server.server import _WRITE_SCOPE, _required_scope
+    from app.services.tool_resource_policy import WRITE_SCOPE, required_oauth_scope
 
-    assert _required_scope("akb_grep", {"pattern": "x"}) != _WRITE_SCOPE
-    assert _required_scope("akb_grep", {"pattern": "x", "replace": ""}) == _WRITE_SCOPE
+    assert required_oauth_scope("akb_grep", {"pattern": "x"}) != WRITE_SCOPE
+    assert required_oauth_scope("akb_grep", {"pattern": "x", "replace": ""}) == WRITE_SCOPE
 
 
 def test_every_arg_write_trigger_names_a_real_tool_argument():
@@ -579,13 +574,14 @@ def test_every_arg_write_trigger_names_a_real_tool_argument():
     `_TOOL_ARG_NAMES`, which is the same schema-derived table `_dispatch`
     rejects unknown arguments with, so a trigger can never name an
     argument the dispatcher would refuse anyway."""
-    from mcp_server.server import _ARG_WRITE_TRIGGERS, _TOOL_ARG_NAMES
+    from app.services.tool_resource_policy import ARG_WRITE_TRIGGERS
+    from mcp_server.server import _TOOL_ARG_NAMES
 
-    for tool, triggers in _ARG_WRITE_TRIGGERS.items():
-        assert tool in _TOOL_ARG_NAMES, f"_ARG_WRITE_TRIGGERS names unknown tool {tool!r}"
+    for tool, triggers in ARG_WRITE_TRIGGERS.items():
+        assert tool in _TOOL_ARG_NAMES, f"ARG_WRITE_TRIGGERS names unknown tool {tool!r}"
         for arg in triggers:
             assert arg in _TOOL_ARG_NAMES[tool], (
-                f"_ARG_WRITE_TRIGGERS[{tool!r}] names {arg!r}, which is not an argument of {tool}"
+                f"ARG_WRITE_TRIGGERS[{tool!r}] names {arg!r}, which is not an argument of {tool}"
             )
 
 
@@ -636,8 +632,8 @@ def test_the_omission_guard_itself_is_not_vacuous():
 def test_read_scoped_tools_that_can_write_declare_an_arg_trigger():
     """The omission guard — the failure mode that actually recurs.
 
-    `_TOOL_SCOPES` has a completeness guard (a new tool must be mapped);
-    `_ARG_WRITE_TRIGGERS` needs the mirror of it, or the next read-mapped
+    `MCP_OPERATION_SCOPES` has a completeness guard (a new tool must be mapped);
+    `ARG_WRITE_TRIGGERS` needs the mirror of it, or the next read-mapped
     tool that grows a mutating argument reproduces this bug silently.
 
     The invariant is checkable against code that already exists: a
@@ -645,23 +641,19 @@ def test_read_scoped_tools_that_can_write_declare_an_arg_trigger():
     write, so its tool cannot be read-grade unless an argument promotes
     it.
     """
-    from mcp_server.server import (
-        _ARG_WRITE_TRIGGERS,
-        _HANDLERS,
-        _READ_SCOPE,
-        _TOOL_SCOPES,
-    )
+    from app.services.tool_resource_policy import ARG_WRITE_TRIGGERS, MCP_OPERATION_SCOPES, READ_SCOPE
+    from mcp_server.server import _HANDLERS
 
     offenders = sorted(
         name
         for name, handler in _HANDLERS.items()
-        if _TOOL_SCOPES.get(name) == _READ_SCOPE and name not in _ARG_WRITE_TRIGGERS and _handler_can_write(handler)
+        if MCP_OPERATION_SCOPES.get(name) == READ_SCOPE and name not in ARG_WRITE_TRIGGERS and _handler_can_write(handler)
     )
     assert offenders == [], (
         f"Read-scoped tools whose handler performs a writer-gated write, with no "
-        f"_ARG_WRITE_TRIGGERS entry: {offenders}. Either the tool belongs in the "
-        f"write half of _TOOL_SCOPES, or the argument that makes it write must be "
-        f"declared in _ARG_WRITE_TRIGGERS."
+        f"ARG_WRITE_TRIGGERS entry: {offenders}. Either the tool belongs in the "
+        f"write half of MCP_OPERATION_SCOPES, or the argument that makes it write must be "
+        f"declared in ARG_WRITE_TRIGGERS."
     )
 
 
@@ -678,42 +670,34 @@ def test_metadata_route_404_when_disabled(monkeypatch):
     app = FastAPI()
     app.include_router(oauth_metadata.router)
     client = TestClient(app)
-    resp = client.get("/.well-known/oauth-protected-resource")
+    resp = client.get("/.well-known/oauth-protected-resource/mcp")
     assert resp.status_code == 404
 
 
-def test_metadata_route_full_shape_when_enabled(monkeypatch):
+@pytest.mark.parametrize("prefix", ["", "/prefix"])
+def test_metadata_route_full_shape_when_enabled(monkeypatch, prefix):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
-
-    monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "keycloak_server_url", "https://kc.example.com", raising=False)
-    monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
-    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com", raising=False)
-    monkeypatch.setattr(settings, "mcp_oauth_audience", "", raising=False)
-
     from app.api.routes import oauth_metadata
 
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", True)
+    monkeypatch.setattr(settings, "keycloak_enabled", True)
+    monkeypatch.setattr(settings, "keycloak_server_url", "https://kc.example.com")
+    monkeypatch.setattr(settings, "keycloak_realm", "akb")
+    monkeypatch.setattr(settings, "public_base_url", f"https://akb.example.com{prefix}")
     app = FastAPI()
     app.include_router(oauth_metadata.router)
     client = TestClient(app)
-    resp = client.get("/.well-known/oauth-protected-resource")
+    path = "/.well-known/oauth-protected-resource"
+    assert client.get(path).status_code == client.get(path + "/other/mcp").status_code == 404
+    resp = client.get(f"{path}{prefix}/mcp")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["resource"] == "https://akb.example.com/mcp"
+    assert body["resource"] == f"https://akb.example.com{prefix}/mcp"
     assert body["authorization_servers"] == ["https://kc.example.com/realms/akb"]
-    assert "akb:vault:read" in body["scopes_supported"]
-    assert "akb:vault:write" in body["scopes_supported"]
-    assert "offline_access" in body["scopes_supported"]
-    # OIDC base scopes are also advertised so spec-compliant MCP
-    # clients (which request exactly scopes_supported) include them in
-    # DCR + authorize. Open-mode first-login fallback still needs email;
-    # exact issuer/subject bindings do not.
-    assert "openid" in body["scopes_supported"]
-    assert "profile" in body["scopes_supported"]
-    assert "email" in body["scopes_supported"]
+    assert set(body["scopes_supported"]) == {"email", "profile", "akb:vault:read", "akb:vault:write"}
     assert body["bearer_methods_supported"] == ["header"]
+    assert "akb_native_client_id" not in body
 
 
 # ── WWW-Authenticate header ────────────────────────────────────────
@@ -733,52 +717,40 @@ def test_www_authenticate_carries_resource_metadata_when_oauth_on(monkeypatch):
     monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com", raising=False)
     h = _www_authenticate_header()
     assert h.startswith("Bearer realm=")
-    assert 'resource_metadata="https://akb.example.com/.well-known/oauth-protected-resource"' in h
+    assert 'resource_metadata="https://akb.example.com/.well-known/oauth-protected-resource/mcp"' in h
 
 
-# ── _TOOL_SCOPES completeness (CI guard) ──────────────────────────
+# ── MCP_OPERATION_SCOPES completeness (CI guard) ──────────────────────────
 
 
 def test_every_registered_tool_has_an_explicit_scope_mapping():
-    """A new tool added to `_HANDLERS` without an entry in `_TOOL_SCOPES`
+    """A new tool added to `_HANDLERS` without an entry in `MCP_OPERATION_SCOPES`
     would silently fail closed to write (which is safe) — but the
     intent is that every tool's scope is an explicit, reviewed choice.
     Lock that down here so a PR adding a read-grade tool can't
     inadvertently promote it to write-grade by forgetting the map."""
-    from mcp_server.server import _HANDLERS, _TOOL_SCOPES
+    from app.services.tool_resource_policy import MCP_OPERATION_SCOPES
+    from mcp_server.server import _HANDLERS
 
-    unmapped = sorted(set(_HANDLERS.keys()) - set(_TOOL_SCOPES.keys()))
+    unmapped = sorted(set(_HANDLERS.keys()) - set(MCP_OPERATION_SCOPES.keys()))
     assert unmapped == [], (
-        f"Tools registered without a _TOOL_SCOPES entry: {unmapped}. "
-        "Add each to _TOOL_SCOPES with the appropriate read/write scope."
+        f"Tools registered without a MCP_OPERATION_SCOPES entry: {unmapped}. "
+        "Add each to MCP_OPERATION_SCOPES with the appropriate read/write scope."
     )
 
 
 @pytest.mark.asyncio
-async def test_unmapped_tool_falls_back_to_write_scope_when_oauth_caller():
-    """A defensive check for the fail-closed path: even with the
-    completeness test above in place, if a future tool slips through
-    (test bypass / dynamic registration), an OAuth caller without
-    `akb:vault:write` must NOT be able to invoke it."""
+async def test_unmapped_tool_is_never_dispatched(monkeypatch):
     from mcp_server.server import _dispatch, _MCPUser, _HANDLERS
 
-    # Register a fake tool that's deliberately NOT in _TOOL_SCOPES.
     async def _stub(args, uid, user):
-        return {"ok": True}
+        pytest.fail("unclassified tool dispatched")
 
-    _HANDLERS["__unmapped_test_tool__"] = _stub
-    try:
-        # Read-only OAuth caller — must be refused at unmapped tool.
-        read_user = _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:read"])
-        result = await _dispatch("__unmapped_test_tool__", {}, read_user)
-        assert result.get("code") == "insufficient_scope"
-        assert result.get("details", {}).get("required_scope") == "akb:vault:write"
-        # Write-grade OAuth caller — allowed through.
-        write_user = _MCPUser(user_id="u-1", oauth_scopes=["akb:vault:write"])
-        result = await _dispatch("__unmapped_test_tool__", {}, write_user)
-        assert result == {"ok": True}
-    finally:
-        _HANDLERS.pop("__unmapped_test_tool__", None)
+    monkeypatch.setitem(_HANDLERS, "__unmapped_test_tool__", _stub)
+    for scopes in (["akb:vault:read"], ["akb:vault:write"], None):
+        user = _MCPUser(user_id="u-1", oauth_scopes=scopes)
+        result = await _dispatch("__unmapped_test_tool__", {}, user)
+        assert result.get("code") == "unknown_tool"
 
 
 # ── verify_access_token resilience ─────────────────────────────────
@@ -792,6 +764,8 @@ async def test_verify_access_token_preserves_jwks_unreachable(monkeypatch, rsa_k
 
     issuer = "https://kc.example.com/realms/akb"
     audience = "https://akb.example.com/mcp"
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", True)
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.com")
     monkeypatch.setattr(settings, "keycloak_server_url", "https://kc.example.com", raising=False)
     monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
 

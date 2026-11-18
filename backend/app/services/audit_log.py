@@ -75,7 +75,7 @@ _GENESIS = "0" * 64
 # Tool-level membership is not sufficient on its own: `akb_grep` is a read
 # tool whose `replace` argument rewrites every matching document. The
 # caller therefore passes `is_write`, computed by the same
-# `_required_scope` that gates the call, so an argument-driven write is
+# scope policy that gates the call, so an argument-driven write is
 # recorded even though the tool name sits in this set.
 _READ_ONLY_TOOLS = frozenset({
     "akb_get", "akb_search", "akb_browse", "akb_drill_down", "akb_grep",
