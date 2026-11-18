@@ -225,7 +225,7 @@ async def get_sso_provider_control_actor(
     session. ``get_current_user`` still enforces the token's method scope before
     this stricter service-admin conjunction is checked.
     """
-    if authorization:
+    if authorization is not None:
         actor = await get_current_user(request)
         if (
             not actor.is_admin

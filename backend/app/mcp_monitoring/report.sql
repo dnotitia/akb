@@ -21,11 +21,12 @@
                         WHEN 'tools' THEN $13::int ELSE 0 END AS skip
     FROM grouped
 )
-SELECT r.*, t.status AS credential_status, t.expires_at AS pat_expires_at, group_count > skip + $10::int AS has_more,
+SELECT r.*, p.ref AS pat_ref, t.status AS credential_status, t.expires_at AS pat_expires_at, group_count > skip + $10::int AS has_more,
        CASE section WHEN 'users' THEN coalesce(nullif(u.display_name,''),u.username)
-                    WHEN 'credentials' THEN t.name END AS label
+                    WHEN 'credentials' THEN 'PAT ' || p.alias_number END AS label
 FROM ranked r
 LEFT JOIN users u ON r.section='users' AND u.id=r.actor_id
 LEFT JOIN pat_status t ON r.section='credentials' AND t.id=r.pat_id AND t.user_id=$3
+LEFT JOIN mcp_monitoring.pat_references p ON p.pat_id=r.pat_id
 WHERE section IN ('summary','series') OR rn BETWEEN skip+1 AND skip+$10
 ORDER BY section,rn

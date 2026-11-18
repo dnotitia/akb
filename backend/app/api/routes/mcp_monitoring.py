@@ -1,5 +1,3 @@
-"""Installation-local, product-admin MCP monitoring."""
-
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
@@ -7,13 +5,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import AwareDatetime, StringConstraints
 
-from app.api.routes.admin_auth import get_current_product_admin
+from app.api.routes.monitoring_auth import get_monitoring_reader
 from app.mcp_monitoring.report import read_operation_calls, read_report
 from app.mcp_monitoring.trace_detail import load_trace
 from app.mcp_monitoring.usage import METRIC_KEY_PATTERN, TOOL_NAME_PATTERN
 from app.mcp_monitoring.schema import AuthKind, CallerKind, MonitoringReport, OperationDetails
 
-router = APIRouter(dependencies=[Depends(get_current_product_admin)])
+router = APIRouter(dependencies=[Depends(get_monitoring_reader)])
 
 
 MetricView = Annotated[str, StringConstraints(pattern=rf"^{TOOL_NAME_PATTERN}/{METRIC_KEY_PATTERN}/(?:{METRIC_KEY_PATTERN}|\*)/[0-9]{{1,6}}$")]
@@ -43,7 +41,7 @@ async def mcp_monitoring(
     user_id: UUID | None = None,
     caller_kind: CallerKind = "human",
     auth_kind: AuthKind | None = None,
-    pat_id: UUID | None = None,
+    pat_ref: UUID | None = None,
     tool: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     user_page: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     credential_page: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
@@ -52,14 +50,14 @@ async def mcp_monitoring(
     browse_group: Literal["conditions", "page_size", "depth", "page"] = "conditions",
     browse_page: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
 ):
-    if pat_id and (not user_id or auth_kind != "pat"):
+    if pat_ref and (not user_id or auth_kind != "pat"):
         raise HTTPException(422, "A PAT filter requires its user and PAT authentication")
     views = {}
     for selection in metric_view or []:
         name, key, group, page = selection.split("/")
         views[f"{name}/{key}"] = {"group": group, "page": int(page)}
     return await read_report(
-        *window, user_id, auth_kind, pat_id, tool, user_page, credential_page, tool_page, browse_group, browse_page, views, operation_page, caller_kind,
+        *window, user_id, auth_kind, pat_ref, tool, user_page, credential_page, tool_page, browse_group, browse_page, views, operation_page, caller_kind,
     )
 
 
@@ -68,14 +66,14 @@ async def operation_calls(
     actor_id: UUID, operation_id: UUID, window: Window,
     caller_kind: CallerKind = "human",
     auth_kind: AuthKind | None = None,
-    pat_id: UUID | None = None,
+    pat_ref: UUID | None = None,
     tool: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     page: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     kind: Literal["conversation", "trace", "turn"] = "trace",
 ):
-    if pat_id and auth_kind != "pat":
+    if pat_ref and auth_kind != "pat":
         raise HTTPException(422, "A PAT filter requires PAT authentication")
-    return await read_operation_calls(*window, actor_id, auth_kind, pat_id, tool, operation_id, page, kind, caller_kind)
+    return await read_operation_calls(*window, actor_id, auth_kind, pat_ref, tool, operation_id, page, kind, caller_kind)
 
 
 @router.get("/admin/mcp-monitoring/calls/{observation_id}/trace")

@@ -27,7 +27,7 @@ function CallSequence({ operation, filters }: { operation: McpOperation; filters
   const [selected, setSelected] = useState<Pick<RecentCall, "observation_id" | "tool"> | null>(null);
   const params = new URLSearchParams({ page: String(page) });
   if (operation.kind === "turn" || operation.kind === "conversation") params.set("kind", operation.kind);
-  for (const key of ["from", "to", "caller_kind", "auth_kind", "pat_id", "tool"]) {
+  for (const key of ["from", "to", "caller_kind", "auth_kind", "pat_ref", "tool"]) {
     const value = filters.get(key);
     if (value) params.set(key, value);
   }

@@ -6,8 +6,7 @@ import { CallTrace } from "./mcp-call-trace";
 import { CallTrend } from "./mcp-call-trend";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
-import { ChevronLeft, RefreshCw, X } from "lucide-react";
+import { RefreshCw, X } from "lucide-react";
 import { PageHeader } from "@/components/ui/page-header";
 import { Panel, PanelHeader } from "@/components/ui/panel";
 import { Button } from "@/components/ui/button";
@@ -17,8 +16,10 @@ import { StatTile } from "@/components/ui/stat-tile";
 import { SelectMenu } from "@/components/ui/select-menu";
 import { LoadingState } from "@/components/ui/loading-state";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ApiError, getMcpMonitoring } from "@/lib/api";
+import { ApiError, getMcpMonitoring, logoutMcpMonitoring } from "@/lib/api";
 import type { AuthKind, Breakdown, CallerKind, CredentialInfo, MonitoringReport, MonitoringRow } from "@/lib/mcp-monitoring";
+
+import { McpMonitoringSignIn } from "./mcp-monitoring-sign-in";
 
 const groups: Breakdown[] = ["users", "credentials", "tools"];
 const firstPages = { users: 0, credentials: 0, tools: 0, operations: 0 };
@@ -32,7 +33,7 @@ type Filters = { user?: Selection; pat?: Selection; tool?: string; auth?: AuthKi
 function rowLabel(row: MonitoringRow, service: boolean): string {
   if (row.user_id) return row.label || `Former account · ${row.user_id.slice(0, 8)}`;
   if (row.tool) return row.tool;
-  if (row.pat_id) return `${row.label || "PAT"} · ${row.pat_id.slice(0, 8)}`;
+  if (row.pat_ref) return row.label || "PAT";
   if (row.auth_kind === "service") return "Service key";
   return row.auth_kind === "oauth" ? (service ? "OAuth" : "SSO") : "PAT";
 }
@@ -73,7 +74,7 @@ function RecentCalls({ report, service }: { report: MonitoringReport; service: b
             <tr key={call.observation_id}>
               <td className="whitespace-nowrap px-4 py-2"><time dateTime={call.finished_at}>{callTime.format(new Date(call.finished_at))}</time></td>
               <td className="px-4">{call.user_label || `Former account · ${call.actor_id.slice(0, 8)}`}</td>
-              <td className="px-4">{call.auth_kind === "service" ? "Service key" : call.auth_kind === "oauth" ? (service ? "OAuth" : "SSO") : `${call.pat_label || "PAT"} · ${call.pat_id?.slice(0, 8)}`}</td>
+              <td className="px-4">{call.auth_kind === "service" ? "Service key" : call.auth_kind === "oauth" ? (service ? "OAuth" : "SSO") : (call.pat_alias || "PAT")}</td>
               <td className="px-4"><CredentialState info={call} /></td>
               <td className="px-4">{call.tool}</td><td className="px-4">{outcomes[call.outcome]}</td>
               <td className="whitespace-nowrap px-4">{call.duration_ms} ms</td>
@@ -89,6 +90,7 @@ function RecentCalls({ report, service }: { report: MonitoringReport; service: b
 }
 
 export default function McpMonitoringPage() {
+  const [signOutError, setSignOutError] = useState(false);
   const [caller, setCaller] = useState<CallerKind>("human");
   const service = caller === "service";
   const titles = { users: service ? "Service callers" : "Users", credentials: "Credentials", tools: "Tools" };
@@ -108,7 +110,7 @@ export default function McpMonitoringPage() {
   }
   if (filters.user) params.set("user_id", filters.user.id);
   if (filters.auth) params.set("auth_kind", filters.auth);
-  if (filters.pat) params.set("pat_id", filters.pat.id);
+  if (filters.pat) params.set("pat_ref", filters.pat.id);
   if (filters.tool) params.set("tool", filters.tool);
   const query = useQuery({
     queryKey: ["admin-mcp-monitoring", params.toString()],
@@ -120,17 +122,30 @@ export default function McpMonitoringPage() {
     const label = rowLabel(row, service);
     if (row.user_id) update({ ...filters, pat: filters.user?.id === row.user_id ? filters.pat : undefined, user: { id: row.user_id, label } });
     else if (row.tool) update({ ...filters, tool: row.tool });
-    else if (row.auth_kind) update({ ...filters, auth: row.auth_kind, pat: row.pat_id ? { id: row.pat_id, label } : undefined });
+    else if (row.auth_kind) update({ ...filters, auth: row.auth_kind, pat: row.pat_ref ? { id: row.pat_ref, label } : undefined });
   };
   const report = query.data;
   const measured = report?.series.some((point) => point.coverage !== "unmeasured");
   const denied = query.error instanceof ApiError && [401, 403].includes(query.error.status);
+  async function signOut() {
+    setSignOutError(false);
+    try {
+      await logoutMcpMonitoring();
+      await query.refetch();
+    } catch {
+      setSignOutError(true);
+    }
+  }
+
   return (
     <main className="min-h-screen bg-background px-4 py-6 sm:px-8">
       <div className="mx-auto max-w-6xl space-y-4">
-        <Link to="/admin" className="inline-flex items-center gap-1 text-sm text-link"><ChevronLeft size={16} /> Product administration</Link>
         <PageHeader compact title="MCP monitoring" subtitle="Tool calls from users and services observed by the AKB server."
-          actions={<Button variant="outline" onClick={() => setUntil(Date.now())}><RefreshCw size={16} /> Refresh</Button>} />
+          actions={report && !query.isError && <>
+            <Button variant="outline" onClick={() => setUntil(Date.now())}><RefreshCw size={16} /> Refresh</Button>
+            <Button variant="outline" onClick={() => void signOut()}>Sign out</Button>
+          </>} />
+        {signOutError && <Alert variant="destructive">Sign-out failed. Try again.</Alert>}
         {!denied && <div className="flex flex-wrap items-center gap-2" aria-label="Report filters">
           <SelectMenu className="w-full sm:w-44" aria-label="Caller type" value={caller} options={callerOptions}
             onValueChange={(value) => { setCaller(value === "service" ? "service" : "human"); update({ tool: filters.tool }); }} />
@@ -147,9 +162,8 @@ export default function McpMonitoringPage() {
           {Object.values(filters).some(Boolean) && <Button variant="ghost" onClick={() => update({})}>Clear filters</Button>}
         </div>}
         {query.isPending && <LoadingState label="Loading MCP report"><Skeleton className="h-24 w-full" /></LoadingState>}
-        {query.isError && <Alert variant="destructive">{denied
-          ? <Link className="underline" to="/admin">Sign in as a product administrator to view this report.</Link>
-          : "The MCP report could not be loaded. Refresh to retry."}</Alert>}
+        {denied && <McpMonitoringSignIn onSignIn={() => { update({}); setUntil(Date.now()); }} />}
+        {query.isError && !denied && <Alert variant="destructive">The MCP report could not be loaded. <Button variant="link" onClick={() => void query.refetch()}>Retry</Button></Alert>}
         {report && !query.isError && <>
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             <StatTile label="Observed calls" value={measured ? report.summary.calls : "—"} kind={measured && !service ? `SSO ${report.summary.sso_calls} · PAT ${report.summary.pat_calls}` : undefined} />
@@ -184,7 +198,7 @@ export default function McpMonitoringPage() {
                       <th key={label} scope="col" className="px-4 py-2">{label}</th>)}
                   </tr></thead>
                   <tbody className="divide-y divide-border">{report[group].map((row) => (
-                    <tr key={row.user_id || row.pat_id || row.tool || row.auth_kind}>
+                    <tr key={row.user_id || row.pat_ref || row.tool || row.auth_kind}>
                       <td className="px-4 py-1"><Button variant="link" onClick={() => select(row)}>{rowLabel(row, service)}</Button></td>
                       {group === "credentials" && <>
                         <td className="px-4"><CredentialState info={row} /></td>

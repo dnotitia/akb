@@ -663,10 +663,28 @@ function adminCsrfCookieName(): string {
     : "akb_dev_admin_csrf";
 }
 
+export async function loginMcpMonitoring(username: string, password: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/admin/mcp-monitoring/auth/local/login`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+}
+
+export async function logoutMcpMonitoring(): Promise<void> {
+  const response = await fetch(`${API_BASE}/admin/mcp-monitoring/auth/logout`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "X-AKB-Monitoring-Logout": "1" },
+  });
+  if (!response.ok) await throwJsonApiError(response);
+}
+
 export async function getMcpMonitoring(query: URLSearchParams, signal?: AbortSignal): Promise<MonitoringReport> {
   const response = await fetch(`${API_BASE}/admin/mcp-monitoring?${query}`, {
     credentials: "same-origin",
-    headers: adminHeaders(),
     cache: "no-store",
     signal,
   });
@@ -676,14 +694,14 @@ export async function getMcpMonitoring(query: URLSearchParams, signal?: AbortSig
 
 export async function getMcpOperationCalls(actor: string, operation: string, query: URLSearchParams, signal?: AbortSignal): Promise<OperationDetails> {
   const path = `${API_BASE}/admin/mcp-monitoring/operations/${encodeURIComponent(actor)}/${encodeURIComponent(operation)}/calls`;
-  const response = await fetch(`${path}?${query}`, { credentials: "same-origin", headers: adminHeaders(), cache: "no-store", signal });
+  const response = await fetch(`${path}?${query}`, { credentials: "same-origin", cache: "no-store", signal });
   if (!response.ok) await throwJsonApiError(response);
   return response.json();
 }
 
 export async function getMcpCallTrace(id: string, signal?: AbortSignal): Promise<McpCallTrace> {
   const response = await fetch(`${API_BASE}/admin/mcp-monitoring/calls/${encodeURIComponent(id)}/trace`, {
-    credentials: "same-origin", headers: adminHeaders(), cache: "no-store", signal,
+    credentials: "same-origin", cache: "no-store", signal,
   });
   if (!response.ok) await throwJsonApiError(response);
   return response.json();

@@ -54,6 +54,8 @@ async def get_current_product_admin(
         if not authorization:
             raise AuthenticationError()
         return await resolve_local_product_admin(authorization)
+    if authorization is not None:
+        raise AuthenticationError()
     return await resolve_sso_admin_browser_session(request.cookies.get(_admin_session_cookie_name(), ""))
 
 
@@ -67,7 +69,7 @@ async def get_product_admin_mutation(
         if not authorization:
             raise AuthenticationError()
         return await resolve_local_product_admin(authorization)
-    if csrf_header is None:
+    if authorization is not None or csrf_header is None:
         raise AuthenticationError("Invalid admin CSRF token")
     return await validate_sso_admin_browser_session_csrf(
         request.cookies.get(_admin_session_cookie_name(), ""),
@@ -339,7 +341,7 @@ async def admin_logout(
         await resolve_local_product_admin(authorization)
         logout_url = "/admin"
     else:
-        if csrf_header is None:
+        if authorization is not None or csrf_header is None:
             raise AuthenticationError("Invalid admin CSRF token")
         raw_token = request.cookies.get(_admin_session_cookie_name(), "")
         csrf_cookie = request.cookies.get(_admin_csrf_cookie_name(), "")

@@ -70,11 +70,15 @@ async def test_replica_flush_replay_and_retention():
         await first.tick()
         assert await pool.fetchval("SELECT COUNT(*) FROM mcp_monitoring.tool_calls") == 3
         end = datetime.now(UTC)
-        result = await read_report(now, end, actor, "pat", pat, None, 0, 0, 0)
+        unfiltered = await read_report(now, end, actor, "pat", None, None, 0, 0, 0)
+        credential, = unfiltered["credentials"]
+        ref = credential["pat_ref"]
+        assert ref != pat
+        result = await read_report(now, end, actor, "pat", ref, None, 0, 0, 0)
         assert result["summary"]["calls"] == 2 and result["summary"]["active_users"] == 1
-        assert result["credentials"][0]["label"] is None
+        assert result["credentials"][0]["label"] == credential["label"]
         with pytest.raises(NotFoundError):
-            await read_report(now, end, uuid4(), "pat", pat, None, 0, 0, 0)
+            await read_report(now, end, uuid4(), "pat", ref, None, 0, 0, 0)
         result = await read_report(now - timedelta(seconds=1), now, None, None, None, None, 0, 0, 0)
         assert result["summary"]["calls"] == 0
         assert await pool.fetchval("""
@@ -115,15 +119,18 @@ async def test_credential_status_uses_current_catalog_for_a_historical_window():
         result = await report(owner)
         assert result["summary"]["calls"] == 4
         assert result["credential_status_as_of"] > expired_at
-        statuses = {pat: name for name, pat in keys.items()} | {None: "session_unverified"}
+        refs = {r["credential_status"]: r["pat_ref"] for r in result["credentials"]}
+        assert len(set(refs.values())) == 4
+        assert not set(keys.values()) & set(refs.values())
+        statuses = {ref: state for state, ref in refs.items()}
         for section in ("credentials", "recent_calls"):
-            assert {r["pat_id"]: r["credential_status"] for r in result[section]} == statuses
-            assert next(r["pat_expires_at"] for r in result[section] if r["pat_id"] == keys["expired"]) == expired_at
+            assert {r["pat_ref"]: r["credential_status"] for r in result[section]} == statuses
+            assert next(r["pat_expires_at"] for r in result[section] if r["pat_ref"] == refs["expired"]) == expired_at
         assert next(r["last_observed_at"] for r in result["credentials"] if r["auth_kind"] == "oauth") == observed
         await pool.execute("UPDATE users SET account_status='suspended' WHERE id=$1", owner)
         suspended = await report(owner)
-        assert {r["pat_id"]: r["credential_status"] for r in suspended["credentials"]} == {
-            **statuses, keys["active"]: "account_suspended",
+        assert {r["pat_ref"]: r["credential_status"] for r in suspended["credentials"]} == {
+            **statuses, refs["active"]: "account_suspended",
         }
 
 
@@ -201,7 +208,9 @@ async def test_usage_groups_from_observations_and_old_rows():
                      search_returned,browse_page_size,browse_depth,browse_followup)
                 VALUES (gen_random_uuid(),$1,$2,'human','pat',$3,$4,'ok',$5,$6,$7,$8,$9)
             """, since, actor, pat, tool, duration, count, size, depth, followup)
-        args = (since, datetime.now(UTC), user, "pat", pat, None, 0, 0, 0)
+        end = datetime.now(UTC)
+        unfiltered = await read_report(since, end, user, "pat", None, None, 0, 0, 0)
+        args = (since, end, user, "pat", unfiltered["credentials"][0]["pat_ref"], None, 0, 0, 0)
         report = await read_report(*args)
         assert report["search_results"] == {"measured": 2, "empty": 1}
         assert len(report["browse_latency"]) == 3
@@ -270,16 +279,19 @@ async def test_operations_are_actor_scoped_ordered_and_independent_of_recent_lim
         assert len(result["recent_calls"]) == 50
         assert len(result["operations"]) == 4
         op = next(r for r in result["operations"] if r["actor_id"] == actor and r["correlated"])
-        assert (op["id"], op["calls"], op["started_at"], op["elapsed_ms"]) == (trace, 52, start, 1500)
+        assert op["id"] != trace
+        assert (op["calls"], op["started_at"], op["elapsed_ms"]) == (52, start, 1500)
+        actor_report = await read_report(start, end, actor, "pat", None, None, 0, 0, 0)
+        pat_ref = actor_report["credentials"][0]["pat_ref"]
         assert len({r["id"] for r in result["operations"] if not r["correlated"]}) == 2
-        detail = await read_operation_calls(start, end, actor, None, None, None, trace, 0)
+        detail = await read_operation_calls(start, end, actor, None, None, None, op["id"], 0)
         assert detail["has_more"] and [c["tool"] for c in detail["calls"][:2]] == ["slow", "legacy"]
-        last = await read_operation_calls(start, end, actor, None, None, None, trace, 1)
+        last = await read_operation_calls(start, end, actor, None, None, None, op["id"], 1)
         assert not last["has_more"] and [c["position"] for c in last["calls"]] == [51, 52]
-        filtered = await read_operation_calls(start, end, actor, "pat", pat, "fast", trace, 0)
+        filtered = await read_operation_calls(start, end, actor, "pat", pat_ref, "fast", op["id"], 0)
         assert len(filtered["calls"]) == 50 and not filtered["has_more"]
-        assert not (await read_operation_calls(start, end, other, "pat", pat, None, trace, 0))["calls"]
-        subset = await read_report(start, end, actor, "pat", pat, "fast", 0, 0, 0)
+        assert not (await read_operation_calls(start, end, other, "pat", pat_ref, None, op["id"], 0))["calls"]
+        subset = await read_report(start, end, actor, "pat", pat_ref, "fast", 0, 0, 0)
         assert [(r["calls"], r["elapsed_ms"]) for r in subset["operations"]] == [(50, 50)]
 
 
@@ -304,11 +316,13 @@ async def test_turn_and_trace_with_equal_keys_have_separate_sequences(monkeypatc
             (actor, "turn", 2), (other, "turn", 1), (actor, "trace", 1),
         }
         monkeypatch.setattr(settings.mcp_monitoring, "tempo_query_url", "http://localhost")
-        detail = await read_operation_calls(start, end, actor, None, None, None, key, 0, "turn")
+        refs = {r["kind"]: r["id"] for r in result["operations"] if r["actor_id"] == actor}
+        assert len(set(refs.values())) == 2 and key not in refs.values()
+        detail = await read_operation_calls(start, end, actor, None, None, None, refs["turn"], 0, "turn")
         assert [(c["observation_id"], c["trace_available"]) for c in detail["calls"]] == [
             (call.observation_id, False), (sampled.observation_id, True),
         ]
-        assert len((await read_operation_calls(start, end, actor, None, None, None, key, 0))["calls"]) == 1
+        assert len((await read_operation_calls(start, end, actor, None, None, None, refs["trace"], 0))["calls"]) == 1
 
 
 async def test_conversation_takes_precedence_and_preserves_unlabelled_history():
@@ -340,10 +354,12 @@ async def test_conversation_takes_precedence_and_preserves_unlabelled_history():
         assert {(r["kind"], r["calls"], r["agent"]) for r in report["operations"]} == {
             ("conversation", 6, "Codex"), ("trace", 1, None), ("turn", 2, None), ("individual", 1, None),
         }
-        detail = await read_operation_calls(start, end, actor, None, None, None, key, 0, "conversation")
+        refs = {r["kind"]: r["id"] for r in report["operations"]}
+        pat_ref = next(r["pat_ref"] for r in report["credentials"] if r["auth_kind"] == "pat")
+        detail = await read_operation_calls(start, end, actor, None, None, None, refs["conversation"], 0, "conversation")
         assert [r["observation_id"] for r in detail["calls"]] == [e.observation_id for e in events]
-        assert len((await read_operation_calls(start, end, actor, None, None, None, key, 0))["calls"]) == 1
-        filtered = await read_operation_calls(start, end, actor, "pat", pat, None, key, 0, "conversation")
+        assert len((await read_operation_calls(start, end, actor, None, None, None, refs["trace"], 0))["calls"]) == 1
+        filtered = await read_operation_calls(start, end, actor, "pat", pat_ref, None, refs["conversation"], 0, "conversation")
         assert [r["observation_id"] for r in filtered["calls"]] == [e.observation_id for e in events[:3]]
 
 
@@ -371,9 +387,12 @@ async def test_service_jobs_and_details_stay_out_of_human_reports():
         assert machine["summary"]["service_key_calls"] == 2
         assert len(machine["operations"]) == 1 and machine["operations"][0]["calls"] == 3
         assert {r["auth_kind"] for r in machine["recent_calls"]} == {"service", "pat"}
-        detail = await read_operation_calls(*args, job, 0, "conversation", "service")
+        matching_operation = machine["operations"][0]
+        assert matching_operation["agent"] == "MCP client" and matching_operation["id"] != job
+        detail = await read_operation_calls(*args, matching_operation["id"], 0, "conversation", "service")
         assert {r["observation_id"] for r in detail["calls"]} == {r["observation_id"] for r in machine["recent_calls"]}
-        assert len((await read_operation_calls(*args, job, 0, "conversation"))["calls"]) == 1
+        assert len((await read_operation_calls(*args, human["operations"][0]["id"], 0, "conversation"))["calls"]) == 1
         # Revoked service-owned PATs have no live token row.
-        filtered = await read_report(start, end, actor, "pat", pat, None, 0, 0, 0, caller_kind="service")
+        pat_ref = next(r["pat_ref"] for r in machine["credentials"] if r["auth_kind"] == "pat")
+        filtered = await read_report(start, end, actor, "pat", pat_ref, None, 0, 0, 0, caller_kind="service")
         assert filtered["summary"]["calls"] == 1

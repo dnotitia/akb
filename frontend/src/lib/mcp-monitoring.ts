@@ -23,7 +23,7 @@ export interface CredentialInfo {
 export interface MonitoringRow extends MonitoringMetrics, CredentialInfo {
   last_observed_at?: string | null;
   user_id: string | null;
-  pat_id: string | null;
+  pat_ref: string | null;
   tool: string | null;
   label: string | null;
   auth_kind: AuthKind | null;
@@ -35,8 +35,8 @@ export interface RecentCall extends CredentialInfo {
   actor_id: string;
   user_label: string | null;
   auth_kind: AuthKind;
-  pat_id: string | null;
-  pat_label: string | null;
+  pat_ref: string | null;
+  pat_alias: string | null;
   tool: string;
   outcome: "ok" | "tool_error" | "rpc_error" | "cancelled" | "unknown";
   duration_ms: number;
@@ -94,8 +94,7 @@ export interface MonitoringReport extends Record<Breakdown, MonitoringRow[]> {
 }
 
 export interface McpCallTrace {
-  trace_id: string;
-  spans: { name: string; span_id: string; start: string; duration_ms: number }[];
+  spans: { name: string; start: string; duration_ms: number }[];
 }
 
 export const outcomes = { ok: "Success", tool_error: "Tool error", rpc_error: "RPC error", cancelled: "Cancelled", unknown: "Unknown" };

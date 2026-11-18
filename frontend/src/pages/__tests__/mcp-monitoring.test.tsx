@@ -12,7 +12,7 @@ vi.mock("@/lib/api", async (original) => ({
 }));
 
 const summary = { calls: 3, sso_calls: 1, pat_calls: 2, service_key_calls: 0, active_users: 1, errors: 0, decided: 3, p95_ms: 2 };
-const base: MonitoringRow = { ...summary, user_id: null, pat_id: null, tool: null, auth_kind: null, label: null };
+const base: MonitoringRow = { ...summary, user_id: null, pat_ref: null, tool: null, auth_kind: null, label: null };
 const report: MonitoringReport = {
   operations: [], has_more_operations: false,
   metrics: [
@@ -24,12 +24,12 @@ const report: MonitoringReport = {
   ],
   recent_calls: [1, 2].map(i => ({
     observation_id: String(i), finished_at: `2026-01-01T00:00:0${i}Z`, actor_id: "user-1", user_label: "Fixture user",
-    auth_kind: "pat", pat_id: "01234567-abcd", pat_label: "Desktop", tool: "akb_help", outcome: "ok", duration_ms: i, trace_available: false,
+    auth_kind: "pat", pat_ref: "01234567-abcd", pat_alias: "PAT 1", tool: "akb_help", outcome: "ok", duration_ms: i, trace_available: false,
   })), summary, window: { from: "2026-01-01T00:00:00Z", to: "2026-01-02T00:00:00Z" },
   collection: { enabled: true, retention_days: 30, started_at: null, last_flush: null, dropped: 0, stale_writers: 0, disabled_writers: 0 },
   series: [{ start: "2026-01-01T00:00:00Z", calls: 3, coverage: "complete" }],
   users: [{ ...base, user_id: "user-1", label: "Fixture user" }],
-  credentials: [{ ...base, auth_kind: "pat", pat_id: "01234567-abcd", label: "Desktop" }],
+  credentials: [{ ...base, auth_kind: "pat", pat_ref: "01234567-abcd", label: "PAT 1" }],
   tools: [{ ...base, tool: "akb_help" }], has_more: { users: false, tools: false, credentials: false },
 };
 
@@ -50,14 +50,14 @@ it("pins the interval while drilling and clears private data when authorization 
   };
   await userEvent.click(await screen.findByRole("tab", { name: "Recent calls" }));
   await clickRow("Users", /Fixture user/);
-  await clickRow("Credentials", /Desktop/);
+  await clickRow("Credentials", /PAT 1/);
   const recent = within(await screen.findByRole("table", { name: "Recent calls" }));
   expect(recent.getAllByRole("cell", { name: "akb_help" })).toHaveLength(2);
-  expect(recent.getAllByRole("cell", { name: "Desktop · 01234567" })).toHaveLength(2);
+  expect(recent.getAllByRole("cell", { name: "PAT 1" })).toHaveLength(2);
   await clickRow("Tools", /akb_help/);
-  await screen.findByRole("link", { name: /sign in as a product administrator/i });
+  await screen.findByText("Sign in to MCP monitoring");
   const latest = requests.at(-1)!;
-  expect(Object.fromEntries(latest)).toMatchObject({ user_id: "user-1", auth_kind: "pat", pat_id: "01234567-abcd", tool: "akb_help" });
+  expect(Object.fromEntries(latest)).toMatchObject({ user_id: "user-1", auth_kind: "pat", pat_ref: "01234567-abcd", tool: "akb_help" });
   expect(latest.get("to")).toEqual(requests[0].get("to"));
   expect(screen.queryByRole("table")).not.toBeInTheDocument();
   expect(screen.queryByText("Fixture user")).not.toBeInTheDocument();
@@ -71,11 +71,11 @@ it("shows current PAT state separately from the last authenticated SSO call", as
       { ...report.credentials[0], credential_status: "expired", pat_expires_at: expiry },
       { ...base, auth_kind: "oauth", credential_status: "session_unverified", last_observed_at: report.window.from },
     ],
-    recent_calls: [{ ...report.recent_calls[0], pat_label: null, credential_status: "deleted" }],
+    recent_calls: [{ ...report.recent_calls[0], credential_status: "deleted" }],
   });
   renderPage();
   const creds = within(await screen.findByRole("table", { name: "Credentials" }));
-  const pat = within(creds.getByRole("row", { name: /Desktop/ }));
+  const pat = within(creds.getByRole("row", { name: /PAT 1/ }));
   expect(pat.getByRole("cell", { name: /^Expired/ })).toHaveTextContent("Expired");
   expect(pat.getByText(new Date(expiry).toLocaleString())).toHaveAttribute("dateTime", expiry);
   const sso = within(creds.getByRole("row", { name: /SSO/ }));
@@ -83,7 +83,7 @@ it("shows current PAT state separately from the last authenticated SSO call", as
   expect(sso.getByText(new Date(report.window.from).toLocaleString())).toHaveAttribute("dateTime", report.window.from);
   await userEvent.click(screen.getByRole("tab", { name: "Recent calls" }));
   const recent = within(await screen.findByRole("table", { name: "Recent calls" }));
-  expect(recent.getByRole("row", { name: /PAT · 01234567/ })).toHaveTextContent("Deleted");
+  expect(recent.getByRole("row", { name: /PAT 1/ })).toHaveTextContent("Deleted");
 });
 
 it("shows an unmeasured interval separately from a measured zero", async () => {
@@ -152,9 +152,9 @@ it.each(["trace", "turn", "conversation"] as const)("expands a %s in start order
   expect(rows[2]).toHaveTextContent("akb_help"); expect(rows[2]).toHaveTextContent("7 ms");
   expect(vi.mocked(getMcpOperationCalls).mock.lastCall?.[2].get("kind")).toBe(kind === "trace" ? null : kind);
   expect(within(rows[1]).queryByRole("button")).toBeNull();
-  vi.mocked(getMcpCallTrace).mockResolvedValue({ trace_id: "abc123", spans: [] });
+  vi.mocked(getMcpCallTrace).mockResolvedValue({ spans: [] });
   await userEvent.click(within(rows[2]).getByRole("button", { name: "View trace for call 2, akb_help" }));
-  expect(await within(await screen.findByRole("dialog")).findByText("abc123")).toBeVisible();
+  expect(await within(await screen.findByRole("dialog")).findByText("Call reference", { exact: false })).toBeVisible();
   expect(vi.mocked(getMcpCallTrace).mock.lastCall?.[0]).toBe("1");
   await userEvent.keyboard("{Escape}");
   expect(expand).toHaveAttribute("aria-expanded", "true");
@@ -168,18 +168,18 @@ it("switches from a human PAT to service jobs and scopes their call sequence", a
     started_at: report.window.from, finished_at: report.window.to };
   vi.mocked(getMcpMonitoring).mockImplementation(async params => params.get("caller_kind") === "service"
     ? { ...report, users: [{ ...base, user_id: "svc", label: "Importer" }], operations: [op],
-        recent_calls: [{ ...report.recent_calls[0], auth_kind: "service", pat_id: null, pat_label: null }] }
+        recent_calls: [{ ...report.recent_calls[0], auth_kind: "service", pat_ref: null, pat_alias: null }] }
     : report);
   vi.mocked(getMcpOperationCalls).mockResolvedValue({ has_more: false, calls: [] });
   renderPage();
   await userEvent.click(within(await screen.findByRole("table", { name: "Users" })).getByRole("button", { name: "Fixture user" }));
-  await userEvent.click(within(await screen.findByRole("table", { name: "Credentials" })).getByRole("button", { name: /Desktop/ }));
+  await userEvent.click(within(await screen.findByRole("table", { name: "Credentials" })).getByRole("button", { name: /PAT 1/ }));
   await userEvent.click(screen.getByLabelText("Caller type"));
   await userEvent.click(await screen.findByRole("menuitemradio", { name: "Service callers" }));
   await screen.findByRole("table", { name: "Service callers" });
   const params = vi.mocked(getMcpMonitoring).mock.lastCall![0];
   expect(params.get("caller_kind")).toBe("service");
-  expect(["user_id", "auth_kind", "pat_id"].some(key => params.has(key))).toBe(false);
+  expect(["user_id", "auth_kind", "pat_ref"].some(key => params.has(key))).toBe(false);
   await userEvent.click(await screen.findByRole("button", { name: "Job 12345678" }));
   await screen.findByRole("table", { name: "Call sequence" });
   expect(vi.mocked(getMcpOperationCalls).mock.lastCall?.[2].get("caller_kind")).toBe("service");
@@ -195,7 +195,7 @@ it.each([
 ] as const)("displays the %s %s trace state", async (status, code, title, canRetry) => {
   vi.mocked(getMcpMonitoring).mockResolvedValue({ ...report, recent_calls: [{ ...report.recent_calls[0], trace_available: true }] });
   vi.mocked(getMcpCallTrace).mockRejectedValueOnce(new ApiError("Status detail.", status, { code }))
-    .mockResolvedValueOnce({ trace_id: "abc123", spans: [] });
+    .mockResolvedValueOnce({ spans: [] });
   renderPage();
   await userEvent.click(await screen.findByRole("tab", { name: "Recent calls" }));
   await userEvent.click(await screen.findByRole("button", { name: "View trace" }));
@@ -203,7 +203,7 @@ it.each([
   expect(await dialog.findByText(title)).toBeVisible();
   if (canRetry) {
     await userEvent.click(dialog.getByRole("button", { name: "Retry" }));
-    expect(await dialog.findByText("abc123")).toBeVisible();
+    expect(await dialog.findByText("Call reference", { exact: false })).toBeVisible();
   } else {
     expect(dialog.queryByRole("button", { name: "Retry" })).toBeNull();
   }

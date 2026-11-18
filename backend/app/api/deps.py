@@ -179,7 +179,7 @@ async def _authenticated_user(
 ) -> AuthenticatedUser:
     current_request_jwt_claims.set(None)
     authorization = request.headers.get("authorization")
-    if authorization:
+    if authorization is not None:
         resolve = (
             resolve_rest_credential_change_authorization
             if for_credential_change
@@ -264,7 +264,7 @@ async def get_optional_user(
     """Extract user if present, None otherwise. For optional auth."""
     current_request_jwt_claims.set(None)
     authorization = request.headers.get("authorization")
-    if not authorization:
+    if authorization is None:
         user = await _resolve_cookie_user(request, optional=True)
         if user is not None:
             _apply_claim_header(request, user)

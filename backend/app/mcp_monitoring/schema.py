@@ -1,5 +1,3 @@
-"""Product-admin monitoring response contract."""
-
 from datetime import datetime
 from typing import Literal, TypedDict
 from uuid import UUID
@@ -28,7 +26,7 @@ class CredentialInfo(TypedDict):
 class BreakdownRow(Metrics, CredentialInfo):
     last_observed_at: datetime | None
     user_id: UUID | None
-    pat_id: UUID | None
+    pat_ref: UUID | None
     auth_kind: AuthKind | None
     tool: str | None
     label: str | None
@@ -40,8 +38,8 @@ class RecentCall(CredentialInfo):
     actor_id: UUID
     user_label: str | None
     auth_kind: AuthKind
-    pat_id: UUID | None
-    pat_label: str | None
+    pat_ref: UUID | None
+    pat_alias: str | None
     tool: str
     outcome: Literal["ok", "tool_error", "rpc_error", "cancelled", "unknown"]
     duration_ms: int

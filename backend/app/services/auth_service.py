@@ -34,6 +34,7 @@ from app.exceptions import (
     ExternalAuthDisabledError,
     ExternalIdentityConflictError,
     ExternalProfileReadOnlyError,
+    ForbiddenError,
     MembershipRequiredError,
     NotFoundError,
     PasswordLifecycleUnavailableError,
@@ -366,63 +367,52 @@ async def register(username: str, email: str, password: str, display_name: str |
     }
 
 
+async def verify_local_login(conn, username: str, password: str, *, monitoring: bool | None = None):
+    username = username.strip()
+    row = await conn.fetchrow(
+        """
+        SELECT id, username, email, password_hash, display_name, is_admin,
+               session_generation, auth_provider, account_status, credential_change_required,
+               account_kind, monitoring_access
+          FROM users
+         WHERE username = $1 OR username = lower($1) OR lower(email) = lower($1)
+         ORDER BY CASE WHEN username = $1 THEN 0 WHEN username = lower($1) THEN 1 ELSE 2 END
+         LIMIT 1
+           FOR SHARE
+        """,
+        username,
+    )
+    if row is None or row["monitoring_access"] is not monitoring:
+        raise AuthenticationError("Invalid credentials")
+    if row["account_status"] != "active" and row["account_kind"] == "human":
+        if monitoring:
+            raise AuthenticationError("Invalid credentials")
+        raise AccountSuspendedError()
+    if row["auth_provider"] != "local" or row["account_kind"] != "human":
+        raise AuthenticationError("Invalid credentials")
+    if not await verify_password_async(password, row["password_hash"]):
+        raise AuthenticationError("Invalid credentials")
+    return row
+
+
 async def login(username: str, password: str) -> dict:
     require_local_auth_enabled()
-    username = username.strip()
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            canonical_username = await conn.fetchval(
-                "SELECT lower($1::text)", username
-            )
-            row = await conn.fetchrow(
-                """
-                SELECT id, username, email, password_hash, display_name, is_admin,
-                       tokens_revoked_before, session_generation, auth_provider,
-                       account_status, account_kind
-                 FROM users
-                 WHERE username = $1
-                    OR username = $2
-                    OR lower(email) = lower($1)
-                 ORDER BY CASE
-                              WHEN username = $1 THEN 0
-                              WHEN username = $2 THEN 1
-                              ELSE 2
-                          END
-                 LIMIT 1
-                   FOR SHARE
-                """,
-                username,
-                canonical_username,
-            )
-            if row and row["account_status"] != "active" and row["account_kind"] == "human":
-                raise AccountSuspendedError()
-            # SSO-provisioned accounts have no usable local password. Reject
-            # the local-login path explicitly with the same generic message
-            # so we don't leak which accounts are SSO-backed.
-            if row and (row["auth_provider"] != "local" or row["account_kind"] != "human"):
-                raise AuthenticationError("Invalid credentials")
-            if not row or not await verify_password_async(password, row["password_hash"]):
-                raise AuthenticationError("Invalid credentials")
-
-            # FOR SHARE serializes issuance with revocation's row UPDATE.
-            # Generation is authoritative, so freshly issued JWTs need no
-            # future iat/nbf to escape the legacy whole-second cutoff.
-            token = create_jwt(
-                str(row["id"]),
-                row["username"],
-                session_generation=row["session_generation"],
-            )
-            return {
-                "token": token,
-                "user": {
-                    "id": str(row["id"]),
-                    "username": row["username"],
-                    "email": row["email"],
-                    "display_name": row["display_name"],
-                    "is_admin": row["is_admin"],
-                },
-            }
+    async with pool.acquire() as conn, conn.transaction():
+        row = await verify_local_login(conn, username, password)
+        token = create_jwt(
+            str(row["id"]), row["username"], session_generation=row["session_generation"],
+        )
+        return {
+            "token": token,
+            "user": {
+                "id": str(row["id"]),
+                "username": row["username"],
+                "email": row["email"],
+                "display_name": row["display_name"],
+                "is_admin": row["is_admin"],
+            },
+        }
 
 
 # ── Keycloak SSO (optional external IdP) ─────────────────────────────
@@ -492,7 +482,7 @@ def _optional_external_string(claims: dict, name: str) -> str | None:
 def _assert_active_human(row) -> None:
     if row["account_status"] != "active":
         raise AccountSuspendedError()
-    if row["account_kind"] != "human":
+    if row["account_kind"] != "human" or row["monitoring_access"] is not None:
         raise ExternalIdentityConflictError()
 
 
@@ -512,7 +502,7 @@ async def _bound_external_user(conn, issuer: str, subject: str, *, lock_user: bo
     query = """
         SELECT u.id, u.username, u.email, u.display_name, u.is_admin,
                u.tokens_revoked_before, u.auth_provider,
-               u.account_status, u.account_kind,
+               u.account_status, u.account_kind, u.monitoring_access,
                e.id AS external_identity_id
           FROM external_identities e
           JOIN users u ON u.id = e.user_id
@@ -576,9 +566,10 @@ async def _refresh_bound_external_user(conn, row, claims: dict):
                  WHERE id = $1
                    AND account_status = 'active'
                    AND account_kind = 'human'
+                   AND monitoring_access IS NULL
              RETURNING id, username, email, display_name, is_admin,
                        tokens_revoked_before, auth_provider,
-                       account_status, account_kind
+                       account_status, account_kind, monitoring_access
                 """,
                 row["id"],
                 email_snapshot,
@@ -656,7 +647,7 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
             """
             SELECT id, username, email, display_name, is_admin,
                    tokens_revoked_before, auth_provider,
-                   account_status, account_kind, is_recovery_admin
+                   account_status, account_kind, is_recovery_admin, monitoring_access
               FROM users WHERE lower(email) = $1
              ORDER BY id
                FOR UPDATE
@@ -670,10 +661,7 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
         if len(targets) != 1:
             raise ExternalIdentityConflictError()
         target = targets[0]
-        if target["account_status"] != "active":
-            raise AccountSuspendedError()
-        if target["account_kind"] != "human":
-            raise ExternalIdentityConflictError()
+        _assert_active_human(target)
         if target["is_recovery_admin"]:
             raise ExternalIdentityConflictError()
         has_issuer_binding = await conn.fetchval(
@@ -744,7 +732,7 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
         """
         SELECT id, username, email, display_name, is_admin,
                tokens_revoked_before, auth_provider,
-               account_status, account_kind
+               account_status, account_kind, monitoring_access
           FROM users WHERE id = $1
         """,
         target["id"],
@@ -955,7 +943,7 @@ async def _resolve_unbound_keycloak_user(
         """
         SELECT id, username, email, display_name, is_admin,
                tokens_revoked_before, auth_provider,
-               account_status, account_kind
+               account_status, account_kind, monitoring_access
           FROM users WHERE id = $1
         """,
         user_id,
@@ -1329,7 +1317,7 @@ async def create_pat(
     async with pool.acquire() as conn:
         async with role_authority_transaction(conn):
             if issuer is None:
-                user_row = await conn.fetchrow("SELECT account_status FROM users WHERE id=$1 FOR UPDATE", uuid.UUID(user_id))
+                user_row = await conn.fetchrow("SELECT account_status, monitoring_access FROM users WHERE id=$1 FOR UPDATE", uuid.UUID(user_id))
             else:
                 await conn.execute("SET LOCAL lock_timeout='5s'")
                 user_rows = await conn.fetch("SELECT * FROM users WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",
@@ -1342,6 +1330,8 @@ async def create_pat(
                 raise NotFoundError("User", user_id)
             if user_row["account_status"] != "active":
                 raise AccountSuspendedError()
+            if user_row["monitoring_access"] is not None:
+                raise ForbiddenError("Monitoring accounts cannot hold API credentials")
             issued_at = datetime.now(timezone.utc)
             if expires_days:
                 try:
@@ -1726,7 +1716,7 @@ async def _project_local_session_principal(
                        CEIL(EXTRACT(EPOCH FROM tokens_revoked_before))::bigint
                            AS revoked_epoch_ceil
                   FROM users
-                 WHERE id = $1 AND account_status = 'active'
+                 WHERE id = $1 AND account_status = 'active' AND monitoring_access IS NULL
                    FOR SHARE
                 """,
                 uuid.UUID(principal.subject),
@@ -1790,7 +1780,7 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
              WHERE t.user_id = u.id
                AND t.token_hash = $1
                AND (t.expires_at IS NULL OR t.expires_at > NOW())
-               AND u.account_status = 'active'
+               AND u.account_status = 'active' AND u.monitoring_access IS NULL
             RETURNING t.id AS token_id, t.user_id, t.scopes, t.vault_scope, t.key_class,
                       t.expires_at, u.username, u.email, u.display_name, u.is_admin,
                       u.account_kind

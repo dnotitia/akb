@@ -138,7 +138,9 @@ async def test_trace_lookup_states(monkeypatch, age_seconds, retention, status, 
     client = httpx.AsyncClient(transport=transport)
     monkeypatch.setattr(trace_detail.httpx, "AsyncClient", lambda **kw: client)
     if expected == 200:
-        assert (await trace_detail.load_trace(uuid4()))["trace_id"] == trace_id.hex
+        assert (await trace_detail.load_trace(uuid4())) == {
+            "spans": [{"name": "tools/call akb_put", "start": datetime.fromtimestamp(0, UTC), "duration_ms": 0}],
+        }
     else:
         with pytest.raises(HTTPException) as exc:
             await trace_detail.load_trace(uuid4())

@@ -11,7 +11,7 @@ function TraceNotice({ error, retry }: { error: Error; retry: () => void }) {
     if (code === "trace_expired") return <Alert variant="info" title="Trace expired">{error.message}</Alert>;
     if (code === "trace_export_pending") return <Alert variant="info" title="Awaiting trace export">{error.message} {retryButton}</Alert>;
     if (error.status === 404) return <Alert variant="warning" title="Trace not found">No matching span is available. {retryButton}</Alert>;
-    if (error.status === 401 || error.status === 403) return <Alert>A product administrator session is required.</Alert>;
+    if (error.status === 401 || error.status === 403) return <Alert>Sign in to MCP monitoring again.</Alert>;
   }
   return <Alert>The trace store could not be reached. {retryButton}</Alert>;
 }
@@ -27,9 +27,9 @@ export function CallTrace({ call, close }: { call: { observation_id: string; too
       {query.isPending && <p role="status">Loading trace…</p>}
       {query.isError && <TraceNotice error={query.error} retry={() => void query.refetch()} />}
       {query.data && !query.isError && <>
-        <p className="break-all text-xs text-foreground-muted">Trace ID <code className="text-foreground">{query.data.trace_id}</code></p>
+        <p className="break-all text-xs text-foreground-muted">Call reference <code className="text-foreground">{call.observation_id}</code></p>
         <ol aria-label="Server spans" className="divide-y divide-border">{query.data.spans.map(span =>
-          <li key={span.span_id} className="flex flex-wrap items-baseline justify-between gap-2 py-3 text-sm">
+          <li key={span.name} className="flex flex-wrap items-baseline justify-between gap-2 py-3 text-sm">
             <span className="font-medium">{span.name}</span>
             <span className="tabular-nums">{span.duration_ms.toLocaleString(undefined, { maximumFractionDigits: 2 })} ms</span>
           </li>)}</ol>
