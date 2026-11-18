@@ -237,8 +237,8 @@ class CliAcceptance:
                 finally:
                     await contender.close()
                 await asyncio.sleep(pause)
-            assert not any(event.get("rpc_method") == "initialize"
-                           for event in self.resource_relay.events[before_resource:]), "explicit login initiated no MCP session"
+            assert not any(event["inner_path"].rstrip("/") == "/mcp"
+                           for event in self.resource_relay.events[before_resource:]), "pending login made no MCP request"
             args = [
                 self.cli[0], str(Path(__file__).with_name("browser-login.mjs")),
                 str(self.capture), str(self.root / f"browser-{index}.json"),
@@ -258,8 +258,8 @@ class CliAcceptance:
                 output, _ = await first.process.process.communicate()
             assert first.process.process.returncode == 0 and output.strip(), "packed login returned successfully after PKCE"
             assert len(self.capture.read_text().splitlines()) == 1, "login launched a single browser"
-            assert not any(event.get("rpc_method") == "initialize"
-                           for event in self.resource_relay.events[before_resource:]), "completed login initiated no MCP session"
+            assert not any(event["inner_path"].rstrip("/") == "/mcp"
+                           for event in self.resource_relay.events[before_resource:]), "completed login made no MCP request"
             return client_id
         finally:
             await first.close()
@@ -389,7 +389,9 @@ async def exercise(args) -> int:
                            "one_login_owner": True, "no_mcp_during_login": True}
         report["stage"] = "signed_grant_and_stdio"
         grant = await acceptance.verify_grant(client_id)
+        before_status = (len(relay.events), len(issuer_relay.events))
         status = await acceptance.status_or_logout("status")
+        assert before_status == (len(relay.events), len(issuer_relay.events)), "status only checks local grant state"
         assert grant["accessToken"] not in status and grant["refreshToken"] not in status, "status protects secrets"
         public_status = json.loads(status)
         assert public_status["clientId"] == client_id and public_status["issuer"] == authority.issuer

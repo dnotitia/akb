@@ -45,9 +45,9 @@ PAT for an independent bytes and MIME check.
 `--hosts` uses isolated temporary Codex and Claude Code configurations. Codex
 uses its app-server to list and call the real MCP tool. Claude Code runs in
 print mode against a deterministic local model endpoint that requests the
-same tool and receives the returned Vault list. Neither host reads the
-operator's host settings, model credentials, sessions, or OAuth store.
-Model inference and user-facing host UI are outside this check.
+same tool and receives the returned Vault list. Each host uses a fresh home,
+provider configuration, and session directory, plus the fixture's OAuth
+grant store.
 
 The runner exits nonzero on a failed check and verifies teardown of the
 processes, containers, networks, volumes, and ports. Read
