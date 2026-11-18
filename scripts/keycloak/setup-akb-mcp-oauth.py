@@ -411,6 +411,8 @@ def main() -> int:
                     f"Disable the alternate Keycloak registration provider {provider} before provisioning"
                 )
         credential = resolve_admin_credential(os.environ)
+        if credential.shadowed:
+            print(f"Ignoring the alternative credential variables {' and '.join(credential.shadowed)}")
         token = get_admin_token(kc, credential)
         base = f"{kc}/admin/realms/{realm}"
         state = api("GET", base, token)

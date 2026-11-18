@@ -500,7 +500,6 @@ async def test_dispatch_read_only_pat_scope_allows_read_tool():
 
 # ── akb_grep: scope depends on the arguments, not just the tool ────
 #
-# Rationale lives with the rule, at `ARG_WRITE_TRIGGERS` in server.py.
 
 
 @pytest.mark.asyncio

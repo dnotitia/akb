@@ -185,7 +185,7 @@ export class OAuthSession {
 
   async #refresh() {
     const started = performance.now();
-    let waitMs = 100;
+    let waitMs = Math.min(1000, this.#options.refreshWaitMs);
     for (;;) {
       checkCancelled(this.#signal);
       const record = this.#read();

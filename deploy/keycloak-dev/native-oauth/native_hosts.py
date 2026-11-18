@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 from pathlib import Path
+import secrets
 import shutil
 
 import uvicorn
@@ -211,7 +212,7 @@ async def claude_probe(binary, root, proxy, proxy_environment, model):
     environment.update({
         "CLAUDE_CONFIG_DIR": str(settings),
         "ANTHROPIC_BASE_URL": model.url,
-        "ANTHROPIC_API_KEY": "local-test-model-key",
+        "ANTHROPIC_API_KEY": secrets.token_urlsafe(24),
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     })
     config = root / "mcp.json"
