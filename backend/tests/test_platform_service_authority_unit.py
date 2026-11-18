@@ -91,7 +91,6 @@ def _configure_workspace(monkeypatch, *, service_admin_client_id: str = SERVICE_
     monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
     monkeypatch.setattr(settings, "api_oauth_audience", API_AUDIENCE, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "mcp_oauth_audience", MCP_AUDIENCE, raising=False)
     monkeypatch.setattr(settings, "public_base_url", "https://akb-workspace.example.com", raising=False)
 
 

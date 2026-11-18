@@ -9,7 +9,7 @@
 # token from a shell script.
 #
 # What this script proves (in order):
-#   1. `/.well-known/oauth-protected-resource` returns the expected shape
+#   1. `/.well-known/oauth-protected-resource/mcp` returns the expected shape
 #   2. `/mcp` rejects no-auth with 401 + WWW-Authenticate including a
 #      `resource_metadata=` parameter (RFC 9728 §5 client tip-off)
 #   3. `/mcp` rejects a syntactically-valid but wrong-audience token
@@ -94,7 +94,14 @@ mcp_tool_call() {
 # ── 1. Protected-resource metadata shape ─────────────────────
 
 section "Protected-resource metadata"
-meta=$(curl -s "${AKB_URL}/.well-known/oauth-protected-resource")
+metadata_url=$(python3 -c '
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+prefix = url.path.rstrip("/")
+print(f"{url.scheme}://{url.netloc}/.well-known/oauth-protected-resource{prefix}/mcp")
+' "$AKB_URL")
+meta=$(curl -s "$metadata_url")
 echo "    ${meta}"
 res=$(echo "$meta" | python3 -c "import sys,json; print(json.load(sys.stdin).get('resource',''))" 2>/dev/null) || true
 if [ -n "$res" ]; then pass "metadata served"; else fail "metadata served" "empty/missing"; fi
@@ -107,8 +114,8 @@ case "$scopes" in *"akb:vault:read"*) pass "scopes_supported lists akb:vault:rea
                       *) fail "scopes_supported lists akb:vault:read" "got '$scopes'" ;; esac
 case "$scopes" in *"akb:vault:write"*) pass "scopes_supported lists akb:vault:write" ;;
                        *) fail "scopes_supported lists akb:vault:write" "got '$scopes'" ;; esac
-case "$scopes" in *"offline_access"*) pass "scopes_supported lists offline_access" ;;
-                      *) fail "scopes_supported lists offline_access" "got '$scopes'" ;; esac
+case "$scopes" in *"offline_access"*) fail "offline_access is not advertised by default" "got '$scopes'" ;;
+                      *) pass "offline_access is not advertised by default" ;; esac
 
 # ── 2. No-auth → 401 + WWW-Authenticate with resource_metadata ──
 
