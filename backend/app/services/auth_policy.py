@@ -1,7 +1,7 @@
 """Deployment-level authentication policy guards."""
 
 from app.config import settings
-from app.exceptions import LocalAuthDisabledError
+from app.exceptions import LocalAuthDisabledError, PersonalAccessTokensDisabledError
 from app.services.sso_browser_session_crypto import (
     BrowserSessionCipher,
     BrowserSessionKeyError,
@@ -36,3 +36,8 @@ def require_local_auth_enabled() -> None:
     """Reject every password/session lifecycle outside canonical local mode."""
     if not settings.local_human_auth_enabled:
         raise LocalAuthDisabledError()
+
+
+def require_pat_enabled() -> None:
+    if not settings.pat_enabled:
+        raise PersonalAccessTokensDisabledError()

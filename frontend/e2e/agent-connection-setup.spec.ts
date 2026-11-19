@@ -4,7 +4,7 @@ test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Uses isolated HTTP fixtures."
 const userId = "00000000-0000-0000-0000-000000000001";
 const tokenId = "00000000-0000-0000-0000-000000000002";
 
-async function setup(page: Page, { oauth = false, dark = false } = {}) {
+async function setup(page: Page, { oauth = false, dark = false, pat = true } = {}) {
   let creations = 0;
   await page.addInitScript(({ dark }) => {
     localStorage.setItem("akb_token", "connection-layout-fixture");
@@ -13,7 +13,7 @@ async function setup(page: Page, { oauth = false, dark = false } = {}) {
   await page.route("**/health/**", route => route.fulfill({ json: {} }));
   await page.route("**/api/**", async route => {
     const path = new URL(route.request().url()).pathname;
-    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: oauth } } });
+    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: oauth }, personal_access_tokens: { enabled: pat }, mcp_endpoint_url: "https://akb.example.test/workspace/mcp/" } });
     if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: userId, username: "reviewer", display_name: "Connection reviewer", email: "reviewer@example.invalid", is_admin: false, auth_method: "local" } });
     if (path.endsWith("/auth/tokens/capabilities")) return route.fulfill({ json: { contract_version: 1, user_id: userId, name_max_length: 255, permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"], vault_scope_semantics: "write_restriction_sql_read_write" } });
     if (path.endsWith("/auth/tokens/issuance")) {
@@ -65,6 +65,18 @@ for (const width of [1440, 375]) for (const oauth of [false, true]) {
     await expect(page.getByRole("button", { name: "Connect an AI tool", exact: true })).toBeFocused();
   });
 }
+
+test("OAuth setup uses the published endpoint while personal keys are disabled", async ({ page }) => {
+  const creations = await setup(page, { oauth: true, pat: false });
+  await page.goto("/settings?tab=tokens");
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Continue with Claude Code" }).click();
+
+  await expect(dialog.getByText(/--transport http/)).toContainText("https://akb.example.test/workspace/mcp/");
+  await expect(dialog.getByRole("radio", { name: "Use a connection key" })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Create connection key" })).toHaveCount(0);
+  expect(creations()).toBe(0);
+});
 
 test("a fresh key stays available across client changes and close requires acknowledgement", async ({ page }) => {
   const creations = await setup(page, { oauth: true });

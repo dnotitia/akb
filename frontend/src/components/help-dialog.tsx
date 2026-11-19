@@ -72,7 +72,7 @@ function HelpContents({ onNavigate, onConnect }: { onNavigate: (href: string) =>
       </div>}
       {topic === "connect" && <div className="space-y-4">
         <p>Your AI tool can use AKB to find and work with knowledge your account can access. Reading and writing in this website is already available; connecting an AI tool is optional.</p>
-        <ol className="list-decimal space-y-3 pl-5"><li>Choose the AI application you use, such as Claude Code or Cursor.</li><li>Add AKB using the instructions for that tool, then approve sign-in or provide a personal connection key.</li><li>Ask the AI tool to list your accessible Vaults and check its actual AKB response.</li></ol>
+        <ol className="list-decimal space-y-3 pl-5"><li>Choose the AI application you use, such as Claude Code or Cursor.</li><li>Open AI connections to see the setup options your deployment supports.</li><li>Ask the AI tool to list your accessible Vaults and check its actual AKB response.</li></ol>
         <p className="text-foreground-muted">Signing in to this website is separate from authorising an AI tool. The setup guide explains where to run each action.</p>
         <Button onClick={onConnect}>Set up an AI connection<ArrowRight className="h-4 w-4" aria-hidden /></Button>
       </div>}

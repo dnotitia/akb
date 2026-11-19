@@ -1,3 +1,5 @@
+import { parseAuthConfig } from "@/lib/api";
+import { localAuthConfig } from "@/stories/page-story-fixtures";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -5,6 +7,8 @@ import { configureAuthTransport, setToken } from "@/lib/api";
 import { defaultPatDraft } from "@/lib/pat-draft";
 import { PatIssuanceForm } from "../pat-issuance-form";
 import { ConnectionSetup } from "../connection-setup";
+
+const connectionConfig = (oauth: boolean) => parseAuthConfig({ ...localAuthConfig, mcp_oauth: { enabled: oauth } });
 
 const uid = "00000000-0000-0000-0000-000000000001", tid = "00000000-0000-0000-0000-000000000002";
 const caps = { contract_version: 1, user_id: uid, name_max_length: 255, permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"], vault_scope_semantics: "write_restriction_sql_read_write" };
@@ -16,7 +20,7 @@ afterEach(() => { setToken(null); configureAuthTransport(null); vi.unstubAllGlob
 
 it("keeps selected SQL restrictions when choosing read only and retains the collapsed summary", async () => {
   const user = userEvent.setup();
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x", restricted: true, prefixes: ["team-"] }} onCreated={vi.fn()} />);
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x", restricted: true, prefixes: ["team-"] }} onCreated={vi.fn()} />);
   await user.click(screen.getByLabelText("Permissions"));
   await user.click(screen.getByRole("menuitemradio", { name: "Read only" }));
   await user.click(screen.getByRole("button", { name: "Advanced options" }));
@@ -28,7 +32,7 @@ it("keeps selected SQL restrictions when choosing read only and retains the coll
 it("keeps selections and supports manual prefixes when the accessible Vault list fails", async () => {
   fetchMock.mockImplementation(url => Promise.resolve(String(url).endsWith("/vaults") ? json({}, 503) : json(caps)));
   const user = userEvent.setup();
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x", restricted: true, vaults: ["kept-vault"] }} onCreated={vi.fn()} />);
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x", restricted: true, vaults: ["kept-vault"] }} onCreated={vi.fn()} />);
   await screen.findByText(/Could not load Vaults/);
   await user.type(screen.getByLabelText("Name prefix"), "future-");
   await user.click(screen.getByRole("button", { name: "Add prefix" }));
@@ -40,7 +44,7 @@ it("requires explicit reset of a restricted legacy draft and sends only name", a
   fetchMock.mockImplementation(url => Promise.resolve(String(url).includes("capabilities") ? json({}, 404) : json({ token_id: tid, name: "x", token: "akb_legacy_secret", prefix: "akb_legacy" })));
   const user = userEvent.setup();
   const onCreated = vi.fn();
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x", permissions: "read" }} onCreated={onCreated} />);
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x", permissions: "read" }} onCreated={onCreated} />);
   expect(await screen.findByRole("button", { name: "Create key with server defaults" })).toBeDisabled();
   expect(posts()).toHaveLength(0);
   await user.click(screen.getByRole("button", { name: "Reset to server defaults" }));
@@ -50,9 +54,21 @@ it("requires explicit reset of a restricted legacy draft and sends only name", a
   expect(onCreated.mock.calls[0][0].verified).toBe(false);
 });
 
+it("keeps a policy rejection from falling back to another issuance endpoint", async () => {
+  fetchMock.mockImplementation(() => Promise.resolve(json({
+    message: "Personal access tokens are disabled", code: "personal_access_tokens_disabled",
+  }, 403)));
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x" }} onCreated={vi.fn()} />);
+
+  await screen.findByText("Personal access tokens are disabled");
+  expect(screen.getByRole("button", { name: "Create connection key" })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Create key with server defaults" })).toBeNull();
+  expect(posts()).toHaveLength(0);
+});
+
 it("does not fall back when the issuance request lands on an old server", async () => {
   fetchMock.mockImplementation((url, init) => Promise.resolve(init.method === "POST" ? json({ detail: "Not found" }, 404) : json(caps)));
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x", permissions: "read" }} onCreated={vi.fn()} />);
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x", permissions: "read" }} onCreated={vi.fn()} />);
   const create = await screen.findByRole("button", { name: "Create connection key" });
   await waitFor(() => expect(create).toBeEnabled()); fireEvent.click(create);
   await screen.findByText("Not found");
@@ -62,7 +78,7 @@ it("does not fall back when the issuance request lands on an old server", async 
 
 it("maps stable field errors to controls and focuses the linked error summary", async () => {
   fetchMock.mockImplementation((url, init) => Promise.resolve(init.method === "POST" ? json({ message: "Invalid request", code: "token_issuance_validation", details: { fields: [{ field: "expires_at", code: "past", message: "Choose a future expiration." }] } }, 422) : json(caps)));
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x", expiration: "30" }} onCreated={vi.fn()} />);
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x", expiration: "30" }} onCreated={vi.fn()} />);
   await waitFor(() => expect(screen.getByRole("button", { name: "Create connection key" })).toBeEnabled());
   fireEvent.click(screen.getByRole("button", { name: "Create connection key" }));
   await screen.findByRole("link", { name: "Choose a future expiration." });
@@ -73,7 +89,7 @@ it("maps stable field errors to controls and focuses the linked error summary", 
 it("prevents duplicate issuance and requires checking an uncertain result before another creation", async () => {
   let resolve!: (response: Response) => void;
   fetchMock.mockImplementation((url, init) => init.method === "POST" ? new Promise<Response>(r => { resolve = r; }) : Promise.resolve(json(caps)));
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x" }} onCreated={vi.fn()} />);
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x" }} onCreated={vi.fn()} />);
   await waitFor(() => expect(screen.getByRole("button", { name: "Create connection key" })).toBeEnabled());
   const form = screen.getByLabelText("Connection key name").closest("form")!;
   fireEvent.submit(form); fireEvent.submit(form);
@@ -88,7 +104,7 @@ it("prevents duplicate issuance and requires checking an uncertain result before
 it("removes masked secrets from the DOM and clears token-bearing snippets after a session change", async () => {
   fetchMock.mockImplementation((url, init) => Promise.resolve(init.method === "POST" ? json({ contract_version: 1, user_id: uid, token_id: tid, name: "x", token: "akb_one_time_secret", prefix: "akb_one", issued_at: "2030-01-01T00:00:00Z", key_class: "pat", scopes: ["read", "write"], vault_scope: null, expires_at: null }) : json(caps)));
   const user = userEvent.setup();
-  render(<ConnectionSetup mcpOauthEnabled={false} />);
+  render(<ConnectionSetup authConfig={parseAuthConfig(localAuthConfig)} />);
   await user.click(screen.getByRole("button", { name: "Continue with Claude Code" }));
   await user.type(screen.getByLabelText("Connection key name"), "x");
   await user.click(screen.getByRole("button", { name: "Create connection key" }));
@@ -106,7 +122,7 @@ it("removes masked secrets from the DOM and clears token-bearing snippets after 
 it.each(["saved token", "OAuth"])("preserves the draft and uncertain result across %s switches", async mode => {
   const user = userEvent.setup();
   const dirty = vi.fn();
-  render(<ConnectionSetup mcpOauthEnabled={mode === "OAuth"} onDirtyChange={dirty}
+  render(<ConnectionSetup authConfig={connectionConfig(mode === "OAuth")} onDirtyChange={dirty}
     initialDraft={{ ...defaultPatDraft(), name: "limited", permissions: "read", expiration: "30", restricted: true, prefixes: ["team-"] }} />);
   await user.click(screen.getByRole("button", { name: "Continue with Claude Code" }));
   if (mode === "OAuth") await user.click(screen.getByRole("radio", { name: "Use a connection key" }));

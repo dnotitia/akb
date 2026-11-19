@@ -5,7 +5,7 @@ import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-c
 import { useDocumentHistoryGuard } from "@/hooks/use-document-history-guard";
 import { Circle, SlidersHorizontal, X } from "lucide-react";
 import { SETTINGS_SECTIONS as SECTIONS, settingsSection } from "@/lib/settings-sections";
-import { getAuthConfig, getMe, listPATs, adminListUsers, type AuthConfig, type AdminUser } from "@/lib/api";
+import { getAuthConfig, AUTH_CONFIG_UNAVAILABLE, getMe, listPATs, adminListUsers, type AuthConfig, type AdminUser } from "@/lib/api";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -35,6 +35,7 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
   const { checking, revision } = useAccessVerification();
   const shellUser = useCurrentUser();
   const readGeneration = useRef(0);
+  const configGeneration = useRef(0);
   const patsGeneration = useRef(0);
   const usersGeneration = useRef(0);
   const [patsLoading, setPatsLoading] = useState(false);
@@ -46,7 +47,7 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
   const [patsError, setPatsError] = useState(false);
   const [users, setUsers] = useState<AdminUser[] | null>(null);
   const [usersError, setUsersError] = useState(false);
-  const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
+  const [authConfig, setAuthConfig] = useState<AuthConfig>(AUTH_CONFIG_UNAVAILABLE);
   const [requestedTab, setRequestedTab] = useState(initialTab);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -91,6 +92,14 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
     window.addEventListener("beforeunload", protect);
     return () => window.removeEventListener("beforeunload", protect);
   }, [dirty, busy]);
+  async function retryAuthConfig() {
+    const generation = readGeneration.current;
+    const request = ++configGeneration.current;
+    const config = await getAuthConfig();
+    if (mounted.current && generation === readGeneration.current && request === configGeneration.current) {
+      setAuthConfig(config);
+    }
+  }
   const loadPATs = useCallback(async () => {
     const generation = readGeneration.current;
     const request = ++patsGeneration.current;
@@ -193,13 +202,13 @@ export default function SettingsDialog({ initialTab = "profile", onClose, onNavi
           <Activity mode={verified ? "visible" : "hidden"}><div>{user && <>
             <TabsContent value="preferences" className="pt-0"><PreferencesSection /></TabsContent>
             <TabsContent value="notifications" className="pt-0"><NotificationsSection onBusyChange={reportBusy} /></TabsContent>
-            <TabsContent value="tokens" className="pt-0"><TokensSection initialView={connectionView} key={user.user_id} visible={verified} ownsOperation={ownsOperation} pats={pats} patsError={patsError} patsLoading={patsLoading} mcpOauthEnabled={authConfig?.available === true && authConfig.mcp_oauth.enabled} onReloadPats={loadPATs} onDirtyChange={reportDirty} onBusyChange={reportBusy} /></TabsContent>
+            <TabsContent value="tokens" className="pt-0"><TokensSection initialView={connectionView} key={user.user_id} visible={verified} ownsOperation={ownsOperation} pats={pats} patsError={patsError} patsLoading={patsLoading} authConfig={authConfig} onRetryAuthConfig={() => void retryAuthConfig()} onReloadPats={loadPATs} onDirtyChange={reportDirty} onBusyChange={reportBusy} /></TabsContent>
           </>}</div></Activity>
         </div>
       </Tabs>
       <ConfirmDialog open={verified && pending !== null} onOpenChange={open => { if (!open) setPending(null); }} returnFocusRef={confirmFocus}
         title={activeTab === "tokens" ? "Leave AI connections?" : "Discard unsaved changes?"}
-        description={activeTab === "tokens" ? "Unfinished connection setup will be cleared. Save any new key or its configuration privately first; it cannot be shown again. Existing keys remain active." : "Your profile, photo or password changes have not been saved. Keep editing, or discard them to continue."}
+        description={activeTab === "tokens" ? "Unfinished connection setup will be cleared. Save any new key or its configuration privately first; it cannot be shown again. Existing keys are retained." : "Your profile, photo or password changes have not been saved. Keep editing, or discard them to continue."}
         confirmLabel={activeTab === "tokens" ? "Leave section" : "Discard changes"} cancelLabel={activeTab === "tokens" ? "Stay here" : "Keep editing"} variant="destructive"
         onConfirm={() => { if (pending) { setDirty(false); execute(pending); } }} />
     </DialogContent>

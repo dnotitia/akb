@@ -14,7 +14,7 @@ import { HomeRecentUpdates } from "@/components/home-recent-updates";
 import type { VaultRow } from "@/components/vault-list";
 import { useVaultFavorites } from "@/hooks/use-vault-favorites";
 import { useAccessVerification, useCurrentUser } from "@/contexts/current-user-context";
-import { listPATs, getAuthConfig } from "@/lib/api";
+import { listPATs, getAuthConfig, AUTH_CONFIG_UNAVAILABLE, type AuthConfig } from "@/lib/api";
 import { useHomeVaultDirectory, useHomeVaultMetrics, type VaultMetrics } from "@/hooks/use-home-inventory";
 import { readRecentDocumentViews, type RecentDocumentView } from "@/lib/recent-document-views";
 
@@ -37,8 +37,9 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
   const [recentViews, setRecentViews] = useState<RecentDocumentView[]>([]);
   const { isFavorite, toggleFavorite, favOrder } = useVaultFavorites();
   const [connection, setConnection] = useState<"loading" | "unused" | "used" | "unknown">("loading");
-  const [oauthEnabled, setOauthEnabled] = useState(false);
-  const [setupAvailable, setSetupAvailable] = useState(false);
+  const [authConfig, setAuthConfig] = useState<AuthConfig>(AUTH_CONFIG_UNAVAILABLE);
+  const [authConfigRevision, setAuthConfigRevision] = useState(0);
+  const setupAvailable = authConfig.available && (authConfig.personal_access_tokens.enabled || authConfig.mcp_oauth.enabled);
   const [createOpen, setCreateOpen] = useState(false);
   const createTrigger = useRef<HTMLButtonElement | null>(null);
 
@@ -56,14 +57,16 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
       if (cancelled) return;
       setConnection(Array.isArray(data.tokens) ? data.tokens.length > 0 ? "used" : "unused" : "unknown");
     }).catch(() => { if (!cancelled) setConnection("unknown"); });
-    getAuthConfig().then(config => {
-      if (!cancelled) {
-        setOauthEnabled(config.available && config.mcp_oauth.enabled);
-        setSetupAvailable(config.available);
-      }
-    }).catch(() => { /* Optional: token connection remains available. */ });
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getAuthConfig().then(config => {
+      if (!cancelled) setAuthConfig(config);
+    });
+    return () => { cancelled = true; };
+  }, [authConfigRevision]);
 
   useEffect(() => {
     setRecentViews(readRecentDocumentViews(userId, 12));
@@ -143,7 +146,7 @@ function HomeWorkspace({ userId, accessChecking, accessRevision }: { userId: str
       <section className="min-w-0" aria-label="Watched document updates"><HomeRecentUpdates scope="watching" /></section>
     </div>
 
-    <HomeConnectionInvitation userId={userId} eligible={connection === "unused" && setupAvailable && !verifyingDirectory && !error && vaults.length > 0} oauthEnabled={oauthEnabled} onTokenCreated={() => setConnection("used")} />
+    <HomeConnectionInvitation userId={userId} eligible={connection === "unused" && setupAvailable && !verifyingDirectory && !error && vaults.length > 0} authConfig={authConfig} onRetryAuthConfig={() => setAuthConfigRevision(value => value + 1)} onTokenCreated={() => setConnection("used")} />
     <VaultCreateDialog open={createOpen} onOpenChange={setCreateOpen} returnFocusRef={createTrigger}
       onCreated={name => navigate(`/vault/${encodeURIComponent(name)}`)} onOpenExisting={name => navigate(`/vault/${encodeURIComponent(name)}`)} />
   </div></>;

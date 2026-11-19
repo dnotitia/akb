@@ -25,7 +25,7 @@ for (const scenario of [
     const url = new URL(request.url());
     const path = url.pathname;
     const respond = (json: unknown, status = 200) => route.fulfill({ json, status });
-    if (path.endsWith("/auth/config")) return respond({ schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } });
+    if (path.endsWith("/auth/config")) return respond({ schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" });
     if (path.endsWith("/auth/me")) return respond({ user_id: "table-pagination-fixture", username: "fixture", email: "reader@example.invalid", is_admin: false });
     if (path.endsWith("/vaults")) return respond({ vaults: [{ name: "fixture", role: "reader" }] });
     if (path.endsWith("/info")) return respond({ name: "fixture", role: "reader", is_archived: false, is_external_git: false });

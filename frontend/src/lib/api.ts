@@ -386,10 +386,7 @@ export interface AuthProviderOption {
   login_url: string | null;
 }
 
-export interface AuthConfig {
-  available: boolean;
-  schema_version: 2 | null;
-  auth_mode: AuthMode | null;
+interface AuthConfigCapabilities {
   local_auth: { enabled: boolean };
   keycloak: {
     enabled: boolean;
@@ -397,7 +394,13 @@ export interface AuthConfig {
   };
   providers: AuthProviderOption[];
   mcp_oauth: { enabled: boolean };
+  personal_access_tokens: { enabled: boolean };
 }
+
+export type AuthConfig = AuthConfigCapabilities & (
+  | { available: true; schema_version: 3; auth_mode: AuthMode; mcp_endpoint_url: string }
+  | { available: false; schema_version: null; auth_mode: null; mcp_endpoint_url: null }
+);
 
 export const AUTH_CONFIG_UNAVAILABLE: AuthConfig = {
   available: false,
@@ -410,6 +413,8 @@ export const AUTH_CONFIG_UNAVAILABLE: AuthConfig = {
   },
   providers: [],
   mcp_oauth: { enabled: false },
+  personal_access_tokens: { enabled: false },
+  mcp_endpoint_url: null,
 };
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -435,19 +440,39 @@ function hasControlCharacters(value: string): boolean {
   });
 }
 
-function parseV2AuthConfig(value: unknown): AuthConfig | null {
+function isMcpEndpointUrl(value: unknown): value is string {
+  if (typeof value !== "string" || !/^https?:\/\/[^/@]+\//.test(value) || /[\s\\?#]/.test(value) || hasControlCharacters(value)) {
+    return false;
+  }
+  try {
+    const url = new URL(value);
+    return Boolean(url.hostname) && !url.username && !url.password && url.pathname.endsWith("/mcp/");
+  } catch {
+    return false;
+  }
+}
+
+function parseV3AuthConfig(value: unknown): AuthConfig | null {
   const root = record(value);
   const localAuth = record(root?.local_auth);
   const keycloak = record(root?.keycloak);
   const mcpOauth = record(root?.mcp_oauth);
+  const personalAccessTokens = record(root?.personal_access_tokens);
+  const mcpEndpointUrl = root?.mcp_endpoint_url;
   const mode = root?.auth_mode;
   const providerValues = root?.providers;
   if (
-    !hasExactKeys(root, ["schema_version", "auth_mode", "local_auth", "keycloak", "providers", "mcp_oauth"]) ||
+    !hasExactKeys(root, [
+      "schema_version", "auth_mode", "local_auth", "keycloak", "providers", "mcp_oauth",
+      "personal_access_tokens", "mcp_endpoint_url",
+    ]) ||
     !hasExactKeys(localAuth, ["enabled"]) ||
     !hasExactKeys(keycloak, ["enabled", "browser_session_ready"]) ||
     !hasExactKeys(mcpOauth, ["enabled"]) ||
-    root?.schema_version !== 2 ||
+    !hasExactKeys(personalAccessTokens, ["enabled"]) ||
+    typeof personalAccessTokens.enabled !== "boolean" ||
+    !isMcpEndpointUrl(mcpEndpointUrl) ||
+    root?.schema_version !== 3 ||
     (mode !== "local" && mode !== "sso") ||
     typeof localAuth?.enabled !== "boolean" ||
     typeof keycloak?.enabled !== "boolean" ||
@@ -499,7 +524,7 @@ function parseV2AuthConfig(value: unknown): AuthConfig | null {
   }
   return {
     available: true,
-    schema_version: 2,
+    schema_version: 3,
     auth_mode: mode,
     local_auth: { enabled: localAuth.enabled },
     keycloak: {
@@ -508,17 +533,19 @@ function parseV2AuthConfig(value: unknown): AuthConfig | null {
     },
     providers,
     mcp_oauth: { enabled: mcpOauth.enabled },
+    personal_access_tokens: { enabled: personalAccessTokens.enabled },
+    mcp_endpoint_url: mcpEndpointUrl,
   };
 }
 
 export function parseAuthConfig(value: unknown): AuthConfig {
-  return parseV2AuthConfig(value) ?? AUTH_CONFIG_UNAVAILABLE;
+  return parseV3AuthConfig(value) ?? AUTH_CONFIG_UNAVAILABLE;
 }
 
 /** Versioned public capabilities. Any transport/schema error is deny-all. */
 export async function getAuthConfig(): Promise<AuthConfig> {
   try {
-    const response = await fetch(`${API_BASE}/auth/config`);
+    const response = await fetch(`${API_BASE}/auth/config`, { cache: "no-store" });
     if (!response.ok) return AUTH_CONFIG_UNAVAILABLE;
     const config = parseAuthConfig(await response.json());
     if (config.available && config.auth_mode !== null) {

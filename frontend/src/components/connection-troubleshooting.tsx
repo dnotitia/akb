@@ -7,7 +7,7 @@ export function ConnectionTroubleshooting() {
       ["The tool cannot reach AKB", "Check connectivity from the computer running your AI tool, including any required VPN. Claude web and Desktop remote connectors connect from Claude's cloud; they need their own network access. A browser check alone cannot prove that path works."],
       ["A Vault is missing from the result", "Check the account used in the AI tool and ask the Vault owner to share access. An empty Vault list can be a successful connection with no accessible Vaults."],
       ["A key creation request was interrupted", "Before requesting another key, open Connection keys in AI connections and check whether the first request created one. Keep existing keys active until you have reviewed the result."],
-      ["I only have part of a connection key", "The key list shows an identifying prefix, not the full secret. Use the complete key you saved, or create a new one in AI connections. Replacing a key and revoking the old one are separate actions."],
+      ["I only have part of a connection key", "The key list shows an identifying prefix, not the full secret. Open AI connections to review the methods available to your tool. You can manage saved keys in Connection keys."],
     ].map(([title, description]) => <details key={title} className="rounded-[var(--radius-md)] border border-border bg-surface">
       <summary className="cursor-pointer px-3 py-3 font-medium text-foreground focus-ring-instant">{title}</summary>
       <p className="px-3 pb-3 leading-relaxed text-foreground-muted">{description}</p>

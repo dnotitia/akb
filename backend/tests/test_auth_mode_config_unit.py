@@ -42,6 +42,7 @@ def test_runtime_load_accepts_explicit_local_auth_mode(
     loaded = _load(monkeypatch, tmp_path, {"auth_mode": "local"})
 
     assert loaded.auth_mode == "local"
+    assert loaded.pat_enabled is True
     assert loaded.local_human_auth_enabled is True
     assert loaded.sso_human_auth_enabled is False
 
@@ -672,3 +673,22 @@ def test_startup_rejects_hs256_after_local_v2_cutover(
 
     with pytest.raises(RuntimeError, match="local-session-rs256-v2"):
         lifecycle._validate_required_settings()
+
+
+@pytest.mark.parametrize("mode", ["local", "sso"])
+@pytest.mark.parametrize("oauth_enabled", [False, True])
+@pytest.mark.parametrize("pat_enabled", [False, True])
+def test_pat_policy_loads_independently_of_browser_mode_and_mcp_oauth(
+    monkeypatch, tmp_path, mode, oauth_enabled, pat_enabled,
+):
+    config = _load(monkeypatch, tmp_path, {
+        "auth_mode": mode,
+        "mcp_oauth_enabled": oauth_enabled,
+        "keycloak_enabled": mode == "sso" or oauth_enabled,
+        "pat_enabled": pat_enabled,
+        "public_base_url": "https://akb.example.test/workspace/",
+    })
+
+    assert config.require_auth_mode() == mode
+    assert config.mcp_oauth_enabled is oauth_enabled
+    assert config.pat_enabled is pat_enabled

@@ -31,7 +31,7 @@ async function fixture(page: Page, { dark = false, reader = false } = {}) {
     const url = new URL(route.request().url());
     const path = url.pathname;
     let json: object = { items: [], history: [], changes: [], relations: [], tokens: [], templates: [], subscribed: false, unread_count: 0 };
-    if (path.endsWith("/auth/config")) json = { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } };
+    if (path.endsWith("/auth/config")) json = { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" };
     else if (path.endsWith("/auth/me")) json = { user_id: "focus-user", username: "fixture", display_name: "Focus reviewer", email: "focus@example.invalid", auth_method: "local", key_class: null, is_admin: false };
     else if (path.endsWith("/vaults")) json = { vaults: [{ id: "fixture", name: "fixture", role }] };
     else if (path.endsWith("/info")) json = { name: "fixture", role, description: "Focused exploration fixture", public_access: "none", document_count: 77, collection_count: 8, file_count: 1, table_count: 1, is_archived: false, is_external_git: false };

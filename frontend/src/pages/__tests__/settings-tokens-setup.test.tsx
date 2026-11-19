@@ -23,7 +23,7 @@ vi.mock("@/lib/api", async () => ({
   // these tests stay focused on the PAT-mint UX they were written for.
   getAuthConfig: vi.fn().mockResolvedValue({
     available: true,
-    schema_version: 2,
+    schema_version: 3,
     auth_mode: "local",
     local_auth: { enabled: true },
     keycloak: {
@@ -32,6 +32,8 @@ vi.mock("@/lib/api", async () => ({
     },
     providers: [],
     mcp_oauth: { enabled: false },
+    personal_access_tokens: { enabled: true },
+    mcp_endpoint_url: "https://akb.example.test/mcp/",
   }),
 }));
 
@@ -101,7 +103,7 @@ describe("Shared connection setup", () => {
     const { getAuthConfig, getMe, listPATs } = await import("@/lib/api");
     (getAuthConfig as any).mockResolvedValue({
       available: true,
-      schema_version: 2,
+      schema_version: 3,
       auth_mode: "sso",
       local_auth: { enabled: false },
       keycloak: {
@@ -115,6 +117,8 @@ describe("Shared connection setup", () => {
         login_url: null,
       }],
       mcp_oauth: { enabled: true },
+      personal_access_tokens: { enabled: true },
+      mcp_endpoint_url: "https://akb.example.test/mcp/",
     });
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
     (listPATs as any).mockResolvedValue({

@@ -131,8 +131,8 @@ export function SecuritySection({ user, onBusyChange, onDirtyChange, ownsOperati
     ? "Sign out all your AKB browser sessions, including this device. You can sign in again with SSO."
     : "Sign out all supported local login sessions, including this device. You will need to sign in again.";
   const sessionExclusions = ssoSession
-    ? "Your identity provider (SSO) session and personal access tokens (PATs) remain active. Your account and Vault data are preserved."
-    : "Personal access tokens (PATs) and agent connections remain active.";
+    ? "Your identity provider (SSO) session remains active. Your personal access tokens (PATs) are retained. Your account and Vault data are preserved."
+    : "Your personal access tokens (PATs) are retained.";
   const canDelete = !managedAccount && !!preview && preview.data.deletion.supported && preview.data.deletion.allowed && preview.data.deletion.blockers.length === 0 && preview.data.deletion.confirmation === "username_and_current_password";
   function close() { if (!busyRef.current) { setStep("none"); setPassword(""); } }
   async function execute(kind: "sessions" | "delete") {

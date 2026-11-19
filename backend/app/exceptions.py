@@ -185,6 +185,15 @@ class LocalAuthDisabledError(AKBError):
         )
 
 
+class PersonalAccessTokensDisabledError(AKBError):
+    def __init__(self):
+        super().__init__(
+            "Personal access tokens are disabled",
+            status_code=403,
+            code="personal_access_tokens_disabled",
+        )
+
+
 class MembershipRequiredError(AKBError):
     """A verified external user has no pre-provisioned AKB membership."""
 

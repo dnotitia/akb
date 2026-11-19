@@ -20,8 +20,8 @@ async function setup(page: Page, { sso = false, legacy = false, dark = false } =
   await page.route("**/api/**", async route => {
     const request = route.request(); const url = new URL(request.url()); const method = request.method();
     if (url.pathname.endsWith("/auth/config")) return route.fulfill({ json: {
-      schema_version: 2, auth_mode: sso ? "sso" : "local", local_auth: { enabled: !sso },
-      keycloak: { enabled: sso, browser_session_ready: sso }, providers: [], mcp_oauth: { enabled: false },
+      schema_version: 3, auth_mode: sso ? "sso" : "local", local_auth: { enabled: !sso },
+      keycloak: { enabled: sso, browser_session_ready: sso }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/",
     } });
     if (url.pathname.endsWith("/auth/me")) return route.fulfill({ json: {
       user_id: fixture.userId, username: "photo-reviewer", email: "photo@example.invalid",

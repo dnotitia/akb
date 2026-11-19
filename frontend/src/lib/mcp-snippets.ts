@@ -21,13 +21,18 @@ export const MCP_AGENT_FILES: Record<McpAgent, string> = {
   openclaw: "openclaw.json",
 };
 
-/** The AKB MCP endpoint the local `akb-mcp` proxy connects to. */
-export const MCP_URL = `${window.location.origin}/mcp/`;
+function shellArgument(value: string): string {
+  return /^[a-zA-Z0-9_./:@%=-]+$/.test(value) ? value : "'" + value.replaceAll("'", "'\"'\"'") + "'";
+}
 
-/** Per-agent install snippet wiring `akb-mcp` to this instance with a PAT. */
-export function mcpInstallSnippets(pat: string): Record<McpAgent, string> {
-  const args = ["akb-mcp", "--url", MCP_URL, "--pat", pat, "--insecure"];
-  const cmd = `npx ${args.join(" ")}`;
+export function supportsMcpProxyEndpoint(endpoint: string): boolean {
+  const url = new URL(endpoint);
+  return url.protocol === "https:" || (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
+}
+
+export function mcpInstallSnippets(endpoint: string, pat: string): Record<McpAgent, string> {
+  const args = ["akb-mcp", "--url", endpoint, "--pat", pat];
+  const cmd = `npx ${args.map(shellArgument).join(" ")}`;
   return {
     claude: `claude mcp add --scope user akb -- ${cmd}`,
     cursor: JSON.stringify({ mcpServers: { akb: { command: "npx", args } } }, null, 2),
@@ -37,25 +42,11 @@ export function mcpInstallSnippets(pat: string): Record<McpAgent, string> {
   };
 }
 
-/**
- * Per-agent install snippet for the OAuth Resource Server path — no PAT
- * required, the agent does Dynamic Client Registration + an OAuth 2.1
- * authorization-code flow against the AKB-configured OIDC provider (Keycloak
- * in the reference deployment) and stores the resulting tokens itself.
- *
- * Only meaningful when the backend has `mcp_oauth_enabled = true`. Surfaced
- * from `/api/v1/auth/config.mcp_oauth.enabled` so the UI can pick which
- * snippet to render.
- *
- * Agents that don't support remote-HTTP MCP at all (e.g. stdio-only
- * clients) are not present in the result — callers should treat keys as
- * optional and fall back to the PAT snippet.
- */
-export function mcpOAuthSnippets(): Partial<Record<McpAgent, string>> {
+export function mcpOAuthSnippets(endpoint: string): Partial<Record<McpAgent, string>> {
   return {
     // Register in the terminal; authenticate using /mcp inside Claude Code.
-    claude: `claude mcp add --scope user --transport http akb ${MCP_URL}`,
-    cursor: JSON.stringify({ mcpServers: { akb: { url: MCP_URL } } }, null, 2),
-    vscode: JSON.stringify({ servers: { akb: { type: "http", url: MCP_URL } } }, null, 2),
+    claude: `claude mcp add --scope user --transport http akb ${shellArgument(endpoint)}`,
+    cursor: JSON.stringify({ mcpServers: { akb: { url: endpoint } } }, null, 2),
+    vscode: JSON.stringify({ servers: { akb: { type: "http", url: endpoint } } }, null, 2),
   };
 }

@@ -20,7 +20,7 @@ async function fixture(page: Page, dark = false, navigationVisible = "1") {
   await page.route("**/api/v1/**", route => {
     const path = new URL(route.request().url()).pathname;
     let json: object = { items: [], history: [], changes: [], relations: [], templates: [], unread_count: 0 };
-    if (path.endsWith("/auth/config")) json = { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } };
+    if (path.endsWith("/auth/config")) json = { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" };
     else if (path.endsWith("/auth/me")) json = { user_id: "focus-owner", username: "owner", display_name: "Review owner", email: "owner@example.invalid", auth_method: "local", is_admin: false };
     else if (path.endsWith("/vaults")) json = { vaults: [{ id: "focus-vault", name: "fixture", role: "owner" }] };
     else if (path.endsWith("/info")) json = { name: "fixture", role: "owner", public_access: "none", description: "A place for operating knowledge.", owner_display_name: "Review owner", created_at: "2026-09-01T09:00:00Z", member_count: 1, document_count: 2, collection_count: 1, table_count: 0, file_count: 0 };
