@@ -34,7 +34,7 @@ function SetupChoice<Value extends string>({ label, name, value, options, disabl
 }) {
   return <fieldset disabled={disabled} className="connection-compact-choices min-w-0">
     <legend className="mb-2 text-xs font-medium text-foreground-muted">{label}</legend>
-    <div className="connection-choice-row flex flex-wrap gap-1">
+    <div className="connection-choice-row flex flex-wrap gap-1" data-pair={options.length === 2 || undefined}>
       {options.map(option => <label key={option.value} data-selected={value === option.value} data-disabled={disabled || Boolean(option.disabled)} className="connection-choice-option">
         <input type="radio" className="sr-only" name={name} value={option.value} disabled={option.disabled} checked={value === option.value} onChange={() => onChange(option.value)} />
         {option.label}
@@ -181,13 +181,15 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
 
       <SetupStep id={`${id}-add`} number={2} title={`Add AKB to ${MCP_AGENT_LABELS[agent]}`} description="Follow the instructions on the computer where this AI tool runs."
         current={currentStep === 2} sectionRef={element => { stepsRef.current[1] = element; }}>
-        {endpoint && <p className="break-all text-xs text-foreground-muted">Installation endpoint <code className="text-foreground">{endpoint}</code></p>}
+        {endpoint && !loginCommand && <p className="break-all text-xs text-foreground-muted">Installation endpoint <code className="text-foreground">{endpoint}</code></p>}
         {methods.length > 0 && <div className="space-y-4">
           <div className="space-y-2">
             <SetupChoice label="Connection transport" name={`${id}-transport`} value={transportAvailable(transport) ? transport : null} disabled={creating}
               options={TRANSPORTS.map(value => ({ value, label: TRANSPORT_LABELS[value], disabled: !transportAvailable(value) }))}
               onChange={value => { setTransport(value); setConfigurationRevision(revision => revision + 1); }} />
-            <p className="text-xs leading-relaxed text-foreground-muted">The local helper runs on your computer and adds local file tools. A direct connection lets your AI tool reach AKB without those file tools.</p>
+            {!loginCommand && <p className="text-xs leading-relaxed text-foreground-muted">{transport === "stdio"
+              ? "The helper runs on your computer and adds local file tools."
+              : "Your AI tool connects to AKB directly. Local file tools require the helper."}</p>}
             {transport !== "http" && !transportAvailable("http") && <p className="text-xs text-foreground-muted">This guide has no tested direct HTTP preset for {MCP_AGENT_LABELS[agent]} with the available authentication methods.</p>}
           </div>
           {authenticationOptions.length > 0 && <SetupChoice label="Authentication" name={`${id}-auth`} value={selectedAuthentication} disabled={creating}
@@ -195,7 +197,6 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
             onChange={value => { setAuthentication(value); setConfigurationRevision(revision => revision + 1); }} />}
           {missingMethods.length > 0 && <p className="text-xs leading-relaxed text-foreground-muted">This guide has no tested {TRANSPORT_LABELS[transport]} preset for {MCP_AGENT_LABELS[agent]} with {missingMethods.map(method => AUTHENTICATION_LABELS[method]).join(" or ")}. {!selectedAuthentication && "Choose an available transport or authentication method."}</p>}
           {authentication !== null && !methods.includes(authentication) && <Alert variant="info">This installation no longer allows the selected authentication method. Choose an available method or ask your administrator about the policy.</Alert>}
-          {selectedAuthentication === "oauth" && <p className="text-xs leading-relaxed text-foreground-muted">The installation’s authorization server handles sign-in and may use your organization’s SSO. Signing in to this website does not authorize your AI tool or local helper.</p>}
         </div>}
         {invalidationNotice && <Alert variant="warning">{invalidationNotice}</Alert>}
         {endpoint && methods.length > 0 && !secureEndpoint && <Alert variant="warning">Connection setup requires HTTPS or loopback HTTP. Ask your administrator to check the installation’s public MCP address and use a trusted certificate.</Alert>}
@@ -229,8 +230,13 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
         </div>}
         {configuration && currentStep === 2 ? <div className="space-y-3">
           {loginCommand && <>
-            <div className="connection-instruction"><span>1</span><div><h4>Sign in from your terminal</h4><p>Use akb-mcp 2.4.0 or later with a supported Node.js release on macOS or Linux. If a previous setup set AKB_PAT, remove it from this terminal and your AI tool’s environment. Run the command as the same OS user that runs the helper. Finish sign-in in the browser and wait for the command to exit.</p></div></div>
+            <div className="connection-instruction"><span>1</span><div><h4>Sign in from your terminal</h4><p>Clear <code>AKB_PAT</code> in your terminal and AI tool first.</p></div></div>
             <CodeSnippet key={`login:${endpoint}:${configurationRevision}`} code={loginCommand} filename="Terminal · AKB sign-in" />
+            <div className="space-y-1 text-xs leading-relaxed text-foreground-muted">
+              <p>The helper runs on your computer and adds local file tools. Run the command as the same OS user that runs the helper. Complete browser sign-in and wait for the command to finish.</p>
+              <p className="break-all">Installation endpoint <code className="text-foreground">{endpoint}</code></p>
+              <p>Requires akb-mcp 2.4.0 or later and a supported Node.js release on macOS or Linux.</p>
+            </div>
           </>}
           <div className="connection-instruction"><span>{loginCommand ? 2 : 1}</span><div><h4>Open the right place</h4><p>{guide.location}</p></div></div>
           <div className="connection-instruction"><span>{loginCommand ? 3 : 2}</span><div><h4>Add this setup</h4><p>{guide.add}</p></div></div>
@@ -242,6 +248,7 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
             ? "The local helper uses the sign-in saved by the terminal command."
             : "The local helper uses your personal connection key."} If npx asks to download akb-mcp, allow it to continue.</p>}
         </div> : showPatControls && <p role="status" className="rounded-[var(--radius-md)] bg-surface-muted p-3 text-sm text-foreground-muted">{freshToken && !showSecret ? "Your key and setup are hidden. Show them above when you are ready to copy." : "Create a connection key or enter the full key you saved. Your setup will appear here."}</p>}
+        {selectedAuthentication === "oauth" && <p className="text-xs leading-relaxed text-foreground-muted">The installation’s authorization server handles sign-in and may use your organization’s SSO. Your AI tool or helper signs in separately from this website.</p>}
         <div className="connection-step-actions"><Button variant="outline" disabled={creating} onClick={() => jumpToStep(1)}><ArrowLeft className="h-4 w-4" aria-hidden />Choose a tool</Button>
           <Button disabled={creating || !configuration} onClick={() => jumpToStep(3)}>Check in {MCP_AGENT_LABELS[agent]}<ArrowRight className="h-4 w-4" aria-hidden /></Button></div>
       </SetupStep>

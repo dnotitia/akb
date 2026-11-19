@@ -60,8 +60,8 @@ confirmations remain authoritative.
 
 Within Agent connections and token replacement, AI-tool, connection transport, and authentication
 choices use content-sized 32px pills with the same soft selected state as Vault
-Settings shortcuts. They wrap instead of filling equal-width columns; touch
-targets remain 44px. These remain native radio groups because they select form
+Settings shortcuts. Pairs can wrap their labels inside each pill in narrow
+frames. Touch targets remain 44px. These remain native radio groups because they select form
 values. Switching choices preserves the current credential draft and receipt.
 
 AI connections uses three explicit stages: Choose a tool → Add AKB → Check in

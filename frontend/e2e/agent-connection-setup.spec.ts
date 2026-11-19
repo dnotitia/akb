@@ -46,7 +46,7 @@ for (const width of [1440, 375]) for (const oauth of [false, true]) {
       await expect(modal.getByRole("radio", { name: "Sign in with AKB (OAuth/SSO)" })).toBeChecked();
       const transport = modal.getByRole("group", { name: "Connection transport" });
       await expect(transport.getByRole("radio", { name: "Local helper (stdio)" })).toBeChecked();
-      await expect(modal.getByLabel("Terminal · AKB sign-in")).toBeVisible();
+      await expect(modal.getByLabel("Terminal · AKB sign-in")).toBeInViewport({ ratio: 1 });
       await page.keyboard.press("Tab");
       await expect(transport.getByRole("radio", { name: "Local helper (stdio)" })).toBeFocused();
       await page.keyboard.press("ArrowRight");
@@ -246,7 +246,13 @@ for (const entry of ["Settings", "Home"] as const) {
       }
       const login = dialog.getByRole("radio", { name: "Sign in with AKB (OAuth/SSO)" });
       const pat = dialog.getByRole("radio", { name: "Personal connection key (PAT)" });
-      if (policy.oauth) await expect(login).toBeChecked(); else await expect(login).toHaveCount(0);
+      if (policy.oauth) {
+        await expect(login).toBeChecked();
+        await expect(dialog.getByLabel("Terminal · AKB sign-in")).toBeInViewport({ ratio: 1 });
+      } else {
+        await expect(login).toHaveCount(0);
+        await expect(dialog.getByLabel("Terminal · AKB sign-in")).toHaveCount(0);
+      }
       if (policy.pat) await expect(pat).toBeVisible(); else await expect(pat).toHaveCount(0);
 
       await expect(dialog.getByRole("checkbox")).toHaveCount(0);
