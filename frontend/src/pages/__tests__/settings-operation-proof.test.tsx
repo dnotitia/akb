@@ -10,7 +10,7 @@ import SettingsDialog from "../settings/settings-dialog";
 
 const uid = "00000000-0000-0000-0000-000000000001", oldId = "00000000-0000-0000-0000-000000000002", newId = "00000000-0000-0000-0000-000000000003";
 const USER = { user_id: uid, username: "alice", email: "a@example.test", display_name: "Alice", is_admin: false, auth_method: "local", key_class: null };
-const config = { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } };
+const config = { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" };
 const caps = { contract_version: 1, user_id: uid, name_max_length: 255, permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"], vault_scope_semantics: "write_restriction_sql_read_write" };
 const original = { token_id: oldId, name: "original", prefix: "akb_old", key_class: "pat", scopes: ["read", "write"], vault_scope: null, expires_at: null };
 const receipt = { ...original, contract_version: 1, user_id: uid, token_id: newId, token: "akb_hidden_receipt_secret", prefix: "akb_hidden", issued_at: "2030-01-01T00:00:00Z" };

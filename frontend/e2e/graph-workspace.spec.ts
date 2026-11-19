@@ -65,8 +65,8 @@ async function fixture(page: Page, scene = fixtureScene(), options: {
     requests.push(url);
     const path = url.pathname;
     if (path.endsWith("/auth/config")) return route.fulfill({ json: {
-      schema_version: 2, auth_mode: "local", local_auth: { enabled: true },
-      keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false },
+      schema_version: 3, auth_mode: "local", local_auth: { enabled: true },
+      keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/",
     } });
     if (path.endsWith("/auth/me")) return route.fulfill({ json: {
       user_id: "graph-fixture-user", username: "reviewer", display_name: "Graph reviewer",

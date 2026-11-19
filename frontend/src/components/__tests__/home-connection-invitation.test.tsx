@@ -1,13 +1,21 @@
+import { parseAuthConfig, type AuthConfig } from "@/lib/api";
+import { localAuthConfig } from "@/stories/page-story-fixtures";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HomeConnectionInvitation } from "@/components/home-connection-invitation";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 
+const connectionConfig = (pat = true) => parseAuthConfig({
+  ...localAuthConfig,
+  mcp_oauth: { enabled: true },
+  personal_access_tokens: { enabled: pat },
+});
+
 vi.mock("@/components/connection-setup", () => ({
-  ConnectionSetup: ({ onDirtyChange, onTokenCreated, onSecretCreated, mcpOauthEnabled }: { onDirtyChange: (dirty: boolean) => void; onTokenCreated?: () => void; onSecretCreated?: () => void; mcpOauthEnabled: boolean }) => <>
-    <p>{mcpOauthEnabled ? "OAuth is available" : "Personal token setup"}</p>
-    <button onClick={() => { onDirtyChange(true); onTokenCreated?.(); onSecretCreated?.(); }}>Create test token</button>
+  ConnectionSetup: ({ onDirtyChange, onTokenCreated, onSecretCreated, authConfig }: { onDirtyChange: (dirty: boolean) => void; onTokenCreated?: () => void; onSecretCreated?: () => void; authConfig: AuthConfig }) => <>
+    <p>{authConfig.mcp_oauth.enabled ? "OAuth is available" : "Personal token setup"}</p>
+    {authConfig.personal_access_tokens.enabled && <button onClick={() => { onDirtyChange(true); onTokenCreated?.(); onSecretCreated?.(); }}>Create test token</button>}
     <input aria-label="Saved private configuration" defaultValue="private-example" />
   </>,
 }));
@@ -33,7 +41,7 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); window.matchMedia = initialMedia; });
 
 function invitation(eligible = true, id = userId) {
-  return <HomeConnectionInvitation userId={id} eligible={eligible} oauthEnabled />;
+  return <HomeConnectionInvitation userId={id} eligible={eligible} authConfig={connectionConfig()} />;
 }
 function region() { return screen.getByTestId("home-connection-invitation"); }
 
@@ -132,7 +140,7 @@ describe("Home connection invitation", () => {
   it("opens existing setup directly, preserves a new secret until confirmed, then restores launcher focus", async () => {
     const user = userEvent.setup();
     const tokenCreated = vi.fn();
-    render(<HomeConnectionInvitation userId={userId} eligible oauthEnabled onTokenCreated={tokenCreated} />);
+    render(<HomeConnectionInvitation userId={userId} eligible authConfig={connectionConfig()} onTokenCreated={tokenCreated} />);
     await user.click(screen.getByRole("button", { name: "Connect an AI tool" }));
     expect(screen.getByText("OAuth is available")).toBeVisible();
     expect(region()).not.toBeVisible();
@@ -150,6 +158,15 @@ describe("Home connection invitation", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(region()).toBeVisible();
     await waitFor(() => expect(screen.getByRole("button", { name: "Connect an AI tool" })).toHaveFocus());
+  });
+
+  it("passes the PAT policy through the Home launcher to Quickstart", async () => {
+    const user = userEvent.setup();
+    render(<HomeConnectionInvitation userId={userId} eligible authConfig={connectionConfig(false)} />);
+    await user.click(screen.getByRole("button", { name: "Connect an AI tool" }));
+
+    expect(screen.getByText("OAuth is available")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Create test token" })).toBeNull();
   });
 
   it("also launches setup from the compact entry and clears private setup on identity change", async () => {

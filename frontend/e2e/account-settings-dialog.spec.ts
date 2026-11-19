@@ -10,7 +10,7 @@ async function setup(page: Page, { dark = false, sso = false, admin = false } = 
   }, { dark });
   await page.route("**/api/**", async route => {
     const path = new URL(route.request().url()).pathname;
-    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: sso ? "sso" : "local", local_auth: { enabled: !sso }, keycloak: { enabled: sso, browser_session_ready: sso }, providers: [], mcp_oauth: { enabled: false } } });
+    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: sso ? "sso" : "local", local_auth: { enabled: !sso }, keycloak: { enabled: sso, browser_session_ready: sso }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
     if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "settings-reader", username: "reader", display_name: "Settings reviewer", email: "reader@example.invalid", is_admin: admin, auth_method: sso ? "browser_session" : "jwt", key_class: null } });
     if (path.endsWith("/my/vaults")) return route.fulfill({ json: { vaults: [] } });
     if (path.endsWith("/auth/tokens")) return route.fulfill({ json: { tokens: [] } });

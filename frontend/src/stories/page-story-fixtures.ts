@@ -4,7 +4,7 @@ import type { PublicationResponse } from "@/lib/api";
 export const API = "/api/v1";
 
 export const localAuthConfig = {
-  schema_version: 2,
+  schema_version: 3,
   auth_mode: "local",
   local_auth: { enabled: true },
   keycloak: {
@@ -13,10 +13,12 @@ export const localAuthConfig = {
   },
   providers: [],
   mcp_oauth: { enabled: false },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/mcp/",
 };
 
 export const stagedSsoAuthConfig = {
-  schema_version: 2,
+  schema_version: 3,
   auth_mode: "sso",
   local_auth: { enabled: false },
   keycloak: {
@@ -30,6 +32,8 @@ export const stagedSsoAuthConfig = {
     login_url: null,
   }],
   mcp_oauth: { enabled: true },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/mcp/",
 };
 
 export const templates = [

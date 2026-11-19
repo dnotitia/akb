@@ -13,7 +13,7 @@ for (const scenario of ["transient", "initial-conflict", "retry-conflict"] as co
     await page.route("**/health/**", route => route.fulfill({ json: {} }));
     await page.route("**/api/v1/**", async route => {
       const path = new URL(route.request().url()).pathname;
-      if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+      if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
       if (path.endsWith("/auth/me")) { identityProofs++; return route.fulfill({ json: { user_id: "recovery-reader", username: "reader", display_name: "Reader", email: "reader@example.invalid", is_admin: false, auth_method: "local" } }); }
       if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ id: "demo", name: "demo", role: "reader" }] } });
       if (path.endsWith("/vaults/demo/info")) return route.fulfill({ json: { name: "demo", role: "reader", document_count: 0, collection_count: 0, table_count: 0, file_count: 0, is_archived: false, is_external_git: false } });

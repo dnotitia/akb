@@ -11,7 +11,7 @@ for (const width of [375, 767, 768, 874, 1024, 1440, 2560]) {
     });
     await page.route("**/api/v1/**", route => {
       const path = new URL(route.request().url()).pathname;
-      if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+      if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
       if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "settings-user", username: "fixture", display_name: "Example User", email: "fixture@example.invalid", is_admin: true, auth_method: "local" } });
       if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [] } });
       // Model a legacy server explicitly; a generic 200 is an invalid contract

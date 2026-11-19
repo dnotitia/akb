@@ -78,3 +78,21 @@ def test_absolute_utc_overflow_is_a_field_error(instant):
     assert exc.value.status_code == 422
     assert exc.value.details["fields"][0]["field"] == "expires_at"
     assert exc.value.details["fields"][0]["code"] == "expiration_overflow"
+
+
+@pytest.mark.asyncio
+async def test_disabled_pat_policy_rejects_before_using_storage_or_generating_secret(monkeypatch):
+    from app.services import auth_service
+
+    def fail_if_called(*_args):
+        pytest.fail("Disabled issuance reached credential generation or storage")
+
+    monkeypatch.setattr(auth_service.settings, "human_pat_enabled", False)
+    monkeypatch.setattr(auth_service, "get_pool", fail_if_called)
+    monkeypatch.setattr(auth_service, "generate_pat", fail_if_called)
+
+    with pytest.raises(AKBError) as exc:
+        await auth_service.create_pat(str(uuid.uuid4()), "disallowed", key_class="pat")
+
+    assert exc.value.status_code == 403
+    assert exc.value.code == "personal_access_tokens_disabled"

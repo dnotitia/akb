@@ -6,7 +6,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import SettingsDialog from "../settings/settings-dialog";
 import * as api from "@/lib/api";
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async importOriginal => ({
+  ...await importOriginal<typeof import("@/lib/api")>(),
   getMe: vi.fn().mockResolvedValue({ user_id: "u1", username: "admin", email: "a@x", is_admin: true }),
   getToken: vi.fn(() => "fake-jwt"),
   setToken: vi.fn(),
@@ -45,7 +46,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.getAuthConfig).mockResolvedValue({
     available: true,
-    schema_version: 2,
+    schema_version: 3,
     auth_mode: "local",
     local_auth: { enabled: true },
     keycloak: {
@@ -54,6 +55,8 @@ beforeEach(() => {
     },
     providers: [],
     mcp_oauth: { enabled: false },
+    personal_access_tokens: { enabled: true },
+    mcp_endpoint_url: "https://akb.example.test/mcp/",
   });
 });
 
@@ -85,7 +88,7 @@ describe("Admin tab search + sort", () => {
   it("hides admin password reset controls in SSO mode", async () => {
     vi.mocked(api.getAuthConfig).mockResolvedValue({
       available: true,
-      schema_version: 2,
+      schema_version: 3,
       auth_mode: "sso",
       local_auth: { enabled: false },
       keycloak: {
@@ -99,6 +102,8 @@ describe("Admin tab search + sort", () => {
         login_url: null,
       }],
       mcp_oauth: { enabled: true },
+      personal_access_tokens: { enabled: true },
+      mcp_endpoint_url: "https://akb.example.test/mcp/",
     });
 
     render(wrap());

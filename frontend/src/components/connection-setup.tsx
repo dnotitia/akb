@@ -1,12 +1,12 @@
 import { useEffect, useId, useState, type ReactNode, type RefCallback } from "react";
 import { ArrowLeft, ArrowRight, Check, CircleHelp } from "lucide-react";
-import { authSessionSnapshot, isCurrentAuthSession, type AuthSessionSnapshot } from "@/lib/api";
+import { authSessionSnapshot, isCurrentAuthSession, type AuthConfig, type AuthSessionSnapshot } from "@/lib/api";
 import { ConnectionTroubleshooting } from "@/components/connection-troubleshooting";
 import { CONNECTION_GUIDES, CONNECTION_TEST_PROMPT } from "@/lib/connection-guide";
 import { type PatReceipt } from "@/lib/api-pat-issuance";
 import { scopeSummary, type PatDraft } from "@/lib/pat-draft";
 import { PatIssuanceForm } from "@/components/pat-issuance-form";
-import { MCP_AGENT_FILES, MCP_AGENT_LABELS, mcpInstallSnippets, mcpOAuthSnippets, type McpAgent } from "@/lib/mcp-snippets";
+import { MCP_AGENT_FILES, MCP_AGENT_LABELS, mcpInstallSnippets, mcpOAuthSnippets, supportsMcpProxyEndpoint, type McpAgent } from "@/lib/mcp-snippets";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { CodeSnippet } from "@/components/ui/code-snippet";
@@ -55,9 +55,10 @@ function SetupChoice({ label, name, value, options, disabled, onChange, appearan
   </fieldset>;
 }
 
-export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreated, onBusyChange, invalidatedTokenId, onDirtyChange, initialDraft, replacement = false, onReceipt, layout = "compact", ownsOperation }: {
+export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated, onSecretCreated, onBusyChange, invalidatedTokenId, onDirtyChange, initialDraft, replacement = false, onReceipt, layout = "compact", ownsOperation }: {
   layout?: "compact" | "workspace" | "settings";
-  mcpOauthEnabled: boolean;
+  authConfig: AuthConfig;
+  onRetryAuthConfig?: () => void;
   onTokenCreated?: () => void;
   onSecretCreated?: () => void;
   onBusyChange?: (busy: boolean) => void;
@@ -71,8 +72,8 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
   const id = useId();
   const { rootRef, navigationRef, stepsRef, currentStep, jumpToStep } = useSetupStepNavigation();
   const [configurationRevision, setConfigurationRevision] = useState(0);
-  const [copied, setCopied] = useState<{ revision: number; agent: McpAgent; oauth: boolean } | null>(null);
-  const [confirmation, setConfirmation] = useState<{ revision: number; agent: McpAgent; oauth: boolean } | null>(null);
+  const [copied, setCopied] = useState<{ revision: number; agent: McpAgent; oauth: boolean; endpoint: string | null } | null>(null);
+  const [confirmation, setConfirmation] = useState<{ revision: number; agent: McpAgent; oauth: boolean; endpoint: string | null } | null>(null);
   const [agent, setAgent] = useState<McpAgent>("claude");
   const [auth, setAuth] = useState("oauth");
   const [credentialMode, setCredentialMode] = useState("create");
@@ -103,12 +104,16 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
     const timer = window.setInterval(check, 1000);
     return () => { window.removeEventListener("storage", check); window.removeEventListener("focus", check); document.removeEventListener("visibilitychange", check); window.clearInterval(timer); };
   }, [session]);
-  const oauthSnippet = mcpOAuthSnippets()[agent];
-  const oauthAvailable = mcpOauthEnabled && oauthSnippet !== undefined;
-  const useOauth = oauthAvailable && auth === "oauth";
+  const endpoint = authConfig.available ? authConfig.mcp_endpoint_url : null;
+  const patEnabled = authConfig.available && authConfig.personal_access_tokens.enabled;
+  const oauthSnippet = !replacement && endpoint && authConfig.mcp_oauth.enabled ? mcpOAuthSnippets(endpoint)[agent] : undefined;
+  const useOauth = Boolean(oauthSnippet) && (auth === "oauth" || !patEnabled);
+  const showPatControls = patEnabled && !useOauth;
+  const canGeneratePatConfig = endpoint !== null && supportsMcpProxyEndpoint(endpoint);
+  const hideIssuanceForm = patEnabled && (!showPatControls || credentialMode !== "create");
   // Start discovery only when token creation is first opened, then preserve
   // the form session even while another credential mode is visible.
-  if (currentStep === 2 && !useOauth && credentialMode === "create" && !issuanceStarted) setIssuanceStarted(true);
+  if (currentStep === 2 && showPatControls && credentialMode === "create" && !issuanceStarted) setIssuanceStarted(true);
   const token = isCurrentAuthSession(session) ? freshToken || (credentialMode === "existing" ? existingToken.trim() : "") : "";
   // A visible prefix or placeholder is never a usable configuration.
   const usableToken = /^[A-Za-z0-9_-]+$/.test(token);
@@ -131,13 +136,15 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
     }
   }
 
-  const configVisible = useOauth || (usableToken && (!freshToken || showSecret));
-  const configuration = configVisible ? useOauth ? oauthSnippet! : mcpInstallSnippets(token)[agent] : null;
+  const configuration = useOauth ? oauthSnippet
+    : endpoint && canGeneratePatConfig && showPatControls && usableToken && (!freshToken || showSecret) ? mcpInstallSnippets(endpoint, token)[agent] : null;
   const guide = CONNECTION_GUIDES[agent];
-  const matches = (record: typeof copied) => isCurrentAuthSession(session) && record?.revision === configurationRevision && record.agent === agent && record.oauth === useOauth;
-  const record = { revision: configurationRevision, agent, oauth: useOauth };
+  const matches = (record: typeof copied) => isCurrentAuthSession(session) && record?.revision === configurationRevision && record.agent === agent && record.oauth === useOauth && record.endpoint === endpoint && Boolean(configuration);
+  const record = { revision: configurationRevision, agent, oauth: useOauth, endpoint };
   const terminal = MCP_AGENT_FILES[agent] === "terminal";
   return <div ref={rootRef} className="connection-setup min-w-0" data-layout={layout}>
+    {!authConfig.available ? <Alert variant="warning">Connection options could not be verified. {onRetryAuthConfig ? <Button variant="link" onClick={onRetryAuthConfig}>Retry connection options</Button> : "Reopen connection setup to retry."}</Alert>
+      : !patEnabled && !authConfig.mcp_oauth.enabled && <Alert variant="info">This deployment has no human MCP connection method enabled.</Alert>}
     <nav ref={navigationRef} className="connection-progress" aria-label="Connection setup steps">
       <ol aria-label="Connection setup overview">
         {[
@@ -165,16 +172,20 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
 
       <SetupStep id={`${id}-add`} number={2} title={`Add AKB to ${MCP_AGENT_LABELS[agent]}`} description="Follow the instructions on the computer where this AI tool runs."
         current={currentStep === 2} sectionRef={element => { stepsRef.current[1] = element; }}>
-        {oauthAvailable ? <SetupChoice label="How to connect" appearance="compact" name={`${id}-access`} value={useOauth ? "oauth" : "key"} disabled={creating}
+        {oauthSnippet && patEnabled ? <SetupChoice label="How to connect" appearance="compact" name={`${id}-access`} value={useOauth ? "oauth" : "key"} disabled={creating}
           onChange={value => { setAuth(value === "oauth" ? "oauth" : "pat"); setConfigurationRevision(value => value + 1); }}
           options={[{ value: "oauth", label: "Sign in with AKB" }, { value: "key", label: "Use a connection key" }]} />
-          : <p className="text-sm text-foreground-muted">This AKB guide uses a personal connection key for {MCP_AGENT_LABELS[agent]}.</p>}
+          : showPatControls ? <p className="text-sm text-foreground-muted">This AKB guide uses a personal connection key for {MCP_AGENT_LABELS[agent]}.</p>
+          : authConfig.available && !useOauth && authConfig.mcp_oauth.enabled && <Alert variant="info">{replacement
+            ? "Personal access tokens are disabled. You can still revoke existing keys."
+            : `This guide has no sign-in instructions for ${MCP_AGENT_LABELS[agent]}. Choose another AI tool to connect.`}</Alert>}
         {invalidationNotice && <Alert variant="warning">{invalidationNotice}</Alert>}
-        <details className="connection-inline-help"><summary>Which connection method should I use?</summary>
+        {showPatControls && !canGeneratePatConfig && <Alert variant="warning">The local helper requires an HTTPS address or loopback HTTP. Ask your administrator to check the public MCP address.</Alert>}
+        {patEnabled && <details className="connection-inline-help"><summary>Which connection method should I use?</summary>
           <p>Sign in with AKB lets your AI tool connect directly after you approve access. You do not create a personal key. The connection-key preset runs a local helper with npx and also supports uploading and downloading files on that computer. Your account’s Vault permissions apply to both.</p>
           <p>For a key-based setup, install a supported Node.js release if npx is unavailable. Web browsing in AKB is ready to use without setting up an AI connection.</p>
-        </details>
-        <div hidden={useOauth} inert={useOauth} className="space-y-3">
+        </details>}
+        <div hidden={!showPatControls} inert={!showPatControls} className="space-y-3">
           <p className="text-xs leading-relaxed text-foreground-muted">Before using a connection key, check that Node.js (including npx) is installed on that computer. It runs the local AKB helper for your AI tool.</p>
           {!freshToken && <SetupChoice label="Connection key" appearance="compact" name={`${id}-credential`} value={credentialMode} disabled={creating}
             onChange={value => { setCredentialMode(value); setConfigurationRevision(value => value + 1); }}
@@ -185,28 +196,27 @@ export function ConnectionSetup({ mcpOauthEnabled, onTokenCreated, onSecretCreat
             <p id={`${id}-saved-help`} className="text-xs text-foreground-muted">Paste the full key you saved. The prefix shown in your key list cannot sign in. It stays in this setup window only.</p>
             {existingToken && !usableToken && <Alert variant="destructive">Enter the full key using only letters, numbers, underscores, and hyphens. A prefix or placeholder cannot authenticate.</Alert>}
           </div>}
-          {/* Keep the issuance session mounted when another method or step is visible. */}
-          {!freshToken && issuanceStarted && <div hidden={credentialMode !== "create"} inert={credentialMode !== "create"}>
-            <PatIssuanceForm ownsOperation={ownsOperation} initial={initialDraft} replacement={replacement} onDirtyChange={setFormDirty} onBusyChange={value => { setCreating(value); onBusyChange?.(value); }} onMetadataChanged={onTokenCreated} onCreated={(result, snapshot) => {
-              setFreshToken(result.token); setFreshTokenId(result.token_id); setReceipt(result); setSession(snapshot); setAuth("pat"); setCredentialMode("create"); setShowSecret(true); setInvalidationNotice(null); setConfigurationRevision(value => value + 1); onSecretCreated?.(); onReceipt?.(result, snapshot);
-            }} />
-          </div>}
-          {freshToken && isCurrentAuthSession(session) && <div className="space-y-2 rounded-[var(--radius-md)] border border-accent/40 bg-accent/5 p-3">
-            <p role="status" className="text-sm font-medium">Connection key created</p>
-            <p className="text-xs leading-relaxed text-foreground-muted">Your setup below includes this key. Keep this window open until you have saved the key or configuration privately. Closing clears the displayed copy; it does not revoke the key.</p>
-            <p className="text-xs text-foreground-muted">{receipt?.verified ? `${receipt.scopes?.includes("write") ? "Read and write" : receipt.scopes?.includes("read") ? "Read only" : "Permissions unavailable"} · ${typeof receipt.expires_at === "string" ? `Expires ${receipt.expires_at}` : receipt.expires_at === null ? "No expiration" : "Expiration unavailable"} · ${scopeSummary(receipt.vault_scope)}` : "Created with server defaults; restrictions were not verified."}</p>
-            <Button type="button" variant="outline" size="sm" onClick={() => setShowSecret(!showSecret)}>{showSecret ? "Hide key and configuration" : "Show key and configuration"}</Button>
-            {showSecret && !useOauth && currentStep === 2 && <details className="connection-inline-help"><summary>Copy the key separately</summary><CodeSnippet code={freshToken} filename="Personal connection key" /></details>}
-          </div>}
         </div>
+        {!freshToken && issuanceStarted && <div hidden={hideIssuanceForm} inert={hideIssuanceForm}>
+          <PatIssuanceForm issuanceEnabled={patEnabled} ownsOperation={ownsOperation} initial={initialDraft} replacement={replacement} onDirtyChange={setFormDirty} onBusyChange={value => { setCreating(value); onBusyChange?.(value); }} onMetadataChanged={onTokenCreated} onCreated={(result, snapshot) => {
+            setFreshToken(result.token); setFreshTokenId(result.token_id); setReceipt(result); setSession(snapshot); setAuth("pat"); setCredentialMode("create"); setShowSecret(true); setInvalidationNotice(null); setConfigurationRevision(value => value + 1); onSecretCreated?.(); onReceipt?.(result, snapshot);
+          }} />
+        </div>}
+        {freshToken && (!useOauth || !patEnabled) && isCurrentAuthSession(session) && <div className="space-y-2 rounded-[var(--radius-md)] border border-accent/40 bg-accent/5 p-3">
+          <p role="status" className="text-sm font-medium">Connection key created</p>
+          <p className="text-xs leading-relaxed text-foreground-muted">{patEnabled ? "Keep this window open until you have saved the key or configuration privately." : "You can save this one-time key. Key-based setup is currently unavailable."} Closing clears the displayed copy; it does not revoke the key.</p>
+          <p className="text-xs text-foreground-muted">{receipt?.verified ? `${receipt.scopes?.includes("write") ? "Read and write" : receipt.scopes?.includes("read") ? "Read only" : "Permissions unavailable"} · ${typeof receipt.expires_at === "string" ? `Expires ${receipt.expires_at}` : receipt.expires_at === null ? "No expiration" : "Expiration unavailable"} · ${scopeSummary(receipt.vault_scope)}` : "Created with server defaults; restrictions were not verified."}</p>
+          <Button type="button" variant="outline" size="sm" onClick={() => setShowSecret(!showSecret)}>{showSecret ? "Hide key" : "Show key"}{patEnabled && " and configuration"}</Button>
+          {showSecret && currentStep === 2 && <details className="connection-inline-help"><summary>Copy the key separately</summary><CodeSnippet code={freshToken} filename="Personal connection key" /></details>}
+        </div>}
         {configuration && currentStep === 2 ? <div className="space-y-3">
           <div className="connection-instruction"><span>1</span><div><h4>Open the right place</h4><p>{guide.location}</p></div></div>
           <div className="connection-instruction"><span>2</span><div><h4>Add this setup</h4><p>{guide.add}</p></div></div>
-          <CodeSnippet key={`${agent}:${useOauth}:${configurationRevision}`} code={configuration} filename={terminal ? `Terminal · ${MCP_AGENT_LABELS[agent]}` : MCP_AGENT_FILES[agent]} onCopied={() => setCopied(record)} />
+          <CodeSnippet key={`${agent}:${endpoint}:${useOauth}:${configurationRevision}`} code={configuration} filename={terminal ? `Terminal · ${MCP_AGENT_LABELS[agent]}` : MCP_AGENT_FILES[agent]} onCopied={() => setCopied(record)} />
           {matches(copied) && <p role="status" className="text-xs text-foreground-muted">Setup copied. Apply it in {MCP_AGENT_LABELS[agent]} before checking the connection.</p>}
           {useOauth && <div className="connection-instruction"><span>3</span><div><h4>Approve access</h4><p>{guide.signIn}</p></div></div>}
           {!useOauth && <p className="text-xs leading-relaxed text-foreground-muted">The local helper uses this key to reach AKB. If npx asks to download akb-mcp, allow it to continue.</p>}
-        </div> : <p role="status" className="rounded-[var(--radius-md)] bg-surface-muted p-3 text-sm text-foreground-muted">{freshToken && !showSecret ? "Your key and setup are hidden. Show them above when you are ready to copy." : "Create a connection key or enter the full key you saved. Your setup will appear here."}</p>}
+        </div> : showPatControls && canGeneratePatConfig && <p role="status" className="rounded-[var(--radius-md)] bg-surface-muted p-3 text-sm text-foreground-muted">{freshToken && !showSecret ? "Your key and setup are hidden. Show them above when you are ready to copy." : "Create a connection key or enter the full key you saved. Your setup will appear here."}</p>}
         <div className="connection-step-actions"><Button variant="outline" disabled={creating} onClick={() => jumpToStep(1)}><ArrowLeft className="h-4 w-4" aria-hidden />Choose a tool</Button>
           <Button disabled={creating || !configuration} onClick={() => jumpToStep(3)}>Check in {MCP_AGENT_LABELS[agent]}<ArrowRight className="h-4 w-4" aria-hidden /></Button></div>
       </SetupStep>

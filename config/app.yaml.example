@@ -315,6 +315,8 @@ app_credential_overlap_seconds: 300
 # keycloak_companion_client_ids_by_origin:
 #   "https://reef.example.com": "reef-web"
 # api_oauth_audience: ""               # default: <public_base_url>/api
+# Personal access token issuance and authentication, independent of MCP OAuth.
+human_pat_enabled: true
 # mcp_oauth_enabled: false
 # mcp_oauth_client_ids: []             # explicitly provisioned direct MCP clients
 # The OAuth audience is exactly <public_base_url>/mcp.

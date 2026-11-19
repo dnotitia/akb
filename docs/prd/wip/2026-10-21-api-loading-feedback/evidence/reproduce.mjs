@@ -13,7 +13,7 @@ async function fixture(options = {}) {
   await page.route('**/api/v1/**', async r => {
     const p = new URL(r.request().url()).pathname;
     let json = { items: [], history: [], relations: [], vaults: [], changes: [], subscribed: false, unread_count: 0 };
-    if (p.endsWith('/auth/config')) json = { schema_version: 2, auth_mode: 'local', local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } };
+    if (p.endsWith('/auth/config')) json = { schema_version: 3, auth_mode: 'local', local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: 'https://akb.example.test/mcp/' };
     else if (p.endsWith('/auth/me')) json = { user_id: 'loading-audit', username: 'fixture', display_name: 'Audit fixture', email: 'audit@example.invalid', auth_method: 'local', is_admin: false };
     else if (p.endsWith('/my/workspace-summary')) {
       if (state.summaryError) return r.fulfill({ status: 503, json: { detail: 'Fixture outage' } });

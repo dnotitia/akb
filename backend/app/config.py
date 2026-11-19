@@ -1170,6 +1170,8 @@ class Settings(BaseModel):
     # existing public-resource convention used by MCP, but stays distinct.
     api_oauth_audience: str = ""
 
+    human_pat_enabled: bool = True
+
     # OAuth for MCP and file/image controls, independent of browser auth.
     mcp_oauth_enabled: bool = False
     # Manually provisioned direct MCP clients. DCR clients prove admission
@@ -1674,10 +1676,14 @@ class Settings(BaseModel):
         return f"{self.public_base_url.rstrip('/')}/api"
 
     @property
+    def mcp_endpoint_url(self) -> str:
+        return f"{self.public_base_url.rstrip('/')}/mcp/"
+
+    @property
     def mcp_oauth_audience_effective(self) -> str:
         if not self.mcp_oauth_enabled:
             return ""
-        return f"{self.public_base_url.rstrip('/')}/mcp"
+        return self.mcp_endpoint_url.removesuffix("/")
 
     @property
     def mcp_oauth_metadata_url(self) -> str:

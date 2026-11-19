@@ -16,6 +16,7 @@ from app.api.deps import get_current_user
 from app.api.routes import access, auth
 from app.db import postgres
 from app.exceptions import AKBError
+from app.models.vault_scope import current_key_class, current_token_id, current_token_scopes, current_vault_scope
 from app.services import auth_service
 from app.services.auth_service import AuthenticatedUser
 from tests.test_recovery_admin_provisioning_postgres import _fresh_database
@@ -237,6 +238,18 @@ async def test_sso_human_issuance_and_browser_csrf(monkeypatch):
             allowed = await client.post("/api/v1/auth/tokens/issuance", json=body(actor),
                                         headers={sessions.SSO_BROWSER_CSRF_HEADER: handle.csrf_token})
             assert allowed.status_code == 200, allowed.text
+            pat = allowed.json()
+            monkeypatch.setattr(auth_service.settings, "human_pat_enabled", False)
+
+            listed = await client.get("/api/v1/auth/tokens")
+            assert listed.status_code == 200
+            assert any(token["token_id"] == pat["token_id"] for token in listed.json()["tokens"])
+            bearer = {"Authorization": f"Bearer {pat['token']}"}
+            denied = await client.get("/api/v1/auth/tokens", headers=bearer)
+            assert denied.status_code == 401
+            assert await pool.fetchval(
+                "SELECT last_used_at FROM tokens WHERE id = $1", uuid.UUID(pat["token_id"]),
+            ) is None
 
 
 @pytest.mark.parametrize("mutation", ["is_admin=false", "account_status='suspended'"])
@@ -292,3 +305,68 @@ async def test_special_scope_cannot_be_minted_by_admin_or_allowlisted_machine(mo
                                           scopes=["sso_operation_requests"], admin_issuance=True)
         assert no_issuer.value.code == "sso_operation_request_scope_issuance_required"
         assert await pool.fetchval("SELECT COUNT(*) FROM tokens WHERE user_id=$1", uuid.UUID(target.user_id)) == 0
+
+
+async def test_disabled_pat_issuance_aliases_and_management(monkeypatch):
+    async with _fresh_database() as pool:
+        wire(monkeypatch, pool)
+        admin = await person(pool, admin=True)
+        existing = await auth_service.create_pat(admin.user_id, "existing")
+        monkeypatch.setattr(auth_service.settings, "human_pat_enabled", False)
+
+        async with client_for(admin) as client:
+            alias = f"/api/v1/admin/users/{admin.user_id}"
+            requests = [
+                ("GET", "/api/v1/auth/tokens/capabilities", None),
+                ("POST", "/api/v1/auth/tokens", {"name": "legacy"}),
+                ("POST", "/api/v1/auth/tokens/issuance", body(admin)),
+                ("POST", f"{alias}/tokens", {"name": "admin"}),
+                ("POST", f"{alias}/managed-tokens", {"name": "managed", "token_id": str(uuid.uuid4())}),
+            ]
+            for method, path, payload in requests:
+                response = await client.request(method, path, json=payload)
+                assert (response.status_code, response.json()["code"]) == (
+                    403, "personal_access_tokens_disabled",
+                )
+
+            assert await pool.fetchval("SELECT count(*) FROM tokens") == 1
+            service = await client.post(f"{alias}/tokens", json={"name": "machine", "key_class": "service"})
+            assert service.status_code == 200 and service.json()["key_class"] == "service"
+            listed = await client.get("/api/v1/auth/tokens")
+            assert any(token["token_id"] == existing["token_id"] for token in listed.json()["tokens"])
+            assert (await client.delete(f"/api/v1/auth/tokens/{existing['token_id']}")).status_code == 200
+
+        monkeypatch.setattr(auth_service.settings, "human_pat_enabled", True)
+        assert await auth_service.resolve_rest_user_authorization(f"Bearer {existing['token']}") is None
+
+
+async def test_disabled_pat_preserves_atomic_verification_and_stored_class(monkeypatch):
+    async with _fresh_database() as pool:
+        wire(monkeypatch, pool)
+        admin = await person(pool, admin=True)
+        saved = await auth_service.create_pat(admin.user_id, "saved")
+        legacy = await auth_service.create_pat(admin.user_id, "null class")
+        promoted = await auth_service.create_pat(admin.user_id, "promoted", scopes=["read"])
+        expired = await auth_service.create_pat(admin.user_id, "expired")
+
+        await pool.execute("ALTER TABLE tokens ALTER COLUMN key_class DROP NOT NULL")
+        await pool.execute("UPDATE tokens SET key_class = NULL WHERE id = $1", uuid.UUID(legacy["token_id"]))
+        await pool.execute("UPDATE tokens SET key_class = 'service' WHERE id = $1", uuid.UUID(promoted["token_id"]))
+        await pool.execute("UPDATE tokens SET expires_at = NOW() WHERE id = $1", uuid.UUID(expired["token_id"]))
+        monkeypatch.setattr(auth_service.settings, "human_pat_enabled", False)
+
+        for resolve in (
+            auth_service.resolve_rest_user_authorization,
+            auth_service.resolve_mcp_authorization,
+            auth_service.resolve_tool_control_authorization,
+        ):
+            assert (await resolve(f"Bearer {promoted['token']}")).key_class == "service"
+            for credential in (saved, legacy, expired):
+                assert await resolve(f"Bearer {credential['token']}") is None
+                assert current_key_class.get() is current_token_id.get() is current_token_scopes.get() is current_vault_scope.get() is None
+
+        assert await pool.fetchval("SELECT count(*) FROM tokens WHERE last_used_at IS NOT NULL") == 1
+        monkeypatch.setattr(auth_service.settings, "human_pat_enabled", True)
+        assert (await auth_service.resolve_mcp_authorization(f"Bearer {saved['token']}")).key_class == "pat"
+        assert (await auth_service.resolve_mcp_authorization(f"Bearer {legacy['token']}")).key_class == "pat"
+        assert await auth_service.resolve_mcp_authorization(f"Bearer {expired['token']}") is None

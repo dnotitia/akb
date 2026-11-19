@@ -40,8 +40,8 @@ beforeEach(() => {
   api.configureAuthTransport("sso");
   identityReads = 0;
   vi.mocked(api.getAuthConfig).mockResolvedValue({
-    available: true, schema_version: 2, auth_mode: "sso", local_auth: { enabled: false },
-    keycloak: { enabled: true, browser_session_ready: true }, providers: [], mcp_oauth: { enabled: false },
+    available: true, schema_version: 3, auth_mode: "sso", local_auth: { enabled: false },
+    keycloak: { enabled: true, browser_session_ready: true }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/",
   });
 });
 afterEach(() => {
@@ -69,8 +69,8 @@ it.each(["sso", "local"] as const)("ends initial %s proof on a real current-sess
     api.configureAuthTransport("local");
     api.setToken("expired-test-session");
     vi.mocked(api.getAuthConfig).mockResolvedValue({
-      available: true, schema_version: 2, auth_mode: "local", local_auth: { enabled: true },
-      keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false },
+      available: true, schema_version: 3, auth_mode: "local", local_auth: { enabled: true },
+      keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/",
     });
   }
   const before = api.authSessionSnapshot();

@@ -102,6 +102,8 @@ beforeEach(() => {
     keycloak: { enabled: false, browser_session_ready: false },
     providers: [],
     mcp_oauth: { enabled: false },
+    personal_access_tokens: { enabled: false },
+    mcp_endpoint_url: null,
   });
   listVaultsMock.mockResolvedValue({ vaults: [...VAULTS] });
   getVaultInfoMock.mockResolvedValue({

@@ -43,7 +43,7 @@ from app.exceptions import (
 from app.models.vault_scope import VaultScope
 from app.repositories.events_repo import emit_event
 from app.services.admission_service import record_arrival
-from app.services.auth_policy import require_local_auth_enabled
+from app.services.auth_policy import require_human_pat_enabled, require_local_auth_enabled
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
     KEYCLOAK_SERVICE_AUTHORITY_V1,
@@ -1282,8 +1282,10 @@ async def create_pat(
     """
     import json
 
-    pool = await get_pool()
     key_class = _normalize_issuable_key_class(key_class)
+    if key_class == "pat":
+        require_human_pat_enabled()
+    pool = await get_pool()
     token_scopes = normalize_token_scopes(scopes)
     dedicated_operation_request_scope = SSO_OPERATION_REQUEST_SCOPE in token_scopes
     if dedicated_operation_request_scope:
@@ -1794,6 +1796,7 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
               FROM users u
              WHERE t.user_id = u.id
                AND t.token_hash = $1
+               AND ($2::boolean OR t.key_class = 'service')
                AND (t.expires_at IS NULL OR t.expires_at > NOW())
                AND u.account_status = 'active' AND u.monitoring_access IS NULL
             RETURNING t.id AS token_id, t.user_id, t.scopes, t.vault_scope, t.key_class,
@@ -1801,6 +1804,7 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
                       u.account_kind
             """,
             token_hash,
+            settings.human_pat_enabled,
         )
         if not row:
             return None

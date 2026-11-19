@@ -16,7 +16,7 @@ for (const dark of [false, true]) test(`Focused vault navigation ${dark ? "dark"
     const url = new URL(route.request().url());
     const path = url.pathname;
     const vault = path.includes("/research") ? "research" : "team";
-    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
     if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "rail-user", username: "reader", display_name: "Workspace User", is_admin: false, auth_method: "local" } });
     if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ id: "team-id", name: "team", role: "owner" }, { id: "research-id", name: "research", role: "reader" }, { id: "work-id", name: "work-notes", role: "writer" }] } });
     if (path.endsWith("/info")) return route.fulfill({ json: { name: vault, role: vault === "team" ? "owner" : "reader", document_count: 1 } });

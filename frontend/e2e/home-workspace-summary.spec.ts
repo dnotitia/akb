@@ -21,7 +21,7 @@ async function fixture(page: Page, dark = false) {
   await page.route("**/api/v1/**", route => {
     const url = new URL(route.request().url());
     const path = url.pathname;
-    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
     if (path.endsWith("/auth/me")) return Promise.resolve(state.authGate).then(() => route.fulfill({ json: { user_id: userId, username: "reviewer", display_name: "임근우", email: "review@example.invalid", is_admin: false, auth_method: "local" } }));
     if (path.endsWith("/auth/tokens/capabilities")) return route.fulfill({ json: {
       contract_version: 1, user_id: userId, name_max_length: 255,

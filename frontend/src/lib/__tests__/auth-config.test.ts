@@ -11,16 +11,18 @@ function response(body: unknown, status = 200): Response {
 }
 
 const local = {
-  schema_version: 2,
+  schema_version: 3,
   auth_mode: "local",
   local_auth: { enabled: true },
   keycloak: { enabled: false, browser_session_ready: false },
   providers: [],
   mcp_oauth: { enabled: true },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/workspace/mcp/",
 };
 
 const stagedSso = {
-  schema_version: 2,
+  schema_version: 3,
   auth_mode: "sso",
   local_auth: { enabled: false },
   keycloak: { enabled: true, browser_session_ready: false },
@@ -31,6 +33,8 @@ const stagedSso = {
     login_url: null,
   }],
   mcp_oauth: { enabled: false },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/workspace/mcp/",
 };
 
 // The unversioned shape served before the versioned contract. It carries no
@@ -52,14 +56,21 @@ afterEach(() => {
 });
 
 
-describe("getAuthConfig v2", () => {
-  it("accepts an exact local-mode v2 payload", async () => {
+describe("getAuthConfig v3", () => {
+  it("accepts an exact local-mode v3 payload", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(local)));
 
     expect(await getAuthConfig()).toEqual({
       available: true,
       ...local,
     });
+  });
+
+  it("keeps a deployment with no human MCP methods distinct from unavailable", async () => {
+    const disabled = { ...local, mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: false } };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(disabled)));
+
+    expect(await getAuthConfig()).toEqual({ available: true, ...disabled });
   });
 
   it("accepts named providers only when every login URL is server-owned", async () => {
@@ -94,6 +105,15 @@ describe("getAuthConfig v2", () => {
       keycloak: { enabled: false, browser_session_ready: false, login_url: null },
       mcp_oauth: { enabled: false },
     }],
+    ["old v2", { ...local, schema_version: 2, personal_access_tokens: undefined, mcp_endpoint_url: undefined }],
+    ["missing PAT capability", { ...local, personal_access_tokens: undefined }],
+    ["invalid PAT policy", { ...local, personal_access_tokens: { enabled: "false" } }],
+    ["missing endpoint", { ...local, mcp_endpoint_url: undefined }],
+    ["relative endpoint", { ...local, mcp_endpoint_url: "/mcp/" }],
+    ["invalid endpoint path", { ...local, mcp_endpoint_url: "https://akb.example.test/mcp" }],
+    ["endpoint with credentials", { ...local, mcp_endpoint_url: "https://user:pass@akb.example.test/mcp/" }],
+    ["endpoint with query", { ...local, mcp_endpoint_url: "https://akb.example.test/mcp/?arg" }],
+    ["endpoint with fragment", { ...local, mcp_endpoint_url: "https://akb.example.test/mcp/#anchor" }],
     ["missing mode", { ...local, auth_mode: undefined }],
     ["unknown mode", { ...local, auth_mode: "hybrid" }],
     ["additional root property", { ...local, local_auth_override: true }],

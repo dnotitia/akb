@@ -11,7 +11,8 @@ import { Profiler } from "react";
 // Mock the entire api module so the test doesn't touch network. Only
 // the call surface used by the Profile tab matters here; other tabs
 // (PATs, admin, memory) get harmless stubs.
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async importOriginal => ({
+  ...await importOriginal<typeof import("@/lib/api")>(),
   getMe: vi.fn(),
   getToken: vi.fn(() => "fake-jwt"),
   setToken: vi.fn(),
@@ -52,7 +53,7 @@ const USER = {
 
 const LOCAL_AUTH_CONFIG = {
   available: true,
-  schema_version: 2,
+  schema_version: 3,
   auth_mode: "local",
   local_auth: { enabled: true },
   keycloak: {
@@ -61,11 +62,13 @@ const LOCAL_AUTH_CONFIG = {
   },
   providers: [],
   mcp_oauth: { enabled: false },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/mcp/",
 };
 
 const SSO_AUTH_CONFIG = {
   available: true,
-  schema_version: 2,
+  schema_version: 3,
   auth_mode: "sso",
   local_auth: { enabled: false },
   keycloak: {
@@ -79,6 +82,8 @@ const SSO_AUTH_CONFIG = {
     login_url: null,
   }],
   mcp_oauth: { enabled: true },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/mcp/",
 };
 
 function InternalNavigation() {

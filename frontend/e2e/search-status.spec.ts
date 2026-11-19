@@ -18,7 +18,7 @@ async function fixtures(page: Page, dark: boolean) {
   await page.route("**/health/vault/**", route => route.fulfill({ json: health(route.request().url().includes("Research") ? state.pending * 2 : state.pending, state.abandoned) }));
   await page.route("**/api/v1/**", route => {
     const path = new URL(route.request().url()).pathname;
-    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
     if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "status-fixture", username: "reviewer", display_name: "임근우", email: "review@example.invalid", is_admin: false, auth_method: "local" } });
     if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ id: "one", name: "Team knowledge", role: "reader", description: "Project notes and working documents." }, { id: "two", name: "Research", role: "owner" }] } });
     if (path.endsWith("/info")) return route.fulfill({ json: { document_count: 21, table_count: 2, file_count: 3, role: "reader" } });

@@ -22,9 +22,6 @@ export function CodeSnippet({
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
   async function copy() {
-    // clipboard is undefined on insecure (plain-HTTP) origins — and AKB ships
-    // an `--insecure` snippet, so that deployment shape is real. Guard so a
-    // copy never throws an uncaught TypeError with no user feedback.
     try {
       setCopied(false);
       setCopyError(false);

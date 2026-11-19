@@ -44,11 +44,16 @@ class Control:
         )
 
 
+@pytest.fixture(autouse=True)
+def public_base_url(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "https://akb.example.test/workspace/")
+
+
 def _call() -> dict:
     return asyncio.run(auth.auth_config(Response()))
 
 
-def test_v2_auth_config_is_never_http_cached(monkeypatch):
+def test_v3_auth_config_is_never_http_cached(monkeypatch):
     monkeypatch.setattr(settings, "auth_mode", "local", raising=False)
     response = Response()
 
@@ -58,7 +63,7 @@ def test_v2_auth_config_is_never_http_cached(monkeypatch):
     assert response.headers["Pragma"] == "no-cache"
 
 
-def test_v2_local_config_derives_human_capabilities_without_control_read(
+def test_v3_local_config_derives_human_capabilities_without_control_read(
     monkeypatch,
 ):
     class MustNotRead:
@@ -72,7 +77,7 @@ def test_v2_local_config_derives_human_capabilities_without_control_read(
     monkeypatch.setattr(auth, "get_keycloak_provider_control", lambda: MustNotRead())
 
     assert _call() == {
-        "schema_version": 2,
+        "schema_version": 3,
         "auth_mode": "local",
         "local_auth": {"enabled": True},
         "keycloak": {
@@ -81,17 +86,19 @@ def test_v2_local_config_derives_human_capabilities_without_control_read(
         },
         "providers": [],
         "mcp_oauth": {"enabled": True},
+        "personal_access_tokens": {"enabled": True},
+        "mcp_endpoint_url": "https://akb.example.test/workspace/mcp/",
     }
 
 
-def test_v2_sso_config_lists_only_enabled_provider_buttons(monkeypatch):
+def test_v3_sso_config_lists_only_enabled_provider_buttons(monkeypatch):
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", False, raising=False)
     monkeypatch.setattr(auth, "get_keycloak_provider_control", lambda: Control())
 
     assert _call() == {
-        "schema_version": 2,
+        "schema_version": 3,
         "auth_mode": "sso",
         "local_auth": {"enabled": False},
         "keycloak": {
@@ -107,10 +114,12 @@ def test_v2_sso_config_lists_only_enabled_provider_buttons(monkeypatch):
             }
         ],
         "mcp_oauth": {"enabled": False},
+        "personal_access_tokens": {"enabled": True},
+        "mcp_endpoint_url": "https://akb.example.test/workspace/mcp/",
     }
 
 
-def test_v2_ready_sso_config_publishes_only_enabled_provider_login_urls(
+def test_v3_ready_sso_config_publishes_only_enabled_provider_login_urls(
     monkeypatch,
 ):
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
@@ -135,7 +144,7 @@ def test_v2_ready_sso_config_publishes_only_enabled_provider_login_urls(
     ]
 
 
-def test_v2_public_config_has_only_non_secret_capability_fields(monkeypatch):
+def test_v3_public_config_has_only_non_secret_capability_fields(monkeypatch):
     monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
@@ -150,6 +159,8 @@ def test_v2_public_config_has_only_non_secret_capability_fields(monkeypatch):
         "keycloak",
         "providers",
         "mcp_oauth",
+        "personal_access_tokens",
+        "mcp_endpoint_url",
     }
     assert set(cfg["local_auth"]) == {"enabled"}
     assert set(cfg["keycloak"]) == {"enabled", "browser_session_ready"}
@@ -158,7 +169,7 @@ def test_v2_public_config_has_only_non_secret_capability_fields(monkeypatch):
 
 
 @pytest.mark.parametrize("delegated", [True, False])
-def test_v2_sso_config_fails_closed_without_a_verified_catalog(
+def test_v3_sso_config_fails_closed_without_a_verified_catalog(
     monkeypatch,
     delegated,
 ):
@@ -177,3 +188,22 @@ def test_v2_sso_config_fails_closed_without_a_verified_catalog(
 
     assert captured.value.status_code == 503
     assert captured.value.detail == "SSO provider catalog is unavailable"
+
+
+@pytest.mark.parametrize("mode", ["local", "sso"])
+@pytest.mark.parametrize("oauth_enabled", [False, True])
+@pytest.mark.parametrize("pat_enabled", [False, True])
+def test_public_capabilities_report_independent_flags(monkeypatch, mode, oauth_enabled, pat_enabled):
+    monkeypatch.setattr(settings, "auth_mode", mode)
+    monkeypatch.setattr(settings, "keycloak_enabled", mode == "sso" or oauth_enabled)
+    monkeypatch.setattr(settings, "mcp_oauth_enabled", oauth_enabled)
+    monkeypatch.setattr(settings, "human_pat_enabled", pat_enabled)
+    monkeypatch.setattr(settings, "api_oauth_audience", "https://distinct.example.test/api")
+    monkeypatch.setattr(auth, "get_keycloak_provider_control", lambda: Control())
+
+    cfg = _call()
+
+    assert cfg["auth_mode"] == mode
+    assert cfg["mcp_oauth"]["enabled"] is oauth_enabled
+    assert cfg["personal_access_tokens"]["enabled"] is pat_enabled
+    assert cfg["mcp_endpoint_url"] == "https://akb.example.test/workspace/mcp/"

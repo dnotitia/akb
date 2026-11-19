@@ -2,6 +2,7 @@ import { useCallback, useState, type FocusEvent, type RefObject } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import type { AuthConfig } from "@/lib/api";
 import { ConnectionSetup } from "@/components/connection-setup";
 import { isModalOpen } from "@/lib/modal-visibility";
 
@@ -22,11 +23,12 @@ function revealSetupFocus(event: FocusEvent<HTMLDivElement>) {
   else if (bounds.bottom > bottom) scroller.scrollTop += Math.min(bounds.bottom - bottom, bounds.top - top);
 }
 
-export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthEnabled, returnFocusRef }: {
+export function QuickstartDialog({ open, onOpenChange, onTokenCreated, authConfig, onRetryAuthConfig, returnFocusRef }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onTokenCreated?: () => void;
-  mcpOauthEnabled: boolean;
+  authConfig: AuthConfig;
+  onRetryAuthConfig?: () => void;
   returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const [hasSecret, setHasSecret] = useState(false);
@@ -62,10 +64,10 @@ export function QuickstartDialog({ open, onOpenChange, onTokenCreated, mcpOauthE
           <DialogTitle>Connect an AI tool</DialogTitle>
           <DialogDescription>Choose your tool, add AKB, then check the result in that tool.</DialogDescription>
         </DialogHeader>
-        {open && <div data-connection-scroll className="min-h-0 overflow-y-auto px-5 pt-5 sm:px-7" onFocusCapture={revealSetupFocus}><ConnectionSetup mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onTokenCreated} onDirtyChange={reportDirty} onSecretCreated={() => setCreatedSecret(true)} onBusyChange={setBusy} /></div>}
+        {open && <div data-connection-scroll className="min-h-0 overflow-y-auto px-5 pt-5 sm:px-7" onFocusCapture={revealSetupFocus}><ConnectionSetup authConfig={authConfig} onRetryAuthConfig={onRetryAuthConfig} onTokenCreated={onTokenCreated} onDirtyChange={reportDirty} onSecretCreated={() => setCreatedSecret(true)} onBusyChange={setBusy} /></div>}
         <DialogFooter className="connection-dialog-footer shrink-0 border-t border-border px-5 py-3 sm:px-7"><Button variant="outline" disabled={busy} onClick={() => requestClose(false)}>Close</Button></DialogFooter>
       </DialogContent>
     </Dialog>
-    <ConfirmDialog className="connection-confirmation" open={confirmClose} onOpenChange={setConfirmClose} title={createdSecret ? "Have you saved your connection key?" : "Leave connection setup?"} description={createdSecret ? "Save the key or its configuration privately before closing. The new key cannot be shown again here. Closing does not revoke it." : "Your setup draft and any entered key will be cleared from this window. Existing keys and connections remain active."} confirmLabel={createdSecret ? "I've saved it — close" : "Leave setup"} cancelLabel="Keep setup open" onConfirm={close} />
+    <ConfirmDialog className="connection-confirmation" open={confirmClose} onOpenChange={setConfirmClose} title={createdSecret ? "Have you saved your connection key?" : "Leave connection setup?"} description={createdSecret ? "Save the key or its configuration privately before closing. The new key cannot be shown again here. Closing does not revoke it." : "Your setup draft and any entered key will be cleared from this window. Existing keys are retained."} confirmLabel={createdSecret ? "I've saved it — close" : "Leave setup"} cancelLabel="Keep setup open" onConfirm={close} />
   </>;
 }

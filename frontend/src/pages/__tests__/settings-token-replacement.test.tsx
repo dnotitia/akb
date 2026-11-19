@@ -1,3 +1,5 @@
+import { parseAuthConfig } from "@/lib/api";
+import { localAuthConfig } from "@/stories/page-story-fixtures";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { Activity } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -11,10 +13,10 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 const fetchMock = vi.fn();
 beforeEach(() => { configureAuthTransport("local"); setToken("fixture-session"); fetchMock.mockReset(); fetchMock.mockImplementation(url => Promise.resolve(json(String(url).endsWith("/vaults") ? { vaults: [] } : caps))); vi.stubGlobal("fetch", fetchMock); });
 afterEach(() => { cleanup(); setToken(null); configureAuthTransport(null); vi.unstubAllGlobals(); });
-function mount(pats = [original]) { render(<TokensSection initialView="keys" pats={pats} patsError={false} mcpOauthEnabled={false} onReloadPats={vi.fn()} />); }
+function mount(pats = [original]) { render(<TokensSection initialView="keys" pats={pats} patsError={false} authConfig={parseAuthConfig(localAuthConfig)} onReloadPats={vi.fn()} />); }
 
 it("preserves the same-account replacement secret while checking and discards it on account-key replacement", async () => {
-  const view = (id: string, active: boolean) => <Activity mode={active ? "visible" : "hidden"}><TokensSection initialView="keys" key={id} pats={[original]} patsError={false} mcpOauthEnabled={false} onReloadPats={vi.fn()} /></Activity>;
+  const view = (id: string, active: boolean) => <Activity mode={active ? "visible" : "hidden"}><TokensSection initialView="keys" key={id} pats={[original]} patsError={false} authConfig={parseAuthConfig(localAuthConfig)} onReloadPats={vi.fn()} /></Activity>;
   const { rerender } = render(view("a", true));
   fireEvent.click(screen.getByRole("button", { name: "Replace key original" }));
   const dialog = screen.getByRole("dialog", { name: "Replace key original" });
@@ -72,7 +74,7 @@ it("preserves restrictions and exact expiry, and keeps the new secret after orig
 });
 
 it("disables replacement when a legacy token omitted its scope metadata", () => {
-  render(<TokensSection initialView="keys" pats={[{ token_id: oldId, name: "legacy", prefix: "akb_old" }]} patsError={false} mcpOauthEnabled={false} onReloadPats={vi.fn()} />);
+  render(<TokensSection initialView="keys" pats={[{ token_id: oldId, name: "legacy", prefix: "akb_old" }]} patsError={false} authConfig={parseAuthConfig(localAuthConfig)} onReloadPats={vi.fn()} />);
   expect(screen.getByRole("button", { name: "Replace key legacy" })).toBeDisabled();
   expect(screen.getByText(/Vault write restriction unknown/)).toBeVisible();
 });
@@ -80,7 +82,7 @@ it("disables replacement when a legacy token omitted its scope metadata", () => 
 
 it("retains token rows during refresh failure and gives retry a busy state", () => {
   const reload = vi.fn();
-  const view = (loading: boolean) => <TokensSection initialView="keys" pats={[original]} patsError mcpOauthEnabled={false} patsLoading={loading} onReloadPats={reload} />;
+  const view = (loading: boolean) => <TokensSection initialView="keys" pats={[original]} patsError authConfig={parseAuthConfig(localAuthConfig)} patsLoading={loading} onReloadPats={reload} />;
   const { rerender } = render(view(false));
   expect(screen.getByRole("button", { name: "Revoke key original" })).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -88,4 +90,20 @@ it("retains token rows during refresh failure and gives retry a busy state", () 
   rerender(view(true));
   expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
   expect(screen.getByRole("region", { name: "Connection keys" })).toHaveAttribute("aria-busy", "true");
+});
+
+
+it("permits explicit revocation when policy blocks replacement", async () => {
+  fetchMock.mockResolvedValue(json({ ok: true }));
+  const disabled = parseAuthConfig({ ...localAuthConfig, personal_access_tokens: { enabled: false } });
+  render(<TokensSection initialView="keys" pats={[original]} patsError={false} authConfig={disabled} onReloadPats={vi.fn()} />);
+
+  expect(screen.getByText("Disabled by deployment")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Replace key original" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Revoke key original" }));
+  const confirm = screen.getByRole("dialog", { name: /revoke/i });
+  fireEvent.click(within(confirm).getByRole("button", { name: /revoke/i }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+    `/api/v1/auth/tokens/${oldId}`, expect.objectContaining({ method: "DELETE" }),
+  ));
 });

@@ -14,16 +14,18 @@ import {
 
 
 const localConfig = {
-  schema_version: 2,
+  schema_version: 3,
   auth_mode: "local",
   local_auth: { enabled: true },
   keycloak: { enabled: false, browser_session_ready: false },
   providers: [],
   mcp_oauth: { enabled: false },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/mcp/",
 };
 
 const ssoConfig = {
-  schema_version: 2,
+  schema_version: 3,
   auth_mode: "sso",
   local_auth: { enabled: false },
   keycloak: { enabled: true, browser_session_ready: true },
@@ -34,6 +36,8 @@ const ssoConfig = {
     login_url: "/api/v1/auth/sso/workforce/login",
   }],
   mcp_oauth: { enabled: true },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/mcp/",
 };
 
 function jsonResponse(body: unknown, status = 200): Response {
