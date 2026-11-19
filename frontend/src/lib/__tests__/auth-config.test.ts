@@ -111,7 +111,7 @@ describe("getAuthConfig v3", () => {
     ["missing endpoint", { ...local, mcp_endpoint_url: undefined }],
     ["relative endpoint", { ...local, mcp_endpoint_url: "/mcp/" }],
     ["invalid endpoint path", { ...local, mcp_endpoint_url: "https://akb.example.test/mcp" }],
-    ["endpoint with credentials", { ...local, mcp_endpoint_url: "https://user:pass@akb.example.test/mcp/" }],
+    ["endpoint with user information", { ...local, mcp_endpoint_url: "https://user@akb.example.test/mcp/" }],
     ["endpoint with query", { ...local, mcp_endpoint_url: "https://akb.example.test/mcp/?arg" }],
     ["endpoint with fragment", { ...local, mcp_endpoint_url: "https://akb.example.test/mcp/#anchor" }],
     ["missing mode", { ...local, auth_mode: undefined }],
