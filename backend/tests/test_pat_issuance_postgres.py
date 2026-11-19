@@ -239,7 +239,7 @@ async def test_sso_human_issuance_and_browser_csrf(monkeypatch):
                                         headers={sessions.SSO_BROWSER_CSRF_HEADER: handle.csrf_token})
             assert allowed.status_code == 200, allowed.text
             pat = allowed.json()
-            monkeypatch.setattr(auth_service.settings, "human_pat_enabled", False)
+            monkeypatch.setattr(auth_service.settings, "pat_enabled", False)
 
             listed = await client.get("/api/v1/auth/tokens")
             assert listed.status_code == 200
@@ -312,7 +312,7 @@ async def test_disabled_pat_issuance_aliases_and_management(monkeypatch):
         wire(monkeypatch, pool)
         admin = await person(pool, admin=True)
         existing = await auth_service.create_pat(admin.user_id, "existing")
-        monkeypatch.setattr(auth_service.settings, "human_pat_enabled", False)
+        monkeypatch.setattr(auth_service.settings, "pat_enabled", False)
 
         async with client_for(admin) as client:
             alias = f"/api/v1/admin/users/{admin.user_id}"
@@ -336,7 +336,7 @@ async def test_disabled_pat_issuance_aliases_and_management(monkeypatch):
             assert any(token["token_id"] == existing["token_id"] for token in listed.json()["tokens"])
             assert (await client.delete(f"/api/v1/auth/tokens/{existing['token_id']}")).status_code == 200
 
-        monkeypatch.setattr(auth_service.settings, "human_pat_enabled", True)
+        monkeypatch.setattr(auth_service.settings, "pat_enabled", True)
         assert await auth_service.resolve_rest_user_authorization(f"Bearer {existing['token']}") is None
 
 
@@ -353,7 +353,7 @@ async def test_disabled_pat_preserves_atomic_verification_and_stored_class(monke
         await pool.execute("UPDATE tokens SET key_class = NULL WHERE id = $1", uuid.UUID(legacy["token_id"]))
         await pool.execute("UPDATE tokens SET key_class = 'service' WHERE id = $1", uuid.UUID(promoted["token_id"]))
         await pool.execute("UPDATE tokens SET expires_at = NOW() WHERE id = $1", uuid.UUID(expired["token_id"]))
-        monkeypatch.setattr(auth_service.settings, "human_pat_enabled", False)
+        monkeypatch.setattr(auth_service.settings, "pat_enabled", False)
 
         for resolve in (
             auth_service.resolve_rest_user_authorization,
@@ -366,7 +366,7 @@ async def test_disabled_pat_preserves_atomic_verification_and_stored_class(monke
                 assert current_key_class.get() is current_token_id.get() is current_token_scopes.get() is current_vault_scope.get() is None
 
         assert await pool.fetchval("SELECT count(*) FROM tokens WHERE last_used_at IS NOT NULL") == 1
-        monkeypatch.setattr(auth_service.settings, "human_pat_enabled", True)
+        monkeypatch.setattr(auth_service.settings, "pat_enabled", True)
         assert (await auth_service.resolve_mcp_authorization(f"Bearer {saved['token']}")).key_class == "pat"
         assert (await auth_service.resolve_mcp_authorization(f"Bearer {legacy['token']}")).key_class == "pat"
         assert await auth_service.resolve_mcp_authorization(f"Bearer {expired['token']}") is None

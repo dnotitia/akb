@@ -197,7 +197,7 @@ def test_public_capabilities_report_independent_flags(monkeypatch, mode, oauth_e
     monkeypatch.setattr(settings, "auth_mode", mode)
     monkeypatch.setattr(settings, "keycloak_enabled", mode == "sso" or oauth_enabled)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", oauth_enabled)
-    monkeypatch.setattr(settings, "human_pat_enabled", pat_enabled)
+    monkeypatch.setattr(settings, "pat_enabled", pat_enabled)
     monkeypatch.setattr(settings, "api_oauth_audience", "https://distinct.example.test/api")
     monkeypatch.setattr(auth, "get_keycloak_provider_control", lambda: Control())
 

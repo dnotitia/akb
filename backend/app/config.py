@@ -1170,7 +1170,7 @@ class Settings(BaseModel):
     # existing public-resource convention used by MCP, but stays distinct.
     api_oauth_audience: str = ""
 
-    human_pat_enabled: bool = True
+    pat_enabled: bool = True
 
     # OAuth for MCP and file/image controls, independent of browser auth.
     mcp_oauth_enabled: bool = False

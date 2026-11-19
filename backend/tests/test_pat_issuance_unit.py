@@ -87,7 +87,7 @@ async def test_disabled_pat_policy_rejects_before_using_storage_or_generating_se
     def fail_if_called(*_args):
         pytest.fail("Disabled issuance reached credential generation or storage")
 
-    monkeypatch.setattr(auth_service.settings, "human_pat_enabled", False)
+    monkeypatch.setattr(auth_service.settings, "pat_enabled", False)
     monkeypatch.setattr(auth_service, "get_pool", fail_if_called)
     monkeypatch.setattr(auth_service, "generate_pat", fail_if_called)
 

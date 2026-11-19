@@ -290,11 +290,11 @@ stdio proxy requires HTTPS or loopback HTTP.
 
 ## Control personal access tokens
 
-Set `human_pat_enabled` in `app.yaml` to permit or disable issuance and
+Set `pat_enabled` in `app.yaml` to permit or disable issuance and
 authentication with personal access tokens (PATs). The default is `true`.
 Choose this setting independently of `mcp_oauth_enabled`.
 
-| `mcp_oauth_enabled` | `human_pat_enabled` | Human MCP authentication |
+| `mcp_oauth_enabled` | `pat_enabled` | Human MCP authentication |
 | --- | --- | --- |
 | `false` | `true` | PAT |
 | `true` | `true` | OAuth or PAT |

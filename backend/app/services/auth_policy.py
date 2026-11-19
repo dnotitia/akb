@@ -38,6 +38,6 @@ def require_local_auth_enabled() -> None:
         raise LocalAuthDisabledError()
 
 
-def require_human_pat_enabled() -> None:
-    if not settings.human_pat_enabled:
+def require_pat_enabled() -> None:
+    if not settings.pat_enabled:
         raise PersonalAccessTokensDisabledError()

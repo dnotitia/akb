@@ -271,7 +271,7 @@ async def test_resolve_mcp_selects_keycloak_profile_without_alg_dispatch(monkeyp
     from app.services import auth_service
     from app.services.auth_verifier_profiles import VerifiedPrincipal
 
-    monkeypatch.setattr(settings, "human_pat_enabled", pat_enabled)
+    monkeypatch.setattr(settings, "pat_enabled", pat_enabled)
     monkeypatch.setattr(settings, "mcp_oauth_enabled", True, raising=False)
     monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
     monkeypatch.setattr(settings, "keycloak_server_url", "https://kc.example.com", raising=False)

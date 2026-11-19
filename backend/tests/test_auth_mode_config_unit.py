@@ -42,7 +42,7 @@ def test_runtime_load_accepts_explicit_local_auth_mode(
     loaded = _load(monkeypatch, tmp_path, {"auth_mode": "local"})
 
     assert loaded.auth_mode == "local"
-    assert loaded.human_pat_enabled is True
+    assert loaded.pat_enabled is True
     assert loaded.local_human_auth_enabled is True
     assert loaded.sso_human_auth_enabled is False
 
@@ -685,10 +685,10 @@ def test_pat_policy_loads_independently_of_browser_mode_and_mcp_oauth(
         "auth_mode": mode,
         "mcp_oauth_enabled": oauth_enabled,
         "keycloak_enabled": mode == "sso" or oauth_enabled,
-        "human_pat_enabled": pat_enabled,
+        "pat_enabled": pat_enabled,
         "public_base_url": "https://akb.example.test/workspace/",
     })
 
     assert config.require_auth_mode() == mode
     assert config.mcp_oauth_enabled is oauth_enabled
-    assert config.human_pat_enabled is pat_enabled
+    assert config.pat_enabled is pat_enabled

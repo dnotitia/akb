@@ -39,8 +39,8 @@ from app.services.auth_service import (
 )
 from app.services.monitoring_auth import MonitoringSsoProof, login_monitoring_sso
 from app.services.auth_policy import (
-    require_human_pat_enabled,
     require_local_auth_enabled,
+    require_pat_enabled,
     sso_browser_session_ready,
 )
 from app.services.keycloak_oidc import (
@@ -234,7 +234,7 @@ async def auth_config(response: Response):
         "mcp_oauth": {
             "enabled": settings.mcp_oauth_enabled,
         },
-        "personal_access_tokens": {"enabled": settings.human_pat_enabled},
+        "personal_access_tokens": {"enabled": settings.pat_enabled},
         "mcp_endpoint_url": settings.mcp_endpoint_url,
     }
 
@@ -829,7 +829,7 @@ async def create_token(req: CreatePATRequest, user: AuthenticatedUser = Depends(
 async def token_issuance_capabilities(response: Response, user: AuthenticatedUser = Depends(get_current_user)):
     from app.db.postgres import get_pool
     require_issuer_carrier(user)
-    require_human_pat_enabled()
+    require_pat_enabled()
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():

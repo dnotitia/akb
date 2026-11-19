@@ -43,7 +43,7 @@ from app.exceptions import (
 from app.models.vault_scope import VaultScope
 from app.repositories.events_repo import emit_event
 from app.services.admission_service import record_arrival
-from app.services.auth_policy import require_human_pat_enabled, require_local_auth_enabled
+from app.services.auth_policy import require_local_auth_enabled, require_pat_enabled
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
     KEYCLOAK_SERVICE_AUTHORITY_V1,
@@ -1284,7 +1284,7 @@ async def create_pat(
 
     key_class = _normalize_issuable_key_class(key_class)
     if key_class == "pat":
-        require_human_pat_enabled()
+        require_pat_enabled()
     pool = await get_pool()
     token_scopes = normalize_token_scopes(scopes)
     dedicated_operation_request_scope = SSO_OPERATION_REQUEST_SCOPE in token_scopes
@@ -1804,7 +1804,7 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
                       u.account_kind
             """,
             token_hash,
-            settings.human_pat_enabled,
+            settings.pat_enabled,
         )
         if not row:
             return None
