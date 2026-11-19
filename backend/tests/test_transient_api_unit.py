@@ -86,14 +86,22 @@ async def test_readiness_success_ttl_failed_probe_and_soft_vector(main, monkeypa
     pool = SimpleNamespace(fetchval=AsyncMock(return_value=1), get_size=lambda: 2,
                            get_idle_size=lambda: 2, get_max_size=lambda: 2)
     monkeypatch.setattr(main, "get_pool", AsyncMock(return_value=pool))
+    ping = AsyncMock(return_value=None)
+    monkeypatch.setattr(main, "readiness_ping", ping)
     monkeypatch.setattr(main, "get_vector_store", lambda: SimpleNamespace(health=AsyncMock(return_value=False)))
     ok, detail = await main._probe_ready()
     assert ok is True
     assert detail["vector_store"] == "degraded:unreachable"
+    # The ping runs on the dedicated probe connection, never on the pool.
+    ping.assert_awaited_once()
+    pool.fetchval.assert_not_awaited()
     now = main.time.monotonic()
     assert main._cache_fresh(main._ReadyState(now, True, detail))
     assert not main._cache_fresh(main._ReadyState(now - 30.1, True, detail))
-    assert not main._cache_fresh(main._ReadyState(now, False, detail))
+    # A failure is shared by concurrent callers for the short floor only.
+    past_floor = now - main._READY_MIN_INTERVAL_SECONDS - 0.1
+    assert main._cache_fresh(main._ReadyState(now, False, detail))
+    assert not main._cache_fresh(main._ReadyState(past_floor, False, detail))
 
 
 @pytest.mark.asyncio
@@ -166,6 +174,8 @@ async def test_ready_cache_can_outlive_data_availability_but_failure_is_not_cach
         await main.readyz()
     assert caught.value.status_code == 503
     monkeypatch.setattr(main, "_probe_ready", healthy)
+    # The failure answers only for the short floor, then the next call probes.
+    main._ready_state.ts -= main._READY_MIN_INTERVAL_SECONDS
     assert (await main.readyz())["cached"] is False
     assert (await main.livez()) == {"status": "alive"}
 

@@ -40,9 +40,9 @@ echo "$body" | grep -q '"detail"' && pass "has detail" || fail "readyz detail" "
 echo "$body" | grep -q '"pool"' && pass "detail.pool reported" || fail "detail.pool" "$body"
 echo "$body" | grep -q '"db"' && pass "detail.db reported" || fail "detail.db" "$body"
 
-# Vector store can be ok or degraded:* — either is acceptable for readyz
-echo "$body" | grep -qE '"vector_store":"(ok|degraded:.*)"' \
-  && pass "vector_store is ok or degraded" \
+# Vector store can be ok, degraded:* or skipped:* (skipped while the pool is saturated)
+echo "$body" | grep -qE '"vector_store":"(ok|degraded:.*|skipped:.*)"' \
+  && pass "vector_store is ok, degraded or skipped" \
   || fail "vector_store status" "$body"
 
 # ── 3. /health returns detailed stats ────────────────────────

@@ -1,8 +1,11 @@
 import asyncio
 import logging
 import os
+import time
 import asyncpg
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from app.config import settings
@@ -11,6 +14,90 @@ logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
 _MIGRATION_LOCK_KEY = 0x414B425F4D494752  # ``AKB_MIGR``
+
+# The readiness probe's own connection (see `readiness_ping`). It is never
+# lent to a request, so it stays usable however busy the pool is.
+_readiness_conn: asyncpg.Connection | None = None
+_readiness_lock = asyncio.Lock()
+# Names the probe's session in pg_stat_activity, apart from request traffic.
+READINESS_APPLICATION_NAME = "akb-readiness-probe"
+
+# Completed acquires of the request pool, counted by its `setup` hook (see
+# get_pool). A busy pool keeps handing its connections to the next caller and
+# this keeps moving; a wedged pool, whose holders never give a connection
+# back, stops it. Readiness tells the two apart by it (see pool_progress).
+_acquires_total = 0
+_last_acquire_at: float | None = None
+# Set while readiness takes pool connections itself, and inherited by the
+# tasks it starts. Those acquires say nothing about whether requests are
+# being served, and one whose connection then fails must not let the next
+# probe skip checking the pool, so they are not counted.
+_readiness_acquiring: ContextVar[bool] = ContextVar("akb_readiness_acquiring", default=False)
+
+
+@contextmanager
+def readiness_acquires() -> Iterator[None]:
+    """Acquires made inside this block do not count as pool progress."""
+    token = _readiness_acquiring.set(True)
+    try:
+        yield
+    finally:
+        _readiness_acquiring.reset(token)
+
+
+async def _count_acquire(_conn) -> None:
+    """The request pool's ``setup`` hook. asyncpg awaits it on every acquire,
+    just before it hands out the connection. It must stay cheap and must not
+    raise: asyncpg closes the connection when ``setup`` fails."""
+    if _readiness_acquiring.get():
+        return
+    global _acquires_total, _last_acquire_at
+    _acquires_total += 1
+    _last_acquire_at = time.monotonic()
+    _wake_progress_waiters()
+
+
+# Futures from `pool_progress_waiter`, each from its own loop.
+_progress_waiters: set[asyncio.Future] = set()
+
+
+def _wake_progress_waiters() -> None:
+    while _progress_waiters:
+        waiter = _progress_waiters.pop()
+        try:
+            if not waiter.done() and not waiter.get_loop().is_closed():
+                waiter.set_result(None)
+        except Exception:  # noqa: BLE001 — the hook must not fail an acquire
+            logger.debug("pool progress waiter could not be woken", exc_info=True)
+
+
+def pool_progress_waiter() -> asyncio.Future:
+    """A future that the next acquire counted as pool progress resolves.
+
+    It is registered before this returns, so no such acquire that completes
+    after the call is missed. Hand it to `forget_pool_progress_waiter` when
+    done with it.
+    """
+    waiter = asyncio.get_running_loop().create_future()
+    _progress_waiters.add(waiter)
+    return waiter
+
+
+def forget_pool_progress_waiter(waiter: asyncio.Future) -> None:
+    _progress_waiters.discard(waiter)
+    if not waiter.done():
+        waiter.cancel()
+
+
+def pool_progress() -> tuple[int, float | None]:
+    """Completed request-pool acquires so far, and seconds since the latest.
+
+    The age is None until the first acquire. A pool built without the hook
+    never moves either value.
+    """
+    if _last_acquire_at is None:
+        return _acquires_total, None
+    return _acquires_total, max(0.0, time.monotonic() - _last_acquire_at)
 
 
 def _pool_sizes() -> tuple[int, int]:
@@ -63,6 +150,9 @@ async def get_pool() -> asyncpg.Pool:
                         "statement_timeout": "30000",
                         "idle_in_transaction_session_timeout": "60000",
                     },
+                    # Counts completed acquires for readiness. This pool has no
+                    # other setup hook; chain into this one if one is added.
+                    setup=_count_acquire,
                 )
                 break
             except ConnectionRefusedError, OSError:
@@ -85,6 +175,80 @@ async def close_pool() -> None:
     if _pool is not None:
         pool, _pool = _pool, None
         await pool.close()
+
+
+async def readiness_ping(*, timeout: float) -> None:
+    """Run ``SELECT 1`` on the readiness probe's dedicated connection.
+
+    Readiness used to borrow a request-pool connection for this ping. When
+    requests held every pool connection, the probe queued behind them and
+    timed out, so a busy pool read as an unreachable database, and every
+    replica reported that at the same moment. Connecting and the ping are
+    each bounded by ``timeout``. Raises on failure; the caller decides what
+    that means.
+    """
+    await with_readiness_connection(lambda conn: conn.fetchval("SELECT 1"), timeout=timeout)
+
+
+async def with_readiness_connection[T](use: Callable[[asyncpg.Connection], Awaitable[T]], *, timeout: float) -> T:
+    """Run ``use`` on the readiness probe's dedicated connection.
+
+    The connection is opened on first use with the pool's DSN, reused by later
+    calls, and replaced after any failure. It is never lent to a request, so it
+    stays usable however busy the pool is. Opening it is bounded by
+    ``timeout``, and so is each statement unless the caller bounds it sooner.
+    """
+    global _readiness_conn
+    async with _readiness_lock:
+        conn = _readiness_conn
+        if conn is not None and conn.is_closed():
+            # The server ended the session while it sat idle (a restart, an
+            # administrator, an idle-session limit): open a new one now rather
+            # than reporting the stale handle as an outage.
+            _readiness_conn = conn = None
+        try:
+            if conn is None:
+                conn = await asyncpg.connect(
+                    dsn=settings.asyncpg_dsn,
+                    timeout=timeout,
+                    command_timeout=timeout,
+                    server_settings={"application_name": READINESS_APPLICATION_NAME},
+                )
+                _readiness_conn = conn
+            return await use(conn)
+        except BaseException:
+            # Includes cancellation by the caller's deadline: a statement cut
+            # off mid-protocol leaves the session in an unknown state, and
+            # terminating it waits on nothing. The next call opens a fresh one.
+            if conn is not None:
+                if _readiness_conn is conn:
+                    _readiness_conn = None
+                _terminate_quietly(conn)
+            raise
+
+
+def _terminate_quietly(conn: asyncpg.Connection) -> None:
+    try:
+        conn.terminate()
+    except Exception:  # noqa: BLE001 — the connection is being discarded either way
+        logger.debug("readiness probe connection could not be terminated", exc_info=True)
+
+
+async def close_readiness_connection(timeout: float = 2.0) -> None:
+    """Close the readiness probe's connection, if one is open.
+
+    The handle is cleared before the await, for the same reason as in
+    ``close_pool``. A connection that does not close within ``timeout`` is
+    aborted; shutdown is not held up by it.
+    """
+    global _readiness_conn
+    conn, _readiness_conn = _readiness_conn, None
+    if conn is None or conn.is_closed():
+        return
+    try:
+        await conn.close(timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 — asyncpg has already aborted it
+        logger.warning("readiness probe connection did not close cleanly: %s", type(exc).__name__)
 
 
 @asynccontextmanager
