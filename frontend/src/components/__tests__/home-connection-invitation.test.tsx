@@ -1,4 +1,4 @@
-import { parseAuthConfig, type AuthConfig } from "@/lib/api";
+import { AUTH_CONFIG_UNAVAILABLE, parseAuthConfig, type AuthConfig } from "@/lib/api";
 import { localAuthConfig } from "@/stories/page-story-fixtures";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -14,7 +14,7 @@ const connectionConfig = (pat = true) => parseAuthConfig({
 
 vi.mock("@/components/connection-setup", () => ({
   ConnectionSetup: ({ onDirtyChange, onTokenCreated, onSecretCreated, authConfig }: { onDirtyChange: (dirty: boolean) => void; onTokenCreated?: () => void; onSecretCreated?: () => void; authConfig: AuthConfig }) => <>
-    <p>{authConfig.mcp_oauth.enabled ? "OAuth is available" : "Personal token setup"}</p>
+    <p>{!authConfig.available ? "Connection options unavailable" : authConfig.mcp_oauth.enabled ? "OAuth is available" : "Personal token setup"}</p>
     {authConfig.personal_access_tokens.enabled && <button onClick={() => { onDirtyChange(true); onTokenCreated?.(); onSecretCreated?.(); }}>Create test token</button>}
     <input aria-label="Saved private configuration" defaultValue="private-example" />
   </>,
@@ -95,6 +95,15 @@ describe("Home connection invitation", () => {
     expect(screen.getByRole("button", { name: "Connect an AI tool" })).toBeVisible();
     rerender(invitation(true));
     expect(region()).toHaveAttribute("data-expanded", "true");
+  });
+
+  it("opens the shared guide with unavailable capabilities from the neutral launcher", async () => {
+    const user = userEvent.setup();
+    render(<HomeConnectionInvitation userId={userId} eligible={false} authConfig={AUTH_CONFIG_UNAVAILABLE} />);
+    await user.click(screen.getByRole("button", { name: "Connect an AI tool" }));
+    const modal = screen.getByRole("dialog", { name: "Connect an AI tool" });
+    expect(within(modal).getByText("Connection options unavailable")).toBeVisible();
+    expect(within(modal).queryByRole("button", { name: "Create test token" })).toBeNull();
   });
 
   it("keeps mobile and short landscape compact, with safe-area positioning", () => {

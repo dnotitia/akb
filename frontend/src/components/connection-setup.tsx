@@ -1,18 +1,17 @@
 import { useEffect, useId, useState, type ReactNode, type RefCallback } from "react";
-import { ArrowLeft, ArrowRight, Check, CircleHelp } from "lucide-react";
+import { ArrowLeft, ArrowRight, CircleHelp } from "lucide-react";
 import { authSessionSnapshot, isCurrentAuthSession, type AuthConfig, type AuthSessionSnapshot } from "@/lib/api";
 import { ConnectionTroubleshooting } from "@/components/connection-troubleshooting";
-import { CONNECTION_GUIDES, CONNECTION_TEST_PROMPT } from "@/lib/connection-guide";
+import { AUTHENTICATION_LABELS, CONNECTION_GUIDES, CONNECTION_TEST_PROMPT, TRANSPORT_LABELS } from "@/lib/connection-guide";
 import { type PatReceipt } from "@/lib/api-pat-issuance";
 import { scopeSummary, type PatDraft } from "@/lib/pat-draft";
 import { PatIssuanceForm } from "@/components/pat-issuance-form";
-import { MCP_AGENT_FILES, MCP_AGENT_LABELS, mcpInstallSnippets, mcpOAuthSnippets, supportsMcpProxyEndpoint, type McpAgent } from "@/lib/mcp-snippets";
+import { MCP_SNIPPET_LABELS, MCP_AGENT_LABELS, hasMcpRecipe, mcpLoginCommand, mcpSnippet, supportsSecureMcpEndpoint, type McpAgent, type McpAuthentication, type McpTransport } from "@/lib/mcp-snippets";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { CodeSnippet } from "@/components/ui/code-snippet";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { cn } from "@/lib/utils";
 import { useSetupStepNavigation, type SetupStepNumber } from "@/hooks/use-setup-step-navigation";
 
 function SetupStep({ id, number, title, description, current, sectionRef, children }: {
@@ -28,32 +27,25 @@ function SetupStep({ id, number, title, description, current, sectionRef, childr
   </section>;
 }
 
-/** One labelled choice, without another select box or nested setup branch. */
-function SetupChoice({ label, name, value, options, disabled, onChange, appearance = "segmented" }: {
-  label: string; name: string; value: string;
-  options: { value: string; label: string; accessibleName?: string }[];
-  disabled: boolean; onChange: (value: string) => void;
-  appearance?: "tabs" | "segmented" | "compact";
+function SetupChoice<Value extends string>({ label, name, value, options, disabled, onChange }: {
+  label: string; name: string; value: Value | null;
+  options: { value: Value; label: string; disabled?: boolean }[];
+  disabled: boolean; onChange: (value: Value) => void;
 }) {
-  const compact = appearance === "compact";
-  return <fieldset disabled={disabled} className={cn("min-w-0", compact && "connection-compact-choices")}>
+  return <fieldset disabled={disabled} className="connection-compact-choices min-w-0">
     <legend className="mb-2 text-xs font-medium text-foreground-muted">{label}</legend>
-    <div className={cn("flex flex-wrap gap-1", compact ? "connection-choice-row" : appearance === "tabs" ? "border-b border-border" : "rounded-[var(--radius-md)] border border-border bg-surface-2 p-1")}>
-      {options.map(option => <label key={option.value} data-selected={value === option.value} data-disabled={disabled} className={compact ? "connection-choice-option" : cn(
-        "relative flex min-h-11 flex-[1_0_auto] cursor-pointer items-center justify-center gap-2 whitespace-nowrap px-3 text-sm transition-token has-[:focus-visible]:z-10 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring has-[:focus-visible]:ring-offset-2 has-[:focus-visible]:ring-offset-surface",
-        appearance === "tabs" ? "rounded-t-[var(--radius-sm)] border-b-2" : "rounded-[var(--radius-sm)] border",
-        disabled && "cursor-not-allowed opacity-50",
-        value === option.value
-          ? cn("bg-surface-selected font-semibold text-surface-selected-foreground", appearance === "tabs" ? "border-link" : "border-border-strong")
-          : "border-transparent text-foreground-muted hover:bg-surface-hover hover:text-foreground",
-      )}>
-        <input type="radio" className="sr-only" name={name} value={option.value} aria-label={option.accessibleName} checked={value === option.value} tabIndex={value === option.value ? 0 : -1} onChange={() => onChange(option.value)} />
-        {appearance === "segmented" && <Check aria-hidden className={cn("h-3.5 w-3.5 shrink-0", value !== option.value && "invisible")} />}
+    <div className="connection-choice-row flex flex-wrap gap-1">
+      {options.map(option => <label key={option.value} data-selected={value === option.value} data-disabled={disabled || Boolean(option.disabled)} className="connection-choice-option">
+        <input type="radio" className="sr-only" name={name} value={option.value} disabled={option.disabled} checked={value === option.value} onChange={() => onChange(option.value)} />
         {option.label}
       </label>)}
     </div>
   </fieldset>;
 }
+
+const TRANSPORTS = ["stdio", "http"] as const;
+const AUTHENTICATION_METHODS = ["oauth", "pat"] as const;
+const AGENTS = (Object.keys(MCP_AGENT_LABELS) as McpAgent[]).map(value => ({ value, label: MCP_AGENT_LABELS[value] }));
 
 export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated, onSecretCreated, onBusyChange, invalidatedTokenId, onDirtyChange, initialDraft, replacement = false, onReceipt, layout = "compact", ownsOperation }: {
   layout?: "compact" | "workspace" | "settings";
@@ -72,10 +64,12 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
   const id = useId();
   const { rootRef, navigationRef, stepsRef, currentStep, jumpToStep } = useSetupStepNavigation();
   const [configurationRevision, setConfigurationRevision] = useState(0);
-  const [copied, setCopied] = useState<{ revision: number; agent: McpAgent; oauth: boolean; endpoint: string | null } | null>(null);
-  const [confirmation, setConfirmation] = useState<{ revision: number; agent: McpAgent; oauth: boolean; endpoint: string | null } | null>(null);
+  const [copied, setCopied] = useState<number | null>(null);
+  const [confirmation, setConfirmation] = useState<number | null>(null);
   const [agent, setAgent] = useState<McpAgent>("claude");
-  const [auth, setAuth] = useState("oauth");
+  const [transport, setTransport] = useState<McpTransport>("stdio");
+  const [authentication, setAuthentication] = useState<McpAuthentication | null>(null);
+  const [patRejected, setPatRejected] = useState(false);
   const [credentialMode, setCredentialMode] = useState("create");
   const [freshToken, setFreshToken] = useState("");
   const [freshTokenId, setFreshTokenId] = useState<string | null>(null);
@@ -86,7 +80,7 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
   const [receipt, setReceipt] = useState<PatReceipt | null>(null);
   const [showSecret, setShowSecret] = useState(true);
   const [formDirty, setFormDirty] = useState(false);
-  const [issuanceStarted, setIssuanceStarted] = useState(false);
+  const [issuanceMounted, setIssuanceMounted] = useState(false);
   const [session, setSession] = useState(authSessionSnapshot);
   const dirty = formDirty || !!freshToken || !!existingToken;
   useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
@@ -104,16 +98,27 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
     const timer = window.setInterval(check, 1000);
     return () => { window.removeEventListener("storage", check); window.removeEventListener("focus", check); document.removeEventListener("visibilitychange", check); window.clearInterval(timer); };
   }, [session]);
-  const endpoint = authConfig.available ? authConfig.mcp_endpoint_url : null;
-  const patEnabled = authConfig.available && authConfig.personal_access_tokens.enabled;
-  const oauthSnippet = !replacement && endpoint && authConfig.mcp_oauth.enabled ? mcpOAuthSnippets(endpoint)[agent] : undefined;
-  const useOauth = Boolean(oauthSnippet) && (auth === "oauth" || !patEnabled);
-  const showPatControls = patEnabled && !useOauth;
-  const canGeneratePatConfig = endpoint !== null && supportsMcpProxyEndpoint(endpoint);
-  const hideIssuanceForm = patEnabled && (!showPatControls || credentialMode !== "create");
-  // Start discovery only when token creation is first opened, then preserve
-  // the form session even while another credential mode is visible.
-  if (currentStep === 2 && showPatControls && credentialMode === "create" && !issuanceStarted) setIssuanceStarted(true);
+  const endpoint = authConfig.mcp_endpoint_url;
+  const patEnabled = authConfig.available && authConfig.personal_access_tokens.enabled && !patRejected;
+  const oauthEnabled = authConfig.available && !replacement && authConfig.mcp_oauth.enabled;
+  const methods = AUTHENTICATION_METHODS.filter(method => method === "pat" ? patEnabled : oauthEnabled);
+  const supports = (selectedTransport: McpTransport, method: McpAuthentication) =>
+    methods.includes(method) && hasMcpRecipe(agent, selectedTransport, method);
+  const transportAvailable = (option: McpTransport) => methods.some(method => supports(option, method));
+  const authenticationOptions = methods.filter(method => supports(transport, method));
+  const selectedAuthentication = authentication !== null && authenticationOptions.includes(authentication) ? authentication : null;
+  const secureEndpoint = endpoint !== null && supportsSecureMcpEndpoint(endpoint);
+  const showPatControls = secureEndpoint && selectedAuthentication === "pat";
+  const formVisible = credentialMode === "create" && (showPatControls || !patEnabled && authentication === "pat");
+  const loginCommand = endpoint && secureEndpoint && transport === "stdio" && selectedAuthentication === "oauth" ? mcpLoginCommand(endpoint) : null;
+  const capabilityKey = JSON.stringify([endpoint, patEnabled, oauthEnabled]);
+  const [previousCapabilities, setPreviousCapabilities] = useState(capabilityKey);
+  if (capabilityKey !== previousCapabilities) {
+    setPreviousCapabilities(capabilityKey);
+    setConfigurationRevision(value => value + 1);
+  }
+  if (authentication === null && authenticationOptions.length > 0) setAuthentication(authenticationOptions[0]);
+  if (currentStep === 2 && showPatControls && credentialMode === "create" && !issuanceMounted) setIssuanceMounted(true);
   const token = isCurrentAuthSession(session) ? freshToken || (credentialMode === "existing" ? existingToken.trim() : "") : "";
   // A visible prefix or placeholder is never a usable configuration.
   const usableToken = /^[A-Za-z0-9_-]+$/.test(token);
@@ -136,15 +141,19 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
     }
   }
 
-  const configuration = useOauth ? oauthSnippet
-    : endpoint && canGeneratePatConfig && showPatControls && usableToken && (!freshToken || showSecret) ? mcpInstallSnippets(endpoint, token)[agent] : null;
+  const configuration = endpoint && secureEndpoint && selectedAuthentication === "oauth"
+    ? mcpSnippet(agent, { transport, authentication: "oauth", endpoint })
+    : endpoint && showPatControls && usableToken && (!freshToken || showSecret)
+      ? mcpSnippet(agent, { transport, authentication: "pat", endpoint, pat: token })
+      : undefined;
   const guide = CONNECTION_GUIDES[agent];
-  const matches = (record: typeof copied) => isCurrentAuthSession(session) && record?.revision === configurationRevision && record.agent === agent && record.oauth === useOauth && record.endpoint === endpoint && Boolean(configuration);
-  const record = { revision: configurationRevision, agent, oauth: useOauth, endpoint };
-  const terminal = MCP_AGENT_FILES[agent] === "terminal";
+  const matches = (revision: number | null) => isCurrentAuthSession(session) && revision === configurationRevision && Boolean(configuration);
+  const missingMethods = methods.filter(method => !hasMcpRecipe(agent, transport, method));
   return <div ref={rootRef} className="connection-setup min-w-0" data-layout={layout}>
     {!authConfig.available ? <Alert variant="warning">Connection options could not be verified. {onRetryAuthConfig ? <Button variant="link" onClick={onRetryAuthConfig}>Retry connection options</Button> : "Reopen connection setup to retry."}</Alert>
-      : !patEnabled && !authConfig.mcp_oauth.enabled && <Alert variant="info">This deployment has no human MCP connection method enabled.</Alert>}
+      : methods.length === 0 && <Alert variant="info">{replacement
+        ? "Personal connection keys are disabled. You can still revoke existing keys."
+        : "This deployment has no human MCP connection method enabled."}</Alert>}
     <nav ref={navigationRef} className="connection-progress" aria-label="Connection setup steps">
       <ol aria-label="Connection setup overview">
         {[
@@ -160,8 +169,8 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
     <div className="connection-steps">
       <SetupStep id={`${id}-tool`} number={1} title="Choose your AI tool" description="Where would you like to use your AKB knowledge?"
         current={currentStep === 1} sectionRef={element => { stepsRef.current[0] = element; }}>
-        <SetupChoice label="AI tool" appearance="compact" name={`${id}-agent`} value={agent} disabled={creating}
-          onChange={value => { setAgent(value as McpAgent); setConfigurationRevision(value => value + 1); }} options={Object.entries(MCP_AGENT_LABELS).map(([value, label]) => ({ value, label }))} />
+        <SetupChoice label="AI tool" name={`${id}-agent`} value={agent} disabled={creating}
+          onChange={value => { setAgent(value); setConfigurationRevision(value => value + 1); }} options={AGENTS} />
         <p className="text-sm leading-relaxed text-foreground-muted">{guide.introduction}</p>
         <p className="text-xs leading-relaxed text-foreground-muted">Have this application installed and make sure that computer can reach your AKB address, including any required VPN.</p>
         <details className="connection-inline-help"><summary>Using Claude Desktop or Claude on the web?</summary>
@@ -172,22 +181,28 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
 
       <SetupStep id={`${id}-add`} number={2} title={`Add AKB to ${MCP_AGENT_LABELS[agent]}`} description="Follow the instructions on the computer where this AI tool runs."
         current={currentStep === 2} sectionRef={element => { stepsRef.current[1] = element; }}>
-        {oauthSnippet && patEnabled ? <SetupChoice label="How to connect" appearance="compact" name={`${id}-access`} value={useOauth ? "oauth" : "key"} disabled={creating}
-          onChange={value => { setAuth(value === "oauth" ? "oauth" : "pat"); setConfigurationRevision(value => value + 1); }}
-          options={[{ value: "oauth", label: "Sign in with AKB" }, { value: "key", label: "Use a connection key" }]} />
-          : showPatControls ? <p className="text-sm text-foreground-muted">This AKB guide uses a personal connection key for {MCP_AGENT_LABELS[agent]}.</p>
-          : authConfig.available && !useOauth && authConfig.mcp_oauth.enabled && <Alert variant="info">{replacement
-            ? "Personal access tokens are disabled. You can still revoke existing keys."
-            : `This guide has no sign-in instructions for ${MCP_AGENT_LABELS[agent]}. Choose another AI tool to connect.`}</Alert>}
+        {endpoint && <p className="break-all text-xs text-foreground-muted">Installation endpoint <code className="text-foreground">{endpoint}</code></p>}
+        {methods.length > 0 && <div className="space-y-4">
+          <div className="space-y-2">
+            <SetupChoice label="Connection transport" name={`${id}-transport`} value={transportAvailable(transport) ? transport : null} disabled={creating}
+              options={TRANSPORTS.map(value => ({ value, label: TRANSPORT_LABELS[value], disabled: !transportAvailable(value) }))}
+              onChange={value => { setTransport(value); setConfigurationRevision(revision => revision + 1); }} />
+            <p className="text-xs leading-relaxed text-foreground-muted">The local helper runs on your computer and adds local file tools. A direct connection lets your AI tool reach AKB without those file tools.</p>
+            {transport !== "http" && !transportAvailable("http") && <p className="text-xs text-foreground-muted">This guide has no tested direct HTTP preset for {MCP_AGENT_LABELS[agent]} with the available authentication methods.</p>}
+          </div>
+          {authenticationOptions.length > 0 && <SetupChoice label="Authentication" name={`${id}-auth`} value={selectedAuthentication} disabled={creating}
+            options={authenticationOptions.map(value => ({ value, label: AUTHENTICATION_LABELS[value] }))}
+            onChange={value => { setAuthentication(value); setConfigurationRevision(revision => revision + 1); }} />}
+          {missingMethods.length > 0 && <p className="text-xs leading-relaxed text-foreground-muted">This guide has no tested {TRANSPORT_LABELS[transport]} preset for {MCP_AGENT_LABELS[agent]} with {missingMethods.map(method => AUTHENTICATION_LABELS[method]).join(" or ")}. {!selectedAuthentication && "Choose an available transport or authentication method."}</p>}
+          {authentication !== null && !methods.includes(authentication) && <Alert variant="info">This installation no longer allows the selected authentication method. Choose an available method or ask your administrator about the policy.</Alert>}
+          {selectedAuthentication === "oauth" && <p className="text-xs leading-relaxed text-foreground-muted">The installation’s authorization server handles sign-in and may use your organization’s SSO. Signing in to this website does not authorize your AI tool or local helper.</p>}
+        </div>}
         {invalidationNotice && <Alert variant="warning">{invalidationNotice}</Alert>}
-        {showPatControls && !canGeneratePatConfig && <Alert variant="warning">The local helper requires an HTTPS address or loopback HTTP. Ask your administrator to check the public MCP address.</Alert>}
-        {patEnabled && <details className="connection-inline-help"><summary>Which connection method should I use?</summary>
-          <p>Sign in with AKB lets your AI tool connect directly after you approve access. You do not create a personal key. The connection-key preset runs a local helper with npx and also supports uploading and downloading files on that computer. Your account’s Vault permissions apply to both.</p>
-          <p>For a key-based setup, install a supported Node.js release if npx is unavailable. Web browsing in AKB is ready to use without setting up an AI connection.</p>
-        </details>}
+        {endpoint && methods.length > 0 && !secureEndpoint && <Alert variant="warning">Connection setup requires HTTPS or loopback HTTP. Ask your administrator to check the installation’s public MCP address and use a trusted certificate.</Alert>}
         <div hidden={!showPatControls} inert={!showPatControls} className="space-y-3">
-          <p className="text-xs leading-relaxed text-foreground-muted">Before using a connection key, check that Node.js (including npx) is installed on that computer. It runs the local AKB helper for your AI tool.</p>
-          {!freshToken && <SetupChoice label="Connection key" appearance="compact" name={`${id}-credential`} value={credentialMode} disabled={creating}
+          {transport === "http" && selectedAuthentication === "pat" && <p className="text-xs leading-relaxed text-foreground-muted">Use your personal configuration file and keep its Authorization header private.</p>}
+          {transport === "stdio" && <p className="text-xs leading-relaxed text-foreground-muted">Install a supported Node.js release with npx on the computer that runs the helper.</p>}
+          {!freshToken && <SetupChoice label="Connection key" name={`${id}-credential`} value={credentialMode} disabled={creating}
             onChange={value => { setCredentialMode(value); setConfigurationRevision(value => value + 1); }}
             options={[{ value: "create", label: "Create a key" }, { value: "existing", label: "Use an existing key" }]} />}
           {!freshToken && credentialMode === "existing" && <div className="space-y-2">
@@ -197,26 +212,36 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
             {existingToken && !usableToken && <Alert variant="destructive">Enter the full key using only letters, numbers, underscores, and hyphens. A prefix or placeholder cannot authenticate.</Alert>}
           </div>}
         </div>
-        {!freshToken && issuanceStarted && <div hidden={hideIssuanceForm} inert={hideIssuanceForm}>
-          <PatIssuanceForm issuanceEnabled={patEnabled} ownsOperation={ownsOperation} initial={initialDraft} replacement={replacement} onDirtyChange={setFormDirty} onBusyChange={value => { setCreating(value); onBusyChange?.(value); }} onMetadataChanged={onTokenCreated} onCreated={(result, snapshot) => {
-            setFreshToken(result.token); setFreshTokenId(result.token_id); setReceipt(result); setSession(snapshot); setAuth("pat"); setCredentialMode("create"); setShowSecret(true); setInvalidationNotice(null); setConfigurationRevision(value => value + 1); onSecretCreated?.(); onReceipt?.(result, snapshot);
+        {!freshToken && issuanceMounted && <div hidden={!formVisible} inert={!formVisible}>
+          <PatIssuanceForm issuanceEnabled={patEnabled && secureEndpoint} ownsOperation={ownsOperation} initial={initialDraft} replacement={replacement} onDirtyChange={setFormDirty} onBusyChange={value => { setCreating(value); onBusyChange?.(value); }} onMetadataChanged={onTokenCreated} onPolicyRejected={() => {
+            setPatRejected(true);
+            onRetryAuthConfig?.();
+          }} onCreated={(result, snapshot) => {
+            setFreshToken(result.token); setFreshTokenId(result.token_id); setReceipt(result); setSession(snapshot); setCredentialMode("create"); setShowSecret(true); setInvalidationNotice(null); setConfigurationRevision(value => value + 1); onSecretCreated?.(); onReceipt?.(result, snapshot);
           }} />
         </div>}
-        {freshToken && (!useOauth || !patEnabled) && isCurrentAuthSession(session) && <div className="space-y-2 rounded-[var(--radius-md)] border border-accent/40 bg-accent/5 p-3">
+        {freshToken && (showPatControls || !patEnabled) && isCurrentAuthSession(session) && <div className="space-y-2 rounded-[var(--radius-md)] border border-accent/40 bg-accent/5 p-3">
           <p role="status" className="text-sm font-medium">Connection key created</p>
           <p className="text-xs leading-relaxed text-foreground-muted">{patEnabled ? "Keep this window open until you have saved the key or configuration privately." : "You can save this one-time key. Key-based setup is currently unavailable."} Closing clears the displayed copy; it does not revoke the key.</p>
           <p className="text-xs text-foreground-muted">{receipt?.verified ? `${receipt.scopes?.includes("write") ? "Read and write" : receipt.scopes?.includes("read") ? "Read only" : "Permissions unavailable"} · ${typeof receipt.expires_at === "string" ? `Expires ${receipt.expires_at}` : receipt.expires_at === null ? "No expiration" : "Expiration unavailable"} · ${scopeSummary(receipt.vault_scope)}` : "Created with server defaults; restrictions were not verified."}</p>
-          <Button type="button" variant="outline" size="sm" onClick={() => setShowSecret(!showSecret)}>{showSecret ? "Hide key" : "Show key"}{patEnabled && " and configuration"}</Button>
+          <Button type="button" variant="outline" size="sm" onClick={() => { setShowSecret(!showSecret); setConfigurationRevision(revision => revision + 1); }}>{showSecret ? "Hide key" : "Show key"}{patEnabled && " and configuration"}</Button>
           {showSecret && currentStep === 2 && <details className="connection-inline-help"><summary>Copy the key separately</summary><CodeSnippet code={freshToken} filename="Personal connection key" /></details>}
         </div>}
         {configuration && currentStep === 2 ? <div className="space-y-3">
-          <div className="connection-instruction"><span>1</span><div><h4>Open the right place</h4><p>{guide.location}</p></div></div>
-          <div className="connection-instruction"><span>2</span><div><h4>Add this setup</h4><p>{guide.add}</p></div></div>
-          <CodeSnippet key={`${agent}:${endpoint}:${useOauth}:${configurationRevision}`} code={configuration} filename={terminal ? `Terminal · ${MCP_AGENT_LABELS[agent]}` : MCP_AGENT_FILES[agent]} onCopied={() => setCopied(record)} />
+          {loginCommand && <>
+            <div className="connection-instruction"><span>1</span><div><h4>Sign in from your terminal</h4><p>Use akb-mcp 2.4.0 or later with a supported Node.js release on macOS or Linux. If a previous setup set AKB_PAT, remove it from this terminal and your AI tool’s environment. Run the command as the same OS user that runs the helper. Finish sign-in in the browser and wait for the command to exit.</p></div></div>
+            <CodeSnippet key={`login:${endpoint}:${configurationRevision}`} code={loginCommand} filename="Terminal · AKB sign-in" />
+          </>}
+          <div className="connection-instruction"><span>{loginCommand ? 2 : 1}</span><div><h4>Open the right place</h4><p>{guide.location}</p></div></div>
+          <div className="connection-instruction"><span>{loginCommand ? 3 : 2}</span><div><h4>Add this setup</h4><p>{guide.add}</p></div></div>
+          <CodeSnippet key={configurationRevision} code={configuration.code} filename={MCP_SNIPPET_LABELS[agent]} onCopied={() => setCopied(previous => Math.max(previous ?? -1, configurationRevision))} />
           {matches(copied) && <p role="status" className="text-xs text-foreground-muted">Setup copied. Apply it in {MCP_AGENT_LABELS[agent]} before checking the connection.</p>}
-          {useOauth && <div className="connection-instruction"><span>3</span><div><h4>Approve access</h4><p>{guide.signIn}</p></div></div>}
-          {!useOauth && <p className="text-xs leading-relaxed text-foreground-muted">The local helper uses this key to reach AKB. If npx asks to download akb-mcp, allow it to continue.</p>}
-        </div> : showPatControls && canGeneratePatConfig && <p role="status" className="rounded-[var(--radius-md)] bg-surface-muted p-3 text-sm text-foreground-muted">{freshToken && !showSecret ? "Your key and setup are hidden. Show them above when you are ready to copy." : "Create a connection key or enter the full key you saved. Your setup will appear here."}</p>}
+          {configuration.signIn && <div className="connection-instruction"><span>3</span><div><h4>Approve access</h4><p>{configuration.signIn}</p></div></div>}
+          {transport === "http" && selectedAuthentication === "pat" && <p className="text-xs leading-relaxed text-foreground-muted">Use your personal configuration file and keep its Authorization header private.</p>}
+          {transport === "stdio" && <p className="text-xs leading-relaxed text-foreground-muted">{loginCommand
+            ? "The local helper uses the sign-in saved by the terminal command."
+            : "The local helper uses your personal connection key."} If npx asks to download akb-mcp, allow it to continue.</p>}
+        </div> : showPatControls && <p role="status" className="rounded-[var(--radius-md)] bg-surface-muted p-3 text-sm text-foreground-muted">{freshToken && !showSecret ? "Your key and setup are hidden. Show them above when you are ready to copy." : "Create a connection key or enter the full key you saved. Your setup will appear here."}</p>}
         <div className="connection-step-actions"><Button variant="outline" disabled={creating} onClick={() => jumpToStep(1)}><ArrowLeft className="h-4 w-4" aria-hidden />Choose a tool</Button>
           <Button disabled={creating || !configuration} onClick={() => jumpToStep(3)}>Check in {MCP_AGENT_LABELS[agent]}<ArrowRight className="h-4 w-4" aria-hidden /></Button></div>
       </SetupStep>
@@ -226,9 +251,9 @@ export function ConnectionSetup({ authConfig, onRetryAuthConfig, onTokenCreated,
         <p className="text-sm leading-relaxed text-foreground-muted">{guide.check}</p>
         <CodeSnippet code={CONNECTION_TEST_PROMPT} filename={`Send in ${MCP_AGENT_LABELS[agent]}`} />
         <div className="rounded-[var(--radius-md)] bg-surface-muted p-3 text-sm leading-relaxed"><p className="font-medium">What you should see</p><p className="mt-1 text-foreground-muted">An AKB tool response with your accessible Vaults. An empty list can also be a valid result. If a Vault is missing, check which account signed in and ask its owner for access.</p></div>
-        <label className="flex min-h-11 cursor-pointer items-start gap-3 py-2 text-sm"><input className="mt-1 h-4 w-4 shrink-0 accent-primary" type="checkbox" checked={matches(confirmation)} onChange={event => setConfirmation(event.target.checked ? record : null)} /><span>I received an AKB response in my AI tool</span></label>
+        <label className="flex min-h-11 cursor-pointer items-start gap-3 py-2 text-sm"><input className="mt-1 h-4 w-4 shrink-0 accent-primary" type="checkbox" disabled={!configuration} checked={matches(confirmation)} onChange={event => setConfirmation(event.target.checked ? configurationRevision : null)} /><span>I received an AKB response in my AI tool</span></label>
         <p role="status" className="text-xs leading-relaxed text-foreground-muted">{matches(confirmation) ? "Confirmed by you. This browser has not independently verified the connection." : "Not checked here. This browser cannot verify an external AI connection."}</p>
-        <details className="connection-inline-help"><summary><CircleHelp className="mr-1 inline h-4 w-4" aria-hidden />Something not working?</summary><ConnectionTroubleshooting /></details>
+        <details className="connection-inline-help"><summary><CircleHelp className="mr-1 inline h-4 w-4" aria-hidden />Something not working?</summary><ConnectionTroubleshooting authentication={selectedAuthentication} transport={transport} loginCommand={loginCommand} /></details>
         <div className="connection-step-actions"><Button variant="outline" disabled={creating} onClick={() => jumpToStep(2)}><ArrowLeft className="h-4 w-4" aria-hidden />Back to setup</Button></div>
       </SetupStep>
     </div>

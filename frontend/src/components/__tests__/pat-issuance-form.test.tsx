@@ -125,15 +125,15 @@ it.each(["saved token", "OAuth"])("preserves the draft and uncertain result acro
   render(<ConnectionSetup authConfig={connectionConfig(mode === "OAuth")} onDirtyChange={dirty}
     initialDraft={{ ...defaultPatDraft(), name: "limited", permissions: "read", expiration: "30", restricted: true, prefixes: ["team-"] }} />);
   await user.click(screen.getByRole("button", { name: "Continue with Claude Code" }));
-  if (mode === "OAuth") await user.click(screen.getByRole("radio", { name: "Use a connection key" }));
+  if (mode === "OAuth") await user.click(screen.getByRole("radio", { name: "Personal connection key (PAT)" }));
   await waitFor(() => expect(screen.getByRole("button", { name: "Create connection key" })).toBeEnabled());
   fetchMock.mockImplementation((url, init) => Promise.resolve(init.method === "POST" ? json({}, 503) : String(url).endsWith("/vaults") ? json({ vaults: [] }) : json(caps)));
   await user.click(screen.getByRole("button", { name: "Create connection key" }));
   await screen.findByText(/We could not confirm whether the key was created/);
-  await user.click(screen.getByRole("radio", { name: mode === "OAuth" ? "Sign in with AKB" : "Use an existing key" }));
+  await user.click(screen.getByRole("radio", { name: mode === "OAuth" ? "Sign in with AKB (OAuth/SSO)" : "Use an existing key" }));
   expect(dirty).toHaveBeenLastCalledWith(true);
   expect(screen.queryByRole("button", { name: "I've checked — review another creation" })).not.toBeInTheDocument();
-  if (mode === "OAuth") await user.click(screen.getByRole("radio", { name: "Use a connection key" }));
+  if (mode === "OAuth") await user.click(screen.getByRole("radio", { name: "Personal connection key (PAT)" }));
   else await user.click(screen.getByRole("radio", { name: "Create a key" }));
   expect(screen.getByText(/We could not confirm whether the key was created/)).toBeVisible();
   expect(screen.getByLabelText("Connection key name")).toHaveValue("limited");
