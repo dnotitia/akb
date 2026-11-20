@@ -132,43 +132,51 @@ async def _make_fixture(pool, tmp_path: Path) -> dict:
     vault_name = f"c9-{uuid.uuid4().hex}"
     git.init_vault(vault_name)
 
-    old_oid = git.commit_file(vault_name, "same.md", "old resource\n", "old")
-    await asyncio.sleep(1.05)
-    initial_oid = git.commit_file(
-        vault_name,
-        "same.md",
-        "new v1\n",
-        "[create] same.md\n\nagent: legacy-writer\naction: create\nsummary: create same document",
-    )
-    initial_dt = Repo(str(git._bare_path(vault_name))).commit(initial_oid).committed_datetime
-    created_at = initial_dt - timedelta(milliseconds=100)
-    await asyncio.sleep(1.05)
-    move_oid = git.move_file(
-        vault_name,
-        "same.md",
-        "renamed.md",
-        "[move] same.md -> renamed.md\n\nagent: legacy-writer\naction: move\nsummary: move same document",
-    )
-    await asyncio.sleep(1.05)
-    current_oid = git.commit_file(
-        vault_name,
-        "renamed.md",
-        "new v2\n",
-        "[update] renamed.md\n\nagent: legacy-writer\naction: update\nsummary: update renamed document",
-    )
-    current_dt = Repo(str(git._bare_path(vault_name))).commit(current_oid).committed_datetime
-    await asyncio.sleep(1.05)
-    other_oid = git.commit_file(
-        vault_name,
-        "other.md",
-        "other\n",
-        "[create] other.md\n\nagent: legacy-writer\naction: create\nsummary: create other document",
-    )
-    other_dt = Repo(str(git._bare_path(vault_name))).commit(other_oid).committed_datetime
-    await asyncio.sleep(1.05)
-    unrelated_tip = git.commit_file(vault_name, "unrelated.md", "tip\n", "unrelated")
-    await asyncio.sleep(1.05)
-    later_file_tip = git.commit_file(vault_name, "renamed.md", "post-head\n", "later file")
+    # The bridge compares Git's second-resolution times with the catalog timestamps.
+    with pytest.MonkeyPatch.context() as commit_env:
+        def set_commit_time(step: int) -> None:
+            instant = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=step)
+            commit_env.setenv("GIT_AUTHOR_DATE", instant.isoformat())
+            commit_env.setenv("GIT_COMMITTER_DATE", instant.isoformat())
+
+        set_commit_time(0)
+        old_oid = git.commit_file(vault_name, "same.md", "old resource\n", "old")
+        set_commit_time(1)
+        initial_oid = git.commit_file(
+            vault_name,
+            "same.md",
+            "new v1\n",
+            "[create] same.md\n\nagent: legacy-writer\naction: create\nsummary: create same document",
+        )
+        initial_dt = Repo(str(git._bare_path(vault_name))).commit(initial_oid).committed_datetime
+        created_at = initial_dt - timedelta(milliseconds=100)
+        set_commit_time(2)
+        move_oid = git.move_file(
+            vault_name,
+            "same.md",
+            "renamed.md",
+            "[move] same.md -> renamed.md\n\nagent: legacy-writer\naction: move\nsummary: move same document",
+        )
+        set_commit_time(3)
+        current_oid = git.commit_file(
+            vault_name,
+            "renamed.md",
+            "new v2\n",
+            "[update] renamed.md\n\nagent: legacy-writer\naction: update\nsummary: update renamed document",
+        )
+        current_dt = Repo(str(git._bare_path(vault_name))).commit(current_oid).committed_datetime
+        set_commit_time(4)
+        other_oid = git.commit_file(
+            vault_name,
+            "other.md",
+            "other\n",
+            "[create] other.md\n\nagent: legacy-writer\naction: create\nsummary: create other document",
+        )
+        other_dt = Repo(str(git._bare_path(vault_name))).commit(other_oid).committed_datetime
+        set_commit_time(5)
+        unrelated_tip = git.commit_file(vault_name, "unrelated.md", "tip\n", "unrelated")
+        set_commit_time(6)
+        later_file_tip = git.commit_file(vault_name, "renamed.md", "post-head\n", "later file")
 
     async with pool.acquire() as conn:
         namespace_id = await conn.fetchval(
