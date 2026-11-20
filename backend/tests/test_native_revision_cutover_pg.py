@@ -10,6 +10,7 @@ import os
 import re
 import threading
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -52,6 +53,7 @@ from app.services.native_revision_cutover import (
 from app.services.legacy_revision_bridge import InventoryEligibilityError
 from app.services.native_revision_backend import NativeRevisionBackend
 from app.services.uri_service import doc_uri, split_uri
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
@@ -63,10 +65,7 @@ _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
 )
-
-
-def _database_dsn(name: str) -> str:
-    return f"{_DSN.rsplit('/', 1)[0]}/{name}"
+_DATABASE_PREFIX = "akb_native_cutover_"
 
 
 def _load(filename: str):
@@ -76,25 +75,6 @@ def _load(filename: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-@asynccontextmanager
-async def _cutover_database(*, template: str | None = None):
-    try:
-        admin = await asyncpg.connect(_DSN, timeout=2)
-    except OSError, asyncpg.PostgresError:
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    name = f"akb_native_cutover_{uuid.uuid4().hex[:12]}"
-    template_sql = f' TEMPLATE "{template}"' if template else ""
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"{template_sql}')
-        try:
-            yield name
-        finally:
-            await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-    finally:
-        await admin.close()
 
 
 async def _install_schema(dsn: str, *, cutover_migrations: bool) -> None:
@@ -134,26 +114,24 @@ async def _install_schema(dsn: str, *, cutover_migrations: bool) -> None:
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
-async def cutover_template():
-    async with _cutover_database() as name:
-        # PostgreSQL requires all connections to the template to close before cloning.
-        await _install_schema(_database_dsn(name), cutover_migrations=True)
-        yield name
+async def cutover_template() -> AsyncIterator[TestDatabase]:
+    async with temporary_database(_DSN, _DATABASE_PREFIX) as database:
+        await _install_schema(database.dsn, cutover_migrations=True)
+        yield database
 
 
 @asynccontextmanager
-async def _cloned_schema(template: str):
-    async with _cutover_database(template=template) as name:
-        async with asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=4) as pool:
+async def _cloned_schema(template: TestDatabase):
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
             yield pool
 
 
 @asynccontextmanager
 async def _legacy_schema():
-    async with _cutover_database() as name:
-        dsn = _database_dsn(name)
-        await _install_schema(dsn, cutover_migrations=False)
-        async with asyncpg.create_pool(dsn, min_size=1, max_size=4) as pool:
+    async with temporary_database(_DSN, _DATABASE_PREFIX) as database:
+        await _install_schema(database.dsn, cutover_migrations=False)
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
             yield pool
 
 
