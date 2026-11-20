@@ -129,15 +129,23 @@ def pytest_runtest_makereport(item, call):
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_make_collect_report(collector):
     report = yield
-    if _fail_on_skip() and report.skipped:
-        report.outcome = "failed"
-        report.longrepr = (
-            f"{collector.nodeid} skipped while it was collected "
-            f"({_skip_reason(report.longrepr)}), and {_FAIL_ON_SKIP_ENV}=1 "
-            "makes that a failure. A module that skips on import cannot be "
-            "deselected by a marker, so move that check into a fixture first. "
-            + _HOW_TO_FIX
-        )
+    if not report.skipped:
+        return report
+    if _fail_on_skip():
+        setting = _FAIL_ON_SKIP_ENV
+        how_to_fix = " " + _HOW_TO_FIX
+    elif _require_unit_only():
+        setting = _REQUIRE_UNIT_ONLY_ENV
+        how_to_fix = ""
+    else:
+        return report
+    report.outcome = "failed"
+    report.longrepr = (
+        f"{collector.nodeid} skipped while it was collected "
+        f"({_skip_reason(report.longrepr)}), and {setting}=1 makes that a failure. "
+        "Move import-time skips into a fixture so CI can collect and select the tests."
+        + how_to_fix
+    )
     return report
 
 

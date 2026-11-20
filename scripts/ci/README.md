@@ -145,9 +145,10 @@ in the live-PG job. This job excludes `backend/tests/mcp_e2e` and tests marked
 marked as an expected failure.
 
 Use `@pytest.mark.unit_only` for cases verified to run without live services.
-The unit job fails if its selector drops a marked case, or if a marked case
-skips or is marked as an expected failure. Mixed modules can mark individual
-tests so their live cases still run in the live-PG job.
+The unit job fails if a module skips during collection or the selector drops
+a marked case. It also fails if a marked case skips or is marked as an expected
+failure. Mixed modules can mark individual tests so their live cases still run
+in the live-PG job.
 
 `test_adoption_vault_delete_e2e.py` requires planned, applied and blocked
 adoption deletion through HTTP, with a non-admin owner, Reader and system

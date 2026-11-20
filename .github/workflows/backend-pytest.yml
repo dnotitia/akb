@@ -62,7 +62,8 @@ jobs:
     #
     # The live job collects the suite and excludes tests/mcp_e2e, cases marked
     # needs_resource, and cases marked unit_only. The unit job requires every
-    # unit_only case to run. AKB_TEST_FAIL_ON_SKIP=1 makes any skip or xfail
+    # unit_only case to run and fails on collection skips.
+    # AKB_TEST_FAIL_ON_SKIP=1 makes any skip or xfail
     # in the live job a failure. The rules live in backend/tests/conftest.py.
     #
     # Caveat: these tests do NOT reproduce the 0.8.3 shared-main-pool
@@ -101,16 +102,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The BM25 index extension, for the VChord test modules. Without this
-      # server those tests skip, and AKB_TEST_FAIL_ON_SKIP makes that skip
-      # fail the job instead of reading like a pass.
-      #
-      # It is the image the install paths build, from deploy/postgres: the
-      # production pgvector base plus vchord_bm25 compiled with the akb#679,
-      # akb#684 and akb#687 fixes. A prebuilt upstream image would test an
-      # extension build that no installation runs, and the one this lane used to
-      # pull has all three defects.
-      #
+      # Build the patched VChord BM25 image used by installations.
       # It runs with the plain `postgres` command, as installations do: no
       # `shared_preload_libraries`. Without a preload the extension's settings
       # exist only once a session has called into it, and a preloaded server

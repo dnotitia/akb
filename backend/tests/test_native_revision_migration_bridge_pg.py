@@ -241,12 +241,7 @@ async def _make_fixture(pool, tmp_path: Path) -> dict:
 
 
 async def _make_compact_failpoint_fixtures(pool, tmp_path: Path) -> tuple[GitService, list[dict]]:
-    """Build one short manual-vault case per registered failpoint.
-
-    The loop intentionally avoids the multi-second chronology fixture above:
-    each case has one current file commit and one unrelated fixed-ref tip, so
-    the table exercises every atomic boundary without repeating six sleeps.
-    """
+    """Build one vault with two commits per registered failpoint."""
     git = GitService(storage_path=str(tmp_path / "git-failpoints"))
     fixtures: list[dict] = []
     async with pool.acquire() as conn:

@@ -12,23 +12,31 @@ _BACKEND = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
-    ("mode", "selector", "extra", "exit_code", "message"),
+    ("mode", "selector", "module_setup", "extra", "exit_code", "message"),
     [
-        ("UNIT", ["-k", "not _e2e"], "", 0, "1 passed, 1 skipped"),
-        ("UNIT", ["-k", "not _e2e and not test_required"], "", 4, "selector deselected"),
-        ("UNIT", [], "@pytest.mark.skip(reason='missing service')", 1, "test_required skipped"),
-        ("UNIT", [], "@pytest.mark.xfail(reason='expected failure')", 1, "expected failure"),
-        ("LIVE", ["-m", "not needs_resource and not unit_only"], "", 1, "test_optional skipped"),
+        ("UNIT", ["-k", "not _e2e"], "", "", 0, "1 passed, 1 skipped"),
+        ("UNIT", ["-k", "not _e2e and not test_required"], "", "", 4, "selector deselected"),
+        ("UNIT", [], "", "@pytest.mark.skip(reason='missing service')", 1, "test_required skipped"),
+        ("UNIT", [], "", "@pytest.mark.xfail(reason='expected failure')", 1, "expected failure"),
+        (
+            "UNIT", [], "if os.environ['AKB_TEST_REQUIRE_UNIT_ONLY'] == '1':\n"
+            "    pytest.skip('missing service', allow_module_level=True)",
+            "", 2, "skipped while it was collected",
+        ),
+        ("LIVE", ["-m", "not needs_resource and not unit_only"], "", "", 1, "test_optional skipped"),
     ],
 )
-def test_ci_test_selection(tmp_path, mode, selector, extra, exit_code, message):
+def test_ci_test_selection(tmp_path, mode, selector, module_setup, extra, exit_code, message):
     (tmp_path / "conftest.py").write_text(
         "from tests.conftest import (pytest_collection_modifyitems, pytest_deselected, "
         "pytest_make_collect_report, pytest_runtest_makereport)\n",
         encoding="utf-8",
     )
     (tmp_path / "test_cases.py").write_text(
-        f"""import pytest
+        f"""import os
+import pytest
+
+{module_setup}
 
 @pytest.mark.unit_only
 {extra}
