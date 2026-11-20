@@ -19,11 +19,13 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.db import postgres
 from app.exceptions import ForbiddenError, ValidationError
 from app.services import access_service
 from app.services import access_contributions as contrib
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
 pytestmark = pytest.mark.asyncio
 
@@ -38,11 +40,6 @@ _DSN = os.environ.get(
 )
 
 
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
-
-
 def _load_migration(path: Path):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
@@ -51,42 +48,23 @@ def _load_migration(path: Path):
     return module
 
 
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    """Install the server's schema, including the write policy and event outbox."""
+    async with temporary_database(_DSN, "akb_contrib_template_") as template:
+        conn = await asyncpg.connect(template.dsn)
+        try:
+            await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
+        finally:
+            await conn.close()
+        yield template
 
 
 @asynccontextmanager
-async def _fresh_database():
-    """A new database built the way a booting server builds one.
-
-    `_run_boot_schema` applies `init.sql` and then every migration the server
-    registers, in its order, so this database has the shape of a real one:
-    `check_vault_access` reads the vault write policy and `emit_event` writes
-    the outbox, and neither table is in `init.sql`. A hand-kept copy of that
-    list here, or a pin to its last entry, goes stale with the next migration
-    and turns every test in this file into a setup error.
-    """
-    if not await _can_connect():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_contrib_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=8)
-    try:
-        async with pool.acquire() as conn:
-            await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
-        yield pool
-    finally:
-        await pool.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
+async def _fresh_database(schema_template: TestDatabase):
+    async with temporary_database(_DSN, "akb_contrib_", template=schema_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool:
+            yield pool
 
 
 class _RecordingRoleSync:
@@ -113,8 +91,8 @@ class _RecordingRoleSync:
 
 
 @pytest.fixture
-async def env(monkeypatch):
-    async with _fresh_database() as pool:
+async def env(monkeypatch, schema_template):
+    async with _fresh_database(schema_template) as pool:
         role_sync = _RecordingRoleSync()
         monkeypatch.setattr(access_service, "get_pool", lambda: pool)
         monkeypatch.setattr(access_service, "get_role_sync", lambda: role_sync)
@@ -734,10 +712,10 @@ class _LiveEnv(_Env):
 
 
 @pytest.fixture
-async def live_role_sync(monkeypatch):
+async def live_role_sync(monkeypatch, schema_template):
     from app.services.role_sync import RoleSync, user_role_name, vault_group_role_name
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(schema_template) as pool:
         role_sync = RoleSync(pool)
         monkeypatch.setattr(access_service, "get_pool", lambda: pool)
         monkeypatch.setattr(access_service, "get_role_sync", lambda: role_sync)

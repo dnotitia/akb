@@ -47,6 +47,9 @@ from app.config import settings
 from app.services import tool_usage
 
 
+pytestmark = pytest.mark.unit_only
+
+
 class _User:
     user_id = "00000000-0000-0000-0000-000000000001"
     username = "alice"
@@ -987,6 +990,10 @@ def test_serialisation_failure_records_the_call_exactly_once(monkeypatch, tmp_pa
     async def _dispatch(name, args, user):
         return circular
 
+    async def _cannot_read_vault(user, uid, vault):
+        return False
+
+    monkeypatch.setattr(srv, "_can_read_vault", _cannot_read_vault)
     usage: list = []
     audit: list = []
     monkeypatch.setattr(srv, "_dispatch", _dispatch)

@@ -653,13 +653,15 @@ def _async_return(value):
 
 @pytest.fixture
 def health_app(monkeypatch, tmp_path):
-    """Stub every collaborator `/health` fans out to, except the queue stats."""
+    """Run the health handler and queue reporter with no real services."""
     # Importing the API app constructs the legacy revision backend, which
     # creates its Git storage root eagerly. Redirect it before the import.
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
     import app.main as main
     from app.services import (
         asset_gc_worker,
+        delete_worker,
+        embed_worker,
         events_publisher,
         external_git_poller,
         metadata_worker,
@@ -667,6 +669,7 @@ def health_app(monkeypatch, tmp_path):
         native_file_projection,
         notification_worker,
         queue_rescuer,
+        search_degradation_stats,
         sparse_encoder,
         vault_backfill,
     )
@@ -676,6 +679,9 @@ def health_app(monkeypatch, tmp_path):
             return True
 
     monkeypatch.setattr(main, "get_vector_store", lambda: _Store())
+    monkeypatch.setattr(embed_worker, "get_pool", _queue_pool(None))
+    monkeypatch.setattr(delete_worker, "delete_outbox_stats", _async_return({}))
+    monkeypatch.setattr(search_degradation_stats, "snapshot", _async_return({}))
     monkeypatch.setattr(main, "worker_lifecycle_snapshot", dict)
     monkeypatch.setattr(queue_rescuer, "snapshot", dict)
     monkeypatch.setattr(vault_backfill, "pending_stats", _async_return({}))
@@ -687,17 +693,17 @@ def health_app(monkeypatch, tmp_path):
     return main
 
 
+@pytest.mark.unit_only
 async def test_health_promotes_the_queue_head_age_to_the_top_level(health_app, monkeypatch):
     """The contract term lives at the top level, not inside an operational blob.
 
     A consumer must not have to know that the value happens to be produced by
     the vector-store backfill reporter, which is free to be reorganised.
     """
-    from app.services import delete_worker, embed_worker
+    from app.services import embed_worker
 
     enqueued = datetime(2026, 8, 21, 7, 30, tzinfo=_UTC)
     monkeypatch.setattr(embed_worker, "get_pool", _queue_pool(enqueued))
-    monkeypatch.setattr(delete_worker, "delete_outbox_stats", _async_return({}))
 
     result = await health_app.health(user=None)
 
@@ -706,17 +712,14 @@ async def test_health_promotes_the_queue_head_age_to_the_top_level(health_app, m
     assert "audit" not in result
 
 
-async def test_health_omits_the_queue_head_age_when_nothing_is_pending(health_app, monkeypatch):
-    from app.services import delete_worker, embed_worker
-
-    monkeypatch.setattr(embed_worker, "get_pool", _queue_pool(None))
-    monkeypatch.setattr(delete_worker, "delete_outbox_stats", _async_return({}))
-
+@pytest.mark.unit_only
+async def test_health_omits_the_queue_head_age_when_nothing_is_pending(health_app):
     result = await health_app.health(user=None)
 
     assert "oldest_pending_enqueued_at" not in result
 
 
+@pytest.mark.unit_only
 async def test_health_surfaces_native_file_projection_exhaustion_as_degraded(health_app, monkeypatch):
     """A terminal S3-to-Native intent must not look like a healthy projection."""
     from app.services import native_file_projection
@@ -763,6 +766,7 @@ async def test_vault_health_surfaces_native_file_projection_diagnostics(monkeypa
     assert result["native_file_projection"] == diagnostic
 
 
+@pytest.mark.unit_only
 async def test_health_reports_a_derived_index_abandonment_beside_the_progress(health_app, monkeypatch):
     """A Resource the indexer gave up on must be countable from `/health`.
 

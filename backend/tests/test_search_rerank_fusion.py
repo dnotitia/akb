@@ -12,6 +12,8 @@ from app.services.search_service import (
     vault_path_eligible,
 )
 
+pytestmark = pytest.mark.unit_only
+
 FUSION_K = 60
 
 
@@ -300,28 +302,25 @@ def test_search_response_carries_degraded_signal():
 
 
 @pytest.mark.asyncio
-async def test_search_requires_vault_or_user_id():
-    """Mirror of the same guard in `grep`: a caller that forwards
-    neither `vault` nor `user_id` would otherwise fall through to an
-    unscoped cross-vault scan. All current callers (REST /search, MCP
-    akb_search) forward `user_id`, so this is defense-in-depth for
-    any future caller that forgets."""
+async def test_search_requires_vault_or_user_id(monkeypatch):
+    from app.services import search_service
+
+    class ReachedDatabase(Exception):
+        pass
+
+    async def stop_at_database():
+        raise ReachedDatabase
+
+    monkeypatch.setattr(search_service, "get_pool", stop_at_database)
     svc = SearchService()
     with pytest.raises(ValidationError):
         await svc.search(query="anything")
     with pytest.raises(ValidationError):
         await svc.search(query="anything", vault=None, user_id=None)
-    # Either argument present is enough — no raise.
-    # (Don't actually run the search; just verify the guard returns
-    # control flow back so something further can happen. Catching
-    # downstream errors keeps this a pure-guard unit test that
-    # doesn't need a DB.)
-    try:
+    with pytest.raises(ReachedDatabase):
         await svc.search(query="x", vault="v")
-    except ValidationError:
-        pytest.fail("Should not raise ValidationError when vault is set")
-    except Exception:
-        pass  # downstream (DB / embedding) is fine to fail; we only assert the guard
+    with pytest.raises(ReachedDatabase):
+        await svc.search(query="x", user_id="user")
 
 
 @pytest.mark.asyncio

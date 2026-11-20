@@ -36,12 +36,12 @@ pnpm exec vitest run --project storybook --maxWorkers=1
 
 자체 HTTP fixture를 사용하는 suite는 실제 앱·Chromium·Radix를 검사하지만
 업무 API의 서버 동작이나 실제 SSO/스토리지 연결을 증명하지 않는다.
-준비된 앱 origin을 `AKB_FRONTEND_URL`로 전달한다. `real`은 해당 origin을
-사용하는 Playwright 설정 이름이며, fixture를 live backend 검사로 바꾸지 않는다.
+`fixture` 모드는 production build를 직접 띄우고 backend 없이 실행한다.
+fixture가 응답하지 않은 요청은 닫힌 포트로 proxy되어 502가 된다.
 
 ```sh
 cd frontend
-AKB_FE_E2E_MODE=real AKB_FRONTEND_URL="$AKB_FRONTEND_URL" \
+AKB_FE_E2E_MODE=fixture \
   pnpm exec playwright test e2e/document-header-navigation.spec.ts \
   e2e/vault-focused-workspace.spec.ts e2e/resource-reading-workspace.spec.ts \
   e2e/resource-overlay-accessibility.spec.ts e2e/document-preview-search-return.spec.ts \

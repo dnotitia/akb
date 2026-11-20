@@ -316,9 +316,9 @@ step "stdio proxy + MCP Inspector contract"
 
 # ─── frontend: vitest (unit + RTL + MSW) ──────────────────────────
 # Closes the biggest gate gap: previously a broken test could merge
-# because check.sh only ran lint/type. Stage 3 (Playwright) lives
-# behind `npm run test:e2e` and needs a live docker-compose stack —
-# wire that into a separate e2e workflow when it's ready.
+# because check.sh only ran lint/type. Playwright is not part of this
+# gate: the e2e workflow runs it in mock, fixture and real modes
+# (frontend/playwright.config.ts).
 step "vitest (frontend)"
 (cd frontend && pnpm run test)
 

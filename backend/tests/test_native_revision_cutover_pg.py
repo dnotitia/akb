@@ -10,6 +10,7 @@ import os
 import re
 import threading
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 from git import Repo
 
 from app.db import postgres
@@ -51,6 +53,7 @@ from app.services.native_revision_cutover import (
 from app.services.legacy_revision_bridge import InventoryEligibilityError
 from app.services.native_revision_backend import NativeRevisionBackend
 from app.services.uri_service import doc_uri, split_uri
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
@@ -62,19 +65,7 @@ _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
 )
-
-
-async def _reachable() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except OSError, asyncpg.PostgresError:
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    return f"{_DSN.rsplit('/', 1)[0]}/{name}"
+_DATABASE_PREFIX = "akb_native_cutover_"
 
 
 def _load(filename: str):
@@ -86,59 +77,62 @@ def _load(filename: str):
     return module
 
 
-@asynccontextmanager
-async def _fresh_schema(*, cutover_migrations: bool = True):
-    if not await _reachable():
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    name = f"akb_native_cutover_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    conn = None
-    pool = None
+async def _install_schema(dsn: str, *, cutover_migrations: bool) -> None:
+    filenames = [
+        "010_external_git_mirror.py",
+        "015_events_outbox.py",
+        "044_vault_write_policy.py",
+        "048_native_revision_core.py",
+        "049_external_git_quarantine.py",
+        "053_native_revision_m1_pg_body.py",
+        "060_native_revision_migration_bridge.py",
+        "061_native_revision_authority.py",
+        "105_bridge_body_digest.py",
+    ]
+    if cutover_migrations:
+        filenames.extend(
+            [
+                "088_native_revision_existing_cutover.py",
+                "089_native_file_projection_outbox.py",
+                "090_native_revision_vault_purge_fence.py",
+                "091_native_revision_committed_receipt_guard.py",
+                "092_native_revision_plan_supersession.py",
+                "093_external_git_retirement.py",
+                "094_native_revision_completed_reservation_transfer.py",
+                "096_native_revision_cutover_fence.py",
+                "097_native_revision_migration_inventory.py",
+                "100_native_revision_cutover_file_applied_path.py",
+            ]
+        )
+    conn = await asyncpg.connect(dsn)
     try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        dsn = _database_dsn(name)
-        conn = await asyncpg.connect(dsn)
         await conn.execute(_INIT_SQL)
-        filenames = [
-            "010_external_git_mirror.py",
-            "015_events_outbox.py",
-            "044_vault_write_policy.py",
-            "048_native_revision_core.py",
-            "049_external_git_quarantine.py",
-            "053_native_revision_m1_pg_body.py",
-            "060_native_revision_migration_bridge.py",
-            "061_native_revision_authority.py",
-            "105_bridge_body_digest.py",
-        ]
-        if cutover_migrations:
-            filenames.extend(
-                [
-                    "088_native_revision_existing_cutover.py",
-                    "089_native_file_projection_outbox.py",
-                    "090_native_revision_vault_purge_fence.py",
-                    "091_native_revision_committed_receipt_guard.py",
-                    "092_native_revision_plan_supersession.py",
-                    "093_external_git_retirement.py",
-                    "094_native_revision_completed_reservation_transfer.py",
-                    "096_native_revision_cutover_fence.py",
-                    "097_native_revision_migration_inventory.py",
-                    "100_native_revision_cutover_file_applied_path.py",
-                ]
-            )
         for filename in filenames:
             await _load(filename).migrate(conn=conn)
-        await conn.close()
-        conn = None
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
-        yield pool
     finally:
-        if pool is not None:
-            await pool.close()
-        if conn is not None and not conn.is_closed():
-            await conn.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+        await conn.close()
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def cutover_template() -> AsyncIterator[TestDatabase]:
+    async with temporary_database(_DSN, _DATABASE_PREFIX) as database:
+        await _install_schema(database.dsn, cutover_migrations=True)
+        yield database
+
+
+@asynccontextmanager
+async def _cloned_schema(template: TestDatabase):
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            yield pool
+
+
+@asynccontextmanager
+async def _legacy_schema():
+    async with temporary_database(_DSN, _DATABASE_PREFIX) as database:
+        await _install_schema(database.dsn, cutover_migrations=False)
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            yield pool
 
 
 async def _manual_vault(pool, git: GitService, *, label: str) -> CutoverVaultInput:
@@ -275,8 +269,8 @@ class _MismatchVerifier:
         }
 
 
-async def test_active_and_archived_manual_vaults_cut_over_as_one_database(tmp_path):
-    async with _fresh_schema() as pool:
+async def test_active_and_archived_manual_vaults_cut_over_as_one_database(tmp_path, cutover_template):
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git"))
         vaults = [
             await _manual_vault(pool, git, label="one"),
@@ -383,8 +377,9 @@ async def test_active_and_archived_manual_vaults_cut_over_as_one_database(tmp_pa
 
 async def test_archived_external_mirror_blocks_authority_without_poisoning_manual_backfill(
     tmp_path,
+    cutover_template,
 ):
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-with-mirror"))
         manual = await _manual_vault(pool, git, label="manual-eligible")
 
@@ -489,9 +484,9 @@ async def test_archived_external_mirror_blocks_authority_without_poisoning_manua
             assert await conn.fetchval("SELECT count(*) FROM native_revision_existing_authority") == 0
 
 
-async def test_aborting_classification_plan_releases_pending_item_reservations(tmp_path):
+async def test_aborting_classification_plan_releases_pending_item_reservations(tmp_path, cutover_template):
     """A retired external mirror may be replanned only after explicit abort."""
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-reclassification"))
         manual = await _manual_vault(pool, git, label="reclassification-manual")
 
@@ -601,9 +596,9 @@ async def test_aborting_classification_plan_releases_pending_item_reservations(t
             await backfill.backfill_run(classification_run_id)
 
 
-async def test_operator_supersedes_one_exact_unlinked_pending_orphan(tmp_path):
+async def test_operator_supersedes_one_exact_unlinked_pending_orphan(tmp_path, cutover_template):
     """An operator can release a stranded pre-cutover plan by exact run ID."""
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-unlinked-orphan"))
         vault = await _manual_vault(pool, git, label="unlinked-orphan")
         backfill = NativeRevisionBackfill(pool, git=git)
@@ -644,9 +639,9 @@ async def test_operator_supersedes_one_exact_unlinked_pending_orphan(tmp_path):
             )
 
 
-async def test_plan_failure_compensates_previously_prepared_unlinked_vaults(tmp_path, monkeypatch):
+async def test_plan_failure_compensates_previously_prepared_unlinked_vaults(tmp_path, monkeypatch, cutover_template):
     """A later vault validation error leaves no active reservation from this plan."""
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-plan-compensation"))
         vaults = sorted(
             [
@@ -707,9 +702,12 @@ async def test_plan_failure_compensates_previously_prepared_unlinked_vaults(tmp_
         assert len(fresh.vaults) == 2
 
 
-async def test_external_git_retirement_reclassifies_a_collector_adoption_and_requires_a_fresh_plan(tmp_path):
+async def test_external_git_retirement_reclassifies_a_collector_adoption_and_requires_a_fresh_plan(
+    tmp_path,
+    cutover_template,
+):
     """The one-way retirement keeps the vault/data/Git while removing only its sidecar."""
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         previous_pool = postgres._pool
         postgres._pool = pool
         try:
@@ -1145,7 +1143,7 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
 
 async def test_plan_supersession_migration_releases_legacy_aborted_reservations(tmp_path):
     """Upgrade releases an attempt that was aborted before plan supersession existed."""
-    async with _fresh_schema(cutover_migrations=False) as pool:
+    async with _legacy_schema() as pool:
         async with pool.acquire() as conn:
             for filename in (
                 "088_native_revision_existing_cutover.py",
@@ -1209,7 +1207,7 @@ async def test_plan_supersession_migration_releases_legacy_aborted_reservations(
 
 async def test_completed_reservation_transfer_migration_upgrades_aborted_applied_cutover(tmp_path):
     """Migration 094 releases only an eligible completed reservation on demand."""
-    async with _fresh_schema(cutover_migrations=False) as pool:
+    async with _legacy_schema() as pool:
         async with pool.acquire() as conn:
             for filename in (
                 "088_native_revision_existing_cutover.py",
@@ -1269,9 +1267,12 @@ async def test_completed_reservation_transfer_migration_upgrades_aborted_applied
             )
 
 
-async def test_deleted_vault_external_git_sidecar_blocks_authority_outside_retained_inventory(tmp_path):
+async def test_deleted_vault_external_git_sidecar_blocks_authority_outside_retained_inventory(
+    tmp_path,
+    cutover_template,
+):
     """A deleted vault is not migratable, but its sidecar still blocks authority."""
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-deleted-sidecar"))
         manual = await _manual_vault(pool, git, label="deleted-sidecar-manual")
 
@@ -1323,8 +1324,8 @@ async def test_deleted_vault_external_git_sidecar_blocks_authority_outside_retai
             ) == "open"
 
 
-async def test_commit_rejects_an_omitted_eligible_file_and_leaves_writes_open(tmp_path):
-    async with _fresh_schema() as pool:
+async def test_commit_rejects_an_omitted_eligible_file_and_leaves_writes_open(tmp_path, cutover_template):
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-omitted-file"))
         vault = await _manual_vault(pool, git, label="omitted-file")
         data = b"preserved binary\x00fixture"
@@ -1373,8 +1374,8 @@ async def test_commit_rejects_an_omitted_eligible_file_and_leaves_writes_open(tm
             )
 
 
-async def test_commit_rejects_a_post_plan_vault_and_rolls_back_the_fence(tmp_path):
-    async with _fresh_schema() as pool:
+async def test_commit_rejects_a_post_plan_vault_and_rolls_back_the_fence(tmp_path, cutover_template):
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-post-plan-vault"))
         original = await _manual_vault(pool, git, label="original")
         cutover = NativeRevisionCutover(
@@ -1412,8 +1413,8 @@ async def test_commit_rejects_a_post_plan_vault_and_rolls_back_the_fence(tmp_pat
             )
 
 
-async def test_commit_rejects_native_head_drift_before_fencing(tmp_path):
-    async with _fresh_schema() as pool:
+async def test_commit_rejects_native_head_drift_before_fencing(tmp_path, cutover_template):
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-native-head-drift"))
         vault = await _manual_vault(pool, git, label="native-head-drift")
         cutover = NativeRevisionCutover(
@@ -1449,8 +1450,8 @@ async def test_commit_rejects_native_head_drift_before_fencing(tmp_path):
             ) == 0
 
 
-async def test_commit_revalidates_file_bytes_and_current_git_refs(tmp_path):
-    async with _fresh_schema() as pool:
+async def test_commit_revalidates_file_bytes_and_current_git_refs(tmp_path, cutover_template):
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-final-revalidation"))
         vault = await _manual_vault(pool, git, label="final-revalidation")
         original_data = b"final bytes\x00"
@@ -1517,8 +1518,9 @@ async def test_commit_revalidates_file_bytes_and_current_git_refs(tmp_path):
 async def test_text_mime_with_invalid_nul_or_oversized_bytes_is_preserved_binary(
     tmp_path,
     monkeypatch,
+    cutover_template,
 ):
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-binary-classification"))
         vault = await _manual_vault(pool, git, label="binary-classification")
         monkeypatch.setattr(cutover_module, "M1_PG_TEXT_MAX_BYTES", 4)
@@ -1565,8 +1567,8 @@ async def test_text_mime_with_invalid_nul_or_oversized_bytes_is_preserved_binary
             )
 
 
-async def test_authority_mint_is_the_boundary_and_fences_external_git_and_receipt_races(tmp_path):
-    async with _fresh_schema() as pool:
+async def test_authority_mint_is_the_boundary_and_fences_external_git_and_receipt_races(tmp_path, cutover_template):
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-fence-race"))
         vault = await _manual_vault(pool, git, label="fence-race")
         async with pool.acquire() as conn:
@@ -1703,9 +1705,10 @@ async def test_authority_mint_is_the_boundary_and_fences_external_git_and_receip
 async def test_authorized_vault_delete_purges_only_its_post_cutover_legacy_rows(
     monkeypatch,
     tmp_path,
+    cutover_template,
 ):
     """The authorized whole-vault lifecycle delete is narrower than direct SQL."""
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         from app.config import settings
         from app.db import postgres as postgres_module
         from app.services import access_service, index_service
@@ -1945,8 +1948,11 @@ async def test_authorized_vault_delete_purges_only_its_post_cutover_legacy_rows(
             ) == "cutover_validated"
 
 
-async def test_committed_cutover_preserves_vault_activity_for_deleted_and_recreated_documents(tmp_path):
-    async with _fresh_schema() as pool:
+async def test_committed_cutover_preserves_vault_activity_for_deleted_and_recreated_documents(
+    tmp_path,
+    cutover_template,
+):
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-frozen-vault-activity"))
         vault_name = f"cutover-frozen-activity-{uuid.uuid4().hex}"
         git.init_vault(vault_name)
@@ -2087,7 +2093,7 @@ async def test_committed_cutover_preserves_vault_activity_for_deleted_and_recrea
 async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop(
     monkeypatch,
 ):
-    async with _fresh_schema(cutover_migrations=False) as pool:
+    async with _legacy_schema() as pool:
         source = (_BACKEND / "app" / "db" / "postgres.py").read_text(encoding="utf-8")
         registered = set(re.findall(r'"([0-9]{3}_[^"]+\.py)"', source))
         cutover_files = {
@@ -2145,8 +2151,8 @@ async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop
             )
 
 
-async def test_unexplained_fixture_mismatch_stops_before_verified_state(tmp_path):
-    async with _fresh_schema() as pool:
+async def test_unexplained_fixture_mismatch_stops_before_verified_state(tmp_path, cutover_template):
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-mismatch"))
         vault = await _manual_vault(pool, git, label="mismatch")
         cutover = NativeRevisionCutover(
@@ -2180,8 +2186,8 @@ async def test_unexplained_fixture_mismatch_stops_before_verified_state(tmp_path
         assert vault_status == "applied"
 
 
-async def test_abort_preserves_additive_evidence_and_keeps_legacy_writes_open(tmp_path):
-    async with _fresh_schema() as pool:
+async def test_abort_preserves_additive_evidence_and_keeps_legacy_writes_open(tmp_path, cutover_template):
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-abort"))
         vault = await _manual_vault(pool, git, label="abort")
         cutover = NativeRevisionCutover(
@@ -2237,6 +2243,7 @@ async def test_aborted_completed_cutover_transfers_reservations_without_duplicat
     tmp_path,
     verify_before_abort,
     expected_abort_status,
+    cutover_template,
 ):
     """A later coverage plan adopts completed work from an aborted cutover.
 
@@ -2245,7 +2252,7 @@ async def test_aborted_completed_cutover_transfers_reservations_without_duplicat
     reservation moves to the replacement run, so the fresh cutover can apply
     without a duplicate history or a second link to the old run.
     """
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-aborted-completed-transfer"))
         vault = await _manual_vault(
             pool,
@@ -2363,8 +2370,8 @@ async def test_aborted_completed_cutover_transfers_reservations_without_duplicat
             }
 
 
-async def test_product_shadow_verifier_checks_real_git_and_native_reads(tmp_path):
-    async with _fresh_schema() as pool:
+async def test_product_shadow_verifier_checks_real_git_and_native_reads(tmp_path, cutover_template):
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-product-verifier"))
         vaults = [
             await _manual_vault(pool, git, label="product-one"),
@@ -2387,7 +2394,7 @@ async def test_product_shadow_verifier_checks_real_git_and_native_reads(tmp_path
         assert {vault.status for vault in verified.vaults} == {"verified"}
 
 
-async def test_apply_disambiguates_file_paths_that_are_already_live(tmp_path):
+async def test_apply_disambiguates_file_paths_that_are_already_live(tmp_path, cutover_template):
     """Legacy File names are not unique; native paths are one authority namespace.
 
     Two attachments can carry the same `logical_path` (the storage key, not the
@@ -2397,7 +2404,7 @@ async def test_apply_disambiguates_file_paths_that_are_already_live(tmp_path):
     Documents already do — keep the clean path for whoever holds it and step the
     rest onto their own uuid — instead of failing the whole run.
     """
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git"))
         vault = await _manual_vault(pool, git, label="file-path-collision")
         bodies: dict[str, bytes] = {}
@@ -2487,11 +2494,11 @@ async def test_apply_disambiguates_file_paths_that_are_already_live(tmp_path):
         assert authority.cutover_id == planned.cutover_id
 
 
-async def test_grep_accepts_verified_cutover_paths_and_binary_exclusions_only_while_current(tmp_path):
+async def test_grep_accepts_verified_cutover_paths_and_binary_exclusions_only_while_current(tmp_path, cutover_template):
     from app.exceptions import AKBError
     from app.services.m1_native_grep_service import M1NativeGrepService
 
-    async with _fresh_schema() as pool:
+    async with _cloned_schema(cutover_template) as pool:
         async with pool.acquire() as conn:
             await _load("055_native_revision_m1_file_storage.py").migrate(conn=conn)
         git = GitService(storage_path=str(tmp_path / "grep-cutover"))

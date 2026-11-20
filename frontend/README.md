@@ -13,9 +13,10 @@ pnpm lint             # eslint src
 pnpm test             # vitest run
 pnpm build            # tsc && vite build
 pnpm preview          # serve dist locally
-pnpm run dev:e2e:mock # start the mock frontend on 127.0.0.1:4173
-pnpm run test:e2e:mock # Playwright + MSW, no backend required
-pnpm run test:e2e:real # Playwright against AKB_FRONTEND_URL from the runtime descriptor
+pnpm run dev:e2e:mock    # start the mock frontend on 127.0.0.1:4173
+pnpm run test:e2e:mock    # Playwright + MSW, no backend required
+pnpm run test:e2e:fixture # Playwright against a production build; specs answer their own HTTP
+pnpm run test:e2e:real    # Playwright against AKB_FRONTEND_URL from the runtime descriptor
 ```
 
 ## Editing documents
@@ -81,7 +82,10 @@ Unit tests live under `src/**/__tests__/`. Vitest runs against jsdom +
 and interactive components (`TagInput`) have explicit coverage. Add a
 test alongside any change to those code paths.
 
-Playwright e2e specs live in `e2e/`. Choose `mock` or `real` explicitly:
+Playwright e2e specs live in `e2e/`. Choose `mock`, `fixture` or `real`
+explicitly. The mode names the server its specs need; fixture and real split
+the suite between them, and mock loads every spec file (the `page.route` specs
+skip themselves there):
 
 - `pnpm run test:e2e:mock` starts `pnpm run dev:e2e:mock` and waits for
   `/__akb_mock__/health`. Vite exposes the runtime descriptor at
@@ -90,7 +94,19 @@ Playwright e2e specs live in `e2e/`. Choose `mock` or `real` explicitly:
   reset generation. The browser MSW worker reads that generation before the
   next auth request and resets its in-memory fixture state. The worker returns
   501 for unhandled `/api` requests.
-- `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` consumes the
+- `pnpm run test:e2e:fixture` builds the app, serves it with `vite preview`,
+  and runs every spec that answers its requests through `page.route`. No
+  backend runs: `/api` is proxied to a closed port, so a request a spec does
+  not answer gets a 502 and a `http proxy error` line on stderr. These specs do
+  not share state, so CI splits them across jobs with `--shard`; locally they
+  run on one worker unless you pass `--workers`. Run one fixture run per host
+  at a time: its port (4174) and build directory are fixed. A spec that needs
+  the runtime backend or the mock server's state belongs in `serverStateSpecs`
+  in `playwright.config.ts`; every other spec runs here. A spec that skips
+  itself outside real mode (`AKB_FE_E2E_MODE !== "real"`) would otherwise run
+  nowhere, so the config refuses to load until it is listed.
+- `AKB_FRONTEND_URL=<services.web.origin> pnpm run test:e2e:real` runs the
+  specs in `serverStateSpecs` that need a backend, and consumes the
   common schema-v2 descriptor. The backend, fixture reset, and process shutdown
   remain owned by the repository runtime.
 - `AKB_FE_E2E_SCENARIO=markdown-reference-adapters` exposes a source-neutral reference

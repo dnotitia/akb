@@ -39,6 +39,8 @@ jobs:
 
       - name: Run unit tests
         working-directory: backend
+        env:
+          AKB_TEST_REQUIRE_UNIT_ONLY: '1'
         # `-k 'not _e2e'` excludes live tests, including the authenticated
         # MCP scenario under tests/mcp_e2e. The repository-owned runtime gate
         # runs that scenario explicitly with its schema-v2 descriptor.
@@ -58,13 +60,11 @@ jobs:
     # server and Redis. The unit job has none of them, so every test that
     # needs a database skips there; this job is where those tests gate.
     #
-    # Selection is a rule, not a list. Every test under backend/tests runs
-    # here except tests/mcp_e2e, which the repository runtime gate runs, and
-    # the tests that declare `@pytest.mark.needs_resource("...")` for
-    # something this job does not provide. AKB_TEST_FAIL_ON_SKIP=1 turns any
-    # skip or xfail into a failure that names the test and the fix, so a new
-    # PostgreSQL-backed test cannot skip here and read as a pass. The rule
-    # lives in backend/tests/conftest.py.
+    # The live job collects the suite and excludes tests/mcp_e2e, cases marked
+    # needs_resource, and cases marked unit_only. The unit job requires every
+    # unit_only case to run and fails on collection skips.
+    # AKB_TEST_FAIL_ON_SKIP=1 makes any skip or xfail
+    # in the live job a failure. The rules live in backend/tests/conftest.py.
     #
     # Caveat: these tests do NOT reproduce the 0.8.3 shared-main-pool
     # `unknown type: public.vector` manifestation — it passes pre-fix in
@@ -102,26 +102,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The BM25 index extension, for the VChord test modules. Without this
-      # server those tests skip, and AKB_TEST_FAIL_ON_SKIP makes that skip
-      # fail the job instead of reading like a pass.
-      #
-      # It is the image the install paths build, from deploy/postgres: the
-      # production pgvector base plus vchord_bm25 compiled with the akb#679,
-      # akb#684 and akb#687 fixes. A prebuilt upstream image would test an
-      # extension build that no installation runs, and the one this lane used to
-      # pull has all three defects.
-      #
+      # Build the patched VChord BM25 image used by installations.
       # It runs with the plain `postgres` command, as installations do: no
       # `shared_preload_libraries`. Without a preload the extension's settings
       # exist only once a session has called into it, and a preloaded server
       # hid the failure of every new pooled connection's first search
       # (akb#615).
-      - name: Build and start the BM25 extension server
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the BM25 extension image
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
+        with:
+          context: deploy/postgres
+          file: deploy/postgres/Dockerfile
+          tags: akb-postgres:ci
+          push: false
+          load: true
+          cache-from: type=gha,scope=akb-ci-postgres
+          cache-to: type=gha,mode=max,scope=akb-ci-postgres,ignore-error=true
+
+      - name: Start the BM25 extension server
         env:
           VCHORD_PASSWORD: akb  # pragma: allowlist secret
         run: |
-          docker build --tag akb-postgres:ci deploy/postgres
           docker run -d --name vchord -p 15433:5432 \
             -e POSTGRES_USER=akb -e POSTGRES_PASSWORD="$VCHORD_PASSWORD" -e POSTGRES_DB=akb \
             akb-postgres:ci postgres
@@ -213,4 +218,4 @@ jobs:
         # triggers, row locks, rollback and cancellation, the catalog after a
         # migration. A fake agrees with whatever SQL it is handed, so those
         # claims are only checked here.
-        run: pytest tests/ --ignore=tests/mcp_e2e -m "not needs_resource" -v --tb=short
+        run: pytest tests/ --ignore=tests/mcp_e2e -m "not needs_resource and not unit_only" -v --tb=short

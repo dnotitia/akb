@@ -16,7 +16,8 @@ that the renumbering commits between the encoding and the write — the window
 the vocabulary epoch closes — which makes the interleaving deterministic.
 
 Requires the extension-capable server (AKB_VCHORD_TEST_DSN, the image
-deploy/postgres builds). Each test creates and drops its own database.
+deploy/postgres builds). Each test clones the migrated schema into its own
+database and drops it when finished.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.config import settings
 from app.db import postgres as postgres_module
@@ -41,6 +43,7 @@ from app.services import embed_worker, sparse_encoder
 from app.services.bm25_maintenance import BM25_VOCAB_EPOCH_LOCK_KEY
 from app.services.vector_store.pgvector import PgvectorStore
 from scripts import compact_bm25_term_ids as compact
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
 pytestmark = pytest.mark.asyncio
 
@@ -52,9 +55,11 @@ _TOP = 20
 _TOLERANCE = 1e-6
 
 
-async def test_dense_ids_repair_an_exhausted_sequence_without_rebuilding(monkeypatch, capsys):
+async def test_dense_ids_repair_an_exhausted_sequence_without_rebuilding(
+    compaction_template, monkeypatch, capsys,
+):
     """Sequence exhaustion can recur without a gap in the vocabulary itself."""
-    async with _installation(monkeypatch) as inst:
+    async with _installation(compaction_template, monkeypatch) as inst:
         async with inst.pool.acquire() as conn:
             await _seed(conn, terms=30, documents=50, max_id=1000, seed=741)
         assert await compact.main(["--apply"]) == 0
@@ -89,49 +94,53 @@ async def _split(text: str) -> list[str]:
     return text.split()
 
 
-@contextlib.asynccontextmanager
-async def _installation(monkeypatch, *, shape: str = "vchord") -> AsyncIterator[_Installation]:
-    """A database the way the backend leaves it, with this process pointed at it."""
+@pytest_asyncio.fixture(scope="module")
+async def compaction_template() -> AsyncIterator[TestDatabase]:
     if not _DSN:
         pytest.skip("AKB_VCHORD_TEST_DSN is required for VectorChord coverage")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_compact_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    dsn = f"{_DSN.rsplit('/', 1)[0]}/{name}"
-    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=8)
-    previous_pool = postgres_module._pool
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(_INIT_SQL.read_text())
-        postgres_module._pool = pool
-        await postgres_module._apply_migrations()
-        store = PgvectorStore(
-            dsn=None, schema=_SCHEMA, dense_dim=4, sparse_shape=shape,
-            get_main_pool=postgres_module.get_pool,
-        )
-        async with pool.acquire() as conn:
-            await store._do_ensure(conn)
-        store._ensured_collection = True
+    async with temporary_database(_DSN, "akb_compact_template_", required=True) as template:
+        async with asyncpg.create_pool(template.dsn, min_size=1, max_size=1) as pool:
+            async with pool.acquire() as conn:
+                await conn.execute(_INIT_SQL.read_text())
+            await postgres_module._apply_migrations(pool=pool)
+        yield template
 
-        # The command reads the process configuration, as it does when run.
-        monkeypatch.setattr(type(settings), "asyncpg_dsn", property(lambda _settings: dsn))
-        monkeypatch.setattr(settings, "vector_store_driver", "pgvector")
-        monkeypatch.setattr(settings, "vector_store_dsn", "")
-        monkeypatch.setattr(settings, "vector_store_schema", _SCHEMA)
-        monkeypatch.setattr(settings, "vector_store_sparse_shape", shape)
-        monkeypatch.setattr(settings, "_sparse_shape_decision", None)
-        monkeypatch.setattr(settings, "embed_base_url", "")
-        # The command closes the process pool on the way out; here it is ours.
-        monkeypatch.setattr(compact, "close_pool", AsyncMock())
-        monkeypatch.setattr(sparse_encoder, "tokenize", _split)
-        monkeypatch.setattr(embed_worker, "get_vector_store", lambda: store)
-        yield _Installation(pool=pool, store=store, dsn=dsn)
-    finally:
-        postgres_module._pool = previous_pool
-        await pool.close()
-        with contextlib.suppress(asyncpg.PostgresError):
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+
+@contextlib.asynccontextmanager
+async def _installation(
+    compaction_template: TestDatabase, monkeypatch, *, shape: str = "vchord",
+) -> AsyncIterator[_Installation]:
+    """A database the way the backend leaves it, with this process pointed at it."""
+    async with (
+        temporary_database(_DSN, "akb_compact_", template=compaction_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool,
+    ):
+        previous_pool = postgres_module._pool
+        postgres_module._pool = pool
+        try:
+            store = PgvectorStore(
+                dsn=None, schema=_SCHEMA, dense_dim=4, sparse_shape=shape,
+                get_main_pool=postgres_module.get_pool,
+            )
+            async with pool.acquire() as conn:
+                await store._do_ensure(conn)
+            store._ensured_collection = True
+
+            # The command reads the process configuration, as it does when run.
+            monkeypatch.setattr(type(settings), "asyncpg_dsn", property(lambda _settings: database.dsn))
+            monkeypatch.setattr(settings, "vector_store_driver", "pgvector")
+            monkeypatch.setattr(settings, "vector_store_dsn", "")
+            monkeypatch.setattr(settings, "vector_store_schema", _SCHEMA)
+            monkeypatch.setattr(settings, "vector_store_sparse_shape", shape)
+            monkeypatch.setattr(settings, "_sparse_shape_decision", None)
+            monkeypatch.setattr(settings, "embed_base_url", "")
+            # The command closes the process pool on the way out; here it is ours.
+            monkeypatch.setattr(compact, "close_pool", AsyncMock())
+            monkeypatch.setattr(sparse_encoder, "tokenize", _split)
+            monkeypatch.setattr(embed_worker, "get_vector_store", lambda: store)
+            yield _Installation(pool=pool, store=store, dsn=database.dsn)
+        finally:
+            postgres_module._pool = previous_pool
 
 
 @dataclass
@@ -322,8 +331,8 @@ async def _state(conn) -> dict:
     }
 
 
-async def test_the_renumbering_is_dense_and_every_query_ranks_the_same(monkeypatch):
-    async with _installation(monkeypatch) as install:
+async def test_the_renumbering_is_dense_and_every_query_ranks_the_same(compaction_template, monkeypatch):
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             corpus = await _seed(conn, terms=3_000, documents=5_000, max_id=50_000_000, seed=687)
             queries = _queries(corpus, seed=687)
@@ -361,8 +370,8 @@ async def test_the_renumbering_is_dense_and_every_query_ranks_the_same(monkeypat
             assert await conn.fetchval("SELECT count(*) FROM bm25_term_id_remap") == size
 
 
-async def test_a_second_run_has_nothing_to_do(monkeypatch, capsys):
-    async with _installation(monkeypatch) as install:
+async def test_a_second_run_has_nothing_to_do(compaction_template, monkeypatch, capsys):
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             await _seed(conn, terms=200, documents=150, max_id=1_000_000, seed=2)
         assert await compact.main(["--apply"]) == 0
@@ -377,8 +386,8 @@ async def test_a_second_run_has_nothing_to_do(monkeypatch, capsys):
             assert await _state(conn) == state
 
 
-async def test_the_dry_run_reports_and_changes_nothing(monkeypatch, capsys):
-    async with _installation(monkeypatch) as install:
+async def test_the_dry_run_reports_and_changes_nothing(compaction_template, monkeypatch, capsys):
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             await _seed(conn, terms=200, documents=150, max_id=1_000_000, seed=3)
             state = await _state(conn)
@@ -392,14 +401,16 @@ async def test_the_dry_run_reports_and_changes_nothing(monkeypatch, capsys):
             assert await _state(conn) == state
 
 
-async def test_a_chunk_encoded_before_the_renumbering_is_refused_then_stored_renumbered(monkeypatch):
+async def test_a_chunk_encoded_before_the_renumbering_is_refused_then_stored_renumbered(
+    compaction_template, monkeypatch,
+):
     """The fence, with the renumbering committed between encode and write.
 
     The encoding holds ids from epoch 0, one of them for a term it registered
     itself. The write must not land: it goes to the retry path, and the next
     attempt stores the chunk under the new numbering.
     """
-    async with _installation(monkeypatch) as install:
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             corpus = await _seed(conn, terms=400, documents=300, max_id=5_000_000, seed=4)
             vault = await conn.fetchval(
@@ -447,7 +458,9 @@ async def test_a_chunk_encoded_before_the_renumbering_is_refused_then_stored_ren
         assert max(ids.values()) == len(ids) - 1  # the latecomer was renumbered with the rest
 
 
-async def test_a_term_id_the_index_cannot_hold_abandons_on_the_first_failure(monkeypatch):
+async def test_a_term_id_the_index_cannot_hold_abandons_on_the_first_failure(
+    compaction_template, monkeypatch,
+):
     """G1(a): `TermIdOutOfRange` is deterministic, so no retry is spent on it.
 
     One term is moved past 2^30 after the encoding, so the write refuses it.
@@ -455,7 +468,7 @@ async def test_a_term_id_the_index_cannot_hold_abandons_on_the_first_failure(mon
     error naming the id, the bound and the remedy — not ~8 retries over
     ~13.6h with an embed call each.
     """
-    async with _installation(monkeypatch) as install:
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             corpus = await _seed(conn, terms=100, documents=0, max_id=100_000, seed=6)
             victim = corpus.vocabulary[0]
@@ -499,9 +512,11 @@ async def test_a_term_id_the_index_cannot_hold_abandons_on_the_first_failure(mon
             assert not await conn.fetchval(f"SELECT EXISTS (SELECT 1 FROM {_SCHEMA}.chunks WHERE chunk_id = $1)", chunk)
 
 
-async def test_indexing_hands_its_batch_back_while_a_renumbering_holds_the_fence(monkeypatch):
+async def test_indexing_hands_its_batch_back_while_a_renumbering_holds_the_fence(
+    compaction_template, monkeypatch,
+):
     """A renumbering holds the fence for its whole transaction; retries are not spent on it."""
-    async with _installation(monkeypatch) as install:
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             corpus = await _seed(conn, terms=100, documents=50, max_id=100_000, seed=5)
             vault = await conn.fetchval(
@@ -539,8 +554,10 @@ async def test_indexing_hands_its_batch_back_while_a_renumbering_holds_the_fence
 
 
 @pytest.mark.parametrize("driver", ["qdrant", "seahorse-db"])
-async def test_a_driver_that_keeps_its_vectors_elsewhere_is_refused(monkeypatch, capsys, driver):
-    async with _installation(monkeypatch) as install:
+async def test_a_driver_that_keeps_its_vectors_elsewhere_is_refused(
+    compaction_template, monkeypatch, capsys, driver,
+):
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             await _seed(conn, terms=100, documents=50, max_id=100_000, seed=6)
             state = await _state(conn)
@@ -553,9 +570,9 @@ async def test_a_driver_that_keeps_its_vectors_elsewhere_is_refused(monkeypatch,
             assert await _state(conn) == state
 
 
-async def test_term_ids_left_in_an_inactive_shape_are_refused(monkeypatch, capsys):
+async def test_term_ids_left_in_an_inactive_shape_are_refused(compaction_template, monkeypatch, capsys):
     """A `posting` table kept under `vchord` holds ids too; this command would strand them."""
-    async with _installation(monkeypatch) as install:
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             corpus = await _seed(conn, terms=100, documents=50, max_id=100_000, seed=7)
             await conn.execute(
@@ -579,9 +596,9 @@ async def test_term_ids_left_in_an_inactive_shape_are_refused(monkeypatch, capsy
             assert await _state(conn) == state
 
 
-async def test_vectors_left_under_posting_are_refused(monkeypatch, capsys):
+async def test_vectors_left_under_posting_are_refused(compaction_template, monkeypatch, capsys):
     """The other direction: a `sparse_bm25` column filled while `posting` serves."""
-    async with _installation(monkeypatch, shape="posting") as install:
+    async with _installation(compaction_template, monkeypatch, shape="posting") as install:
         async with install.pool.acquire() as conn:
             corpus = await _seed(conn, terms=100, documents=50, max_id=100_000, seed=8, shape="posting")
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vchord_bm25")
@@ -600,14 +617,16 @@ async def test_vectors_left_under_posting_are_refused(monkeypatch, capsys):
             assert await _vocabulary(conn) == vocabulary
 
 
-async def test_an_index_counting_rows_vacuum_has_not_removed_is_refused(monkeypatch, capsys):
+async def test_an_index_counting_rows_vacuum_has_not_removed_is_refused(
+    compaction_template, monkeypatch, capsys,
+):
     """The baseline must come from statistics of the live rows alone.
 
     The index counts an updated row twice until VACUUM takes the old version
     out. A rebuild counts it once, so the scores would differ for a reason that
     has nothing to do with the renumbering.
     """
-    async with _installation(monkeypatch) as install:
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             corpus = await _seed(conn, terms=100, documents=50, max_id=100_000, seed=9)
             # A changed vector, so not a HOT update: the new version goes into
@@ -628,8 +647,8 @@ async def test_an_index_counting_rows_vacuum_has_not_removed_is_refused(monkeypa
         assert await compact.main(["--apply"]) == 0
 
 
-async def test_a_failed_verification_changes_nothing(monkeypatch, capsys):
-    async with _installation(monkeypatch) as install:
+async def test_a_failed_verification_changes_nothing(compaction_template, monkeypatch, capsys):
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             await _seed(conn, terms=300, documents=200, max_id=2_000_000, seed=10)
             state = await _state(conn)
@@ -643,8 +662,8 @@ async def test_a_failed_verification_changes_nothing(monkeypatch, capsys):
             assert await conn.fetchval("SELECT nextval('bm25_term_id_seq')") == 2_000_000 + 1_001
 
 
-async def test_revert_restores_the_original_numbering(monkeypatch):
-    async with _installation(monkeypatch) as install:
+async def test_revert_restores_the_original_numbering(compaction_template, monkeypatch):
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             corpus = await _seed(conn, terms=500, documents=400, max_id=5_000_000, seed=11)
             queries = _queries(corpus, seed=11)
@@ -667,13 +686,13 @@ async def test_revert_restores_the_original_numbering(monkeypatch):
             assert await conn.fetchval("SELECT nextval('bm25_term_id_seq')") > max(corpus.ids.values())
 
 
-async def test_revert_keeps_a_term_registered_after_the_renumbering(monkeypatch):
+async def test_revert_keeps_a_term_registered_after_the_renumbering(compaction_template, monkeypatch):
     """A term minted under the dense numbering has no old id to go back to.
 
     It takes the next id past the old numbering's largest, and the vector that
     uses it follows it there.
     """
-    async with _installation(monkeypatch) as install:
+    async with _installation(compaction_template, monkeypatch) as install:
         async with install.pool.acquire() as conn:
             corpus = await _seed(conn, terms=300, documents=200, max_id=3_000_000, seed=12)
         assert await compact.main(["--apply"]) == 0
@@ -702,8 +721,8 @@ async def test_revert_keeps_a_term_registered_after_the_renumbering(monkeypatch)
         assert holding == [Counter(content.split())]
 
 
-async def test_posting_ids_are_renumbered_and_score_the_same(monkeypatch):
-    async with _installation(monkeypatch, shape="posting") as install:
+async def test_posting_ids_are_renumbered_and_score_the_same(compaction_template, monkeypatch):
+    async with _installation(compaction_template, monkeypatch, shape="posting") as install:
         async with install.pool.acquire() as conn:
             corpus = await _seed(conn, terms=1_000, documents=800, max_id=10_000_000, seed=13, shape="posting")
             queries = _queries(corpus, seed=13)

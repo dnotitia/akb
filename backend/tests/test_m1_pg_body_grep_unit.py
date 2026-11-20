@@ -18,6 +18,9 @@ from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_payload_verification import NativePayloadPlacementError
 
 
+pytestmark = pytest.mark.unit_only
+
+
 def _row(body: bytes = b"hello\nneedle\n") -> dict:
     return {
         "canonical_bytes": body,
