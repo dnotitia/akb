@@ -140,8 +140,14 @@ users in the disposable fixture and does not skip ACL checks for missing PATs.
 The selected runtime backend is exercised through HTTP; Native catalog paging,
 concurrent edits and stable endpoint identity are additionally checked by
 `test_graph_native_catalog_pg.py` and `test_native_graph_resource_identity_pg.py`
-in the live-PG lane, which runs every backend test outside `backend/tests/mcp_e2e`
-that does not declare `@pytest.mark.needs_resource` and fails on any skip.
+in the live-PG job. This job excludes `backend/tests/mcp_e2e` and tests marked
+`needs_resource` or `unit_only`. It fails if any selected test skips or is
+marked as an expected failure.
+
+Use `@pytest.mark.unit_only` for cases verified to run without live services.
+The unit job fails if its selector drops a marked case, or if a marked case
+skips or is marked as an expected failure. Mixed modules can mark individual
+tests so their live cases still run in the live-PG job.
 
 `test_adoption_vault_delete_e2e.py` requires planned, applied and blocked
 adoption deletion through HTTP, with a non-admin owner, Reader and system

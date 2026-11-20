@@ -693,6 +693,7 @@ def health_app(monkeypatch, tmp_path):
     return main
 
 
+@pytest.mark.unit_only
 async def test_health_promotes_the_queue_head_age_to_the_top_level(health_app, monkeypatch):
     """The contract term lives at the top level, not inside an operational blob.
 
@@ -711,12 +712,14 @@ async def test_health_promotes_the_queue_head_age_to_the_top_level(health_app, m
     assert "audit" not in result
 
 
+@pytest.mark.unit_only
 async def test_health_omits_the_queue_head_age_when_nothing_is_pending(health_app):
     result = await health_app.health(user=None)
 
     assert "oldest_pending_enqueued_at" not in result
 
 
+@pytest.mark.unit_only
 async def test_health_surfaces_native_file_projection_exhaustion_as_degraded(health_app, monkeypatch):
     """A terminal S3-to-Native intent must not look like a healthy projection."""
     from app.services import native_file_projection
@@ -763,6 +766,7 @@ async def test_vault_health_surfaces_native_file_projection_diagnostics(monkeypa
     assert result["native_file_projection"] == diagnostic
 
 
+@pytest.mark.unit_only
 async def test_health_reports_a_derived_index_abandonment_beside_the_progress(health_app, monkeypatch):
     """A Resource the indexer gave up on must be countable from `/health`.
 

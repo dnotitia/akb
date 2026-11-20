@@ -46,6 +46,9 @@ from app.services.external_git_validation import (
 from tests.extgit_http import build_runner
 
 
+pytestmark = pytest.mark.unit_only
+
+
 def _legacy_settings(**overrides) -> Settings:
     """This suite exercises the explicitly selected Bare Git capability."""
     return Settings(**{"document_revision_backend": "bare_git", **overrides})

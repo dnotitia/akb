@@ -18,6 +18,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from app.config import settings
 
 
+pytestmark = pytest.mark.unit_only
+
+
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 

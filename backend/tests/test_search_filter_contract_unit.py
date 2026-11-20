@@ -17,6 +17,9 @@ from app.services.search_filters import collection_predicate, escape_like, metad
 from app.services.m1_native_grep_service import HeadBody, M1NativeGrepService
 
 
+pytestmark = pytest.mark.unit_only
+
+
 @pytest.mark.parametrize("scope,expected", [("unarchived", ["draft", "active"]), ("archived", ["archived"]), ("all", ["draft", "active", "archived"])])
 @pytest.mark.parametrize("legacy", [False, True])
 def test_archive_scope_overrides_legacy_flag(scope, expected, legacy):

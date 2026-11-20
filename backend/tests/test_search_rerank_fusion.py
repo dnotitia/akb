@@ -12,6 +12,8 @@ from app.services.search_service import (
     vault_path_eligible,
 )
 
+pytestmark = pytest.mark.unit_only
+
 FUSION_K = 60
 
 
