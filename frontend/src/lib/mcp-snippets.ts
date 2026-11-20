@@ -1,8 +1,10 @@
-// Single source of truth for the "connect your agent" install snippets.
-// Used by the dashboard CONNECT panel, Settings, and the first-run Quickstart
-// — keep the command shape in one place so a change lands everywhere.
-
 export type McpAgent = "claude" | "cursor" | "codex" | "vscode" | "openclaw";
+export type McpTransport = "stdio" | "http";
+export type McpAuthentication = "oauth" | "pat";
+
+type McpRecipe =
+  | { transport: McpTransport; authentication: "oauth"; endpoint: string }
+  | { transport: McpTransport; authentication: "pat"; endpoint: string; pat: string };
 
 export const MCP_AGENT_LABELS: Record<McpAgent, string> = {
   claude: "Claude Code",
@@ -12,11 +14,10 @@ export const MCP_AGENT_LABELS: Record<McpAgent, string> = {
   openclaw: "OpenClaw",
 };
 
-/** Filename / context label shown on each snippet's header bar. */
-export const MCP_AGENT_FILES: Record<McpAgent, string> = {
-  claude: "terminal",
+export const MCP_SNIPPET_LABELS: Record<McpAgent, string> = {
+  claude: "Terminal · Claude Code",
   cursor: "mcp.json",
-  codex: "terminal",
+  codex: "Terminal · Codex",
   vscode: "mcp.json",
   openclaw: "openclaw.json",
 };
@@ -25,28 +26,76 @@ function shellArgument(value: string): string {
   return /^[a-zA-Z0-9_./:@%=-]+$/.test(value) ? value : "'" + value.replaceAll("'", "'\"'\"'") + "'";
 }
 
-export function supportsMcpProxyEndpoint(endpoint: string): boolean {
+function json(config: object): string {
+  return JSON.stringify(config, null, 2);
+}
+
+type HttpOAuthPreset = { render: (endpoint: string) => string; signIn: string };
+type McpSnippet = { code: string; signIn?: string };
+
+const RECIPES: Record<McpAgent, {
+  stdio: (args: string[]) => string;
+  http: { oauth?: HttpOAuthPreset; pat?: (endpoint: string, pat: string) => string };
+}> = {
+  claude: {
+    stdio: args => `claude mcp add --scope user akb -- npx ${args.map(shellArgument).join(" ")}`,
+    http: { oauth: {
+      render: endpoint => `claude mcp add --scope user --transport http akb ${shellArgument(endpoint)}`,
+      signIn: "Open Claude Code, enter /mcp, select AKB and complete the browser sign-in. Return to Claude Code after approving access.",
+    } },
+  },
+  cursor: {
+    stdio: args => json({ mcpServers: { akb: { command: "npx", args } } }),
+    http: {
+      oauth: {
+        render: endpoint => json({ mcpServers: { akb: { url: endpoint } } }),
+        signIn: "In Cursor's MCP settings, select AKB and complete the browser sign-in when prompted.",
+      },
+      pat: (endpoint, pat) => json({ mcpServers: { akb: { url: endpoint, headers: { Authorization: `Bearer ${pat}` } } } }),
+    },
+  },
+  codex: {
+    stdio: args => `codex mcp add akb -- npx ${args.map(shellArgument).join(" ")}`,
+    http: {},
+  },
+  vscode: {
+    stdio: args => json({ servers: { akb: { type: "stdio", command: "npx", args } } }),
+    http: { oauth: {
+      render: endpoint => json({ servers: { akb: { type: "http", url: endpoint } } }),
+      signIn: "Follow VS Code's AKB sign-in prompt and approve access in your browser.",
+    } },
+  },
+  openclaw: {
+    stdio: args => json({ mcp: { servers: { akb: { command: "npx", args } } } }),
+    http: {},
+  },
+};
+
+export function hasMcpRecipe(agent: McpAgent, transport: McpTransport, authentication: McpAuthentication): boolean {
+  return transport === "stdio" || Boolean(RECIPES[agent].http[authentication]);
+}
+
+export function supportsSecureMcpEndpoint(endpoint: string): boolean {
   const url = new URL(endpoint);
   return url.protocol === "https:" || (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
 }
 
-export function mcpInstallSnippets(endpoint: string, pat: string): Record<McpAgent, string> {
-  const args = ["akb-mcp", "--url", endpoint, "--pat", pat];
-  const cmd = `npx ${args.map(shellArgument).join(" ")}`;
-  return {
-    claude: `claude mcp add --scope user akb -- ${cmd}`,
-    cursor: JSON.stringify({ mcpServers: { akb: { command: "npx", args } } }, null, 2),
-    codex: `codex mcp add akb -- ${cmd}`,
-    vscode: JSON.stringify({ servers: { akb: { type: "stdio", command: "npx", args } } }, null, 2),
-    openclaw: JSON.stringify({ mcp: { servers: { akb: { command: "npx", args } } } }, null, 2),
-  };
+export function mcpLoginCommand(endpoint: string): string {
+  return `npx akb-mcp login --url ${shellArgument(endpoint)}`;
 }
 
-export function mcpOAuthSnippets(endpoint: string): Partial<Record<McpAgent, string>> {
-  return {
-    // Register in the terminal; authenticate using /mcp inside Claude Code.
-    claude: `claude mcp add --scope user --transport http akb ${shellArgument(endpoint)}`,
-    cursor: JSON.stringify({ mcpServers: { akb: { url: endpoint } } }, null, 2),
-    vscode: JSON.stringify({ servers: { akb: { type: "http", url: endpoint } } }, null, 2),
-  };
+export function mcpSnippet(agent: McpAgent, recipe: McpRecipe): McpSnippet | undefined {
+  const { endpoint } = recipe;
+  const presets = RECIPES[agent];
+  if (recipe.transport === "stdio") {
+    const args = ["akb-mcp", "--url", endpoint];
+    if (recipe.authentication === "pat") args.push("--pat", recipe.pat);
+    return { code: presets.stdio(args) };
+  }
+  if (recipe.authentication === "oauth") {
+    const preset = presets.http.oauth;
+    return preset && { code: preset.render(endpoint), signIn: preset.signIn };
+  }
+  const render = presets.http.pat;
+  return render && { code: render(endpoint, recipe.pat) };
 }

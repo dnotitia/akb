@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionSetup } from "../connection-setup";
 import { QuickstartDialog } from "../quickstart-dialog";
-import { AUTH_CONFIG_UNAVAILABLE, configureAuthTransport, parseAuthConfig, setToken } from "@/lib/api";
+import { ApiError, AUTH_CONFIG_UNAVAILABLE, configureAuthTransport, parseAuthConfig, setToken } from "@/lib/api";
 import { issuePat, getPatCapabilities } from "@/lib/api-pat-issuance";
 
 const connectionConfig = (oauth: boolean, pat = true) => parseAuthConfig({
@@ -18,7 +18,7 @@ vi.mock("@/lib/api-pat-issuance", async () => ({ ...await vi.importActual<typeof
 beforeEach(() => { vi.clearAllMocks(); configureAuthTransport("local"); setToken("fixture-session"); vi.mocked(getPatCapabilities).mockResolvedValue({ contract_version: 1, user_id: "00000000-0000-0000-0000-000000000001", name_max_length: 255, permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"], vault_scope_semantics: "write_restriction_sql_read_write" }); });
 const fresh = { token: "akb_fresh_secret", token_id: "fresh-id", name: "laptop", prefix: "akb_fresh", verified: true };
 const setup = async (user: ReturnType<typeof userEvent.setup>, tool = "Claude Code") => user.click(screen.getByRole("button", { name: `Continue with ${tool}` }));
-const method = async (user: ReturnType<typeof userEvent.setup>) => user.click(screen.getByRole("radio", { name: "Use a connection key" }));
+const method = async (user: ReturnType<typeof userEvent.setup>) => user.click(screen.getByRole("radio", { name: "Personal connection key (PAT)" }));
 const backToTool = async (user: ReturnType<typeof userEvent.setup>) => user.click(screen.getByRole("button", { name: "Choose a tool" }));
 
 describe("Connection setup", () => {
@@ -67,12 +67,22 @@ describe("Connection setup", () => {
     expect(screen.getByLabelText("Connection key name")).toHaveValue("laptop");
   });
 
-  it("guides browser sign-in without minting a key", async () => {
+  it("uses the same URL for stdio pre-login and proxy setup, and delegates HTTP sign-in to the tool", async () => {
     const user = userEvent.setup(); render(<ConnectionSetup authConfig={connectionConfig(true)} />); await setup(user);
-    expect(screen.getByRole("radio", { name: "Sign in with AKB" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "Sign in with AKB (OAuth/SSO)" })).toBeChecked();
     expect(screen.queryByLabelText("Connection key name")).toBeNull();
+    expect(screen.getByRole("radio", { name: "Local helper (stdio)" })).toBeChecked();
+    const login = screen.getByLabelText("Terminal · AKB sign-in");
+    const proxy = screen.getByLabelText("Terminal · Claude Code");
+    expect(login.textContent).toBe("npx akb-mcp login --url https://knowledge.example.test/workspace/mcp/");
+    expect(proxy.textContent).toBe("claude mcp add --scope user akb -- npx akb-mcp --url https://knowledge.example.test/workspace/mcp/");
+    expect(login.compareDocumentPosition(proxy) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await user.click(screen.getByRole("radio", { name: "Direct connection (HTTP)" }));
+    expect(screen.getByRole("radio", { name: "Sign in with AKB (OAuth/SSO)" })).toBeChecked();
+    expect(screen.queryByLabelText("Terminal · AKB sign-in")).toBeNull();
     expect(screen.getByText(/--transport http/)).toBeVisible();
     expect(screen.getByText(/Open Claude Code, enter \/mcp/)).toBeVisible();
+    expect(screen.getByText(/no tested Direct connection.*Personal connection key/)).toBeVisible();
     expect(issuePat).not.toHaveBeenCalled();
   });
 
@@ -80,13 +90,15 @@ describe("Connection setup", () => {
     const user = userEvent.setup();
     render(<ConnectionSetup authConfig={connectionConfig(true, false)} />);
     await setup(user);
-    expect(screen.getByText(/--transport http/)).toHaveTextContent("https://knowledge.example.test/workspace/mcp/");
-    expect(screen.queryByRole("radio", { name: "Use a connection key" })).toBeNull();
+    expect(screen.getByLabelText("Terminal · AKB sign-in")).toHaveTextContent("https://knowledge.example.test/workspace/mcp/");
+    expect(screen.queryByRole("radio", { name: "Personal connection key (PAT)" })).toBeNull();
     expect(getPatCapabilities).not.toHaveBeenCalled();
     await backToTool(user);
     await user.click(screen.getByRole("radio", { name: "Codex" }));
     await setup(user, "Codex");
-    expect(screen.getByText(/no sign-in instructions for Codex/)).toBeVisible();
+    expect(screen.getByLabelText("Terminal · AKB sign-in")).toBeVisible();
+    expect(screen.getByRole("radio", { name: "Direct connection (HTTP)" })).toBeDisabled();
+    expect(screen.getByText(/no tested direct HTTP preset for Codex/)).toBeVisible();
     expect(screen.queryByRole("radio", { name: "Use an existing key" })).toBeNull();
   });
 
@@ -95,10 +107,9 @@ describe("Connection setup", () => {
     const config = parseAuthConfig({ ...localAuthConfig, mcp_endpoint_url: "http://akb.example.test/mcp/" });
     render(<ConnectionSetup authConfig={config} />);
     await setup(user);
-    await user.click(screen.getByRole("radio", { name: "Use an existing key" }));
-    await user.type(screen.getByLabelText("Full connection key"), "akb_saved");
-
-    expect(screen.getByText(/requires an HTTPS address or loopback HTTP/)).toBeVisible();
+    expect(screen.queryByRole("radio", { name: "Use an existing key" })).toBeNull();
+    expect(getPatCapabilities).not.toHaveBeenCalled();
+    expect(screen.getByText(/requires HTTPS or loopback HTTP/)).toBeVisible();
     expect(screen.queryByText(/npx akb-mcp/)).toBeNull();
   });
 
@@ -136,17 +147,39 @@ describe("Connection setup", () => {
     expect(screen.queryByText(/npx akb-mcp/)).toBeNull();
   });
 
-  it("keeps one tab stop per group and separates method from key preparation", async () => {
+  it("blocks stale key setup when issuance reports that the deployment disabled it", async () => {
+    vi.mocked(issuePat).mockRejectedValue(new ApiError("Personal access tokens are disabled", 403, { code: "personal_access_tokens_disabled" }));
+    const retry = vi.fn();
+    const user = userEvent.setup();
+    const { rerender } = render(<ConnectionSetup authConfig={connectionConfig(true)} onRetryAuthConfig={retry} />);
+    await setup(user);
+    await method(user);
+    await user.type(screen.getByLabelText("Connection key name"), "work laptop");
+    await user.click(screen.getByRole("button", { name: "Create connection key" }));
+
+    expect(await screen.findByText("Personal access tokens are disabled")).toBeVisible();
+    expect(retry).toHaveBeenCalledOnce();
+    rerender(<ConnectionSetup authConfig={connectionConfig(true)} onRetryAuthConfig={retry} />);
+    expect(screen.queryByRole("radio", { name: "Personal connection key (PAT)" })).toBeNull();
+    expect(screen.getByRole("radio", { name: "Sign in with AKB (OAuth/SSO)" })).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "Check in Claude Code" })).toBeDisabled();
+  });
+
+  it("uses native radio keys for separate transport and authentication choices", async () => {
     const user = userEvent.setup(); render(<ConnectionSetup authConfig={connectionConfig(true)} />);
-    expect(screen.getByRole("radio", { name: "Claude Code" })).toHaveAttribute("tabindex", "0");
-    await user.click(screen.getByRole("radio", { name: "VS Code" }));
-    expect(screen.getByRole("radio", { name: "VS Code" })).toHaveAttribute("tabindex", "0");
-    expect(screen.getByRole("radio", { name: "Claude Code" })).toHaveAttribute("tabindex", "-1");
-    await setup(user, "VS Code"); await method(user);
-    expect(screen.getByRole("radio", { name: "Use a connection key" })).toHaveAttribute("tabindex", "0");
+    await user.click(screen.getByRole("radio", { name: "Cursor" }));
+    await setup(user, "Cursor");
+    await user.tab();
+    expect(screen.getByRole("radio", { name: "Local helper (stdio)" })).toHaveFocus();
+    await user.keyboard("{ArrowRight}");
+    expect(screen.getByRole("radio", { name: "Direct connection (HTTP)" })).toBeChecked();
+    await user.tab();
+    expect(screen.getByRole("radio", { name: "Sign in with AKB (OAuth/SSO)" })).toHaveFocus();
+    await user.keyboard("{ArrowRight}");
+    expect(screen.getByRole("radio", { name: "Personal connection key (PAT)" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "Direct connection (HTTP)" })).toBeChecked();
     await user.click(screen.getByRole("radio", { name: "Use an existing key" }));
-    expect(screen.getByRole("radio", { name: "Use an existing key" })).toHaveAttribute("tabindex", "0");
-    expect(screen.getByRole("radio", { name: "Sign in with AKB" })).not.toBeChecked();
+    expect(screen.getByLabelText("Full connection key")).toBeVisible();
   });
 
   it("rejects prefixes and shell text instead of putting them in a command", async () => {
@@ -167,7 +200,7 @@ describe("Connection setup", () => {
     const user = userEvent.setup(); render(<ConnectionSetup authConfig={connectionConfig(true)} />); await setup(user); await method(user);
     await user.type(screen.getByLabelText("Connection key name"), "retained draft");
     await backToTool(user); await user.click(screen.getByRole("radio", { name: "Cursor" })); await setup(user, "Cursor");
-    expect(screen.getByRole("radio", { name: "Use a connection key" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "Personal connection key (PAT)" })).toBeChecked();
     expect(screen.getByLabelText("Connection key name")).toHaveValue("retained draft");
   });
 
@@ -232,14 +265,33 @@ describe("Connection setup", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Enter your current full token again");
   });
 
-  it("explains the provided Codex preset without claiming the client lacks OAuth", async () => {
+  it("preserves a selected key across Cursor transports and clears its configuration for an untested client combination", async () => {
     const user = userEvent.setup(); render(<ConnectionSetup authConfig={connectionConfig(true)} />);
-    await user.click(screen.getByRole("radio", { name: "Codex" })); await setup(user, "Codex");
-    expect(screen.queryByRole("radio", { name: "Sign in with AKB" })).toBeNull();
-    await user.type(screen.getByLabelText("Connection key name"), "retained draft");
-    await backToTool(user); await user.click(screen.getByRole("radio", { name: "Claude Code" })); await setup(user);
-    expect(screen.getByRole("radio", { name: "Sign in with AKB" })).toBeChecked();
-    await method(user); expect(screen.getByLabelText("Connection key name")).toHaveValue("retained draft");
+    const endpoint = "https://knowledge.example.test/workspace/mcp/";
+    await user.click(screen.getByRole("radio", { name: "Cursor" })); await setup(user, "Cursor");
+    const config = () => JSON.parse(screen.getByLabelText("mcp.json").textContent ?? "").mcpServers.akb;
+    expect(config()).toEqual({ command: "npx", args: ["akb-mcp", "--url", endpoint] });
+    await user.click(screen.getByRole("radio", { name: "Direct connection (HTTP)" }));
+    expect(config()).toEqual({ url: endpoint });
+    await method(user);
+    await user.click(screen.getByRole("radio", { name: "Use an existing key" }));
+    await user.type(screen.getByLabelText("Full connection key"), "akb_saved_secret");
+    expect(config()).toEqual({ url: endpoint, headers: { Authorization: "Bearer akb_saved_secret" } });
+    await user.click(screen.getByRole("radio", { name: "Local helper (stdio)" }));
+    expect(config()).toEqual({ command: "npx", args: ["akb-mcp", "--url", endpoint, "--pat", "akb_saved_secret"] });
+    await user.click(screen.getByRole("radio", { name: "Direct connection (HTTP)" }));
+
+    await backToTool(user);
+    await user.click(screen.getByRole("radio", { name: "Claude Code" })); await setup(user);
+    expect(screen.getByText(/no tested Direct connection/)).toBeVisible();
+    expect(screen.getByRole("radio", { name: "Sign in with AKB (OAuth/SSO)" })).not.toBeChecked();
+    expect(screen.getByLabelText("Full connection key")).not.toBeVisible();
+    expect(screen.queryByLabelText("Terminal · Claude Code")).toBeNull();
+    await user.tab();
+    await user.tab();
+    expect(screen.getByRole("radio", { name: "Sign in with AKB (OAuth/SSO)" })).toHaveFocus();
+    await user.keyboard(" ");
+    expect(screen.getByLabelText("Terminal · Claude Code")).toHaveTextContent("--transport http");
     expect(issuePat).not.toHaveBeenCalled();
   });
 

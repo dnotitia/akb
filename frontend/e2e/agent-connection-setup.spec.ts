@@ -4,8 +4,9 @@ test.skip(process.env.AKB_FE_E2E_MODE === "mock", "Uses isolated HTTP fixtures."
 const userId = "00000000-0000-0000-0000-000000000001";
 const tokenId = "00000000-0000-0000-0000-000000000002";
 
-async function setup(page: Page, { oauth = false, dark = false, pat = true } = {}) {
+async function setup(page: Page, { oauth = false, dark = false, pat = true, unavailable = false } = {}) {
   let creations = 0;
+  let verifiedAccount = false;
   await page.addInitScript(({ dark }) => {
     localStorage.setItem("akb_token", "connection-layout-fixture");
     localStorage.setItem("akb_theme", dark ? "dark" : "light");
@@ -13,8 +14,11 @@ async function setup(page: Page, { oauth = false, dark = false, pat = true } = {
   await page.route("**/health/**", route => route.fulfill({ json: {} }));
   await page.route("**/api/**", async route => {
     const path = new URL(route.request().url()).pathname;
-    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: oauth }, personal_access_tokens: { enabled: pat }, mcp_endpoint_url: "https://akb.example.test/workspace/mcp/" } });
-    if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: userId, username: "reviewer", display_name: "Connection reviewer", email: "reviewer@example.invalid", is_admin: false, auth_method: "local" } });
+    if (path.endsWith("/auth/config")) return unavailable && verifiedAccount ? route.fulfill({ status: 503 }) : route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: oauth }, personal_access_tokens: { enabled: pat }, mcp_endpoint_url: "https://akb.example.test/workspace/mcp/" } });
+    if (path.endsWith("/auth/me")) {
+      verifiedAccount = true;
+      return route.fulfill({ json: { user_id: userId, username: "reviewer", display_name: "Connection reviewer", email: "reviewer@example.invalid", is_admin: false, auth_method: "local" } });
+    }
     if (path.endsWith("/auth/tokens/capabilities")) return route.fulfill({ json: { contract_version: 1, user_id: userId, name_max_length: 255, permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"], vault_scope_semantics: "write_restriction_sql_read_write" } });
     if (path.endsWith("/auth/tokens/issuance")) {
       creations++;
@@ -39,9 +43,18 @@ for (const width of [1440, 375]) for (const oauth of [false, true]) {
     await modal.getByRole("button", { name: "Continue with Claude Code" }).click();
     await expect(modal.getByRole("heading", { name: "2. Add AKB to Claude Code" })).toBeFocused();
     if (oauth) {
-      await expect(modal.getByRole("radio", { name: "Sign in with AKB" })).toBeChecked();
+      await expect(modal.getByRole("radio", { name: "Sign in with AKB (OAuth/SSO)" })).toBeChecked();
+      const transport = modal.getByRole("group", { name: "Connection transport" });
+      await expect(transport.getByRole("radio", { name: "Local helper (stdio)" })).toBeChecked();
+      await expect(modal.getByLabel("Terminal · AKB sign-in")).toBeInViewport({ ratio: 1 });
+      await page.keyboard.press("Tab");
+      await expect(transport.getByRole("radio", { name: "Local helper (stdio)" })).toBeFocused();
+      await page.keyboard.press("ArrowRight");
       await expect(modal.getByText(/--transport http/)).toBeVisible();
       await expect(modal.getByText(/Open Claude Code, enter \/mcp/)).toBeVisible();
+      await expect(modal.getByLabel("Terminal · AKB sign-in")).toHaveCount(0);
+      await page.keyboard.press("ArrowLeft");
+      await expect(modal.getByLabel("Terminal · AKB sign-in")).toBeVisible();
     } else {
       await modal.getByRole("radio", { name: "Use an existing key" }).locator("..").click();
       await modal.getByLabel("Full connection key").fill("akb_complete_fixture_key");
@@ -72,8 +85,8 @@ test("OAuth setup uses the published endpoint while personal keys are disabled",
   const dialog = page.getByRole("dialog", { name: "Settings" });
   await dialog.getByRole("button", { name: "Continue with Claude Code" }).click();
 
-  await expect(dialog.getByText(/--transport http/)).toContainText("https://akb.example.test/workspace/mcp/");
-  await expect(dialog.getByRole("radio", { name: "Use a connection key" })).toHaveCount(0);
+  await expect(dialog.getByLabel("Terminal · AKB sign-in")).toContainText("https://akb.example.test/workspace/mcp/");
+  await expect(dialog.getByRole("radio", { name: "Personal connection key (PAT)" })).toHaveCount(0);
   await expect(dialog.getByRole("button", { name: "Create connection key" })).toHaveCount(0);
   expect(creations()).toBe(0);
 });
@@ -85,6 +98,7 @@ test("a fresh key stays available across client changes and close requires ackno
   const modal = page.getByRole("dialog", { name: "Connect an AI tool" });
   await modal.getByRole("radio", { name: "Codex", exact: true }).locator("..").click();
   await modal.getByRole("button", { name: "Continue with Codex" }).click();
+  await modal.getByRole("radio", { name: "Personal connection key (PAT)" }).locator("..").click();
   await modal.getByLabel("Connection key name").fill("Work laptop");
   await modal.getByRole("button", { name: "Create connection key", exact: true }).click();
   await expect(modal.getByText("Connection key created", { exact: true })).toBeVisible();
@@ -92,8 +106,12 @@ test("a fresh key stays available across client changes and close requires ackno
   await modal.getByRole("button", { name: "Choose a tool", exact: true }).click();
   await modal.getByRole("radio", { name: "Cursor", exact: true }).locator("..").click();
   await modal.getByRole("button", { name: "Continue with Cursor" }).click();
-  await expect(modal.getByRole("radio", { name: "Use a connection key" })).toBeChecked();
-  await expect(modal.getByLabel("mcp.json", { exact: true })).toContainText("akb_fixture_secret_only");
+  await expect(modal.getByRole("radio", { name: "Personal connection key (PAT)" })).toBeChecked();
+  await modal.getByRole("radio", { name: "Direct connection (HTTP)" }).locator("..").click();
+  const snippet = modal.getByLabel("mcp.json", { exact: true });
+  expect(JSON.parse(await snippet.innerText())).toEqual({
+    mcpServers: { akb: { url: "https://akb.example.test/workspace/mcp/", headers: { Authorization: "Bearer akb_fixture_secret_only" } } },
+  });
   await modal.getByRole("button", { name: "Hide key and configuration" }).click();
   await expect(modal.getByLabel("mcp.json", { exact: true })).toHaveCount(0);
   await modal.getByRole("button", { name: "Show key and configuration" }).click();
@@ -132,7 +150,7 @@ for (const width of [1440, 375]) {
     await expect(page.getByRole("heading", { name: "AI connections", exact: true })).toBeVisible();
     await expect(page.getByRole("dialog")).toHaveCount(1);
     await page.getByRole("button", { name: "Continue with Claude Code" }).click();
-    await page.getByRole("radio", { name: "Use a connection key" }).locator("..").click();
+    await page.getByRole("radio", { name: "Personal connection key (PAT)" }).locator("..").click();
     await page.getByLabel("Connection key name").fill("Unfinished setup");
     await page.getByRole("tab", { name: "Connection keys", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Connection keys", exact: true })).toBeVisible();
@@ -193,7 +211,58 @@ test("keyboard tool selection and copying never claim a verified connection", as
   await modal.getByLabel("mcp.json", { exact: true }).locator("..").getByRole("button", { name: "Copy snippet", exact: true }).click();
   await expect(modal.getByText(/Setup copied. Apply it in Cursor/)).toBeVisible();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toContain("mcpServers");
+  await modal.getByRole("radio", { name: "Direct connection (HTTP)" }).locator("..").click();
+  await expect(modal.getByText(/Setup copied/)).toHaveCount(0);
+  await modal.getByRole("radio", { name: "Local helper (stdio)" }).locator("..").click();
+  await expect(modal.getByText(/Setup copied/)).toHaveCount(0);
   await modal.getByRole("button", { name: "Check in Cursor", exact: true }).click();
   await expect(modal.getByRole("checkbox")).not.toBeChecked();
   await expect(modal.getByText(/This browser cannot verify/)).toBeVisible();
 });
+
+for (const entry of ["Settings", "Home"] as const) {
+  for (const policy of [
+    { label: "both", oauth: true, pat: true },
+    { label: "pat-only", oauth: false, pat: true },
+    { label: "oauth-only", oauth: true, pat: false },
+    { label: "no-methods", oauth: false, pat: false },
+    { label: "unavailable", oauth: false, pat: false, unavailable: true },
+  ]) {
+    test(`${entry} setup shows ${policy.label} policy`, async ({ page }, testInfo) => {
+      await setup(page, { ...policy, dark: entry === "Home" });
+      await page.setViewportSize({ width: entry === "Settings" ? 1440 : 390, height: 980 });
+      await page.goto(entry === "Settings" ? "/settings?tab=tokens" : "/");
+      if (entry === "Home") await page.getByRole("button", { name: "Connect an AI tool", exact: true }).click();
+      const dialog = page.getByRole("dialog", { name: entry === "Settings" ? "Settings" : "Connect an AI tool", exact: true });
+      await dialog.getByRole("button", { name: "Continue with Claude Code" }).click();
+      await expect(dialog.getByRole("heading", { name: "2. Add AKB to Claude Code" })).toBeFocused();
+
+      if (policy.unavailable) {
+        await expect(dialog.getByRole("button", { name: "Retry connection options" })).toBeVisible();
+      } else if (!policy.oauth && !policy.pat) {
+        await expect(dialog.getByText(/no human MCP connection method/)).toBeVisible();
+      } else {
+        await expect(dialog.getByRole("radio", { name: "Local helper (stdio)" })).toBeChecked();
+      }
+      const login = dialog.getByRole("radio", { name: "Sign in with AKB (OAuth/SSO)" });
+      const pat = dialog.getByRole("radio", { name: "Personal connection key (PAT)" });
+      if (policy.oauth) {
+        await expect(login).toBeChecked();
+        await expect(dialog.getByLabel("Terminal · AKB sign-in")).toBeInViewport({ ratio: 1 });
+      } else {
+        await expect(login).toHaveCount(0);
+        await expect(dialog.getByLabel("Terminal · AKB sign-in")).toHaveCount(0);
+      }
+      if (policy.pat) await expect(pat).toBeVisible(); else await expect(pat).toHaveCount(0);
+
+      await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+      expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+      await page.screenshot({ path: testInfo.outputPath(`${entry.toLowerCase()}-${policy.label}.png`), animations: "disabled" });
+      if (entry === "Settings" && policy.label === "both") {
+        await dialog.getByRole("radio", { name: "Direct connection (HTTP)" }).locator("..").click();
+        await expect(dialog.getByText(/--transport http/)).toBeVisible();
+        await page.screenshot({ path: testInfo.outputPath("settings-direct-oauth.png"), animations: "disabled" });
+      }
+    });
+  }
+}

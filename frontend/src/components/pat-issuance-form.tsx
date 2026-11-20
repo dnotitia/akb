@@ -10,10 +10,17 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SelectMenu } from "@/components/ui/select-menu";
 
-export function PatIssuanceForm({ initial, issuanceEnabled, replacement = false, onCreated, onMetadataChanged, onDirtyChange, onBusyChange, ownsOperation }: {
+function isPatPolicyRejection(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status !== 403) return false;
+  const detail = error.detail;
+  return typeof detail === "object" && detail !== null && "code" in detail && detail.code === "personal_access_tokens_disabled";
+}
+
+export function PatIssuanceForm({ initial, issuanceEnabled, replacement = false, onCreated, onMetadataChanged, onDirtyChange, onBusyChange, ownsOperation, onPolicyRejected }: {
   issuanceEnabled: boolean; initial?: PatDraft; replacement?: boolean; onCreated: (receipt: PatReceipt, snapshot: AuthSessionSnapshot) => void;
   onMetadataChanged?: () => void; onDirtyChange?: (dirty: boolean) => void; onBusyChange?: (busy: boolean) => void;
   ownsOperation?: () => boolean;
+  onPolicyRejected?: () => void;
 }) {
   const id = useId();
   const [draft, setDraft] = useState<PatDraft>(() => initial ?? defaultPatDraft());
@@ -48,7 +55,11 @@ export function PatIssuanceForm({ initial, issuanceEnabled, replacement = false,
     try {
       const data = await getPatCapabilities(snapshot);
       if (mounted.current && sequence === discovery.current && isCurrentAuthSession(snapshot)) setCapability({ data, snapshot });
-    } catch (e) { if (mounted.current && sequence === discovery.current) setError(e instanceof Error ? e.message : "Could not verify token issuance support."); }
+    } catch (e) {
+      if (!mounted.current || sequence !== discovery.current || !isCurrentAuthSession(snapshot)) return;
+      setError(e instanceof Error ? e.message : "Could not verify token issuance support.");
+      if (isPatPolicyRejection(e)) onPolicyRejected?.();
+    }
     finally { if (mounted.current && sequence === discovery.current) setLoading(false); }
   }
   useEffect(() => {
@@ -90,6 +101,7 @@ export function PatIssuanceForm({ initial, issuanceEnabled, replacement = false,
     } catch (e) {
       if (!currentOperation()) return;
       if (!isCurrentAuthSession(snapshot)) { setCapability(null); setError("Your sign-in session changed. Review token creation again."); return; }
+      if (isPatPolicyRejection(e)) onPolicyRejected?.();
       if (e instanceof ApiError && e.status === 422) {
         const detail = e.detail as { details?: { fields?: { field?: unknown; message?: unknown }[] } } | null;
         const next: PatFieldErrors = {};

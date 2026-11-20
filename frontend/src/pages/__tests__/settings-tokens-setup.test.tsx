@@ -18,9 +18,6 @@ vi.mock("@/lib/api", async () => ({
   adminDeleteUser: vi.fn(),
   changePassword: vi.fn(),
   updateProfile: vi.fn(),
-  // tokens-section calls this on mount to decide whether to show the
-  // OAuth toggle alongside the PAT snippet. Mock as "OAuth off" so
-  // these tests stay focused on the PAT-mint UX they were written for.
   getAuthConfig: vi.fn().mockResolvedValue({
     available: true,
     schema_version: 3,
@@ -97,6 +94,29 @@ describe("Shared connection setup", () => {
     await screen.findByRole("heading", { name: "AI connections" });
     expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
     expect(screen.queryByText(/akb_xyz…/)).not.toBeInTheDocument();
+  });
+
+  it("retries unavailable connection options and forwards the public endpoint", async () => {
+    const { AUTH_CONFIG_UNAVAILABLE, getAuthConfig, listPATs, parseAuthConfig } = await import("@/lib/api");
+    vi.mocked(listPATs).mockResolvedValue({ tokens: [] });
+    const config = parseAuthConfig({
+      schema_version: 3,
+      auth_mode: "local",
+      local_auth: { enabled: true },
+      keycloak: { enabled: false, browser_session_ready: false },
+      providers: [],
+      mcp_oauth: { enabled: true },
+      personal_access_tokens: { enabled: false },
+      mcp_endpoint_url: "https://akb.example.test/workspace/mcp/",
+    });
+    vi.mocked(getAuthConfig).mockResolvedValueOnce(AUTH_CONFIG_UNAVAILABLE).mockResolvedValueOnce(config);
+    const user = userEvent.setup();
+    render(wrap());
+    await user.click(await screen.findByRole("button", { name: "Continue with Claude Code" }));
+    expect(screen.getByRole("button", { name: "Check in Claude Code" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Retry connection options" }));
+    expect(await screen.findByLabelText("Terminal · AKB sign-in")).toHaveTextContent("https://akb.example.test/workspace/mcp/");
+    expect(screen.queryByRole("radio", { name: "Personal connection key (PAT)" })).toBeNull();
   });
 
   it("keeps PAT management available in SSO mode", async () => {

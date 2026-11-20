@@ -58,10 +58,10 @@ Loading retains the same window geometry. Existing account-proof ownership,
 unfinished-work guards, explicit saves, token receipts and destructive-action
 confirmations remain authoritative.
 
-Within Agent connections and token replacement, AI-tool and access-method
+Within Agent connections and token replacement, AI-tool, connection transport, and authentication
 choices use content-sized 32px pills with the same soft selected state as Vault
-Settings shortcuts. They wrap instead of filling equal-width columns; touch
-targets remain 44px. These remain native radio groups because they select form
+Settings shortcuts. Pairs can wrap their labels inside each pill in narrow
+frames. Touch targets remain 44px. These remain native radio groups because they select form
 values. Switching choices preserves the current credential draft and receipt.
 
 AI connections uses three explicit stages: Choose a tool → Add AKB → Check in
@@ -69,8 +69,9 @@ that tool. Only the selected stage is visible; inactive stages and an opened
 credential form stay mounted, hidden and inert so drafts and one-time secrets
 survive navigation. The step bar describes navigation, not completion, and
 scrolling never changes it. Navigation moves focus to the selected heading.
-Tool selection precedes the sign-in/key choice. Key creation and existing-key
-entry are separate choices within the key method. Each client guide states
+Tool selection comes first. Add AKB presents separate native radio groups for
+connection transport and authentication. Key creation and existing-key entry
+are separate choices within the key method. Each client guide states
 where to act, what to do, and where the result appears. Unsupported presets
 never imply that the client itself lacks a protocol capability.
 
@@ -1038,11 +1039,9 @@ an `sr-only` summary, never the only signal.
   prepare access, configure, then try a read-only request. Never hide the final
   phase until token creation or offer a placeholder secret as usable config.
   Quickstart and Settings share the same numbered, hairline-separated flow.
-  One tool choice leads into one access-method choice (supported browser sign-in,
-  new token, or saved token), rather than nested tool/auth/token selects.
-  Tool choices use an underline strip; access methods use a bordered segmented
-  choice with a check on the selection. Both retain labelled native radio groups,
-  a single selected tab stop, arrow-key selection and visible focus in both themes.
+  After tool selection, Add AKB presents transport and authentication in separate
+  labelled native radio groups. The groups use compact pills, arrow-key selection
+  and visible focus in both themes.
   Expiration and write restrictions remain under Advanced options, with the
   reviewed permissions summary always visible before issuance. Keep the form
   mounted across method changes; a hidden draft or uncertain result is not reset.
