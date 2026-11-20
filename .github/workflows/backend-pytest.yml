@@ -116,11 +116,25 @@ jobs:
       # exist only once a session has called into it, and a preloaded server
       # hid the failure of every new pooled connection's first search
       # (akb#615).
-      - name: Build and start the BM25 extension server
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the BM25 extension image
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
+        with:
+          context: deploy/postgres
+          file: deploy/postgres/Dockerfile
+          tags: akb-postgres:ci
+          push: false
+          load: true
+          cache-from: type=gha,scope=akb-ci-postgres
+          cache-to: type=gha,mode=max,scope=akb-ci-postgres,ignore-error=true
+
+      - name: Start the BM25 extension server
         env:
           VCHORD_PASSWORD: akb  # pragma: allowlist secret
         run: |
-          docker build --tag akb-postgres:ci deploy/postgres
           docker run -d --name vchord -p 15433:5432 \
             -e POSTGRES_USER=akb -e POSTGRES_PASSWORD="$VCHORD_PASSWORD" -e POSTGRES_DB=akb \
             akb-postgres:ci postgres
