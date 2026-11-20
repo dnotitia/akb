@@ -6,7 +6,11 @@ import pytest
 from app.services import sparse_encoder
 from scripts import compact_bm25_term_ids as compact
 from tests.test_bm25_query_epoch_postgres import _seed
-from tests.test_bm25_term_id_compaction_postgres import _installation, _state
+from tests.test_bm25_term_id_compaction_postgres import (
+    _installation,
+    _state,
+    compaction_template as compaction_template,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -31,8 +35,10 @@ class _NoTableRewrite:
     ((1 << 30) - 1, True),  # A late term would be allocated beyond the old maximum.
     (-1, False),  # Corrupt historical vocabulary must not be restored either.
 ])
-async def test_revert_refuses_out_of_range_targets_without_changing_state(monkeypatch, old_id, late_term):
-    async with _installation(monkeypatch) as install:
+async def test_revert_refuses_out_of_range_targets_without_changing_state(
+    compaction_template, monkeypatch, old_id, late_term,
+):
+    async with _installation(compaction_template, monkeypatch) as install:
         await _seed(install, "vchord")
         async with install.pool.acquire() as conn:
             await conn.execute("UPDATE bm25_vocab SET term_id=$1 WHERE term='gamma'", old_id)

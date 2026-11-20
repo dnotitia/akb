@@ -9,7 +9,10 @@ import pytest
 from app.services import sparse_encoder
 from app.services.vector_store import VectorSearchDegraded
 from tests.test_bm25_query_epoch_postgres import _seed
-from tests.test_bm25_term_id_compaction_postgres import _installation
+from tests.test_bm25_term_id_compaction_postgres import (
+    _installation,
+    compaction_template as compaction_template,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -38,8 +41,10 @@ async def _timeout(conn, **_kwargs):
 
 @pytest.mark.parametrize("failed", ["dense", "sparse"])
 @pytest.mark.parametrize("scope", ["none", "vault", "source"])
-async def test_statement_timeout_preserves_the_healthy_scoped_oracle(monkeypatch, failed, scope):
-    async with _installation(monkeypatch) as install:
+async def test_statement_timeout_preserves_the_healthy_scoped_oracle(
+    compaction_template, monkeypatch, failed, scope,
+):
+    async with _installation(compaction_template, monkeypatch) as install:
         kwargs = await _prepare(install)
         if scope == "vault":
             kwargs["vault_ids"] = [str(uuid.UUID(int=9))]
@@ -63,8 +68,10 @@ async def test_statement_timeout_preserves_the_healthy_scoped_oracle(monkeypatch
 
 
 @pytest.mark.parametrize("failure", [asyncpg.InsufficientPrivilegeError, asyncpg.UndefinedTableError])
-async def test_acl_or_schema_failure_cancels_and_drains_the_other_leg(monkeypatch, failure):
-    async with _installation(monkeypatch) as install:
+async def test_acl_or_schema_failure_cancels_and_drains_the_other_leg(
+    compaction_template, monkeypatch, failure,
+):
+    async with _installation(compaction_template, monkeypatch) as install:
         kwargs = await _prepare(install)
         entered, cancelled = asyncio.Event(), asyncio.Event()
 
@@ -86,8 +93,8 @@ async def test_acl_or_schema_failure_cancels_and_drains_the_other_leg(monkeypatc
         assert cancelled.is_set()
 
 
-async def test_both_legs_failing_produces_no_partial_results(monkeypatch):
-    async with _installation(monkeypatch) as install:
+async def test_both_legs_failing_produces_no_partial_results(compaction_template, monkeypatch):
+    async with _installation(compaction_template, monkeypatch) as install:
         kwargs = await _prepare(install)
         monkeypatch.setattr(install.store, "_search_dense", _timeout)
         monkeypatch.setattr(install.store, "_search_sparse", _timeout)
@@ -97,8 +104,10 @@ async def test_both_legs_failing_produces_no_partial_results(monkeypatch):
         assert exc.value.hits == []
 
 
-async def test_partial_search_releases_failed_connection_with_a_one_slot_pool(monkeypatch):
-    async with _installation(monkeypatch) as install:
+async def test_partial_search_releases_failed_connection_with_a_one_slot_pool(
+    compaction_template, monkeypatch,
+):
+    async with _installation(compaction_template, monkeypatch) as install:
         kwargs = await _prepare(install)
         oracle = await install.store.hybrid_search(**{**kwargs, "query_dense": None})
         tiny = await asyncpg.create_pool(install.dsn, min_size=1, max_size=1)
@@ -115,8 +124,10 @@ async def test_partial_search_releases_failed_connection_with_a_one_slot_pool(mo
 
 
 @pytest.mark.parametrize("nested_transaction", [False, True])
-async def test_lost_dense_backend_preserves_the_sparse_oracle(monkeypatch, nested_transaction):
-    async with _installation(monkeypatch) as install:
+async def test_lost_dense_backend_preserves_the_sparse_oracle(
+    compaction_template, monkeypatch, nested_transaction,
+):
+    async with _installation(compaction_template, monkeypatch) as install:
         kwargs = await _prepare(install)
         oracle = await install.store.hybrid_search(**{**kwargs, "query_dense": None})
 
@@ -142,8 +153,8 @@ async def test_lost_dense_backend_preserves_the_sparse_oracle(monkeypatch, neste
         assert exc.value.hits == oracle
 
 
-async def test_caller_cancellation_drains_both_legs(monkeypatch):
-    async with _installation(monkeypatch) as install:
+async def test_caller_cancellation_drains_both_legs(compaction_template, monkeypatch):
+    async with _installation(compaction_template, monkeypatch) as install:
         kwargs = await _prepare(install)
         entered = [asyncio.Event(), asyncio.Event()]
         cancelled = [asyncio.Event(), asyncio.Event()]
