@@ -21,7 +21,11 @@ class TestDatabase:
 
 @asynccontextmanager
 async def temporary_database(
-    admin_dsn: str, prefix: str, *, template: TestDatabase | None = None
+    admin_dsn: str,
+    prefix: str,
+    *,
+    template: TestDatabase | None = None,
+    required: bool = False,
 ) -> AsyncIterator[TestDatabase]:
     """Create an empty database or clone a template with no live connections."""
     name = f"{prefix}{uuid4().hex[:12]}"
@@ -31,6 +35,8 @@ async def temporary_database(
     except (OSError, asyncpg.PostgresError):
         if os.environ.get("REQUIRE_REAL_PG") == "1":
             pytest.fail("REQUIRE_REAL_PG=1 but the test PostgreSQL server is unreachable")
+        if required or template is not None:
+            raise
         pytest.skip("Test PostgreSQL server is unreachable")
 
     try:
