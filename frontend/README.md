@@ -13,6 +13,7 @@ pnpm lint             # eslint src
 pnpm test             # vitest run
 pnpm build            # tsc && vite build
 pnpm preview          # serve dist locally
+pnpm run dev:e2e:mock    # start the mock frontend on 127.0.0.1:4173
 pnpm run test:e2e:mock    # Playwright + MSW, no backend required
 pnpm run test:e2e:fixture # Playwright against a production build; specs answer their own HTTP
 pnpm run test:e2e:real    # Playwright against AKB_FRONTEND_URL from the runtime descriptor
@@ -86,15 +87,13 @@ explicitly. The mode names the server its specs need; fixture and real split
 the suite between them, and mock loads every spec file (the `page.route` specs
 skip themselves there):
 
-- `pnpm run test:e2e:mock` starts Vite with the browser MSW worker, exposes
-  mock readiness/discovery/reset at `/__akb_mock__/health`,
-  `/__akb_mock__/discover`, and `POST /__akb_mock__/reset`, and fails
-  unhandled `/api` requests with a 501 response. The public reset increments
-  the Vite run's reset generation; the browser worker reads that generation
-  before the next auth request and resets its in-memory fixture state, so an
-  external HTTP client can reset the active browser run without reaching into
-  the page. Once the mock listener is ready, Vite also prints the same
-  schema-v2 descriptor as one JSON line on stdout for runtime helpers.
+- `pnpm run test:e2e:mock` starts `pnpm run dev:e2e:mock` and waits for
+  `/__akb_mock__/health`. Vite exposes the runtime descriptor at
+  `/__akb_mock__/discover` and prints it as one schema-v2 JSON line on stdout
+  when the mock listener is ready. `POST /__akb_mock__/reset` advances the
+  reset generation. The browser MSW worker reads that generation before the
+  next auth request and resets its in-memory fixture state. The worker returns
+  501 for unhandled `/api` requests.
 - `pnpm run test:e2e:fixture` builds the app, serves it with `vite preview`,
   and runs every spec that answers its requests through `page.route`. No
   backend runs: `/api` is proxied to a closed port, so a request a spec does
@@ -115,11 +114,8 @@ skip themselves there):
   canonical document/file/attachment targets, unavailable resolution, and partial upload
   recovery through the same mock reset path.
 
-For a manual mock session, run `VITE_AKB_TEST_MODE=mock pnpm run dev --host
-127.0.0.1 --port 4173 --strictPort`. The browser worker exposes readiness and
-discovery at `/__akb_mock__/health` and `/__akb_mock__/discover`, and reset at
-`POST /__akb_mock__/reset`; stop the Vite process with Ctrl-C. Mock mode is
-never enabled by the default application or production build.
+For a manual mock session, run `pnpm run dev:e2e:mock` and open
+`http://127.0.0.1:4173`. Stop Vite with Ctrl-C.
 
 ## Adding routes
 

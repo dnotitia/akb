@@ -16,6 +16,7 @@ from app.exceptions import (
     ExternalIdentityConflictError,
     ExternalIdentityAdoptionNotRequestedError,
     ExternalIdentityIssuerMismatchError,
+    ForbiddenError,
     NotFoundError,
     RecoveryAdminProtectedError,
     ServiceIdentityAdoptionError,
@@ -767,7 +768,7 @@ async def set_user_admin(user_id: str, *, is_admin: bool, actor_id: str) -> dict
         async with role_authority_transaction(conn):
             current = await conn.fetchrow(
                 """
-                SELECT account_status, account_kind, is_recovery_admin
+                SELECT account_status, account_kind, is_recovery_admin, monitoring_access
                   FROM users WHERE id = $1
                    FOR UPDATE
                 """,
@@ -777,6 +778,8 @@ async def set_user_admin(user_id: str, *, is_admin: bool, actor_id: str) -> dict
                 raise NotFoundError("Human user", user_id)
             if not is_admin and current["is_recovery_admin"]:
                 raise RecoveryAdminProtectedError()
+            if is_admin and current["monitoring_access"] is not None:
+                raise ForbiddenError("Monitoring accounts cannot become administrators")
             if is_admin and current["account_status"] != "active":
                 raise AccountSuspendedError()
             row = await conn.fetchrow(

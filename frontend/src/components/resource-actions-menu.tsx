@@ -1,6 +1,6 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import type { ReactNode, Ref } from "react";
-import { Archive, ArchiveRestore, FolderInput, MoreHorizontal, Share2, Trash2 } from "lucide-react";
+import { useCallback, useRef, type ReactNode, type Ref } from "react";
+import { Archive, ArchiveRestore, FolderInput, MoreHorizontal, PencilLine, Share2, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -8,6 +8,7 @@ interface ResourceActionsMenuProps {
   resourceName: string;
   deleteLabel?: string;
   onDelete?: () => void;
+  onRename?: (trigger: HTMLButtonElement) => void;
   moveLabel?: string;
   onMove?: () => void;
   publishLabel?: string;
@@ -37,6 +38,7 @@ export function ResourceActionsMenu({
   resourceName,
   deleteLabel,
   onDelete,
+  onRename,
   moveLabel,
   onMove,
   publishLabel,
@@ -53,16 +55,23 @@ export function ResourceActionsMenu({
   readerControl = false,
   triggerRef,
 }: ResourceActionsMenuProps) {
+  const menuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const renameRequested = useRef(false);
+  const setTriggerRef = useCallback((element: HTMLButtonElement | null) => {
+    menuTriggerRef.current = element;
+    if (typeof triggerRef === "function") triggerRef(element);
+    else if (triggerRef) triggerRef.current = element;
+  }, [triggerRef]);
   const showMoveAction = Boolean(moveLabel && (onMove || moveDisabledReason));
   const showPublishAction = Boolean(publishLabel && onPublish);
   const showDeleteAction = Boolean(deleteLabel && onDelete);
-  if (!children && !showMoveAction && !showPublishAction && !showDeleteAction && !archiveAction) return null;
+  if (!children && !onRename && !showMoveAction && !showPublishAction && !showDeleteAction && !archiveAction) return null;
 
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         <Button
-          ref={triggerRef}
+          ref={setTriggerRef}
           type="button"
           variant="ghost"
           size="icon"
@@ -77,7 +86,14 @@ export function ResourceActionsMenu({
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
-          onCloseAutoFocus={onCloseAutoFocus}
+          onCloseAutoFocus={event => {
+            const rename = renameRequested.current;
+            renameRequested.current = false;
+            if (rename && menuTriggerRef.current && onRename) {
+              event.preventDefault();
+              onRename(menuTriggerRef.current);
+            } else onCloseAutoFocus?.(event);
+          }}
           side={side}
           align={align}
           sideOffset={4}
@@ -85,7 +101,11 @@ export function ResourceActionsMenu({
           className="z-[var(--z-popover)] max-h-[min(32rem,var(--radix-dropdown-menu-content-available-height))] min-w-48 max-w-[calc(100vw-1rem)] overflow-y-auto overscroll-contain rounded-[var(--radius-md)] border border-border bg-surface p-1 shadow-md"
         >
           {children}
-          {children && (showMoveAction || showPublishAction || showDeleteAction || archiveAction) && <DropdownMenu.Separator className="my-1 h-px bg-border" />}
+          {children && (onRename || showMoveAction || showPublishAction || showDeleteAction || archiveAction) && <DropdownMenu.Separator className="my-1 h-px bg-border" />}
+          {onRename && <DropdownMenu.Item onSelect={() => { renameRequested.current = true; }}
+            className="flex cursor-pointer select-none items-center gap-2 rounded-[var(--radius-sm)] px-2.5 py-2 text-sm text-foreground outline-none data-[highlighted]:bg-surface-hover">
+            <PencilLine className="h-4 w-4 text-link" aria-hidden />Rename
+          </DropdownMenu.Item>}
           {showMoveAction && (
             <DropdownMenu.Item
               aria-disabled={moveDisabledReason ? true : undefined}
@@ -137,7 +157,7 @@ export function ResourceActionsMenu({
               {publishLabel}
             </DropdownMenu.Item>
           )}
-          {(showMoveAction || showPublishAction || archiveAction) && showDeleteAction && (
+          {(onRename || showMoveAction || showPublishAction || archiveAction) && showDeleteAction && (
             <DropdownMenu.Separator className="my-1 h-px bg-border" />
           )}
           {showDeleteAction && (

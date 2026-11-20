@@ -10,7 +10,7 @@ async function fixture(page: Page, documentStatus = 200) {
   await page.route("**/health**", route => route.fulfill({ json: {} }));
   await page.route("**/api/v1/**", route => {
     const path = new URL(route.request().url()).pathname;
-    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
     if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "00000000-0000-4000-8000-000000000100", username: "fixture", display_name: "Fixture Author", auth_method: "local", is_admin: false } });
     if (path.endsWith("/my/vaults")) return route.fulfill({ json: { vaults: [{ id: "fixture-vault", name: "fixture", role: "owner" }] } });
     if (path.endsWith("/info")) return route.fulfill({ json: { name: "fixture", role: "owner", role_source: "member", public_access: "none", is_archived: false, is_external_git: false, document_count: 1 } });
@@ -40,12 +40,26 @@ for (const status of [0, 200, 403, 404, 503]) {
     await search.getByRole("option", { name: /Operating guide/ }).click();
     const preview = page.getByTestId("document-preview-dialog");
     await expect(preview).toBeVisible();
-    if (status !== 0 && status !== 200) await expect(preview.getByText("Fixture document is unavailable", { exact: true })).toBeVisible();
+    if (status !== 0 && status !== 200) await expect(preview.getByRole("heading", { name: status === 403 ? "You don’t have access to this document" : status === 404 ? "Document unavailable" : "Couldn’t load this document", exact: true })).toBeVisible();
     await preview.getByRole("button", { name: "Close dialog", exact: true }).click();
     await expect(preview).toHaveCount(0);
     await expect(search).toBeVisible();
   });
 }
+
+test("an unavailable preview offers a direct return to its search results", async ({ page }) => {
+  await fixture(page, 403);
+  await page.goto("/search");
+  await page.getByRole("button", { name: "Search knowledge", exact: true }).click();
+  const search = page.getByTestId("global-search-dialog");
+  await search.getByRole("combobox").fill("guide");
+  await search.getByRole("option", { name: /Operating guide/ }).click();
+  const preview = page.getByTestId("document-preview-dialog");
+  await preview.getByRole("button", { name: "Close preview", exact: true }).click();
+  await expect(preview).toHaveCount(0);
+  await expect(search).toBeVisible();
+  await expect(search.getByRole("combobox")).toHaveValue("guide");
+});
 
 for (const height of [540, 320]) {
 test(`mobile Invite keeps footer reachable at height ${height}`, async ({ page }, testInfo) => {

@@ -609,6 +609,8 @@ class KeycloakProviderControl:
     async def configure(
         self,
         spec: ProviderConfigureSpec,
+        *,
+        require_absent: bool = False,
     ) -> ProviderMutationReadback:
         self._require_direct()
         try:
@@ -621,9 +623,15 @@ class KeycloakProviderControl:
             code = getattr(exc, "code", "unsupported_sso_provider_type")
             raise _fail(code) from exc
 
+        if require_absent and validated.client_secret is None:
+            raise _fail("provider_client_secret_required")
+        if require_absent and validated.client_secret == keycloak_oidc.MASKED_SECRET:
+            raise _fail("provider_client_secret_invalid")
         async with self._client() as client:
             token = await self._token(client)
             existing = await self._get_exact(client, token, validated.alias)
+            if require_absent and existing is not None:
+                raise _fail("provider_alias_conflict")
             preserve_secret = False
             existing_readback: ProviderReadback | None = None
             if existing is None:
@@ -659,15 +667,22 @@ class KeycloakProviderControl:
             except ProviderDefinitionError as exc:
                 raise _fail(exc.code) from exc
             if existing is None:
-                await self._request(
+                # Discovery can take time and external administrators do not
+                # hold AKB's alias lock. Never change the create-only path to
+                # an update even if the alias appears while discovery runs.
+                if require_absent and await self._get_exact(client, token, validated.alias) is not None:
+                    raise _fail("provider_alias_conflict")
+                created = await self._request(
                     client,
                     "POST",
                     self._instances_path(),
                     token=token,
                     json_body=desired,
-                    expected=frozenset({201}),
+                    expected=frozenset({201, 409}) if require_absent else frozenset({201}),
                     code="keycloak_provider_create_failed",
                 )
+                if created.status_code == 409:
+                    raise _fail("provider_alias_conflict")
             else:
                 await self._request(
                     client,

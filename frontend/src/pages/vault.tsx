@@ -945,7 +945,7 @@ function VaultEmptyOnboarding({
               icon={Plug}
               tone="people"
               to="/settings?tab=tokens"
-              title="Connect an agent"
+              title="Connect an AI tool"
               body="Create a token and let an MCP client contribute knowledge here."
             />
           </div>

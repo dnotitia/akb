@@ -102,6 +102,8 @@ beforeEach(() => {
     keycloak: { enabled: false, browser_session_ready: false },
     providers: [],
     mcp_oauth: { enabled: false },
+    personal_access_tokens: { enabled: false },
+    mcp_endpoint_url: null,
   });
   listVaultsMock.mockResolvedValue({ vaults: [...VAULTS] });
   getVaultInfoMock.mockResolvedValue({
@@ -161,7 +163,7 @@ describe("Home working set", () => {
     expect(screen.queryByText("Knowledge index")).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Workspace" })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Finish setup" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Connect an agent" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Connect an AI tool" })).toBeInTheDocument();
     expect(await within(screen.getByRole("region", { name: "Workspace summary" })).findByText("300")).toBeInTheDocument();
 
     expect(screen.queryByText("Recent changes")).not.toBeInTheDocument();
@@ -229,7 +231,7 @@ describe("Home working set", () => {
 
     renderPage();
 
-    expect(await screen.findByRole("button", { name: "Connect an agent" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Connect an AI tool" })).toBeInTheDocument();
     expect(screen.queryByText("Agent connection active")).not.toBeInTheDocument();
     await waitFor(() => {
       expect(screen.queryByRole("heading", { name: "Use AKB with your AI tools" })).not.toBeInTheDocument();
@@ -247,9 +249,9 @@ describe("Home working set", () => {
     expect(await screen.findByRole("button", { name: "Create a vault" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Minimize connection guide" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Connect an agent" }));
-    expect(screen.getByRole("dialog", { name: "Connect an agent" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "1. Prepare access" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Connect an AI tool" }));
+    expect(screen.getByRole("dialog", { name: "Connect an AI tool" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "1. Choose your AI tool" })).toBeInTheDocument();
   });
 
   it("caps a large favorite set and restores focus if an unpinned card leaves Home", async () => {
@@ -283,7 +285,7 @@ describe("Home working set", () => {
   it("does not label a failed connection lookup as incomplete setup", async () => {
     listPATsMock.mockRejectedValue(new Error("Offline"));
     renderPage();
-    expect(await screen.findByRole("button", { name: "Connect an agent" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Connect an AI tool" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Use AKB with your AI tools" })).not.toBeInTheDocument();
   });
 

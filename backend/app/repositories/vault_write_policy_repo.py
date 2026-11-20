@@ -110,6 +110,21 @@ async def is_granted(
     return "*" in actions or (action is not None and action in actions)
 
 
+async def sql_restricted_vaults(conn, vault_ids: list[uuid.UUID], token_id: uuid.UUID | None):
+    """Marked Vaults where the current token lacks a wildcard write grant."""
+    return await conn.fetch("""
+        SELECT v.id, v.name, p.managed_by
+          FROM vault_write_policy p
+          JOIN vaults v ON v.id = p.vault_id
+         WHERE p.vault_id = ANY($1::uuid[])
+           AND NOT EXISTS (
+               SELECT 1 FROM vault_write_grants g
+                WHERE g.vault_id = p.vault_id AND g.token_id = $2 AND '*' = ANY(g.write_actions)
+           )
+         ORDER BY v.name
+    """, vault_ids, token_id)
+
+
 async def set_policy(
     vault_id: uuid.UUID,
     managed_by: str,

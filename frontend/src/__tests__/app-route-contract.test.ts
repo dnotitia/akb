@@ -5,6 +5,7 @@ describe("application route contract", () => {
   it("keeps route, component, and shell ownership explicit", () => {
     expect(appRouteContract).toEqual([
       { path: "/admin", component: "AdminPage", boundary: "admin" },
+      { path: "/admin/mcp-monitoring", component: "McpMonitoringPage", boundary: "admin" },
       { path: "/auth", component: "AuthPage", boundary: "auth" },
       { path: "/auth/forgot", component: "AuthForgotPage", boundary: "auth" },
       { path: "/p/:slug", component: "PublicationPage", boundary: "public" },

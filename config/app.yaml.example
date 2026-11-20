@@ -315,8 +315,11 @@ app_credential_overlap_seconds: 300
 # keycloak_companion_client_ids_by_origin:
 #   "https://reef.example.com": "reef-web"
 # api_oauth_audience: ""               # default: <public_base_url>/api
+# Personal access token issuance and authentication, independent of MCP OAuth.
+pat_enabled: true
 # mcp_oauth_enabled: false
-# mcp_oauth_audience: ""               # default: <public_base_url>/mcp
+# mcp_oauth_client_ids: []             # explicitly provisioned direct MCP clients
+# The OAuth audience is exactly <public_base_url>/mcp.
 # API and MCP audiences must remain distinct.
 # keycloak_client_secret, keycloak_admin_client_secret,
 # sso_browser_session_encryption_key, and the optional standalone
@@ -455,6 +458,14 @@ notification_retention_days: 90
 #   region: ""
 #   upload_interval_secs: 3600
 #   local_retention_days: 2
+
+# Product-admin MCP dashboard. Collects authenticated server tool calls.
+# mcp_monitoring:
+#   enabled: true
+#   tempo_query_url: ""   # Installation-local Tempo query origin for the admin call trace dialog.
+#   tempo_retention_hours: null  # Match the Tempo tenant's retention in hours (e.g. 720 for 30 days).
+#   export_traces: false  # Opt in to OTLP/HTTP; configure OTEL_EXPORTER_OTLP_TRACES_ENDPOINT.
+#   retention_days: 30
 
 # === MCP tool-usage analytics ==================================
 # Answers "which MCP tool is actually used, by whom, in what order, and how

@@ -21,7 +21,7 @@ async function fixture(page: Page, dark = false) {
   await page.route("**/api/v1/**", route => {
     const url = new URL(route.request().url());
     const path = url.pathname;
-    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
     if (path.endsWith("/auth/me")) return Promise.resolve(state.authGate).then(() => route.fulfill({ json: { user_id: userId, username: "reviewer", display_name: "임근우", email: "review@example.invalid", is_admin: false, auth_method: "local" } }));
     if (path.endsWith("/auth/tokens/capabilities")) return route.fulfill({ json: {
       contract_version: 1, user_id: userId, name_max_length: 255,
@@ -212,8 +212,8 @@ for (const reducedMotion of ["no-preference", "reduce"] as const) {
     expect(scrolled.x).toBeCloseTo(initial.x, 0);
     await page.evaluate(() => window.scrollTo(0, 0));
     await expect.poll(async () => (await invitation.boundingBox())!.y).toBeCloseTo(initial.y, 0);
-    await page.getByRole("button", { name: "Connect an agent", exact: true }).click();
-    await expect(page.getByRole("dialog", { name: "Connect an agent", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Connect an AI tool", exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "Connect an AI tool", exact: true })).toBeVisible();
   });
 }
 
@@ -222,23 +222,24 @@ test("Connection invitation minimizes, survives reload, and preserves a new secr
   await fixture(page);
   await page.goto("/");
   await page.getByRole("button", { name: "Minimize connection guide" }).click();
-  const launcher = page.getByRole("button", { name: "Connect an agent", exact: true });
+  const launcher = page.getByRole("button", { name: "Connect an AI tool", exact: true });
   await expect(launcher).toBeFocused();
   await page.reload();
   await expect(launcher).toBeVisible();
   await expect(page.getByRole("button", { name: "Minimize connection guide" })).toHaveCount(0);
   await launcher.click();
-  const dialog = page.getByRole("dialog", { name: "Connect an agent", exact: true });
+  const dialog = page.getByRole("dialog", { name: "Connect an AI tool", exact: true });
   await expect(dialog).toBeVisible();
   await expect(page.getByTestId("home-connection-invitation")).toBeHidden();
-  await dialog.getByLabel("Token name", { exact: true }).fill("Example work laptop");
-  await dialog.getByRole("button", { name: "Create token", exact: true }).click();
-  await expect(dialog.getByText("Token created — save it now")).toBeVisible();
+  await dialog.getByRole("button", { name: "Continue with Claude Code" }).click();
+  await dialog.getByLabel("Connection key name", { exact: true }).fill("Example work laptop");
+  await dialog.getByRole("button", { name: "Create connection key", exact: true }).click();
+  await expect(dialog.getByText("Connection key created")).toBeVisible();
   await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: "Close", exact: true }).click();
-  await expect(page.getByRole("dialog", { name: "Have you saved your token?" })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Have you saved your connection key?" })).toBeVisible();
   await page.getByRole("button", { name: "Keep setup open" }).click();
-  await expect(dialog.getByText("Token created — save it now")).toBeVisible();
+  await expect(dialog.getByText("Connection key created")).toBeVisible();
   await dialog.getByRole("button", { name: "Close", exact: true }).click();
   await page.getByRole("button", { name: "I've saved it — close" }).click();
   await expect(dialog).toHaveCount(0);

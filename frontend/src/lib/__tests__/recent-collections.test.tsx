@@ -129,7 +129,7 @@ describe("Explorer visit recording", () => {
       { kind: "document" as const, name: "One", path: "notes/one.md" },
     ] }],
     items: [], path: "", accessDenied: false, complete: true, paginationUnsupported: false, hasMore: false, pageCount: 1, pastCollectionCatalog: false, loadingMore: false, loadMore: vi.fn(),
-    loading: false, refreshing: false, showingPreviousScope: false, unsupported: false, error: "", refetch: vi.fn(),
+    loading: false, refreshing: false, showingPreviousScope: false, unsupported: false, error: "", refetch: vi.fn(), retry: vi.fn(),
   });
   const explorer = (route: string, userId = "alice", checking = false) => (
     <CurrentUserProvider user={{ user_id: userId, username: userId, is_admin: false } as CurrentUser} checking={checking}>

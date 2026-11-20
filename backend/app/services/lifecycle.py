@@ -52,6 +52,7 @@ from app.services.search_capabilities import metadata_enabled
 from app.services.role_sync import RoleSync, get_role_sync, set_role_sync
 from app.services.user_sql_executor import UserSqlExecutor, set_user_sql_executor
 from app.services.vector_store import decide_sparse_shape_for_settings, get_vector_store
+from app.mcp_monitoring.collector import collector as mcp_collector
 from app.stats import listener as stats_listener, sampler as stats_sampler
 
 logger = logging.getLogger("akb.lifecycle")
@@ -325,6 +326,8 @@ def _start_api_local(started: list[str]) -> None:
     search_degradation_stats.start()
     started.append("search_degradation_flusher")
 
+    mcp_collector.start()
+    started.append("mcp_monitoring")
     tool_usage.start()
     started.append("tool_usage_maintenance")
     if settings.tool_usage.enabled:
@@ -500,6 +503,7 @@ async def stop_workers(*, include_api_local: bool = True) -> None:
         components.extend([
             ("audit_uploader", audit_log.stop_uploader),
             ("tool_usage", lambda: tool_usage.stop()),
+            ("mcp_monitoring", mcp_collector.stop),
             # Drains its un-flushed delta, so an ordinary rolling deploy loses
             # no counts; an ungraceful kill still loses up to one flush
             # interval, which `pending_flush` on `/health` makes visible.
@@ -544,6 +548,7 @@ async def stop_api_runtime() -> None:
     """Stop only serving-process sinks and process-local executors."""
     request_stop_all()
     tasks = [
+        asyncio.create_task(_stop_component("mcp_monitoring", mcp_collector.stop), name="stop:mcp_monitoring"),
         asyncio.create_task(
             _stop_component("audit_uploader", audit_log.stop_uploader),
             name="stop:audit_uploader",

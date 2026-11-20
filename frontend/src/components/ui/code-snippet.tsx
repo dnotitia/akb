@@ -12,23 +12,23 @@ export function CodeSnippet({
   code,
   filename,
   className,
+  onCopied,
 }: {
   code: string;
   filename?: string;
   className?: string;
+  onCopied?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
   async function copy() {
-    // clipboard is undefined on insecure (plain-HTTP) origins — and AKB ships
-    // an `--insecure` snippet, so that deployment shape is real. Guard so a
-    // copy never throws an uncaught TypeError with no user feedback.
     try {
       setCopied(false);
       setCopyError(false);
       if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
       await navigator.clipboard.writeText(code);
       setCopied(true);
+      onCopied?.();
       setTimeout(() => setCopied(false), 2000);
     } catch {
       setCopyError(true);

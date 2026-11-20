@@ -9,10 +9,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 
-export function DocumentReaderToolsActions({ anchorRef }: { anchorRef?: RefObject<HTMLButtonElement | null> }) {
+export function DocumentReaderToolsActions({ anchorRef, settingsInMenu = false }: { anchorRef?: RefObject<HTMLButtonElement | null>; settingsInMenu?: boolean }) {
   const tools = useReaderTools();
   const findTrigger = useRef<HTMLButtonElement>(null);
-  const virtualAnchor = useMemo(() => ({ current: { getBoundingClientRect: () => anchorRef?.current?.getBoundingClientRect() ?? new DOMRect() } }), [anchorRef]);
+  const settingsContent = useRef<HTMLDivElement>(null);
+  const settingsAnchor = useMemo(() => ({ current: { getBoundingClientRect: () => anchorRef?.current?.getBoundingClientRect() ?? new DOMRect() } }), [anchorRef]);
   const openFind = tools?.openFind;
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
@@ -27,8 +28,17 @@ export function DocumentReaderToolsActions({ anchorRef }: { anchorRef?: RefObjec
   const { preferences: value, setPreferences } = tools;
   return <>
     <DocumentIconButton ref={findTrigger} label="Find in document" className="document-find-trigger" aria-expanded={tools.findOpen} onClick={event => tools.openFind(event.currentTarget)}><Search size={16} aria-hidden /></DocumentIconButton>
-    <Popover open={tools.settingsOpen} onOpenChange={tools.setSettingsOpen}>{anchorRef ? <PopoverAnchor virtualRef={virtualAnchor} /> : <PopoverTrigger asChild><DocumentIconButton label="Reading settings"><SlidersHorizontal size={16} aria-hidden /></DocumentIconButton></PopoverTrigger>}
-      <PopoverContent align="end" className="reader-settings" aria-label="Reading settings" onCloseAutoFocus={event => { if (anchorRef?.current) { event.preventDefault(); anchorRef.current.focus({ preventScroll: true }); } }}>
+    <Popover open={tools.settingsOpen} onOpenChange={tools.setSettingsOpen}>
+      {settingsInMenu ? <PopoverAnchor virtualRef={settingsAnchor} /> : <PopoverTrigger asChild><DocumentIconButton label="Reading settings"><SlidersHorizontal size={16} aria-hidden /></DocumentIconButton></PopoverTrigger>}
+      <PopoverContent ref={settingsContent} align="end" className="reader-settings" aria-label="Reading settings"
+        portalContainer={settingsInMenu ? anchorRef?.current?.closest<HTMLElement>('[role="dialog"]') ?? undefined : undefined}
+        onCloseAutoFocus={event => {
+          if (!settingsInMenu) return;
+          event.preventDefault();
+          const focused = document.activeElement;
+          if (focused instanceof HTMLElement && focused !== document.body && focused.isConnected && !settingsContent.current?.contains(focused)) return;
+          anchorRef?.current?.focus({ preventScroll: true });
+        }}>
         <h2 className="text-sm font-semibold">Reading settings</h2>
         <div className="reader-setting-row"><span id="reader-font-label">Text size</span><div role="group" aria-labelledby="reader-font-label">
           <Button size="icon" variant="ghost" aria-label="Decrease text size" disabled={value.fontSize <= 14} onClick={() => setPreferences({ ...value, fontSize: [14, 15, 16, 18, 20, 22].filter(size => size < value.fontSize).at(-1)! })}><Minus size={15} aria-hidden /></Button>

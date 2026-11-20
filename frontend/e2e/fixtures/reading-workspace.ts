@@ -10,7 +10,7 @@ export async function readingFixture(page: Page, dark = false, contents?: Record
   await page.route("**/api/v1/**", route => {
     const url = new URL(route.request().url());
     const pathname = url.pathname;
-    if (pathname.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+    if (pathname.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
     if (pathname.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "studio-reader", username: "fixture", display_name: "Reading reviewer", email: "reader@example.invalid", auth_method: "local", is_admin: false } });
     if (pathname.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ id: "studio-vault", name: "fixture", role: "writer" }] } });
     if (pathname.endsWith("/info")) return route.fulfill({ json: { name: "fixture", role: "writer", is_archived: false, is_external_git: false, document_count: 2 } });

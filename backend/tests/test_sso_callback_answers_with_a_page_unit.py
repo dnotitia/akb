@@ -18,10 +18,15 @@ Two properties, and the second is a disclosure decision rather than a nicety:
 from __future__ import annotations
 
 import tempfile
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 import pytest
 
 from app.config import settings
+from app.exceptions import AuthenticationError
 
 _STORAGE = tempfile.mkdtemp(prefix="sso-callback-page-")
 object.__setattr__(settings, "git_storage_path", _STORAGE)
@@ -62,13 +67,36 @@ def test_the_reason_cannot_put_text_on_the_screen():
     assert _location(auth._sso_sign_in_failed(injected)) == "/auth?sso_error=sso_failed"
 
 
-def test_the_callback_never_raises_its_refusals():
-    """Nothing in the callback answers a browser with an error body."""
-    import inspect
+@pytest.mark.parametrize(
+    ("purpose", "location"),
+    [
+        ({}, "/auth?sso_error=sso_failed"),
+        ({"purpose": "monitoring"}, "/admin/mcp-monitoring?auth_error=sign_in_failed"),
+    ],
+)
+def test_callback_redirects_to_its_sign_in_page_when_exchange_fails(monkeypatch, purpose, location):
+    state = {
+        "client_id": settings.keycloak_client_id,
+        "redirect_path": "/admin/mcp-monitoring" if purpose else "/",
+        "provider_alias": "local",
+        "code_verifier": "fixture-verifier",
+        "nonce": "fixture-nonce",
+        **purpose,
+    }
+    exchange = AsyncMock(side_effect=AuthenticationError("private exchange failure"))
+    oidc = SimpleNamespace(consume_browser_state=AsyncMock(return_value=state), exchange_browser_code=exchange)
+    monkeypatch.setattr(auth, "_require_sso_browser_session", lambda: None)
+    monkeypatch.setattr(auth, "get_keycloak_oidc", lambda: oidc)
+    app = FastAPI()
+    app.include_router(auth.router)
 
-    source = inspect.getsource(auth.keycloak_callback)
-    assert "raise AuthenticationError" not in source
-    assert source.count("_sso_sign_in_failed") >= 9
+    with TestClient(app) as client:
+        response = client.get("/auth/keycloak/callback?code=fixture-code&state=fixture-state", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert _location(response) == location
+    assert "private exchange failure" not in response.text
+    exchange.assert_awaited_once_with("fixture-code", "fixture-verifier")
 
 
 @pytest.mark.asyncio

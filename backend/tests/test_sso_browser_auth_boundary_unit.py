@@ -246,9 +246,10 @@ async def test_callback_projects_access_token_but_returns_only_opaque_cookies(
 
     captured: dict[str, object] = {}
 
-    async def project(value, *, provider_alias=None):
+    async def project(value, *, provider_alias, sync_profile):
         assert value is principal
         assert provider_alias == "workforce"
+        assert sync_profile is True
         # The boundary carries a reason alongside the account now, so the callback
         # can tell "not a member" apart from every other refusal. Success carries
         # none.

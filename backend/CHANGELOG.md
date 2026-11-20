@@ -7,6 +7,59 @@ specifically; the proxy has its own log in
 
 ## Unreleased
 
+- SQL queries over a declared archived Vault or a managed Vault without write
+  authority run in a PostgreSQL read-only transaction. Ordinary writes retain
+  their existing receipts and policy errors. A pending call observes a grant
+  revocation that commits before it acquires the Vault lock.
+
+- Native `akb_grep` now enforces the same vault-guide edit policy as Bare Git.
+  A replacement that would change the guide stops with `permission_denied`.
+  The response lists any documents already committed before that point.
+
+- MCP `akb_activity` accepts an exclusive RFC 3339 `until` bound. Author,
+  collection, and time filters now select events before the result limit,
+  including on migrated Native history. `truncated` reports whether another
+  matching event exists.
+
+- MCP `akb_put`, `akb_update`, and `akb_move` accept `title_conflict_policy`.
+  The default `allow` preserves duplicate display titles. Use `reject` to
+  check for an existing title in the destination collection on creation,
+  title updates, and moves. A match returns `document_title_conflict`.
+
+- MCP `akb_search` can filter documents by `created_at` or `updated_at` with
+  `source_type="document"` and `time_range`. The start (`gte`) is inclusive
+  and the end (`lt`) is exclusive. Dated responses echo the applied UTC
+  bounds and keep relevance ordering.
+
+- MCP `akb_browse` supports `name_query` to match names and paths, and
+  `content_type="resources"` to list documents, tables and files without
+  collection rows. Both use cursor paging with a default page size of 100.
+  `archive_scope` overrides `include_archived` for both cursor and legacy
+  listings. New name-query cursors bind the trimmed search text. Previously
+  issued cursors still resume their original traversal.
+
+- `akb_search` accepts `doc_types` (any listed document type), `source_type`
+  (`document`, `file`, or `table`), and `archive_scope` (`unarchived`,
+  `archived`, or `all`). These filters intersect with the caller's readable
+  Vaults and existing search filters. An explicit archive scope overrides
+  `include_archived`.
+
+- Native document create/update accepts an optional UUID `idempotency_key`
+  through MCP and REST. Matching retries return the original write receipt;
+  reuse with different input conflicts. Keys bind the authenticated user,
+  Vault, operation and normalized request, and reuse the immutable Native
+  mutation record without a new request table. Current access is checked on
+  every attempt; original-read conditions remain required for body updates.
+  MCP advertises support per tool. Bare Git rejects keys explicitly, and
+  keyless calls retain existing behavior. See
+  [document retry semantics](../docs/operations/document-idempotency.md).
+
+- MCP document creation rejects missing, null or non-string `content` with
+  `invalid_argument` and `details.field=/content`. Updates reject non-string,
+  non-null bodies before storage access. Metadata-only/null updates, empty
+  body replacements and existing revision/hash preconditions retain their
+  semantics. Local file input remains proxy-only.
+
 ### Breaking: retired authentication inputs
 
 - Remove configuration inputs that `auth_mode` and server-custodied SSO

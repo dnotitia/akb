@@ -7,6 +7,7 @@ import uuid
 import tempfile
 
 import asyncpg
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -171,7 +172,7 @@ def test_member_active_status_uses_user_session_and_only_returns_active(monkeypa
         return {"active": True}
 
     monkeypatch.setattr(
-        app_installations, "get_member_installation_active_status", fake_status
+        app_installations, "get_installation_active_status", fake_status
     )
     response = _client(user=user).get(
         f"/api/v1/apps/{app_id}/installations/{vault_id}/active"
@@ -187,8 +188,9 @@ def test_member_active_status_uses_user_session_and_only_returns_active(monkeypa
     assert isinstance(requested[0]["correlation_id"], str)
 
 
-def test_member_active_status_query_failure_is_safe_and_no_store(monkeypatch, caplog):
-    user = _user(is_admin=False)
+@pytest.mark.parametrize("is_admin", [False, True])
+def test_active_status_query_failure_is_safe_and_no_store(monkeypatch, caplog, is_admin):
+    user = _user(is_admin=is_admin)
     vault_id = uuid.uuid4()
     raw_error_marker = "RAW_MEMBER_INSTALLATION_QUERY_ERROR"
     raw_credential = "synthetic-fault-credential-abcdef"
@@ -204,6 +206,8 @@ def test_member_active_status_query_failure_is_safe_and_no_store(monkeypatch, ca
             }
 
         async def fetchval(self, query, *_args):
+            if query == "SELECT name FROM vaults WHERE id = $1":
+                return "member-status-vault"
             assert "FROM vault_app_installations" in query
             raise asyncpg.exceptions.UndefinedTableError(raw_error)
 
@@ -274,8 +278,9 @@ def test_member_active_status_invalid_session_is_no_store():
     assert response.headers["pragma"] == "no-cache"
 
 
-def test_member_active_status_requires_pat_read_scope(monkeypatch):
-    user = _user(is_admin=False)
+@pytest.mark.parametrize("is_admin", [False, True])
+def test_active_status_requires_pat_read_scope(monkeypatch, is_admin):
+    user = _user(is_admin=is_admin)
     user.token_scopes = frozenset({"write"})
 
     async def authorize(_authorization):

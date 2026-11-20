@@ -24,7 +24,7 @@ async function fixture(page: Page, { dark = false, folded = false, empty = false
       createdCollections.push(path);
       return route.fulfill({ json: { ok: true, created: true, collection: { path, name: path.split("/").at(-1), summary: null, doc_count: 0 } } });
     }
-    if (p.endsWith("/auth/config")) json = { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } };
+    if (p.endsWith("/auth/config")) json = { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" };
     else if (p.endsWith("/auth/me")) json = { user_id: "overview-user", username: "fixture", display_name: "Review user", email: "review@example.invalid", auth_method: "local", is_admin: false };
     else if (p.endsWith("/vaults")) json = { vaults: [{ id: "overview-vault", name: "fixture", role: "owner" }] };
     else if (p.endsWith("/info")) json = legacy ? { name: "fixture", role: "reader", file_count: 0 } : {

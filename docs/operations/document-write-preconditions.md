@@ -56,6 +56,26 @@ exact edits recompute against the current body and pin each derived write.
 Metadata-only reservation backfills remain unchanged. The proxy forwards
 conditions unchanged when reading a local file and never fetches one itself.
 
-No database migration, new configuration or proxy-runtime upgrade is required.
-Existing clients can send the new required condition through their existing
-transport. See the SDK README for the typed update pattern.
+### MCP content and local file input
+
+For `akb_put`, supply exactly one of `content` (a string, including `""`) or
+`file` (a non-empty local path). `file` is available only through the stdio
+proxy; HTTP clients send `content`. The proxy reads the file and forwards its
+text as `content`, preserving the caller's version/hash conditions.
+
+For `akb_update`, omit both fields to update metadata only. With no `file`,
+`content: null` also retains the body; `content: ""` clears it and therefore
+requires an original-read condition. A file update has the same precondition
+requirement, including when the local file is empty.
+
+Passing both keys is an `invalid_argument`, even if `content` is `null` or
+`""`. Clients that used placeholder content with a file must **omit the content
+key entirely**. Invalid body types and empty/non-string file paths are rejected
+with `details.field` before any file read or document mutation. A local file
+that cannot be read remains a file I/O failure, not a version conflict.
+
+No database migration or new configuration is required. Existing clients can
+send original-read conditions through their existing transport. The corrected
+file-input schema and proxy validation require updating and restarting the
+proxy; the backend body validation requires the matching server update.
+See the SDK README for the typed update pattern.

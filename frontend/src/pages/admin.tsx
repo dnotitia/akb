@@ -146,6 +146,9 @@ export default function AdminPage() {
                 <p className="mt-1 text-sm text-foreground-muted">{session.user.email}</p>
                 <p className="coord mt-3">{session.auth_mode.toUpperCase()} ADMIN SESSION</p>
               </div>
+              <Button asChild variant="outline" className="w-full">
+                <Link to="/admin/mcp-monitoring">MCP monitoring</Link>
+              </Button>
               {session.auth_mode === "sso" && <SsoProviderControl />}
               {session.auth_mode === "sso" && <RealmAccountResidue />}
               {error && <Alert variant="destructive">{error}</Alert>}

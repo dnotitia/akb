@@ -34,7 +34,7 @@ All connected via a unified knowledge graph with AKB URI scheme.
 | `tables` | create_table, sql, alter_table, drop_table | Structured data (real PG tables + SQL) |
 | `files` | put_file, get_file, delete_file | Binary files (S3-backed) |
 | `images` | put_image, discard_image | Inline images for Markdown documents |
-| `access` | grant, revoke, vault_members, vault_info, ... | Permissions and vault management |
+| `access` | grant, revoke, vault_members, explain_access, ... | Permissions and vault management |
 | `history` | activity, diff, history | Vault activity + git-based change history |
 | `publishing` | publish, unpublish, publications, publication_snapshot | Public sharing for docs/tables/files |
 | `relations` | link, unlink, relations, graph, provenance | Knowledge graph — cross-type connections |
@@ -192,6 +192,7 @@ Combines **vector similarity** (semantic meaning) with **keyword matching**.
 ```
 akb_search(query="how does authentication work")
 akb_search(query="gRPC vs REST", vault="engineering", type="decision")
+akb_search(query="gRPC", doc_types=["spec", "decision"], archive_scope="archived")
 akb_search(query="invoice", tags=["finance"])
 # restrict to a known set of resources (hybrid retrieval runs only inside them):
 akb_search(query="auth flow", source_uris=[
@@ -210,7 +211,9 @@ akb_search(query="auth flow", source_uris=[
 - `vault`, `path`, `tags`, `doc_type`: metadata
 
 `akb_search` surfaces documents **and** tables **and** files in one
-ranked list. Filter by `type="document"|"table"|"file"` to narrow.
+ranked list. Use `source_type="document"`, `"table"`, or `"file"` to select a resource kind.
+For documents, `time_range` can restrict creation or last update time. Supply
+`gte` for an inclusive start and/or `lt` for an exclusive end.
 
 ## akb_browse — Tree Navigation
 When you want to **see everything** rather than search:
@@ -226,7 +229,8 @@ When a document is long and you only need one part:
 
 ```
 akb_drill_down(uri="akb://v/doc/path/to/file.md")                    # All sections
-akb_drill_down(uri="akb://v/doc/path/to/file.md", section="Setup")   # Just "Setup"
+akb_drill_down(uri="akb://v/doc/path/to/file.md", section="Setup")   # Body chunks matching "Setup"
+akb_drill_down(uri="akb://v/doc/path/to/file.md", mode="outline", section="# Setup")  # Heading and descendants
 ```
 
 ## Search → Read Pattern
@@ -296,7 +300,7 @@ akb_sql(vault="finance",
 |------|------|-------|----------------|-------------|
 | reader | ✓ | | | |
 | writer | ✓ | ✓ | | |
-| admin | ✓ | ✓ | ✓ | |
+| admin | ✓ | ✓ | ✓ | ✓ |
 | owner | ✓ | ✓ | ✓ | ✓ |
 
 ## Tools
@@ -305,7 +309,8 @@ akb_sql(vault="finance",
 akb_search_users(query="kim")           # Find a user
 akb_grant(vault="v", user="kim", role="writer")  # Grant access
 akb_revoke(vault="v", user="kim")       # Remove access
-akb_vault_members(vault="v")            # See who has access
+akb_vault_members(vault="v")            # List the owner and explicit members
+akb_explain_access(vault="v", user="kim")  # Inspect membership and other access paths
 akb_vault_info(vault="v")               # Vault stats
 akb_transfer_ownership(vault="v", new_owner="kim")
 akb_archive_vault(vault="v")            # Make read-only
@@ -670,6 +675,7 @@ akb_help(topic="link-resources")    # Workflow guide
 | vault | ✓ | Target vault name |
 | collection | ✓ | Directory path (e.g. "api-specs", "meeting-notes"). `overview` is a reserved system collection (vault-skill only) |
 | title | ✓ | Document title |
+| title_conflict_policy | | `allow` (default) keeps duplicate titles. `reject` checks for an existing title in the target collection before creating the document. |
 | slug | | Optional filename slug. When omitted, the path is derived from `title`; pass this to pin a stable URI filename independently of the display title. |
 | content | ✓ | Markdown body |
 | type | | free-form except reserved `skill`; recommended: note, report, decision, spec, plan, session, task, reference |
@@ -750,6 +756,7 @@ an already-composed stale body. No automatic merge or force overwrite occurs.
 | uri | ✓ | Document AKB URI |
 | content | | New Markdown body (replaces existing) |
 | title | | New title |
+| title_conflict_policy | | `allow` (default) or `reject`. When supplying a title, `reject` checks other documents in this collection. |
 | status | | draft (default), active, archived |
 | tags | | New tag list (replaces existing) |
 | summary | | New summary |
@@ -848,12 +855,17 @@ Each item includes its `uri` for use with akb_link, akb_relations, etc.
 ## Parameters
 | Param | Required | Description |
 |-------|----------|-------------|
-| vault | ✓ | Vault name |
+| uri | | Vault or collection URI. Takes precedence over vault and collection. |
+| vault | | Required when uri is omitted |
 | collection | | Collection path (omit for top-level) |
 | depth | | 0 = direct children; N = descend N collection levels; -1 = entire subtree |
-| content_type | | all, collections, documents, tables, files (default: all) |
+| content_type | | all (default), collections, documents, tables, files, or resources. Resources lists documents, tables and files without collection rows. |
+| name_query | | Literal case-insensitive name/path substring, up to 200 characters. Uses cursor paging, as do resources and collections. Default page size is 100. |
+| filter | | Filter the returned list or page by name/path. Choose filter or name_query. |
+| archive_scope | | unarchived, archived, or all. Overrides include_archived. Archived scope excludes files and tables. Collection navigation depends on content_type. |
+| include_archived | | Include archived documents when true (default false). |
 | page_size | | Opt into identity-bounded pages (1–200); do not combine with legacy limit/offset |
-| cursor | | Previous next_cursor for the same Vault, collection, depth and kind |
+| cursor | | Previous next_cursor for the same Vault, collection, depth, kind, archive scope and name query |
 
 ## Examples
 ```
@@ -862,6 +874,7 @@ akb_browse(vault="eng", content_type="tables")  # Only tables (collections suppr
 akb_browse(vault="eng", collection="specs")     # Drill into specs/, direct children
 akb_browse(vault="eng", depth=-1)               # Entire vault subtree (unbounded)
 akb_browse(vault="eng", depth=0)                # Strict: vault root contents only
+akb_browse(uri="akb://eng/coll/specs", name_query="설계", content_type="resources", archive_scope="all")
 ```
 
 ## Large Vaults
@@ -888,7 +901,13 @@ Combines vector similarity (meaning) with keyword matching.
 | query | ✓ | Natural language search query |
 | vault | | Limit to specific vault |
 | collection | | Limit to specific collection |
-| type | | Filter by type (any string); common: note, report, decision, spec, plan, session, task, reference, skill |
+| type | | Existing single type filter, e.g. `note`, `report`, or `decision` |
+| doc_types | | Match documents of any listed type. An empty list adds no restriction. |
+| source_type | | Restrict the resource kind to `document`, `file`, or `table`. |
+| time_range | | Requires `source_type="document"`. Select `field` (`created_at` or `updated_at`) and supply at least one of `gte` (inclusive) or `lt` (exclusive). Use RFC 3339 timestamps with a UTC offset and up to six fractional digits. |
+| archive_scope | | `unarchived`, `archived`, or `all`. An explicit scope overrides `include_archived`. Archived-only searches return documents. |
+| include_archived | | Include archived documents when true (default false). |
+| source_uris | | Restrict candidates to these resource URIs. Omit or pass an empty list for the usual search scope. |
 | tags | | Filter by tags |
 | limit | | Max results (default 10, max 50) |
 
@@ -897,7 +916,16 @@ Combines vector similarity (meaning) with keyword matching.
 akb_search(query="deployment process")
 akb_search(query="인증 흐름", vault="eng", type="spec")
 akb_search(query="budget", tags=["finance"], limit=5)
+akb_search(query="release", source_type="document", doc_types=["decision", "report"], archive_scope="all")
+akb_search(query="release", source_type="document", time_range={
+    "field": "updated_at", "gte": "2026-11-10T00:00:00+09:00", "lt": "2026-11-11T00:00:00+09:00"
+})
 ```
+
+Filters intersect with the caller's readable vaults and with each other. For example,
+`type="report"` together with `doc_types=["report", "note"]` selects only reports.
+When a time range is supplied, the response includes the applied `time_range` in UTC,
+even for an empty page. Hits are ranked by relevance.
 
 ## Result Fields
 - `uri`: AKB URI — pass to akb_get / akb_drill_down (docs), akb_get_file (files), akb_sql (tables)
@@ -905,7 +933,21 @@ akb_search(query="budget", tags=["finance"], limit=5)
 - `score`: relevance (0.0-1.0)
 - `matched_section`: the most relevant chunk
 - `source_type`: `"document"`, `"table"`, or `"file"`
-- `vault`, `collection`, `type`, `tags`: metadata""",
+- `vault`, `collection`, `doc_type`, `tags`: metadata""",
+
+    "akb_move": """# akb_move — Move a Document
+
+Supply the document's `uri` and a new `collection`, `slug`, or both.
+Use `title_conflict_policy="reject"` to check the document's display title in
+the destination collection. A match returns `document_title_conflict` with
+the existing path and title. The source document stays at its original path.
+The default `allow` permits duplicate titles. An explicitly chosen slug
+must still be free.
+
+```
+akb_move(uri="akb://eng/coll/drafts/doc/api-guide.md", collection="guides",
+         title_conflict_policy="reject")
+```""",
 
     "akb_grep": """# akb_grep — Exact Text / Regex Search & Replace
 
@@ -968,7 +1010,10 @@ akb_grep(pattern="v(\\d+)\\.1", vault="eng", regex=true, replace="v\\1.2")
 
 **Tip:** Run grep WITHOUT replace first to preview matches, then add replace with
 `max_replacements` set high enough for the intended scope.
-Each replaced document gets its own git commit and is re-indexed for search.
+Each changed document gets its own revision. If a write fails, replacement
+stops. Earlier writes remain committed and are listed in `replacements`.
+`details.failed_uri` identifies the document that stopped the batch.
+Bulk replacement cannot edit the vault guide. Its owner can edit it with `akb_update`.
 
 ## Result Structure
 Each result includes `uri`, `vault`, `path`, `title`, and `matches` — a list of
@@ -989,16 +1034,20 @@ Read specific sections of a document without loading everything.
 | Param | Required | Description |
 |-------|----------|-------------|
 | uri | ✓ | Document AKB URI |
-| section | | Section name filter (partial match) |
+| mode | | `sections` (default) reads body chunks. `outline` lists distinct heading paths. |
+| section | | In `sections`, match a heading substring. In `outline`, pass the exact path of a heading to include it and its descendants. |
+| pattern | | Case-insensitive substring in the body, used in `sections` only. |
 
 ## Examples
 ```
-akb_drill_down(uri="akb://eng/doc/specs/api.md")                    # All section headings
-akb_drill_down(uri="akb://eng/doc/specs/api.md", section="Setup")   # Just "Setup" section
-akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API")     # Sections containing "API"
+akb_drill_down(uri="akb://eng/doc/specs/api.md", mode="outline")
+akb_drill_down(uri="akb://eng/doc/specs/api.md", mode="outline", section="# Guide > ## Setup")
+akb_drill_down(uri="akb://eng/doc/specs/api.md", section="API", pattern="token")
 ```
 
-💡 Token-efficient: read summaries via browse, then drill into the section you need.""",
+Outline returns up to 50 matching paths in document order. When truncated,
+use a more specific heading path. An unmatched outline returns an empty list.
+In `sections` mode an empty match includes an outline to help you retry.""",
 
 
     "akb_create_table": """# akb_create_table — Create a Table
@@ -1078,11 +1127,13 @@ akb_create_table(vault="finance", name="invoices",
 
     "akb_list_vaults": """# akb_list_vaults — List Accessible Vaults
 
-No parameters. Returns all vaults you have access to.
+Lists accessible vaults with your effective `role` on each one. Archived vaults are
+excluded by default. Use `include_archived=true` to include them, `filter` to
+match names or descriptions, and `limit` / `offset` to page through matches.
 
 ```
-akb_list_vaults()
-→ {"vaults": [{"name": "eng", "description": "...", "role": "writer"}, ...]}
+akb_list_vaults(filter="eng", limit=10)
+→ {"vaults": [{"name": "eng", "description": "...", "role": "writer"}], "total": 1, "returned": 1}
 ```""",
 
     "akb_create_vault": """# akb_create_vault — Create a Vault
@@ -1225,7 +1276,7 @@ Shows who created a document, when, and its visible same-vault relations
 ## Example
 ```
 akb_provenance(uri="akb://eng/doc/specs/api.md")
-→ {title, path, vault, uri, created_by, created_at, updated_at, relations: [...]}
+→ {doc_id, title, path, vault, uri, created_by, created_at, updated_at, current_commit, relations: [...]}
 ```""",
 
     "akb_history": """# akb_history — Document Version History
@@ -1240,16 +1291,22 @@ akb_get(uri="akb://eng/doc/specs/api.md", version="abc123def456")
 
 Each document change creates a Git commit. Use akb_history to see all versions, then akb_get with version= to read any past version.""",
 
-    "akb_activity": """# akb_activity — Vault Activity History (Git-based)
+    "akb_activity": """# akb_activity — Vault Activity History
 
-Shows who changed what, when, and why. Each entry is a Git commit.
+Shows document revision activity, newest first. An author filter matches a
+case-insensitive substring of either the author or the recorded agent.
 
 ```
 akb_activity(vault="eng")                              # All activity
 akb_activity(vault="eng", collection="specs")          # Only specs/ changes
 akb_activity(vault="eng", author="김영로")              # By author
 akb_activity(vault="eng", since="2026-04-01", limit=5) # Since date
+akb_activity(vault="eng", author="김", since="2026-04-01", until="2026-05-01T00:00:00Z")
 ```
+
+When using `until`, supply an RFC 3339 timestamp with an offset and up to six fractional
+digits. The end is exclusive. A paired `since` is inclusive; a date or a
+timezone-free start uses UTC. `truncated` indicates additional matching entries.
 
 Each entry includes:
 - hash: commit hash (use with akb_diff)
@@ -1404,6 +1461,20 @@ akb_vault_members(vault="v")
 
 Roles: owner, admin, writer, reader.""",
 
+    "akb_explain_access": """# akb_explain_access — Explain a User’s Vault Access
+
+```
+akb_explain_access(vault="eng", user="kim")
+```
+
+Pass the vault name and the target username. You need reader access to look up
+yourself and admin access to look up another user.
+
+`effective_role` is the stored membership role. `derived_role` is computed from
+the grants in `contributions`. Both roles can be null, including for a vault
+owner with no explicit membership. `non_member_paths` reports ownership,
+system administration, the vault’s public access level and its write policy.""",
+
     "akb_search_users": """# akb_search_users — Find Users
 
 ```
@@ -1436,11 +1507,12 @@ akb_set_public(vault="v", level="reader")
 ```
 
 Levels:
-- `none` — private (default, login required)
-- `reader` — anyone can read without login
-- `writer` — anyone can read and write without login
+- `none` — grants no access through the public level
+- `reader` — gives authenticated users read access
+- `writer` — gives authenticated users read and write access
 
-Owner only.""",
+Requires owner access to an active vault. To share a resource through a link
+that people can open without signing in, use `akb_publish`.""",
 
     "akb_whoami": """# akb_whoami — Check Your Identity
 
@@ -1456,10 +1528,10 @@ Use this to verify who you are authenticated as.""",
 ⚠️ **Permanent and irreversible.** Deletes ALL data: documents, tables, files, edges, Git history.
 
 ```
-akb_delete_vault(vault="v", confirm="v")
+akb_delete_vault(vault="v")
 ```
 
-The `confirm` parameter must match the vault name. Owner only.""",
+Requires vault admin or owner access. The call deletes the named vault immediately, including an archived vault.""",
 
     "akb_alter_table": """# akb_alter_table — Modify Table Schema
 
@@ -1587,7 +1659,10 @@ akb_sql(vaults=["sales","external-projects"],
   sql="SELECT * FROM sales__pipeline p JOIN sales__partners c ON ...")
 ```
 
-Permissions: SELECT=reader, INSERT/UPDATE/DELETE=writer""",
+Permissions: SELECT requires a Vault reader role; writes require a writer role.
+A credential with read authority but no write authority runs SQL in a PostgreSQL
+read-only transaction. Database mutations are denied even when the account has
+write privileges. Write-authorized credentials retain the existing write path.""",
 
     "images": """# Inline Document Images
 

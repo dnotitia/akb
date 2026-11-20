@@ -10,7 +10,7 @@ import SettingsDialog from "../settings/settings-dialog";
 
 const uid = "00000000-0000-0000-0000-000000000001", oldId = "00000000-0000-0000-0000-000000000002", newId = "00000000-0000-0000-0000-000000000003";
 const USER = { user_id: uid, username: "alice", email: "a@example.test", display_name: "Alice", is_admin: false, auth_method: "local", key_class: null };
-const config = { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } };
+const config = { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" };
 const caps = { contract_version: 1, user_id: uid, name_max_length: 255, permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"], vault_scope_semantics: "write_restriction_sql_read_write" };
 const original = { token_id: oldId, name: "original", prefix: "akb_old", key_class: "pat", scopes: ["read", "write"], vault_scope: null, expires_at: null };
 const receipt = { ...original, contract_version: 1, user_id: uid, token_id: newId, token: "akb_hidden_receipt_secret", prefix: "akb_hidden", issued_at: "2030-01-01T00:00:00Z" };
@@ -27,7 +27,7 @@ function read(url: string) {
 function CurrentLocation() { const location = useLocation(); return <output aria-label="Current route">{location.pathname}{location.search}</output>; }
 function mount(tab: string, initialUser = USER) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const view = (checking = false, revision = 0, user = initialUser) => <QueryClientProvider client={client}><MemoryRouter><CurrentUserProvider user={user} checking={checking} revision={revision}><ResourceNavigationProvider><CurrentLocation /><SettingsDialog initialTab={tab} onClose={vi.fn()} /></ResourceNavigationProvider></CurrentUserProvider></MemoryRouter></QueryClientProvider>;
+  const view = (checking = false, revision = 0, user = initialUser) => <QueryClientProvider client={client}><MemoryRouter initialEntries={[tab === "tokens" ? "/settings?tab=tokens&connectionView=keys" : "/"]}><CurrentUserProvider user={user} checking={checking} revision={revision}><ResourceNavigationProvider><CurrentLocation /><SettingsDialog initialTab={tab} onClose={vi.fn()} /></ResourceNavigationProvider></CurrentUserProvider></MemoryRouter></QueryClientProvider>;
   return { ...render(view()), view };
 }
 beforeEach(() => {
@@ -38,20 +38,21 @@ afterEach(() => { cleanup(); setToken(null); configureAuthTransport(null); vi.un
 
 it("delivers a replacement's one-time receipt completed while the real Settings Activity is hidden", async () => {
   const { rerender, view } = mount("tokens");
-  fireEvent.click(await screen.findByRole("button", { name: "Replace token original" }));
-  const dialog = screen.getByRole("dialog", { name: "Replace token original" });
-  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement token" })).toBeEnabled());
+  fireEvent.click(await screen.findByRole("button", { name: "Replace key original" }));
+  const dialog = screen.getByRole("dialog", { name: "Replace key original" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Continue with Claude Code" }));
+  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement key" })).toBeEnabled());
   let finish!: (response: Response) => void;
   fetchMock.mockImplementation((url: string, init: RequestInit) => init?.method === "POST" ? new Promise<Response>(resolve => { finish = resolve; }) : Promise.resolve(json(read(url))));
-  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement token" }));
+  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement key" }));
   rerender(view(true));
   expect(dialog).not.toBeVisible();
-  expect(screen.queryByRole("dialog", { name: "Replace token original" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("dialog", { name: "Replace key original" })).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Close settings" })).toBeDisabled();
   expect(document.body).toHaveAttribute("data-scroll-locked", "1");
   await act(async () => finish(json(receipt)));
   rerender(view(false, 1));
-  await waitFor(() => expect(screen.getByText("Token created — save it now")).toBeVisible());
+  await waitFor(() => expect(screen.getByText("Connection key created")).toBeVisible());
   expect(document.body.textContent).toContain(receipt.token);
   expect(screen.getByRole("button", { name: "Close replacement" })).toBeEnabled();
   expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
@@ -61,12 +62,13 @@ it("delivers a replacement's one-time receipt completed while the real Settings 
 
 it("never delivers a hidden previous-account token receipt to a replacement account", async () => {
   const { rerender, view } = mount("tokens");
-  fireEvent.click(await screen.findByRole("button", { name: "Replace token original" }));
-  const dialog = screen.getByRole("dialog", { name: "Replace token original" });
-  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement token" })).toBeEnabled());
+  fireEvent.click(await screen.findByRole("button", { name: "Replace key original" }));
+  const dialog = screen.getByRole("dialog", { name: "Replace key original" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Continue with Claude Code" }));
+  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement key" })).toBeEnabled());
   let finish!: (response: Response) => void;
   fetchMock.mockImplementation((url: string, init: RequestInit) => init?.method === "POST" ? new Promise<Response>(resolve => { finish = resolve; }) : Promise.resolve(json(read(url))));
-  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement token" }));
+  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement key" }));
   setToken("session-b"); rerender(view(true, 0, { ...USER, user_id: "b", username: "bob" }));
   await act(async () => finish(json(receipt)));
   expect(document.body.textContent).not.toContain(receipt.token);
@@ -75,12 +77,13 @@ it("never delivers a hidden previous-account token receipt to a replacement acco
 
 it.each(["pending", "failure"])("preserves replacement ownership across proof with %s issuance", async result => {
   const { rerender, view } = mount("tokens");
-  fireEvent.click(await screen.findByRole("button", { name: "Replace token original" }));
-  const dialog = screen.getByRole("dialog", { name: "Replace token original" });
-  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement token" })).toBeEnabled());
+  fireEvent.click(await screen.findByRole("button", { name: "Replace key original" }));
+  const dialog = screen.getByRole("dialog", { name: "Replace key original" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Continue with Claude Code" }));
+  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Create replacement key" })).toBeEnabled());
   let finish!: (response: Response) => void;
   fetchMock.mockImplementation((url: string, init: RequestInit) => init?.method === "POST" ? new Promise<Response>(resolve => { finish = resolve; }) : Promise.resolve(json(read(url))));
-  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement token" }));
+  fireEvent.click(within(dialog).getByRole("button", { name: "Create replacement key" }));
   rerender(view(true));
   if (result === "failure") await act(async () => finish(json({ detail: "Token creation rejected" }, 403)));
   rerender(view(false, 1));
@@ -89,10 +92,10 @@ it.each(["pending", "failure"])("preserves replacement ownership across proof wi
     expect(within(dialog).getByRole("button", { name: "Close replacement" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Close settings", hidden: true })).toBeDisabled();
     await act(async () => finish(json(receipt)));
-    expect(await within(dialog).findByText("Token created — save it now")).toBeVisible();
+    expect(await within(dialog).findByText("Connection key created")).toBeVisible();
   } else {
     expect(await within(dialog).findByText("Token creation rejected")).toBeVisible();
-    expect(within(dialog).getByRole("button", { name: "Create replacement token" })).toBeEnabled();
+    expect(within(dialog).getByRole("button", { name: "Create replacement key" })).toBeEnabled();
   }
   expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
 });

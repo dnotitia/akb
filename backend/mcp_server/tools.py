@@ -32,13 +32,115 @@ ID parameter (`todo_id`, publication `slug`); these are not
 URI-addressable.
 """
 
+from datetime import UTC, datetime
+from typing import Annotated, Literal, NotRequired, TypedDict
+
 from mcp.types import Tool
+from app.mcp_monitoring.usage import Dimension, Latency, MeasuredTool, ZeroRate, measured_tool
+from pydantic import ConfigDict, Field, TypeAdapter, ValidateAs, with_config
+from app.config import settings
+from app.models.document import TitleConflictPolicy
 from app.models.document_preconditions import BODY_UPDATE_CONDITION, CONTENT_HASH_PATTERN, REVISION_PATTERN
 
 from app.services import template_registry
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.services.grep_replace import DEFAULT_MAX_REPLACEMENTS, MAX_REPLACEMENTS
 from app.services.kg_service import LINK_RELATION_TYPES
+from app.services.search_filters import ArchiveScope, DocumentTimeField, DocumentTimeRange
+
+
+# Match the precision of PostgreSQL timestamps. Check the offset components
+# before fromisoformat, which otherwise normalizes e.g. +01:60 to +02:00.
+_TimestampText = Annotated[str, Field(
+    pattern=(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+             r"(\.[0-9]{1,6})?([Zz]|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$"),
+    json_schema_extra={"format": "date-time"},
+)]
+
+
+def _utc_instant(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value.upper()).astimezone(UTC)
+    except OverflowError as exc:
+        raise ValueError("Timestamp falls outside the supported UTC range") from exc
+
+
+_UtcInstant = Annotated[datetime, ValidateAs(_TimestampText, _utc_instant)]
+
+
+@with_config(ConfigDict(extra="forbid", json_schema_extra={"anyOf": [{"required": ["gte"]}, {"required": ["lt"]}]}))
+class _TimeRangeInput(TypedDict):
+    field: DocumentTimeField
+    gte: NotRequired[_UtcInstant]
+    lt: NotRequired[_UtcInstant]
+
+
+class _ActivityOptions(TypedDict, total=False):
+    collection: Annotated[str, Field(description="Limit activity to the collection path and its descendants.")]
+    since: Annotated[str, Field(description="Inclusive start as an ISO date or datetime, e.g. 2026-04-01.")]
+    author: Annotated[str, Field(description="Case-insensitive literal substring of the author or recorded agent.")]
+    until: Annotated[_UtcInstant, Field(description="Exclusive activity end, as RFC 3339 with an offset.")]
+    limit: Annotated[int, Field(ge=1, le=100, json_schema_extra={"default": 20})]
+
+
+ACTIVITY_OPTIONS = TypeAdapter(_ActivityOptions)
+
+
+class _SearchFilterOptions(TypedDict, total=False):
+    time_range: Annotated[DocumentTimeRange, ValidateAs(_TimeRangeInput, lambda args: DocumentTimeRange(**args)), Field(
+        description="With source_type=document, filter created_at or updated_at. Supply gte (inclusive), "
+        "lt (exclusive), or both as RFC 3339 timestamps with an offset and up to six fractional digits. "
+        "Results retain relevance order. The response echoes the applied bounds in UTC."
+    )]
+    doc_types: Annotated[list[str], Field(description=(
+        "Match documents of any listed type, intersected with type and the other filters. "
+        "An empty list adds no restriction."
+    ))]
+    source_type: Annotated[Literal["document", "file", "table"], Field(
+        description="Restrict results to one resource kind."
+    )]
+    archive_scope: Annotated[ArchiveScope, Field(description=(
+        "Overrides include_archived. The archived scope returns documents only. "
+        "Omit to keep the existing include_archived behavior (default: unarchived)."
+    ))]
+
+
+SEARCH_FILTER_OPTIONS = TypeAdapter(_SearchFilterOptions)
+_SEARCH_FILTER_SCHEMA = SEARCH_FILTER_OPTIONS.json_schema()
+
+
+class _BrowseFilterOptions(TypedDict, total=False):
+    name_query: Annotated[str, Field(
+        max_length=200, pattern=r"^[^\u0000]*$",
+        description="Case-insensitive literal substring of a name or path across the selected scope. "
+        "Uses cursor paging (default 100). Omit filter, limit and offset.",
+    )]
+    archive_scope: Annotated[ArchiveScope, Field(
+        description="Override include_archived for documents. Archived scope excludes files and tables.",
+    )]
+
+
+BROWSE_FILTER_OPTIONS = TypeAdapter(_BrowseFilterOptions)
+
+DOCUMENT_TITLE_POLICY = {
+    **TypeAdapter(TitleConflictPolicy).json_schema(),
+    "default": "allow",
+    "description": (
+        "Allow duplicate display titles (default), or reject when another document in the destination "
+        "collection already has the same title. On update this check runs only when a title is supplied. "
+        "An explicit slug still has to be available."
+    ),
+}
+
+DOCUMENT_IDEMPOTENCY_KEY = {
+    "type": ["string", "null"], "format": "uuid",
+    "description": (
+        "PostgreSQL Native only: reuse this UUID with the identical request after a lost "
+        "response to retrieve the original write receipt. Scoped to the authenticated "
+        "user and Vault; different input with the same key conflicts. Preserve original "
+        "revision/hash conditions. See the tool's akb/document_idempotency capability."
+    ),
+}
 
 # The link/unlink relation vocabulary is defined once in kg_service; the
 # tool schemas below derive from it so the MCP surface and the REST
@@ -74,9 +176,7 @@ TOOLS = [
     Tool(
         name="akb_list_vaults",
         description=(
-            "List accessible vaults as {name, description} pairs. "
-            "Response is slim — no metadata (id/role/created_at) — to "
-            "fit large tenants in agent context. Returns "
+            "List accessible vaults with name, description, and the caller’s effective role. Returns "
             "{vaults, total, returned, truncated?, hint?}.\n"
             "Optional args:\n"
             "- filter: substring match on name+description (case-insensitive). "
@@ -149,6 +249,8 @@ TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
+                "idempotency_key": DOCUMENT_IDEMPOTENCY_KEY,
+                "title_conflict_policy": DOCUMENT_TITLE_POLICY,
                 "parent": {
                     "type": "string",
                     "description": (
@@ -226,6 +328,8 @@ TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
+                "idempotency_key": DOCUMENT_IDEMPOTENCY_KEY,
+                "title_conflict_policy": DOCUMENT_TITLE_POLICY,
                 "uri": {"type": "string", "description": "Document URI"},
                 "content": {"type": ["string", "null"], "description": "Whole replacement body, including empty string; requires an original-read condition. Null leaves the body unchanged."},
                 "title": {"type": "string", "description": "New title"},
@@ -299,6 +403,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "uri": {"type": "string", "description": "Document URI to move"},
+                "title_conflict_policy": DOCUMENT_TITLE_POLICY,
                 "collection": {
                     "type": "string",
                     "description": "New collection path (omit to keep the current collection)",
@@ -323,7 +428,15 @@ TOOLS = [
             "required": ["uri"],
         },
     ),
-    Tool(
+    measured_tool(
+        Latency("latency", "Browse latency", (
+            Dimension("page_size", "Page size",
+                      lambda args, result: args.get("page_size", 100) if result.get("complete") is not None else None,
+                      {"null": "Legacy"}),
+            Dimension("depth", "Depth", lambda args, _: args.get("depth", 1), {"-1": "All (−1)"}),
+            Dimension("page", "Page position", lambda args, _: bool(args.get("cursor")) or int(args.get("offset") or 0) > 0,
+                      {"false": "First", "true": "Subsequent"}),
+        )),
         name="akb_browse",
         description=(
             "Browse ALL vault content — documents, tables, and files — under a browse "
@@ -334,16 +447,14 @@ TOOLS = [
             "that can be pasted straight back in.\n\n"
             "`depth` is tree-depth from the browse root, mirroring `tree -L N`: "
             "0 = direct children only (no descent), N = descend N collection levels, "
-            "-1 = entire subtree. Collection rows are always emitted as navigation "
-            "aids regardless of depth.\n\n"
+            "-1 = entire subtree. Legacy document listings include collection navigation "
+            "rows regardless of depth. Paged listings apply depth to all rows.\n\n"
             "The response includes metadata for the current browse root in `context`, "
             "and collection items include `summary` by default so agents understand "
             "their intended purpose. Other resource summaries stay opt-in so large "
-            "vaults fit in the agent's context window. Returns "
-            "{vault, path, context, items, total, returned, truncated?, hint?}."
-            " For large Vaults use page_size (1–200) and next_cursor: identities are "
-            "selected before body reads; complete marks traversal exhaustion, not an "
-            "exact inventory total. A filtered page may be empty and still have a cursor. "
+            "vaults fit in the agent's context window. Legacy lists report total and returned. "
+            "For large Vaults use page_size (1–200) and next_cursor. Paged lists report "
+            "scanned, returned and complete. A filtered page may be empty and still have a cursor. "
             "Use collection with depth=0 to drill down. Legacy limit/offset slices a "
             "fully materialized listing and is not a bounded database read."
         ),
@@ -374,23 +485,25 @@ TOOLS = [
                     "description": (
                         "Tree depth from the browse root. 0 = direct children only "
                         "(no descent into any collection). N = descend N collection "
-                        "levels. -1 = unbounded (entire subtree). Collections "
-                        "themselves are always emitted regardless of depth."
+                        "levels. -1 = unbounded (entire subtree). In paged mode "
+                        "depth applies to collection rows too."
                     ),
                     "default": 1,
                     "minimum": -1,
                 },
                 "content_type": {
                     "type": "string",
-                    "enum": ["all", "collections", "documents", "tables", "files"],
+                    "enum": ["all", "collections", "resources", "documents", "tables", "files"],
                     "default": "all",
-                    "description": "Filter by content type",
+                    "description": "Use resources for documents, tables and files without collection rows. "
+                    "Both resources and collections use cursor paging (default 100).",
                 },
-                "filter": {"type": "string", "description": "Substring filter on item name/path (case-insensitive)."},
+                **BROWSE_FILTER_OPTIONS.json_schema()["properties"],
+                "filter": {"type": "string", "description": "Case-insensitive name/path filter on the returned list or page. Mutually exclusive with name_query."},
                 "limit": {"type": "integer", "description": "Cap returned item count."},
                 "offset": {"type": "integer", "description": "Skip first N items (default 0)."},
                 "page_size": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Opt into identity-bounded pages. Do not combine with limit/offset. In this mode depth applies to collections too."},
-                "cursor": {"type": "string", "maxLength": 32768, "description": "Previous next_cursor; keep Vault, collection, depth and content_type unchanged. Follow until complete=true, including after an empty filtered page."},
+                "cursor": {"type": "string", "maxLength": 32768, "description": "Previous next_cursor. Keep Vault, collection, depth, content_type, archive scope and name_query unchanged. Follow until complete=true, including after an empty page."},
                 "include_summary": {
                     "type": "boolean",
                     "description": (
@@ -411,12 +524,23 @@ TOOLS = [
                     "description": "Include archived documents. Default false — `status: archived` docs are hidden from browse.",
                 },
             },
+            "allOf": [
+                {"not": {"required": ["name_query", "filter"]}},
+                {
+                    "if": {"anyOf": [
+                        {"required": ["name_query"]}, {"required": ["page_size"]}, {"required": ["cursor"]},
+                        {"required": ["content_type"], "properties": {"content_type": {"enum": ["collections", "resources"]}}},
+                    ]},
+                    "then": {"not": {"anyOf": [{"required": ["limit"]}, {"required": ["offset"]}]}},
+                },
+            ],
             # Either `vault` or `uri` must be present — enforced at the
             # handler since JSON schema's anyOf-on-required is awkward
             # to express in some MCP clients.
         },
     ),
-    Tool(
+    measured_tool(
+        ZeroRate("empty_results", "Empty search results", "returned"),
         name="akb_search",
         description=(
             "Search documents with hybrid retrieval — dense vector (semantic) fused with "
@@ -455,6 +579,7 @@ TOOLS = [
                 "query": {"type": "string", "description": "Natural language search query"},
                 "vault": {"type": "string", "description": "Limit search to a specific vault"},
                 "collection": {"type": "string", "description": "Limit search to a specific collection"},
+                **_SEARCH_FILTER_SCHEMA["properties"],
                 "type": {
                     "type": "string",
                     "description": (
@@ -482,6 +607,9 @@ TOOLS = [
                 },
             },
             "required": ["query"],
+            "$defs": _SEARCH_FILTER_SCHEMA["$defs"],
+            "if": {"required": ["time_range"]},
+            "then": {"required": ["source_type"], "properties": {"source_type": {"const": "document"}}},
         },
     ),
     Tool(
@@ -528,7 +656,7 @@ TOOLS = [
                 "collection": {"type": "string", "description": "Limit to a specific collection"},
                 "regex": {"type": "boolean", "default": False, "description": "Treat pattern as regex (native: Python per line; legacy: PostgreSQL candidates). REQUIRED to use alternation (|), wildcards (.*), character classes, anchors, etc. When false (default), the entire pattern including any metacharacters is matched literally."},
                 "case_sensitive": {"type": "boolean", "default": False, "description": "Case-sensitive matching (default: case-insensitive)"},
-                "replace": {"type": "string", "description": "Replacement string. If provided and the full scope fits max_replacements, replaces all matches in EVERY matching document (git commit + re-index per doc); otherwise writes nothing. Treated literally when regex=false; supports regex backreferences (\\1, \\2) only when regex=true. For precise edits to a single known document, prefer akb_edit instead."},
+                "replace": {"type": "string", "description": "Replacement string. An over-budget request writes nothing. Within budget, each changed document gets its own revision. A failed write stops the batch and returns receipts for earlier writes. Bulk replacement cannot edit the vault guide. Treated literally when regex=false; supports regex backreferences (\\1, \\2) only when regex=true. For precise edits to a single known document, prefer akb_edit instead."},
                 "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50, "description": "Max documents to return; does not limit replacement writes"},
                 "max_replacements": {
                     "type": "integer",
@@ -579,8 +707,8 @@ TOOLS = [
             "`pattern` (substring grep on body). On empty match the response "
             "carries an `outline` so you can retry.\n"
             "- `mode='outline'`: return heading paths only (no bodies). "
-            "Use this to discover the document's structure cheaply before "
-            "deciding which section to read.\n"
+            "Set `section` to a full heading path to list that heading and its descendants. "
+            "Returns up to 50 matching paths in document order.\n"
             "Returns {uri, sections|outline, returned, total?, truncated?, hint?}."
         ),
         input_schema={
@@ -593,7 +721,7 @@ TOOLS = [
                     "default": "sections",
                     "description": "'sections' for body content, 'outline' for heading paths only.",
                 },
-                "section": {"type": "string", "description": "Section heading filter (partial match). Used in `sections` mode."},
+                "section": {"type": "string", "description": "Heading substring in sections mode. In outline mode, use the exact heading path, including Markdown heading markers, to select its subtree."},
                 "pattern": {"type": "string", "description": "Substring grep inside matched section bodies (case-insensitive). Used in `sections` mode."},
             },
             "required": ["uri"],
@@ -603,17 +731,14 @@ TOOLS = [
         name="akb_activity",
         description=(
             "Get activity history for a vault — who changed what, when, and why. "
-            "Returns Git commit history with changed file list. "
+            "Returns document revision activity with changed files. "
             "Use akb_diff to see the actual content changes for a specific commit."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "vault": {"type": "string", "description": "Vault name"},
-                "collection": {"type": "string", "description": "Filter by collection path prefix"},
-                "author": {"type": "string", "description": "Filter by author name"},
-                "since": {"type": "string", "description": "ISO datetime to filter from (e.g. 2026-04-01)"},
-                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+                **ACTIVITY_OPTIONS.json_schema()["properties"],
             },
             "required": ["vault"],
         },
@@ -724,8 +849,7 @@ TOOLS = [
     Tool(
         name="akb_provenance",
         description=(
-            "Get provenance for a document — who created it, when, which entities were "
-            "extracted, and its visible same-vault relations."
+            "Get document identity, creator, timestamps, current_commit, and visible same-vault relations."
         ),
         input_schema={
             "type": "object",
@@ -1202,9 +1326,8 @@ TOOLS = [
     Tool(
         name="akb_explain_access",
         description=(
-            "Explain why a user holds the role they hold on a vault: every "
-            "independent basis, and the effective role derived from them. "
-            "A member list shows the result, never the reasons."
+            "Explain a user’s membership grants, stored and derived roles, and non-member access paths. "
+            "Requires reader access for yourself or admin access for another user."
         ),
         input_schema={
             "type": "object",
@@ -1314,7 +1437,10 @@ TOOLS = [
     ),
     Tool(
         name="akb_set_public",
-        description="Set vault public access level. Owner only. 'none'=private, 'reader'=public read, 'writer'=public read+write.",
+        description=(
+            "Set the access granted to authenticated users on an active vault. Requires owner access. "
+            "Use akb_publish to share a resource by public link."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -1430,6 +1556,15 @@ TOOLS = [
 ]
 
 
+_TOOL_NAMES = frozenset(tool.name for tool in TOOLS)
+TOOL_METRICS = {tool.name: tool.metrics for tool in TOOLS if isinstance(tool, MeasuredTool)}
+
+
+def catalog_tool_name(name: object) -> str:
+    """Bound stored and exported tool names to the server catalog."""
+    return name if isinstance(name, str) and name in _TOOL_NAMES else "other"
+
+
 def available_tools() -> list[Tool]:
     """Advertise only supported creation options without mutating validation.
 
@@ -1437,11 +1572,19 @@ def available_tools() -> list[Tool]:
     explicit unsupported requests must reach the service's stable error.
     """
     capabilities = get_vault_creation_capabilities()
-    if capabilities.templates and capabilities.external_git:
-        return TOOLS
     result = []
     for tool in TOOLS:
+        if tool.name in {"akb_put", "akb_update"}:
+            tool = tool.model_copy(deep=True)
+            tool.meta = {**(tool.meta or {}), "akb/document_idempotency": {
+                "supported": settings.document_revision_backend in {"postgres_native", "native_ledger_m1"},
+            }}
+            result.append(tool)
+            continue
         if tool.name != "akb_create_vault":
+            result.append(tool)
+            continue
+        if capabilities.templates and capabilities.external_git:
             result.append(tool)
             continue
         tool = tool.model_copy(deep=True)

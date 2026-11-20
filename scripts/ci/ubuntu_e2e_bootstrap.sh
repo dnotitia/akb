@@ -22,6 +22,8 @@ shift
 CHECKOUT="${AKB_CHECKOUT:-$DEFAULT_CHECKOUT}"
 RUNTIME_ROOT="${AKB_RUNTIME_ROOT:-}"
 WITH_FRONTEND=0
+PROFILE=tool-only
+WITH_STDIO=0
 FORWARD_ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -39,6 +41,25 @@ while [ "$#" -gt 0 ]; do
       WITH_FRONTEND=1
       FORWARD_ARGS+=("$1")
       shift
+      ;;
+    --profile|--profile=*|--capability|--capability=*)
+      option=${1%%=*}
+      if [ "$1" = "$option" ]; then
+        [ "$#" -ge 2 ] || die "$option requires a value"
+        value=$2
+        FORWARD_ARGS+=("$1" "$2")
+        shift 2
+      else
+        value=${1#*=}
+        FORWARD_ARGS+=("$1")
+        shift
+      fi
+      value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+      if [ "$option" = "--profile" ]; then
+        PROFILE=$value
+      elif [[ "$value" =~ (^[[:space:]]*|[,+])stdio([,+]|[[:space:]]*$) ]]; then
+        WITH_STDIO=1
+      fi
       ;;
     *)
       FORWARD_ARGS+=("$1")
@@ -131,6 +152,11 @@ NODE_VERSION=$(node --version) \
 NPM_VERSION=$(npm --version) \
   || die "npm version check failed"
 echo "Node.js ${NODE_VERSION}, npm ${NPM_VERSION} ready" >&2
+
+if [ "$WITH_STDIO" -eq 1 ] || [[ "$PROFILE" =~ ^[[:space:]]*(transport-proxy|transport-oidc)[[:space:]]*$ ]]; then
+  npm ci --prefix "$CHECKOUT/packages/akb-mcp-client" \
+    || die "MCP client npm ci failed"
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
   "${SUDO[@]}" apt-get install -y docker.io \

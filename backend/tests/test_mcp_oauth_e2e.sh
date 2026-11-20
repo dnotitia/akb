@@ -9,7 +9,7 @@
 # token from a shell script.
 #
 # What this script proves (in order):
-#   1. `/.well-known/oauth-protected-resource` returns the expected shape
+#   1. `/.well-known/oauth-protected-resource/mcp` returns the expected shape
 #   2. `/mcp` rejects no-auth with 401 + WWW-Authenticate including a
 #      `resource_metadata=` parameter (RFC 9728 §5 client tip-off)
 #   3. `/mcp` rejects a syntactically-valid but wrong-audience token
@@ -20,23 +20,20 @@
 #   6. A token with only `akb:vault:read` is refused at a write-grade
 #      tool with `insufficient_scope`
 #
-# Stack required:
-#   docker compose -f docker-compose.yaml -f docker-compose.keycloak.yaml up -d
-#   # config/app.yaml must have:
-#   #   auth_mode: local
-#   #   keycloak_enabled: true
-#   #   mcp_oauth_enabled: true
-#   #   public_base_url: http://localhost:8000
+# Run against a disposable AKB and Keycloak fixture with auth_mode: local,
+# keycloak_enabled: true, and mcp_oauth_enabled: true. Provision a dedicated
+# confidential client with password grant enabled and list it in
+# mcp_oauth_client_ids. Give it the two optional AKB vault scopes, each with
+# an access-token audience mapper for the exact <public_base_url>/mcp.
+# Use a verified fixture user with the claims required for AKB enrollment.
 #
-# Run:
-#   bash backend/tests/test_mcp_oauth_e2e.sh
+# Set KC_TEST_CLIENT_ID and KC_TEST_CLIENT_SECRET in the environment before
+# running bash backend/tests/test_mcp_oauth_e2e.sh.
 #
-# Tunable via env:
+# Optional environment overrides:
 #   AKB_URL=http://localhost:8000
 #   KC_URL=http://localhost:8080
 #   KC_REALM=akb
-#   KC_TEST_CLIENT_ID=akb-web
-#   KC_TEST_CLIENT_SECRET=local-akb-dev-secret
 #   KC_TEST_USERNAME=alice
 #   KC_TEST_PASSWORD=alice-password
 set -uo pipefail
@@ -44,8 +41,8 @@ set -uo pipefail
 AKB_URL="${AKB_URL:-http://localhost:8000}"
 KC_URL="${KC_URL:-http://localhost:8080}"
 KC_REALM="${KC_REALM:-akb}"
-KC_TEST_CLIENT_ID="${KC_TEST_CLIENT_ID:-akb-web}"
-KC_TEST_CLIENT_SECRET="${KC_TEST_CLIENT_SECRET:-local-akb-dev-secret}"
+: "${KC_TEST_CLIENT_ID:?Set KC_TEST_CLIENT_ID to the dedicated MCP password-grant fixture client}"
+: "${KC_TEST_CLIENT_SECRET:?Set KC_TEST_CLIENT_SECRET for the dedicated fixture client}"
 KC_TEST_USERNAME="${KC_TEST_USERNAME:-alice}"
 KC_TEST_PASSWORD="${KC_TEST_PASSWORD:-alice-password}"
 
@@ -63,11 +60,16 @@ section() { echo; echo "── $1 ──"; }
 mint_token() {
   # $1 = scope (space-delimited). Empty → realm-default scopes only.
   local scope="$1"
-  local data="grant_type=password&client_id=${KC_TEST_CLIENT_ID}&client_secret=${KC_TEST_CLIENT_SECRET}&username=${KC_TEST_USERNAME}&password=${KC_TEST_PASSWORD}"
-  if [ -n "$scope" ]; then data="${data}&scope=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$scope")"; fi
+  local fields=(
+    --data-urlencode "grant_type=password"
+    --data-urlencode "client_id=${KC_TEST_CLIENT_ID}"
+    --data-urlencode "client_secret=${KC_TEST_CLIENT_SECRET}"
+    --data-urlencode "username=${KC_TEST_USERNAME}"
+    --data-urlencode "password=${KC_TEST_PASSWORD}"
+  )
+  if [ -n "$scope" ]; then fields+=(--data-urlencode "scope=$scope"); fi
   curl -s -X POST "${KC_URL}/realms/${KC_REALM}/protocol/openid-connect/token" \
-       -H "Content-Type: application/x-www-form-urlencoded" \
-       -d "$data" \
+       "${fields[@]}" \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))"
 }
 
@@ -94,7 +96,14 @@ mcp_tool_call() {
 # ── 1. Protected-resource metadata shape ─────────────────────
 
 section "Protected-resource metadata"
-meta=$(curl -s "${AKB_URL}/.well-known/oauth-protected-resource")
+metadata_url=$(python3 -c '
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+prefix = url.path.rstrip("/")
+print(f"{url.scheme}://{url.netloc}/.well-known/oauth-protected-resource{prefix}/mcp")
+' "$AKB_URL")
+meta=$(curl -s "$metadata_url")
 echo "    ${meta}"
 res=$(echo "$meta" | python3 -c "import sys,json; print(json.load(sys.stdin).get('resource',''))" 2>/dev/null) || true
 if [ -n "$res" ]; then pass "metadata served"; else fail "metadata served" "empty/missing"; fi
@@ -107,8 +116,8 @@ case "$scopes" in *"akb:vault:read"*) pass "scopes_supported lists akb:vault:rea
                       *) fail "scopes_supported lists akb:vault:read" "got '$scopes'" ;; esac
 case "$scopes" in *"akb:vault:write"*) pass "scopes_supported lists akb:vault:write" ;;
                        *) fail "scopes_supported lists akb:vault:write" "got '$scopes'" ;; esac
-case "$scopes" in *"offline_access"*) pass "scopes_supported lists offline_access" ;;
-                      *) fail "scopes_supported lists offline_access" "got '$scopes'" ;; esac
+case "$scopes" in *"offline_access"*) fail "offline_access is not advertised by default" "got '$scopes'" ;;
+                      *) pass "offline_access is not advertised by default" ;; esac
 
 # ── 2. No-auth → 401 + WWW-Authenticate with resource_metadata ──
 

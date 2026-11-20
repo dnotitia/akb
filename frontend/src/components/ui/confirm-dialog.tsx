@@ -15,6 +15,7 @@ import {
 type Variant = "default" | "destructive";
 
 interface ConfirmDialogProps {
+  className?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   title: string;
@@ -31,6 +32,7 @@ interface ConfirmDialogProps {
 }
 
 export function ConfirmDialog({
+  className,
   open,
   onOpenChange,
   title,
@@ -80,6 +82,7 @@ export function ConfirmDialog({
   return (
     <Dialog open={open} onOpenChange={(o) => !isBusy && onOpenChange(o)}>
       <DialogContent
+        className={className}
         onCloseAutoFocus={(event) => {
           if (!returnFocusRef?.current) return;
           event.preventDefault();

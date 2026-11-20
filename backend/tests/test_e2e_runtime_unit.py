@@ -71,6 +71,23 @@ def test_stdio_sample_image_fixture_is_a_small_decodable_png() -> None:
         assert image.size == (400, 400)
 
 
+@pytest.mark.asyncio
+async def test_stdio_probe_reads_a_catalog_larger_than_64_kib(tmp_path: Path) -> None:
+    runtime = E2ERuntime(make_config(tmp_path))
+    runtime.config.logs_dir.mkdir(parents=True)
+    # Use the actual subprocess pipe and JSON line reader used by tools/list.
+    child = (
+        "import json; tools = [{'name': 'akb_put', 'description': 'x' * 70000}]; "
+        "print(json.dumps({'jsonrpc': '2.0', 'id': 2, 'result': {'tools': tools}}))"
+    )
+    await runtime._spawn_interactive_process("stdio", [sys.executable, "-c", child], "stdio.log", environment={})
+    try:
+        response = await runtime._stdio_response(2)
+        assert len(response["result"]["tools"][0]["description"]) == 70000
+    finally:
+        await runtime._stop_named_process("stdio")
+
+
 def test_authorization_fixture_vault_repository_is_initialized_idempotently(tmp_path: Path) -> None:
     runtime = E2ERuntime(make_config(tmp_path))
     runtime.config.vault_dir.mkdir(parents=True)
@@ -768,7 +785,7 @@ async def test_member_installation_unavailable_fault_is_bounded_and_reversible(
         app_installation_service, "check_vault_access", allow_owner_access
     )
 
-    before = await app_installation_service.get_member_installation_active_status(
+    before = await app_installation_service.get_installation_active_status(
         app_id, vault_id, user=user, correlation_id="before-fault"
     )
 
@@ -782,13 +799,13 @@ async def test_member_installation_unavailable_fault_is_bounded_and_reversible(
         "fault_injection", "status_active", True, "member_installation_unavailable"
     )
     with pytest.raises(AKBError) as unavailable:
-        await app_installation_service.get_member_installation_active_status(
+        await app_installation_service.get_installation_active_status(
             app_id, vault_id, user=user, correlation_id="during-fault"
         )
     disabled = await runtime.fixture_control(
         "fault_injection", "status_active", False, "member_installation_unavailable"
     )
-    after = await app_installation_service.get_member_installation_active_status(
+    after = await app_installation_service.get_installation_active_status(
         app_id, vault_id, user=user, correlation_id="after-fault"
     )
     other_scenario = E2ERuntime(make_config(tmp_path / "other"))
@@ -1859,9 +1876,9 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     postgres = compose["services"]["postgres"]
     assert "image" not in postgres, postgres
     assert (CI_DIR / postgres["build"]["context"]).resolve() == (CI_DIR.parents[1] / "deploy/postgres").resolve()
-    # The IBM mirror keeps the upstream artifact pinned by digest.
+    # The public mirror keeps the upstream artifact pinned by digest.
     minio_image = compose["services"]["minio"]["image"]
-    assert minio_image.startswith("icr.io/fusion-open/minio/minio@sha256:"), minio_image
+    assert minio_image.startswith("docker.io/dappros/minio@sha256:"), minio_image
     assert "@sha256:" in minio_image, minio_image
     assert compose["services"]["postgres"]["ports"] == [
         "${AKB_E2E_POSTGRES_PORT:-15432}:5432"

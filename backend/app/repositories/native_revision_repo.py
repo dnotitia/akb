@@ -851,6 +851,9 @@ class NativeRevisionRepository:
         limit: int,
         since: datetime | None = None,
         path: str | None = None,
+        until: datetime | None = None,
+        author: str | None = None,
+        exclude_imported: bool = False,
     ) -> list[dict]:
         """List activity events, scoped to one Resource ``surface``.
 
@@ -867,9 +870,19 @@ class NativeRevisionRepository:
         the activity row) reads the one immutable fact recorded at Resource
         creation, which never drifts even across a move/replace lineage.
         """
+        # A completed mapping is represented by the frozen Git event. Keep its
+        # synthetic import activity out of the page using the mapping index.
+        # Native-only core schemas need no migration tables.
+        import_filter = """AND NOT EXISTS (
+            SELECT 1 FROM legacy_revision_mappings m
+            JOIN native_revision_migration_runs run
+              ON run.run_id = m.run_id AND run.namespace_id = m.namespace_id
+            WHERE m.namespace_id = a.namespace_id AND m.resource_id = a.resource_id
+              AND m.native_revision_id = a.revision_id AND run.status = 'complete'
+        )""" if exclude_imported else ""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT a.resource_id, a.revision_id, a.action, a.actor,
                        a.subject, a.summary, a.changed_path_from,
                        a.changed_path_to, a.occurred_at,
@@ -886,12 +899,15 @@ class NativeRevisionRepository:
                    AND (
                         $4::text IS NULL
                         OR r.path_at_revision = $4
-                        OR r.path_at_revision LIKE $4 || '/%'
+                        OR starts_with(r.path_at_revision, $4 || '/')
                         OR a.changed_path_from = $4
-                        OR a.changed_path_from LIKE $4 || '/%'
+                        OR starts_with(a.changed_path_from, $4 || '/')
                         OR a.changed_path_to = $4
-                        OR a.changed_path_to LIKE $4 || '/%'
+                        OR starts_with(a.changed_path_to, $4 || '/')
                    )
+                   AND ($6::timestamptz IS NULL OR a.occurred_at < $6)
+                   AND ($7::text IS NULL OR strpos(lower(a.actor), lower($7)) > 0)
+                   {import_filter}
                  ORDER BY a.occurred_at DESC, a.revision_id DESC
                  LIMIT $5
                 """,
@@ -899,7 +915,7 @@ class NativeRevisionRepository:
                 surface,
                 since,
                 path,
-                limit,
+                limit, until, author,
             )
         return [dict(row) for row in rows]
 

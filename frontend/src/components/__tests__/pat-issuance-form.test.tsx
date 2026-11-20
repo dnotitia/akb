@@ -1,3 +1,5 @@
+import { parseAuthConfig } from "@/lib/api";
+import { localAuthConfig } from "@/stories/page-story-fixtures";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -5,6 +7,8 @@ import { configureAuthTransport, setToken } from "@/lib/api";
 import { defaultPatDraft } from "@/lib/pat-draft";
 import { PatIssuanceForm } from "../pat-issuance-form";
 import { ConnectionSetup } from "../connection-setup";
+
+const connectionConfig = (oauth: boolean) => parseAuthConfig({ ...localAuthConfig, mcp_oauth: { enabled: oauth } });
 
 const uid = "00000000-0000-0000-0000-000000000001", tid = "00000000-0000-0000-0000-000000000002";
 const caps = { contract_version: 1, user_id: uid, name_max_length: 255, permission_presets: [["read"], ["read", "write"]], expiration_modes: ["none", "days", "absolute"], vault_scope_semantics: "write_restriction_sql_read_write" };
@@ -16,7 +20,7 @@ afterEach(() => { setToken(null); configureAuthTransport(null); vi.unstubAllGlob
 
 it("keeps selected SQL restrictions when choosing read only and retains the collapsed summary", async () => {
   const user = userEvent.setup();
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x", restricted: true, prefixes: ["team-"] }} onCreated={vi.fn()} />);
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x", restricted: true, prefixes: ["team-"] }} onCreated={vi.fn()} />);
   await user.click(screen.getByLabelText("Permissions"));
   await user.click(screen.getByRole("menuitemradio", { name: "Read only" }));
   await user.click(screen.getByRole("button", { name: "Advanced options" }));
@@ -28,7 +32,7 @@ it("keeps selected SQL restrictions when choosing read only and retains the coll
 it("keeps selections and supports manual prefixes when the accessible Vault list fails", async () => {
   fetchMock.mockImplementation(url => Promise.resolve(String(url).endsWith("/vaults") ? json({}, 503) : json(caps)));
   const user = userEvent.setup();
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x", restricted: true, vaults: ["kept-vault"] }} onCreated={vi.fn()} />);
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x", restricted: true, vaults: ["kept-vault"] }} onCreated={vi.fn()} />);
   await screen.findByText(/Could not load Vaults/);
   await user.type(screen.getByLabelText("Name prefix"), "future-");
   await user.click(screen.getByRole("button", { name: "Add prefix" }));
@@ -40,20 +44,32 @@ it("requires explicit reset of a restricted legacy draft and sends only name", a
   fetchMock.mockImplementation(url => Promise.resolve(String(url).includes("capabilities") ? json({}, 404) : json({ token_id: tid, name: "x", token: "akb_legacy_secret", prefix: "akb_legacy" })));
   const user = userEvent.setup();
   const onCreated = vi.fn();
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x", permissions: "read" }} onCreated={onCreated} />);
-  expect(await screen.findByRole("button", { name: "Create with server defaults" })).toBeDisabled();
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x", permissions: "read" }} onCreated={onCreated} />);
+  expect(await screen.findByRole("button", { name: "Create key with server defaults" })).toBeDisabled();
   expect(posts()).toHaveLength(0);
   await user.click(screen.getByRole("button", { name: "Reset to server defaults" }));
-  await user.click(screen.getByRole("button", { name: "Create with server defaults" }));
+  await user.click(screen.getByRole("button", { name: "Create key with server defaults" }));
   await waitFor(() => expect(onCreated).toHaveBeenCalled());
   expect(posts()).toHaveLength(1); expect(JSON.parse(posts()[0][1].body)).toEqual({ name: "x" });
   expect(onCreated.mock.calls[0][0].verified).toBe(false);
 });
 
+it("keeps a policy rejection from falling back to another issuance endpoint", async () => {
+  fetchMock.mockImplementation(() => Promise.resolve(json({
+    message: "Personal access tokens are disabled", code: "personal_access_tokens_disabled",
+  }, 403)));
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x" }} onCreated={vi.fn()} />);
+
+  await screen.findByText("Personal access tokens are disabled");
+  expect(screen.getByRole("button", { name: "Create connection key" })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Create key with server defaults" })).toBeNull();
+  expect(posts()).toHaveLength(0);
+});
+
 it("does not fall back when the issuance request lands on an old server", async () => {
   fetchMock.mockImplementation((url, init) => Promise.resolve(init.method === "POST" ? json({ detail: "Not found" }, 404) : json(caps)));
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x", permissions: "read" }} onCreated={vi.fn()} />);
-  const create = await screen.findByRole("button", { name: "Create token" });
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x", permissions: "read" }} onCreated={vi.fn()} />);
+  const create = await screen.findByRole("button", { name: "Create connection key" });
   await waitFor(() => expect(create).toBeEnabled()); fireEvent.click(create);
   await screen.findByText("Not found");
   expect(posts()).toHaveLength(1); expect(posts()[0][0]).toContain("/issuance");
@@ -62,9 +78,9 @@ it("does not fall back when the issuance request lands on an old server", async 
 
 it("maps stable field errors to controls and focuses the linked error summary", async () => {
   fetchMock.mockImplementation((url, init) => Promise.resolve(init.method === "POST" ? json({ message: "Invalid request", code: "token_issuance_validation", details: { fields: [{ field: "expires_at", code: "past", message: "Choose a future expiration." }] } }, 422) : json(caps)));
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x", expiration: "30" }} onCreated={vi.fn()} />);
-  await waitFor(() => expect(screen.getByRole("button", { name: "Create token" })).toBeEnabled());
-  fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x", expiration: "30" }} onCreated={vi.fn()} />);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Create connection key" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Create connection key" }));
   await screen.findByRole("link", { name: "Choose a future expiration." });
   expect(screen.getByLabelText("Expiration")).toHaveAttribute("aria-invalid", "true");
   expect(document.activeElement?.textContent).toContain("Invalid request");
@@ -73,28 +89,29 @@ it("maps stable field errors to controls and focuses the linked error summary", 
 it("prevents duplicate issuance and requires checking an uncertain result before another creation", async () => {
   let resolve!: (response: Response) => void;
   fetchMock.mockImplementation((url, init) => init.method === "POST" ? new Promise<Response>(r => { resolve = r; }) : Promise.resolve(json(caps)));
-  render(<PatIssuanceForm initial={{ ...defaultPatDraft(), name: "x" }} onCreated={vi.fn()} />);
-  await waitFor(() => expect(screen.getByRole("button", { name: "Create token" })).toBeEnabled());
-  const form = screen.getByLabelText("Token name").closest("form")!;
+  render(<PatIssuanceForm issuanceEnabled initial={{ ...defaultPatDraft(), name: "x" }} onCreated={vi.fn()} />);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Create connection key" })).toBeEnabled());
+  const form = screen.getByLabelText("Connection key name").closest("form")!;
   fireEvent.submit(form); fireEvent.submit(form);
   expect(posts()).toHaveLength(1);
   await act(async () => resolve(json({}, 503)));
-  const review = screen.getByRole("link", { name: "Review token list (opens in a new tab)" });
+  const review = screen.getByRole("link", { name: "Review connection keys (opens in a new tab)" });
   expect(review).toBeVisible();
   expect(review).toHaveAttribute("target", "_blank");
-  expect(screen.queryByRole("button", { name: "Create token" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Create connection key" })).not.toBeInTheDocument();
 });
 
 it("removes masked secrets from the DOM and clears token-bearing snippets after a session change", async () => {
   fetchMock.mockImplementation((url, init) => Promise.resolve(init.method === "POST" ? json({ contract_version: 1, user_id: uid, token_id: tid, name: "x", token: "akb_one_time_secret", prefix: "akb_one", issued_at: "2030-01-01T00:00:00Z", key_class: "pat", scopes: ["read", "write"], vault_scope: null, expires_at: null }) : json(caps)));
   const user = userEvent.setup();
-  render(<ConnectionSetup mcpOauthEnabled={false} />);
-  await user.type(screen.getByLabelText("Token name"), "x");
-  await user.click(screen.getByRole("button", { name: "Create token" }));
-  await screen.findByText("Token created — save it now");
-  await user.click(screen.getByRole("button", { name: "Hide token and configuration" }));
+  render(<ConnectionSetup authConfig={parseAuthConfig(localAuthConfig)} />);
+  await user.click(screen.getByRole("button", { name: "Continue with Claude Code" }));
+  await user.type(screen.getByLabelText("Connection key name"), "x");
+  await user.click(screen.getByRole("button", { name: "Create connection key" }));
+  await screen.findByText("Connection key created");
+  await user.click(screen.getByRole("button", { name: "Hide key and configuration" }));
   expect(document.body.textContent).not.toContain("akb_one_time_secret");
-  await user.click(screen.getByRole("button", { name: "Show token and configuration" }));
+  await user.click(screen.getByRole("button", { name: "Show key and configuration" }));
   expect(document.body.textContent).toContain("akb_one_time_secret");
   setToken("new-same-account-session"); fireEvent.focus(window);
   await screen.findByText(/Previous secrets and configuration have been cleared/);
@@ -105,27 +122,27 @@ it("removes masked secrets from the DOM and clears token-bearing snippets after 
 it.each(["saved token", "OAuth"])("preserves the draft and uncertain result across %s switches", async mode => {
   const user = userEvent.setup();
   const dirty = vi.fn();
-  render(<ConnectionSetup mcpOauthEnabled={mode === "OAuth"} onDirtyChange={dirty}
+  render(<ConnectionSetup authConfig={connectionConfig(mode === "OAuth")} onDirtyChange={dirty}
     initialDraft={{ ...defaultPatDraft(), name: "limited", permissions: "read", expiration: "30", restricted: true, prefixes: ["team-"] }} />);
-  if (mode === "OAuth") {
-    await user.click(screen.getByRole("radio", { name: "Create a new token" }));
-  }
-  await waitFor(() => expect(screen.getByRole("button", { name: "Create token" })).toBeEnabled());
+  await user.click(screen.getByRole("button", { name: "Continue with Claude Code" }));
+  if (mode === "OAuth") await user.click(screen.getByRole("radio", { name: "Personal connection key (PAT)" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Create connection key" })).toBeEnabled());
   fetchMock.mockImplementation((url, init) => Promise.resolve(init.method === "POST" ? json({}, 503) : String(url).endsWith("/vaults") ? json({ vaults: [] }) : json(caps)));
-  await user.click(screen.getByRole("button", { name: "Create token" }));
-  await screen.findByText(/Creation result needs checking/);
-  await user.click(screen.getByRole("radio", { name: mode === "OAuth" ? "Browser sign-in" : "Use a saved token" }));
+  await user.click(screen.getByRole("button", { name: "Create connection key" }));
+  await screen.findByText(/We could not confirm whether the key was created/);
+  await user.click(screen.getByRole("radio", { name: mode === "OAuth" ? "Sign in with AKB (OAuth/SSO)" : "Use an existing key" }));
   expect(dirty).toHaveBeenLastCalledWith(true);
   expect(screen.queryByRole("button", { name: "I've checked — review another creation" })).not.toBeInTheDocument();
-  await user.click(screen.getByRole("radio", { name: "Create a new token" }));
-  expect(screen.getByText(/Creation result needs checking/)).toBeVisible();
-  expect(screen.getByLabelText("Token name")).toHaveValue("limited");
-  expect(screen.getByText(/Expires 30 × 24 hours after issuance · Read only · Writes: prefix team-/)).toBeVisible();
-  expect(screen.queryByRole("button", { name: "Create token" })).not.toBeInTheDocument();
+  if (mode === "OAuth") await user.click(screen.getByRole("radio", { name: "Personal connection key (PAT)" }));
+  else await user.click(screen.getByRole("radio", { name: "Create a key" }));
+  expect(screen.getByText(/We could not confirm whether the key was created/)).toBeVisible();
+  expect(screen.getByLabelText("Connection key name")).toHaveValue("limited");
+  expect(screen.getByText(/Expires in 30 days · Read only · Writes: prefix team-/)).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Create connection key" })).not.toBeInTheDocument();
   expect(posts()).toHaveLength(1);
   await user.click(screen.getByRole("button", { name: "I've checked — review another creation" }));
-  await waitFor(() => expect(screen.getByRole("button", { name: "Create token" })).toBeEnabled());
-  await user.click(screen.getByRole("button", { name: "Create token" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Create connection key" })).toBeEnabled());
+  await user.click(screen.getByRole("button", { name: "Create connection key" }));
   await waitFor(() => expect(posts()).toHaveLength(2));
   expect(JSON.parse(posts()[1][1].body)).toMatchObject({ name: "limited", scopes: ["read"], expires_days: 30, vault_scope: { prefixes: ["team-"], extra_vaults: [] } });
 });

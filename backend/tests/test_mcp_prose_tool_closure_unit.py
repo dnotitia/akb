@@ -70,21 +70,22 @@ def _module_tree(name: str) -> ast.AST:
 
 
 def _tool_names() -> set[str]:
-    """Names from every ``Tool(name="…", …)`` literal in tools.py."""
+    """Read literal names from plain and measured tool declarations in tools.py."""
     names: set[str] = set()
+    constructors = {"Tool", "measured_tool"}
     for node in ast.walk(_module_tree("tools.py")):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        is_tool = (isinstance(func, ast.Name) and func.id == "Tool") or (
-            isinstance(func, ast.Attribute) and func.attr == "Tool"
+        is_tool = (isinstance(func, ast.Name) and func.id in constructors) or (
+            isinstance(func, ast.Attribute) and func.attr in constructors
         )
         if not is_tool:
             continue
         for kw in node.keywords:
             if kw.arg == "name" and isinstance(kw.value, ast.Constant):
                 names.add(kw.value.value)
-    assert names, "no Tool(name=…) literals found in tools.py"
+    assert names, "no tool declarations with literal names found in tools.py"
     return names
 
 

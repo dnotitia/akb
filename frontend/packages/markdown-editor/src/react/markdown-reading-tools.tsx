@@ -47,7 +47,7 @@ export interface MarkdownViewerReadingOptions {
 }
 
 type CodeSlot = MarkdownViewerCodeBlock & { pos: number; size: number; host: HTMLElement }
-type SectionSlot = MarkdownViewerSection & { pos: number; end: number; headingSize: number }
+type SectionSlot = MarkdownViewerSection & { pos: number; end: number; headingSize: number; host: HTMLElement }
 
 /** Viewer-only decorations. Neither toolbar widgets, folds nor matches enter the document model. */
 export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor | null; options?: MarkdownViewerReadingOptions }) {
@@ -72,6 +72,7 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
     let previousCollapsed = latest.current?.collapsedSections
     let lastScroll = ''
     const hosts = new Map<number, HTMLElement>()
+    const sectionHosts = new Map<number, HTMLElement>()
     const sync = () => {
       if (editor.isDestroyed) return
       const settings = latest.current
@@ -82,12 +83,20 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
       const stack: SectionSlot[] = []
       for (const [index, { node, pos }] of roots.entries()) {
         if (node.type.name !== 'heading') continue
+        let host = sectionHosts.get(index)
+        if (!host) {
+          host = editor.view.dom.ownerDocument.createElement('span')
+          host.dataset.markdownSectionTools = 'true'
+          host.setAttribute('contenteditable', 'false')
+          sectionHosts.set(index, host)
+        }
         const level = Number(node.attrs.level)
         while (stack.length && stack[stack.length - 1]!.level >= level) stack.pop()!.end = pos
-        const section = { index, title: node.textContent, level, collapsed: Boolean(settings?.collapsedSections?.includes(index)) && !opened.has(index), pos, end: editor.state.doc.content.size, headingSize: node.nodeSize }
+        const section = { index, title: node.textContent, level, collapsed: Boolean(settings?.collapsedSections?.includes(index)) && !opened.has(index), pos, end: editor.state.doc.content.size, headingSize: node.nodeSize, host }
         sections.push(section); stack.push(section)
       }
       sections = sections.filter(section => section.end > section.pos + section.headingSize)
+      for (const index of sectionHosts.keys()) if (!sections.some(section => section.index === index)) sectionHosts.delete(index)
       matches = []
       let limited = false
       const codeBlocks: CodeSlot[] = []
@@ -157,8 +166,17 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
         for (const [index, root] of roots.entries()) {
           const attributes: Record<string, string> = { 'data-reading-block-position': String(root.pos) }
           if (isHidden(root.pos)) { attributes.hidden = ''; attributes['data-reading-section-hidden'] = 'true' }
-          if (root.node.type.name === 'heading') attributes['data-reading-section-index'] = String(index)
+          if (root.node.type.name === 'heading') {
+            attributes['data-reading-section-index'] = String(index)
+            if (settings?.renderSectionToggle && root.node.textContent) attributes['aria-label'] = root.node.textContent
+          }
           decorations.push(Decoration.node(root.pos, root.pos + root.node.nodeSize, attributes))
+        }
+        if (settings?.renderSectionToggle) for (const section of sections) {
+          if (isHidden(section.pos)) continue
+          decorations.push(Decoration.widget(section.pos + 1, section.host, {
+            key: `reading-section-${section.index}`, side: -1, ignoreSelection: true, stopEvent: () => true,
+          }))
         }
         for (const block of blocks) {
           if (isHidden(block.pos)) continue
@@ -210,5 +228,5 @@ export function MarkdownViewerReadingTools({ editor, options }: { editor: Editor
     return () => { cancelAnimationFrame(frame); refresh.current = null; editor.off('transaction', onTransaction); editor.unregisterPlugin(key); editor.view.dom.removeEventListener('markdown-reading-reveal', onReveal); editor.view.dom.removeEventListener('beforematch', onReveal); editor.view.dom.removeEventListener('click', onClick, true); window.removeEventListener('hashchange', onHash) }
   }, [editor, enabled])
   useLayoutEffect(() => { refresh.current?.() }, [options])
-  return <>{slots.map(slot => createPortal(options?.renderCodeToolbar?.(slot), slot.host, `code-${slot.index}`))}{sectionSlots.map(slot => <Fragment key={`section-${slot.index}`}>{options?.renderSectionToggle?.(slot)}</Fragment>)}{imageSlots.map(slot => <Fragment key={`image-${slot.index}`}>{options?.renderImageToolbar?.(slot)}</Fragment>)}</>
+  return <>{slots.map(slot => createPortal(options?.renderCodeToolbar?.(slot), slot.host, `code-${slot.index}`))}{sectionSlots.map(slot => createPortal(options?.renderSectionToggle?.(slot), slot.host, `section-${slot.index}`))}{imageSlots.map(slot => <Fragment key={`image-${slot.index}`}>{options?.renderImageToolbar?.(slot)}</Fragment>)}</>
 }

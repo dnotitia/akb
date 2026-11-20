@@ -42,6 +42,7 @@ def test_runtime_load_accepts_explicit_local_auth_mode(
     loaded = _load(monkeypatch, tmp_path, {"auth_mode": "local"})
 
     assert loaded.auth_mode == "local"
+    assert loaded.pat_enabled is True
     assert loaded.local_human_auth_enabled is True
     assert loaded.sso_human_auth_enabled is False
 
@@ -600,13 +601,37 @@ def test_api_audience_has_distinct_public_resource_default() -> None:
     assert loaded.mcp_oauth_audience_effective == "https://akb.example.com/mcp"
 
 
+@pytest.mark.parametrize("url", [
+    "http://akb.example.com/prefix", "https://akb.example.com/?",
+    "https://user@akb.example.com", "https://akb.example.com/prefix#",
+    "https://akb.example.com:443/prefix", "https://AKB.example.com/prefix",
+    "https://akb.example.com/foo/../prefix",
+])
+def test_mcp_oauth_requires_canonical_public_base(url: str) -> None:
+    with pytest.raises(ValidationError, match="canonical"):
+        app_config.Settings(
+            document_revision_backend="bare_git", mcp_oauth_enabled=True, public_base_url=url,
+        )
+
+
+def test_mcp_oauth_preserves_canonical_loopback_prefix() -> None:
+    loaded = app_config.Settings(
+        document_revision_backend="bare_git", mcp_oauth_enabled=True,
+        public_base_url="http://127.0.0.1:18000/prefix/",
+    )
+    assert loaded.mcp_oauth_audience_effective == "http://127.0.0.1:18000/prefix/mcp"
+    assert loaded.mcp_oauth_metadata_url == (
+        "http://127.0.0.1:18000/.well-known/oauth-protected-resource/prefix/mcp"
+    )
+
+
 def test_startup_rejects_equal_api_and_mcp_audiences(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     from app.services import lifecycle
 
-    shared_audience = "https://akb.example.com/resource"
+    shared_audience = "https://akb.example.com/mcp"
     loaded = _load(
         monkeypatch,
         tmp_path,
@@ -616,7 +641,6 @@ def test_startup_rejects_equal_api_and_mcp_audiences(
             "mcp_oauth_enabled": True,
             "keycloak_server_url": "https://auth.example.com",
             "api_oauth_audience": shared_audience,
-            "mcp_oauth_audience": shared_audience,
             "system_hmac_secret": "test-system-hmac-secret",  # pragma: allowlist secret
             "db_password": "test-db-password",  # pragma: allowlist secret
             "public_base_url": "https://akb.example.com",
@@ -649,3 +673,22 @@ def test_startup_rejects_hs256_after_local_v2_cutover(
 
     with pytest.raises(RuntimeError, match="local-session-rs256-v2"):
         lifecycle._validate_required_settings()
+
+
+@pytest.mark.parametrize("mode", ["local", "sso"])
+@pytest.mark.parametrize("oauth_enabled", [False, True])
+@pytest.mark.parametrize("pat_enabled", [False, True])
+def test_pat_policy_loads_independently_of_browser_mode_and_mcp_oauth(
+    monkeypatch, tmp_path, mode, oauth_enabled, pat_enabled,
+):
+    config = _load(monkeypatch, tmp_path, {
+        "auth_mode": mode,
+        "mcp_oauth_enabled": oauth_enabled,
+        "keycloak_enabled": mode == "sso" or oauth_enabled,
+        "pat_enabled": pat_enabled,
+        "public_base_url": "https://akb.example.test/workspace/",
+    })
+
+    assert config.require_auth_mode() == mode
+    assert config.mcp_oauth_enabled is oauth_enabled
+    assert config.pat_enabled is pat_enabled

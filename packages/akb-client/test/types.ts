@@ -262,6 +262,8 @@ updatedDoc.throwOnError().data.current_commit satisfies string | null | undefine
 docs.update("guides/readme.md", { content: "new body", expectedCommit: "a".repeat(40) });
 docs.update("guides/readme.md", { content: "", expectedContentHash: "b".repeat(64) });
 docs.update("guides/readme.md", { content: null, title: "metadata only" });
+docs.put({ collection: "guides", title: "Draft", content: "body", idempotencyKey: "11111111-2222-4333-8444-555555555555" });
+docs.update("guides/readme.md", { content: "body", expectedCommit: "a".repeat(40), idempotencyKey: "11111111-2222-4333-8444-555555555556" });
 // @ts-expect-error Whole-body replacement requires a read condition.
 docs.update("guides/readme.md", { content: "unprotected body" });
 // @ts-expect-error Null conditions do not authorize a full replacement.

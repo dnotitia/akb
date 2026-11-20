@@ -264,6 +264,41 @@ async def _revoke_all_sso_browser_sessions(user: AuthenticatedUser) -> datetime:
     return revoked_at
 
 
+async def _lock_sso_sid(conn, session_epoch: uuid.UUID, issuer: str, sid: str) -> None:
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        f"sso-browser-sid:{session_epoch}:{issuer}:{sid}",
+    )
+
+
+async def lock_sso_sid_and_check_logout(
+    conn, session_epoch: uuid.UUID, issuer: str, sid: str, subject: str, issued_at: datetime,
+) -> None:
+    await _lock_sso_sid(conn, session_epoch, issuer, sid)
+    await conn.execute("DELETE FROM sso_browser_logout_fences WHERE expires_at <= NOW()")
+    fenced = await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM sso_browser_logout_fences
+             WHERE session_epoch = $1
+               AND identity_issuer = $2
+               AND keycloak_sid = $3
+               AND (identity_subject IS NULL OR identity_subject = $4)
+               AND logout_issued_at >= $5
+               AND expires_at > NOW()
+        )
+        """,
+        session_epoch,
+        issuer,
+        sid,
+        subject,
+        issued_at,
+    )
+    if fenced:
+        raise AuthenticationError("SSO session was logged out")
+
+
 async def create_sso_browser_session(
     user: AuthenticatedUser,
     principal: VerifiedPrincipal,
@@ -354,35 +389,7 @@ async def create_sso_browser_session(
                 type(login_sequence) is not int or login_sequence <= revoked_sequence
             ):
                 raise AuthenticationError("SSO login started before all browser sessions were ended; sign in again")
-            # Session creation and back-channel logout share this exact lock.
-            # The durable fence below then rejects a callback that resumes
-            # after a verified logout event has already committed.
-            await conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                f"sso-browser-sid:{session_epoch}:{issuer}:{sid}",
-            )
-            await conn.execute("DELETE FROM sso_browser_logout_fences WHERE expires_at <= NOW()")
-            fenced = await conn.fetchval(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                      FROM sso_browser_logout_fences
-                     WHERE session_epoch = $1
-                       AND identity_issuer = $2
-                       AND keycloak_sid = $3
-                       AND (identity_subject IS NULL OR identity_subject = $4)
-                       AND logout_issued_at >= $5
-                       AND expires_at > NOW()
-                )
-                """,
-                session_epoch,
-                issuer,
-                sid,
-                subject,
-                session_issued_at,
-            )
-            if fenced:
-                raise AuthenticationError("SSO session was logged out")
+            await lock_sso_sid_and_check_logout(conn, session_epoch, issuer, sid, subject, session_issued_at)
             identity = await conn.fetchrow(
                 """
                 SELECT e.id
@@ -394,6 +401,7 @@ async def create_sso_browser_session(
                    AND u.account_status = 'active'
                    AND u.account_kind = 'human'
                    AND u.auth_provider = 'keycloak'
+                   AND u.monitoring_access IS NULL
                  FOR SHARE OF e, u
                 """,
                 user_id,
@@ -571,6 +579,7 @@ async def _resolve_sso_browser_session_pass(
                     ON e.id = s.external_identity_id AND e.user_id = s.user_id
                  WHERE s.token_hash = $1
                    AND s.session_epoch = $2
+                   AND u.monitoring_access IS NULL
                  FOR UPDATE OF s
                 """,
                 token_hash,
@@ -913,10 +922,7 @@ async def revoke_sso_browser_sessions_from_logout_token(
     async with pool.acquire() as conn:
         async with conn.transaction():
             await lock_active_sso_session_epoch(conn, authority)
-            await conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                f"sso-browser-sid:{session_epoch}:{issuer}:{sid}",
-            )
+            await _lock_sso_sid(conn, session_epoch, issuer, sid)
             await conn.execute("DELETE FROM sso_browser_logout_fences WHERE expires_at <= NOW()")
             await conn.execute(
                 """
@@ -948,6 +954,16 @@ async def revoke_sso_browser_sessions_from_logout_token(
                 subject,
                 event_issued_at,
                 fence_expires_at,
+            )
+            await conn.execute(
+                """
+                DELETE FROM mcp_monitoring.sessions s USING external_identities e
+                 WHERE s.external_identity_id = e.id AND e.issuer = $1
+                   AND s.keycloak_sid = $2 AND ($3::text IS NULL OR s.identity_subject = $3)
+                """,
+                issuer,
+                sid,
+                subject,
             )
             result = await conn.execute(
                 """

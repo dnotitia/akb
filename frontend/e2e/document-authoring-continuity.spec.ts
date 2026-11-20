@@ -15,7 +15,7 @@ async function fixture(page: Page, dark = false, content = "# Reading\n\nKeep th
   await page.route("**/health/**", route => route.fulfill({ json: {} }));
   await page.route("**/api/v1/**", route => {
     const pathname = new URL(route.request().url()).pathname;
-    if (pathname.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+    if (pathname.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
     if (pathname.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "continuity-user", username: "fixture", display_name: "Author", auth_method: "local", is_admin: false } });
     if (pathname.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ id: "fixture-vault", name: "fixture", role: "writer" }] } });
     if (pathname.endsWith("/info")) return route.fulfill({ json: { name: "fixture", role: "writer", is_archived: false, is_external_git: false, document_count: 1 } });

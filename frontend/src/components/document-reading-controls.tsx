@@ -8,8 +8,8 @@ import { formatByteSize, formatLineCount, getDocumentStats } from "@/lib/documen
 
 export { DocumentSummary } from "@/components/document-summary";
 
-export function DocumentTimestamp({ value, label = "Last edited", compact = false }: {
-  value?: string | null; label?: string; compact?: boolean;
+export function DocumentTimestamp({ value, label = "Last edited", compact = false, showLabel = true }: {
+  value?: string | null; label?: string; compact?: boolean; showLabel?: boolean;
 }) {
   const date = value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return compact ? null : <span>Not available</span>;
@@ -18,8 +18,8 @@ export function DocumentTimestamp({ value, label = "Last edited", compact = fals
   return <TooltipProvider delayDuration={250}><Tooltip>
     <TooltipTrigger asChild>
       <time dateTime={date.toISOString()} tabIndex={0}
-        className="min-w-0 truncate @[48rem]/reader:shrink-0 rounded-[var(--radius-sm)] text-sm text-foreground-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-        <span aria-hidden>{label} {timeAgo(value)}</span>
+        className="min-w-0 truncate @[48rem]/reader:shrink-0 rounded-[var(--radius-sm)] text-xs text-foreground-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        <span aria-hidden>{showLabel && `${label} `}{timeAgo(value)}</span>
         <span className="sr-only">{label}: {exact}</span>
       </time>
     </TooltipTrigger>
@@ -41,7 +41,7 @@ export function DocumentIconButton({ label, children, ...props }: Omit<Component
       <Button {...props} type="button" variant="ghost" size="icon" data-reader-control data-reader-icon aria-label={label}
         className={cn("text-foreground-muted hover:text-foreground", props.className)}>{children}</Button>
     </TooltipTrigger>
-    <TooltipContent side="bottom">{label}</TooltipContent>
+    <TooltipContent side="top">{label}</TooltipContent>
   </Tooltip></TooltipProvider>;
 }
 

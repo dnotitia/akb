@@ -104,8 +104,8 @@ test("opens the current document beside Raw without changing the tab's saved vie
   await page.setViewportSize({ width: 1920, height: 1000 }); await readingFixture(page, false, content);
   await page.goto("/vault/fixture/doc/reading.md?view=raw");
   await expect(page.getByTestId("doc-raw")).toBeVisible();
-  await page.getByRole("group", { name: "Document reading tools", exact: true }).getByRole("button", { name: "Actions for Reading workflow", exact: true }).click();
-  await page.getByRole("menuitem", { name: "Read side by side", exact: true }).click();
+  await page.getByRole("tab", { name: "Reading workflow", exact: true }).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Read Reading workflow beside", exact: true }).click();
   await expect(page.getByRole("complementary", { name: "Side document: Reading workflow", exact: true })).toBeVisible();
   await expect.poll(() => page.evaluate(key => JSON.parse(localStorage.getItem(key) || "{}").tabs?.[0]?.raw, sessionKey)).toBe(true);
   await page.reload();

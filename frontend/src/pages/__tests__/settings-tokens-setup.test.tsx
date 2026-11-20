@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
 import SettingsDialog from "../settings/settings-dialog";
 
 vi.mock("@/lib/api", async () => ({
@@ -17,12 +18,9 @@ vi.mock("@/lib/api", async () => ({
   adminDeleteUser: vi.fn(),
   changePassword: vi.fn(),
   updateProfile: vi.fn(),
-  // tokens-section calls this on mount to decide whether to show the
-  // OAuth toggle alongside the PAT snippet. Mock as "OAuth off" so
-  // these tests stay focused on the PAT-mint UX they were written for.
   getAuthConfig: vi.fn().mockResolvedValue({
     available: true,
-    schema_version: 2,
+    schema_version: 3,
     auth_mode: "local",
     local_auth: { enabled: true },
     keycloak: {
@@ -31,6 +29,8 @@ vi.mock("@/lib/api", async () => ({
     },
     providers: [],
     mcp_oauth: { enabled: false },
+    personal_access_tokens: { enabled: true },
+    mcp_endpoint_url: "https://akb.example.test/mcp/",
   }),
 }));
 
@@ -60,21 +60,26 @@ describe("Shared connection setup", () => {
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
     (listPATs as any).mockResolvedValue({ tokens: [] });
     render(wrap());
-    expect(await screen.findByText("No tokens yet")).toBeVisible();
+    await screen.findByRole("heading", { name: "AI connections" });
+    expect(screen.getAllByRole("heading", { level: 3 })).toHaveLength(1);
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Connection keys" }));
+    expect(await screen.findByText("No connection keys yet")).toBeVisible();
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Connection setup" }));
     expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
-    expect(screen.getByRole("heading", { name: "1. Prepare access" })).toBeVisible();
-    expect(screen.getByRole("heading", { name: /2. Configure/ })).toBeVisible();
-    expect(screen.getByRole("heading", { name: "3. Try it in your agent" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "1. Choose your AI tool" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "3. Check the connection" })).toBeNull();
   });
 
-  it("keeps all setup phases visible even when the user has a PAT", async () => {
+  it("keeps setup and key management separately available with an existing PAT", async () => {
     const { listPATs, getMe } = await import("@/lib/api");
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
     (listPATs as any).mockResolvedValue({
       tokens: [{ token_id: "t1", name: "claude", prefix: "akb_xyz", created_at: "2026-05-19", last_used_at: null }],
     });
     render(wrap());
+    await userEvent.setup().click(await screen.findByRole("tab", { name: "Connection keys" }));
     expect(await screen.findByText(/claude/)).toBeVisible();
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Connection setup" }));
     expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
   });
 
@@ -86,16 +91,39 @@ describe("Shared connection setup", () => {
       tokens: [{ token_id: "t1", name: "claude", prefix: "akb_xyz", created_at: "2026-05-19", last_used_at: null }],
     });
     render(wrap());
-    await screen.findByRole("heading", { name: "Agent connections" });
+    await screen.findByRole("heading", { name: "AI connections" });
     expect(document.getElementById("setup-guide-body")).not.toHaveAttribute("hidden");
     expect(screen.queryByText(/akb_xyz…/)).not.toBeInTheDocument();
+  });
+
+  it("retries unavailable connection options and forwards the public endpoint", async () => {
+    const { AUTH_CONFIG_UNAVAILABLE, getAuthConfig, listPATs, parseAuthConfig } = await import("@/lib/api");
+    vi.mocked(listPATs).mockResolvedValue({ tokens: [] });
+    const config = parseAuthConfig({
+      schema_version: 3,
+      auth_mode: "local",
+      local_auth: { enabled: true },
+      keycloak: { enabled: false, browser_session_ready: false },
+      providers: [],
+      mcp_oauth: { enabled: true },
+      personal_access_tokens: { enabled: false },
+      mcp_endpoint_url: "https://akb.example.test/workspace/mcp/",
+    });
+    vi.mocked(getAuthConfig).mockResolvedValueOnce(AUTH_CONFIG_UNAVAILABLE).mockResolvedValueOnce(config);
+    const user = userEvent.setup();
+    render(wrap());
+    await user.click(await screen.findByRole("button", { name: "Continue with Claude Code" }));
+    expect(screen.getByRole("button", { name: "Check in Claude Code" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Retry connection options" }));
+    expect(await screen.findByLabelText("Terminal · AKB sign-in")).toHaveTextContent("https://akb.example.test/workspace/mcp/");
+    expect(screen.queryByRole("radio", { name: "Personal connection key (PAT)" })).toBeNull();
   });
 
   it("keeps PAT management available in SSO mode", async () => {
     const { getAuthConfig, getMe, listPATs } = await import("@/lib/api");
     (getAuthConfig as any).mockResolvedValue({
       available: true,
-      schema_version: 2,
+      schema_version: 3,
       auth_mode: "sso",
       local_auth: { enabled: false },
       keycloak: {
@@ -109,6 +137,8 @@ describe("Shared connection setup", () => {
         login_url: null,
       }],
       mcp_oauth: { enabled: true },
+      personal_access_tokens: { enabled: true },
+      mcp_endpoint_url: "https://akb.example.test/mcp/",
     });
     (getMe as any).mockResolvedValue({ user_id: "u1", username: "u", email: "u@x", is_admin: false });
     (listPATs as any).mockResolvedValue({
@@ -117,7 +147,8 @@ describe("Shared connection setup", () => {
 
     render(wrap());
 
+    await userEvent.setup().click(await screen.findByRole("tab", { name: "Connection keys" }));
     expect(await screen.findByText("automation")).toBeVisible();
-    expect(screen.getByRole("button", { name: /revoke token automation/i })).toBeVisible();
+    expect(screen.getByRole("button", { name: /revoke key automation/i })).toBeVisible();
   });
 });

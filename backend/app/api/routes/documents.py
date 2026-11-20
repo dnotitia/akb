@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user
+from app.exceptions import ConflictError
 from app.services import skill_policy, template_registry
 from app.services.access_service import (
     check_vault_access,
@@ -20,6 +21,7 @@ from app.models.document import (
 )
 from app.services.auth_service import AuthenticatedUser
 from app.services.revision_backend import get_document_service
+from app.services.document_idempotency import document_actor_options
 from app.services.vault_creation_capabilities import get_vault_creation_capabilities
 from app.util.git_refs import HEX_COMMIT_RE
 from app.util.text import to_nfc
@@ -101,7 +103,10 @@ async def list_vaults(user: AuthenticatedUser = Depends(get_current_user)):
 )
 async def put_document(req: DocumentPutRequest, user: AuthenticatedUser = Depends(get_current_user)):
     await check_vault_access(user.user_id, req.vault, required_role="writer")
-    return await doc_service.put(req, agent_id=user.username)
+    return await doc_service.put(
+        req, agent_id=user.username,
+        **document_actor_options(req.idempotency_key, str(user.user_id)),
+    )
 
 
 @router.post(
@@ -158,14 +163,17 @@ async def get_document(
     operation_id="documentsUpdateDocument",
 )
 async def update_document(vault: str, doc_id: str, req: DocumentUpdateRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    await check_vault_access(user.user_id, vault, required_role="writer")
+    writer_access = await check_vault_access(user.user_id, vault, required_role="writer")
     current = await doc_service.get(vault, doc_id)
     skill_internal = current.path == skill_policy.VAULT_SKILL_PATH
     if skill_internal:
-        await check_vault_access(user.user_id, vault, required_role="owner")
+        owner_access = await check_vault_access(user.user_id, vault, required_role="owner")
+        if owner_access["vault_id"] != writer_access["vault_id"]:
+            raise ConflictError("Vault identity changed after authorization")
     return await doc_service.update(
         vault, doc_id, req, agent_id=user.username,
         skill_internal=skill_internal,
+        **document_actor_options(req.idempotency_key, str(user.user_id)),
     )
 
 

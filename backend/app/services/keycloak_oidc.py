@@ -39,6 +39,7 @@ from app.services.auth_verifier_profiles import (
     KeycloakRouteProfile,
     VerifiedPrincipal,
 )
+from app.services.tool_resource_policy import DCR_ADMISSION_CLAIM, DCR_ADMISSION_VALUE
 from app.sso.providers.keycloak_oidc import ProviderDefinitionError, validate_alias
 from app.sso import local_realm
 
@@ -243,6 +244,7 @@ class KeycloakOIDC:
         provider_alias: str,
         allowed_provider_aliases: list[str] | None = None,
         login_challenge_id: str | None = None,
+        monitoring: bool = False,
     ) -> BrowserAuthorizationRequest:
         """Build the ordinary AKB browser's nonce+PKCE authorization request.
 
@@ -266,6 +268,8 @@ class KeycloakOIDC:
             "browser_binding_hash": hashlib.sha256(browser_binding.encode("ascii")).hexdigest(),
             "login_sequence": str(login_sequence),
         }
+        if monitoring:
+            payload["purpose"] = "monitoring"
         if login_challenge_id is not None:
             payload["login_challenge_id"] = login_challenge_id
         if allowed_provider_aliases is not None:
@@ -965,7 +969,7 @@ class KeycloakOIDC:
             return None
         # The dedicated browser-admin client is an authentication proof only.
         # Its access token must never become an API or MCP resource credential,
-        # even on the MCP profile where dynamic client IDs are otherwise valid.
+        # including MCP clients admitted by the registration policy.
         if claims["azp"] == settings.keycloak_admin_client_id:
             return None
         # A client an operator named as the non-human service authority is
@@ -977,6 +981,16 @@ class KeycloakOIDC:
             return None
         if route_profile == "api" and claims["azp"] not in settings.keycloak_human_client_ids:
             return None
+        if route_profile == "mcp":
+            if claims["azp"] in settings.keycloak_human_client_ids:
+                return None
+            if (
+                claims["azp"] not in settings.mcp_oauth_client_ids
+                and claims.get(DCR_ADMISSION_CLAIM) != DCR_ADMISSION_VALUE
+            ):
+                return None
+            if audience != settings.mcp_oauth_audience_effective or claims["aud"] not in (audience, [audience]):
+                return None
         if type(claims.get("iat")) is not int or type(claims.get("exp")) is not int:
             return None
         if claims["exp"] <= claims["iat"]:

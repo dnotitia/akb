@@ -69,6 +69,6 @@ export function scopeSummary(scope: VaultWriteScope | null | undefined): string 
   return `Writes: ${[...scope.extra_vaults, ...scope.prefixes.map(p => `prefix ${p}`)].join(" OR ") || "Select at least one Vault or prefix"}`;
 }
 export function draftSummary(draft: PatDraft): string {
-  const expiration = draft.expiration === "none" ? "No expiration" : draft.expiration === "custom" ? `Expires ${customExpiration(draft) ?? "at a date and time you choose"}` : `Expires ${draft.expiration} × 24 hours after issuance`;
+  const expiration = draft.expiration === "none" ? "No expiration" : draft.expiration === "custom" ? `Expires ${customExpiration(draft) ?? "at a date and time you choose"}` : `Expires in ${draft.expiration} days`;
   return `${expiration} · ${draft.permissions === "read" ? "Read only" : draft.permissions === "read-write" ? "Read and write" : `Unsupported permissions: ${draft.originalScopes?.join(", ")}`} · ${scopeSummary(draft.restricted ? { prefixes: draft.prefixes, extra_vaults: draft.vaults } : null)}`;
 }

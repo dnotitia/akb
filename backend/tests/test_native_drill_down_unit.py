@@ -98,3 +98,26 @@ async def test_native_heading_only_outline_retains_hierarchy_and_order(native_bo
     assert await service.drill_down("native", "id", section="Last") == [
         {"section_path": "# Last", "content": "", "chunk_index": 2},
     ]
+
+
+@pytest.mark.asyncio
+async def test_filtered_outline_can_reach_headings_beyond_the_first_page(native_body, monkeypatch):
+    from mcp_server import server
+
+    monkeypatch.setattr(server, "check_vault_access", AsyncMock())
+    early = "".join(f"# Early {index}\nbody\n" for index in range(51))
+    native_body.return_value = SimpleNamespace(content=early + (
+        "# 설치\nintro\n## 설정\nfirst\n## 설정\nrepeat\n"
+        "# 설치법\nsibling\n## 설정\nother\n# 설치/API\nslash in title\n"
+    ))
+    args = {"uri": "akb://native/doc/guide.md", "mode": "outline"}
+    full = await server._handle_drill_down(args, "reader", None)
+    assert full["returned"] == 50 and full["truncated"] is True
+    assert "# 설치" not in full["outline"]
+    for prefix, paths in [
+        ("# 설치", ["# 설치", "# 설치 > ## 설정"]),
+        ("# 설치 > ## 설정", ["# 설치 > ## 설정"]),
+        ("# 없는 제목", []),
+    ]:
+        result = await server._handle_drill_down({**args, "section": prefix}, "reader", None)
+        assert result == {"uri": args["uri"], "outline": paths, "returned": len(paths), "total": len(paths)}

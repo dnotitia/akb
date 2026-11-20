@@ -46,7 +46,7 @@ services:
     # S3-compatible object store for vault file uploads. Without this,
     # `akb_put_file` / file e2e suites can't run locally — they get
     # routed to a non-existent endpoint and silently 0-out.
-    image: icr.io/fusion-open/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    image: docker.io/dappros/minio@sha256:624bad2fe79a8613aa3c5c9b765ebcab365080b8445cf1b05c357cc7753725f0
     command: server /data --address :9000 --console-address :9001
     environment:
       MINIO_ROOT_USER: akb-local
@@ -66,7 +66,7 @@ services:
   # exits — no long-lived sidecar. Backend brings up after this finishes
   # so the bucket is guaranteed present on first request.
   minio-bootstrap:
-    image: icr.io/fusion-open/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    image: docker.io/dappros/minio@sha256:624bad2fe79a8613aa3c5c9b765ebcab365080b8445cf1b05c357cc7753725f0
     depends_on:
       minio:
         condition: service_healthy

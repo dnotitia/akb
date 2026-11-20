@@ -35,6 +35,7 @@ const minutes = (count: number) => count * 60 * 1000;
 const serverStateSpecs = [
   "smoke",
   "search-live",
+  "mcp-monitoring-access",
   "pat-issuance-live",
   "account-security-live",
   "profile-photo-live",
@@ -77,8 +78,8 @@ const modes: Record<"mock" | "fixture" | "real", PlaywrightTestConfig> = {
   mock: {
     use: { baseURL: "http://127.0.0.1:4173" },
     webServer: {
-      command: "VITE_AKB_TEST_MODE=mock pnpm run dev --host 127.0.0.1 --port 4173 --strictPort",
-      url: "http://127.0.0.1:4173",
+      command: "pnpm run dev:e2e:mock",
+      url: "http://127.0.0.1:4173/__akb_mock__/health",
       reuseExistingServer: false,
       timeout: 120_000,
     },

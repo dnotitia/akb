@@ -5,11 +5,11 @@ import re
 from typing import NoReturn
 import uuid
 
-from fastapi import HTTPException, Request, Security
+from fastapi import Header, HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import settings
-from app.exceptions import AuthenticationError
+from app.exceptions import AuthenticationError, ForbiddenError
 from app.models.vault_scope import (
     current_request_jwt_claims,
     parse_request_jwt_claims_header,
@@ -19,6 +19,7 @@ from app.services.auth_service import (
     resolve_delegated_human_authorization,
     resolve_rest_credential_change_authorization,
     resolve_rest_user_authorization,
+    resolve_tool_control_authorization,
     token_has_scope,
 )
 from app.services.app_identity_service import (
@@ -33,6 +34,8 @@ from app.services.sso_browser_session_service import (
     sso_browser_csrf_cookie_name,
     sso_browser_session_cookie_name,
 )
+from app.services.tool_resource_policy import REST_OPERATION_SCOPES
+from app.sso.operation_request_scope import SSO_OPERATION_REQUEST_SCOPES
 
 bearer_auth = HTTPBearer(auto_error=False, scheme_name="bearerAuth")
 
@@ -171,19 +174,37 @@ async def get_current_user(
     return await _authenticated_user(request)
 
 
+@dataclass(frozen=True)
+class ToolControlUser:
+    operation: str
+
+    def __post_init__(self) -> None:
+        if self.operation not in REST_OPERATION_SCOPES:
+            raise ValueError(f"Not an admitted tool control: {self.operation}")
+
+    async def __call__(
+        self,
+        request: Request,
+        _credentials: HTTPAuthorizationCredentials | None = Security(bearer_auth),
+    ) -> AuthenticatedUser:
+        return await _authenticated_user(request, tool_operation=self.operation)
+
+
 async def _authenticated_user(
     request: Request,
     *,
     for_credential_change: bool = False,
+    tool_operation: str | None = None,
 ) -> AuthenticatedUser:
     current_request_jwt_claims.set(None)
     authorization = request.headers.get("authorization")
-    if authorization:
-        resolve = (
-            resolve_rest_credential_change_authorization
-            if for_credential_change
-            else resolve_rest_user_authorization
-        )
+    if authorization is not None:
+        if tool_operation is not None:
+            resolve = resolve_tool_control_authorization
+        elif for_credential_change:
+            resolve = resolve_rest_credential_change_authorization
+        else:
+            resolve = resolve_rest_user_authorization
         user = await resolve(authorization)
     else:
         user = await _resolve_cookie_user(request, optional=False)
@@ -191,6 +212,23 @@ async def _authenticated_user(
             raise HTTPException(status_code=401, detail="Authentication required")
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if (
+        tool_operation is not None
+        and user.oauth_audience is not None
+        and user.oauth_audience == settings.mcp_oauth_audience_effective
+    ):
+        required = REST_OPERATION_SCOPES[tool_operation]
+        if required not in (user.oauth_scopes or ()):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": f"OAuth token is missing required scope '{required}'",
+                    "code": "insufficient_scope",
+                    "required_scope": required,
+                    "granted_scopes": sorted(user.oauth_scopes or ()),
+                },
+                headers={"WWW-Authenticate": f'Bearer error="insufficient_scope", scope="{required}"'},
+            )
     required_scope = _required_scope_for_request(request)
     if not token_has_scope(user.token_scopes, required_scope):
         raise HTTPException(
@@ -203,6 +241,40 @@ async def _authenticated_user(
             },
         )
     _apply_claim_header(request, user)
+    return user
+
+
+async def get_sso_operation_request_service_key(
+    authorization: str | None = Header(default=None),
+) -> AuthenticatedUser:
+    """Resolve only the dedicated bearer key for operation-request routes.
+
+    This deliberately calls the REST bearer resolver directly rather than the
+    generic request dependency: this one scope is neither read nor write, so
+    treating it as either would grant it every ordinary API route. It also
+    never consults cookies or a browser session.
+    """
+    if not authorization:
+        raise ForbiddenError(
+            "SSO operation requests require a dedicated service key",
+            code="sso_operation_request_service_key_required",
+        )
+    user = await resolve_rest_user_authorization(authorization)
+    if user is None:
+        raise AuthenticationError()
+    if (
+        user.account_kind != "service"
+        or user.is_admin
+        or user.auth_method != "pat"
+        or user.token_id is None
+        or user.key_class != "service"
+        or user.vault_scope is not None
+        or user.token_scopes != SSO_OPERATION_REQUEST_SCOPES
+    ):
+        raise ForbiddenError(
+            "SSO operation requests require a dedicated service key",
+            code="sso_operation_request_service_key_required",
+        )
     return user
 
 
@@ -229,7 +301,7 @@ async def get_optional_user(
     """Extract user if present, None otherwise. For optional auth."""
     current_request_jwt_claims.set(None)
     authorization = request.headers.get("authorization")
-    if not authorization:
+    if authorization is None:
         user = await _resolve_cookie_user(request, optional=True)
         if user is not None:
             _apply_claim_header(request, user)

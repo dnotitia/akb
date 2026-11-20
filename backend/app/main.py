@@ -19,6 +19,8 @@ from app.api.deps import get_current_user, get_optional_user
 from app.api.routes import (
     access,
     admin_auth,
+    mcp_monitoring,
+    monitoring_auth,
     admin_sso,
     activity,
     assets,
@@ -218,6 +220,8 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/api/v1/admin/mcp-monitoring"):
+        return JSONResponse(status_code=422, content=_error_payload(422, "Invalid monitoring request"))
     details = exc.errors()
     if request.url.path == "/api/v1/auth/tokens/issuance":
         fields = [{"field": ".".join(str(part) for part in error["loc"] if part != "body") or "form",
@@ -370,6 +374,8 @@ app.add_middleware(CancelDisconnectedReadMiddleware)
 
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(user_avatar.router, prefix="/api/v1", tags=["auth"])
+app.include_router(mcp_monitoring.router, prefix="/api/v1", tags=["mcp-monitoring"])
+app.include_router(monitoring_auth.router, prefix="/api/v1", tags=["monitoring-auth"])
 app.include_router(admin_auth.router, prefix="/api/v1", tags=["admin-auth"])
 app.include_router(admin_sso.router, prefix="/api/v1", tags=["admin-sso"])
 app.include_router(app_identity.router, prefix="/api/v1", tags=["app-identity"])
@@ -407,7 +413,12 @@ install_openapi_contract(app)
 app.include_router(oauth_metadata.router)
 
 # Mount MCP Streamable HTTP at /mcp
-app.mount("/mcp", mcp_app)
+if settings.mcp_monitoring.export_traces:
+    from app.mcp_monitoring.tracing import instrument_mcp
+
+    app.mount("/mcp", instrument_mcp(mcp_app))
+else:
+    app.mount("/mcp", mcp_app)
 
 
 @app.get("/livez")

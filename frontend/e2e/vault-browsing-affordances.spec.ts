@@ -22,7 +22,7 @@ async function fixture(page: Page, dark = false) {
   await page.route("**/api/v1/**", route => {
     const url = new URL(route.request().url());
     const path = url.pathname;
-    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
     if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "browsing-user", username: "reader", email: "reader@example.invalid", display_name: "Workspace Reader", auth_method: "local", key_class: null, is_admin: false } });
     if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults } });
     if (path.endsWith("/info")) return route.fulfill({ json: { name: "alpha-engineering", role: "owner", document_count: 2, collection_count: 1, table_count: 0, file_count: 0 } });

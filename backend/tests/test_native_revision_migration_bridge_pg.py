@@ -1691,7 +1691,7 @@ async def test_alias_mutation_after_prepare_fails_closed_before_publication(tmp_
             )
 
 
-async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics(tmp_path):
+async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics(tmp_path, monkeypatch):
     async with _fresh_schema(tmp_path) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         backfill = NativeRevisionBackfill(pool, git=fixture["git"])
@@ -1726,7 +1726,31 @@ async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics
 
         assert [entry["hash"] for entry in bridged] == frozen_hashes
         assert bridged == [expected_by_hash[commit] for commit in frozen_hashes]
+        newest = bridged[0]
+        instant = datetime.fromisoformat(newest["date"])
+        options = {"max_count": 1, "since": instant.isoformat(), "path": None, "author": newest["agent"].upper()}
+        assert await backend.vault_activity(fixture["vault_name"], until=instant, **options) == []
+        assert await backend.vault_activity(
+            fixture["vault_name"], until=instant + timedelta(microseconds=1), **options,
+        ) == [newest]
         assert fixture["later_file_tip"][:12] not in {entry["hash"] for entry in activity}
+
+        # A synthetic import with the same actor is newer than this genuine
+        # Native event. It must not spend the only slot of a limit=1 query.
+        from app.services import native_revision_service
+
+        class EarlierClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return instant - timedelta(days=1)
+
+        monkeypatch.setattr(native_revision_service, "datetime", EarlierClock)
+        native = native_revision_service.NativeRevisionService(pool, payload_store=backfill.body_store)
+        older = await native.create_text(namespace_id=fixture["namespace_id"], surface="document", path="native.md",
+                                         payload="native", actor=backfill.actor, mutation_id=uuid.uuid4())
+        results = await backend.vault_activity(fixture["vault_name"], max_count=1, since=None,
+                                              path=None, author=backfill.actor)
+        assert [e["hash"] for e in results] == [older.revision_id]
 
 
 async def test_completed_backfill_preserves_pg_only_public_document_metadata(tmp_path):

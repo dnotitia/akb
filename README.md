@@ -24,11 +24,15 @@ Any agent client that speaks **MCP (Streamable HTTP or stdio)**:
   [`akb-mcp`](https://www.npmjs.com/package/akb-mcp) stdio proxy
 - Custom agents — direct HTTP `POST /mcp/` with a Bearer token
 
-The default flow uses a Personal Access Token. Deployments with the
-optional **MCP OAuth Resource Server** path turned on (via Keycloak as
-the AS — see [`docs/mcp-clients/web-connectors.md`](./docs/mcp-clients/web-connectors.md))
-also accept Claude Code's `mcp add --transport http` + `mcp login` flow
-end-to-end, without a PAT.
+The stdio proxy accepts an explicit Personal Access Token (PAT). On an
+OAuth-enabled installation, run `npx akb-mcp login --url <mcp-url>` once
+before starting the host with a URL-only configuration. One credential covers
+MCP and the proxy's local file tools. [Configure the stdio proxy](packages/akb-mcp-client/README.md).
+
+For direct HTTP OAuth, configure the client and authorization server.
+[Configure direct HTTP OAuth](docs/mcp-clients/web-connectors.md).
+
+Product administrators can view server-observed calls by user, PAT and tool. [MCP monitoring](docs/operations/mcp-monitoring.md)
 
 ## MCP protocol compatibility
 
@@ -300,6 +304,27 @@ Task-oriented guides for teams evaluating or adopting an agent knowledge layer:
 - [Applying permissions at query time when agents search shared knowledge](docs/guides/query-time-permissions-for-agent-search.md)
 - [Keeping a record of what coding agents decided](docs/guides/recording-coding-agent-decisions.md)
 - [Keeping search current when documents and embedding models change](docs/guides/keeping-embeddings-current.md)
+- [Adding a knowledge layer to an existing agent stack](docs/guides/adding-a-knowledge-layer-to-an-existing-agent-stack.md)
+- [Adding a new department without rebuilding the setup](docs/guides/adding-a-new-department-without-a-rebuild.md)
+- [Exporting a vault to the Open Knowledge Format](docs/guides/exporting-a-vault-to-open-knowledge-format.md)
+- [Keeping model calls inside your network](docs/guides/keeping-model-calls-inside-your-network.md)
+- [Moving agent memory from one laptop to a team-wide store](docs/guides/moving-agent-memory-to-a-team-store.md)
+- [Moving Markdown notes into a searchable store](docs/guides/moving-markdown-notes-into-a-searchable-store.md)
+- [Why a vector store alone is a weak agent memory](docs/guides/why-a-vector-store-alone-is-a-weak-agent-memory.md)
+- [Choosing what to ingest into a knowledge base](docs/guides/choosing-what-to-ingest.md)
+- [Combining search, grep, relations and SQL for agent lookups](docs/guides/combining-search-grep-relations-and-sql.md)
+- [Connectors or your own ingestion](docs/guides/connectors-or-your-own-ingestion.md)
+- [Keeping ingested copies linked to their source](docs/guides/keeping-ingested-copies-linked-to-their-source.md)
+- [Reaching people in the tools they already use](docs/guides/reaching-people-in-the-tools-they-already-use.md)
+- [Running agent knowledge alongside a wiki](docs/guides/running-agent-knowledge-alongside-a-wiki.md)
+- [Separating teams and agents with vault permissions](docs/guides/separating-teams-and-agents-with-vault-permissions.md)
+- [Building curation on change events](docs/guides/building-curation-on-change-events.md)
+- [Citing the exact source behind an answer](docs/guides/citing-the-exact-source-behind-an-answer.md)
+- [Finding duplicate and outdated documents](docs/guides/finding-duplicate-and-outdated-documents.md)
+- [Reconciling conflicting names across systems](docs/guides/reconciling-conflicting-names-across-systems.md)
+- [Reviewing agent writes before they go live](docs/guides/reviewing-agent-writes-before-they-go-live.md)
+- [Rolling back a document to an earlier version](docs/guides/rolling-back-a-document-to-an-earlier-version.md)
+- [Running a shared vocabulary as living documents](docs/guides/running-a-shared-vocabulary-as-living-documents.md)
 
 ## Quick Start
 

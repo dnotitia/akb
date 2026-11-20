@@ -14,9 +14,10 @@ import { EditorContent, useEditor } from '@tiptap/react'
 import { createPortal } from 'react-dom'
 import { MarkdownViewerReadingTools, type MarkdownViewerReadingOptions } from './markdown-reading-tools.js'
 import { MarkdownViewerFootnotes } from './markdown-footnotes.js'
+import { installHeadingPresentation } from './markdown-heading-presentation.js'
 export { findReadingTextMatches, revealMarkdownTarget } from './markdown-reading-tools.js'
 export type { MarkdownViewerReadingOptions, MarkdownViewerCodeBlock, ReadingTextMatch } from './markdown-reading-tools.js'
-import { Plugin, PluginKey } from '@tiptap/pm/state'
+import { Plugin, PluginKey, type EditorState } from '@tiptap/pm/state'
 import { Decoration, DecorationSet } from '@tiptap/pm/view'
 import type { Editor } from '@tiptap/core'
 import {
@@ -717,98 +718,26 @@ export function MarkdownSurface({
   }, [editor])
 
   useLayoutEffect(() => {
-    const root = editor?.view.dom
-    if (!root) return
-
-    const addedClasses = (contentClassName ?? '').split(/\s+/).filter(Boolean).filter(
-      className => !root.classList.contains(className),
-    )
-    root.classList.add(...addedClasses)
-
-    const previousAttributes = new Map<string, string | null>()
-    for (const [name, value] of Object.entries(contentAttributes ?? {})) {
-      previousAttributes.set(name, root.getAttribute(name))
-      if (value === null || value === undefined) root.removeAttribute(name)
-      else root.setAttribute(name, String(value))
-    }
-
-    return () => {
-      root.classList.remove(...addedClasses)
-      for (const [name, value] of previousAttributes) {
-        if (value === null) root.removeAttribute(name)
-        else root.setAttribute(name, value)
+    if (!editor || (!contentClassName && !contentAttributes)) return
+    // ProseMirror refreshes root attributes when plugins change. Keep product
+    // roles, labels and classes in that same owner rather than mutating its DOM.
+    const previous = editor.view.props.attributes
+    const attributes = (state: EditorState) => {
+      const result = { ...(typeof previous === 'function' ? previous(state) : previous) }
+      for (const [name, value] of Object.entries(contentAttributes ?? {})) {
+        if (value === null || value === undefined) delete result[name]
+        else result[name] = String(value)
       }
+      if (contentClassName) result.class = [result.class, contentClassName].filter(Boolean).join(' ')
+      return result
     }
+    editor.view.setProps({ attributes })
+    return () => { if (!editor.isDestroyed && editor.view.props.attributes === attributes) editor.view.setProps({ attributes: previous }) }
   }, [contentAttributes, contentClassName, editor])
 
   useLayoutEffect(() => {
-    const root = editor?.view.dom
-    if (!root || editable || !headings) return
-
-    const managed = new Map<HTMLElement, { tagName: string; id: string | null }>()
-    const apply = () => {
-      for (const heading of managed.keys()) if (!heading.isConnected) managed.delete(heading)
-      const offset = Math.trunc(headings.levelOffset ?? 0)
-      markdownContentElements<HTMLElement>(root, 'h1, h2, h3, h4, h5, h6').forEach((heading, index) => {
-        const original = managed.get(heading) ?? {
-          tagName: heading.tagName.toLowerCase(),
-          id: heading.getAttribute('id'),
-        }
-        managed.set(heading, original)
-        const sourceLevel = Number(original.tagName.slice(1))
-        const nextLevel = Math.max(1, Math.min(6, sourceLevel + offset))
-        let target = heading
-        const tagName = `h${nextLevel}`
-        if (heading.tagName.toLowerCase() !== tagName) {
-          const replacement = root.ownerDocument.createElement(tagName)
-          for (const attribute of Array.from(heading.attributes)) {
-            replacement.setAttribute(attribute.name, attribute.value)
-          }
-          replacement.innerHTML = heading.innerHTML
-          heading.replaceWith(replacement)
-          managed.delete(heading)
-          managed.set(replacement, original)
-          target = replacement
-        }
-        const id = headings.ids?.[index]
-        if (id) target.id = id
-        else if (original.id === null) target.removeAttribute('id')
-        else target.id = original.id
-      })
-    }
-
-    const restore = () => {
-      for (const [heading, original] of managed) {
-        if (!heading.isConnected) continue
-        let target = heading
-        if (heading.tagName.toLowerCase() !== original.tagName) {
-          const replacement = root.ownerDocument.createElement(original.tagName)
-          for (const attribute of Array.from(heading.attributes)) {
-            replacement.setAttribute(attribute.name, attribute.value)
-          }
-          replacement.innerHTML = heading.innerHTML
-          heading.replaceWith(replacement)
-          target = replacement
-        }
-        if (original.id === null) target.removeAttribute('id')
-        else target.id = original.id
-      }
-    }
-
-    apply()
-    root.addEventListener('markdown-reading-presentation', apply)
-    editor.on('transaction', apply)
-    const observer = typeof MutationObserver === 'undefined'
-      ? null
-      : new MutationObserver(apply)
-    observer?.observe(root, { childList: true, subtree: true })
-
-    return () => {
-      editor.off('transaction', apply)
-      root.removeEventListener('markdown-reading-presentation', apply)
-      observer?.disconnect()
-      restore()
-    }
+    if (!editor || editable || !headings) return
+    return installHeadingPresentation(editor, headings)
   }, [editable, editor, headings])
 
   useLayoutEffect(() => {
@@ -1991,6 +1920,8 @@ export interface MarkdownViewerProps extends Omit<MarkdownSurfaceProps, 'editor'
   reading?: MarkdownViewerReadingOptions
   /** Read-only presentation after a leading heading, or before a headingless body. Never serialized. */
   afterLeadingHeading?: ReactNode
+  /** Read-only presentation before the entire body. Never serialized or searched as source. */
+  beforeContent?: ReactNode
   markdown: string
   profile?: MarkdownProfile
   adapters?: MarkdownAdapters
@@ -2002,6 +1933,7 @@ export function MarkdownViewer({
   markdown,
   reading,
   afterLeadingHeading,
+  beforeContent,
   profile = 'preserve',
   adapters,
   reference,
@@ -2024,9 +1956,17 @@ export function MarkdownViewer({
     element.setAttribute('contenteditable', 'false')
     return element
   })
+  const [beforeHost] = useState(() => {
+    if (typeof document === 'undefined') return null
+    const element = document.createElement('div')
+    element.dataset.markdownLeadingAdornment = 'true'
+    element.setAttribute('contenteditable', 'false')
+    return element
+  })
   const hasAdornment = afterLeadingHeading != null && afterLeadingHeading !== false
+  const hasBefore = beforeContent != null && beforeContent !== false
   useLayoutEffect(() => {
-    if (!rawEditor || !adornmentHost || !hasAdornment) return
+    if (!rawEditor || !adornmentHost || !beforeHost || (!hasAdornment && !hasBefore)) return
     const key = new PluginKey('markdownViewerLeadingAdornment')
     rawEditor.registerPlugin(new Plugin({
       key,
@@ -2034,15 +1974,21 @@ export function MarkdownViewer({
         decorations(state) {
           const first = state.doc.firstChild
           const position = first?.type.name === 'heading' ? first.nodeSize : 0
-          return DecorationSet.create(state.doc, [Decoration.widget(position, adornmentHost, {
+          const decorations = []
+          if (hasBefore) decorations.push(Decoration.widget(0, beforeHost, {
+            key: 'before-content', side: -2, ignoreSelection: true,
+            stopEvent: () => true,
+          }))
+          if (hasAdornment) decorations.push(Decoration.widget(position, adornmentHost, {
             key: 'leading-adornment', side: -1, ignoreSelection: true,
             stopEvent: () => true,
-          })])
+          }))
+          return DecorationSet.create(state.doc, decorations)
         },
       },
     }))
     return () => { rawEditor.unregisterPlugin(key) }
-  }, [rawEditor, adornmentHost, hasAdornment])
+  }, [rawEditor, adornmentHost, beforeHost, hasAdornment, hasBefore])
 
   const resolutions = useMarkdownTargetResolutions(
     markdown,
@@ -2085,6 +2031,7 @@ export function MarkdownViewer({
       <MarkdownViewerReadingTools editor={rawEditor} options={reading} />
       <MarkdownViewerFootnotes editor={rawEditor} />
       {hasAdornment && adornmentHost && createPortal(afterLeadingHeading, adornmentHost)}
+      {hasBefore && beforeHost && createPortal(beforeContent, beforeHost)}
     </>
   )
 }

@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.4.0
+
+- Run `akb-mcp login --url <mcp-url>` before starting a URL-only stdio
+  connection. The proxy uses the saved OAuth grant for MCP and file controls.
+- Use `--pat` or `AKB_PAT` to select PAT mode. The proxy requires verified TLS
+  outside loopback development.
+- Submit each caller operation once. The proxy reports unknown outcomes after
+  loss of a response and partial outcomes after a successful file transfer
+  stage. Reconnect probes can still restore the connection for new calls.
+
+## Unreleased — document body input validation
+
+`akb_put` accepts exactly one of `content` or local `file`; `akb_update`
+continues to accept metadata-only changes and `content: null`. Supplying both
+fields is now rejected even when `content` is empty or null. Integrations that
+send placeholder content alongside a file must omit the content key entirely.
+Empty/non-string file paths and invalid body types return `invalid_argument`
+with `details.field` before file reads or forwarding.
+
+The advertised schema now allows file-only creation and applies the backend's
+whole-body preconditions to file updates. Original-read tokens are forwarded
+unchanged; the proxy never fetches a replacement token or retries a conflict.
+
+Opt-in usage records include document input validation and file-read failures,
+with one record per call and no document content or local paths in the log.
+
 ## Unreleased — the proxy's own refusals set `isError`
 
 The file tools the proxy answers itself (`akb_put_file`, `akb_get_file`,

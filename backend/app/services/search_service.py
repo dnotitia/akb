@@ -17,13 +17,16 @@ import re
 import time
 import uuid
 import functools
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import nullcontext
 from typing import Literal, ParamSpec
+
+from pydantic import AwareDatetime, TypeAdapter, ValidationError as TimestampError
 
 from app.config import settings
 from app.db.postgres import get_pool
 from app.exceptions import ValidationError
-from app.services.search_filters import ArchiveScope, collection_predicate, escape_like, metadata_matches, resolve_archive_scope, status_matches
+from app.services.search_filters import ArchiveScope, DocumentTimeRange, collection_predicate, escape_like, metadata_matches, resolve_archive_scope, status_matches
 from app.models.document import SearchResponse, SearchResult
 from app.repositories.vault_files_repo import confirmed_file_predicate
 from app.services import sparse_encoder
@@ -123,7 +126,7 @@ NATIVE_CANDIDATE_PAGE_SIZE = 2_000
 # flag and giving it a word the caller sees are the same decision: a cause with
 # no public name would be dropped from the response with nothing to explain the
 # short page, which is the gap akb#608 exists to close.
-PUBLIC_DROP_CAUSE_NAMES = {"archive_scope_excluded": "archived"}
+PUBLIC_DROP_CAUSE_NAMES = {"archive_scope_excluded": "archived", "time_range_excluded": "time_range"}
 NON_DEGRADING_DROP_CAUSES = frozenset(PUBLIC_DROP_CAUSE_NAMES)
 
 
@@ -211,10 +214,10 @@ def degradation_causes(reason: str | None) -> tuple[str, ...]:
 _P = ParamSpec("_P")
 
 
-def _counted(
+def _search_request(
     fn: Callable[_P, Awaitable[SearchResponse]],
 ) -> Callable[_P, Awaitable[SearchResponse]]:
-    """Count every search response on its way out (akb#612).
+    """Enforce the opt-in document-window deadline and count completed responses.
 
     A decorator rather than a call before each `return`: `search` has four
     return sites and adding a fifth is an ordinary edit, so a chokepoint that
@@ -230,7 +233,13 @@ def _counted(
 
     @functools.wraps(fn)
     async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> SearchResponse:
-        response = await fn(*args, **kwargs)
+        # A date window may have to read canonical Native metadata to resolve
+        # creation times. Bound the entire operation, including pool waits and
+        # remote retrieval. Untimed searches retain their existing leg budgets.
+        deadline = (asyncio.timeout(settings.search_retrieval_timeout_secs)
+                    if kwargs.get("time_range") is not None else nullcontext())
+        async with deadline:
+            response = await fn(*args, **kwargs)
         from app.services import search_degradation_stats
 
         search_degradation_stats.record(response)
@@ -642,6 +651,33 @@ def _verified_native_metadata(row) -> dict:
     return metadata
 
 
+_AWARE_DOCUMENT_TIME = TypeAdapter(AwareDatetime)
+_TIME_LEGACY_JOIN = "LEFT JOIN documents legacy ON legacy.vault_id = r.namespace_id AND legacy.id = r.resource_id"
+_TIME_COLUMNS = """r.created_at AS resource_created_at, r.updated_at AS resource_updated_at,
+                   legacy.created_at AS legacy_created_at, legacy.doc_type AS legacy_type,
+                   legacy.tags AS legacy_tags, legacy.status AS legacy_status"""
+
+
+def _dated_native_metadata(row) -> dict:
+    # Migrated heads can lack fields that the public document read supplies
+    # from the frozen catalog. Preserve explicitly authored values.
+    metadata = _verified_native_metadata(row)
+    for key in ("type", "tags", "status", "created_at"):
+        if metadata.get(key) is None:
+            metadata[key] = row[f"legacy_{key}"]
+    return metadata
+
+
+def _native_time_matches(window: DocumentTimeRange, row, metadata: dict) -> bool:
+    if window.field == "updated_at":
+        return window.includes(row["resource_updated_at"])
+    try:
+        stamp = _AWARE_DOCUMENT_TIME.validate_python(metadata.get("created_at") or row["resource_created_at"])
+    except TimestampError as exc:
+        raise ValidationError("Document created_at has no usable timezone-aware instant") from exc
+    return window.includes(stamp)
+
+
 # Matches a complete leading frontmatter envelope: an opening `---` line, then
 # a closing `---` line. `re.DOTALL` so the envelope may span lines; `\Z`-safe
 # via `$` with MULTILINE. Only the envelope presence is tested here — full
@@ -718,6 +754,34 @@ def _decode_slice_prefix(raw: bytes) -> str | None:
     return None
 
 
+async def _native_section_body(vault: str, doc_id: str) -> str:
+    from app.services.native_document_service import NativeDocumentService
+
+    document = await NativeDocumentService(pool=await get_pool()).get(vault, doc_id)
+    return document.content or ""
+
+
+def _native_section_spans(body: str) -> Iterator[tuple[str, int, int]]:
+    """Yield heading paths with their source body bounds, including any preamble."""
+    from app.services.index_service import _HEADING_RE
+
+    path = ""
+    start = 0
+    hierarchy: list[tuple[int, str]] = []
+    for heading in _HEADING_RE.finditer(body):
+        if path or heading.start():
+            yield path, start, heading.start()
+        level = len(heading.group(1))
+        while hierarchy and hierarchy[-1][0] >= level:
+            hierarchy.pop()
+        hierarchy.append((level, f"{heading.group(1)} {heading.group(2).strip()}"))
+        path = " > ".join(label for _, label in hierarchy)
+        start = heading.end()
+        if body[start:start + 1] == "\n":
+            start += 1
+    yield path, start, len(body)
+
+
 class SearchService:
 
     async def _native_document_candidates(
@@ -734,6 +798,7 @@ class SearchService:
         archive_scope: ArchiveScope | None = None,
         source_uris: list[str] | None,
         doc_types: list[str] | None = None,
+        time_range: DocumentTimeRange | None = None,
     ) -> tuple[list[str], dict[str, int]]:
         conditions = ["r.surface = 'document'", "r.lifecycle = 'live'"]
         params: list = []
@@ -820,28 +885,36 @@ class SearchService:
               ) requested_resources ON requested_resources.resource_id = r.resource_id
             """
 
+        if time_range is not None and time_range.field == "updated_at":
+            time_range.add_predicates("r.updated_at", conditions, params)
+        # For dated requests a missing payload must fail the bounded scan,
+        # rather than disappearing from the aggregate as an apparent nonmatch.
+        join = "LEFT JOIN" if time_range is not None else "JOIN"
         joins = f"""
               FROM native_resources r
               {source_scope_join}
               JOIN vaults v ON v.id = r.namespace_id
-              JOIN native_revisions nr
+              {join} native_revisions nr
                 ON nr.resource_id = r.resource_id
                 AND nr.revision_id = r.head_revision_id
-              JOIN native_payload_manifests pm
+              {join} native_payload_manifests pm
                 ON pm.payload_manifest_id = nr.payload_manifest_id
-              JOIN m1_reference_payloads p ON p.payload_id = pm.private_locator
+              {join} m1_reference_payloads p ON p.payload_id = pm.private_locator
         """
         where_sql = " AND ".join(conditions)
         # The aggregate guard reads manifest numbers only — no body bytes are
         # touched, so an oversized scope is rejected before asyncpg
         # materializes anything (same shape as the grep guard).
         async with conn.transaction(isolation="repeatable_read", readonly=True):
+            scope_rows = f"SELECT p.byte_size, p.payload_id {joins} WHERE {where_sql}"
+            if time_range is not None:
+                scope_rows += f" LIMIT {NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES + 1}"
             scope = await conn.fetchrow(
                 f"""
                 SELECT COUNT(*)::bigint AS resource_count,
-                       COALESCE(SUM(p.byte_size), 0)::bigint AS body_bytes
-                  {joins}
-                 WHERE {where_sql}
+                       COALESCE(SUM(p.byte_size), 0)::bigint AS body_bytes,
+                       COUNT(*) FILTER (WHERE p.payload_id IS NULL) AS missing_bodies
+                  FROM ({scope_rows}) p
                 """,
                 *params,
             )
@@ -852,6 +925,13 @@ class SearchService:
                 raise ValidationError(
                     "native search scope exceeds the bounded candidate corpus"
                 )
+            if time_range is not None and scope["missing_bodies"]:
+                raise ValidationError("Date search requires readable canonical Native document heads")
+            body_projection = (
+                f"p.canonical_bytes, {_TIME_COLUMNS}" if time_range is not None
+                else f"substring(p.canonical_bytes FROM 1 FOR {NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES + 1}) AS body_slice"
+            )
+            read_metadata = _dated_native_metadata if time_range is not None else _filtered_native_metadata
             # Slice + paginate: the filter decision needs only
             # the leading frontmatter envelope, so fetch an 8KiB prefix per row
             # instead of the full body, keyset-paged by resource_id so peak
@@ -871,11 +951,9 @@ class SearchService:
                 SELECT r.resource_id, r.current_path, v.name AS vault_name,
                        p.byte_size, p.digest, p.encoding,
                        p.selected_placement, p.verification_profile,
-                       substring(
-                           p.canonical_bytes FROM 1
-                           FOR {NATIVE_CANDIDATE_FRONTMATTER_SLICE_BYTES + 1}
-                       ) AS body_slice
+                       {body_projection}
                   {joins}
+                  {_TIME_LEGACY_JOIN if time_range is not None else ""}
                  WHERE {page_where}
                  ORDER BY r.resource_id
                  LIMIT {NATIVE_CANDIDATE_PAGE_SIZE}
@@ -886,9 +964,7 @@ class SearchService:
                     break
                 for row in rows:
                     last_seen = str(row["resource_id"])
-                    metadata = await asyncio.to_thread(
-                        _filtered_native_metadata, row
-                    )
+                    metadata = await asyncio.to_thread(read_metadata, row)
                     if metadata is None:
                         # Envelope opens but never closes inside the slice:
                         # filter fields may lie beyond it. Exclude + count,
@@ -901,9 +977,14 @@ class SearchService:
                         continue
                     if not metadata_matches(metadata, doc_types, tags, include_archived, archive_scope):
                         continue
+                    if time_range is not None and not _native_time_matches(time_range, row, metadata):
+                        continue
                     candidates.append(str(row["resource_id"]))
                 if len(rows) < NATIVE_CANDIDATE_PAGE_SIZE:
                     break
+            if time_range is not None:
+                logger.info("date_candidates storage=native inspected=%d eligible=%d body_bytes=%d",
+                            scope["resource_count"], len(candidates), scope["body_bytes"])
         if filter_stats:
             logger.warning(
                 "native candidates: %d unparseable envelope(s) excluded: %s",
@@ -911,7 +992,7 @@ class SearchService:
             )
         return candidates, filter_stats
 
-    @_counted
+    @_search_request
     async def search(
         self,
         query: str,
@@ -928,6 +1009,8 @@ class SearchService:
         source_uris: list[str] | None = None,
         doc_types: list[str] | None = None,
         source_type: Literal["document", "file", "table"] | None = None,
+        *,
+        time_range: DocumentTimeRange | None = None,
     ) -> SearchResponse:
         """Hybrid search across documents. See module docstring for flow.
 
@@ -937,6 +1020,8 @@ class SearchService:
         set. An empty/omitted list means no restriction (default behaviour).
         """
         scope = resolve_archive_scope(archive_scope, include_archived)
+        if time_range is not None and source_type != "document":
+            raise ValidationError("A document time range requires source_type=document")
         include_archived = scope != "unarchived"
         if mode != "hybrid":
             raise ValidationError("unsupported search mode")
@@ -1030,7 +1115,7 @@ class SearchService:
                 collection=collection, doc_type=doc_type, tags=tags, source_uris=source_uris,
             )
         )
-        vault_ready = vault_backfill.is_ready() or await vault_backfill.is_ready_async()
+        vault_ready = vault_path_wanted and (vault_backfill.is_ready() or await vault_backfill.is_ready_async())
         if vault_path_wanted and not vault_ready:
             # One line on the serving side naming the disabled path (akb#526):
             # without it this surfaces only as an unrelated search refusal
@@ -1130,6 +1215,9 @@ class SearchService:
                 elif scope == "archived":
                     conditions.append("d.status = 'archived'")
 
+                if time_range is not None and document_source == LEGACY_DOCUMENT_SOURCE:
+                    column = "d.created_at" if time_range.field == "created_at" else "d.updated_at"
+                    time_range.add_predicates(column, conditions, params)
                 where_sql = " AND ".join(conditions) if conditions else "TRUE"
                 if source_type in {"file", "table"}:
                     candidate_source_ids = []
@@ -1146,17 +1234,24 @@ class SearchService:
                         archive_scope=scope,
                         source_uris=source_uris,
                         doc_types=doc_types,
+                        **({"time_range": time_range} if time_range is not None else {}),
                     )
                 else:
+                    limit_clause = f"LIMIT {NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES + 1}" if time_range is not None else ""
                     rows = await conn.fetch(
                         f"""
                         SELECT d.id FROM documents d
                         JOIN vaults v ON d.vault_id = v.id
                         WHERE {where_sql}
+                        {limit_clause}
                         """,
                         *params,
                     )
                     candidate_source_ids = [str(r["id"]) for r in rows]
+                    if time_range is not None:
+                        if len(rows) > NATIVE_SEARCH_MAX_CANDIDATE_RESOURCES:
+                            raise ValidationError("Date search exceeds the bounded candidate corpus")
+                        logger.info("date_candidates storage=bare_git eligible=%d body_bytes=0", len(rows))
 
                 # Document metadata filters never admit unrelated files/tables.
                 if scope != "archived" and (not doc_type or doc_type == "table") and not (doc_types or tags) and source_type in {None, "table"}:
@@ -1244,10 +1339,14 @@ class SearchService:
             query_embedding=query_embedding,
             candidate_source_ids=candidate_source_ids,
             candidate_vault_ids=candidate_vault_ids,
-            source_types=[document_source, "table", "file", SOURCE_NATIVE_FILE],
+            source_types=[document_source] if time_range is not None else [document_source, "table", "file", SOURCE_NATIVE_FILE],
             limit=target_unique * 3,
         )
         phases["retrieval"] = time.perf_counter() - phase_started
+        if time_range is not None:
+            allowed = set(candidate_source_ids or ())
+            if any(h.source_type != document_source or h.source_id not in allowed for h in hits):
+                raise VectorStoreUnavailable("Vector driver did not honor the document candidate scope")
         if degraded_reason is None and embedding_failed:
             degraded_reason = "query_embedding_failed"
 
@@ -1313,10 +1412,11 @@ class SearchService:
         # consumes at least one spare hit, so it terminates; when the pool is
         # exhausted the page really is short and `dropped` names the cause.
         page, spare = unique_hits[:limit], unique_hits[limit:]
-        results, dropped = await self._hydrate_hits(page, archive_scope=scope)
+        hydration_options = {"time_range": time_range} if time_range is not None else {}
+        results, dropped = await self._hydrate_hits(page, archive_scope=scope, **hydration_options)
         while len(results) < limit and spare:
             take, spare = spare[: limit - len(results)], spare[limit - len(results):]
-            more, more_dropped = await self._hydrate_hits(take, archive_scope=scope)
+            more, more_dropped = await self._hydrate_hits(take, archive_scope=scope, **hydration_options)
             results.extend(more)
             for cause, count in more_dropped.items():
                 dropped[cause] = dropped.get(cause, 0) + count
@@ -1502,7 +1602,7 @@ class SearchService:
         return doc_ids, table_ids, file_ids
 
     async def _hydrate_hits(
-        self, hits: list, *, archive_scope: ArchiveScope = "all",
+        self, hits: list, *, archive_scope: ArchiveScope = "all", time_range: DocumentTimeRange | None = None,
     ) -> tuple[list[SearchResult], dict[str, int]]:
         from app.services.index_service import SOURCE_TYPES
         by_type: dict[str, list[str]] = {t: [] for t in SOURCE_TYPES}
@@ -1536,13 +1636,18 @@ class SearchService:
         pool = await get_pool()
         meta: dict[tuple[str, str], dict] = {}
         chunk_indexes: dict[str, int] = {}
-        async with pool.acquire() as conn:
+        # On the date path, the Native byte guard and verified head reads must
+        # observe the same catalog snapshot.
+        async with pool.acquire() as conn, (
+            conn.transaction(isolation="repeatable_read", readonly=True) if time_range is not None else nullcontext()
+        ):
             if by_type["document"]:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT d.id, v.name AS vault_name, d.path, d.title,
                            c.path AS collection,
                            d.doc_type, d.summary, d.tags, d.status
+                           {", d.created_at, d.updated_at" if time_range is not None else ""}
                       FROM documents d
                       JOIN vaults v ON d.vault_id = v.id
                       LEFT JOIN collections c ON c.id = d.collection_id
@@ -1558,6 +1663,7 @@ class SearchService:
                         "summary": r["summary"],
                         "tags": list(r["tags"]) if r["tags"] else [],
                         "collection": r["collection"],
+                        "in_time_range": time_range is None or time_range.includes(r[time_range.field]),
                     }
             if by_type[NATIVE_DOCUMENT_SOURCE]:
                 native_hits = {
@@ -1591,13 +1697,13 @@ class SearchService:
                         "native search hydration exceeds the bounded body corpus"
                     )
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT c.id AS chunk_id, r.resource_id, r.current_path,
                            r.head_revision_id, v.name AS vault_name,
                            p.payload_id, p.namespace_id, p.content_profile,
                            p.digest, p.byte_size, p.encoding,
                            p.selected_placement, p.verification_profile,
-                           p.canonical_bytes
+                           p.canonical_bytes {", " + _TIME_COLUMNS if time_range is not None else ""}
                       FROM chunks c
                       JOIN native_derived_chunks dc ON dc.chunk_id = c.id
                       JOIN native_derived_heads dh
@@ -1608,6 +1714,7 @@ class SearchService:
                        AND r.head_revision_id = dc.revision_id
                        AND r.lifecycle = 'live'
                       JOIN vaults v ON v.id = r.namespace_id
+                      {_TIME_LEGACY_JOIN if time_range is not None else ""}
                       JOIN native_revisions nr
                         ON nr.resource_id = r.resource_id
                        AND nr.revision_id = r.head_revision_id
@@ -1623,7 +1730,7 @@ class SearchService:
                 for r in rows:
                     # Hydration independently verifies the current Head body;
                     # the derived chunk is only a candidate, never authority.
-                    metadata = await asyncio.to_thread(_verified_native_metadata, r)
+                    metadata = await asyncio.to_thread(_dated_native_metadata if time_range is not None else _verified_native_metadata, r)
                     path = r["current_path"]
                     collection = path.rsplit("/", 1)[0] if "/" in path else None
                     meta[(NATIVE_DOCUMENT_SOURCE, str(r["resource_id"]))] = {
@@ -1636,6 +1743,7 @@ class SearchService:
                         "tags": list(metadata.get("tags") or []),
                         "collection": collection,
                         "revision": r["head_revision_id"],
+                        "in_time_range": time_range is None or _native_time_matches(time_range, r, metadata),
                     }
             if by_type[SOURCE_NATIVE_FILE]:
                 native_file_hits = {
@@ -1874,6 +1982,9 @@ class SearchService:
                 # ends up as `total_matches=30, returned=0` with no explanation,
                 # and that shape must never again read as a silent zero-match.
                 dropped["hydration_miss"] = dropped.get("hydration_miss", 0) + 1
+                continue
+            if time_range is not None and not m["in_time_range"]:
+                dropped["time_range_excluded"] = dropped.get("time_range_excluded", 0) + 1
                 continue
             # Archive scope (akb#530). `m["status"]` is the AUTHORITY for this
             # arm and it is already in hand: the native branch parsed it out of
@@ -2489,37 +2600,14 @@ class SearchService:
     async def drill_down(self, vault: str, doc_id: str, section: str | None = None) -> list[dict]:
         """Get L3 section-level content for a document."""
         if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
-            from app.services.native_document_service import NativeDocumentService
-            from app.services.index_service import MAX_CHUNK_SIZE, _HEADING_RE
+            from app.services.index_service import MAX_CHUNK_SIZE
 
-            # Read verified current authority, not a possibly absent/stale derived
-            # chunk or a legacy catalogue row. The adapter resolves IDs/paths/aliases.
-            document = await NativeDocumentService(pool=await get_pool()).get(vault, doc_id)
+            body = await _native_section_body(vault, doc_id)
 
             def native_sections() -> list[dict]:
-                body = document.content or ""
-                headings = list(_HEADING_RE.finditer(body))
-                spans: list[tuple[str, int, int]] = []
-                if not headings:
-                    spans.append(("", 0, len(body)))
-                elif headings[0].start():
-                    spans.append(("", 0, headings[0].start()))
-                hierarchy: list[tuple[int, str]] = []
-                for index, heading in enumerate(headings):
-                    level = len(heading.group(1))
-                    while hierarchy and hierarchy[-1][0] >= level:
-                        hierarchy.pop()
-                    hierarchy.append((level, f"{'#' * level} {heading.group(2).strip()}"))
-                    path = " > ".join(label for _, label in hierarchy)
-                    start = heading.end()
-                    if body[start:start + 1] == "\n":
-                        start += 1  # Only the heading's line terminator belongs to its syntax.
-                    end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
-                    spans.append((path, start, end))
-
                 rows: list[dict] = []
                 chunk_index = 0
-                for path, start, end in spans:
+                for path, start, end in _native_section_spans(body):
                     # Index chunks insert nested overlap and synthetic context.
                     # Current-body reads instead slice source spans directly:
                     # no content guessing, no duplicate bytes, bounded rows.
@@ -2565,30 +2653,35 @@ class SearchService:
 
             return clean_section_rows(rows)
 
-    async def list_section_headings(self, vault: str, doc_id: str, limit: int | None = None) -> list[str]:
-        """Return the document's distinct section paths, without their bodies,
-        in first-occurrence order.
-
-        Used by `akb_drill_down`'s empty-match fallback to surface the
-        available headings cheaply — pulling full content for a 1000-
-        section doc just to extract heading strings is wasteful.
-
-        One heading, one row. A section longer than `MAX_CHUNK_SIZE` is stored
-        as several chunks that all carry the same `section_path`, so the
-        row-per-chunk form repeated a heading once per chunk and the caller's
-        outline cap was spent on duplicates instead of on headings it had not
-        seen yet. `limit` therefore bounds *headings*: the grouping happens in
-        SQL, before the LIMIT, and the Python pass keeps the contract true
-        regardless of how the rows arrive.
-        """
+    async def list_section_headings(
+        self, vault: str, doc_id: str, limit: int | None = None, *, section: str | None = None,
+    ) -> list[str]:
+        """List distinct paths in first-occurrence order, optionally within one heading subtree."""
+        # Indexed Markdown uses "# Parent > ## Child". Older unmarked paths
+        # use "Parent/Child". A slash in a Markdown heading is literal.
+        child_prefix = None
+        if section:
+            delimiter = " > #" if section.startswith("#") else "/"
+            child_prefix = section + delimiter
         if _configured_document_source_type() == NATIVE_DOCUMENT_SOURCE:
-            rows = await self.drill_down(vault, doc_id)
-            native_headings = list(dict.fromkeys(row["section_path"] for row in rows if row["section_path"]))
-            return native_headings[:limit] if isinstance(limit, int) and limit > 0 else native_headings
+            body = await _native_section_body(vault, doc_id)
+
+            def native_headings() -> list[str]:
+                paths: dict[str, None] = {}
+                for path, _, _ in _native_section_spans(body):
+                    if not path or (child_prefix and path != section and not path.startswith(child_prefix)):
+                        continue
+                    paths[path] = None
+                    if limit and limit > 0 and len(paths) == limit:
+                        break
+                return list(paths)
+
+            return await asyncio.to_thread(native_headings)
         from app.repositories.document_repo import DocumentRepository
         pool = await get_pool()
         async with pool.acquire() as conn:
             doc_match = DocumentRepository.match_clause(2)
+            subtree = "AND (c.section_path = $3 OR starts_with(c.section_path, $4))" if child_prefix else ""
             sql = f"""
                 SELECT c.section_path, MIN(c.chunk_index) AS first_chunk_index
                 FROM chunks c
@@ -2597,12 +2690,14 @@ class SearchService:
                 WHERE v.name = $1 AND {doc_match}
                   AND c.section_path IS NOT NULL
                   AND c.section_path <> ''
+                  {subtree}
                 GROUP BY c.section_path
                 ORDER BY first_chunk_index, c.section_path
             """
             if isinstance(limit, int) and limit > 0:
                 sql += f" LIMIT {int(limit)}"
-            rows = await conn.fetch(sql, vault, doc_id)
+            params = (vault, doc_id, section, child_prefix) if child_prefix else (vault, doc_id)
+            rows = await conn.fetch(sql, *params)
             headings: list[str] = []
             seen: set[str] = set()
             for r in rows:

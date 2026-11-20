@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { KeyRound, RotateCw, Trash2 } from "lucide-react";
-import { authSessionSnapshot, isCurrentAuthSession, type AuthSessionSnapshot } from "@/lib/api";
+import { authSessionSnapshot, isCurrentAuthSession, type AuthConfig, type AuthSessionSnapshot } from "@/lib/api";
 import { canonicalScope, revokeIssuedPat, type PatMetadata } from "@/lib/api-pat-issuance";
 import { replacementDraft, scopeSummary, type PatDraft } from "@/lib/pat-draft";
 import { formatDate, timeAgo } from "@/lib/utils";
@@ -18,12 +19,15 @@ import { SettingsHeading } from "./settings-ui";
 
 export type PAT = PatMetadata;
 interface Props {
-  pats: PAT[] | null; patsError: boolean; patsLoading?: boolean; mcpOauthEnabled: boolean; onReloadPats: () => void | Promise<boolean>;
+  pats: PAT[] | null; patsError: boolean; patsLoading?: boolean; authConfig: AuthConfig; onRetryAuthConfig?: () => void; onReloadPats: () => void | Promise<boolean>;
   onDirtyChange?: (dirty: boolean) => void; onBusyChange?: (busy: boolean) => void;
   ownsOperation?: () => boolean;
   visible?: boolean;
+  initialView?: "setup" | "keys";
 }
-export function TokensSection({ pats, patsError, patsLoading = false, mcpOauthEnabled, onReloadPats, onDirtyChange, onBusyChange, ownsOperation, visible = true }: Props) {
+export function TokensSection({ pats, patsError, patsLoading = false, authConfig, onRetryAuthConfig, onReloadPats, onDirtyChange, onBusyChange, ownsOperation, visible = true, initialView = "setup" }: Props) {
+  const patEnabled = authConfig.available && authConfig.personal_access_tokens.enabled;
+  const [view, setView] = useState(initialView);
   const [revokedIds, setRevokedIds] = useState<string[]>([]);
   const visiblePats = pats?.filter(token => !revokedIds.includes(token.token_id));
   const [invalidatedTokenId, setInvalidatedTokenId] = useState<string>();
@@ -70,34 +74,44 @@ export function TokensSection({ pats, patsError, patsLoading = false, mcpOauthEn
   return <>
     <div className="settings-connections space-y-7">
       {notice && <Alert variant="warning">{notice}</Alert>}
-      <section aria-labelledby="connection-heading"><SettingsHeading id="connection-heading" title="Agent connections" description="Give your tools access to the knowledge they need." />
-        <div id="setup-guide-body"><ConnectionSetup ownsOperation={ownsOperation} layout="settings" mcpOauthEnabled={mcpOauthEnabled} onTokenCreated={onReloadPats} onDirtyChange={setSetupDirty} onBusyChange={setSetupBusy} invalidatedTokenId={invalidatedTokenId} /></div>
-      </section>
-      <section aria-labelledby="tokens-heading" aria-busy={patsLoading}><header className="mb-3 flex items-start justify-between gap-4 border-b border-border pb-3"><div><h2 id="tokens-heading" className="text-base font-semibold">Saved tokens</h2><p className="mt-1 text-sm text-foreground-muted">Manage access separately from setup. Last use is not a live connection status.</p></div><Badge variant="default">{visiblePats?.length ?? "··"}</Badge></header>
+      <SettingsHeading id="connection-heading" title="AI connections" description="Use your AI tool with the knowledge your account can access." />
+      <Tabs value={view} onValueChange={value => setView(value === "keys" ? "keys" : "setup")}>
+        <TabsList aria-label="AI connection views"><TabsTrigger value="setup" disabled={setupBusy || replacementBusy}>Connection setup</TabsTrigger><TabsTrigger value="keys" disabled={setupBusy || replacementBusy}>Connection keys</TabsTrigger></TabsList>
+        <TabsContent value="setup" forceMount hidden={view !== "setup"} inert={view !== "setup"}>
+        <div id="setup-guide-body"><ConnectionSetup ownsOperation={ownsOperation} layout="settings" authConfig={authConfig} onRetryAuthConfig={onRetryAuthConfig} onTokenCreated={onReloadPats} onDirtyChange={setSetupDirty} onBusyChange={setSetupBusy} invalidatedTokenId={invalidatedTokenId} /></div>
+        </TabsContent>
+        <TabsContent value="keys" forceMount hidden={view !== "keys"} inert={view !== "keys"}>
+      <section aria-labelledby="tokens-heading" aria-busy={patsLoading}><header className="mb-3 flex items-start justify-between gap-4 border-b border-border pb-3"><div><h2 id="tokens-heading" className="text-base font-semibold">Connection keys</h2><p className="mt-1 text-sm text-foreground-muted">Manage the personal keys used by your tools. Recent use does not confirm a live connection.</p></div><Badge variant="default">{visiblePats?.length ?? "··"}</Badge></header>
         {patsLoading && pats && <InlineLoadingState label="Updating tokens" className="py-3" />}
         {patsError && pats && <Alert variant="warning">Could not update tokens. Previous tokens are shown.<Button variant="outline" loading={patsLoading} onClick={() => void onReloadPats()}>Retry</Button></Alert>}
-        {patsError && !pats ? <EmptyState title="Couldn't load tokens" description="Something went wrong fetching your tokens." action={<Button variant="outline" loading={patsLoading} onClick={() => void onReloadPats()}>Retry</Button>} /> : !visiblePats ? <LoadingState label="Loading tokens" className="space-y-3 py-3">{[0, 1, 2].map(row => <Skeleton key={row} className="h-24 w-full" />)}</LoadingState> : visiblePats.length === 0 ? <EmptyState title="No tokens yet" description="A token is only needed for token-based connections. Browser sign-in does not require one." /> : <div className="divide-y divide-border overflow-hidden rounded-[var(--radius-md)] border border-border">{visiblePats.map(token => {
+        {patsError && !pats ? <EmptyState title="Couldn't load tokens" description="Something went wrong fetching your tokens." action={<Button variant="outline" loading={patsLoading} onClick={() => void onReloadPats()}>Retry</Button>} /> : !visiblePats ? <LoadingState label="Loading tokens" className="space-y-3 py-3">{[0, 1, 2].map(row => <Skeleton key={row} className="h-24 w-full" />)}</LoadingState> : visiblePats.length === 0 ? <EmptyState title="No connection keys yet" description={patEnabled ? "Open Connection setup to create a personal key." : "Open Connection setup to review the available methods."} /> : <div className="divide-y divide-border overflow-hidden rounded-[var(--radius-md)] border border-border">{visiblePats.map(token => {
           const replacementOptions = replacementDraft(token);
           const expired = typeof token.expires_at === "string" && Date.parse(token.expires_at) <= Date.now();
+          const policyDisabled = token.key_class === "pat" && authConfig.available && !patEnabled;
+          const status = expired ? "Expired"
+            : policyDisabled ? "Disabled by deployment"
+            : token.expires_at === undefined ? "Expiration unknown" : "Active";
           return <div key={token.token_id} className="flex min-w-0 flex-wrap items-center justify-between gap-3 px-4 py-3">
             <div className="flex min-w-0 flex-1 items-start gap-3"><KeyRound className="h-4 w-4 shrink-0 text-foreground-muted" aria-hidden /><div className="min-w-0 flex-1 space-y-1">
-              <div className="flex flex-wrap items-center gap-2"><span className="break-all text-sm font-semibold">{token.name}</span><code className="text-xs text-foreground-muted">{token.prefix}••••</code><Badge variant={expired ? "warning" : "default"}>{expired ? "Expired" : token.expires_at === undefined ? "Expiration unknown" : "Active"}</Badge><span className="text-xs text-foreground-muted">{token.key_class === "pat" ? "PAT" : token.key_class === "service" ? "Service key" : "Credential type unknown"}</span></div>
+              <div className="flex flex-wrap items-center gap-2"><span className="break-all text-sm font-semibold">{token.name}</span><code className="text-xs text-foreground-muted">{token.prefix}••••</code><Badge variant={expired || policyDisabled ? "warning" : "default"}>{status}</Badge><span className="text-xs text-foreground-muted">{token.key_class === "pat" ? "PAT" : token.key_class === "service" ? "Service key" : "Credential type unknown"}</span></div>
               <p className="break-words text-xs text-foreground-muted">{token.scopes?.length ? `Permissions: ${token.scopes.join(" + ")}` : "Permissions unknown"} · {scopeSummary(canonicalScope(token.vault_scope))}</p>
               <p className="text-xs text-foreground-muted">{token.expires_at === null ? "No expiration" : token.expires_at === undefined ? "Expiration unavailable" : `${expired ? "Expired" : "Expires"} ${formatDate(token.expires_at)}`}</p>
               <p className="text-xs text-foreground-muted">Created {timeAgo(token.created_at)} · {token.last_used_at ? `Used ${timeAgo(token.last_used_at)}` : "Never used"}</p>
-              {!replacementOptions && <p className="text-xs text-foreground-muted">Replacement requires complete PAT metadata. Create a new token independently and revoke this one separately.</p>}
+              {patEnabled && !replacementOptions && <p className="text-xs text-foreground-muted">Replacement requires complete PAT metadata. Create a new token independently and revoke this one separately.</p>}
             </div></div>
-            <div className="flex flex-wrap items-center gap-1"><Button variant="ghost" size="sm" disabled={!replacementOptions || setupBusy || replacementBusy || revoking} aria-label={`Replace token ${token.name}`} onClick={() => { if (replacementOptions) { setReplacement({ token, draft: replacementOptions, snapshot: authSessionSnapshot() }); setReplacementCreated(false); setOriginalRevoked(false); } }}><RotateCw className="h-3 w-3" aria-hidden />Replace</Button><Button variant="ghost" size="sm" disabled={setupBusy || replacementBusy || revoking} aria-label={`Revoke token ${token.name}`} onClick={() => setPendingRevoke({ token, snapshot: authSessionSnapshot() })}><Trash2 className="h-3 w-3" aria-hidden />Revoke</Button></div>
+            <div className="flex flex-wrap items-center gap-1"><Button variant="ghost" size="sm" disabled={!patEnabled || !replacementOptions || setupBusy || replacementBusy || revoking} aria-label={`Replace key ${token.name}`} onClick={() => { if (patEnabled && replacementOptions) { setReplacement({ token, draft: replacementOptions, snapshot: authSessionSnapshot() }); setReplacementCreated(false); setOriginalRevoked(false); } }}><RotateCw className="h-3 w-3" aria-hidden />Replace</Button><Button variant="ghost" size="sm" disabled={setupBusy || replacementBusy || revoking} aria-label={`Revoke key ${token.name}`} onClick={() => setPendingRevoke({ token, snapshot: authSessionSnapshot() })}><Trash2 className="h-3 w-3" aria-hidden />Revoke</Button></div>
           </div>;
         })}</div>}
       </section>
+        </TabsContent>
+      </Tabs>
     </div>
-    <Dialog open={replacement !== null} onOpenChange={open => { if (!open) requestCloseReplacement(); }}><DialogContent hidden={!visible} className="settings-studio max-h-[90dvh] max-w-3xl overflow-y-auto"><DialogHeader><DialogTitle>Replace token {replacement?.token.name}</DialogTitle><DialogDescription>Review expiration, permissions and Vault write restrictions before creating a replacement. The original is retained.</DialogDescription></DialogHeader>
-      {replacement && <ConnectionSetup ownsOperation={ownsOperation} layout="settings" key={replacement.token.token_id} mcpOauthEnabled={false} initialDraft={replacement.draft} replacement onTokenCreated={onReloadPats} onDirtyChange={setReplacementDirty} onBusyChange={setReplacementBusy} invalidatedTokenId={invalidatedTokenId} onReceipt={() => setReplacementCreated(true)} />}
+    <Dialog open={replacement !== null} onOpenChange={open => { if (!open) requestCloseReplacement(); }}><DialogContent hidden={!visible} className="settings-studio max-h-[90dvh] max-w-3xl overflow-y-auto"><DialogHeader><DialogTitle>Replace key {replacement?.token.name}</DialogTitle><DialogDescription>Review expiration, permissions and Vault write restrictions before creating a replacement. The original is retained.</DialogDescription></DialogHeader>
+      {replacement && <ConnectionSetup ownsOperation={ownsOperation} layout="settings" key={replacement.token.token_id} authConfig={authConfig} onRetryAuthConfig={onRetryAuthConfig} initialDraft={replacement.draft} replacement onTokenCreated={onReloadPats} onDirtyChange={setReplacementDirty} onBusyChange={setReplacementBusy} invalidatedTokenId={invalidatedTokenId} onReceipt={() => setReplacementCreated(true)} />}
       {replacementCreated && <Alert variant="info">{originalRevoked ? "The original token was revoked. Keep the replacement secret somewhere private." : "Both tokens now exist. Update your agents, save the replacement, then explicitly revoke the original."}</Alert>}
-      <DialogFooter><Button variant="outline" disabled={replacementBusy || revoking} onClick={requestCloseReplacement}>Close replacement</Button>{replacementCreated && !originalRevoked && replacement && <Button variant="destructive" disabled={replacementBusy || revoking} onClick={() => setPendingRevoke({ token: replacement.token, snapshot: replacement.snapshot })}>Revoke original token</Button>}</DialogFooter>
+      <DialogFooter><Button variant="outline" disabled={replacementBusy || revoking} onClick={requestCloseReplacement}>Close replacement</Button>{replacementCreated && !originalRevoked && replacement && <Button variant="destructive" disabled={replacementBusy || revoking} onClick={() => setPendingRevoke({ token: replacement.token, snapshot: replacement.snapshot })}>Revoke original key</Button>}</DialogFooter>
     </DialogContent></Dialog>
-    <ConfirmDialog open={visible && pendingRevoke !== null} onOpenChange={open => { if (!open) setPendingRevoke(null); }} title={pendingRevoke ? `Revoke "${pendingRevoke.token.name}"?` : "Revoke token?"} description="Any agent using this token will lose access immediately. This cannot be undone. Other tokens stay active." confirmLabel="Revoke token" variant="destructive" busy={revoking} onConfirm={revoke} />
+    <ConfirmDialog open={visible && pendingRevoke !== null} onOpenChange={open => { if (!open) setPendingRevoke(null); }} title={pendingRevoke ? `Revoke "${pendingRevoke.token.name}"?` : "Revoke key?"} description="Any agent using this token will lose access immediately. This cannot be undone. Other tokens are retained." confirmLabel="Revoke key" variant="destructive" busy={revoking} onConfirm={revoke} />
     <ConfirmDialog open={visible && closeReplacement} onOpenChange={setCloseReplacement} title="Have you saved your replacement?" description="Closing discards draft changes and the one-time replacement secret. It does not revoke either token." confirmLabel="I've saved it — close" onConfirm={() => { setReplacement(null); setCloseReplacement(false); }} />
   </>;
 }

@@ -29,11 +29,11 @@ does not add a speculative realm-specific API scope: issuer, audience,
 authorized party, human token kind, and the complete claim policy are its
 boundary.
 
-MCP uses a distinct audience and route profile. It accepts token-store PAT or
-service credentials in both modes, and may accept `keycloak-access-v1` only
-when MCP OAuth is enabled. MCP scope enforcement remains authoritative and DCR
-client IDs are not constrained by the static human API `azp` list. Local AKB
-session JWTs are never MCP credentials.
+The tool resource uses the canonical public `/mcp` URL as its exact audience.
+When OAuth is enabled, admitted clients can use the resulting bearer for MCP
+and the approved file and image control operations. The resource verifies the
+signed client admission and the scope for each operation. Local session JWTs
+remain valid on the browser API. See the [tool resource contract](../mcp-oauth-dcr/00-overview.md).
 
 No token header selects an algorithm, issuer, key source, or fallback
 verifier. Token-supplied key URLs/material are rejected. An unknown `kid` may
@@ -246,13 +246,13 @@ stores, or transports an AKB user JWT. Reef and Naut must instead own their
 separate BFF callback/token custody and present their Keycloak access token to
 AKB; that cross-product change remains part of the release gate.
 
-## Public capability schema v2
+## Public capability schema v3
 
 `GET /api/v1/auth/config` publishes only non-secret capabilities:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "auth_mode": "sso",
   "local_auth": { "enabled": false },
   "keycloak": {
@@ -267,7 +267,9 @@ AKB; that cross-product change remains part of the release gate.
       "login_url": "/api/v1/auth/sso/workforce/login"
     }
   ],
-  "mcp_oauth": { "enabled": false }
+  "mcp_oauth": { "enabled": true },
+  "personal_access_tokens": { "enabled": false },
+  "mcp_endpoint_url": "https://akb.example.com/mcp/"
 }
 ```
 
@@ -278,7 +280,40 @@ non-drifted provider read-backs. A provider login URL is non-null only when the
 browser-session encryption/client profile is ready; otherwise the same enabled
 provider may be listed with `login_url: null`. MCP OAuth remains orthogonal.
 
-Clients accept only schema v2 with a known mode and internally consistent
-capabilities. Fetch failure, non-success status, malformed JSON, old/missing
-shape, unknown version/mode, or mode contradiction yields a deny-all
-unavailable state; clients never infer local mode.
+Clients accept schema v3 with a known mode and internally consistent
+capabilities. A failed request or an invalid response makes the capabilities
+unavailable. The response is served with `Cache-Control: no-store`.
+
+`mcp_endpoint_url` appends `/mcp/` to the configured `public_base_url`, including
+any external path prefix. Configure ingress to route that prefix to AKB. The
+stdio proxy requires HTTPS or loopback HTTP.
+
+## Control personal access tokens
+
+Set `pat_enabled` in `app.yaml` to permit or disable issuance and
+authentication with personal access tokens (PATs). The default is `true`.
+Choose this setting independently of `mcp_oauth_enabled`.
+
+| `mcp_oauth_enabled` | `pat_enabled` | Human MCP authentication |
+| --- | --- | --- |
+| `false` | `true` | PAT |
+| `true` | `true` | OAuth or PAT |
+| `true` | `false` | OAuth |
+| `false` | `false` | None |
+
+Browser login follows `auth_mode`. Service credentials follow their own
+issuance and access rules. Disabling PATs leaves existing records available
+for listing and revocation through authorized browser and administrator
+sessions. Re-enabling PATs restores access for unexpired, unrevoked records.
+Revoke tokens for permanent invalidation. In-flight operations and issued byte
+transfer URLs keep their existing authorization and expiry rules.
+
+Before disabling PATs, verify browser or administrator access for recovery.
+If people need MCP access, verify that their OAuth connection works. Update
+the deployment configuration and restart all backend replicas. Each replica
+enforces the policy it loaded at startup, so enforcement can vary during a
+rolling restart.
+
+Roll out the schema v3 backend and frontend together. Different versions can
+temporarily make sign-in and connection setup unavailable. After both rollouts
+finish, refresh open browser tabs to load the current client and capabilities.

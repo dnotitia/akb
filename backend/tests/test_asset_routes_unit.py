@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_current_user
+from app.api.deps import ToolControlUser, get_current_user
 from app.api.routes import assets
 
 
@@ -20,7 +20,8 @@ class _FakeUser:
 def _client() -> TestClient:
     application = FastAPI()
     application.include_router(assets.router, prefix="/api/v1")
-    application.dependency_overrides[get_current_user] = lambda: _FakeUser()
+    for dependency in (get_current_user, ToolControlUser("asset.upload"), ToolControlUser("asset.discard")):
+        application.dependency_overrides[dependency] = _FakeUser
     return TestClient(application)
 
 

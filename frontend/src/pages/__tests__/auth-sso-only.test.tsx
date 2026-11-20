@@ -33,8 +33,8 @@ vi.mock("react-router-dom", async () => {
 });
 
 const localConfig = {
-  available: true,
-  schema_version: 2 as const,
+  available: true as const,
+  schema_version: 3 as const,
   auth_mode: "local" as const,
   local_auth: { enabled: true },
   keycloak: {
@@ -43,11 +43,13 @@ const localConfig = {
   },
   providers: [],
   mcp_oauth: { enabled: false },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/mcp/",
 };
 
 const stagedSsoConfig = {
-  available: true,
-  schema_version: 2 as const,
+  available: true as const,
+  schema_version: 3 as const,
   auth_mode: "sso" as const,
   local_auth: { enabled: false },
   keycloak: {
@@ -61,6 +63,8 @@ const stagedSsoConfig = {
     login_url: null,
   }],
   mcp_oauth: { enabled: false },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/mcp/",
 };
 
 function renderAuth() {
@@ -222,7 +226,7 @@ describe("Account lifecycle completion notices", () => {
       providers: [{ ...stagedSsoConfig.providers[0], login_url: "/api/v1/auth/sso/workforce/login" }],
     });
     renderAuth();
-    expect(await screen.findByText(/Your AKB browser sessions have been signed out/)).toHaveTextContent("identity provider session and personal access tokens remain active");
+    expect(await screen.findByText(/Your AKB browser sessions have been signed out/)).toHaveTextContent("identity provider session remains active. Your personal access tokens are retained");
     expect(screen.getByText(/Your AKB browser sessions have been signed out/)).toHaveTextContent("account and Vault data are preserved");
     expect(screen.getByRole("button", { name: /Sign in with Company SSO/i })).toBeInTheDocument();
     expect(screen.queryByText(/Your local login sessions have been signed out/)).not.toBeInTheDocument();
@@ -232,6 +236,6 @@ describe("Account lifecycle completion notices", () => {
     window.history.replaceState({}, "", "/auth?reason=sessions-revoked");
     vi.mocked(getAuthConfig).mockResolvedValue(localConfig);
     renderAuth();
-    expect(await screen.findByText(/Your local login sessions have been signed out/)).toHaveTextContent("Personal access tokens remain active");
+    expect(await screen.findByText(/Your local login sessions have been signed out/)).toHaveTextContent("Your personal access tokens are retained");
   });
 });

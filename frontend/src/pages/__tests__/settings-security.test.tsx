@@ -155,7 +155,7 @@ it("revokes SSO browser sessions with explicit scope, preserves managed account 
   expect(screen.queryByText("Danger zone")).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Review account deletion" })).not.toBeInTheDocument();
   expect(screen.getByText(/organization or Keycloak administrator/)).toBeInTheDocument();
-  expect(screen.getByText(/identity provider \(SSO\) session and personal access tokens/)).toBeInTheDocument();
+  expect(screen.getByText(/personal access tokens \(PATs\) are retained/)).toHaveTextContent("identity provider (SSO) session remains active");
   fireEvent.click(screen.getByRole("button", { name: "Sign out all sessions" }));
   expect(screen.getByRole("dialog")).toHaveTextContent("all your AKB browser sessions, including this device");
   expect(screen.getByRole("dialog")).toHaveTextContent("account and Vault data are preserved");

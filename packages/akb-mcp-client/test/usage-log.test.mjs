@@ -1,3 +1,4 @@
+import { PatCredentials } from "../lib/credentials.mjs";
 // Opt-in usage record: `AKB_MCP_USAGE_LOG=<path>` appends one JSON line
 // per tools/call. Unset, the proxy must behave exactly as before — no
 // file, no throw, nothing to notice.
@@ -24,7 +25,7 @@ function itAsync(name, fn) {
 const ORIGINAL_LOG = process.env.AKB_MCP_USAGE_LOG;
 
 function backedBy(text) {
-  const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+  const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
   proxy._ensureBackend = async () => true;
   proxy._rpc = async () => ({ content: [{ type: "text", text }] });
   return proxy;
@@ -105,7 +106,7 @@ itAsync("appends one record per tools/call with the documented fields", async ()
 itAsync("sums text_chars across every text block, in characters", async () => {
   await withLogPath(async (path) => {
     const parts = ["첫 번째 블록입니다.", "second block", "세 번째 블록"];
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
     proxy._ensureBackend = async () => true;
     proxy._rpc = async () => ({
       content: [
@@ -128,7 +129,7 @@ itAsync("sums text_chars across every text block, in characters", async () => {
 
 itAsync("records concurrent calls as whole lines, one per call", async () => {
   await withLogPath(async (path) => {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
     proxy._ensureBackend = async () => true;
     proxy._rpc = async () => {
       await new Promise((resolve) => setTimeout(resolve, 1));
@@ -147,14 +148,82 @@ itAsync("records concurrent calls as whole lines, one per call", async () => {
 
 // ── failures are measured too ────────────────────────────────────
 
+itAsync("records one unknown write outcome without logging its arguments", async () => {
+  await withLogPath(async (path) => {
+    const proxy = backedBy("unused");
+    let dispatches = 0;
+    proxy._backendReady = true;
+    proxy._startBackendMonitor = () => {};
+    proxy._rpc = async () => { dispatches += 1; throw new Error("ECONNRESET"); };
+    const response = await proxy._handle({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "akb_put", arguments: { content: "private-write-body" } },
+    });
+    assert.equal(dispatches, 1);
+    const records = await readLines(path);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].error, true);
+    assert.equal(records[0].result_bytes, Buffer.byteLength(JSON.stringify(response.result), "utf8"));
+    assert.equal(JSON.parse(response.result.content[0].text).details.operation_outcome, "unknown");
+    assert.ok(!(await readFile(path, "utf8")).includes("private-write-body"));
+  });
+});
+
+itAsync("records document validation and file read failures once without arguments", async () => {
+  await withLogPath(async (path) => {
+    const canary = "private-document-input";
+    const proxy = backedBy("unused");
+    let fileReads = 0;
+    proxy._resolveFileToContent = () => {
+      fileReads += 1;
+      throw new Error(`Cannot read /tmp/${canary}.md`);
+    };
+    proxy._forward = async () => assert.fail("invalid input must not be forwarded");
+    const calls = [
+      { name: "akb_put", arguments: { content: canary, file: `/tmp/${canary}.md` } },
+      { name: "akb_update", arguments: { content: { body: canary } } },
+      { name: "akb_update", arguments: { file: `/tmp/${canary}.md` } },
+    ];
+    const responses = [];
+    for (const [id, params] of calls.entries()) {
+      responses.push(await proxy._handle({ jsonrpc: "2.0", id, method: "tools/call", params }));
+    }
+    assert.equal(fileReads, 1, "validation failures must not read files");
+    const records = await readLines(path);
+    assert.equal(records.length, calls.length);
+    for (const [i, record] of records.entries()) {
+      assert.equal(record.tool, calls[i].name);
+      assert.equal(record.error, true);
+      assert.equal(record.result_bytes, Buffer.byteLength(JSON.stringify(responses[i].result), "utf8"));
+      assert.equal(record.text_chars, responses[i].result.content[0].text.length);
+    }
+    assert.ok(!(await readFile(path, "utf8")).includes(canary));
+  });
+});
+
+itAsync("records a converted document file once on successful forwarding", async () => {
+  await withLogPath(async (path) => {
+    const proxy = backedBy("saved");
+    proxy._resolveFileToContent = ({ file, ...args }) => ({ ...args, content: "body" });
+    await proxy._handle({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "akb_put", arguments: { file: "/tmp/draft.md" } },
+    });
+    const records = await readLines(path);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].tool, "akb_put");
+    assert.equal(records[0].error, false);
+  });
+});
+
 itAsync("records a call that threw, with error true and no payload", async () => {
   await withLogPath(async (path) => {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
     proxy._forward = async () => {
-      throw new Error("backend unreachable");
+      throw new Error("unexpected tool failure");
     };
 
-    await assert.rejects(() => proxy._handle(searchCall(1)), /backend unreachable/);
+    await assert.rejects(() => proxy._handle(searchCall(1)), /unexpected tool failure/);
 
     const [record] = await readLines(path);
     assert.equal(record.tool, "akb_search");
@@ -167,7 +236,7 @@ itAsync("records a call that threw, with error true and no payload", async () =>
 itAsync("marks an isError result as an error without losing its size", async () => {
   await withLogPath(async (path) => {
     const body = JSON.stringify({ error: "vault not found", code: "not_found" });
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
     proxy._ensureBackend = async () => true;
     proxy._rpc = async () => ({ content: [{ type: "text", text: body }], isError: true });
 
@@ -234,7 +303,7 @@ itAsync("records a bigger payload as more bytes", async () => {
 
 itAsync("measures a proxy-local file tool too", async () => {
   await withLogPath(async (path) => {
-    const proxy = new AKBProxy({ url: "http://akb.test/mcp", pat: "test" });
+    const proxy = new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test") });
     proxy._fileToolSkillPreflight = async () => null;
     proxy._getFile = async () => ({ kind: "file", save_to: "/tmp/a.bin" });
 

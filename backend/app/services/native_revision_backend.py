@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 import asyncpg
@@ -20,6 +20,7 @@ from app.repositories.native_revision_repo import (
     NativeRevisionRepository,
     NativeRevisionSelectorAmbiguousError,
 )
+from app.services.activity_filters import matches_author, parse_activity_since
 from app.services.document_service import _parse_markdown
 from app.services.git_service import FixedRefHistoryError, GitService
 from app.services.native_document_service import NativeDocumentService
@@ -192,7 +193,9 @@ class NativeRevisionBackend:
         max_count: int,
         since: datetime | None,
         path: str | None,
-    ) -> tuple[list[dict[str, Any]], set[str]]:
+        author: str | None,
+        until: datetime | None,
+    ) -> tuple[list[dict[str, Any]], bool]:
         """Re-open Legacy activity through the committed vault fixed ref.
 
         A completed existing-database cutover already persists one exact Git
@@ -205,29 +208,35 @@ class NativeRevisionBackend:
         pool = await self._pool()
         migration = NativeRevisionMigrationRepository(pool)
         try:
-            anchors = await migration.list_completed_lineage_anchors(
-                namespace_id=vault_id,
-            )
-        except asyncpg.UndefinedTableError:
-            return [], set()
-
-        try:
             fixed_ref = await NativeRevisionCutoverRepository(pool).committed_vault_fixed_git_oid(vault_id)
         except asyncpg.UndefinedTableError:
             fixed_ref = None
 
+        if fixed_ref is not None:
+            events = await asyncio.to_thread(
+                self._legacy_git_reader().manual_fixed_ref_vault_log,
+                vault,
+                fixed_ref,
+                max_count=max_count,
+                since=None if since is None else since.isoformat(),
+                path=path, author=author, until=until,
+            )
+            return events, True
+
+        try:
+            anchors = await migration.list_completed_lineage_anchors(
+                namespace_id=vault_id,
+            )
+        except asyncpg.UndefinedTableError:
+            return [], False
+
         bridged_by_hash: dict[str, dict[str, Any]] = {}
-        mapped_native_ids: set[str] = set()
         for anchor in anchors:
             mappings = await migration.list_resource_mappings(
                 namespace_id=vault_id,
                 resource_id=anchor.resource_id,
             )
             for mapping in mappings:
-                if mapping.native_revision_id is not None:
-                    mapped_native_ids.add(mapping.native_revision_id)
-                if fixed_ref is not None:
-                    continue
                 try:
                     snapshot = await asyncio.to_thread(
                         self._legacy_git_reader().manual_fixed_ref_history,
@@ -237,15 +246,19 @@ class NativeRevisionBackend:
                         current_commit=mapping.legacy_git_oid,
                     )
                 except FixedRefHistoryError:
+                    if author or until is not None:
+                        raise
                     continue
                 activity = snapshot.get("activity")
                 if not isinstance(activity, dict) or not self._legacy_activity_matches_path(activity, path):
                     continue
                 entry = self._legacy_activity_entry(mapping, snapshot)
-                if entry is None:
+                if entry is None or not matches_author(author, entry["author"], entry["agent"]):
                     continue
-                occurred_at = activity.get("committed_at")
-                if since is not None and isinstance(occurred_at, datetime) and occurred_at < since:
+                occurred_at: datetime = activity["committed_at"]
+                if since is not None and occurred_at < since:
+                    continue
+                if until is not None and occurred_at >= until:
                     continue
                 existing = bridged_by_hash.get(entry["hash"])
                 if existing is None:
@@ -261,17 +274,8 @@ class NativeRevisionBackend:
                     if signature not in known_files:
                         existing["files"].append(changed)
                         known_files.add(signature)
-        if fixed_ref is not None:
-            events = await asyncio.to_thread(
-                self._legacy_git_reader().manual_fixed_ref_vault_log,
-                vault,
-                fixed_ref,
-                max_count=max_count,
-                since=None if since is None else since.isoformat(),
-                path=path,
-            )
-            return events, mapped_native_ids
-        return list(bridged_by_hash.values()), mapped_native_ids
+        legacy = sorted(bridged_by_hash.values(), key=lambda e: (datetime.fromisoformat(e["date"]), e["hash"]), reverse=True)
+        return legacy, bool(anchors)
 
     async def _legacy_mappings_for_selector(
         self,
@@ -319,10 +323,9 @@ class NativeRevisionBackend:
         if not since:
             return None
         try:
-            parsed = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            return parse_activity_since(since)
         except ValueError:
             return None
-        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
 
     async def vault_activity(
         self,
@@ -331,12 +334,21 @@ class NativeRevisionBackend:
         max_count: int,
         since: str | None,
         path: str | None,
+        author: str | None = None,
+        until: datetime | None = None,
     ) -> list[dict[str, Any]]:
         vault_id = await self._vault_id(vault)
         if vault_id is None:
             return []
         repository = NativeRevisionRepository(await self._pool())
         parsed_since = self._parse_since(since)
+        legacy, has_legacy_history = await self._bridged_legacy_activity(
+            vault=vault,
+            vault_id=vault_id,
+            max_count=max_count,
+            since=parsed_since,
+            path=path, author=author, until=until,
+        )
         rows = await repository.list_activity(
             namespace_id=vault_id,
             # This facade is the Document-only feed selected by A1; text-File
@@ -345,14 +357,7 @@ class NativeRevisionBackend:
             surface="document",
             limit=max_count,
             since=parsed_since,
-            path=path,
-        )
-        legacy, mapped_native_ids = await self._bridged_legacy_activity(
-            vault=vault,
-            vault_id=vault_id,
-            max_count=max_count,
-            since=parsed_since,
-            path=path,
+            path=path, author=author, until=until, exclude_imported=has_legacy_history,
         )
         native = [
             {
@@ -366,10 +371,11 @@ class NativeRevisionBackend:
                 "files": [self._activity_file(row)],
             }
             for row in rows
-            if row["revision_id"] not in mapped_native_ids
         ]
         events = [*native, *legacy]
-        events.sort(key=lambda event: (event["date"], event["hash"]), reverse=True)
+        # Both arms already establish their own order for equal timestamps.
+        # Preserve it so a larger page cannot reorder a tie in frozen Git history.
+        events.sort(key=lambda event: datetime.fromisoformat(event["date"]), reverse=True)
         return events[:max_count]
 
     async def recent_changes(

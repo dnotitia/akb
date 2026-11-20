@@ -2,6 +2,7 @@
 
 import uuid
 from collections.abc import Mapping
+from typing import Literal, TypedDict
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
 
@@ -10,6 +11,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import ConfigDict, Field, StrictInt, field_validator
 
 from app.api.deps import get_credential_change_user, get_current_user
+from app.api.routes.monitoring_auth import MONITORING_PAGE, set_monitoring_cookie
 from app.config import settings
 from app.sso.runtime_identity import IdentityCapabilitiesResponse
 from app.exceptions import (
@@ -35,7 +37,12 @@ from app.services.auth_service import (
     update_profile,
     project_verified_principal_with_reason,
 )
-from app.services.auth_policy import require_local_auth_enabled, sso_browser_session_ready
+from app.services.monitoring_auth import MonitoringSsoProof, login_monitoring_sso
+from app.services.auth_policy import (
+    require_local_auth_enabled,
+    require_pat_enabled,
+    sso_browser_session_ready,
+)
 from app.services.keycloak_oidc import (
     browser_login_provider_aliases,
     get_keycloak_oidc,
@@ -214,7 +221,7 @@ async def auth_config(response: Response):
                 }
             )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "auth_mode": mode,
         "local_auth": {
             "enabled": mode == "local",
@@ -227,6 +234,8 @@ async def auth_config(response: Response):
         "mcp_oauth": {
             "enabled": settings.mcp_oauth_enabled,
         },
+        "personal_access_tokens": {"enabled": settings.pat_enabled},
+        "mcp_endpoint_url": settings.mcp_endpoint_url,
     }
 
 
@@ -450,18 +459,28 @@ def _require_signed_provider(
         raise AuthenticationError("SSO sign-in failed")
 
 
+class _BrowserLoginOptions(TypedDict, total=False):
+    monitoring: bool
+    login_challenge_id: str
+
+
 @router.get(
     "/auth/sso/{alias}/login",
     summary="Start an enabled SSO login",
     status_code=status.HTTP_303_SEE_OTHER,
     response_class=RedirectResponse,
 )
-async def sso_provider_login(alias: str, redirect: str = "/", login_challenge: str | None = None):
+async def sso_provider_login(
+    alias: str, redirect: str = "/", login_challenge: str | None = None,
+    purpose: Literal["monitoring"] | None = None,
+):
     _require_sso_browser_session()
-    redirect_path = _safe_redirect_path(redirect)
+    redirect_path = MONITORING_PAGE if purpose == "monitoring" else _safe_redirect_path(redirect)
     provider_alias = await _require_enabled_provider(alias)
-    challenge_options = {}
+    challenge_options: _BrowserLoginOptions = {"monitoring": True} if purpose == "monitoring" else {}
     if login_challenge is not None:
+        if purpose == "monitoring":
+            raise AuthenticationError()
         from app.sso.callback_evidence import browser_challenge
         challenge_options["login_challenge_id"] = await browser_challenge(login_challenge, provider_alias)
     issued = await get_keycloak_oidc().begin_browser_login(
@@ -523,6 +542,13 @@ def _sso_sign_in_failed(reason: str | None = None) -> RedirectResponse:
     )
 
 
+def _monitoring_sign_in_failed() -> RedirectResponse:
+    return RedirectResponse(
+        f"{MONITORING_PAGE}?auth_error=sign_in_failed",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @router.get(
     "/auth/keycloak/callback",
     summary="Complete an ordinary Keycloak SSO browser login",
@@ -543,7 +569,7 @@ async def keycloak_callback(
         state,
         request.cookies.get(_sso_oidc_binding_cookie_name(), ""),
     )
-    if not isinstance(transient, dict) or set(transient) - {"login_sequence", "allowed_provider_aliases", "login_challenge_id"} != {
+    if not isinstance(transient, dict) or set(transient) - {"login_sequence", "allowed_provider_aliases", "login_challenge_id", "purpose"} != {
         "redirect_path",
         "provider_alias",
         "client_id",
@@ -551,19 +577,20 @@ async def keycloak_callback(
         "nonce",
     }:
         return _sso_sign_in_failed()
+    refuse_login = _monitoring_sign_in_failed if transient.get("purpose") == "monitoring" else _sso_sign_in_failed
     login_sequence = None
     if "login_sequence" in transient:
         raw_sequence = transient["login_sequence"]
         if not isinstance(raw_sequence, str) or not raw_sequence.isascii() or not raw_sequence.isdecimal() or len(raw_sequence) > 19:
-            return _sso_sign_in_failed()
+            return refuse_login()
         login_sequence = int(raw_sequence)
         if not 0 < login_sequence < 2**63:
-            return _sso_sign_in_failed()
+            return refuse_login()
     if transient.get("client_id") != settings.keycloak_client_id:
-        return _sso_sign_in_failed()
+        return refuse_login()
     provider_alias = transient.get("provider_alias")
     if not isinstance(provider_alias, str):
-        return _sso_sign_in_failed()
+        return refuse_login()
     try:
         validate_alias(provider_alias)
         allowed_aliases = (
@@ -571,37 +598,37 @@ async def keycloak_callback(
             if "allowed_provider_aliases" in transient else (provider_alias,)
         )
     except (ProviderDefinitionError, AuthenticationError):
-        return _sso_sign_in_failed()
+        return refuse_login()
     try:
         redirect_path = _safe_redirect_path(transient.get("redirect_path"))
     except AuthenticationError:
-        return _sso_sign_in_failed()
+        return refuse_login()
     verifier = transient.get("code_verifier")
     nonce = transient.get("nonce")
     if not isinstance(verifier, str) or not isinstance(nonce, str):
-        return _sso_sign_in_failed()
+        return refuse_login()
     try:
         tokens = await oidc.exchange_browser_code(code, verifier)
     except AuthenticationError:
-        return _sso_sign_in_failed()
+        return refuse_login()
     access_token = tokens.get("access_token")
     id_token = tokens.get("id_token")
     if tokens.get("token_type") != "Bearer" or not isinstance(access_token, str) or not isinstance(id_token, str):
-        return _sso_sign_in_failed()
+        return refuse_login()
     principal = await oidc.verify_access_token(
         access_token,
         settings.api_oauth_audience_effective,
         route_profile="api",
     )
     if principal is None:
-        return _sso_sign_in_failed()
+        return refuse_login()
     try:
         claim_alias = principal.claims.get("identity_provider")
         if claim_alias is not None and not isinstance(claim_alias, str):
-            return _sso_sign_in_failed()
+            return refuse_login()
         actual_alias = local_realm.ALIAS if claim_alias is None else validate_alias(claim_alias)
         if actual_alias not in allowed_aliases:
-            return _sso_sign_in_failed()
+            return refuse_login()
         _require_signed_provider(principal.claims, actual_alias)
         if "allowed_provider_aliases" in transient:
             # A broker disabled since the chooser opened must not be admitted
@@ -616,7 +643,22 @@ async def keycloak_callback(
         )
         _require_signed_provider(id_claims, actual_alias)
     except (AuthenticationError, ProviderDefinitionError, HTTPException):
-        return _sso_sign_in_failed()
+        return refuse_login()
+    if "purpose" in transient:
+        if transient["purpose"] != "monitoring" or "login_challenge_id" in transient:
+            return refuse_login()
+        if redirect_path != MONITORING_PAGE:
+            return refuse_login()
+        try:
+            proof = MonitoringSsoProof.from_verified_tokens(principal.claims, id_claims)
+            monitoring_session = await login_monitoring_sso(proof)
+        except AuthenticationError:
+            return refuse_login()
+        response = RedirectResponse(MONITORING_PAGE, status_code=status.HTTP_303_SEE_OTHER)
+        set_monitoring_cookie(response, monitoring_session)
+        _clear_sso_oidc_binding_cookie(response)
+        return response
+
     challenge_id = None
     if "login_challenge_id" in transient:
         from app.sso.callback_evidence import verify_callback
@@ -628,7 +670,9 @@ async def keycloak_callback(
             return _sso_sign_in_failed()
     # State grants the choice; both signed tokens prove which one was used.
     # Admission and authoritative-domain policy must use that actual provider.
-    outcome = await project_verified_principal_with_reason(principal, provider_alias=actual_alias)
+    outcome = await project_verified_principal_with_reason(
+        principal, provider_alias=actual_alias, sync_profile=True,
+    )
     user = outcome.user
     if user is None:
         # The one place the reason is repeated, and only for the refusal the
@@ -785,6 +829,7 @@ async def create_token(req: CreatePATRequest, user: AuthenticatedUser = Depends(
 async def token_issuance_capabilities(response: Response, user: AuthenticatedUser = Depends(get_current_user)):
     from app.db.postgres import get_pool
     require_issuer_carrier(user)
+    require_pat_enabled()
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():

@@ -145,6 +145,7 @@ from app.repositories.vault_files_repo import DocumentAssetOwner
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.repositories.vault_repo import VaultRepository, lock_vault_for_child_write
 from app.services.git_service import GitService
+from app.services.access_service import checked_vault_id
 from app.services import asset_service
 from app.services import skill_policy
 from app.services.index_service import (
@@ -613,7 +614,11 @@ class DocumentService:
         *,
         allow_unavailable_asset_refs: bool = False,
         skill_internal: bool = False,
+        idempotency_actor: uuid.UUID | None = None,
     ) -> DocumentPutResponse:
+        if req.idempotency_key is not None:
+            from app.services.document_idempotency import DocumentIdempotencyUnsupportedError
+            raise DocumentIdempotencyUnsupportedError()
         if req.status not in DOC_STATUSES:
             raise ValidationError(
                 f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}"
@@ -623,9 +628,7 @@ class DocumentService:
         )
         vault_repo, doc_repo, coll_repo = await self._repos()
 
-        vault_id = await vault_repo.get_id_by_name(req.vault)
-        if not vault_id:
-            raise NotFoundError("Vault", req.vault)
+        vault_id = checked_vault_id(req.vault, await vault_repo.get_id_by_name(req.vault))
 
         now = datetime.now(timezone.utc)
         # Generate the doc id up front so a collision can disambiguate the path
@@ -837,9 +840,7 @@ class DocumentService:
     async def get(self, vault: str, doc_ref: str) -> DocumentResponse:
         vault_repo, doc_repo, _ = await self._repos()
 
-        vault_id = await vault_repo.get_id_by_name(vault)
-        if not vault_id:
-            raise NotFoundError("Vault", vault)
+        vault_id = checked_vault_id(vault, await vault_repo.get_id_by_name(vault))
 
         row = await doc_repo.find_by_ref(vault_id, doc_ref)
         if not row:
@@ -1032,7 +1033,11 @@ class DocumentService:
     async def update(
         self, vault: str, doc_ref: str, req: DocumentUpdateRequest,
         agent_id: str | None = None, *, skill_internal: bool = False,
+        idempotency_actor: uuid.UUID | None = None,
     ) -> DocumentPutResponse:
+        if req.idempotency_key is not None:
+            from app.services.document_idempotency import DocumentIdempotencyUnsupportedError
+            raise DocumentIdempotencyUnsupportedError()
         validate_update_preconditions(
             content=req.content, expected_commit=req.expected_commit,
             expected_content_hash=req.expected_content_hash,
@@ -1043,9 +1048,7 @@ class DocumentService:
             )
         vault_repo, doc_repo, _ = await self._repos()
 
-        vault_id = await vault_repo.get_id_by_name(vault)
-        if not vault_id:
-            raise NotFoundError("Vault", vault)
+        vault_id = checked_vault_id(vault, await vault_repo.get_id_by_name(vault))
 
         # Resolve once to learn the path, then acquire the lock and re-read.
         row = await doc_repo.find_by_ref(vault_id, doc_ref)
@@ -1285,9 +1288,7 @@ class DocumentService:
         )
 
         vault_repo, doc_repo, coll_repo = await self._repos()
-        vault_id = await vault_repo.get_id_by_name(vault)
-        if not vault_id:
-            raise NotFoundError("Vault", vault)
+        vault_id = checked_vault_id(vault, await vault_repo.get_id_by_name(vault))
 
         if collection is None and slug is None:
             raise ValidationError("move requires at least one of collection or slug")

@@ -34,6 +34,7 @@ class RevisionBackend(Protocol):
 
     async def vault_activity(
         self, vault: str, *, max_count: int, since: str | None, path: str | None,
+        author: str | None = None, until: datetime | None = None,
     ) -> list[dict[str, Any]]: ...
 
     async def recent_changes(
@@ -63,9 +64,10 @@ class LegacyRevisionBackend:
 
     async def vault_activity(
         self, vault: str, *, max_count: int, since: str | None, path: str | None,
+        author: str | None = None, until: datetime | None = None,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
-            self._git.vault_log, vault, max_count=max_count, since=since, path=path,
+            self._git.vault_log, vault, max_count=max_count, since=since, path=path, author=author, until=until,
         )
 
     async def recent_changes(

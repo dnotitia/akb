@@ -1,3 +1,4 @@
+import type { McpCallTrace, MonitoringReport, OperationDetails } from "./mcp-monitoring";
 import { changesInventory, notifyInventoryChanged } from "./inventory-refresh";
 
 const API_BASE = "/api/v1";
@@ -385,10 +386,7 @@ export interface AuthProviderOption {
   login_url: string | null;
 }
 
-export interface AuthConfig {
-  available: boolean;
-  schema_version: 2 | null;
-  auth_mode: AuthMode | null;
+interface AuthConfigCapabilities {
   local_auth: { enabled: boolean };
   keycloak: {
     enabled: boolean;
@@ -396,7 +394,13 @@ export interface AuthConfig {
   };
   providers: AuthProviderOption[];
   mcp_oauth: { enabled: boolean };
+  personal_access_tokens: { enabled: boolean };
 }
+
+export type AuthConfig = AuthConfigCapabilities & (
+  | { available: true; schema_version: 3; auth_mode: AuthMode; mcp_endpoint_url: string }
+  | { available: false; schema_version: null; auth_mode: null; mcp_endpoint_url: null }
+);
 
 export const AUTH_CONFIG_UNAVAILABLE: AuthConfig = {
   available: false,
@@ -409,6 +413,8 @@ export const AUTH_CONFIG_UNAVAILABLE: AuthConfig = {
   },
   providers: [],
   mcp_oauth: { enabled: false },
+  personal_access_tokens: { enabled: false },
+  mcp_endpoint_url: null,
 };
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -434,19 +440,39 @@ function hasControlCharacters(value: string): boolean {
   });
 }
 
-function parseV2AuthConfig(value: unknown): AuthConfig | null {
+function isMcpEndpointUrl(value: unknown): value is string {
+  if (typeof value !== "string" || !/^https?:\/\/[^/@]+\//.test(value) || /[\s\\?#]/.test(value) || hasControlCharacters(value)) {
+    return false;
+  }
+  try {
+    const url = new URL(value);
+    return Boolean(url.hostname) && !url.username && !url.password && url.pathname.endsWith("/mcp/");
+  } catch {
+    return false;
+  }
+}
+
+function parseV3AuthConfig(value: unknown): AuthConfig | null {
   const root = record(value);
   const localAuth = record(root?.local_auth);
   const keycloak = record(root?.keycloak);
   const mcpOauth = record(root?.mcp_oauth);
+  const personalAccessTokens = record(root?.personal_access_tokens);
+  const mcpEndpointUrl = root?.mcp_endpoint_url;
   const mode = root?.auth_mode;
   const providerValues = root?.providers;
   if (
-    !hasExactKeys(root, ["schema_version", "auth_mode", "local_auth", "keycloak", "providers", "mcp_oauth"]) ||
+    !hasExactKeys(root, [
+      "schema_version", "auth_mode", "local_auth", "keycloak", "providers", "mcp_oauth",
+      "personal_access_tokens", "mcp_endpoint_url",
+    ]) ||
     !hasExactKeys(localAuth, ["enabled"]) ||
     !hasExactKeys(keycloak, ["enabled", "browser_session_ready"]) ||
     !hasExactKeys(mcpOauth, ["enabled"]) ||
-    root?.schema_version !== 2 ||
+    !hasExactKeys(personalAccessTokens, ["enabled"]) ||
+    typeof personalAccessTokens.enabled !== "boolean" ||
+    !isMcpEndpointUrl(mcpEndpointUrl) ||
+    root?.schema_version !== 3 ||
     (mode !== "local" && mode !== "sso") ||
     typeof localAuth?.enabled !== "boolean" ||
     typeof keycloak?.enabled !== "boolean" ||
@@ -498,7 +524,7 @@ function parseV2AuthConfig(value: unknown): AuthConfig | null {
   }
   return {
     available: true,
-    schema_version: 2,
+    schema_version: 3,
     auth_mode: mode,
     local_auth: { enabled: localAuth.enabled },
     keycloak: {
@@ -507,17 +533,19 @@ function parseV2AuthConfig(value: unknown): AuthConfig | null {
     },
     providers,
     mcp_oauth: { enabled: mcpOauth.enabled },
+    personal_access_tokens: { enabled: personalAccessTokens.enabled },
+    mcp_endpoint_url: mcpEndpointUrl,
   };
 }
 
 export function parseAuthConfig(value: unknown): AuthConfig {
-  return parseV2AuthConfig(value) ?? AUTH_CONFIG_UNAVAILABLE;
+  return parseV3AuthConfig(value) ?? AUTH_CONFIG_UNAVAILABLE;
 }
 
 /** Versioned public capabilities. Any transport/schema error is deny-all. */
 export async function getAuthConfig(): Promise<AuthConfig> {
   try {
-    const response = await fetch(`${API_BASE}/auth/config`);
+    const response = await fetch(`${API_BASE}/auth/config`, { cache: "no-store" });
     if (!response.ok) return AUTH_CONFIG_UNAVAILABLE;
     const config = parseAuthConfig(await response.json());
     if (config.available && config.auth_mode !== null) {
@@ -660,6 +688,50 @@ function adminCsrfCookieName(): string {
   return window.location.protocol === "https:"
     ? "__Host-akb_admin_csrf"
     : "akb_dev_admin_csrf";
+}
+
+export async function loginMcpMonitoring(username: string, password: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/admin/mcp-monitoring/auth/local/login`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!response.ok) await throwJsonApiError(response);
+}
+
+export async function logoutMcpMonitoring(): Promise<void> {
+  const response = await fetch(`${API_BASE}/admin/mcp-monitoring/auth/logout`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "X-AKB-Monitoring-Logout": "1" },
+  });
+  if (!response.ok) await throwJsonApiError(response);
+}
+
+export async function getMcpMonitoring(query: URLSearchParams, signal?: AbortSignal): Promise<MonitoringReport> {
+  const response = await fetch(`${API_BASE}/admin/mcp-monitoring?${query}`, {
+    credentials: "same-origin",
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json();
+}
+
+export async function getMcpOperationCalls(actor: string, operation: string, query: URLSearchParams, signal?: AbortSignal): Promise<OperationDetails> {
+  const path = `${API_BASE}/admin/mcp-monitoring/operations/${encodeURIComponent(actor)}/${encodeURIComponent(operation)}/calls`;
+  const response = await fetch(`${path}?${query}`, { credentials: "same-origin", cache: "no-store", signal });
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json();
+}
+
+export async function getMcpCallTrace(id: string, signal?: AbortSignal): Promise<McpCallTrace> {
+  const response = await fetch(`${API_BASE}/admin/mcp-monitoring/calls/${encodeURIComponent(id)}/trace`, {
+    credentials: "same-origin", cache: "no-store", signal,
+  });
+  if (!response.ok) await throwJsonApiError(response);
+  return response.json();
 }
 
 export async function getAdminSession(): Promise<AdminSession | null> {
@@ -1216,6 +1288,8 @@ export interface AdminSsoOperationRequestDocument {
   owner_id: string;
   requested_by: string;
   requested_token_id: string;
+  request_nonce?: string;
+  expected_realm_id?: string;
   claim: { expected_revision: number; expected_fingerprint: string } | null;
   grant: {
     operation_id: string;
@@ -1264,6 +1338,7 @@ const OPERATION_REQUEST_DOCUMENT_KEYS = [
   "schema_version", "request_id", "kind", "installation_id", "target_id", "provider_alias", "owner_id",
   "requested_by", "requested_token_id", "claim", "grant",
 ] as const;
+const OPERATION_REQUEST_DOCUMENT_OPTIONAL_KEYS = ["request_nonce", "expected_realm_id"] as const;
 const OPERATION_GRANT_KEYS = [
   "operation_id", "source", "expected_provider_revision", "verbs", "provider_payload_sha256",
   "configure_summary", "ttl_seconds", "provider_secret_revision", "recipient_public_key",
@@ -1361,8 +1436,11 @@ function parseOperationGrant(value: unknown): NonNullable<AdminSsoOperationReque
 function parseOperationRequestDocument(value: unknown): AdminSsoOperationRequestDocument {
   const document = record(value);
   const claim = document?.claim === null ? null : record(document?.claim);
+  const optionalKeys = document
+    ? OPERATION_REQUEST_DOCUMENT_OPTIONAL_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(document, key))
+    : [];
   if (
-    !hasExactKeys(document, OPERATION_REQUEST_DOCUMENT_KEYS) ||
+    !hasExactKeys(document, [...OPERATION_REQUEST_DOCUMENT_KEYS, ...optionalKeys]) ||
     document.schema_version !== 1 ||
     !isUuid(document.request_id) ||
     (document.kind !== "ownership_claim" && document.kind !== "provider_grant") ||
@@ -1372,6 +1450,8 @@ function parseOperationRequestDocument(value: unknown): AdminSsoOperationRequest
     !isBoundedText(document.owner_id, 255) ||
     !isUuid(document.requested_by) ||
     !isUuid(document.requested_token_id) ||
+    (optionalKeys.includes("request_nonce") && !isUuid(document.request_nonce)) ||
+    (optionalKeys.includes("expected_realm_id") && !isUuid(document.expected_realm_id)) ||
     (document.kind === "ownership_claim") !== (claim !== null && document.grant === null) ||
     (claim !== null && (
       !hasExactKeys(claim, ["expected_revision", "expected_fingerprint"]) ||
@@ -1391,6 +1471,8 @@ function parseOperationRequestDocument(value: unknown): AdminSsoOperationRequest
     owner_id: document.owner_id,
     requested_by: document.requested_by,
     requested_token_id: document.requested_token_id,
+    ...(optionalKeys.includes("request_nonce") ? { request_nonce: document.request_nonce as string } : {}),
+    ...(optionalKeys.includes("expected_realm_id") ? { expected_realm_id: document.expected_realm_id as string } : {}),
     claim: claim === null ? null : {
       expected_revision: claim.expected_revision as number,
       expected_fingerprint: claim.expected_fingerprint as string,

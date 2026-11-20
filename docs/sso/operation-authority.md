@@ -16,8 +16,8 @@ becomes a second verifier, a public login choice or an OIDC credential issuer.
 All paths below are relative to `/api/v1`. The existing administrator service
 PAT can read `/admin/sso/operation-capabilities` and
 `/admin/sso/providers/{alias}/ownership`. It cannot grant or retire operations or
-assign ownership itself; it can ask a human to, through an
-[operation request](#operation-requests). Human calls use the product-admin
+assign ownership itself. A separate dedicated service key can ask a human
+through an [operation request](#operation-requests). Human calls use the product-admin
 session; mutations also require the matching `X-AKB-Admin-CSRF` cookie/header
 proof.
 
@@ -31,7 +31,9 @@ Capabilities return `schema_version: 1`, the database-owned `installation_id`,
 - `auth.callback-login-evidence.v1`
 - `sso.operation-attempts.v1`
 - `sso.provider-client-credentials.v1`
+- `sso.provider-initialize.v1`
 - `sso.operation-requests.v1`
+- `sso.operation-request-service-key.v1`
 
 `realm_identity` is `{realm_id, realm_name, issuer}` from an actual Admin REST
 read of the configured realm. Missing permission, delegated management and
@@ -82,6 +84,36 @@ because neither changes the secret, so after the latch is cleared the ownership
 read still names the configured secret version. An ordinary configure and a
 release of ownership clear it.
 
+## Initialize an absent provider
+
+When a provider alias is absent, an authorized provider-control actor may use
+`PUT /admin/sso/providers/{alias}/initialize`. Supply the ordinary
+configuration fields `provider_type`, `display_name`, `issuer`,
+`discovery_url`, `client_id` and `client_secret`, plus the
+`expected_fingerprint` from the absent-provider ownership read and a
+nonempty `secret_revision` label. The label is an opaque revision of the
+secret in the caller's secret store, never the secret itself.
+
+Initialization requires an unowned alias without an emergency latch and creates
+the provider disabled. It does not enable the provider. The operation checks
+the absent fingerprint under the ownership lock and checks Keycloak again after
+discovery; creation uses only Keycloak's create operation. A concurrent
+creation causes a conflict and is never overwritten. The normal provider
+response is secret-free; ownership readback shows the resulting fingerprint,
+revision and secret-revision label.
+
+Keycloak and the AKB database are separate authorities. If a response is lost
+or the database or audit write fails after Keycloak accepted creation, the
+provider can exist without the corresponding AKB evidence. Do not automatically
+retry initialization after an ambiguous result: inspect the provider and
+ownership readback, then reconcile explicitly. Existing providers require the
+ordinary configuration or client-credential paths.
+
+The `sso.provider-initialize.v1` capability advertises this endpoint.
+The independent `sso.operation-request-service-key.v1` capability advertises
+Native issuance of the dedicated request key; the older
+`sso.operation-requests.v1` capability alone does not establish that support.
+
 ## Operation requests
 
 A direct grant (next section) returns the raw operation credential to the
@@ -92,10 +124,12 @@ only the token that asked collects the credential, once, sealed to a key it
 generated for that request. No response returned to a human contains a
 credential.
 
-`POST /admin/sso/operation-requests` accepts only an administrator service key
-(the same `read`, `write`, `admin` service PAT conjunction an operation actor
-must hold). The requesting user and token are taken from the calling token; the
-body cannot name them. Two kinds exist:
+`POST /admin/sso/operation-requests` accepts only a service key with exactly
+the `sso_operation_requests` scope and no vault scope, belonging to an active
+non-admin service account. Provision it using the
+[Native bootstrap](#provision-the-requester-key). Broad read, write and admin
+keys do not acquire this authority. The requesting user and token are taken
+from the calling token; the body cannot name them. Two kinds exist:
 
 ```json
 {
@@ -157,7 +191,7 @@ product-admin session and the CSRF header, and the body
 `{"expected_request_sha256": "<digest the screen showed>"}`. A different digest,
 or a request that is no longer pending, is a `409` conflict, so a stale screen
 cannot decide anything it did not show. Approval also requires the requesting
-token to still be a live administrator service key.
+token to still be the live dedicated service key.
 
 - Approving a claim runs the ownership compare-and-set above with the approving
   human as the actor and `updated_by`, in the transaction that records the
@@ -319,8 +353,40 @@ and adopt the live fingerprint before issuing another operation.
 Human administrators inspect a secret-free operation with
 `GET /admin/sso/identity-operations/{id}` and retire it with
 `POST /admin/sso/identity-operations/{id}/retire`. Those paths also accept the
-bounded operation carrier while valid. Retirement retains the journal. No
-automatic Keycloak user/link deletion is performed.
+bounded operation carrier while valid. The dedicated requester key can inspect
+and retire only operations originating from its own collected requests and
+their human-reauthorized attempts, bound to the same user and token.
+Retirement retains the journal. No automatic Keycloak user/link deletion is performed.
+
+## Provision the requester key
+
+This command is a trusted Native operator action with database authority. It is
+the only issuance path for this scope; generic HTTP token minting cannot issue
+it. Before running it, create and durably retain a fresh credential in the
+operator's secret store. It must be `akb_secret_` followed by the unpadded
+base64url encoding of 32 cryptographically random bytes. Choose a fresh UUID
+for the token ID and retain both values across retries.
+
+Pipe the retained credential directly to standard input, and write the
+secret-free receipt to a protected path:
+
+```sh
+cat /protected/requester-key | python -m app.cli provision-approval-service-credential \
+  --token-id "$REQUESTER_TOKEN_ID" --receipt-file /protected/requester-receipt.json
+```
+
+Standard input must be a pipe; the value never appears in command arguments,
+stdout, stderr, the receipt or audit events. The receipt includes
+`requester_user_id`, `requester_token_id`, `installation_id`, `key_class`,
+`scopes`, `vault_scope` and `status` (`issued` or `replayed`). Store the
+identity metadata with the secret. Retrying the same UUID and value returns
+the same identity; a changed value, a deleted key, or an altered account is
+refused. The ledger retains a tombstone even when an account or token is deleted.
+
+For rotation, retain a new credential under a new token UUID and run the same
+command. It adds a key to the same non-admin requester without revoking the
+prior key. Existing requests and operations stay bound to their original user
+and token; revoke an old key only when its outstanding work no longer needs it.
 
 ## Installed management targets
 

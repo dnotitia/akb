@@ -71,7 +71,7 @@ async def reset_password(
         async with conn.transaction():
             row = await conn.fetchrow(
                 """
-                SELECT id, username, auth_provider, account_status, account_kind
+                SELECT id, username, auth_provider, account_status, account_kind, monitoring_access
                   FROM users WHERE username = $1
                    FOR UPDATE
                 """,
@@ -81,7 +81,8 @@ async def reset_password(
                 raise NotFoundError("User", username)
             if row["account_status"] != "active":
                 raise AccountSuspendedError()
-            if row["auth_provider"] != "local" or row["account_kind"] != "human":
+            if (row["auth_provider"] != "local" or row["account_kind"] != "human"
+                    or row["monitoring_access"] is not None):
                 raise PasswordLifecycleUnavailableError()
 
             temp = generate_temp_password()

@@ -28,7 +28,7 @@ async function fixture(page: Page, dark = false, treeVisible = "1") {
   await page.route("**/api/v1/**", route => {
     const path = new URL(route.request().url()).pathname;
     let json: object = { items: [], history: [], changes: [], relations: [], subscribed: false, unread_count: 0 };
-    if (path.endsWith("/auth/config")) json = { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } };
+    if (path.endsWith("/auth/config")) json = { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" };
     else if (path.endsWith("/auth/me")) json = { user_id: "document-header-owner", username: "fixture", display_name: "Reading reviewer", email: "reviewer@example.invalid", auth_method: "local", is_admin: false };
     else if (path.endsWith("/vaults")) json = { vaults: [{ id: "document-header-vault", name: "fixture", role: "owner" }] };
     else if (path.endsWith("/info")) json = { name: "fixture", role: "owner", description: "Shared reading decisions.", public_access: "none", is_archived: false, is_external_git: false, document_count: 1, collection_count: 1 };
@@ -164,8 +164,6 @@ for (const width of [375, 1440]) for (const dark of [false, true]) {
       tools.getByRole("radio", { name: "Preview", exact: true }),
       tools.getByRole("radio", { name: "Raw markdown", exact: true }),
       tools.getByRole("button", { name: "Find in document", exact: true }),
-      tools.getByRole("button", { name: "Table of contents", exact: true }),
-      tools.getByRole("button", { name: /^Show document references/ }),
       ...(width >= 640 ? [tools.getByRole("button", { name: "Copy markdown", exact: true })] : []),
       tools.getByRole("button", { name: "Edit", exact: true }),
       tools.getByRole("button", { name: `Actions for ${title}`, exact: true }),
@@ -182,11 +180,11 @@ for (const width of [375, 1440]) for (const dark of [false, true]) {
     await page.getByRole("menuitem", { name: "Copy markdown", exact: true }).click();
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("# Reading context\n\nKeep decisions close to their source.");
     await expect(detailsActions).toBeFocused();
-    await detailsActions.click();
-    await page.getByRole("menuitem", { name: "Document details", exact: true }).click();
+    const detailsTrigger = page.locator("#document-reading-canvas").getByRole("button", { name: "Details", exact: true });
+    await detailsTrigger.click();
     await expect(page.locator('[data-slot="document-context-panel"]')).toBeVisible();
-    await page.getByRole("button", { name: "Close document panel", exact: true }).click();
-    await expect(detailsActions).toBeFocused();
+    await page.getByRole("button", { name: "Close details", exact: true }).click();
+    await expect(detailsTrigger).toBeFocused();
     await page.screenshot({ path: testInfo.outputPath("document-header.png"), animations: "disabled" });
     for (const [name, href] of destinations) {
       await vaultBreadcrumb(page).click();

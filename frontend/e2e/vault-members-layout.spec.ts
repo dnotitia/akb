@@ -23,12 +23,14 @@ async function fixture(page: Page, dark = false, count = 4) {
     };
     if (path.endsWith("/auth/config"))
       json = {
-        schema_version: 2,
+        schema_version: 3,
         auth_mode: "local",
         local_auth: { enabled: true },
         keycloak: { enabled: false, browser_session_ready: false },
         providers: [],
         mcp_oauth: { enabled: false },
+        personal_access_tokens: { enabled: true },
+        mcp_endpoint_url: "https://akb.example.test/mcp/",
       };
     else if (path.endsWith("/auth/me"))
       json = {

@@ -46,12 +46,14 @@ let appliedExpireDraftGeneration = 0;
 let fixturePoll: number | null = null;
 
 const documentScenarioAuthConfig = {
-  schema_version: 2 as const,
+  schema_version: 3 as const,
   auth_mode: "sso" as const,
   local_auth: { enabled: false },
   keycloak: { enabled: true, browser_session_ready: true },
   providers: [],
   mcp_oauth: { enabled: false },
+  personal_access_tokens: { enabled: true },
+  mcp_endpoint_url: "https://akb.example.test/mcp/",
 };
 
 type FixtureDocument = {

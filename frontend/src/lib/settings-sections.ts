@@ -5,7 +5,7 @@ export const SETTINGS_SECTIONS = [
   { id: "preferences", label: "Appearance", icon: Palette },
   { id: "notifications", label: "Watched documents", icon: Bell },
   { id: "security", label: "Security", icon: ShieldCheck },
-  { id: "tokens", label: "Agent connections", icon: KeyRound },
+  { id: "tokens", label: "AI connections", icon: KeyRound },
   { id: "admin", label: "Administration", icon: ShieldCheck },
 ] as const;
 

@@ -240,7 +240,8 @@ def drill_down_handler(monkeypatch):
         async def fake_drill_down(_vault, _doc, section=None):
             return list(sections)
 
-        async def fake_headings(_vault, _doc, limit=None):
+        async def fake_headings(_vault, _doc, limit=None, *, section=None):
+            assert section is None
             return list(headings if limit is None else headings[:limit])
 
         monkeypatch.setattr(

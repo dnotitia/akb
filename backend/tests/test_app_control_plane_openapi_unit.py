@@ -77,14 +77,15 @@ def test_control_plane_fixture_matches_live_operation_contract():
     assert fixture["components"].get("securitySchemes") == live["components"].get("securitySchemes")
 
 
-def test_member_installation_active_openapi_is_a_minimal_user_session_contract():
+def test_installation_active_openapi_is_a_minimal_user_contract():
     schema = app.openapi()
-    operation = schema["paths"][
-        "/api/v1/apps/{app_id}/installations/{vault_id}/active"
-    ]["get"]
+    path = "/api/v1/apps/{app_id}/installations/{vault_id}/active"
+    operation = schema["paths"][path]["get"]
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
     response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
 
     assert operation["operationId"] == "appsGetInstallationActive"
+    assert operation["summary"] == fixture["paths"][path]["get"]["summary"]
     assert response_schema == {
         "$ref": "#/components/schemas/InstallationActiveStatus"
     }

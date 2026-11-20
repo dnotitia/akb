@@ -1,3 +1,4 @@
+import { PatCredentials } from "../lib/credentials.mjs";
 // Resilience contract for the proxy's connection lifecycle.
 //
 // Covers the VPN-drop failure mode: the client-visible MCP server must
@@ -32,7 +33,7 @@ function itAsync(name, fn) {
 
 const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
 function newProxy() {
-  return new AKBProxy({ url: "http://akb.test/mcp", pat: "test-pat" });
+  return new AKBProxy({ url: "http://akb.test/mcp", credentials: new PatCredentials("test-pat") });
 }
 const fileToolNames = [
   "akb_put_file",
@@ -313,7 +314,7 @@ itAsync("vault-guide acknowledgement never authorizes an unrelated queued write"
 
 // ── _forward never kills the process; it recovers or surfaces an error ─
 
-itAsync("_forward retries a connection error then surfaces it (process survives)", async () => {
+itAsync("_forward reports an unknown read outcome and starts recovery", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {}; // observe restart without spinning a loop
   let restarts = 0;
@@ -323,19 +324,25 @@ itAsync("_forward retries a connection error then surfaces it (process survives)
     origNoop();
   };
   proxy._backendReady = true;
+  proxy._ensureBackend = async () => {
+    proxy._backendReady = true;
+    return true;
+  };
   let calls = 0;
   proxy._rpc = async () => {
     calls++;
     throw new Error("ECONNRESET");
   };
 
-  await assert.rejects(() => proxy._forward({ method: "tools/call", id: 5, params: {} }));
+  const response = await proxy._forward({ method: "tools/call", id: 5, params: { name: "akb_search" } });
+  assert.equal(response.result.isError, true);
+  assert.equal(JSON.parse(response.result.content[0].text).details.operation_outcome, "unknown");
   assert.equal(proxy._backendReady, false, "marks backend not-ready");
   assert.ok(restarts >= 1, "kicks the reconnect monitor");
-  assert.ok(calls >= 3, "attempted the initial call plus retries");
+  assert.equal(calls, 1, "dispatched the read once");
 });
 
-itAsync("_forward recovers on a later attempt once the backend returns", async () => {
+itAsync("_forward accepts a new call when the backend returns", async () => {
   const proxy = newProxy();
   proxy._startBackendMonitor = () => {};
   proxy._backendReady = true;
@@ -350,8 +357,11 @@ itAsync("_forward recovers on a later attempt once the backend returns", async (
     return true;
   };
 
-  const res = await proxy._forward({ method: "tools/call", id: 7, params: {} });
-  assert.equal(res.result.ok, true, "second attempt succeeds");
+  const first = await proxy._forward({ method: "tools/call", id: 7, params: { name: "akb_search" } });
+  assert.equal(first.result.isError, true);
+  assert.equal(calls, 1);
+  const next = await proxy._forward({ method: "tools/call", id: 8, params: { name: "akb_search" } });
+  assert.equal(next.result.ok, true, "a separate request succeeds");
   assert.equal(calls, 2);
 });
 

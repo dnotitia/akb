@@ -57,6 +57,7 @@ def _stub_workers(monkeypatch, lifecycle, started: list[str]) -> None:
     # tool_usage maintenance runner is started unconditionally (a real start
     # would asyncio.create_task off a running loop); stub it so this test stays
     # loop-free and exercises only the external_git gate.
+    monkeypatch.setattr(lifecycle.mcp_collector, "start", rec("mcp_monitoring"))
     monkeypatch.setattr(lifecycle.tool_usage, "start", rec("tool_usage_maintenance"))
     # The transfer-capability reaper is likewise unconditional now: both file
     # lanes write grants to that table and it is the only thing that expires
@@ -161,6 +162,7 @@ def test_worker_role_excludes_api_local_in_memory_sinks(monkeypatch, tmp_path):
     lifecycle.start_workers(include_api_local=False)
 
     assert "embed_worker" in started
+    assert "mcp_monitoring" not in started
     assert "tool_usage_maintenance" not in started
     # A worker process never answers a search, so it has nothing to count and
     # must not run a flusher that would only ever write empty deltas.
@@ -175,6 +177,7 @@ def test_api_role_starts_no_durable_queue_consumer(monkeypatch, tmp_path):
 
     lifecycle.start_api_runtime()
 
+    assert "mcp_monitoring" in started
     assert "tool_usage_maintenance" in started
     # The counters live in this process's memory because this is the process
     # that produces the responses being counted (akb#612).

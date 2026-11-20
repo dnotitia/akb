@@ -51,6 +51,7 @@ from git.exc import BadName, BadObject, GitError
 
 from app.config import settings
 from app.exceptions import AKBError, MirrorMarkerError
+from app.services.activity_filters import commit_metadata, git_activity_dates, matches_author
 from app.services.external_git_runner import ExternalGitRunner
 from app.services.external_git_validation import validate_branch
 from app.util.errors import (
@@ -2692,20 +2693,17 @@ class GitService:
         return out
 
     def _vault_log_mirror(
-        self, vault_name: str, max_count: int, since: str | None, path: str | None
+        self, vault_name: str, max_count: int, since: str | None, path: str | None,
+        author: str | None, until: datetime | None,
     ) -> list[dict]:
         bare = self._mirror_bare(vault_name)
         if not bare.exists():
             return []
         results: list[dict] = []
         for e in self._ext_runner.vault_log_entries(
-            bare, max_count=max_count, since=since, path=path
+            bare, max_count=max_count, since=since, path=path, author=author, until=until,
         ):
-            meta: dict[str, str] = {}
-            for bl in (line.strip() for line in e["body"].split("\n")):
-                if bl and ":" in bl:
-                    k, val = bl.split(":", 1)
-                    meta[k.strip().lower()] = val.strip()
+            meta = commit_metadata(e["body"])
             results.append(
                 {
                     "hash": e["hash"][:12],
@@ -3212,18 +3210,17 @@ class GitService:
     def _legacy_commit_metadata(commit) -> dict[str, str]:
         """Parse the commit-message metadata used by the legacy activity feed."""
         message = str(commit.message)
-        lines = message.strip().split("\n")
-        metadata: dict[str, str] = {"subject": lines[0] if lines else ""}
-        for body_line in (line.strip() for line in lines[1:] if line.strip()):
-            if ":" in body_line:
-                key, value = body_line.split(":", 1)
-                metadata[key.strip().lower()] = value.strip()
+        subject, _, body = message.strip().partition("\n")
+        metadata = {"subject": subject, **commit_metadata(body)}
         metadata.setdefault("action", "")
         metadata.setdefault("summary", "")
         metadata.setdefault("agent", str(commit.author))
         return metadata
 
-    def vault_log(self, vault_name: str, max_count: int = 30, since: str | None = None, path: str | None = None) -> list[dict]:
+    def vault_log(
+        self, vault_name: str, max_count: int = 30, since: str | None = None, path: str | None = None,
+        *, author: str | None = None, until: datetime | None = None,
+    ) -> list[dict]:
         """Get commit log for the vault, optionally scoped to a path.
 
         Like `git log -- <path>`: Git natively filters to only commits
@@ -3232,9 +3229,9 @@ class GitService:
         Mirror vaults are read through the hermetic runner.
         """
         if self._use_mirror_reader(vault_name):
-            return self._vault_log_mirror(vault_name, max_count, since, path)
+            return self._vault_log_mirror(vault_name, max_count, since, path, author, until)
         with _managed_repo(self._get_repo(vault_name)) as repo:
-            return self._vault_log_with_repo(repo, max_count, since, path)
+            return self._vault_log_with_repo(repo, max_count, since, path, author=author, until=until)
 
     def manual_fixed_ref_vault_log(
         self,
@@ -3244,6 +3241,8 @@ class GitService:
         max_count: int,
         since: str | None,
         path: str | None,
+        author: str | None = None,
+        until: datetime | None = None,
     ) -> list[dict]:
         """Read a vault activity feed from one exact manual-vault ancestor.
 
@@ -3263,7 +3262,7 @@ class GitService:
                     max_count,
                     since,
                     path,
-                    fixed_ref=fixed_ref,
+                    fixed_ref=fixed_ref, author=author, until=until,
                 )
         except (BadName, BadObject, FileNotFoundError, GitError, TypeError, ValueError) as exc:
             raise FixedRefHistoryError("fixed-ref vault activity could not be read") from exc
@@ -3276,38 +3275,37 @@ class GitService:
         path: str | None,
         *,
         fixed_ref: str | None = None,
+        author: str | None = None,
+        until: datetime | None = None,
     ) -> list[dict]:
+        if max_count <= 0:
+            return []
+        dates = git_activity_dates(since, until)
+        if dates is None:
+            return []
+        options: dict[str, Any] = dict(dates)
+        if not author:
+            options["max_count"] = max_count
+        selected = []
+        timeout = settings.git_write_timeout_secs
+        deadline = time.monotonic() + timeout
         try:
-            # gitpython's iter_commits stub forbids **kwargs splatting
-            # (each named param is typed individually). Two branches by
-            # which optional flags are present — explicit, mypy-clean.
-            if fixed_ref is not None and since and path:
-                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, since=since, paths=path))
-            elif fixed_ref is not None and since:
-                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, since=since))
-            elif fixed_ref is not None and path:
-                commits = list(repo.iter_commits(fixed_ref, max_count=max_count, paths=path))
-            elif fixed_ref is not None:
-                commits = list(repo.iter_commits(fixed_ref, max_count=max_count))
-            elif since and path:
-                commits = list(repo.iter_commits(max_count=max_count, since=since, paths=path))
-            elif since:
-                commits = list(repo.iter_commits(max_count=max_count, since=since))
-            elif path:
-                commits = list(repo.iter_commits(max_count=max_count, paths=path))
-            else:
-                commits = list(repo.iter_commits(max_count=max_count))
+            # Stream commit identities; only matching commits require file diffs.
+            for commit in repo.iter_commits(fixed_ref, paths=f":(literal){path}" if path else "", **options):
+                if author and time.monotonic() >= deadline:
+                    raise GitHistoryBoundError("timeout", timeout)
+                meta = self._legacy_commit_metadata(commit)
+                if matches_author(author, str(commit.author), meta["agent"]):
+                    selected.append((commit, meta))
+                    if len(selected) == max_count:
+                        break
         except (ValueError, GitError):
+            if (author or until is not None) and (fixed_ref or repo.head.is_valid()):
+                raise GitHistoryCommandError() from None
             return []
 
         results = []
-        for c in commits:
-            # Parse commit message for action/summary. `c.message` is
-            # `str | bytes` per the stub; in practice gitpython always
-            # decodes to str via its `default_encoding`. `str(...)` is
-            # a cheap normalisation that also satisfies mypy.
-            meta = self._legacy_commit_metadata(c)
-
+        for c, meta in selected:
             # Get changed files
             changed_files: list[dict] = []
             try:

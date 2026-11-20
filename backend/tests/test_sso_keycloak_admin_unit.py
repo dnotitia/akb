@@ -1006,3 +1006,113 @@ async def test_client_credentials_refuse_absent_unmanaged_and_invalid_providers(
         await control.set_client_credentials("workforce", client_id="akb-broker", client_secret=_NEW_SECRET)
     assert invalid.value.code == "provider_configuration_invalid"
     assert config["clientSecret"] == _SECRET
+
+
+async def test_create_only_refuses_existing_provider_before_discovery():
+    fixture = KeycloakFixture()
+    control = _control(fixture)
+    await control.configure(_spec())
+    original = deepcopy(fixture.providers["workforce"])
+    fixture.requests.clear()
+
+    with pytest.raises(ProviderControlError) as refused:
+        await control.configure(_spec(client_secret=_NEW_SECRET), require_absent=True)
+    assert refused.value.code == "provider_alias_conflict"
+    assert fixture.providers["workforce"] == original
+    assert not any("import-config" in path for _, path in fixture.requests)
+    assert not any(method in {"POST", "PUT"} and "identity-provider/instances" in path
+                   for method, path in fixture.requests)
+
+
+async def test_create_only_rechecks_absence_after_discovery():
+    class DiscoveryRace(KeycloakFixture):
+        def handler(self, request):
+            response = super().handler(request)
+            if request.url.path.endswith("/identity-provider/import-config"):
+                self.providers["workforce"] = {"alias": "workforce", "providerId": "oidc",
+                                               "enabled": True, "config": {"clientSecret": "outside-fixture"}}  # pragma: allowlist secret
+            return response
+
+    fixture = DiscoveryRace()
+    with pytest.raises(ProviderControlError) as refused:
+        await _control(fixture).configure(_spec(), require_absent=True)
+    assert refused.value.code == "provider_alias_conflict"
+    assert fixture.providers["workforce"]["enabled"] is True
+    assert not any(method in {"POST", "PUT"} and "identity-provider/instances" in path
+                   for method, path in fixture.requests)
+
+
+async def test_create_only_post_conflict_never_falls_back_to_put():
+    class PostRace(KeycloakFixture):
+        def handler(self, request):
+            if request.url.path.endswith("/identity-provider/instances") and request.method == "POST":
+                self.providers["workforce"] = {"alias": "workforce", "providerId": "oidc",
+                                               "enabled": True, "config": {"clientSecret": "outside-fixture"}}  # pragma: allowlist secret
+            return super().handler(request)
+
+    fixture = PostRace()
+    with pytest.raises(ProviderControlError) as refused:
+        await _control(fixture).configure(_spec(), require_absent=True)
+    assert refused.value.code == "provider_alias_conflict"
+    assert fixture.providers["workforce"]["enabled"] is True
+    assert sum(method == "POST" and path.endswith("/identity-provider/instances")
+               for method, path in fixture.requests) == 1
+    assert not any(method == "PUT" for method, _ in fixture.requests)
+
+
+async def test_create_only_transport_failure_is_redacted_and_never_retried():
+    class PostFailure(KeycloakFixture):
+        def handler(self, request):
+            if request.url.path.endswith("/identity-provider/instances") and request.method == "POST":
+                self.requests.append((request.method, request.url.path))
+                return httpx.Response(500, text=_SECRET)
+            return super().handler(request)
+
+    fixture = PostFailure()
+    with pytest.raises(ProviderControlError) as refused:
+        await _control(fixture).configure(_spec(), require_absent=True)
+    assert refused.value.code == "keycloak_provider_create_failed"
+    assert _SECRET not in str(refused.value)
+    assert sum(method == "POST" and path.endswith("/identity-provider/instances")
+               for method, path in fixture.requests) == 1
+    assert not any(method == "PUT" for method, _ in fixture.requests)
+
+
+async def test_create_only_lost_response_never_retries_after_keycloak_commit():
+    class LostResponse(KeycloakFixture):
+        def handler(self, request):
+            response = super().handler(request)
+            if request.url.path.endswith("/identity-provider/instances") and request.method == "POST":
+                raise httpx.ReadTimeout("fixture transport loss", request=request)
+            return response
+
+    fixture = LostResponse()
+    with pytest.raises(ProviderControlError) as refused:
+        await _control(fixture).configure(_spec(), require_absent=True)
+    assert refused.value.code == "keycloak_provider_control_unreachable"
+    assert fixture.providers["workforce"]["enabled"] is False
+    assert sum(method == "POST" and path.endswith("/identity-provider/instances")
+               for method, path in fixture.requests) == 1
+    assert not any(method == "PUT" for method, _ in fixture.requests)
+    assert _SECRET not in str(refused.value)
+
+
+async def test_create_only_success_posts_once_and_proves_disabled_readback():
+    fixture = KeycloakFixture()
+    mutation = await _control(fixture).configure(_spec(), require_absent=True)
+    assert mutation.before is None and mutation.after.state == "configured_disabled"
+    assert mutation.after.enabled is False and fixture.providers["workforce"]["enabled"] is False
+    collection = "/auth/admin/realms/akb/identity-provider/instances"
+    assert sum(method == "POST" and path == collection for method, path in fixture.requests) == 1
+    assert sum(method == "GET" and path == collection + "/workforce" for method, path in fixture.requests) == 3
+    assert not any(method == "PUT" for method, _ in fixture.requests)
+
+
+@pytest.mark.parametrize("secret,code", [(None, "provider_client_secret_required"),
+                                         (MASKED_SECRET, "provider_client_secret_invalid")])
+async def test_create_only_rejects_missing_or_masked_secret_before_network(secret, code):
+    fixture = KeycloakFixture()
+    with pytest.raises(ProviderControlError) as refused:
+        await _control(fixture).configure(_spec(client_secret=secret), require_absent=True)
+    assert refused.value.code == code
+    assert fixture.requests == []

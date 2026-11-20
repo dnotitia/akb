@@ -11,7 +11,7 @@ async function directoryFixture(page: Page, dark: boolean) {
   await page.route("**/health**", route => route.fulfill({ json: {} }));
   await page.route("**/api/v1/**", route => {
     const path = new URL(route.request().url()).pathname;
-    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+    if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
     if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "composition-user", username: "fixture", display_name: "Workspace Reviewer", is_admin: false, auth_method: "local" } });
     if (path.endsWith("/my/vaults")) return route.fulfill({ json: { vaults: Array.from({ length: 65 }, (_, index) => ({ id: `vault-${index}`, name: `workspace-${String(index).padStart(2, "0")}`, role: index % 2 ? "reader" : "owner" })) } });
     return route.fulfill({ json: { items: [], history: [], relations: [], vaults: [], tokens: [], unread_count: 0, supported: true } });
@@ -59,9 +59,11 @@ test("workspace sidebar keeps brand and support icon anchors stable", async ({ p
     expect(Math.abs(before[index]!.y - after[index]!.y)).toBeLessThanOrEqual(1);
   }
   await page.getByRole("button", { name: "Help", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Getting around AKB" });
-  await expect(dialog).toContainText("Sidebar filters");
-  await dialog.press("Escape");
+  const dialog = page.getByRole("dialog", { name: "Help" });
+  await dialog.getByRole("button", { name: /^Find a document/ }).click();
+  const article = page.getByRole("dialog", { name: "Find a document", exact: true });
+  await expect(article).toContainText("A sidebar name filter");
+  await article.press("Escape");
   await expect(page.getByRole("button", { name: "Help", exact: true })).toBeFocused();
   await page.screenshot({ path: testInfo.outputPath("workspace-collapsed.png") });
 });

@@ -29,7 +29,10 @@ test("PAT options preserve expiry and Vault scope through creation and replaceme
     await page.goto("/auth");
     await page.evaluate(token => localStorage.setItem("akb_token", token), jwt);
     await page.goto("/settings?tab=tokens");
-    await page.getByLabel("Token name", { exact: true }).fill("restricted browser token");
+    await page.getByRole("button", { name: "Continue with Claude Code" }).click();
+    const keyMethod = page.getByRole("radio", { name: "Use a connection key", exact: true });
+    if (await keyMethod.count()) await keyMethod.locator("..").click();
+    await page.getByLabel("Connection key name", { exact: true }).fill("restricted browser token");
     await page.getByRole("button", { name: "Advanced options", exact: true }).click();
     // Accessible labels below are shared by Home and Settings through one form.
     await page.getByLabel("Expiration", { exact: true }).click();
@@ -46,14 +49,14 @@ test("PAT options preserve expiry and Vault scope through creation and replaceme
     await page.screenshot({ path: test.info().outputPath("pat-options-mobile.png"), fullPage: true });
     await page.setViewportSize({ width: 1280, height: 900 });
     const createdResponse = page.waitForResponse(response => response.url().endsWith("/auth/tokens/issuance") && response.request().method() === "POST");
-    await page.getByRole("button", { name: "Create token", exact: true }).click();
+    await page.getByRole("button", { name: "Create connection key", exact: true }).click();
     const created = await createdResponse;
     expect(created.ok()).toBeTruthy();
     const issued = await created.json();
     expect(issued.scopes).toEqual(["read", "write"]);
     expect(issued.vault_scope).toEqual({ prefixes: [], extra_vaults: [inside] });
     expect(Date.parse(issued.expires_at) - Date.parse(issued.issued_at)).toBe(30 * 86_400_000);
-    await expect(page.getByText("Token created — save it now", { exact: true })).toBeVisible();
+    await expect(page.getByText("Connection key created", { exact: true })).toBeVisible();
     expect((await request.patch(`${endpoint}/vaults/${inside}`, { headers: bearer(issued.token), data: { description: "Allowed scoped write" } })).status()).toBe(200);
     expect((await request.patch(`${endpoint}/vaults/${outside}`, { headers: bearer(issued.token), data: { description: "Must be denied" } })).status()).toBe(403);
     expect((await request.get(`${endpoint}/vaults/${outside}/info`, { headers: bearer(issued.token) })).status()).toBe(200);
@@ -63,11 +66,13 @@ test("PAT options preserve expiry and Vault scope through creation and replaceme
     expect(metadata.vault_scope).toEqual(issued.vault_scope);
     expect(metadata.expires_at).toBe(issued.expires_at);
     expect(metadata.token).toBeUndefined();
-    await page.getByRole("button", { name: "Replace token restricted browser token", exact: true }).click();
-    const replacement = page.getByRole("dialog", { name: "Replace token restricted browser token", exact: true });
-    await expect(replacement.getByLabel("Token name", { exact: true })).toHaveValue("restricted browser token");
+    await page.getByRole("tab", { name: "Connection keys", exact: true }).click();
+    await page.getByRole("button", { name: "Replace key restricted browser token", exact: true }).click();
+    const replacement = page.getByRole("dialog", { name: "Replace key restricted browser token", exact: true });
+    await replacement.getByRole("button", { name: "Continue with Claude Code" }).click();
+    await expect(replacement.getByLabel("Connection key name", { exact: true })).toHaveValue("restricted browser token");
     const replacementResponse = page.waitForResponse(response => response.url().endsWith("/auth/tokens/issuance") && response.request().method() === "POST");
-    await replacement.getByRole("button", { name: "Create replacement token", exact: true }).click();
+    await replacement.getByRole("button", { name: "Create replacement key", exact: true }).click();
     const replacementCreated = await replacementResponse;
     expect(replacementCreated.ok()).toBeTruthy();
     const next = await replacementCreated.json();
@@ -76,8 +81,8 @@ test("PAT options preserve expiry and Vault scope through creation and replaceme
     expect(next.vault_scope).toEqual(issued.vault_scope);
     expect(next.expires_at).toBe(issued.expires_at);
     expect((await request.get(`${endpoint}/auth/me`, { headers: bearer(issued.token) })).status()).toBe(200);
-    await replacement.getByRole("button", { name: "Revoke original token", exact: true }).click();
-    await page.getByRole("dialog", { name: 'Revoke "restricted browser token"?', exact: true }).getByRole("button", { name: "Revoke token", exact: true }).click();
+    await replacement.getByRole("button", { name: "Revoke original key", exact: true }).click();
+    await page.getByRole("dialog", { name: 'Revoke "restricted browser token"?', exact: true }).getByRole("button", { name: "Revoke key", exact: true }).click();
     await expect(replacement.getByText("The original token was revoked. Keep the replacement secret somewhere private.")).toBeVisible();
     expect((await request.get(`${endpoint}/auth/me`, { headers: bearer(issued.token) })).status()).toBe(401);
     expect((await request.get(`${endpoint}/auth/me`, { headers: bearer(next.token) })).status()).toBe(200);

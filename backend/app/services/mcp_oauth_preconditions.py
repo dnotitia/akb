@@ -56,10 +56,8 @@ logger = logging.getLogger("akb.mcp_oauth")
 SETUP_SCRIPT = "scripts/keycloak/setup-akb-mcp-oauth.py"
 RUNBOOK = "docs/mcp-clients/web-connectors.md"
 
-# The scopes `/.well-known/oauth-protected-resource` advertises and the
-# consent screen has to be able to offer. Keycloak lists a realm client
-# scope in `scopes_supported` once it is a default or optional scope,
-# which is the state the setup script leaves behind.
+# Keycloak discovery lists the realm's client scopes, including the
+# installer-owned scopes that are available only through explicit grants.
 #
 # These are the DISCRIMINATING signal, measured on a live realm: they
 # appear in the discovery document only after the setup script has run.

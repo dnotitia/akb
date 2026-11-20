@@ -8,7 +8,7 @@ import { configureAuthTransport, getMe, getToken, setToken, type CurrentUser } f
 import SettingsDialog from "../settings/settings-dialog";
 
 const USER: CurrentUser = { user_id: "a", username: "alice", email: "alice@example.test", display_name: "Alice", is_admin: false, auth_method: "local", key_class: null };
-const config = { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } };
+const config = { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 const fetchMock = vi.fn();
 let account = USER;

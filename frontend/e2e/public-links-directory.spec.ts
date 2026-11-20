@@ -22,7 +22,7 @@ async function fixture(page: Page, { dark = false, failNext = false } = {}) {
     const url = new URL(route.request().url());
     const path = url.pathname;
     let json: object = { items: [], history: [], relations: [], vaults: [], subscribed: false, unread_count: 0 };
-    if (path.endsWith("/auth/config")) json = { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } };
+    if (path.endsWith("/auth/config")) json = { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" };
     else if (path.endsWith("/auth/me")) json = { user_id: "public-links-user", username: "fixture", display_name: "Review user", email: "review@example.invalid", auth_method: "local", is_admin: false };
     else if (path.endsWith("/vaults")) json = { vaults: ["engineering", "research"].map((name, i) => ({ id: `vault-${i}`, name, role: "owner" })) };
     else if (path.endsWith("/info")) json = { role: "owner", name: "engineering", is_archived: false, is_external_git: false, tables: [] };

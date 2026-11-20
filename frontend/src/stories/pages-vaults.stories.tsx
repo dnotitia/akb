@@ -212,7 +212,7 @@ export const OverviewEmptyOnboarding: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByText("This vault is just getting started")).toBeInTheDocument();
     await expect(await canvas.findByRole("link", { name: /Describe this vault/i })).toBeInTheDocument();
-    await expect(await canvas.findByRole("link", { name: /Connect an agent/i })).toBeInTheDocument();
+    await expect(await canvas.findByRole("link", { name: /Connect an AI tool/i })).toBeInTheDocument();
     await expect(await canvas.findByRole("button", { name: /Import knowledge bundle/i })).toBeInTheDocument();
     await expect(await canvas.findByRole("region", { name: "empty Vault overview" })).toBeInTheDocument();
     await expect(await canvas.findByRole("complementary", { name: "Vault overview details" })).toBeInTheDocument();

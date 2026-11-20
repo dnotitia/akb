@@ -35,7 +35,7 @@ is no separate per-agent instruction file.
 
 - **Backend**: Python 3.14, FastAPI + Uvicorn, PostgreSQL 16 + pgvector; PostgreSQL Native revisions by default, GitPython for explicit Bare Git installations
 - **MCP**: Anthropic MCP SDK (Streamable HTTP) — backend serves as HTTP MCP server
-- **Proxy**: `packages/akb-mcp-client/` — Node.js ESM, zero dependencies, stdio ↔ HTTP bridge
+- **Proxy**: `packages/akb-mcp-client/` — Node.js ESM, MCP client SDK for OAuth, stdio ↔ HTTP bridge
 - **Frontend**: React 19 + TypeScript + Vite + Radix UI + Tailwind CSS v4 + Tiptap (`@akb/markdown-editor`; lazy-loaded in Edit / New-document flows)
 
 ## Frontend Design System
@@ -155,6 +155,10 @@ Ubuntu host bootstrap are documented in
   - `UserSqlExecutor` (`backend/app/services/user_sql_executor.py`)
     is the sole entry point for user SQL. System admins
     (`users.is_admin=TRUE`) bypass the role switch.
+  - Raw SQL checks the declared Vaults' archive/managed policies in the same
+    transaction as the statement. Policy changes serialize on the parent Vault
+    rows. Restricted queries use PostgreSQL READ ONLY; explicit mutations
+    retain their Vault policy errors.
   - Design: `docs/designs/pg-native-rbac/00-overview.md`.
 - npm package: `akb-mcp` on npmjs.org.
 

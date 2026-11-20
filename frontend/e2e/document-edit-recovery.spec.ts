@@ -517,7 +517,7 @@ test.describe("document edit recovery mock contract", () => {
 
     await page.getByRole("button", { name: "Cancel" }).click();
     await page.getByRole("button", { name: "Discard changes" }).click();
-    await expect(page.locator("#doc-title")).toHaveText("Recovery document");
+    await expect(page.getByRole("heading", { name: "Recovery document", level: 1, exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Edit" }).click();
     await expect(page.getByRole("textbox", { name: "Document title" })).toHaveValue("Recovery document");
     const reopenedEditor = page.getByRole("textbox", { name: "Document body (markdown)" });

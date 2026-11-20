@@ -49,10 +49,28 @@ async def test_whole_body_update_requires_original_read_predicates(
     mcp_client: Client, runtime_session: RuntimeContext,
 ) -> None:
     vault = await _create_vault(mcp_client, runtime_session, "write-predicates")
+    for body in ({}, {"content": None}, {"content": False}, {"content": 1}, {"content": []}, {"content": {}}):
+        rejected = await _call_json(mcp_client, runtime_session, "akb_put", {
+            "vault": vault, "title": "Rejected input", **body,
+        }, expect_error=True)
+        assert rejected["code"] == "invalid_argument"
+        assert rejected["details"]["field"] == "/content"
     original = await _call_json(mcp_client, runtime_session, "akb_put", {
         "vault": vault, "collection": "notes", "title": "Predicate contract", "content": "body A",
     })
     uri = original["uri"]
+    for content in (False, 1, [], {}):
+        rejected = await _call_json(mcp_client, runtime_session, "akb_update", {
+            "uri": uri, "content": content, "expected_commit": original["current_commit"],
+        }, expect_error=True)
+        assert rejected["code"] == "invalid_argument"
+        assert rejected["details"]["field"] == "/content"
+    await _call_json(mcp_client, runtime_session, "akb_update", {
+        "uri": uri, "title": "Metadata without body", "tags": [], "domain": "", "summary": "",
+    })
+    unchanged_body = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": uri})
+    assert unchanged_body["content"] == "body A"
+    assert unchanged_body["title"] == "Metadata without body"
     for content in ("stale body", ""):
         rejected = await _call_json(mcp_client, runtime_session, "akb_update", {
             "uri": uri, "content": content,

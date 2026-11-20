@@ -23,6 +23,7 @@ from app.services.search_filters import ArchiveScope, collection_predicate
 import asyncpg
 
 from app.exceptions import AKBError, ForbiddenError, GrepScopeTooLargeError, ValidationError
+from app.services import skill_policy
 from app.services.document_service import _parse_markdown
 from app.services.grep_replace import (
     DEFAULT_MAX_REPLACEMENTS,
@@ -999,6 +1000,9 @@ class M1NativeGrepService:
                     await self._require_write_access(
                         user_id=user_id, namespace_ids={head_body.namespace_id},
                     )
+                    # Bulk replacement writes directly to the revision service.
+                    # Apply the same document policy as DocumentService.update.
+                    skill_policy.check_update(head_body.path, None)
                     result = await NativeRevisionService(
                         self.pool,
                         payload_store=payload_store,

@@ -34,6 +34,7 @@ from app.exceptions import (
     ExternalAuthDisabledError,
     ExternalIdentityConflictError,
     ExternalProfileReadOnlyError,
+    ForbiddenError,
     MembershipRequiredError,
     NotFoundError,
     PasswordLifecycleUnavailableError,
@@ -42,7 +43,7 @@ from app.exceptions import (
 from app.models.vault_scope import VaultScope
 from app.repositories.events_repo import emit_event
 from app.services.admission_service import record_arrival
-from app.services.auth_policy import require_local_auth_enabled
+from app.services.auth_policy import require_local_auth_enabled, require_pat_enabled
 from app.services.auth_verifier_profiles import (
     KEYCLOAK_ACCESS_V1,
     KEYCLOAK_SERVICE_AUTHORITY_V1,
@@ -55,6 +56,7 @@ from app.services.auth_verifier_profiles import (
 )
 from app.services.role_sync import get_role_sync
 from app.services.service_authority_service import resolve_service_authority
+from app.sso.operation_request_scope import SSO_OPERATION_REQUEST_SCOPE
 from app.services.user_identity import (
     display_name_from_external,
     normalize_display_name,
@@ -66,7 +68,7 @@ from app.services.user_identity import (
 
 TOKEN_KEY_CLASSES = frozenset({"pat", "service", "publishable"})
 ISSUABLE_TOKEN_KEY_CLASSES = frozenset({"pat", "service"})
-TOKEN_SCOPES = frozenset({"read", "write", "admin"})
+TOKEN_SCOPES = frozenset({"read", "write", "admin", SSO_OPERATION_REQUEST_SCOPE})
 DEFAULT_TOKEN_SCOPES = ("read", "write")
 
 
@@ -95,6 +97,7 @@ class AuthenticatedUser:
     # caller that presented a valid token with zero scopes is rejected by the
     # dispatcher's `vault:read|write` requirement.
     oauth_scopes: list[str] | None = None
+    oauth_audience: str | None = None
     # Token-table class for PAT/service-key paths. None for JWT/OAuth.
     key_class: str | None = None
     # Coarse read/write/admin scopes carried by tokens.scopes. None means
@@ -267,6 +270,9 @@ def scopes_from_db(scopes: object) -> frozenset[str]:
 
 def token_has_scope(granted: frozenset[str] | None, required: str) -> bool:
     """Return True if this credential may perform the coarse operation."""
+    if required == SSO_OPERATION_REQUEST_SCOPE:
+        # Even an administrator or an unscoped human is not this capability.
+        return granted == frozenset({SSO_OPERATION_REQUEST_SCOPE})
     if granted is None:
         return True
     return "admin" in granted or required in granted
@@ -362,63 +368,52 @@ async def register(username: str, email: str, password: str, display_name: str |
     }
 
 
+async def verify_local_login(conn, username: str, password: str, *, monitoring: bool | None = None):
+    username = username.strip()
+    row = await conn.fetchrow(
+        """
+        SELECT id, username, email, password_hash, display_name, is_admin,
+               session_generation, auth_provider, account_status, credential_change_required,
+               account_kind, monitoring_access
+          FROM users
+         WHERE username = $1 OR username = lower($1) OR lower(email) = lower($1)
+         ORDER BY CASE WHEN username = $1 THEN 0 WHEN username = lower($1) THEN 1 ELSE 2 END
+         LIMIT 1
+           FOR SHARE
+        """,
+        username,
+    )
+    if row is None or row["monitoring_access"] is not monitoring:
+        raise AuthenticationError("Invalid credentials")
+    if row["account_status"] != "active" and row["account_kind"] == "human":
+        if monitoring:
+            raise AuthenticationError("Invalid credentials")
+        raise AccountSuspendedError()
+    if row["auth_provider"] != "local" or row["account_kind"] != "human":
+        raise AuthenticationError("Invalid credentials")
+    if not await verify_password_async(password, row["password_hash"]):
+        raise AuthenticationError("Invalid credentials")
+    return row
+
+
 async def login(username: str, password: str) -> dict:
     require_local_auth_enabled()
-    username = username.strip()
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            canonical_username = await conn.fetchval(
-                "SELECT lower($1::text)", username
-            )
-            row = await conn.fetchrow(
-                """
-                SELECT id, username, email, password_hash, display_name, is_admin,
-                       tokens_revoked_before, session_generation, auth_provider,
-                       account_status, account_kind
-                 FROM users
-                 WHERE username = $1
-                    OR username = $2
-                    OR lower(email) = lower($1)
-                 ORDER BY CASE
-                              WHEN username = $1 THEN 0
-                              WHEN username = $2 THEN 1
-                              ELSE 2
-                          END
-                 LIMIT 1
-                   FOR SHARE
-                """,
-                username,
-                canonical_username,
-            )
-            if row and row["account_status"] != "active" and row["account_kind"] == "human":
-                raise AccountSuspendedError()
-            # SSO-provisioned accounts have no usable local password. Reject
-            # the local-login path explicitly with the same generic message
-            # so we don't leak which accounts are SSO-backed.
-            if row and (row["auth_provider"] != "local" or row["account_kind"] != "human"):
-                raise AuthenticationError("Invalid credentials")
-            if not row or not await verify_password_async(password, row["password_hash"]):
-                raise AuthenticationError("Invalid credentials")
-
-            # FOR SHARE serializes issuance with revocation's row UPDATE.
-            # Generation is authoritative, so freshly issued JWTs need no
-            # future iat/nbf to escape the legacy whole-second cutoff.
-            token = create_jwt(
-                str(row["id"]),
-                row["username"],
-                session_generation=row["session_generation"],
-            )
-            return {
-                "token": token,
-                "user": {
-                    "id": str(row["id"]),
-                    "username": row["username"],
-                    "email": row["email"],
-                    "display_name": row["display_name"],
-                    "is_admin": row["is_admin"],
-                },
-            }
+    async with pool.acquire() as conn, conn.transaction():
+        row = await verify_local_login(conn, username, password)
+        token = create_jwt(
+            str(row["id"]), row["username"], session_generation=row["session_generation"],
+        )
+        return {
+            "token": token,
+            "user": {
+                "id": str(row["id"]),
+                "username": row["username"],
+                "email": row["email"],
+                "display_name": row["display_name"],
+                "is_admin": row["is_admin"],
+            },
+        }
 
 
 # ── Keycloak SSO (optional external IdP) ─────────────────────────────
@@ -488,7 +483,7 @@ def _optional_external_string(claims: dict, name: str) -> str | None:
 def _assert_active_human(row) -> None:
     if row["account_status"] != "active":
         raise AccountSuspendedError()
-    if row["account_kind"] != "human":
+    if row["account_kind"] != "human" or row["monitoring_access"] is not None:
         raise ExternalIdentityConflictError()
 
 
@@ -504,20 +499,40 @@ def _resolved_external_user(row, *, newly_provisioned: bool) -> dict:
     }
 
 
-async def _bound_external_user(conn, issuer: str, subject: str):
-    return await conn.fetchrow(
-        """
+async def _bound_external_user(conn, issuer: str, subject: str, *, lock_user: bool = False):
+    query = """
         SELECT u.id, u.username, u.email, u.display_name, u.is_admin,
                u.tokens_revoked_before, u.auth_provider,
-               u.account_status, u.account_kind,
+               u.account_status, u.account_kind, u.monitoring_access,
                e.id AS external_identity_id
           FROM external_identities e
           JOIN users u ON u.id = e.user_id
          WHERE e.issuer = $1 AND e.subject = $2
-        """,
-        issuer,
-        subject,
-    )
+        """
+    if lock_user:
+        query += " FOR SHARE OF u"
+    return await conn.fetchrow(query, issuer, subject)
+
+
+async def _read_bound_external_user(conn, issuer: str, subject: str):
+    async with conn.transaction(isolation="read_committed"):
+        bound = await _bound_external_user(conn, issuer, subject, lock_user=True)
+        if bound is None:
+            return None
+        # The user row lock waits for account changes. The joined identity
+        # may still come from before that wait. Binding changes for an existing
+        # user lock its row, so check the exact binding in a fresh snapshot
+        # while the user row is held, without taking an identity row lock.
+        binding_exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM external_identities
+                 WHERE issuer = $1 AND subject = $2 AND id = $3 AND user_id = $4
+            )
+            """,
+            issuer, subject, bound["external_identity_id"], bound["id"],
+        )
+        return bound if binding_exists else None
 
 
 async def _refresh_bound_external_user(conn, row, claims: dict):
@@ -552,9 +567,10 @@ async def _refresh_bound_external_user(conn, row, claims: dict):
                  WHERE id = $1
                    AND account_status = 'active'
                    AND account_kind = 'human'
+                   AND monitoring_access IS NULL
              RETURNING id, username, email, display_name, is_admin,
                        tokens_revoked_before, auth_provider,
-                       account_status, account_kind
+                       account_status, account_kind, monitoring_access
                 """,
                 row["id"],
                 email_snapshot,
@@ -632,7 +648,7 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
             """
             SELECT id, username, email, display_name, is_admin,
                    tokens_revoked_before, auth_provider,
-                   account_status, account_kind, is_recovery_admin
+                   account_status, account_kind, is_recovery_admin, monitoring_access
               FROM users WHERE lower(email) = $1
              ORDER BY id
                FOR UPDATE
@@ -646,10 +662,7 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
         if len(targets) != 1:
             raise ExternalIdentityConflictError()
         target = targets[0]
-        if target["account_status"] != "active":
-            raise AccountSuspendedError()
-        if target["account_kind"] != "human":
-            raise ExternalIdentityConflictError()
+        _assert_active_human(target)
         if target["is_recovery_admin"]:
             raise ExternalIdentityConflictError()
         has_issuer_binding = await conn.fetchval(
@@ -720,7 +733,7 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
         """
         SELECT id, username, email, display_name, is_admin,
                tokens_revoked_before, auth_provider,
-               account_status, account_kind
+               account_status, account_kind, monitoring_access
           FROM users WHERE id = $1
         """,
         target["id"],
@@ -729,14 +742,16 @@ async def _adopt_authoritative_user(conn, issuer: str, subject: str, claims: dic
     return _resolved_external_user(row, newly_provisioned=False)
 
 
-async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: str | None = None) -> dict:
+async def _resolve_or_provision_keycloak_user(
+    claims: dict, *, provider_alias: str | None = None, sync_profile: bool = False,
+) -> dict:
     """Resolve exact issuer/subject, adopt or create on authority, or refuse.
 
     Email and username are collision checks only — except on the one path
     the operator explicitly opened: a browser login through a provider
     declared authoritative for the address's domain (``provider_alias``
-    names the provider the flow selected and verified; ``None`` is the
-    non-browser projection paths, which stay on today's behaviour).
+    names the provider the flow selected and verified). The callback opts
+    into profile synchronization; bound bearer requests use the stored profile.
     ``invite_only`` therefore accepts an exact prebound identity, an
     authority adopt, or an authority provision; ``open`` additionally keeps
     its fresh-account JIT, whose collision branch adopts on authority
@@ -748,6 +763,12 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        if not sync_profile:
+            bound = await _read_bound_external_user(conn, issuer, subject)
+            if bound is not None:
+                _assert_active_human(bound)
+                return _resolved_external_user(bound, newly_provisioned=False)
+
         # Share the exact-identity lock with administrative/periodic approval.
         # Authority logins additionally serialize on the claimed address so
         # different subjects cannot adopt the same account concurrently.
@@ -771,15 +792,18 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
                 )
             bound = await _bound_external_user(conn, issuer, subject)
             if bound is not None:
-                refreshed = await _refresh_bound_external_user(conn, bound, claims)
-                return _resolved_external_user(refreshed, newly_provisioned=False)
+                if sync_profile:
+                    bound = await _refresh_bound_external_user(conn, bound, claims)
+                else:
+                    _assert_active_human(bound)
+                return _resolved_external_user(bound, newly_provisioned=False)
 
             try:
                 # Roll back any partial account mutation on refusal, but keep
                 # the admission note in the outer transaction with the lock.
                 async with conn.transaction():
                     return await _resolve_unbound_keycloak_user(
-                        conn, issuer, subject, claims, pre_email, pre_domain
+                        conn, issuer, subject, claims, pre_email, pre_domain, sync_profile=sync_profile,
                     )
             except (
                 MembershipRequiredError,
@@ -797,7 +821,8 @@ async def _resolve_or_provision_keycloak_user(claims: dict, *, provider_alias: s
 
 
 async def _resolve_unbound_keycloak_user(
-    conn, issuer: str, subject: str, claims: dict, email: str, domain: str | None
+    conn, issuer: str, subject: str, claims: dict, email: str, domain: str | None,
+    *, sync_profile: bool,
 ) -> dict:
     """Resolve an unbound identity while the caller holds its transaction lock."""
     if email and domain is not None:
@@ -894,13 +919,16 @@ async def _resolve_unbound_keycloak_user(
         # record lands.
         bound = await _bound_external_user(conn, issuer, subject)
         if bound is not None:
-            refreshed = await _refresh_bound_external_user(conn, bound, claims)
+            if sync_profile:
+                bound = await _refresh_bound_external_user(conn, bound, claims)
+            else:
+                _assert_active_human(bound)
             await conn.execute(
                 "DELETE FROM pending_admissions WHERE issuer = $1 AND subject = $2",
                 issuer,
                 subject,
             )
-            return _resolved_external_user(refreshed, newly_provisioned=False)
+            return _resolved_external_user(bound, newly_provisioned=False)
         if domain is not None:
             adopted = await _adopt_authoritative_user(conn, issuer, subject, claims, email, domain or "")
             if adopted is not None:
@@ -916,7 +944,7 @@ async def _resolve_unbound_keycloak_user(
         """
         SELECT id, username, email, display_name, is_admin,
                tokens_revoked_before, auth_provider,
-               account_status, account_kind
+               account_status, account_kind, monitoring_access
           FROM users WHERE id = $1
         """,
         user_id,
@@ -947,21 +975,22 @@ class ProjectionOutcome:
 async def _project_keycloak_principal(
     principal: VerifiedPrincipal,
     *,
-    provider_alias: str | None = None,
+    provider_alias: str | None,
+    sync_profile: bool,
 ) -> ProjectionOutcome:
     """Project a completely verified OIDC identity onto the AKB account path.
 
     ``provider_alias`` is the provider the browser flow selected and
-    verified (``None`` on the bearer paths, which pass none and therefore
-    stay on today's behaviour). It is the only key the authority-domain
-    decision reads — never a claim reinterpreted at this layer.
+    verified. It is the only key the authority-domain decision reads.
     """
     claims = dict(principal.claims)
     try:
         issuer, subject = _external_identity_key(claims)
         if (issuer, subject) != (principal.issuer, principal.subject):
             return ProjectionOutcome(None, "identity_claims_inconsistent")
-        resolved = await _resolve_or_provision_keycloak_user(claims, provider_alias=provider_alias)
+        resolved = await _resolve_or_provision_keycloak_user(
+            claims, provider_alias=provider_alias, sync_profile=sync_profile,
+        )
     except AKBError as e:
         logging.getLogger("akb.auth").info("Keycloak access token: account projection rejected (%s)", e)
         return ProjectionOutcome(None, getattr(e, "code", None))
@@ -980,6 +1009,7 @@ async def _project_keycloak_principal(
             is_admin=resolved["is_admin"],
             auth_method="oauth",
             oauth_scopes=scopes,
+            oauth_audience=principal.audience,
         )
     )
 
@@ -1027,7 +1057,6 @@ async def project_verified_principal(
     principal: VerifiedPrincipal,
     *,
     for_credential_change: bool = False,
-    provider_alias: str | None = None,
 ) -> AuthenticatedUser | None:
     """Common verified-human boundary before existing AKB authorization.
 
@@ -1037,14 +1066,10 @@ async def project_verified_principal(
     fail-closed: a future caller of this boundary is gated unless it
     deliberately asks not to be.
 
-    ``provider_alias`` carries the browser flow's verified provider into
-    the keycloak projection only. ``None`` (the default every bearer path
-    keeps) disables the authority-domain decision entirely.
     """
     outcome = await project_verified_principal_with_reason(
         principal,
         for_credential_change=for_credential_change,
-        provider_alias=provider_alias,
     )
     return outcome.user
 
@@ -1054,6 +1079,7 @@ async def project_verified_principal_with_reason(
     *,
     for_credential_change: bool = False,
     provider_alias: str | None = None,
+    sync_profile: bool = False,
 ) -> ProjectionOutcome:
     """The same boundary, carrying the reason when it refuses.
 
@@ -1070,7 +1096,9 @@ async def project_verified_principal_with_reason(
             )
         )
     if principal.profile_id == KEYCLOAK_ACCESS_V1:
-        return await _project_keycloak_principal(principal, provider_alias=provider_alias)
+        return await _project_keycloak_principal(
+            principal, provider_alias=provider_alias, sync_profile=sync_profile,
+        )
     if principal.profile_id == KEYCLOAK_SERVICE_AUTHORITY_V1:
         return ProjectionOutcome(
             await _project_service_authority_principal(principal)
@@ -1254,9 +1282,18 @@ async def create_pat(
     """
     import json
 
-    pool = await get_pool()
     key_class = _normalize_issuable_key_class(key_class)
+    if key_class == "pat":
+        require_pat_enabled()
+    pool = await get_pool()
     token_scopes = normalize_token_scopes(scopes)
+    dedicated_operation_request_scope = SSO_OPERATION_REQUEST_SCOPE in token_scopes
+    if dedicated_operation_request_scope:
+        raise AKBError(
+            "The SSO operation-request scope requires Native bootstrap.",
+            403,
+            code="sso_operation_request_scope_issuance_required",
+        )
     raw_token, token_hash, token_prefix = generate_pat(key_class)
     if token_id is None:
         resolved_token_id = uuid.uuid4()
@@ -1284,7 +1321,7 @@ async def create_pat(
     async with pool.acquire() as conn:
         async with role_authority_transaction(conn):
             if issuer is None:
-                user_row = await conn.fetchrow("SELECT account_status FROM users WHERE id=$1 FOR UPDATE", uuid.UUID(user_id))
+                user_row = await conn.fetchrow("SELECT account_status, monitoring_access FROM users WHERE id=$1 FOR UPDATE", uuid.UUID(user_id))
             else:
                 await conn.execute("SET LOCAL lock_timeout='5s'")
                 user_rows = await conn.fetch("SELECT * FROM users WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",
@@ -1297,6 +1334,8 @@ async def create_pat(
                 raise NotFoundError("User", user_id)
             if user_row["account_status"] != "active":
                 raise AccountSuspendedError()
+            if user_row["monitoring_access"] is not None:
+                raise ForbiddenError("Monitoring accounts cannot hold API credentials")
             issued_at = datetime.now(timezone.utc)
             if expires_days:
                 try:
@@ -1606,6 +1645,19 @@ async def _verify_sso_rest_bearer(token: str) -> VerifiedPrincipal | None:
     return await verify_keycloak_access_v1(token, "api")
 
 
+async def resolve_tool_control_authorization(authorization: str) -> AuthenticatedUser | None:
+    """Choose a verifier by audience. A verifier refusal ends the request."""
+    token = _bearer_token(authorization)
+    if token is None:
+        return None
+    resource = settings.mcp_oauth_audience_effective
+    if resource and not token.startswith("akb_"):
+        audience = _unverified_claim(token, "aud")
+        if audience == resource or (isinstance(audience, list) and resource in audience):
+            return await resolve_mcp_authorization(authorization)
+    return await resolve_rest_user_authorization(authorization)
+
+
 async def resolve_mcp_authorization(authorization: str) -> AuthenticatedUser | None:
     """Resolve only token-store credentials or the MCP access-token profile."""
     _reset_request_credential_context()
@@ -1681,7 +1733,7 @@ async def _project_local_session_principal(
                        CEIL(EXTRACT(EPOCH FROM tokens_revoked_before))::bigint
                            AS revoked_epoch_ceil
                   FROM users
-                 WHERE id = $1 AND account_status = 'active'
+                 WHERE id = $1 AND account_status = 'active' AND monitoring_access IS NULL
                    FOR SHARE
                 """,
                 uuid.UUID(principal.subject),
@@ -1744,13 +1796,15 @@ async def _resolve_pat(raw_token: str) -> AuthenticatedUser | None:
               FROM users u
              WHERE t.user_id = u.id
                AND t.token_hash = $1
+               AND ($2::boolean OR t.key_class = 'service')
                AND (t.expires_at IS NULL OR t.expires_at > NOW())
-               AND u.account_status = 'active'
+               AND u.account_status = 'active' AND u.monitoring_access IS NULL
             RETURNING t.id AS token_id, t.user_id, t.scopes, t.vault_scope, t.key_class,
                       t.expires_at, u.username, u.email, u.display_name, u.is_admin,
                       u.account_kind
             """,
             token_hash,
+            settings.pat_enabled,
         )
         if not row:
             return None

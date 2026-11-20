@@ -2,6 +2,7 @@ import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncEx
 import { createPortal } from "react-dom";
 import { ArrowRight, ArrowUpRight, PlugZap, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import type { AuthConfig } from "@/lib/api";
 import { QuickstartDialog } from "@/components/quickstart-dialog";
 import { useModalOpen } from "@/lib/modal-visibility";
 
@@ -29,7 +30,8 @@ interface HomeConnectionInvitationProps {
   userId: string | null;
   /** Verified PAT-empty + available setup + at least one accessible Vault. */
   eligible: boolean;
-  oauthEnabled: boolean;
+  authConfig: AuthConfig;
+  onRetryAuthConfig?: () => void;
   onTokenCreated?: () => void;
 }
 
@@ -39,7 +41,7 @@ export function HomeConnectionInvitation(props: HomeConnectionInvitationProps) {
   return <ConnectionInvitation key={props.userId ?? "anonymous"} {...props} />;
 }
 
-function ConnectionInvitation({ userId, eligible, oauthEnabled, onTokenCreated }: HomeConnectionInvitationProps) {
+function ConnectionInvitation({ userId, eligible, authConfig, onRetryAuthConfig, onTokenCreated }: HomeConnectionInvitationProps) {
   const [canIntroduce] = useState(() => !wasSeen(userId));
   const [minimized, setMinimized] = useState(false);
   const [quickstartOpen, setQuickstartOpen] = useState(false);
@@ -164,12 +166,12 @@ function ConnectionInvitation({ userId, eligible, oauthEnabled, onTokenCreated }
           </Button>
         </div>
         <p className="mt-1 text-sm leading-5 text-foreground-muted">Search your vaults from your AI tool.</p>
-        <Button className="mt-4 h-11 w-full text-sm" onClick={openSetup} aria-haspopup="dialog">Connect an agent <ArrowRight className="h-4 w-4" aria-hidden /></Button>
+        <Button className="mt-4 h-11 w-full text-sm" onClick={openSetup} aria-haspopup="dialog">Connect an AI tool <ArrowRight className="h-4 w-4" aria-hidden /></Button>
       </div> : <Button ref={launcherRef} variant="outline" className="h-11 border-border-strong text-sm text-link shadow-md" onClick={openSetup} aria-haspopup="dialog">
-        <PlugZap className="h-4 w-4" aria-hidden /> Connect an agent <ArrowUpRight className="h-4 w-4" aria-hidden />
+        <PlugZap className="h-4 w-4" aria-hidden /> Connect an AI tool <ArrowUpRight className="h-4 w-4" aria-hidden />
       </Button>}
     </aside>, document.body)}
-    <QuickstartDialog open={quickstartOpen} onOpenChange={setQuickstartOpen} mcpOauthEnabled={oauthEnabled} returnFocusRef={launcherRef}
+    <QuickstartDialog open={quickstartOpen} onOpenChange={setQuickstartOpen} authConfig={authConfig} onRetryAuthConfig={onRetryAuthConfig} returnFocusRef={launcherRef}
       onTokenCreated={() => { remember(userId); setMinimized(true); onTokenCreated?.(); }} />
   </>;
 }

@@ -136,7 +136,8 @@ class _BrowserFlow:
             email="alice@example.com", display_name="Alice", is_admin=False, auth_method="oauth",
         )
 
-        async def project(principal, *, provider_alias):
+        async def project(principal, *, provider_alias, sync_profile):
+            assert sync_profile is True
             self.projection_aliases.append(provider_alias)
             return ProjectionOutcome(user)
 

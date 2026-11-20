@@ -29,12 +29,14 @@ for (const viewport of [
           if (url.pathname.endsWith("/auth/config"))
             return route.fulfill({
               json: {
-                schema_version: 2,
+                schema_version: 3,
                 auth_mode: "local",
                 local_auth: { enabled: true },
                 keycloak: { enabled: false, browser_session_ready: false },
                 providers: [],
                 mcp_oauth: { enabled: false },
+                personal_access_tokens: { enabled: true },
+                mcp_endpoint_url: "https://akb.example.test/mcp/",
               },
             });
           if (url.pathname.endsWith("/auth/me"))

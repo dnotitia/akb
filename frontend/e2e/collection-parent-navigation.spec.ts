@@ -18,7 +18,7 @@ for (const width of [375, 1440]) for (const dark of [false, true]) {
     await context.route("**/api/v1/**", route => {
       const url = new URL(route.request().url());
       const path = url.pathname;
-      if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+      if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
       if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "parent-reader", username: "reader", email: "reader@example.invalid", display_name: "Reader", auth_method: "local", is_admin: false } });
       if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ id: "fixture", name: "fixture", role: "reader" }] } });
       if (path.endsWith("/info")) return route.fulfill({ json: { name: "fixture", role: "reader", document_count: 1, collection_count: 4, table_count: 0, file_count: 0 } });

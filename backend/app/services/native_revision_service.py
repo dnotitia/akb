@@ -281,6 +281,34 @@ class NativeRevisionService:
             idempotent_replay=replay,
         )
 
+    async def find_request_result(
+        self, *, namespace_id: uuid.UUID, mutation_id: uuid.UUID, fingerprint: str,
+    ) -> NativeMutationResult | None:
+        """Read a committed receipt before the facade generates dynamic fields.
+
+        This is internal; callers must authorize the current request first.
+        Publication still checks the same identity under the mutation lock,
+        so this optimistic lookup does not arbitrate concurrent requests.
+        """
+        async with self.pool.acquire() as conn:
+            prior = await self.repository.find_mutation(conn, namespace_id, mutation_id)
+        if prior is None:
+            return None
+        if prior["request_fingerprint"] != fingerprint:
+            raise ConflictError("Native idempotency key was reused with different input")
+        return self._from_row(prior, replay=True)
+
+    @staticmethod
+    def _request_fingerprint(value: str | None, fallback: str) -> str:
+        # Only the trusted facade supplies this server-computed request hash.
+        # Generated timestamps, paths and merged metadata are deliberately not
+        # the public retry identity. Internal callers keep their payload hash.
+        if value is None:
+            return fallback
+        if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+            raise ValidationError("Request fingerprint must be a SHA-256 digest")
+        return value
+
     @staticmethod
     def _opaque_revision_id() -> str:
         # P0 froze this at random 20 bytes rendered as 40 lowercase hex.
@@ -418,6 +446,7 @@ class NativeRevisionService:
         expected_digest: str | None = None,
         expected_size: int | None = None,
         allow_unavailable_asset_refs: bool = False,
+        request_fingerprint: str | None = None,
     ) -> NativeMutationResult:
         self._validate_common(surface=surface, path=path, actor=actor, mutation_id=mutation_id)
         if resource_id is not None and not isinstance(resource_id, uuid.UUID):
@@ -442,6 +471,7 @@ class NativeRevisionService:
             prepared=prepared,
             asset_ids=await native_document_assets.image_ids(payload) if surface == "document" else set(),
             allow_unavailable_asset_refs=allow_unavailable_asset_refs,
+            request_fingerprint=request_fingerprint,
         )
         await self._hit("authority.after_commit_before_response")
         return result
@@ -512,9 +542,10 @@ class NativeRevisionService:
         asset_ids: set[uuid.UUID],
         allow_unavailable_asset_refs: bool,
         conn: asyncpg.Connection | None = None,
+        request_fingerprint: str | None = None,
     ) -> NativeMutationResult:
         await self._hit("payload.after_verified")
-        fingerprint = self._fingerprint(
+        fingerprint = self._request_fingerprint(request_fingerprint, self._fingerprint(
             action="create",
             namespace_id=namespace_id,
             surface=surface,
@@ -527,7 +558,7 @@ class NativeRevisionService:
             summary=summary,
             requested_resource_id=resource_id,
             allow_unavailable_asset_refs=allow_unavailable_asset_refs,
-        )
+        ))
         await self._hit("payload.after_prepare_before_tx")
         result = await self._publish_create(
             namespace_id=namespace_id,
@@ -720,6 +751,7 @@ class NativeRevisionService:
         expected_size: int | None = None,
         notification_previous_status: str | None = None,
         notification_status: str | None = None,
+        request_fingerprint: str | None = None,
     ) -> NativeMutationResult:
         self._validate_common(surface=surface, path=path, actor=actor, mutation_id=mutation_id)
         self._validate_expected_revision(expected_revision_id)
@@ -731,7 +763,7 @@ class NativeRevisionService:
             expected_size=expected_size,
         )
         await self._hit("payload.after_verified")
-        fingerprint = self._fingerprint(
+        fingerprint = self._request_fingerprint(request_fingerprint, self._fingerprint(
             action="replace",
             namespace_id=namespace_id,
             surface=surface,
@@ -743,7 +775,7 @@ class NativeRevisionService:
             subject=subject,
             summary=summary,
             expected_resource_id=expected_resource_id,
-        )
+        ))
         await self._hit("payload.after_prepare_before_tx")
         result = await self._publish_replace(
             namespace_id=namespace_id,

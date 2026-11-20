@@ -64,7 +64,7 @@ export const HomeWorkspace: Story = {
     await expect(await canvas.findByText("Your vaults")).toBeInTheDocument();
     await expect(await canvas.findByRole("link", { name: "View all vaults" })).toBeInTheDocument();
     await expect(canvas.queryByRole("button", { name: "Show more vaults" })).not.toBeInTheDocument();
-    await expect(await within(document.body).findByRole("button", { name: "Connect an agent" })).toBeInTheDocument();
+    await expect(await within(document.body).findByRole("button", { name: "Connect an AI tool" })).toBeInTheDocument();
     await expect(await canvas.findByRole("navigation", { name: "Workspace navigation" })).toBeInTheDocument();
     await expect(canvas.queryByRole("navigation", { name: "Vaults" })).not.toBeInTheDocument();
   },

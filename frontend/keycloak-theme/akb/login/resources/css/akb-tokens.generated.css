@@ -80,8 +80,8 @@
   --akb-text-ui--line-height: 1.25rem;
   --akb-spacing-document-preview-edge: clamp(1rem, 2vw, 3rem);
   --akb-spacing-document-reading-gutter: clamp(1rem, 2cqi, 2rem);
-  --akb-spacing-document-command-row: 3rem;
-  --akb-spacing-document-command-touch-row: 4rem;
+  --akb-spacing-document-command-row: 2.5rem;
+  --akb-spacing-document-command-touch-row: 3rem;
   --akb-spacing-document-command-inset: 1.25rem;
   --akb-radius: 0.875rem;
   --akb-radius-xs: 0.1875rem;

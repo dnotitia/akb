@@ -21,6 +21,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 from app.util.text import fuzzy_hint
 from mcp_server.tools import TOOLS
 
@@ -102,3 +104,25 @@ def test_relation_tool_descriptions_match_the_vault_boundary():
     assert "explicit" in relations and "implicit" in relations
     unlink = tools["akb_unlink"].description.lower()
     assert "explicit" in unlink and "implicit" in unlink
+
+
+@pytest.mark.parametrize("name", [
+    "akb_delete_vault", "akb_set_public", "akb_explain_access",
+    "akb_list_vaults", "akb_provenance",
+])
+def test_help_examples_are_valid_advertised_calls(name):
+    from jsonschema import validate
+    from mcp_server.help import _resolve_help
+
+    topic = _resolve_help(name)
+    examples = [line for line in topic.splitlines() if line.startswith("akb_")]
+    assert examples, f"missing examples in help for {name}"
+    tools = {tool.name: tool for tool in TOOLS}
+    for line in examples:
+        call = ast.parse(line, mode="eval").body
+        assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        assert call.func.id == name and not call.args
+        arguments = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+        schema = tools[call.func.id].input_schema
+        assert arguments.keys() <= schema["properties"].keys()
+        validate(arguments, schema)

@@ -77,12 +77,14 @@ describe("Layout — auth gate", () => {
     vi.mocked(api.isCurrentAuthSession).mockReturnValue(true);
     vi.mocked(api.getAuthConfig).mockResolvedValue({
       available: true,
-      schema_version: 2,
+      schema_version: 3,
       auth_mode: "local",
       local_auth: { enabled: true },
       keycloak: { enabled: false, browser_session_ready: false },
       providers: [],
       mcp_oauth: { enabled: false },
+      personal_access_tokens: { enabled: true },
+      mcp_endpoint_url: "https://akb.example.test/mcp/",
     });
     vi.mocked(api.getMe).mockResolvedValue({
       user_id: "user-1",
@@ -358,12 +360,14 @@ describe("Layout — auth gate", () => {
   it("accepts a verified SSO cookie session without any local token", async () => {
     vi.mocked(api.getAuthConfig).mockResolvedValue({
       available: true,
-      schema_version: 2,
+      schema_version: 3,
       auth_mode: "sso",
       local_auth: { enabled: false },
       keycloak: { enabled: true, browser_session_ready: true },
       providers: [],
       mcp_oauth: { enabled: true },
+      personal_access_tokens: { enabled: true },
+      mcp_endpoint_url: "https://akb.example.test/mcp/",
     });
     vi.mocked(api.getToken).mockReturnValue(null);
 
@@ -376,12 +380,14 @@ describe("Layout — auth gate", () => {
   it("rechecks a foreground SSO identity before clearing prior private queries", async () => {
     vi.mocked(api.getAuthConfig).mockResolvedValue({
       available: true,
-      schema_version: 2,
+      schema_version: 3,
       auth_mode: "sso",
       local_auth: { enabled: false },
       keycloak: { enabled: true, browser_session_ready: true },
       providers: [],
       mcp_oauth: { enabled: true },
+      personal_access_tokens: { enabled: true },
+      mcp_endpoint_url: "https://akb.example.test/mcp/",
     });
     vi.mocked(api.getToken).mockReturnValue(null);
     let resolveForeground: ((user: api.CurrentUser) => void) | undefined;

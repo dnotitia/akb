@@ -52,6 +52,9 @@ from oidc_fixture import OIDCFixture
 LOGGER = logging.getLogger("akb.e2e_runtime")
 SCHEMA_VERSION = 2
 PROTOCOL_REVISION = "2025-06-18"
+# The stdio catalog is a single newline-delimited JSON-RPC frame. Its
+# descriptions and schemas already exceed asyncio's default 64 KiB line limit.
+STDIO_FRAME_LIMIT = 1024 * 1024
 Scenario = Literal[
     "empty",
     "app-installation-lifecycle",
@@ -851,7 +854,7 @@ class E2ERuntime:
             oidc_evidence = self.oidc_fixture.discovery()
             oidc_evidence["resource_metadata"] = {
                 "method": "GET",
-                "url": f"{self.config.app_origin}/.well-known/oauth-protected-resource",
+                "url": f"{self.config.app_origin}/.well-known/oauth-protected-resource/mcp",
             }
             oidc_evidence["challenge"] = {
                 "method": "POST",
@@ -1844,7 +1847,7 @@ class E2ERuntime:
             assert isinstance(app_service, dict)
             app_service["oauth_metadata"] = {
                 "method": "GET",
-                "url": f"{self.config.app_origin}/.well-known/oauth-protected-resource",
+                "url": f"{self.config.app_origin}/.well-known/oauth-protected-resource/mcp",
             }
             app_service["oauth_challenge"] = {
                 "method": "POST",
@@ -1956,8 +1959,7 @@ class E2ERuntime:
                     "keycloak_server_url": self.oidc_fixture.origin,
                     "keycloak_internal_url": self.oidc_fixture.origin,
                     "keycloak_realm": self.oidc_fixture.realm,
-                    "keycloak_client_id": "runtime-mcp-client",
-                    "mcp_oauth_audience": self.oidc_fixture.audience,
+                    "mcp_oauth_client_ids": ["runtime-mcp-client"],
                     "keycloak_enrollment_mode": "open",
                     "keycloak_require_verified_email": True,
                 }
@@ -2148,6 +2150,7 @@ class E2ERuntime:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=handle,
+                limit=STDIO_FRAME_LIMIT,
                 start_new_session=True,
             )
         managed = ManagedProcess(
@@ -2647,6 +2650,9 @@ class E2ERuntime:
                 line = await asyncio.wait_for(managed.stdout.readline(), timeout=20)
             except asyncio.TimeoutError:
                 raise ProductAssertionFailure("stdio response timed out") from None
+            except ValueError:
+                # StreamReader.readline raises ValueError for an over-limit frame.
+                raise ProductAssertionFailure(f"stdio response exceeded {STDIO_FRAME_LIMIT} bytes") from None
             if not line:
                 raise ProductAssertionFailure("stdio process closed its output")
             try:

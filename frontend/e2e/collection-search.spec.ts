@@ -19,7 +19,7 @@ for (const width of [375, 2560]) for (const dark of [false, true]) {
     await page.route("**/api/v1/**", route => {
       const url = new URL(route.request().url());
       const path = url.pathname;
-      if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+      if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
       if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "collection-reader", username: "reader", display_name: "Collection reader", email: "reader@example.invalid", auth_method: "local", is_admin: false } });
       if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ id: "alpha", name: "alpha", role: "reader" }] } });
       if (path.endsWith("/info")) return route.fulfill({ json: { name: "alpha", role: "reader", document_count: 1, collection_count: 2, is_archived: false, is_external_git: false } });

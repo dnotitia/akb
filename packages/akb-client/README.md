@@ -25,6 +25,13 @@ must match. On conflict, re-read and deliberately merge/recompose the draft;
 never fetch a newer revision just to submit an older-derived body. The client
 does not automatically fetch versions, retry conflicts or force an overwrite.
 
+Native document `put` and `update` also accept `idempotencyKey` (a UUID string).
+Choose one key for one intended write. If its response is lost, explicitly
+repeat the identical input with that key and the original-read conditions;
+the backend returns the original receipt. Changing input with the same key
+conflicts. Bare Git rejects keys, and the SDK does not automatically retry.
+See [document idempotency](../../docs/operations/document-idempotency.md).
+
 AKB HTTP success responses keep the backend envelope:
 
 ```json

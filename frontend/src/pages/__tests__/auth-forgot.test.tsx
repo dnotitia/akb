@@ -39,7 +39,7 @@ describe("AuthForgotPage", () => {
   it("renders password guidance only for validated local mode", async () => {
     vi.mocked(getAuthConfig).mockResolvedValue({
       available: true,
-      schema_version: 2,
+      schema_version: 3,
       auth_mode: "local",
       local_auth: { enabled: true },
       keycloak: {
@@ -48,6 +48,8 @@ describe("AuthForgotPage", () => {
       },
       providers: [],
       mcp_oauth: { enabled: false },
+      personal_access_tokens: { enabled: true },
+      mcp_endpoint_url: "https://akb.example.test/mcp/",
     });
 
     render(<MemoryRouter><AuthForgotPage /></MemoryRouter>);
@@ -58,8 +60,8 @@ describe("AuthForgotPage", () => {
 
   it.each([
     ["sso", {
-      available: true,
-      schema_version: 2 as const,
+      available: true as const,
+      schema_version: 3 as const,
       auth_mode: "sso" as const,
       local_auth: { enabled: false },
       keycloak: {
@@ -73,6 +75,8 @@ describe("AuthForgotPage", () => {
         login_url: null,
       }],
       mcp_oauth: { enabled: false },
+      personal_access_tokens: { enabled: true },
+      mcp_endpoint_url: "https://akb.example.test/mcp/",
     }],
     ["unavailable", AUTH_CONFIG_UNAVAILABLE],
   ])("does not render local password guidance in %s state", async (_name, config) => {

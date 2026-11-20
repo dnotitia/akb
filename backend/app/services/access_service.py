@@ -43,6 +43,7 @@ from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
 from app.services.write_lane import run_compensation, run_git_write
 from app.util.errors import NOT_FOUND, err
+from app.util.text import to_nfc
 
 logger = logging.getLogger("akb.access")
 
@@ -130,6 +131,17 @@ def authorized_vault_id() -> str | None:
     vault cannot be replayed against a new vault with the same name.
     """
     return _authorized_vault_id.get()
+
+
+def checked_vault_id(name: str, resolved_id: uuid.UUID | None) -> uuid.UUID:
+    """Reject a replacement Vault before reading its documents or writing to it."""
+    if resolved_id is None:
+        raise NotFoundError("Vault", name)
+    approved_name = authorized_vault()
+    if approved_name is not None and to_nfc(approved_name) == to_nfc(name):
+        if authorized_vault_id() != str(resolved_id):
+            raise ConflictError("Vault identity changed after authorization")
+    return resolved_id
 
 
 def reset_authorized_vault() -> None:

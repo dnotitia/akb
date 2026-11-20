@@ -10,10 +10,17 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SelectMenu } from "@/components/ui/select-menu";
 
-export function PatIssuanceForm({ initial, replacement = false, onCreated, onMetadataChanged, onDirtyChange, onBusyChange, ownsOperation }: {
-  initial?: PatDraft; replacement?: boolean; onCreated: (receipt: PatReceipt, snapshot: AuthSessionSnapshot) => void;
+function isPatPolicyRejection(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status !== 403) return false;
+  const detail = error.detail;
+  return typeof detail === "object" && detail !== null && "code" in detail && detail.code === "personal_access_tokens_disabled";
+}
+
+export function PatIssuanceForm({ initial, issuanceEnabled, replacement = false, onCreated, onMetadataChanged, onDirtyChange, onBusyChange, ownsOperation, onPolicyRejected }: {
+  issuanceEnabled: boolean; initial?: PatDraft; replacement?: boolean; onCreated: (receipt: PatReceipt, snapshot: AuthSessionSnapshot) => void;
   onMetadataChanged?: () => void; onDirtyChange?: (dirty: boolean) => void; onBusyChange?: (busy: boolean) => void;
   ownsOperation?: () => boolean;
+  onPolicyRejected?: () => void;
 }) {
   const id = useId();
   const [draft, setDraft] = useState<PatDraft>(() => initial ?? defaultPatDraft());
@@ -48,10 +55,18 @@ export function PatIssuanceForm({ initial, replacement = false, onCreated, onMet
     try {
       const data = await getPatCapabilities(snapshot);
       if (mounted.current && sequence === discovery.current && isCurrentAuthSession(snapshot)) setCapability({ data, snapshot });
-    } catch (e) { if (mounted.current && sequence === discovery.current) setError(e instanceof Error ? e.message : "Could not verify token issuance support."); }
+    } catch (e) {
+      if (!mounted.current || sequence !== discovery.current || !isCurrentAuthSession(snapshot)) return;
+      setError(e instanceof Error ? e.message : "Could not verify token issuance support.");
+      if (isPatPolicyRejection(e)) onPolicyRejected?.();
+    }
     finally { if (mounted.current && sequence === discovery.current) setLoading(false); }
   }
-  useEffect(() => { mounted.current = true; void discover(false); return () => { mounted.current = false; discovery.current++; }; }, []);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; discovery.current++; };
+  }, []);
+  useEffect(() => { if (issuanceEnabled) void discover(false); }, [issuanceEnabled]);
   async function loadVaults() {
     setVaultLoading(true); setVaultError(false);
     const snapshot = authSessionSnapshot();
@@ -59,7 +74,7 @@ export function PatIssuanceForm({ initial, replacement = false, onCreated, onMet
     catch { if (mounted.current) setVaultError(true); }
     finally { if (mounted.current) setVaultLoading(false); }
   }
-  useEffect(() => { if (draft.restricted && vaultNames === null && !vaultError && !vaultLoading) void loadVaults(); }, [draft.restricted, vaultNames, vaultError, vaultLoading]);
+  useEffect(() => { if (issuanceEnabled && draft.restricted && vaultNames === null && !vaultError && !vaultLoading) void loadVaults(); }, [issuanceEnabled, draft.restricted, vaultNames, vaultError, vaultLoading]);
   useEffect(() => { if (error || Object.keys(fields).length) errorSummary.current?.focus(); }, [error, fields]);
   function update(patch: Partial<PatDraft>) { setDraft(current => ({ ...current, ...patch })); setFields({}); }
   function add(kind: "vaults" | "prefixes", value: string) {
@@ -71,7 +86,7 @@ export function PatIssuanceForm({ initial, replacement = false, onCreated, onMet
   const basic = draft.permissions === "read-write" && draft.expiration === "none" && !draft.restricted;
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (pending.current || !capability || uncertain || (capability.data === "legacy" && (!basic || replacement))) return;
+    if (!issuanceEnabled || pending.current || !capability || uncertain || (capability.data === "legacy" && (!basic || replacement))) return;
     const validation = validatePatDraft(draft, capability.data === "legacy" ? 255 : capability.data.name_max_length);
     if (draft.restricted && (exact.trim() || prefix.trim())) validation.errors.vault_scope = "Add the typed Vault name or prefix to the selection before creating, or clear it.";
     if (!validation.intent || Object.keys(validation.errors).length) { setFields(validation.errors); setAdvanced(true); return; }
@@ -86,6 +101,7 @@ export function PatIssuanceForm({ initial, replacement = false, onCreated, onMet
     } catch (e) {
       if (!currentOperation()) return;
       if (!isCurrentAuthSession(snapshot)) { setCapability(null); setError("Your sign-in session changed. Review token creation again."); return; }
+      if (isPatPolicyRejection(e)) onPolicyRejected?.();
       if (e instanceof ApiError && e.status === 422) {
         const detail = e.detail as { details?: { fields?: { field?: unknown; message?: unknown }[] } } | null;
         const next: PatFieldErrors = {};
@@ -97,7 +113,7 @@ export function PatIssuanceForm({ initial, replacement = false, onCreated, onMet
         setFields(next); setAdvanced(true); setError(e.message);
       } else if (e instanceof ApiError && e.status < 500) setError(e.message);
       else {
-        setUncertain(true); setError("Creation result needs checking. Review your tokens before trying again; a token may have been created.");
+        setUncertain(true); setError("We could not confirm whether the key was created. Review your connection keys before trying again.");
         if (e instanceof UnverifiedPatReceipt && e.tokenId) setCreatedCandidate({ id: e.tokenId, snapshot });
         onMetadataChanged?.();
       }
@@ -108,9 +124,10 @@ export function PatIssuanceForm({ initial, replacement = false, onCreated, onMet
   const matches = vaultNames?.filter(name => draft.vaults.includes(name) || draft.prefixes.some(p => name.startsWith(p))) ?? [];
   return <form onSubmit={submit} className="min-w-0 space-y-3" aria-busy={busy || loading}>
     {(error || Object.keys(fields).length > 0) && <div ref={errorSummary} tabIndex={-1} className="rounded-[var(--radius-sm)] focus-visible:ring-2 focus-visible:ring-ring"><Alert variant="destructive"><p>{error || "Correct the highlighted fields."}</p><ul>{Object.entries(fields).map(([field, message]) => <li key={field}><a href={`#${id}-${field}`} className="underline">{message}</a></li>)}</ul></Alert></div>}
+    <fieldset hidden={!issuanceEnabled} disabled={!issuanceEnabled} className="min-w-0 space-y-3">
     {loading && <p role="status">Checking token issuance support…</p>}
     {!loading && !capability && <Button type="button" variant="outline" onClick={() => void discover()}>Retry token support</Button>}
-    <div className="space-y-1.5"><Label htmlFor={`${id}-name`}>Token name</Label><Input id={`${id}-name`} value={draft.name} onChange={e => update({ name: e.target.value })} placeholder="For example, work laptop" disabled={busy} aria-invalid={!!fields.name} aria-describedby={errorId("name")} />{fieldError("name")}</div>
+    <div className="space-y-1.5"><Label htmlFor={`${id}-name`}>Connection key name</Label><Input id={`${id}-name`} value={draft.name} onChange={e => update({ name: e.target.value })} placeholder="For example, work laptop" disabled={busy} aria-invalid={!!fields.name} aria-describedby={`${id}-name-help ${errorId("name") ?? ""}`.trim()} /><p id={`${id}-name-help`} className="text-xs text-foreground-muted">A nickname you will recognise later, such as your device or AI tool. AKB creates the secret key for you.</p>{fieldError("name")}</div>
     <Button type="button" variant="ghost" size="sm" className="-ml-2 text-link" aria-expanded={advanced} aria-controls={`${id}-advanced`} onClick={() => setAdvanced(!advanced)}>Advanced options<ChevronDown className={advanced ? "h-3.5 w-3.5 rotate-180" : "h-3.5 w-3.5"} aria-hidden /></Button>
     <div id={`${id}-advanced`} hidden={!advanced} className="space-y-4">
       <div className="space-y-1.5"><Label htmlFor={`${id}-expires_at`}>Expiration</Label><SelectMenu id={`${id}-expires_at`} value={draft.expiration} disabled={busy} onValueChange={value => update({ expiration: value })} options={[{ value: "none", label: "No expiration" }, ...[7, 30, 90, 365].map(days => ({ value: String(days), label: `${days} days` })), { value: "custom", label: "Custom date and time" }]} aria-invalid={!!fields.expires_at} aria-describedby={errorId("expires_at")} />
@@ -131,8 +148,10 @@ export function PatIssuanceForm({ initial, replacement = false, onCreated, onMet
     </div>
     <div className="space-y-1 border-l-2 border-border pl-3 text-xs leading-relaxed"><p className="font-medium">Before you create</p><p className="break-words text-foreground-muted">{draftSummary(draft)}</p><p className="text-foreground-muted">Your account permissions still apply. An expiration and limited writes are recommended.</p>{draft.restricted && <p className="text-foreground-muted">{draft.permissions === "read" ? "Writes are disabled. " : ""}Ordinary document reads are not restricted to this selection. SQL reads and writes are restricted by it.</p>}</div>
     {capability?.data === "legacy" && <Alert variant="warning">Advanced issuance is unavailable on this server. Only explicit server-default creation is available; its restrictions cannot be verified.{(!basic || replacement) && <p>{replacement ? "Create independently and revoke separately; this server cannot preserve a reviewed replacement." : "Your restricted draft is retained. Review and reset it before creating with server defaults."}</p>}{!basic && !replacement && <Button type="button" variant="outline" onClick={() => { setDraft({ ...defaultPatDraft(), name: draft.name }); setExact(""); setPrefix(""); }}>Reset to server defaults</Button>}</Alert>}
-    {replacement && <Alert variant="info">Review the preserved settings and any changes. The original token remains active until you explicitly revoke it after creating the replacement.</Alert>}
-    {uncertain ? <div className="space-y-2"><a className="text-link underline" href="/settings?tab=tokens" target="_blank" rel="noopener noreferrer">Review token list <span className="text-xs">(opens in a new tab)</span></a>{createdCandidate && <Button type="button" variant="destructive" onClick={() => setConfirmRevoke(true)}>Revoke identified new token</Button>}<Button type="button" variant="outline" onClick={() => { setUncertain(false); setCreatedCandidate(null); setError(""); void discover(); }}>I've checked — review another creation</Button></div> : <Button type="submit" variant="accent" loading={busy} disabled={loading || !capability || !draft.name.trim() || (capability.data === "legacy" && (!basic || replacement))}>{capability?.data === "legacy" ? "Create with server defaults" : replacement ? "Create replacement token" : "Create token"}</Button>}
+    {replacement && <Alert variant="info">Review the preserved settings and any changes. Revoke the original token after creating and saving the replacement.</Alert>}
+    {!uncertain && <Button type="submit" variant="accent" loading={busy} disabled={loading || !capability || !draft.name.trim() || (capability.data === "legacy" && (!basic || replacement))}>{capability?.data === "legacy" ? "Create key with server defaults" : replacement ? "Create replacement key" : "Create connection key"}</Button>}
+    </fieldset>
+    {uncertain && <div className="space-y-2"><a className="text-link underline" href="/settings?tab=tokens&connectionView=keys" target="_blank" rel="noopener noreferrer">Review connection keys <span className="text-xs">(opens in a new tab)</span></a>{createdCandidate && <Button type="button" variant="destructive" onClick={() => setConfirmRevoke(true)}>Revoke identified new token</Button>}{issuanceEnabled && <Button type="button" variant="outline" onClick={() => { setUncertain(false); setCreatedCandidate(null); setError(""); void discover(); }}>I've checked — review another creation</Button>}</div>}
     <ConfirmDialog open={confirmRevoke} onOpenChange={setConfirmRevoke} title="Revoke the identified new token?" description="This revokes only the new token ID returned by the failed verification. It does not revoke another token with the same name." confirmLabel="Revoke new token" variant="destructive" onConfirm={async () => { if (createdCandidate) { await revokeIssuedPat(createdCandidate.snapshot, createdCandidate.id); setCreatedCandidate(null); onMetadataChanged?.(); } }} />
   </form>;
 }

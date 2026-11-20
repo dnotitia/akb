@@ -17,7 +17,7 @@ for (const width of [1920, 1440, 375]) for (const dark of [false, true]) {
       const path = url.pathname;
       const method = route.request().method();
       if (method !== "GET") writes.push(`${method} ${path}`);
-      if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 2, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false } } });
+      if (path.endsWith("/auth/config")) return route.fulfill({ json: { schema_version: 3, auth_mode: "local", local_auth: { enabled: true }, keycloak: { enabled: false, browser_session_ready: false }, providers: [], mcp_oauth: { enabled: false }, personal_access_tokens: { enabled: true }, mcp_endpoint_url: "https://akb.example.test/mcp/" } });
       if (path.endsWith("/auth/me")) return route.fulfill({ json: { user_id: "home-watch-user", username: "fixture", display_name: "테스터", email: "fixture@example.invalid", is_admin: false, auth_method: "local" } });
       if (path.endsWith("/vaults")) return route.fulfill({ json: { vaults: [{ name: "fixture", role: "writer" }] } });
       if (path.endsWith("/vaults/fixture/info")) return route.fulfill({ json: { name: "fixture", role: "writer", is_archived: false, is_external_git: false } });

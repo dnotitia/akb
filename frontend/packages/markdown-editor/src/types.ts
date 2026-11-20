@@ -80,6 +80,8 @@ export interface MarkdownImageOptions {
 export interface MarkdownHeadingOptions {
   /** Presentation-only offset applied to rendered heading levels. */
   levelOffset?: number
+  /** Optional per-heading levels, without changing their source or ids. */
+  levels?: readonly number[]
   /** Presentation-only ids, matched to rendered headings in document order. */
   ids?: readonly string[]
 }

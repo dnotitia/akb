@@ -8,9 +8,8 @@ import { cn } from "@/lib/utils";
  * identifiers (akb:// URIs, doc ids, collection names) that were previously
  * plain text with no way to copy.
  *
- * Clipboard is undefined on insecure (plain-HTTP) origins — AKB ships an
- * `--insecure` deployment shape — so the write is guarded and fails silently
- * (the user can still select the text manually).
+ * The Clipboard API requires a secure context. Users can select the text
+ * manually when clipboard access is unavailable.
  */
 export function CopyButton({
   value,
