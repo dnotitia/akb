@@ -24,6 +24,29 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.helpers.auth_database import (
+    admin_auth_template as admin_auth_template,
+    auth_schema_template as auth_schema_template,
+    browser_auth_template as browser_auth_template,
+    identity_operations_template as identity_operations_template,
+    operation_requests_template as operation_requests_template,
+)
+from tests.helpers.native_revision_database import (
+    derived_pipeline_template as derived_pipeline_template,
+    native_template as native_template,
+)
+from tests.helpers.pg_database import (
+    _local_audit_application_schema_template as _local_audit_application_schema_template,
+    audit_application_schema_template as audit_application_schema_template,
+    application_schema_template as application_schema_template,
+    base_schema_template as base_schema_template,
+)
+from tests.helpers.vector_database import (
+    compaction_template as compaction_template,
+    corpus_template as corpus_template,
+    empty_vchord_template as empty_vchord_template,
+)
+
 _BACKEND_DIR = Path(__file__).resolve().parents[1]
 _REPO_ROOT = _BACKEND_DIR.parent
 

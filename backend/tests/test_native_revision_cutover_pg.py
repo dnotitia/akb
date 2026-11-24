@@ -53,7 +53,7 @@ from app.services.native_revision_cutover import (
 from app.services.legacy_revision_bridge import InventoryEligibilityError
 from app.services.native_revision_backend import NativeRevisionBackend
 from app.services.uri_service import doc_uri, split_uri
-from tests.helpers.pg_database import TestDatabase, temporary_database
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
@@ -77,8 +77,9 @@ def _load(filename: str):
     return module
 
 
-async def _install_schema(dsn: str, *, cutover_migrations: bool) -> None:
-    filenames = [
+async def _initialize_legacy_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(_INIT_SQL)
+    for filename in (
         "010_external_git_mirror.py",
         "015_events_outbox.py",
         "044_vault_write_policy.py",
@@ -88,49 +89,55 @@ async def _install_schema(dsn: str, *, cutover_migrations: bool) -> None:
         "060_native_revision_migration_bridge.py",
         "061_native_revision_authority.py",
         "105_bridge_body_digest.py",
-    ]
-    if cutover_migrations:
-        filenames.extend(
-            [
+    ):
+        await _load(filename).migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def legacy_cutover_template() -> AsyncIterator[TestDatabase]:
+    async with database_template(_DSN, _DATABASE_PREFIX, _initialize_legacy_schema) as template:
+        yield template
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def pre_supersession_template(legacy_cutover_template: TestDatabase) -> AsyncIterator[TestDatabase]:
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=legacy_cutover_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            for filename in (
                 "088_native_revision_existing_cutover.py",
                 "089_native_file_projection_outbox.py",
                 "090_native_revision_vault_purge_fence.py",
                 "091_native_revision_committed_receipt_guard.py",
+            ):
+                await _load(filename).migrate(conn=conn)
+        finally:
+            await conn.close()
+        yield database
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def cutover_template(pre_supersession_template: TestDatabase) -> AsyncIterator[TestDatabase]:
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=pre_supersession_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            for filename in (
                 "092_native_revision_plan_supersession.py",
                 "093_external_git_retirement.py",
                 "094_native_revision_completed_reservation_transfer.py",
                 "096_native_revision_cutover_fence.py",
                 "097_native_revision_migration_inventory.py",
                 "100_native_revision_cutover_file_applied_path.py",
-            ]
-        )
-    conn = await asyncpg.connect(dsn)
-    try:
-        await conn.execute(_INIT_SQL)
-        for filename in filenames:
-            await _load(filename).migrate(conn=conn)
-    finally:
-        await conn.close()
-
-
-@pytest_asyncio.fixture(scope="module", loop_scope="module")
-async def cutover_template() -> AsyncIterator[TestDatabase]:
-    async with temporary_database(_DSN, _DATABASE_PREFIX) as database:
-        await _install_schema(database.dsn, cutover_migrations=True)
+            ):
+                await _load(filename).migrate(conn=conn)
+        finally:
+            await conn.close()
         yield database
 
 
 @asynccontextmanager
 async def _cloned_schema(template: TestDatabase):
     async with temporary_database(_DSN, _DATABASE_PREFIX, template=template) as database:
-        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
-            yield pool
-
-
-@asynccontextmanager
-async def _legacy_schema():
-    async with temporary_database(_DSN, _DATABASE_PREFIX) as database:
-        await _install_schema(database.dsn, cutover_migrations=False)
         async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
             yield pool
 
@@ -1141,15 +1148,11 @@ async def test_external_git_retirement_reclassifies_a_collector_adoption_and_req
             postgres._pool = previous_pool
 
 
-async def test_plan_supersession_migration_releases_legacy_aborted_reservations(tmp_path):
+async def test_plan_supersession_migration_releases_legacy_aborted_reservations(tmp_path, pre_supersession_template):
     """Upgrade releases an attempt that was aborted before plan supersession existed."""
-    async with _legacy_schema() as pool:
+    async with _cloned_schema(pre_supersession_template) as pool:
         async with pool.acquire() as conn:
             for filename in (
-                "088_native_revision_existing_cutover.py",
-                "089_native_file_projection_outbox.py",
-                "090_native_revision_vault_purge_fence.py",
-                "091_native_revision_committed_receipt_guard.py",
                 "097_native_revision_migration_inventory.py",
                 "100_native_revision_cutover_file_applied_path.py",
             ):
@@ -1205,15 +1208,11 @@ async def test_plan_supersession_migration_releases_legacy_aborted_reservations(
         assert fresh.vaults[0].migration_run_id != prior_run_id
 
 
-async def test_completed_reservation_transfer_migration_upgrades_aborted_applied_cutover(tmp_path):
+async def test_completed_reservation_transfer_migration_upgrades_aborted_applied_cutover(tmp_path, pre_supersession_template):
     """Migration 094 releases only an eligible completed reservation on demand."""
-    async with _legacy_schema() as pool:
+    async with _cloned_schema(pre_supersession_template) as pool:
         async with pool.acquire() as conn:
             for filename in (
-                "088_native_revision_existing_cutover.py",
-                "089_native_file_projection_outbox.py",
-                "090_native_revision_vault_purge_fence.py",
-                "091_native_revision_committed_receipt_guard.py",
                 "092_native_revision_plan_supersession.py",
                 "093_external_git_retirement.py",
                 "097_native_revision_migration_inventory.py",
@@ -2092,8 +2091,9 @@ async def test_committed_cutover_preserves_vault_activity_for_deleted_and_recrea
 
 async def test_cutover_migrations_upgrade_once_and_second_runner_start_is_a_noop(
     monkeypatch,
+    legacy_cutover_template,
 ):
-    async with _legacy_schema() as pool:
+    async with _cloned_schema(legacy_cutover_template) as pool:
         source = (_BACKEND / "app" / "db" / "postgres.py").read_text(encoding="utf-8")
         registered = set(re.findall(r'"([0-9]{3}_[^"]+\.py)"', source))
         cutover_files = {

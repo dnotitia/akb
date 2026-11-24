@@ -16,7 +16,7 @@ three sides:
   entry) was resolved against the legacy catalog the native arm never writes,
   so a native-only target produced no edge at all.
 
-These run against a dedicated PostgreSQL 16 through the same `_fresh_database`
+These run against a dedicated PostgreSQL 16 through the same `cloned_derived_database`
 helper the derived-pipeline concurrency tests use, with real native revision
 writes and real graph SQL. Set `AKB_TEST_DSN` to an instance whose user can
 create and drop databases; `REQUIRE_REAL_PG=1` turns a missing instance from a
@@ -40,7 +40,7 @@ from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_derived_worker import NativeDerivedWorker
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
-from tests.concurrency.test_native_derived_pipeline import _fresh_database
+from tests.helpers.native_revision_database import cloned_derived_database
 
 pytestmark = pytest.mark.asyncio
 
@@ -113,22 +113,6 @@ async def _intent(pool, revision_id):
     return intent
 
 
-async def _apply_migration(pool, number: int) -> None:
-    """Apply one numbered migration onto an already-built test database."""
-    import importlib.util
-
-    path = next(
-        (pathlib.Path(__file__).resolve().parents[1] / "app" / "db" / "migrations")
-        .glob(f"{number:03d}_*.py")
-    )
-    spec = importlib.util.spec_from_file_location(f"extra_migration_{number}", path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    async with pool.acquire() as conn:
-        await module.migrate(conn=conn)
-
-
 async def _apply(worker, pool, revision_id):
     """Apply one resource's derived rewrite out of band, as a delayed worker would."""
     intent = await _intent(pool, revision_id)
@@ -142,8 +126,8 @@ async def _apply(worker, pool, revision_id):
 # ── akb#654 — a delayed delete must not reach a replacement ─────────
 
 
-async def test_a_delayed_delete_keeps_the_replacements_links(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_delayed_delete_keeps_the_replacements_links(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         original = await native.create_text(**_args(vault_id, "a.md"), payload="old")
         deleted = await native.delete_resource(
@@ -161,8 +145,8 @@ async def test_a_delayed_delete_keeps_the_replacements_links(monkeypatch):
         assert await _edges(pool) == [(_doc("source.md"), _doc("a.md"))]
 
 
-async def test_a_delete_removes_both_directions_when_the_path_is_free(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_delete_removes_both_directions_when_the_path_is_free(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         doomed = await native.create_text(**_args(vault_id, "a.md"), payload="body")
         other = await native.create_text(**_args(vault_id, "other.md"), payload="body")
@@ -183,9 +167,9 @@ async def test_a_delete_removes_both_directions_when_the_path_is_free(monkeypatc
         assert await _edges(pool) == []
 
 
-async def test_a_retried_delete_intent_is_idempotent(monkeypatch):
+async def test_a_retried_delete_intent_is_idempotent(derived_pipeline_template, monkeypatch):
     """Delivery is at-least-once, so the cleanup has to survive a second run."""
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         doomed = await native.create_text(**_args(vault_id, "a.md"), payload="body")
         await _explicit_edge(
@@ -209,13 +193,13 @@ async def test_a_retried_delete_intent_is_idempotent(monkeypatch):
         assert await _edges(pool) == [(_doc("source.md"), _doc("a.md"))]
 
 
-async def test_a_delete_removes_rows_that_predate_identity_stamping(monkeypatch):
+async def test_a_delete_removes_rows_that_predate_identity_stamping(derived_pipeline_template, monkeypatch):
     """The upgrade case: an unclaimed row at a path nobody holds is still cleared.
 
     Skipping every URI-keyed row when identity is absent would swap one defect
     for its mirror image — a deleted document keeping its links forever.
     """
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         doomed = await native.create_text(**_args(vault_id, "a.md"), payload="body")
         await _explicit_edge(pool, vault_id, source=_doc("source.md"), target=_doc("a.md"))
@@ -228,9 +212,9 @@ async def test_a_delete_removes_rows_that_predate_identity_stamping(monkeypatch)
         assert await _edges(pool) == []
 
 
-async def test_an_unstamped_row_at_a_reused_path_survives_the_old_delete(monkeypatch):
+async def test_an_unstamped_row_at_a_reused_path_survives_the_old_delete(derived_pipeline_template, monkeypatch):
     """The same upgrade case, with the path taken over — the row is not ours."""
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         original = await native.create_text(**_args(vault_id, "a.md"), payload="old")
         deleted = await native.delete_resource(
@@ -244,14 +228,14 @@ async def test_an_unstamped_row_at_a_reused_path_survives_the_old_delete(monkeyp
         assert await _edges(pool) == [(_doc("source.md"), _doc("a.md"))]
 
 
-async def test_a_delete_leaves_a_legacy_documents_edges_at_the_same_path(monkeypatch):
+async def test_a_delete_leaves_a_legacy_documents_edges_at_the_same_path(derived_pipeline_template, monkeypatch):
     """A cutover can leave a legacy catalog row at the path a native resource holds.
 
     `_resolve_document_endpoint` answers with the legacy row first, so an
     unstamped edge at that URI is the LEGACY document's. The unconditional
     URI sweep this replaces erased it along with the native resource.
     """
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         doomed = await native.create_text(**_args(vault_id, "a.md"), payload="body")
         async with pool.acquire() as conn:
@@ -273,8 +257,8 @@ async def test_a_delete_leaves_a_legacy_documents_edges_at_the_same_path(monkeyp
 
 
 @pytest.mark.parametrize("reordered", [False, True])
-async def test_move_hooks_end_at_the_current_path_in_either_order(monkeypatch, reordered):
-    async with _fresh_database() as pool:
+async def test_move_hooks_end_at_the_current_path_in_either_order(derived_pipeline_template, monkeypatch, reordered):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, facade, _ = await _setup(pool, monkeypatch)
         a = await native.create_text(**_args(vault_id, "a.md"), payload="body")
         await _explicit_edge(
@@ -311,14 +295,14 @@ async def test_move_hooks_end_at_the_current_path_in_either_order(monkeypatch, r
         assert await _edges(pool) == [(_doc("source.md"), _doc("c.md"))]
 
 
-async def test_a_move_hook_that_never_ran_is_recovered_by_the_next_one(monkeypatch):
+async def test_a_move_hook_that_never_ran_is_recovered_by_the_next_one(derived_pipeline_template, monkeypatch):
     """Recovery after a post-commit interruption.
 
     The A→B hook is lost entirely — the process died between commit and hook.
     The B→C hook writes the head path for the resource, not the B→C step, so
     the endpoint lands on `c.md` without the lost hook ever running.
     """
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, facade, _ = await _setup(pool, monkeypatch)
         a = await native.create_text(**_args(vault_id, "a.md"), payload="body")
         await _explicit_edge(
@@ -341,7 +325,7 @@ async def test_a_move_hook_that_never_ran_is_recovered_by_the_next_one(monkeypat
         assert await _edges(pool) == [(_doc("source.md"), _doc("c.md"))]
 
 
-async def test_the_derived_worker_recovers_an_endpoint_no_hook_ever_carried(monkeypatch):
+async def test_the_derived_worker_recovers_an_endpoint_no_hook_ever_carried(derived_pipeline_template, monkeypatch):
     """Durable recovery: the facade hook never runs at all.
 
     A crash between the authoritative commit and the post-commit hook leaves
@@ -349,7 +333,7 @@ async def test_the_derived_worker_recovers_an_endpoint_no_hook_ever_carried(monk
     invalidation intent IS durable, so the worker repoints the endpoints from
     the head path it has already locked.
     """
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         a = await native.create_text(**_args(vault_id, "a.md"), payload="body")
         await _explicit_edge(
@@ -366,8 +350,8 @@ async def test_the_derived_worker_recovers_an_endpoint_no_hook_ever_carried(monk
         assert await _edges(pool) == [(_doc("source.md"), _doc("b.md"))]
 
 
-async def test_a_move_then_delete_interleaving_leaves_no_edge(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_move_then_delete_interleaving_leaves_no_edge(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, facade, _ = await _setup(pool, monkeypatch)
         a = await native.create_text(**_args(vault_id, "a.md"), payload="body")
         await _explicit_edge(
@@ -391,13 +375,13 @@ async def test_a_move_then_delete_interleaving_leaves_no_edge(monkeypatch):
         assert await _edges(pool) == []
 
 
-async def test_a_delayed_move_rewrite_keeps_the_new_owners_implicit_links(monkeypatch):
+async def test_a_delayed_move_rewrite_keeps_the_new_owners_implicit_links(derived_pipeline_template, monkeypatch):
     """The derived rewrite's old-path sweep was the same defect as akb#654.
 
     Resource X moves off `a.md`, resource Y takes it and settles first. X's
     delayed rewrite must not clear the implicit rows now sitting at `a.md`.
     """
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         await native.create_text(**_args(vault_id, "target.md"), payload="target")
         worker = NativeDerivedWorker(pool)
@@ -430,8 +414,8 @@ async def test_a_delayed_move_rewrite_keeps_the_new_owners_implicit_links(monkey
     "body",
     ["[B](a.md)", "[[a.md]]", "[[a.md|Label]]", "[B](./a.md)", f"[B]({_doc('a.md')})"],
 )
-async def test_every_reference_form_links_a_native_only_document(monkeypatch, body):
-    async with _fresh_database() as pool:
+async def test_every_reference_form_links_a_native_only_document(derived_pipeline_template, monkeypatch, body):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         await native.create_text(**_args(vault_id, "a.md"), payload="target")
         async with pool.acquire() as conn:
@@ -442,8 +426,8 @@ async def test_every_reference_form_links_a_native_only_document(monkeypatch, bo
         assert await _edges(pool) == [(_doc("source.md"), _doc("a.md"))]
 
 
-async def test_a_bare_frontmatter_reference_links_a_native_only_document(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_bare_frontmatter_reference_links_a_native_only_document(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         await native.create_text(**_args(vault_id, "a.md"), payload="target")
         async with pool.acquire() as conn:
@@ -454,8 +438,8 @@ async def test_a_bare_frontmatter_reference_links_a_native_only_document(monkeyp
         assert await _edges(pool) == [(_doc("source.md"), _doc("a.md"))]
 
 
-async def test_a_suffix_reference_resolves_a_native_document_in_a_collection(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_suffix_reference_resolves_a_native_document_in_a_collection(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         await native.create_text(**_args(vault_id, "specs/a.md"), payload="target")
         async with pool.acquire() as conn:
@@ -468,13 +452,13 @@ async def test_a_suffix_reference_resolves_a_native_document_in_a_collection(mon
         ]
 
 
-async def test_an_ambiguous_suffix_reference_stores_no_edge(monkeypatch):
+async def test_an_ambiguous_suffix_reference_stores_no_edge(derived_pipeline_template, monkeypatch):
     """Two candidates and no way to choose: refuse rather than pick one.
 
     The legacy arm returns whichever row came back first — its own docstring
     calls that a wrong-doc magnet. The native arm does not inherit it.
     """
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         await native.create_text(**_args(vault_id, "specs/a.md"), payload="one")
         await native.create_text(**_args(vault_id, "notes/a.md"), payload="two")
@@ -486,8 +470,8 @@ async def test_an_ambiguous_suffix_reference_stores_no_edge(monkeypatch):
         assert await _edges(pool) == []
 
 
-async def test_a_reference_to_a_deleted_native_document_stores_no_edge(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_reference_to_a_deleted_native_document_stores_no_edge(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         gone = await native.create_text(**_args(vault_id, "a.md"), payload="target")
         await native.delete_resource(
@@ -501,8 +485,8 @@ async def test_a_reference_to_a_deleted_native_document_stores_no_edge(monkeypat
         assert await _edges(pool) == []
 
 
-async def test_a_reference_to_a_moved_native_document_resolves_to_its_current_path(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_reference_to_a_moved_native_document_resolves_to_its_current_path(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         a = await native.create_text(**_args(vault_id, "a.md"), payload="target")
         await native.move_text(
@@ -519,8 +503,8 @@ async def test_a_reference_to_a_moved_native_document_resolves_to_its_current_pa
         ]
 
 
-async def test_a_reference_does_not_reach_another_vaults_native_document(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_reference_does_not_reach_another_vaults_native_document(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         other_id = await _vault(pool, "other")
         other = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
@@ -534,9 +518,9 @@ async def test_a_reference_does_not_reach_another_vaults_native_document(monkeyp
         assert await _edges(pool) == []
 
 
-async def test_a_legacy_installation_never_links_through_the_native_ledger(monkeypatch):
+async def test_a_legacy_installation_never_links_through_the_native_ledger(derived_pipeline_template, monkeypatch):
     """Preserve legacy-mode semantics: the selector still gates the new arm."""
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         await native.create_text(**_args(vault_id, "a.md"), payload="target")
         monkeypatch.setattr(
@@ -550,9 +534,9 @@ async def test_a_legacy_installation_never_links_through_the_native_ledger(monke
         assert await _edges(pool) == []
 
 
-async def test_a_legacy_catalog_reference_still_resolves_on_a_native_installation(monkeypatch):
+async def test_a_legacy_catalog_reference_still_resolves_on_a_native_installation(derived_pipeline_template, monkeypatch):
     """A cutover leaves pre-cutover documents in `documents`; they stay linkable."""
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, _, _, _ = await _setup(pool, monkeypatch)
         async with pool.acquire() as conn:
             await conn.execute(
@@ -575,7 +559,7 @@ async def test_a_legacy_catalog_reference_still_resolves_on_a_native_installatio
 # ── collection delete, native branch ───────────────────────────────
 
 
-async def test_a_collection_delete_clears_a_native_documents_edges_by_identity(monkeypatch):
+async def test_a_collection_delete_clears_a_native_documents_edges_by_identity(derived_pipeline_template, monkeypatch):
     """The native branch of collection delete follows the resource, not the URI.
 
     It used to clear by `d["path"]` — a value read from `native_resources`
@@ -594,11 +578,8 @@ async def test_a_collection_delete_clears_a_native_documents_edges_by_identity(m
     from app.services import native_document_service as native_mod
     from app.services.collection_service import CollectionService
 
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, source = await _setup(pool, monkeypatch)
-        # `_fresh_database` applies a hand-picked migration list; the delete
-        # emits an event, and the outbox is not on it.
-        await _apply_migration(pool, 15)
 
         async def _get_pool():
             return pool
@@ -633,10 +614,10 @@ async def test_a_collection_delete_clears_a_native_documents_edges_by_identity(m
 # ── migration 112 ──────────────────────────────────────────────────
 
 
-async def test_the_migration_backfill_stamps_an_existing_unclaimed_edge(monkeypatch):
+async def test_the_migration_backfill_stamps_an_existing_unclaimed_edge(derived_pipeline_template, monkeypatch):
     """The backfill is the upgrade path, and a fresh database never exercises it.
 
-    `_fresh_database` applies every migration to an EMPTY database, so the
+    `cloned_derived_database` applies every migration to an EMPTY database, so the
     batching, the array carry and the `IS NULL` guard all run over nothing.
     Re-running the migration over a database that already has rows is what
     tells us the backfill works — and that it is idempotent, which the boot
@@ -654,7 +635,7 @@ async def test_the_migration_backfill_stamps_an_existing_unclaimed_edge(monkeypa
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, source = await _setup(pool, monkeypatch)
         target = await native.create_text(**_args(vault_id, "a.md"), payload="target")
         # A row exactly as it would look before identity stamping existed.
@@ -678,9 +659,9 @@ async def test_the_migration_backfill_stamps_an_existing_unclaimed_edge(monkeypa
         assert row["target_resource_id"] == target.resource_id
 
 
-async def test_the_identity_columns_reject_an_id_no_resource_owns(monkeypatch):
+async def test_the_identity_columns_reject_an_id_no_resource_owns(derived_pipeline_template, monkeypatch):
     """The foreign key is real, not decorative."""
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, _ = await _setup(pool, monkeypatch)
         await native.create_text(**_args(vault_id, "a.md"), payload="target")
         with pytest.raises(asyncpg.exceptions.ForeignKeyViolationError):
@@ -693,8 +674,8 @@ async def test_the_identity_columns_reject_an_id_no_resource_owns(monkeypatch):
 # ── the stamp itself ───────────────────────────────────────────────
 
 
-async def test_an_implicit_edge_records_both_endpoints_identity(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_an_implicit_edge_records_both_endpoints_identity(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, source = await _setup(pool, monkeypatch)
         target = await native.create_text(**_args(vault_id, "a.md"), payload="target")
         async with pool.acquire() as conn:
@@ -709,9 +690,9 @@ async def test_an_implicit_edge_records_both_endpoints_identity(monkeypatch):
         assert row["target_resource_id"] == target.resource_id
 
 
-async def test_an_implicit_rewrite_leaves_an_explicit_edge_explicit(monkeypatch):
+async def test_an_implicit_rewrite_leaves_an_explicit_edge_explicit(derived_pipeline_template, monkeypatch):
     """The `kind` discriminator from migration 028 still protects akb_link rows."""
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault_id, native, _, source = await _setup(pool, monkeypatch)
         await native.create_text(**_args(vault_id, "a.md"), payload="target")
         await _explicit_edge(

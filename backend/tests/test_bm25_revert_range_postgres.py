@@ -9,7 +9,6 @@ from tests.test_bm25_query_epoch_postgres import _seed
 from tests.test_bm25_term_id_compaction_postgres import (
     _installation,
     _state,
-    compaction_template as compaction_template,
 )
 
 pytestmark = pytest.mark.asyncio

@@ -38,8 +38,8 @@ async def _open(pool, sweep, attempt, *, resume=False, **changes):
     return await open_checkpoint(pool, _SCHEMA, **args)
 
 
-async def test_checkpoint_advances_only_past_committed_writer_waves(monkeypatch):
-    async with _corpus(monkeypatch) as (store, pool):
+async def test_checkpoint_advances_only_past_committed_writer_waves(corpus_template, monkeypatch):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         ids = [uuid.UUID(int=i) for i in range(1, 5)]
         for i, cid in enumerate(ids):
             await _write_old(store, pool, cid, f"row {i}", i)
@@ -91,8 +91,8 @@ async def test_checkpoint_advances_only_past_committed_writer_waves(monkeypatch)
         assert nulls == 0
 
 
-async def test_written_wave_without_checkpoint_receipt_replays(monkeypatch):
-    async with _corpus(monkeypatch) as (store, pool):
+async def test_written_wave_without_checkpoint_receipt_replays(corpus_template, monkeypatch):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         cid = uuid.UUID(int=11)
         await _write_old(store, pool, cid, "already committed", 0)
         await bf._prepare(pool, _SCHEMA)
@@ -120,8 +120,8 @@ async def test_written_wave_without_checkpoint_receipt_replays(monkeypatch):
         assert resumed.cursor == cid
 
 
-async def test_committed_checkpoint_survives_lost_acknowledgement(monkeypatch):
-    async with _corpus(monkeypatch) as (store, pool):
+async def test_committed_checkpoint_survives_lost_acknowledgement(corpus_template, monkeypatch):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         cid = uuid.UUID(int=17)
         await _write_old(store, pool, cid, "one completed wave", 0)
         await bf._prepare(pool, _SCHEMA)
@@ -144,8 +144,8 @@ async def test_committed_checkpoint_survives_lost_acknowledgement(monkeypatch):
         assert await bf._pass(pool, _SCHEMA, _SINCE, checkpoint=resumed) == 0
 
 
-async def test_resume_does_not_replace_protected_catch_up(monkeypatch):
-    async with _corpus(monkeypatch) as (store, pool):
+async def test_resume_does_not_replace_protected_catch_up(corpus_template, monkeypatch):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         ids = [uuid.UUID(int=31), uuid.UUID(int=32)]
         for i, cid in enumerate(ids):
             await _write_old(store, pool, cid, f"old {i}", i)
@@ -186,8 +186,8 @@ async def test_resume_does_not_replace_protected_catch_up(monkeypatch):
         assert fixed["vector"] == await _expected(pool, fixed["content"])
 
 
-async def test_checkpoint_contract_and_attempt_are_fenced(monkeypatch):
-    async with _corpus(monkeypatch) as (_store, pool):
+async def test_checkpoint_contract_and_attempt_are_fenced(corpus_template, monkeypatch):
+    async with _corpus(monkeypatch, corpus_template) as (_store, pool):
         await bf._prepare(pool, _SCHEMA)
         sweep, first = uuid.uuid4(), uuid.uuid4()
         old = await _open(pool, sweep, first)

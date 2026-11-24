@@ -30,12 +30,10 @@ import uuid
 from collections import Counter
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
-import pytest_asyncio
 
 from app.config import settings
 from app.db import postgres as postgres_module
@@ -50,7 +48,6 @@ pytestmark = pytest.mark.asyncio
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _SCHEMA = "vector_index"
 _INDEX = f"{_SCHEMA}.idx_vi_chunks_bm25"
-_INIT_SQL = Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
 _TOP = 20
 _TOLERANCE = 1e-6
 
@@ -94,25 +91,13 @@ async def _split(text: str) -> list[str]:
     return text.split()
 
 
-@pytest_asyncio.fixture(scope="module")
-async def compaction_template() -> AsyncIterator[TestDatabase]:
-    if not _DSN:
-        pytest.skip("AKB_VCHORD_TEST_DSN is required for VectorChord coverage")
-    async with temporary_database(_DSN, "akb_compact_template_", required=True) as template:
-        async with asyncpg.create_pool(template.dsn, min_size=1, max_size=1) as pool:
-            async with pool.acquire() as conn:
-                await conn.execute(_INIT_SQL.read_text())
-            await postgres_module._apply_migrations(pool=pool)
-        yield template
-
-
 @contextlib.asynccontextmanager
 async def _installation(
-    compaction_template: TestDatabase, monkeypatch, *, shape: str = "vchord",
+    compaction_template: dict[str, TestDatabase], monkeypatch, *, shape: str = "vchord",
 ) -> AsyncIterator[_Installation]:
     """A database the way the backend leaves it, with this process pointed at it."""
     async with (
-        temporary_database(_DSN, "akb_compact_", template=compaction_template) as database,
+        temporary_database(_DSN, "akb_compact_", template=compaction_template[shape]) as database,
         asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool,
     ):
         previous_pool = postgres_module._pool
@@ -122,8 +107,6 @@ async def _installation(
                 dsn=None, schema=_SCHEMA, dense_dim=4, sparse_shape=shape,
                 get_main_pool=postgres_module.get_pool,
             )
-            async with pool.acquire() as conn:
-                await store._do_ensure(conn)
             store._ensured_collection = True
 
             # The command reads the process configuration, as it does when run.

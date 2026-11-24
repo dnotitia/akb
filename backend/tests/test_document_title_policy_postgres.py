@@ -14,8 +14,8 @@ from tests.test_event_tail_postgres import _fresh_database, _make_vault
 
 
 @pytest.mark.asyncio
-async def test_native_title_conflicts_do_not_create_revisions_or_intents():
-    async with _fresh_database() as pool:
+async def test_native_title_conflicts_do_not_create_revisions_or_intents(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = "title-policy"
         vault_id = await _make_vault(pool, vault)
         service = NativeDocumentService(pool=pool)
@@ -40,8 +40,10 @@ async def test_native_title_conflicts_do_not_create_revisions_or_intents():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["put", "move"])
-async def test_native_filename_title_uses_the_public_name_at_the_destination(operation):
-    async with _fresh_database() as pool:
+async def test_native_filename_title_uses_the_public_name_at_the_destination(
+    operation, application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool:
         vault = "imported"
         vault_id = await _make_vault(pool, vault)
         service = NativeDocumentService(pool=pool)
@@ -64,8 +66,8 @@ async def test_native_filename_title_uses_the_public_name_at_the_destination(ope
 
 
 @pytest.mark.asyncio
-async def test_recreated_vault_is_rejected_before_title_or_source_lookup(tmp_path):
-    async with _fresh_database() as pool:
+async def test_recreated_vault_is_rejected_before_title_or_source_lookup(tmp_path, application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         name, private = "original", "replacement"
         original = await _make_vault(pool, name)
         replacement = await _make_vault(pool, private)

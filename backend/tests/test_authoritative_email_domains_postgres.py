@@ -19,6 +19,10 @@ import uuid
 import asyncpg
 import pytest
 
+from tests.helpers.pg_database import (
+    temporary_database,
+)
+
 from app.config import settings
 from app.exceptions import (
     AccountSuspendedError,
@@ -36,43 +40,26 @@ _DOMAIN = "corp.example"
 
 
 @pytest.fixture
-async def pool(monkeypatch):
-    try:
-        pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=3)
-    except Exception:
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
-
-    from app.db.postgres import _load_migration
-    from app.services import auth_service
-
-    for filename in (
-        "043_workspace_account_governance.py",
-        "071_recovery_admin.py",
-        "082_pending_admissions.py",
+async def pool(monkeypatch, application_schema_template):
+    async with (
+        temporary_database(_DSN, "akb_authoritative_email_domains_", template=application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=3) as pool,
     ):
-        migration = _load_migration(filename)
-        assert migration is not None
-        async with pool.acquire() as conn:
-            await migration.migrate(conn=conn)
+        from app.services import auth_service
 
-    async def _get_pool():
-        return pool
+        async def _get_pool():
+            return pool
 
-    monkeypatch.setattr(auth_service, "get_pool", _get_pool)
-    monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
-    monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
-    monkeypatch.setattr(
-        settings,
-        "keycloak_authoritative_email_domains_by_provider",
-        {_ALIAS: [_DOMAIN]},
-        raising=False,
-    )
-    yield pool
-
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM users WHERE username LIKE 'auth-%'")
-        await conn.execute("DELETE FROM events WHERE actor_id LIKE 'auth-%'")
-    await pool.close()
+        monkeypatch.setattr(auth_service, "get_pool", _get_pool)
+        monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
+        monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
+        monkeypatch.setattr(
+            settings,
+            "keycloak_authoritative_email_domains_by_provider",
+            {_ALIAS: [_DOMAIN]},
+            raising=False,
+        )
+        yield pool
 
 
 def _claims(subject: str, email: str | None = None, *, verified: bool = True) -> dict:

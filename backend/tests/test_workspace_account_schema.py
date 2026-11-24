@@ -7,6 +7,9 @@ import uuid
 
 import asyncpg
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 from app.db.postgres import _load_migration
 
@@ -15,14 +18,32 @@ pytestmark = pytest.mark.asyncio
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 
 
+async def _initialize(conn: asyncpg.Connection) -> None:
+    await conn.execute("""
+        CREATE EXTENSION "uuid-ossp";
+        CREATE TABLE users (
+            id UUID PRIMARY KEY,
+            username TEXT NOT NULL,
+            email TEXT NOT NULL,
+            password_hash TEXT NOT NULL
+        );
+    """)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    async with database_template(_DSN, "akb_legacy_account_template_", _initialize) as template:
+        yield template
+
+
 @pytest.fixture
-async def conn():
-    try:
-        connection = await asyncpg.connect(_DSN)
-    except Exception:
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
-    yield connection
-    await connection.close()
+async def conn(schema_template):
+    async with temporary_database(_DSN, "akb_legacy_account_", template=schema_template) as database:
+        connection = await asyncpg.connect(database.dsn)
+        try:
+            yield connection
+        finally:
+            await connection.close()
 
 
 async def test_migration_is_additive_idempotent_and_preserves_legacy_user(conn):

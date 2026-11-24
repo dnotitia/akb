@@ -7,29 +7,23 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from urllib.parse import urlsplit, urlunsplit
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.services.search_service import SearchService
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
+
 
 pytestmark = pytest.mark.asyncio
+_DATABASE_PREFIX = "akb_native_scope_"
 _USER = uuid.UUID(int=100_001)
 
 
-@pytest.fixture
-async def scope_conn():
-    dsn = os.environ.get("AKB_SEARCH_TEST_DSN")
-    if not dsn:
-        pytest.skip("AKB_SEARCH_TEST_DSN is required")
-    name = f"akb_native_scope_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(dsn)
-    conn = None
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        conn = await asyncpg.connect(urlunsplit(urlsplit(dsn)._replace(path=f"/{name}")))
-        await conn.execute("""
+async def _initialize_corpus(conn: asyncpg.Connection) -> None:
+    await conn.execute("""
             CREATE TABLE vaults (
                 id uuid PRIMARY KEY, name text UNIQUE, owner_id uuid, public_access text
             );
@@ -86,12 +80,26 @@ async def scope_conn():
                   FROM native_resources;
             ANALYZE;
         """)
-        yield conn
-    finally:
-        if conn is not None:
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def scope_template() -> AsyncIterator[tuple[str, TestDatabase]]:
+    dsn = os.environ.get("AKB_SEARCH_TEST_DSN")
+    if not dsn:
+        pytest.skip("AKB_SEARCH_TEST_DSN is required")
+    async with database_template(dsn, _DATABASE_PREFIX, _initialize_corpus, required=True) as template:
+        yield dsn, template
+
+
+@pytest_asyncio.fixture
+async def scope_conn(scope_template):
+    dsn, template = scope_template
+    async with temporary_database(dsn, _DATABASE_PREFIX, template=template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            yield conn
+        finally:
             await conn.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 class _ObservedConnection:

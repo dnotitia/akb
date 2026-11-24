@@ -15,8 +15,8 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.mark.parametrize("counted", [None, True, False])
-async def test_catalog_counts_are_explicit_without_changing_default(monkeypatch, counted):
-    async with _fresh_database() as pool:
+async def test_catalog_counts_are_explicit_without_changing_default(monkeypatch, counted, application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(table_service, "get_pool", AsyncMock(return_value=pool))
         async with pool.acquire() as conn:
             vault = await conn.fetchval(
@@ -49,8 +49,8 @@ async def test_catalog_counts_are_explicit_without_changing_default(monkeypatch,
             assert count.await_count == 2
 
 
-async def test_existing_and_new_tables_share_default_page_index(monkeypatch):
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_existing_and_new_tables_share_default_page_index(monkeypatch, application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         vault = await conn.fetchval(
             "INSERT INTO vaults(name,git_path) VALUES('page-index','/tmp/page-index.git') RETURNING id"
         )

@@ -7,8 +7,8 @@ from tests.test_notifications_postgres import seed, queue, drain, inbox
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resubscribe", [False, True])
-async def test_unwatch_suppresses_pending_work_even_after_resubscribing(resubscribe):
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_unwatch_suppresses_pending_work_even_after_resubscribing(resubscribe, application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, _, vault, doc = await seed(conn)
         await queue(conn, "before-unwatch", owner, vault, doc)
         await conn.execute("DELETE FROM notification_subscriptions WHERE user_id=$1", reader)

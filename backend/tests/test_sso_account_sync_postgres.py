@@ -13,8 +13,8 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-async def fixture(monkeypatch):
-    async with _fresh_database() as pool:
+async def fixture(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         monkeypatch.setattr(sync, "get_pool", AsyncMock(return_value=pool))
         monkeypatch.setattr(sync, "cleanup_token_roles", AsyncMock())
         monkeypatch.setattr(sync, "_cursor", None)

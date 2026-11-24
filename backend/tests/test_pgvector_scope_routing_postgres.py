@@ -11,14 +11,16 @@ import logging
 import os
 import random
 import uuid
-from urllib.parse import urlsplit, urlunsplit
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
+import pytest_asyncio
 from pgvector.asyncpg import register_vector
 
 from app.services.vector_store import pgvector as pgvector_module
 from app.services.vector_store.pgvector import PgvectorStore
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 pytestmark = pytest.mark.asyncio
 _VAULT = uuid.UUID(int=100)
@@ -27,38 +29,41 @@ _SOURCE = uuid.UUID(int=200)
 _OTHER_SOURCE = uuid.UUID(int=201)
 
 
-@pytest.fixture
-async def store_pool():
+def _test_dsn() -> str:
     dsn = os.environ.get("AKB_SEARCH_TEST_DSN") or os.environ.get("AKB_VCHORD_TEST_DSN")
     if not dsn:
         pytest.skip("AKB_SEARCH_TEST_DSN or AKB_VCHORD_TEST_DSN is required")
-    name = f"akb_scope_routes_{uuid.uuid4().hex[:12]}"
-    parsed = urlsplit(dsn)
-    test_dsn = urlunsplit(parsed._replace(path=f"/{name}"))
-    admin = await asyncpg.connect(dsn)
-    pool = None
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        bootstrap = await asyncpg.connect(test_dsn)
+    return dsn
+
+
+async def _initialize_schema(conn: asyncpg.Connection) -> None:
+    store = PgvectorStore(dsn=None, schema="vector_index", dense_dim=4, sparse_shape="posting")
+    await store._do_ensure(conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template() -> AsyncIterator[TestDatabase]:
+    async with database_template(
+        _test_dsn(), "akb_scope_routes_template_", _initialize_schema, required=True,
+    ) as template:
+        yield template
+
+
+@pytest_asyncio.fixture
+async def store_pool(schema_template: TestDatabase) -> AsyncIterator[tuple[PgvectorStore, asyncpg.Pool]]:
+    async with temporary_database(_test_dsn(), "akb_scope_routes_", template=schema_template) as database:
+        pool = await asyncpg.create_pool(database.dsn, min_size=2, max_size=4, init=register_vector)
         try:
-            await bootstrap.execute("CREATE EXTENSION vector")
+            async def get_pool():
+                return pool
+
+            store = PgvectorStore(
+                dsn=None, schema="vector_index", dense_dim=4, sparse_shape="posting", get_main_pool=get_pool,
+            )
+            store._ensured_collection = True
+            yield store, pool
         finally:
-            await bootstrap.close()
-        pool = await asyncpg.create_pool(test_dsn, min_size=2, max_size=4, init=register_vector)
-
-        async def get_pool():
-            return pool
-
-        store = PgvectorStore(
-            dsn=None, schema="vector_index", dense_dim=4, sparse_shape="posting", get_main_pool=get_pool,
-        )
-        await store.ensure_collection()
-        yield store, pool
-    finally:
-        if pool is not None:
             await asyncio.wait_for(pool.close(), timeout=5)
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 class _ObservedConnection:

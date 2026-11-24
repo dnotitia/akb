@@ -27,19 +27,13 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
+
 
 pytestmark = pytest.mark.asyncio
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")
-
-
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
 
 
 def _database_dsn(name: str) -> str:
@@ -47,37 +41,30 @@ def _database_dsn(name: str) -> str:
     return f"{base}/{name}"
 
 
+async def _initialize(conn: asyncpg.Connection) -> None:
+    init_sql = (Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql").read_text()
+    await conn.execute(init_sql)
+    # Migration 086 owns this function. A stub lets the table installer add
+    # its trigger while the tests exercise CAS independently of events.
+    await conn.execute(
+        "CREATE OR REPLACE FUNCTION "
+        "public.akb_dynamic_table_rows_changed() "
+        "RETURNS TRIGGER AS $$ BEGIN RETURN NULL; END; "
+        "$$ LANGUAGE plpgsql"
+    )
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def row_cas_template():
+    async with database_template(_DSN, "akb_rowcas_template_", _initialize) as template:
+        yield template
+
+
 @contextlib.asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_rowcas_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=8)
-    try:
-        init_sql = (
-            Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
-        ).read_text()
-        async with pool.acquire() as conn:
-            await conn.execute(init_sql)
-            # init.sql does not carry the rows_changed trigger function
-            # (migration 086 owns it); install a no-op stub so
-            # create_dynamic_table's trigger install succeeds. The stub
-            # is OUT of what this file proves (CAS only, not events).
-            await conn.execute(
-                "CREATE OR REPLACE FUNCTION "
-                "public.akb_dynamic_table_rows_changed() "
-                "RETURNS TRIGGER AS $$ BEGIN RETURN NULL; END; "
-                "$$ LANGUAGE plpgsql"
-            )
-        yield pool
-    finally:
-        await pool.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
-        await admin.close()
+async def _fresh_database(template: TestDatabase):
+    async with temporary_database(_DSN, "akb_rowcas_", template=template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool:
+            yield pool
 
 
 async def _make_table(pool, pg_name: str = "vt_eng__incidents"):
@@ -94,8 +81,8 @@ async def _make_table(pool, pg_name: str = "vt_eng__incidents"):
     return pg_name
 
 
-async def test_row_commit_minted_and_bumped_on_update():
-    async with _fresh_database() as pool:
+async def test_row_commit_minted_and_bumped_on_update(row_cas_template):
+    async with _fresh_database(row_cas_template) as pool:
         pg = await _make_table(pool)
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -114,8 +101,8 @@ async def test_row_commit_minted_and_bumped_on_update():
                 "trigger did not bump row_commit"
 
 
-async def test_stale_token_update_matches_zero_rows():
-    async with _fresh_database() as pool:
+async def test_stale_token_update_matches_zero_rows(row_cas_template):
+    async with _fresh_database(row_cas_template) as pool:
         pg = await _make_table(pool)
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -143,8 +130,8 @@ async def test_stale_token_update_matches_zero_rows():
             assert n2 == "UPDATE 1", f"fresh retry failed: {n2}"
 
 
-async def test_stale_token_delete_matches_zero_rows():
-    async with _fresh_database() as pool:
+async def test_stale_token_delete_matches_zero_rows(row_cas_template):
+    async with _fresh_database(row_cas_template) as pool:
         pg = await _make_table(pool)
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -160,8 +147,8 @@ async def test_stale_token_delete_matches_zero_rows():
             assert left == 1, "row deleted by stale token"
 
 
-async def test_migration_108_backfills_legacy_table():
-    async with _fresh_database() as pool:
+async def test_migration_108_backfills_legacy_table(row_cas_template):
+    async with _fresh_database(row_cas_template) as pool:
         # Simulate a pre-107 table: create, then strip the new column.
         pg = await _make_table(pool, "vt_eng__legacy")
         async with pool.acquire() as conn:

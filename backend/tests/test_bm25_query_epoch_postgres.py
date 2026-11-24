@@ -12,7 +12,6 @@ from app.services.bm25_maintenance import BM25_VOCAB_EPOCH_LOCK_KEY
 from scripts import compact_bm25_term_ids as compact
 from tests.test_bm25_term_id_compaction_postgres import (
     _installation,
-    compaction_template as compaction_template,
 )
 
 pytestmark = pytest.mark.asyncio

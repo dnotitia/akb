@@ -4,47 +4,31 @@ from __future__ import annotations
 
 import os
 import uuid
-from pathlib import Path
 
 import asyncpg
 import pytest
 import pytest_asyncio
+
+from tests.helpers.pg_database import (
+    temporary_database,
+)
 
 from app.services.kg_service import _resolve_doc_ref, store_document_relations
 
 
 pytestmark = pytest.mark.asyncio
 
-_BACKEND = Path(__file__).resolve().parents[1]
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
 
 
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 @pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=1, max_size=4)
-    async with pool.acquire() as conn:
-        await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-    try:
-        yield pool
-    finally:
-        await pool.close()
+async def pool(base_schema_template):
+    async with temporary_database(_DSN, "akb_kg_ref_", template=base_schema_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            yield pool
 
 
 @pytest_asyncio.fixture

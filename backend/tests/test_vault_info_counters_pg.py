@@ -19,8 +19,11 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.services import access_service
+from tests.helpers.pg_database import database_template, temporary_database
+
 
 
 pytestmark = pytest.mark.asyncio
@@ -34,15 +37,6 @@ _DSN = os.environ.get(
 )
 
 
-async def _reachable() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 def _load(filename: str):
     path = _MIGRATIONS / filename
     spec = importlib.util.spec_from_file_location(f"migration_vault_info_{filename}", path)
@@ -52,31 +46,30 @@ def _load(filename: str):
     return module
 
 
-@pytest.fixture
-async def pool(monkeypatch):
-    if not await _reachable():
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    name = f"akb_vault_info_counters_{uuid.uuid4().hex[:10]}"
-    admin = await asyncpg.connect(_DSN)
-    conn = None
-    pool = None
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        dsn = f"{_DSN.rsplit('/', 1)[0]}/{name}"
-        conn = await asyncpg.connect(dsn)
-        await conn.execute(_INIT_SQL)
-        for filename in (
-            "010_external_git_mirror.py",
-            "015_events_outbox.py",
-            "044_vault_write_policy.py",
-            "045_vault_write_grant_actions.py",
-            "048_native_revision_core.py",
-        ):
-            await _load(filename).migrate(conn=conn)
-        await conn.close()
-        conn = None
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+async def _initialize(conn):
+    await conn.execute(_INIT_SQL)
+    for filename in (
+        "010_external_git_mirror.py",
+        "015_events_outbox.py",
+        "044_vault_write_policy.py",
+        "045_vault_write_grant_actions.py",
+        "048_native_revision_core.py",
+    ):
+        await _load(filename).migrate(conn=conn)
 
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def vault_info_template():
+    async with database_template(_DSN, "akb_vault_info_template_", _initialize) as template:
+        yield template
+
+
+@pytest_asyncio.fixture
+async def pool(monkeypatch, vault_info_template):
+    async with (
+        temporary_database(_DSN, "akb_vault_info_counters_", template=vault_info_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
+    ):
         from app.repositories import vault_write_policy_repo
         from app.services import auth_service, table_service
 
@@ -88,13 +81,6 @@ async def pool(monkeypatch):
         monkeypatch.setattr(access_service, "get_pool", _get_pool)
         monkeypatch.setattr(table_service, "get_pool", _get_pool)
         yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        if conn is not None and not conn.is_closed():
-            await conn.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 async def _create_user(pool) -> uuid.UUID:

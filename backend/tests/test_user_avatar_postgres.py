@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 import asyncpg
 import boto3
 import pytest
+import pytest_asyncio
 from PIL import Image
 
 from app.db.postgres import _load_migration
@@ -26,6 +27,7 @@ from app.exceptions import AKBError
 from app.repositories import user_avatars_repo as repo, vault_files_repo
 from app.services import access_service, account_self_service, auth_service, s3_delete_worker as worker
 from app.services import user_avatar_service as service
+from tests.helpers.auth_database import apply_auth_migrations, auth_database_template
 from tests.test_account_self_lifecycle_postgres import PASSWORD, person as account_person
 from tests.test_recovery_admin_provisioning_postgres import _fresh_database
 
@@ -43,15 +45,20 @@ async def person(pool):
                    local_session_expires_at=time.time() + 3600)
 
 
-@pytest.fixture
-async def runtime(monkeypatch):
-    async with _fresh_database() as pool:
-        for filename in ("019_s3_delete_outbox.py", "079_worker_claim_lifecycle.py", "114_user_avatars.py"):
-            migration = _load_migration(filename)
-            assert migration is not None
-            async with pool.acquire() as conn:
-                await migration.migrate(conn=conn)
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def avatar_template(auth_schema_template):
+    async def initialize(conn):
+        await apply_auth_migrations(
+            conn, "019_s3_delete_outbox.py", "079_worker_claim_lifecycle.py", "114_user_avatars.py",
+        )
 
+    async with auth_database_template(auth_schema_template, "akb_avatar_template_", initialize) as template:
+        yield template
+
+
+@pytest.fixture
+async def runtime(monkeypatch, avatar_template):
+    async with _fresh_database(avatar_template) as pool:
         async def get_pool():
             return pool
 

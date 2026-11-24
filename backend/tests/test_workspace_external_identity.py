@@ -13,6 +13,10 @@ import httpx
 import pytest
 from fastapi import FastAPI, Request
 
+from tests.helpers.pg_database import (
+    temporary_database,
+)
+
 from app.config import settings
 from app.exceptions import (
     AccountSuspendedError,
@@ -29,32 +33,20 @@ _LOCK_TEST_TIMEOUT = 10
 
 
 @pytest.fixture
-async def pool(monkeypatch):
-    try:
-        pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=5)
-    except Exception:
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
+async def pool(monkeypatch, application_schema_template):
+    async with (
+        temporary_database(_DSN, "akb_workspace_external_identity_", template=application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=5) as pool,
+    ):
+        from app.services import auth_service
 
-    from app.db.postgres import _load_migration
-    from app.services import auth_service
+        async def _get_pool():
+            return pool
 
-    migration = _load_migration("043_workspace_account_governance.py")
-    assert migration is not None
-    async with pool.acquire() as conn:
-        await migration.migrate(conn=conn)
-
-    async def _get_pool():
-        return pool
-
-    monkeypatch.setattr(auth_service, "get_pool", _get_pool)
-    monkeypatch.setattr(settings, "keycloak_enrollment_mode", "open", raising=False)
-    monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
-    yield pool
-
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM users WHERE username LIKE 'wsg-%'")
-        await conn.execute("DELETE FROM events WHERE actor_id LIKE 'wsg-%'")
-    await pool.close()
+        monkeypatch.setattr(auth_service, "get_pool", _get_pool)
+        monkeypatch.setattr(settings, "keycloak_enrollment_mode", "open", raising=False)
+        monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
+        yield pool
 
 
 @pytest.fixture

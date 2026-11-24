@@ -27,31 +27,21 @@ unreachable — the same convention as the neighbouring `*_pg.py` files.
 
 from __future__ import annotations
 
-import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import asyncpg
 import pytest
-import pytest_asyncio
 
-from app.db import postgres
 from app.services import access_service
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
-from tests.helpers.pg_database import TestDatabase, temporary_database
+from tests.helpers.pg_database import AUDIT_TEST_DSN, TestDatabase, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
 
-_BACKEND = Path(__file__).resolve().parents[1]
-_INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8")
-_DSN = os.environ.get(
-    "AKB_TEST_DSN",
-    "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
-)
 
 # A believable, motionless number: what a cutover leaves behind in the
 # denormalised columns, and what every assertion below must refuse to echo.
@@ -59,23 +49,11 @@ _FROZEN_COUNT = 41
 _FROZEN_AT = datetime(2026, 5, 14, 9, 44, 12, tzinfo=timezone.utc)
 
 
-@pytest_asyncio.fixture(scope="module", loop_scope="module")
-async def schema_template():
-    """Install the server's schema, including native document asset references."""
-    async with temporary_database(_DSN, "akb_document_counters_template_") as template:
-        conn = await asyncpg.connect(template.dsn)
-        try:
-            await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
-        finally:
-            await conn.close()
-        yield template
-
-
 @asynccontextmanager
-async def _fresh_database(monkeypatch, schema_template: TestDatabase):
+async def _fresh_database(monkeypatch, audit_application_schema_template: TestDatabase):
     """Seed a vault and its owner in an isolated copy of the schema."""
     async with (
-        temporary_database(_DSN, "akb_document_counters_", template=schema_template) as database,
+        temporary_database(AUDIT_TEST_DSN, "akb_document_counters_", template=audit_application_schema_template) as database,
         asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
     ):
         suffix = uuid.uuid4().hex[:12]
@@ -164,7 +142,7 @@ async def _freeze_legacy_document(pool, vault_id, path: str) -> None:
 # ── akb_browse ───────────────────────────────────────────────
 
 
-async def test_browse_collection_counters_read_the_native_authority(monkeypatch, schema_template):
+async def test_browse_collection_counters_read_the_native_authority(monkeypatch, audit_application_schema_template):
     """A collection lists the documents it really holds, and when they landed.
 
     The frozen `collections.doc_count` is the number a cutover leaves behind;
@@ -172,7 +150,7 @@ async def test_browse_collection_counters_read_the_native_authority(monkeypatch,
     items in the very same payload.
     """
     _native_backend(monkeypatch)
-    async with _fresh_database(monkeypatch, schema_template) as (pool, vault_id, vault_name, _owner):
+    async with _fresh_database(monkeypatch, audit_application_schema_template) as (pool, vault_id, vault_name, _owner):
         await _freeze_collection(pool, vault_id, "notes", "notes")
         await _write_native_doc(pool, vault_id, "notes/a.md", actor="writer", body="alpha\n")
         await _write_native_doc(pool, vault_id, "notes/b.md", actor="writer", body="beta\n")
@@ -190,7 +168,7 @@ async def test_browse_collection_counters_read_the_native_authority(monkeypatch,
     assert collections[0].last_updated > _FROZEN_AT
 
 
-async def test_browse_collection_with_no_live_documents_reads_zero(monkeypatch, schema_template):
+async def test_browse_collection_with_no_live_documents_reads_zero(monkeypatch, audit_application_schema_template):
     """An emptied collection reads 0, never the frozen number.
 
     This is the shape the issue calls dangerous in reverse: a stale non-zero
@@ -198,7 +176,7 @@ async def test_browse_collection_with_no_live_documents_reads_zero(monkeypatch, 
     of the two can be caught by looking for a suspicious zero.
     """
     _native_backend(monkeypatch)
-    async with _fresh_database(monkeypatch, schema_template) as (pool, vault_id, vault_name, _owner):
+    async with _fresh_database(monkeypatch, audit_application_schema_template) as (pool, vault_id, vault_name, _owner):
         await _freeze_collection(pool, vault_id, "emptied", "emptied")
 
         response = await NativeDocumentService(pool=pool).browse(
@@ -211,7 +189,7 @@ async def test_browse_collection_with_no_live_documents_reads_zero(monkeypatch, 
     assert collections[0].last_updated is None
 
 
-async def test_browse_counts_direct_children_not_the_subtree(monkeypatch, schema_template):
+async def test_browse_counts_direct_children_not_the_subtree(monkeypatch, audit_application_schema_template):
     """`doc_count` keeps its legacy meaning: documents directly inside.
 
     `increment_count` is called with the document's own `collection_id`, so a
@@ -219,7 +197,7 @@ async def test_browse_counts_direct_children_not_the_subtree(monkeypatch, schema
     native ledger must not quietly turn this into a subtree total.
     """
     _native_backend(monkeypatch)
-    async with _fresh_database(monkeypatch, schema_template) as (pool, vault_id, vault_name, _owner):
+    async with _fresh_database(monkeypatch, audit_application_schema_template) as (pool, vault_id, vault_name, _owner):
         await _freeze_collection(pool, vault_id, "outer", "outer")
         await _freeze_collection(pool, vault_id, "outer/inner", "inner")
         await _write_native_doc(pool, vault_id, "outer/top.md", actor="writer", body="top\n")
@@ -233,7 +211,7 @@ async def test_browse_counts_direct_children_not_the_subtree(monkeypatch, schema
     assert counts == {"outer": 1, "outer/inner": 1}
 
 
-async def test_browse_into_a_subtree_counts_that_subtree(monkeypatch, schema_template):
+async def test_browse_into_a_subtree_counts_that_subtree(monkeypatch, audit_application_schema_template):
     """Browsing into a collection scopes the scan and still counts right.
 
     The scan is narrowed to the prefix because only collections under it are
@@ -241,7 +219,7 @@ async def test_browse_into_a_subtree_counts_that_subtree(monkeypatch, schema_tem
     a sibling because `_` is a LIKE wildcard, would show up here.
     """
     _native_backend(monkeypatch)
-    async with _fresh_database(monkeypatch, schema_template) as (pool, vault_id, vault_name, _owner):
+    async with _fresh_database(monkeypatch, audit_application_schema_template) as (pool, vault_id, vault_name, _owner):
         await _freeze_collection(pool, vault_id, "team_notes", "team_notes")
         await _freeze_collection(pool, vault_id, "team_notes/drafts", "drafts")
         await _freeze_collection(pool, vault_id, "teamXnotes", "teamXnotes")
@@ -257,11 +235,11 @@ async def test_browse_into_a_subtree_counts_that_subtree(monkeypatch, schema_tem
     assert counts == {"team_notes/drafts": 2}
 
 
-async def test_browse_on_bare_git_keeps_the_stored_columns(monkeypatch, schema_template):
+async def test_browse_on_bare_git_keeps_the_stored_columns(monkeypatch, audit_application_schema_template):
     """The legacy arm is untouched: the stored counters are its authority,
     and a native resource must not leak into them."""
     _legacy_backend(monkeypatch)
-    async with _fresh_database(monkeypatch, schema_template) as (pool, vault_id, vault_name, _owner):
+    async with _fresh_database(monkeypatch, audit_application_schema_template) as (pool, vault_id, vault_name, _owner):
         await _freeze_collection(pool, vault_id, "notes", "notes")
         await _write_native_doc(pool, vault_id, "notes/a.md", actor="writer", body="alpha\n")
 
@@ -277,7 +255,7 @@ async def test_browse_on_bare_git_keeps_the_stored_columns(monkeypatch, schema_t
 # ── vault info: updates, not only creates ────────────────────
 
 
-async def test_vault_last_activity_follows_an_update(monkeypatch, schema_template):
+async def test_vault_last_activity_follows_an_update(monkeypatch, audit_application_schema_template):
     """`last_activity` moves when a document is EDITED, not only created.
 
     Measured on one installation before this arc: three documents repaired
@@ -288,7 +266,7 @@ async def test_vault_last_activity_follows_an_update(monkeypatch, schema_templat
     edit and the reported user is whoever made it.
     """
     _native_backend(monkeypatch)
-    async with _fresh_database(monkeypatch, schema_template) as (pool, vault_id, vault_name, owner_id):
+    async with _fresh_database(monkeypatch, audit_application_schema_template) as (pool, vault_id, vault_name, owner_id):
         await _freeze_legacy_document(pool, vault_id, "notes/a.md")
         created = await _write_native_doc(
             pool, vault_id, "notes/a.md", actor="original-author", body="first\n",
@@ -319,7 +297,7 @@ async def test_vault_last_activity_follows_an_update(monkeypatch, schema_templat
     assert head_at > _FROZEN_AT + timedelta(days=1), "not the retained catalog timestamp"
 
 
-async def test_vault_last_activity_picks_the_newest_of_several_documents(monkeypatch, schema_template):
+async def test_vault_last_activity_picks_the_newest_of_several_documents(monkeypatch, audit_application_schema_template):
     """Ordering runs over resources; the actor must come from the same row.
 
     The reported timestamp and the reported user are read from two different
@@ -327,7 +305,7 @@ async def test_vault_last_activity_picks_the_newest_of_several_documents(monkeyp
     return a time from one document and a name from another.
     """
     _native_backend(monkeypatch)
-    async with _fresh_database(monkeypatch, schema_template) as (pool, vault_id, vault_name, owner_id):
+    async with _fresh_database(monkeypatch, audit_application_schema_template) as (pool, vault_id, vault_name, owner_id):
         await _write_native_doc(pool, vault_id, "notes/old.md", actor="earlier", body="old\n")
         await _write_native_doc(pool, vault_id, "notes/new.md", actor="later", body="new\n")
 
@@ -347,7 +325,7 @@ async def test_vault_last_activity_picks_the_newest_of_several_documents(monkeyp
 # ── operator corpus inventory ────────────────────────────────
 
 
-async def test_instance_corpus_count_reads_the_native_authority(monkeypatch, schema_template):
+async def test_instance_corpus_count_reads_the_native_authority(monkeypatch, audit_application_schema_template):
     """The installation-wide document total counts what exists now.
 
     The retained catalog row is the pre-cutover population; the native
@@ -357,7 +335,7 @@ async def test_instance_corpus_count_reads_the_native_authority(monkeypatch, sch
     _native_backend(monkeypatch)
     from app.stats import sampler
 
-    async with _fresh_database(monkeypatch, schema_template) as (pool, vault_id, _vault_name, _owner):
+    async with _fresh_database(monkeypatch, audit_application_schema_template) as (pool, vault_id, _vault_name, _owner):
         await _freeze_legacy_document(pool, vault_id, "notes/retained.md")
         await _write_native_doc(pool, vault_id, "notes/a.md", actor="writer", body="alpha\n")
         await _write_native_doc(pool, vault_id, "notes/b.md", actor="writer", body="beta\n")
@@ -369,12 +347,12 @@ async def test_instance_corpus_count_reads_the_native_authority(monkeypatch, sch
     assert corpus["doc_count"] == 3
 
 
-async def test_instance_corpus_count_on_bare_git_reads_the_catalog(monkeypatch, schema_template):
+async def test_instance_corpus_count_on_bare_git_reads_the_catalog(monkeypatch, audit_application_schema_template):
     """The legacy arm still counts `documents`, with no native leak."""
     _legacy_backend(monkeypatch)
     from app.stats import sampler
 
-    async with _fresh_database(monkeypatch, schema_template) as (pool, vault_id, _vault_name, _owner):
+    async with _fresh_database(monkeypatch, audit_application_schema_template) as (pool, vault_id, _vault_name, _owner):
         await _freeze_legacy_document(pool, vault_id, "notes/retained.md")
         await _write_native_doc(pool, vault_id, "notes/a.md", actor="writer", body="alpha\n")
 

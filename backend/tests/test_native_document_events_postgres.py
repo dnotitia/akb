@@ -11,7 +11,10 @@ from app.exceptions import ConflictError, NotFoundError
 from app.services import events_publisher
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_revision_service import NativeRevisionService
-from tests.test_event_tail_postgres import _fresh_database, _make_vault
+from tests.test_event_tail_postgres import (
+    _fresh_database,
+    _make_vault,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -40,8 +43,8 @@ async def lifecycle(native, vault):
     return results
 
 
-async def test_lifecycle_identity_and_move_scopes():
-    async with _fresh_database() as pool:
+async def test_lifecycle_identity_and_move_scopes(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "native-events")
         results = await lifecycle(NativeRevisionService(pool, payload_store=M1PgBodyStore(pool)), vault)
         rows = await events(pool)
@@ -67,8 +70,8 @@ async def test_lifecycle_identity_and_move_scopes():
 
 
 @pytest.mark.parametrize("action", ["create", "replace", "move", "delete", "restore"])
-async def test_rollback_replay_and_obsolete_head_for_each_mutation(action):
-    async with _fresh_database() as pool:
+async def test_rollback_replay_and_obsolete_head_for_each_mutation(application_schema_template, action):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "native-retry")
         native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         common = dict(namespace_id=vault, surface="document", actor="writer")
@@ -102,8 +105,8 @@ async def test_rollback_replay_and_obsolete_head_for_each_mutation(action):
             assert len(await events(pool)) == len(before) + 1
 
 
-async def test_caller_owned_create_transaction_rollback_discards_event():
-    async with _fresh_database() as pool:
+async def test_caller_owned_create_transaction_rollback_discards_event(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "native-outer")
         native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         async with pool.acquire() as conn:
@@ -118,7 +121,7 @@ async def test_caller_owned_create_transaction_rollback_discards_event():
         assert await events(pool) == []
 
 
-async def test_existing_publisher_delivers_native_events_to_real_redis(monkeypatch):
+async def test_existing_publisher_delivers_native_events_to_real_redis(application_schema_template, monkeypatch):
     redis_url = os.environ.get("AKB_TEST_REDIS_URL")
     if not redis_url:
         if os.environ.get("REQUIRE_REAL_REDIS") == "1": pytest.fail("AKB_TEST_REDIS_URL required")
@@ -126,7 +129,7 @@ async def test_existing_publisher_delivers_native_events_to_real_redis(monkeypat
     client = redis.from_url(redis_url)
     stream = "native-event-test:" + uuid.uuid4().hex
     try:
-        async with _fresh_database() as pool:
+        async with _fresh_database(application_schema_template) as pool:
             vault = await _make_vault(pool, "native-stream")
             await lifecycle(NativeRevisionService(pool, payload_store=M1PgBodyStore(pool)), vault)
             monkeypatch.setattr(settings, "redis_url", redis_url)

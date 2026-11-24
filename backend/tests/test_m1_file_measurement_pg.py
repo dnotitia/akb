@@ -9,10 +9,13 @@ import os
 import threading
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
 import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 from app.config import settings
 from app.exceptions import AKBError, ConflictError, ForbiddenError, NotFoundError
@@ -45,33 +48,45 @@ def _migration(filename: str):
     return module
 
 
-@pytest_asyncio.fixture
-async def pool():
+async def _initialize(conn: asyncpg.Connection) -> None:
+    await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
+    for filename in (
+        "015_events_outbox.py",
+        "019_s3_delete_outbox.py",
+        "048_native_revision_core.py",
+        "053_native_revision_m1_pg_body.py",
+        "054_native_revision_searchable_derived.py",
+        "055_native_revision_m1_file_storage.py",
+        "056_native_revision_m1_file_constraints.py",
+        "057_native_revision_m1_payload_placement.py",
+        "059_native_file_searchable_derived.py",
+        "089_native_file_projection_outbox.py",
+        "107_native_document_asset_refs.py",
+    ):
+        await _migration(filename).migrate(conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
     if not _DSN:
         if os.environ.get("REQUIRE_REAL_PG") == "1":
             pytest.fail("AKB_M1_FILE_TEST_DSN is required by the real-PG gate")
         pytest.skip("AKB_M1_FILE_TEST_DSN is not configured")
-    pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=8)
-    async with pool.acquire() as conn:
-        await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-        for filename in (
-            "015_events_outbox.py",
-            "019_s3_delete_outbox.py",
-            "048_native_revision_core.py",
-            "053_native_revision_m1_pg_body.py",
-            "054_native_revision_searchable_derived.py",
-            "055_native_revision_m1_file_storage.py",
-            "056_native_revision_m1_file_constraints.py",
-            "057_native_revision_m1_payload_placement.py",
-            "059_native_file_searchable_derived.py",
-            "089_native_file_projection_outbox.py",
-            "107_native_document_asset_refs.py",
-        ):
-            await _migration(filename).migrate(conn)
-    try:
+    database_name = urlsplit(_DSN).path.lstrip("/")
+    prefix = _migration("057_native_revision_m1_payload_placement.py").MEASUREMENT_DATABASE_PREFIX
+    if database_name != prefix and not database_name.startswith(prefix + "_"):
+        pytest.fail("AKB_M1_FILE_TEST_DSN must name an M1 measurement database")
+    async with database_template(_DSN, f"{prefix}_template_", _initialize, required=True) as template:
+        yield template
+
+
+@pytest_asyncio.fixture
+async def pool(schema_template):
+    async with (
+        temporary_database(_DSN, "akb_revision_m1_measurement_", template=schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool,
+    ):
         yield pool
-    finally:
-        await pool.close()
 
 
 @pytest_asyncio.fixture

@@ -7,17 +7,40 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import AsyncIterator
+
+import asyncpg
 
 import pytest
+import pytest_asyncio
 
+from app.db.postgres import _load_migration
 from app.services import document_counters, kg_service
 from app.repositories.native_revision_repo import NativeRevisionRepository
 from app.services.native_revision_service import NativeRevisionService
 from app.services.m1_pg_body_store import M1PgBodyStore
-from tests.concurrency.test_native_derived_pipeline import _fresh_database
-from tests.test_native_graph_resource_identity_pg import _apply_migration, _args, _vault
+from tests.helpers.native_revision_database import (
+    DERIVED_DATABASE_PREFIX,
+    NATIVE_TEST_DSN,
+    cloned_derived_database,
+)
+from tests.helpers.pg_database import TestDatabase, temporary_database
+from tests.test_native_graph_resource_identity_pg import _args, _vault
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def graph_publication_template(derived_pipeline_template: TestDatabase) -> AsyncIterator[TestDatabase]:
+    async with temporary_database(NATIVE_TEST_DSN, DERIVED_DATABASE_PREFIX, template=derived_pipeline_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            migration = _load_migration("106_native_document_publications.py")
+            assert migration is not None
+            await migration.migrate(conn=conn)
+        finally:
+            await conn.close()
+        yield database
 
 
 def _body(title, status="active"):
@@ -36,8 +59,8 @@ async def _setup(pool, monkeypatch):
     return await _vault(pool), NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
 
 
-async def test_native_graph_metadata_uses_live_heads_and_same_migration_fallback(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_native_graph_metadata_uses_live_heads_and_same_migration_fallback(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault, native = await _setup(pool, monkeypatch)
         live = await native.create_text(**_args(vault, "live.md"), payload=_body("Current native title"))
         migrated = await native.create_text(**_args(vault, "migrated.md"), payload="body without frontmatter")
@@ -62,8 +85,8 @@ async def test_native_graph_metadata_uses_live_heads_and_same_migration_fallback
             assert await kg_service._graph_document_rows(conn, vault, excluded_paths=["live.md"]) == []
 
 
-async def test_native_pages_progress_past_archives_and_share_one_snapshot(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_native_pages_progress_past_archives_and_share_one_snapshot(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault, native = await _setup(pool, monkeypatch)
         oldest = await native.create_text(**_args(vault, "oldest.md"), payload=_body("Before concurrent edit"))
         for i in range(256):
@@ -94,10 +117,11 @@ async def test_native_pages_progress_past_archives_and_share_one_snapshot(monkey
         assert "After concurrent edit" in current.text
 
 
-async def test_provenance_uses_native_identity_not_legacy_and_excludes_deleted_or_foreign(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_provenance_uses_native_identity_not_legacy_and_excludes_deleted_or_foreign(
+    graph_publication_template, monkeypatch,
+):
+    async with cloned_derived_database(graph_publication_template) as pool:
         vault, native = await _setup(pool, monkeypatch)
-        await _apply_migration(pool, 106)
         other_vault = await _vault(pool, "other")
         old = await native.create_text(**_args(vault, "a.md"), payload=_body("Native A"))
         result = await kg_service.get_provenance("a.md", vault_id=vault)
@@ -111,8 +135,8 @@ async def test_provenance_uses_native_identity_not_legacy_and_excludes_deleted_o
         assert (await kg_service.get_provenance("a.md", vault_id=vault))["doc_id"] == str(replacement.resource_id)
 
 
-async def test_legacy_catalog_remains_the_authority_in_legacy_mode(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_legacy_catalog_remains_the_authority_in_legacy_mode(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         vault, native = await _setup(pool, monkeypatch)
         monkeypatch.setattr(document_counters, "native_documents_are_authoritative", lambda: False)
         await native.create_text(**_args(vault, "native-only.md"), payload=_body("Not selected"))
@@ -124,7 +148,9 @@ async def test_legacy_catalog_remains_the_authority_in_legacy_mode(monkeypatch):
         assert result["title"] == "Legacy A"
 
 
-async def test_native_rest_and_mcp_reads_enforce_real_vault_acl_without_a_legacy_mirror(monkeypatch, tmp_path):
+async def test_native_rest_and_mcp_reads_enforce_real_vault_acl_without_a_legacy_mirror(
+    graph_publication_template, monkeypatch, tmp_path,
+):
     from types import SimpleNamespace
 
     import httpx
@@ -141,9 +167,8 @@ async def test_native_rest_and_mcp_reads_enforce_real_vault_acl_without_a_legacy
     from app.services.native_document_service import NativeDocumentService
     import mcp_server.server as mcp
 
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(graph_publication_template) as pool:
         vault, native = await _setup(pool, monkeypatch)
-        await _apply_migration(pool, 106)
         monkeypatch.setattr(postgres, "_pool", pool)
         monkeypatch.setattr(documents, "doc_service", NativeDocumentService(pool=pool))
         created = await native.create_text(**_args(vault, "canary.md"), payload=_body("Native API canary"))

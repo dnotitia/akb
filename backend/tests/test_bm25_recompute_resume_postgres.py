@@ -19,11 +19,9 @@ import contextlib
 import os
 import uuid
 from collections.abc import AsyncIterator
-from pathlib import Path
 
 import asyncpg
 import pytest
-import pytest_asyncio
 
 from app.db import postgres as postgres_module
 from app.services import sparse_encoder
@@ -32,7 +30,6 @@ from tests.helpers.pg_database import TestDatabase, temporary_database
 pytestmark = pytest.mark.asyncio
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
-_INIT_SQL = Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
 
 # Twelve documents over a four-word vocabulary, chosen so every term has a
 # different document frequency: alpha 12, beta 6, gamma 4, delta 3. A resumed
@@ -50,20 +47,10 @@ _EXPECTED_DF = {"alpha": 12, "beta": 6, "gamma": 4, "delta": 3}
 _EXPECTED_TOTAL_LENGTH = sum(len(d.split()) for d in _CORPUS)
 
 
-@pytest_asyncio.fixture(scope="module")
-async def resume_template() -> AsyncIterator[TestDatabase]:
-    async with temporary_database(_DSN, "akb_bm25_resume_template_") as template:
-        async with asyncpg.create_pool(template.dsn, min_size=1, max_size=1) as pool:
-            async with pool.acquire() as conn:
-                await conn.execute(_INIT_SQL.read_text())
-            await postgres_module._apply_migrations(pool=pool)
-        yield template
-
-
 @contextlib.asynccontextmanager
-async def _fresh_database(resume_template: TestDatabase) -> AsyncIterator[asyncpg.Pool]:
+async def _fresh_database(application_schema_template: TestDatabase) -> AsyncIterator[asyncpg.Pool]:
     async with (
-        temporary_database(_DSN, "akb_bm25_resume_", template=resume_template) as database,
+        temporary_database(_DSN, "akb_bm25_resume_", template=application_schema_template) as database,
         asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
     ):
         previous_pool = postgres_module._pool
@@ -142,8 +129,8 @@ async def _published(pool) -> dict:
     return stats
 
 
-async def test_an_interrupted_scan_publishes_nothing_but_keeps_its_progress(resume_template, monkeypatch):
-    async with _fresh_database(resume_template) as pool:
+async def test_an_interrupted_scan_publishes_nothing_but_keeps_its_progress(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         tok = _Tokenizer(fail_after=7)
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", tok)
 
@@ -175,8 +162,8 @@ async def test_an_interrupted_scan_publishes_nothing_but_keeps_its_progress(resu
         )
 
 
-async def test_the_second_pass_tokenizes_only_what_is_left(resume_template, monkeypatch):
-    async with _fresh_database(resume_template) as pool:
+async def test_the_second_pass_tokenizes_only_what_is_left(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer(fail_after=7))
         with pytest.raises(RuntimeError):
             await sparse_encoder.recompute_stats(batch_size=3)
@@ -193,13 +180,13 @@ async def test_the_second_pass_tokenizes_only_what_is_left(resume_template, monk
         assert (await _published(pool))["df"] == _EXPECTED_DF
 
 
-async def test_a_resumed_run_publishes_what_an_uninterrupted_one_would(resume_template, monkeypatch):
-    async with _fresh_database(resume_template) as pool:
+async def test_a_resumed_run_publishes_what_an_uninterrupted_one_would(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer())
         clean = await sparse_encoder.recompute_stats(batch_size=3)
         clean_published = await _published(pool)
 
-    async with _fresh_database(resume_template) as pool:
+    async with _fresh_database(application_schema_template) as pool:
         # Each substitute counts its OWN calls, and a resumed pass only sees
         # what is left — so the second cut is at 4 of the remaining 9, not at 9
         # of the original 12. Getting this wrong makes the run finish quietly
@@ -227,8 +214,8 @@ async def test_a_resumed_run_publishes_what_an_uninterrupted_one_would(resume_te
     assert resumed_published["df"] == clean_published["df"] == _EXPECTED_DF
 
 
-async def test_a_finished_run_leaves_no_progress_behind(resume_template, monkeypatch):
-    async with _fresh_database(resume_template) as pool:
+async def test_a_finished_run_leaves_no_progress_behind(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer())
         await sparse_encoder.recompute_stats(batch_size=5)
 
@@ -240,8 +227,8 @@ async def test_a_finished_run_leaves_no_progress_behind(resume_template, monkeyp
             assert await conn.fetchval("SELECT count(*) FROM bm25_recompute_terms") == 0
 
 
-async def test_a_tokenizer_change_discards_the_partial_run_instead_of_resuming(resume_template, monkeypatch):
-    async with _fresh_database(resume_template) as pool:
+async def test_a_tokenizer_change_discards_the_partial_run_instead_of_resuming(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer(fail_after=7))
         with pytest.raises(RuntimeError):
             await sparse_encoder.recompute_stats(batch_size=3)
@@ -260,8 +247,8 @@ async def test_a_tokenizer_change_discards_the_partial_run_instead_of_resuming(r
         assert (await _published(pool))["df"] == _EXPECTED_DF
 
 
-async def test_the_invalidation_boundary_is_the_one_the_run_started_with(resume_template, monkeypatch):
-    async with _fresh_database(resume_template) as pool:
+async def test_the_invalidation_boundary_is_the_one_the_run_started_with(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer(fail_after=7))
         with pytest.raises(RuntimeError):
             await sparse_encoder.recompute_stats(batch_size=3)
@@ -293,7 +280,7 @@ async def test_the_invalidation_boundary_is_the_one_the_run_started_with(resume_
         )
 
 
-async def test_a_recompute_draws_term_ids_only_for_new_terms(resume_template, monkeypatch):
+async def test_a_recompute_draws_term_ids_only_for_new_terms(application_schema_template, monkeypatch):
     """A pass over known terms leaves `bm25_term_id_seq` where it was (akb#687).
 
     The recompute used to call `nextval()` for every term it saw and let
@@ -302,7 +289,7 @@ async def test_a_recompute_draws_term_ids_only_for_new_terms(resume_template, mo
     sizes its per-term arrays by the largest id, and its VACUUM cleanup walks
     all of them with the metapage locked.
     """
-    async with _fresh_database(resume_template) as pool:
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer())
 
         async def vocab_and_sequence():

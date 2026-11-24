@@ -19,18 +19,18 @@ from pathlib import Path
 
 import asyncpg
 import pytest
-import pytest_asyncio
 
-from app.db import postgres
 from app.exceptions import ForbiddenError, ValidationError
 from app.services import access_service
 from app.services import access_contributions as contrib
-from tests.helpers.pg_database import TestDatabase, temporary_database
+from tests.helpers.pg_database import (
+    TestDatabase,
+    temporary_database,
+)
 
 pytestmark = pytest.mark.asyncio
 
 _BACKEND = Path(__file__).resolve().parents[1]
-_INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
 _MIGRATION_085 = (
     _BACKEND / "app" / "db" / "migrations" / "085_vault_access_contributions.py"
 )
@@ -48,21 +48,9 @@ def _load_migration(path: Path):
     return module
 
 
-@pytest_asyncio.fixture(scope="module", loop_scope="module")
-async def schema_template():
-    """Install the server's schema, including the write policy and event outbox."""
-    async with temporary_database(_DSN, "akb_contrib_template_") as template:
-        conn = await asyncpg.connect(template.dsn)
-        try:
-            await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
-        finally:
-            await conn.close()
-        yield template
-
-
 @asynccontextmanager
-async def _fresh_database(schema_template: TestDatabase):
-    async with temporary_database(_DSN, "akb_contrib_", template=schema_template) as database:
+async def _fresh_database(application_schema_template: TestDatabase):
+    async with temporary_database(_DSN, "akb_contrib_", template=application_schema_template) as database:
         async with asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool:
             yield pool
 
@@ -91,8 +79,8 @@ class _RecordingRoleSync:
 
 
 @pytest.fixture
-async def env(monkeypatch, schema_template):
-    async with _fresh_database(schema_template) as pool:
+async def env(monkeypatch, application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         role_sync = _RecordingRoleSync()
         monkeypatch.setattr(access_service, "get_pool", lambda: pool)
         monkeypatch.setattr(access_service, "get_role_sync", lambda: role_sync)
@@ -712,10 +700,10 @@ class _LiveEnv(_Env):
 
 
 @pytest.fixture
-async def live_role_sync(monkeypatch, schema_template):
+async def live_role_sync(monkeypatch, application_schema_template):
     from app.services.role_sync import RoleSync, user_role_name, vault_group_role_name
 
-    async with _fresh_database(schema_template) as pool:
+    async with _fresh_database(application_schema_template) as pool:
         role_sync = RoleSync(pool)
         monkeypatch.setattr(access_service, "get_pool", lambda: pool)
         monkeypatch.setattr(access_service, "get_role_sync", lambda: role_sync)

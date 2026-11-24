@@ -13,8 +13,8 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-async def pool(monkeypatch):
-    async with _fresh_database() as database:
+async def pool(monkeypatch, admin_auth_template):
+    async with _fresh_database(admin_auth_template) as database:
         async def get_pool():
             return database
         monkeypatch.setattr(bootstrap, "get_pool", get_pool)

@@ -16,6 +16,10 @@ import uuid
 import asyncpg
 import pytest
 
+from tests.helpers.pg_database import (
+    temporary_database,
+)
+
 from app.config import settings
 from app.sso import realm_residue
 from app.sso.models import RealmAccount, RealmAccountListing
@@ -26,45 +30,25 @@ _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb"
 _ISSUER = "https://residue.example.test/realms/akb"
 _OTHER_ISSUER = "https://upstream.example.test/realms/workforce"
 
-
 @pytest.fixture
-async def pool(monkeypatch):
-    try:
-        pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=3)
-    except Exception:
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
+async def pool(monkeypatch, application_schema_template):
+    async with (
+        temporary_database(_DSN, "akb_realm_account_residue_", template=application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=3) as pool,
+    ):
 
-    from app.db.postgres import _load_migration
+        async def _get_pool():
+            return pool
 
-    async with pool.acquire() as conn:
-        for filename in (
-            "043_workspace_account_governance.py",
-            "082_pending_admissions.py",
-        ):
-            migration = _load_migration(filename)
-            assert migration is not None
-            await migration.migrate(conn=conn)
+        monkeypatch.setattr(realm_residue, "get_pool", _get_pool)
+        monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+        monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
+        monkeypatch.setattr(settings, "keycloak_server_url", "https://residue.example.test", raising=False)
+        monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
+        monkeypatch.setattr(settings, "keycloak_pending_admission_retention_hours", 24, raising=False)
+        assert settings.keycloak_issuer == _ISSUER
 
-    async def _get_pool():
-        return pool
-
-    monkeypatch.setattr(realm_residue, "get_pool", _get_pool)
-    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
-    monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "keycloak_server_url", "https://residue.example.test", raising=False)
-    monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
-    monkeypatch.setattr(settings, "keycloak_pending_admission_retention_hours", 24, raising=False)
-    assert settings.keycloak_issuer == _ISSUER
-
-    yield pool
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM pending_admissions WHERE issuer = ANY($1::text[])",
-            [_ISSUER, _OTHER_ISSUER],
-        )
-        await conn.execute("DELETE FROM users WHERE username LIKE 'residue-%'")
-    await pool.close()
+        yield pool
 
 
 async def _bind(pool, issuer: str, subject: str) -> None:

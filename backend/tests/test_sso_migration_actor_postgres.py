@@ -26,9 +26,9 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.mark.parametrize("operation", ["preflight", "apply", "rollback"])
 async def test_real_provider_service_pat_cannot_authorize_identity_migration(
-    monkeypatch, operation,
+    monkeypatch, admin_auth_template, operation,
 ):
-    async with _fresh_database() as pool:
+    async with _fresh_database(admin_auth_template) as pool:
         async def get_test_pool():
             return pool
 

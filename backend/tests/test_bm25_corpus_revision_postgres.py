@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
+from app.db.postgres import _load_migration
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 pytestmark = pytest.mark.asyncio
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
+
+_INIT_SQL = Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
 
 
 async def _revision(conn) -> int:
@@ -25,8 +32,6 @@ async def _revision(conn) -> int:
 
 
 async def test_migration_skips_optional_bm25_tables_when_not_materialized():
-    from app.db.postgres import _load_migration
-
     class HistoricalBootstrapConnection:
         async def fetchval(self, query, *args):
             assert "to_regclass('public.bm25_stats')" in query
@@ -40,44 +45,38 @@ async def test_migration_skips_optional_bm25_tables_when_not_materialized():
     await migration.migrate(HistoricalBootstrapConnection())
 
 
-@pytest.fixture
-async def connection():
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
+async def _initialize_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(_INIT_SQL.read_text())
+    for filename in (
+        "005_qdrant_index.py",  # Materialize the optional BM25 vocabulary and stats.
+        "084_bm25_corpus_revision.py",  # Track corpus changes.
+        "111_bm25_recompute_resume.py",  # Keep the recompute cursor and partial counts.
+    ):
+        migration = _load_migration(filename)
+        assert migration is not None
+        await migration.migrate(conn)
 
-    from app.db.postgres import _load_migration
 
-    # ``init.sql`` intentionally leaves historical derived-index tables to
-    # migration 005.  Make this focused test self-contained on a fresh schema.
-    if not await conn.fetchval("SELECT to_regclass('public.bm25_stats')"):
-        bm25_base = _load_migration("005_qdrant_index.py")
-        assert bm25_base is not None
-        await bm25_base.migrate(conn)
-    migration = _load_migration("084_bm25_corpus_revision.py")
-    assert migration is not None
-    await migration.migrate(conn)
-    # `recompute_stats` keeps its cursor and partial term counts in real
-    # tables now (akb#616), so this fixture needs 111 for the same reason it
-    # needs 005 — the schema it exercises is no longer implied by init.sql.
-    resume_tables = _load_migration("111_bm25_recompute_resume.py")
-    assert resume_tables is not None
-    await resume_tables.migrate(conn)
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template() -> AsyncIterator[TestDatabase]:
+    async with database_template(_DSN, "akb_bm25_revision_template_", _initialize_schema) as template:
+        yield template
 
-    vault_name = f"bm25-revision-{uuid.uuid4().hex[:10]}"
-    vault_id = await conn.fetchval(
-        "INSERT INTO vaults(name, git_path) VALUES($1, $2) RETURNING id",
-        vault_name,
-        f"/tmp/{vault_name}.git",
-    )
-    try:
-        yield conn, vault_id
-    finally:
-        await conn.execute("DELETE FROM vaults WHERE id = $1", vault_id)
-        await conn.close()
+
+@pytest_asyncio.fixture
+async def connection(schema_template: TestDatabase) -> AsyncIterator[tuple[asyncpg.Connection, uuid.UUID]]:
+    async with temporary_database(_DSN, "akb_bm25_revision_", template=schema_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            vault_name = f"bm25-revision-{uuid.uuid4().hex[:10]}"
+            vault_id = await conn.fetchval(
+                "INSERT INTO vaults(name, git_path) VALUES($1, $2) RETURNING id",
+                vault_name,
+                f"/tmp/{vault_name}.git",
+            )
+            yield conn, vault_id
+        finally:
+            await conn.close()
 
 
 async def test_only_bm25_relevant_chunk_mutations_advance_revision(connection):

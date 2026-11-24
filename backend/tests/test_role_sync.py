@@ -2,8 +2,8 @@
 
 Talk to a real Postgres (mocks don't catch GRANT semantics) but stay
 focused on RoleSync invariants — no service layer, no HTTP, no
-lifecycle wiring. Each test acquires its own pool, applies init.sql
-to a throwaway DB or the dev DB, and cleans up after itself.
+lifecycle wiring. Each test opens its own pool on a disposable clone
+of the schema initialized by init.sql.
 
 DSN comes from ``AKB_TEST_DSN`` (default
 ``postgresql://akb:akb@localhost:15432/akb`` to match the dev override).  # pragma: allowlist secret
@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import os
 import uuid
-from pathlib import Path
 
 import asyncpg
 import pytest
 import pytest_asyncio
+
+from tests.helpers.pg_database import (
+    temporary_database,
+)
 
 from app.services.role_sync import (
     AUTHENTICATED_ROLE,
@@ -39,27 +42,11 @@ _DSN = os.environ.get(
 )
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 @pytest_asyncio.fixture
-async def pool():
-    from tests.test_boot_schema_serialization_pg import _empty_database
-    async with _empty_database() as dsn:
-        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
-        init_sql = (Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql").read_text()
-        async with pool.acquire() as conn:
-            await conn.execute(init_sql)
-        try:
+async def pool(base_schema_template):
+    async with temporary_database(_DSN, "akb_role_sync_", template=base_schema_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
             yield pool
-        finally:
-            await pool.close()
 
 
 async def _seed_catalog(pool, *, uid=None, vid=None, owner=None):

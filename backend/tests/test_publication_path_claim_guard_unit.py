@@ -43,7 +43,6 @@ static tests at the bottom need no database and run everywhere.
 from __future__ import annotations
 
 import ast
-import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,12 +54,8 @@ import pytest_asyncio
 from app.exceptions import ConflictError
 from app.repositories.document_repo import DocumentRepository
 from app.repositories.vault_repo import VaultRepository
+from tests.helpers.pg_database import AUDIT_TEST_DSN, temporary_database
 
-
-_DSN = os.environ.get(
-    "AKB_TEST_DSN",
-    "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
-)
 
 _BACKEND = Path(__file__).resolve().parents[1]
 
@@ -75,40 +70,21 @@ _PATH_SHAPES = [
 ]
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 @pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=2, max_size=10)
-    init_sql = (_BACKEND / "app" / "db" / "init.sql").read_text()
-    async with pool.acquire() as conn:
-        await conn.execute(init_sql)
-    # Services under test resolve their connection through the module-global
-    # `get_pool()`; wire it to this pool for the duration of the test.
+async def pool(audit_application_schema_template):
     from app.db import postgres as pg_mod
-    prev = pg_mod._pool
-    pg_mod._pool = pool
-    try:
-        # init.sql is only half the schema — `events`, `resource_aliases`,
-        # `chunks.vault_id` and friends arrive by migration, and the writes
-        # exercised here touch all of them. Drive the app's own runner rather
-        # than a hand-copied DDL list that would rot on the next migration.
-        await pg_mod._apply_migrations()
-        yield pool
-    finally:
-        pg_mod._pool = prev
-        await pool.close()
+
+    async with (
+        temporary_database(AUDIT_TEST_DSN, "akb_publication_path_", template=audit_application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=2, max_size=10) as pool,
+    ):
+        # Services resolve their connection through the module-global get_pool.
+        prev = pg_mod._pool
+        pg_mod._pool = pool
+        try:
+            yield pool
+        finally:
+            pg_mod._pool = prev
 
 
 @pytest_asyncio.fixture

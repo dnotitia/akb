@@ -20,6 +20,8 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from tests.helpers.pg_database import database_template, temporary_database
+
 from app.exceptions import NotFoundError
 from app.repositories.vault_repo import VaultRepository
 from app.services import file_service as fs
@@ -39,37 +41,27 @@ _MIGRATIONS = (
 )
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+async def _initialize(conn: asyncpg.Connection) -> None:
+    from app.db.postgres import _load_migration
+
+    await conn.execute((Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql").read_text())
+    for filename in _MIGRATIONS:
+        migration = _load_migration(filename)
+        assert migration is not None
+        await migration.migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    async with database_template(_DSN, "akb_file_capability_template_", _initialize) as template:
+        yield template
 
 
 @pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect(_DSN):
-        if os.getenv("REQUIRE_REAL_PG") == "1":
-            pytest.fail("Real PostgreSQL is required for File lifecycle tests")
-        pytest.skip("Postgres not reachable; set AKB_TEST_DSN for File lifecycle tests")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=1, max_size=4)
-    backend_dir = Path(__file__).resolve().parents[1]
-    async with pool.acquire() as conn:
-        await conn.execute((backend_dir / "app" / "db" / "init.sql").read_text())
-    import importlib.util
-    for name in _MIGRATIONS:
-        path = backend_dir / "app" / "db" / "migrations" / name
-        spec = importlib.util.spec_from_file_location(name, str(path))
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        async with pool.acquire() as conn:
-            await module.migrate(conn=conn)
-    try:
-        yield pool
-    finally:
-        await pool.close()
+async def pool(schema_template):
+    async with temporary_database(_DSN, "akb_file_capability_", template=schema_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            yield pool
 
 
 @pytest_asyncio.fixture

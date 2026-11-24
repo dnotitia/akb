@@ -26,8 +26,7 @@ Docker stack default is `postgresql://akb:akb@localhost:5433/akb`.
 This file runs in the live-PG job of `backend-pytest.yml`, which
 sets `AKB_TEST_DSN` and `REQUIRE_REAL_PG=1` — under that flag an
 unreachable DB fails instead of skipping, so the gate cannot go quietly
-green. The `pool` fixture applies init.sql *and* the migrations, because
-CI hands it an empty database.
+green. Each test clones the initialized application schema.
 """
 
 from __future__ import annotations
@@ -36,11 +35,12 @@ import asyncio
 import os
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import asyncpg
 import pytest
 import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, initialize_application_schema, temporary_database
 
 from app.repositories.document_repo import DocumentRepository
 from app.repositories.vault_repo import VaultRepository
@@ -52,50 +52,29 @@ _DSN = os.environ.get(
 )
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    async with database_template(_DSN, "akb_concurrency_invariants_template_", initialize_application_schema) as template:
+        yield template
 
 
 @pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect(_DSN):
-        # This file is in the DB-backed CI job, where an unreachable
-        # Postgres means the gate silently stopped firing — fail loudly
-        # rather than skip into a false green. Locally it still skips.
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=2, max_size=10)
-    init_sql = (
-        Path(__file__).resolve().parents[2] / "app" / "db" / "init.sql"
-    ).read_text()
-    async with pool.acquire() as conn:
-        await conn.execute(init_sql)
-    # The session_service uses get_pool() (module-global). Wire it to
-    # this test pool for the duration of the test.
-    from app.db import postgres as pg_mod
-    prev = pg_mod._pool
-    pg_mod._pool = pool
-    try:
-        # init.sql is only half the schema: `events` (migration 015),
-        # `s3_delete_outbox` (019), `chunks.vault_id` (014) and friends are
-        # created by migrations, and tests below need them. Against the
-        # empty database CI creates, init.sql alone leaves this file red.
-        # Drive the app's own runner rather than a hand-copied DDL list
-        # that would rot the first time someone adds a migration. This has
-        # to run AFTER the _pool wiring above — _apply_migrations resolves
-        # its connection through get_pool(). The schema_migrations ledger
-        # makes every run after the first a single SELECT.
-        await pg_mod._apply_migrations()
-        yield pool
-    finally:
-        pg_mod._pool = prev
-        await pool.close()
+async def database(schema_template):
+    async with temporary_database(_DSN, "akb_concurrency_invariants_", template=schema_template) as database:
+        yield database
+
+
+@pytest_asyncio.fixture
+async def pool(database):
+    async with asyncpg.create_pool(database.dsn, min_size=2, max_size=10) as pool:
+        from app.db import postgres as pg_mod
+
+        previous_pool = pg_mod._pool
+        pg_mod._pool = pool
+        try:
+            yield pool
+        finally:
+            pg_mod._pool = previous_pool
 
 
 @pytest_asyncio.fixture
@@ -1170,6 +1149,7 @@ async def _await_blocked(watch, *, count: int, contains: str | None = None,
 
 @pytest.mark.asyncio
 async def test_publication_waits_for_vault_before_locking_document(
+    database,
     pool, vault, monkeypatch,
 ):
     """Publication creation follows the vault -> document lifecycle order."""
@@ -1194,7 +1174,7 @@ async def test_publication_waits_for_vault_before_locking_document(
         )
 
     doc_repo = DocumentRepository(pool)
-    watch = await asyncpg.connect(_DSN)
+    watch = await asyncpg.connect(database.dsn)
     try:
         async with pool.acquire() as lifecycle:
             tx = lifecycle.transaction()
@@ -1236,7 +1216,7 @@ async def test_publication_waits_for_vault_before_locking_document(
 
 
 @pytest.mark.asyncio
-async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, monkeypatch):
+async def test_publish_delete_race_leaves_no_orphan_publication(database, pool, vault, monkeypatch):
     """A publisher that commits *while a delete is in flight* must not leave
     its publication behind.
 
@@ -1286,8 +1266,8 @@ async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, mon
         )
 
     doc_repo = DocumentRepository(pool)
-    blocker = await asyncpg.connect(_DSN)   # holds the row so we can order the queue
-    watch = await asyncpg.connect(_DSN)     # observes who is parked on it
+    blocker = await asyncpg.connect(database.dsn)   # holds the row so we can order the queue
+    watch = await asyncpg.connect(database.dsn)     # observes who is parked on it
     pub_result: dict | None = None
     pub_error: Exception | None = None
     try:
@@ -1383,6 +1363,7 @@ async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, mon
 
 @pytest.mark.asyncio
 async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_reach(
+    database,
     pool, vault,
 ):
     """The same lock-ordering proof, on the one population the FK is blind to.
@@ -1414,8 +1395,8 @@ async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_re
     await _insert_doc(pool, doc_id=did, vault_id=vid, path=path, title="Legacy")
 
     doc_repo = DocumentRepository(pool)
-    blocker = await asyncpg.connect(_DSN)
-    watch = await asyncpg.connect(_DSN)
+    blocker = await asyncpg.connect(database.dsn)
+    watch = await asyncpg.connect(database.dsn)
     try:
         btx = blocker.transaction()
         await btx.start()
@@ -1496,7 +1477,7 @@ async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_re
 
 
 @pytest.mark.asyncio
-async def test_publish_aborts_when_the_delete_holds_the_row(pool, vault, monkeypatch):
+async def test_publish_aborts_when_the_delete_holds_the_row(database, pool, vault, monkeypatch):
     """The other interleaving: the deleter wins the row, so the publisher's
     FOR SHARE re-check finds nothing and `create_publication` fails closed
     instead of inserting a publication for a document that is already gone.
@@ -1528,7 +1509,7 @@ async def test_publish_aborts_when_the_delete_holds_the_row(pool, vault, monkeyp
         )
 
     doc_repo = DocumentRepository(pool)
-    watch = await asyncpg.connect(_DSN)
+    watch = await asyncpg.connect(database.dsn)
     try:
         async with pool.acquire() as c:
             tx = c.transaction()

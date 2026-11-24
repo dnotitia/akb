@@ -3,13 +3,15 @@
 import pytest
 
 from app.db.postgres import _load_migration
-from tests.test_event_tail_postgres import _fresh_database
+from tests.test_event_tail_postgres import (
+    _fresh_database,
+)
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_recent_index_matches_live_document_keyset_and_is_idempotent():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_recent_index_matches_live_document_keyset_and_is_idempotent(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         migration = _load_migration("117_native_recent_order.py")
         assert migration is not None, "Recent feed order migration must be installed"
         await migration.migrate(conn)

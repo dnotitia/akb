@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-from pathlib import Path
 from unittest.mock import AsyncMock
 import uuid
 
@@ -14,20 +13,11 @@ import pytest
 
 from app.repositories.events_repo import get_vault_event_bounds, list_vault_events
 from app.services.event_tail_service import EventBounds, EventCursorCodec, EventGapError, validate_event_gap
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
-
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
-
-
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2)
-    except OSError, asyncpg.PostgresError:
-        return False
-    await conn.close()
-    return True
 
 
 def _database_dsn(name: str) -> str:
@@ -36,34 +26,17 @@ def _database_dsn(name: str) -> str:
 
 
 @contextlib.asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
+async def _fresh_database(template: TestDatabase):
+    async with temporary_database(_DSN, "akb_event_tail_", template=template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            from app.db import postgres as postgres_module
 
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_event_tail_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=4)
-    previous_pool = None
-    try:
-        init_sql = (Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql").read_text()
-        async with pool.acquire() as conn:
-            await conn.execute(init_sql)
-        from app.db import postgres as postgres_module
-
-        previous_pool = postgres_module._pool
-        postgres_module._pool = pool
-        await postgres_module._apply_migrations()
-        yield pool
-    finally:
-        from app.db import postgres as postgres_module
-
-        postgres_module._pool = previous_pool
-        await pool.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
+            previous_pool = postgres_module._pool
+            postgres_module._pool = pool
+            try:
+                yield pool
+            finally:
+                postgres_module._pool = previous_pool
 
 
 async def _make_vault(pool: asyncpg.Pool, name: str) -> uuid.UUID:
@@ -96,8 +69,8 @@ async def _insert_event(
         )
 
 
-async def test_event_repository_orders_and_isolates_vault_rows():
-    async with _fresh_database() as pool:
+async def test_event_repository_orders_and_isolates_vault_rows(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "event-tail-a")
         other_vault_id = await _make_vault(pool, "event-tail-b")
         first_id = await _insert_event(pool, vault_id, "document.put", "alice")
@@ -113,8 +86,8 @@ async def test_event_repository_orders_and_isolates_vault_rows():
         assert second_id not in {first_id, third_id}
 
 
-async def test_retention_bounds_drive_gap_recovery_without_skipping():
-    async with _fresh_database() as pool:
+async def test_retention_bounds_drive_gap_recovery_without_skipping(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "event-gap")
         first_id = await _insert_event(pool, vault_id, "document.put", "alice")
         second_id = await _insert_event(pool, vault_id, "document.update", "alice")
@@ -139,14 +112,14 @@ async def test_retention_bounds_drive_gap_recovery_without_skipping():
         assert exc_info.value.details["latest_cursor"]
 
 
-async def test_postgres_tail_stream_preserves_order_filter_checkpoints_and_resume(monkeypatch):
+async def test_postgres_tail_stream_preserves_order_filter_checkpoints_and_resume(monkeypatch, application_schema_template):
     from app.services import event_tail_service
 
     class _Request:
         async def is_disconnected(self) -> bool:
             return False
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "event-stream")
         first_id = await _insert_event(pool, vault_id, "document.put", "alice")
         selected_id = await _insert_event(pool, vault_id, "table.rows_changed", "alice")

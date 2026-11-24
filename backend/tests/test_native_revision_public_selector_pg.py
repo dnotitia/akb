@@ -2,71 +2,28 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import asyncpg
 import pytest
 
-from app.db import postgres
 from app.exceptions import ConflictError, NotFoundError, ValidationError
 from app.services.native_revision_backend import NativeRevisionBackend
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
+from tests.helpers.pg_database import AUDIT_TEST_DSN, TestDatabase, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
 
-_BACKEND = Path(__file__).resolve().parents[1]
-_INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8")
-_DSN = os.environ.get(
-    "AKB_TEST_DSN",
-    "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
-)
-
-
-async def _reachable() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    return f"{_DSN.rsplit('/', 1)[0]}/{name}"
-
 
 @asynccontextmanager
-async def _fresh_database():
-    """A database built the way a booting server builds one.
-
-    `_run_boot_schema` applies `init.sql` and then every registered migration
-    in the server's order. `create_text` reaches tables that later migrations
-    change (it records inline-image references in
-    `document_asset_refs.native_document_id`, added by 107), so a hand-kept
-    migration list here goes stale with the next migration and turns every
-    test in this file into a setup error.
-    """
-    if not await _reachable():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    name = f"akb_native_public_selector_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    conn = None
-    pool = None
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        conn = await asyncpg.connect(_database_dsn(name))
-        await postgres._run_boot_schema(conn, init_sql=_INIT_SQL)
-        await conn.close()
-        conn = None
-        pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=4)
+async def _fresh_database(template: TestDatabase):
+    async with (
+        temporary_database(AUDIT_TEST_DSN, "akb_native_public_selector_", template=template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
+    ):
         vault_name = f"native-selector-{uuid.uuid4().hex}"
         async with pool.acquire() as seeded:
             namespace_id = await seeded.fetchval(
@@ -75,16 +32,9 @@ async def _fresh_database():
                 "/tmp/native-selector-unused.git",
             )
         yield pool, namespace_id, vault_name
-    finally:
-        if pool is not None:
-            await pool.close()
-        if conn is not None and not conn.is_closed():
-            await conn.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
 
 
-async def test_public_historical_selector_is_exact_or_resource_scoped_prefix(monkeypatch):
+async def test_public_historical_selector_is_exact_or_resource_scoped_prefix(monkeypatch, audit_application_schema_template):
     revision_ids = iter(
         (
             "abcdef0" + "1" * 33,
@@ -98,7 +48,7 @@ async def test_public_historical_selector_is_exact_or_resource_scoped_prefix(mon
         staticmethod(lambda: next(revision_ids)),
     )
 
-    async with _fresh_database() as (pool, namespace_id, vault_name):
+    async with _fresh_database(audit_application_schema_template) as (pool, namespace_id, vault_name):
         service = NativeRevisionService(pool)
         first = await service.create_text(
             namespace_id=namespace_id,

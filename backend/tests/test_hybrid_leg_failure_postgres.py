@@ -9,10 +9,7 @@ import pytest
 from app.services import sparse_encoder
 from app.services.vector_store import VectorSearchDegraded
 from tests.test_bm25_query_epoch_postgres import _seed
-from tests.test_bm25_term_id_compaction_postgres import (
-    _installation,
-    compaction_template as compaction_template,
-)
+from tests.test_bm25_term_id_compaction_postgres import _installation
 
 pytestmark = pytest.mark.asyncio
 

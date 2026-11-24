@@ -14,13 +14,8 @@ from app.services import asset_gc_worker, asset_service, native_asset_ref_backfi
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
-from tests.concurrency.test_native_ledger_b_core import (
-    _MIGRATION,
-    _cloned_database,
-    _create_args,
-    _load_migration,
-    native_template as native_template,
-)
+from tests.concurrency.test_native_ledger_b_core import _create_args
+from tests.helpers.native_revision_database import cloned_ledger_database
 
 pytestmark = pytest.mark.asyncio
 
@@ -50,7 +45,7 @@ async def _refs(pool, resource_id):
 
 
 async def test_direct_document_publication_and_remove_last_image(native_template):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         asset = await _asset(pool, vault_id)
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         args = _create_args(vault_id)
@@ -71,7 +66,7 @@ async def test_direct_document_publication_and_remove_last_image(native_template
 
 
 async def test_new_missing_image_is_rejected_without_publishing_a_document(native_template):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         args = _create_args(vault_id)
         args["payload"] = _body(uuid.uuid4())
@@ -83,7 +78,7 @@ async def test_new_missing_image_is_rejected_without_publishing_a_document(nativ
 
 @pytest.mark.parametrize("competitor", ["replace", "delete"])
 async def test_delayed_response_cannot_republish_old_image_references(native_template, competitor):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         image_a, image_b = await _asset(pool, vault_id), await _asset(pool, vault_id)
         committed, resume = asyncio.Event(), asyncio.Event()
 
@@ -112,7 +107,7 @@ async def test_delayed_response_cannot_republish_old_image_references(native_tem
 
 
 async def test_failed_publication_rolls_back_claim_refs_head_and_events(native_template):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         image = await _asset(pool, vault_id)
 
         def fail(boundary):
@@ -130,7 +125,7 @@ async def test_failed_publication_rolls_back_claim_refs_head_and_events(native_t
 
 @pytest.mark.parametrize("operation", ["replace", "delete"])
 async def test_facade_delayed_save_cannot_overwrite_newer_refs(native_template, operation):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id=$1", vault_id)
         first, second = await _asset(pool, vault_id), await _asset(pool, vault_id)
@@ -161,7 +156,7 @@ async def test_facade_delayed_save_cannot_overwrite_newer_refs(native_template, 
 
 
 async def test_broken_import_stays_editable_but_new_broken_images_are_rejected(native_template):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         missing, another = uuid.uuid4(), uuid.uuid4()
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         args = {**_create_args(vault_id), "payload": _body(missing)}
@@ -174,7 +169,7 @@ async def test_broken_import_stays_editable_but_new_broken_images_are_rejected(n
 
 
 async def test_move_uses_locked_body_not_corrupted_live_cache_and_replay_is_inert(native_template):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         image, wrong = await _asset(pool, vault_id), await _asset(pool, vault_id)
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         args = {**_create_args(vault_id), "payload": _body(image)}
@@ -203,7 +198,7 @@ async def test_move_uses_locked_body_not_corrupted_live_cache_and_replay_is_iner
 
 
 async def test_delete_retains_actual_head_and_collection_policy_does_not_extend_it(native_template):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         image = await _asset(pool, vault_id)
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         args = {**_create_args(vault_id), "payload": _body(image)}
@@ -224,9 +219,7 @@ async def test_delete_retains_actual_head_and_collection_policy_does_not_extend_
 
 @pytest.mark.parametrize("claim_first", [True, False])
 async def test_real_gc_and_publication_both_winner_orders(native_template, monkeypatch, claim_first):
-    async with _cloned_database(native_template) as (pool, vault_id):
-        async with pool.acquire() as conn:
-            await _load_migration(_MIGRATION.with_name("019_s3_delete_outbox.py")).migrate(conn=conn)
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         image = await _asset(pool, vault_id)
         async with pool.acquire() as conn:
             await conn.execute("UPDATE vault_files SET created_at=NOW()-INTERVAL '90 days', updated_at=NOW()-INTERVAL '90 days' WHERE id=$1", image)
@@ -289,7 +282,7 @@ async def test_real_gc_and_publication_both_winner_orders(native_template, monke
 
 
 async def test_repair_clears_empty_body_refs_and_does_not_extend_retention(native_template, monkeypatch):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         image = await _asset(pool, vault_id)
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         created = await service.create_text(**_create_args(vault_id))
@@ -323,7 +316,7 @@ async def test_repair_clears_empty_body_refs_and_does_not_extend_retention(nativ
 
 @pytest.mark.parametrize("operation", ["replace", "delete"])
 async def test_existing_document_failure_rolls_back_refs_and_retention(native_template, operation):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         first, second = await _asset(pool, vault_id), await _asset(pool, vault_id)
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         args = {**_create_args(vault_id), "payload": _body(first)}
@@ -351,7 +344,7 @@ async def test_existing_document_failure_rolls_back_refs_and_retention(native_te
 
 
 async def test_delete_retry_retains_new_head_not_original_snapshot(native_template, monkeypatch):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         first, second = await _asset(pool, vault_id), await _asset(pool, vault_id)
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id=$1", vault_id)
@@ -376,7 +369,7 @@ async def test_delete_retry_retains_new_head_not_original_snapshot(native_templa
 
 
 async def test_repair_serializes_with_delete_without_resurrecting_refs(native_template, monkeypatch):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         image = await _asset(pool, vault_id)
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         created = await service.create_text(**{**_create_args(vault_id), "payload": _body(image)})
@@ -417,7 +410,7 @@ async def test_repair_serializes_with_delete_without_resurrecting_refs(native_te
 
 @pytest.mark.parametrize("dry_run", [True, False])
 async def test_default_repair_reports_missing_images_without_any_attachment_rows(native_template, monkeypatch, dry_run):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         await service.create_text(
             **{**_create_args(vault_id), "payload": _body(uuid.uuid4())},
@@ -435,7 +428,7 @@ async def test_default_repair_reports_missing_images_without_any_attachment_rows
 
 
 async def test_repair_limit_reports_incomplete_and_rejects_nonpositive_limits(native_template, monkeypatch):
-    async with _cloned_database(native_template) as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         for index in range(3):
             await service.create_text(**{**_create_args(vault_id), "path": f"notes/{index}.md"})

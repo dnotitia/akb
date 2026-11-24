@@ -21,7 +21,7 @@ async def test_kiwi_ids_survive_reencoding_backfill_and_missing_external_stats(m
     monkeypatch.setattr(sparse_encoder.settings, "vector_store_driver", "pgvector")
     # The migration backfill must explicitly choose VChord while serving posting.
     monkeypatch.setattr(sparse_encoder.settings, "vector_store_sparse_shape", "posting")
-    async with _corpus(monkeypatch, shape="vchord") as (_, pool):
+    async with _corpus(monkeypatch, None, shape="vchord") as (_, pool):
         monkeypatch.setattr(sparse_encoder, "tokenize", real_tokenize)
         text = "검색 검색 데이터 데이터 engine engine engines"
         counts = Counter(await real_tokenize(text))

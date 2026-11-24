@@ -29,8 +29,8 @@ async def counts(pool, vault_id):
         )
 
 
-async def test_put_replay_precedes_slug_title_checks_and_uses_original_receipt():
-    async with _fresh_database() as pool:
+async def test_put_replay_precedes_slug_title_checks_and_uses_original_receipt(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "retry-documents")
         service = NativeDocumentService(pool=pool)
         actor = uuid.uuid4()
@@ -51,8 +51,10 @@ async def test_put_replay_precedes_slug_title_checks_and_uses_original_receipt()
 
 
 @pytest.mark.parametrize("explicit_slug", [False, True])
-async def test_simultaneous_puts_share_one_revision_despite_dynamic_fields(explicit_slug):
-    async with _fresh_database() as pool:
+async def test_simultaneous_puts_share_one_revision_despite_dynamic_fields(
+    explicit_slug, application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "retry-documents")
         barrier = asyncio.Barrier(4)
         async def pause(name):
@@ -69,8 +71,10 @@ async def test_simultaneous_puts_share_one_revision_despite_dynamic_fields(expli
 
 
 @pytest.mark.parametrize("body_update", [False, True])
-async def test_concurrent_updates_and_later_replay_preserve_receipt_and_occ(body_update):
-    async with _fresh_database() as pool:
+async def test_concurrent_updates_and_later_replay_preserve_receipt_and_occ(
+    body_update, application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "retry-documents")
         service = NativeDocumentService(pool=pool)
         created = await service.put(put_request())
@@ -105,8 +109,8 @@ async def test_concurrent_updates_and_later_replay_preserve_receipt_and_occ(body
             await service.update("retry-documents", created.path, DocumentUpdateRequest(content="stale", expected_commit=created.current_commit))
 
 
-async def test_committed_response_loss_can_be_recovered_after_restart():
-    async with _fresh_database() as pool:
+async def test_committed_response_loss_can_be_recovered_after_restart(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "retry-documents")
         async def lose_response(name):
             if name == "authority.after_commit_before_response":
@@ -127,8 +131,10 @@ async def test_committed_response_loss_can_be_recovered_after_restart():
         assert await counts(pool, vault_id) == (1, 2, 2, 2)
 
 
-async def test_same_key_is_scoped_to_actor_and_vault_and_missing_vault_denies_replay():
-    async with _fresh_database() as pool:
+async def test_same_key_is_scoped_to_actor_and_vault_and_missing_vault_denies_replay(
+    application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "retry-documents")
         other_id = await _make_vault(pool, "retry-other")
         service = NativeDocumentService(pool=pool)
@@ -146,8 +152,10 @@ async def test_same_key_is_scoped_to_actor_and_vault_and_missing_vault_denies_re
             await service.put(req, idempotency_actor=actor)
 
 
-async def test_commit_between_early_lookup_and_precondition_check_rechecks_receipt(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_commit_between_early_lookup_and_precondition_check_rechecks_receipt(
+    monkeypatch, application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool:
         await _make_vault(pool, "retry-documents")
         service = NativeDocumentService(pool=pool)
         actor = uuid.uuid4()
@@ -164,8 +172,8 @@ async def test_commit_between_early_lookup_and_precondition_check_rechecks_recei
         assert calls == 2
 
 
-async def test_concurrent_different_requests_with_one_key_have_one_winner():
-    async with _fresh_database() as pool:
+async def test_concurrent_different_requests_with_one_key_have_one_winner(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "retry-documents")
         barrier = asyncio.Barrier(2)
         async def pause(name):
@@ -185,7 +193,9 @@ async def test_concurrent_different_requests_with_one_key_have_one_winner():
 
 
 @pytest.mark.parametrize("options", [{}, {"title_conflict_policy": "reject"}], ids=["legacy", "reject"])
-async def test_mcp_and_rest_share_receipts_but_reauthorize_scope_and_revoked_membership(monkeypatch, tmp_path, options):
+async def test_mcp_and_rest_share_receipts_but_reauthorize_scope_and_revoked_membership(
+    monkeypatch, tmp_path, options, application_schema_template,
+):
     from app.config import settings
     from app.models.vault_scope import VaultScope, current_vault_scope
     from app.services.access_service import reset_authorized_vault
@@ -193,7 +203,7 @@ async def test_mcp_and_rest_share_receipts_but_reauthorize_scope_and_revoked_mem
     from mcp_server import server
     from app.api.routes import documents
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "retry-documents")
         async with pool.acquire() as conn:
             actor = await conn.fetchval("INSERT INTO users(username,email,password_hash) VALUES('retry-writer','retry@example.invalid','disabled') RETURNING id")
@@ -235,8 +245,10 @@ async def test_mcp_and_rest_share_receipts_but_reauthorize_scope_and_revoked_mem
         reset_authorized_vault()
 
 
-async def test_precommit_failure_rolls_back_identity_and_keyless_calls_remain_independent():
-    async with _fresh_database() as pool:
+async def test_precommit_failure_rolls_back_identity_and_keyless_calls_remain_independent(
+    application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "retry-documents")
         async def fail_before_commit(name):
             if name == "authority.before_commit":
@@ -257,8 +269,10 @@ async def test_precommit_failure_rolls_back_identity_and_keyless_calls_remain_in
         assert await counts(pool, vault_id) == (3, 3, 3, 3)
 
 
-async def test_vault_identity_change_between_lookup_and_write_is_rejected(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_vault_identity_change_between_lookup_and_write_is_rejected(
+    monkeypatch, application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool:
         original = await _make_vault(pool, "retry-documents")
         replacement = await _make_vault(pool, "retry-other")
         service = NativeDocumentService(pool=pool)
@@ -273,14 +287,16 @@ async def test_vault_identity_change_between_lookup_and_write_is_rejected(monkey
 
 @pytest.mark.parametrize("surface", ["rest", "mcp"])
 @pytest.mark.parametrize("operation,keyed", [("put", True), ("update", True), ("put", False), ("update", False)])
-async def test_recreation_after_writer_check_cannot_target_replacement(monkeypatch, tmp_path, surface, operation, keyed):
+async def test_recreation_after_writer_check_cannot_target_replacement(
+    monkeypatch, tmp_path, surface, operation, keyed, application_schema_template,
+):
     from app.config import settings
     from app.services.access_service import check_vault_access, reset_authorized_vault
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
     from app.api.routes import documents
     from mcp_server import server
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         name = "recreated-vault"
         original = await _make_vault(pool, name)
         async with pool.acquire() as conn:

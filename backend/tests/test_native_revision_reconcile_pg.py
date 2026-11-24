@@ -6,12 +6,14 @@ import hashlib
 import importlib.util
 import os
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 from git import Repo
 
 from app.services.git_service import GitService
@@ -26,6 +28,7 @@ from app.services.native_revision_reconcile import (
     NativeRevisionReconcile,
     ReconcileIntegrityError,
 )
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
@@ -37,6 +40,7 @@ _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
 )
+_DATABASE_PREFIX = "akb_c9_reconcile_"
 
 # Revisions of one Resource are a parent chain, and the chain is the order.
 # ``occurred_at`` is not: reconcile copies it from the legacy Git commit, Git
@@ -63,19 +67,6 @@ _LINEAGE_ORDERED_REVISIONS = """
 """
 
 
-async def _reachable() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    return f"{_DSN.rsplit('/', 1)[0]}/{name}"
-
-
 def _load(filename: str):
     path = _MIGRATIONS / filename
     spec = importlib.util.spec_from_file_location(f"migration_c9_reconcile_{filename}", path)
@@ -85,45 +76,30 @@ def _load(filename: str):
     return module
 
 
-@asynccontextmanager
-async def _fresh_schema(tmp_path: Path):
-    if not await _reachable():
-        # The DB-free unit job has nothing on the default DSN, so skipping there
-        # is correct. On the live-PG gate it is not: a skip and a pass read the
-        # same, and every assertion in this file is about what PostgreSQL stores.
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"the real-PG gate requires a reachable Postgres at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
+async def _initialize_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(_INIT_SQL)
+    for filename in (
+        "010_external_git_mirror.py",
+        "048_native_revision_core.py",
+        "053_native_revision_m1_pg_body.py",
+        "060_native_revision_migration_bridge.py",
+        "097_native_revision_migration_inventory.py",
+        "105_bridge_body_digest.py",
+    ):
+        await _load(filename).migrate(conn=conn)
 
-    name = f"akb_c9_reconcile_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    conn = None
-    pool = None
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        dsn = _database_dsn(name)
-        conn = await asyncpg.connect(dsn)
-        await conn.execute(_INIT_SQL)
-        for filename in (
-            "010_external_git_mirror.py",
-            "048_native_revision_core.py",
-            "053_native_revision_m1_pg_body.py",
-            "060_native_revision_migration_bridge.py",
-            "097_native_revision_migration_inventory.py",
-            "105_bridge_body_digest.py",
-        ):
-            await _load(filename).migrate(conn=conn)
-        await conn.close()
-        conn = None
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
-        yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        if conn is not None and not conn.is_closed():
-            await conn.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template() -> AsyncIterator[TestDatabase]:
+    async with database_template(_DSN, _DATABASE_PREFIX, _initialize_schema) as template:
+        yield template
+
+
+@asynccontextmanager
+async def _fresh_schema(template: TestDatabase):
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            yield pool
 
 
 async def _make_fixture(pool, tmp_path: Path, *, document_count: int = 1) -> dict:
@@ -368,8 +344,8 @@ async def test_operator_reconcile_is_explicitly_constructed():
     assert NativeRevisionReconcile.coverage_version == "c9-native-reconcile-v1"
 
 
-async def test_update_only_publishes_one_replace_and_keeps_r1_immutable(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_update_only_publishes_one_replace_and_keeps_r1_immutable(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(await _make_fixture(pool, tmp_path), move=False)
         before_r1 = await _authority_snapshot(pool, fixture["namespace_id"], fixture["document_id"])
         service = NativeRevisionReconcile(pool, git=fixture["git"], bridge=fixture["bridge"])
@@ -432,8 +408,8 @@ async def test_update_only_publishes_one_replace_and_keeps_r1_immutable(tmp_path
         )
 
 
-async def test_update_then_final_move_collapses_to_one_move_and_binds_suffix(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_update_then_final_move_collapses_to_one_move_and_binds_suffix(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(await _make_fixture(pool, tmp_path), move=True)
         service = NativeRevisionReconcile(pool, git=fixture["git"], bridge=fixture["bridge"])
 
@@ -521,7 +497,7 @@ def _assert_history_is_the_chain(head_revision_id, history):
     assert history[1]["revision_id"] == history[0]["parent_revision_id"]
 
 
-async def test_history_is_the_chain_when_two_revisions_share_one_second(tmp_path, monkeypatch):
+async def test_history_is_the_chain_when_two_revisions_share_one_second(schema_template, tmp_path, monkeypatch):
     """Git commit times are whole seconds, so one instant can hold both Revisions.
 
     The fixture already reaches this state on roughly 4 runs in 10 by committing
@@ -535,7 +511,7 @@ async def test_history_is_the_chain_when_two_revisions_share_one_second(tmp_path
     against a case that only shows up on a coin flip is how this file came to
     have a test that flipped on an unchanged tree (akb#399).
     """
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         instant = "2026-01-02T03:04:05+00:00"
         for _ in range(24):
             head_revision_id, instants, history = await _reconciled_head_and_history(
@@ -553,8 +529,8 @@ async def test_history_is_the_chain_when_two_revisions_share_one_second(tmp_path
         _assert_history_is_the_chain(head_revision_id, history)
 
 
-async def test_move_then_update_collapses_to_move_and_resolves_suffix_mappings(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_move_then_update_collapses_to_move_and_resolves_suffix_mappings(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_move_update_suffix(
             await _make_fixture(pool, tmp_path),
             repeated=False,
@@ -617,8 +593,8 @@ async def test_move_then_update_collapses_to_move_and_resolves_suffix_mappings(t
         assert final.native_revision_id == revision["revision_id"]
 
 
-async def test_repeated_move_update_suffix_resumes_replays_and_collapses_once(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_repeated_move_update_suffix_resumes_replays_and_collapses_once(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_move_update_suffix(
             await _make_fixture(pool, tmp_path),
             repeated=True,
@@ -747,8 +723,8 @@ async def test_repeated_move_update_suffix_resumes_replays_and_collapses_once(tm
         assert dict(after_replay) == dict(before_replay)
 
 
-async def test_unchanged_final_ref_has_no_item_or_native_fact(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_unchanged_final_ref_has_no_item_or_native_fact(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         fixed_r2 = fixture["git"].commit_file(
             fixture["vault_name"], "unchanged-tip.md", "tip\n", "fixed R2 tip"
@@ -771,8 +747,8 @@ async def test_unchanged_final_ref_has_no_item_or_native_fact(tmp_path):
             ) == 0
 
 
-async def test_terminal_replay_is_a_noop_and_before_commit_resumes(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_terminal_replay_is_a_noop_and_before_commit_resumes(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(await _make_fixture(pool, tmp_path), move=False)
         fired = False
 
@@ -839,8 +815,8 @@ async def test_terminal_replay_is_a_noop_and_before_commit_resumes(tmp_path):
             ) == 2
 
 
-async def test_multi_item_resume_sees_only_completed_current_run_items(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_multi_item_resume_sees_only_completed_current_run_items(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(
             await _make_fixture(pool, tmp_path, document_count=2),
             move=False,
@@ -994,8 +970,8 @@ async def test_multi_item_resume_sees_only_completed_current_run_items(tmp_path)
         assert resolution.kind == "native"
 
 
-async def test_successive_reconciles_preserve_run_item_and_mapping_ownership(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_successive_reconciles_preserve_run_item_and_mapping_ownership(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         after_r2 = await _advance_fixture(fixture, move=False)
         service = NativeRevisionReconcile(pool, git=after_r2["git"], bridge=after_r2["bridge"])
@@ -1064,8 +1040,8 @@ async def test_successive_reconciles_preserve_run_item_and_mapping_ownership(tmp
         assert all(row["native_head_revision_id"] is not None for row in items)
 
 
-async def test_reconcile_rejects_missing_previously_migrated_document_without_facts(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_reconcile_rejects_missing_previously_migrated_document_without_facts(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         before = await _authority_snapshot(pool, fixture["namespace_id"], fixture["document_id"])
         async with pool.acquire() as conn:
@@ -1118,8 +1094,8 @@ async def test_reconcile_rejects_missing_previously_migrated_document_without_fa
         assert await _authority_snapshot(pool, fixture["namespace_id"], fixture["document_id"]) == before
 
 
-async def test_reconcile_rejects_missing_resource_without_facts(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_reconcile_rejects_missing_resource_without_facts(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(await _make_fixture(pool, tmp_path), move=True)
         new_oid = fixture["git"].commit_file(
             fixture["vault_name"],
@@ -1160,8 +1136,8 @@ async def test_reconcile_rejects_missing_resource_without_facts(tmp_path):
             ) == 0
 
 
-async def test_legacy_documents_and_git_are_unchanged_by_reconcile(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+async def test_legacy_documents_and_git_are_unchanged_by_reconcile(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(await _make_fixture(pool, tmp_path), move=True)
         before_git_head = fixture["git"].current_commit(fixture["vault_name"])
         before_document = await _authority_snapshot(pool, fixture["namespace_id"], fixture["document_id"])

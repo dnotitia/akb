@@ -32,45 +32,35 @@ from app.services.vector_store.pgvector import (
     _bm25query_literal,
     _bm25vector_literal,
 )
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
 pytestmark = pytest.mark.asyncio  # 동기 테스트는 아래에서 개별 해제
 
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 
 
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
-
-
 @contextlib.asynccontextmanager
-async def _store(*, posting_first: bool = False, **store_kwargs):
+async def _store(empty_vchord_template: TestDatabase | None, *, posting_first: bool = False, **store_kwargs):
     if not _DSN:
         pytest.skip("AKB_VCHORD_TEST_DSN 미설정 — 확장이 있는 PostgreSQL 이 필요하다")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_vchord_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=4)
-    try:
+    async with (
+        temporary_database(_DSN, "akb_vchord_", template=empty_vchord_template, required=True) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
+    ):
         store = PgvectorStore(
-            dsn=_database_dsn(name), schema="vector_index",
+            dsn=database.dsn, schema="vector_index",
             dense_dim=4, sparse_shape="vchord", **store_kwargs,
         )
-        async with pool.acquire() as conn:
-            if posting_first:
-                # An installation that came from `posting`: its side table is
-                # there before the shape flips.
-                await PgvectorStore(
-                    dsn=_database_dsn(name), schema="vector_index",
-                    dense_dim=4, sparse_shape="posting",
-                )._do_ensure(conn)
-            await store._do_ensure(conn)
+        if empty_vchord_template is None:
+            async with pool.acquire() as conn:
+                if posting_first:
+                    # The old posting table exists before the shape flips.
+                    posting = PgvectorStore(
+                        dsn=None, schema="vector_index", dense_dim=4, sparse_shape="posting",
+                    )
+                    await posting._do_ensure(conn)
+                await store._do_ensure(conn)
         yield store, pool
-    finally:
-        await pool.close()
-        with contextlib.suppress(asyncpg.PostgresError):
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
@@ -104,7 +94,7 @@ def test_the_vector_literal_is_strictly_increasing_and_folded():
 
 
 async def test_the_ddl_creates_an_index_the_planner_can_use():
-    async with _store() as (store, pool):
+    async with _store(None) as (store, pool):
         async with pool.acquire() as conn:
             kind = await conn.fetchval(
                 """
@@ -118,7 +108,7 @@ async def test_the_ddl_creates_an_index_the_planner_can_use():
         )
 
 
-async def test_the_ddl_leaves_a_populated_tables_index_to_the_backfill():
+async def test_the_ddl_leaves_a_populated_tables_index_to_the_backfill(empty_vchord_template):
     """Startup builds the BM25 index only for an empty table (akb#615).
 
     Over existing chunks the index is `scripts/backfill_bm25_vector.py
@@ -129,7 +119,7 @@ async def test_the_ddl_leaves_a_populated_tables_index_to_the_backfill():
     kind that measured 42x slower per batch. Selecting the shape before the
     runbook has run must fail visibly instead, and build nothing.
     """
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             chunk = uuid.uuid4()
             # A row written under `posting`: no vector yet.
@@ -184,7 +174,7 @@ async def test_vchord_keeps_posting_current_while_the_way_back_is_retained():
     back is retained, an installation that came from `posting` writes both, so
     switching back serves the rows as they are now.
     """
-    async with _store(posting_first=True, posting_weights=_ten_times) as (store, pool):
+    async with _store(None, posting_first=True, posting_weights=_ten_times) as (store, pool):
         vault, chunk = uuid.uuid4(), uuid.UUID(int=1)
         async with pool.acquire() as conn:
             async def write(terms: list[int], tfs: list[float]) -> None:
@@ -215,7 +205,7 @@ async def test_vchord_keeps_posting_current_while_the_way_back_is_retained():
 
 async def test_a_fresh_vchord_install_has_no_posting_to_keep():
     """Nothing to go back to, so nothing is written or created for it."""
-    async with _store(posting_weights=_ten_times) as (store, pool):
+    async with _store(None, posting_weights=_ten_times) as (store, pool):
         async with pool.acquire() as conn:
             await store.upsert_one(
                 chunk_id=str(uuid.UUID(int=1)), source_type="document",
@@ -228,8 +218,8 @@ async def test_a_fresh_vchord_install_has_no_posting_to_keep():
             ) is None
 
 
-async def test_a_written_chunk_comes_back_from_a_search():
-    async with _store() as (store, pool):
+async def test_a_written_chunk_comes_back_from_a_search(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         vid = uuid.uuid4()
         async with pool.acquire() as conn:
             for i, terms in enumerate([[10, 10, 20], [20, 30], [40]], start=1):
@@ -261,7 +251,7 @@ _PAST_U32 = 4_294_967_296
 
 @pytest.mark.parametrize("term", [_MAX_TERM_ID, _PAST_INT4], ids=["largest-held", "past-int4"])
 @pytest.mark.parametrize("shape", ["unfiltered", "index-led", "materialised"])
-async def test_a_large_query_term_fails_no_query_shape(shape, term):
+async def test_a_large_query_term_fails_no_query_shape(empty_vchord_template, shape, term):
     """Term ids are `bigint` where they are minted, and the query path bound
     them as `int4` (akb#665). asyncpg refused any id past 2,147,483,647 before
     the query was sent, so a query holding one failed outright in every shape,
@@ -278,7 +268,7 @@ async def test_a_large_query_term_fails_no_query_shape(shape, term):
     asks for more rows than its scope holds, so the global-candidate probe
     runs as well.
     """
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         vault = uuid.uuid4()
         async with pool.acquire() as conn:
             for i, terms in enumerate([[20, 30], [20]], start=1):
@@ -341,13 +331,13 @@ def test_a_query_keeps_the_ids_a_document_can_hold_and_drops_the_rest():
 
 
 @pytest.mark.parametrize("term", [_PAST_INDEX, _PAST_U32], ids=["past-index", "past-u32"])
-async def test_a_query_term_the_index_cannot_hold_matches_nothing(term):
+async def test_a_query_term_the_index_cannot_hold_matches_nothing(empty_vchord_template, term):
     """No document can hold such a term, so it cannot fail the search (akb#665).
 
     Both ids are dropped before the query is sent. The first is one the text
     input would take; the second it would refuse, failing the whole search, if
     it were sent."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             await store.upsert_one(
                 chunk_id=str(uuid.UUID(int=1)), source_type="document",
@@ -367,7 +357,7 @@ async def test_a_query_term_the_index_cannot_hold_matches_nothing(term):
     assert mixed == [str(uuid.UUID(int=1))]
 
 
-async def test_both_query_shapes_return_the_same_rows():
+async def test_both_query_shapes_return_the_same_rows(empty_vchord_template):
     """The selectivity branch chooses for speed. If it also changed the answer,
     the threshold would be a correctness knob rather than a performance one.
 
@@ -378,7 +368,7 @@ async def test_both_query_shapes_return_the_same_rows():
     then the two shapes disagreed, because a tie has no right answer and each
     broke it differently. That is worth knowing, but it is not what this test
     is for, and asserting it here would have been asserting the tie-break."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         vid = uuid.uuid4()
         async with pool.acquire() as conn:
             for i in range(1, 31):
@@ -417,10 +407,10 @@ async def _const(value):
     return value
 
 
-async def test_the_selectivity_estimate_agrees_with_the_truth():
+async def test_the_selectivity_estimate_agrees_with_the_truth(empty_vchord_template):
     """A filter covering most rows is not selective; one covering a handful is.
     The estimate only has to be right about that, which is what is asserted."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         big, small = uuid.uuid4(), uuid.uuid4()
         async with pool.acquire() as conn:
             for i in range(1, 301):
@@ -436,8 +426,8 @@ async def test_the_selectivity_estimate_agrees_with_the_truth():
             assert await store._filter_is_selective(conn, "vault_id", [big]) is False
 
 
-async def test_a_statistics_failure_does_not_take_the_search_with_it():
-    async with _store() as (store, pool):
+async def test_a_statistics_failure_does_not_take_the_search_with_it(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             broken = PgvectorStore(
                 dsn=store._dsn, schema="no_such_schema",
@@ -446,7 +436,7 @@ async def test_a_statistics_failure_does_not_take_the_search_with_it():
             assert await broken._filter_is_selective(conn, "vault_id", [uuid.uuid4()]) is False
 
 
-async def test_a_selective_filter_does_not_let_the_bm25_index_lead():
+async def test_a_selective_filter_does_not_let_the_bm25_index_lead(empty_vchord_template):
     """The one thing the returned rows cannot show.
 
     Both shapes answer identically — that is asserted above and is the point of
@@ -458,7 +448,7 @@ async def test_a_selective_filter_does_not_let_the_bm25_index_lead():
 
     What separates them is which SQL went out; the plan itself is asserted by
     the test below, which catches what a text match cannot."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         vid, bulk = uuid.uuid4(), uuid.uuid4()
         async with pool.acquire() as conn:
             for i in range(1, 401):
@@ -498,7 +488,7 @@ async def test_a_selective_filter_does_not_let_the_bm25_index_lead():
         )
 
 
-async def test_documents_without_the_query_term_never_fill_the_page():
+async def test_documents_without_the_query_term_never_fill_the_page(empty_vchord_template):
     """`<&>` orders the whole table, it does not filter.
 
     A document holding none of the query terms scores exactly `-0`, which sorts
@@ -510,7 +500,7 @@ async def test_documents_without_the_query_term_never_fill_the_page():
     The earlier version of the shape-agreement test could not see this: all
     thirty of its documents held the query term, so the page was never short.
     """
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         vid = uuid.uuid4()
         async with pool.acquire() as conn:
             for i in range(1, 31):
@@ -546,7 +536,7 @@ async def test_documents_without_the_query_term_never_fill_the_page():
         assert set(unfiltered) == matching
 
 
-async def test_an_empty_vector_is_stored_and_never_displaces_a_match():
+async def test_an_empty_vector_is_stored_and_never_displaces_a_match(empty_vchord_template):
     """`'{}'` is written for a document with no terms, and costs nothing.
 
     The column has to distinguish "nothing encoded this row yet" (`NULL`) from
@@ -560,7 +550,7 @@ async def test_an_empty_vector_is_stored_and_never_displaces_a_match():
     `-0 < 0` is false so the outer filter drops it there. This asserts it at a
     scale where a wrong answer could not hide — three matches against two
     hundred empty rows, asked for ten."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         vid = uuid.uuid4()
         async with pool.acquire() as conn:
             for i in range(1, 4):
@@ -603,13 +593,13 @@ async def test_an_empty_vector_is_stored_and_never_displaces_a_match():
                 )
 
 
-async def test_the_shape_reaches_the_encoder_from_the_store_not_the_setting():
+async def test_the_shape_reaches_the_encoder_from_the_store_not_the_setting(empty_vchord_template):
     """The bench harness builds one store per shape while `settings` never
     moves, and encodes its corpus once for all of them. Reading the setting
     would hand pre-baked weights to the shape that must not have them."""
     from app.services import sparse_encoder
 
-    async with _store() as (store, _pool):
+    async with _store(empty_vchord_template) as (store, _pool):
         assert store.sparse_shape == "vchord"
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(sparse_encoder.settings, "vector_store_driver", "pgvector")
@@ -618,7 +608,7 @@ async def test_the_shape_reaches_the_encoder_from_the_store_not_the_setting():
             assert sparse_encoder._use_raw_weights() is False
 
 
-async def test_pre_baked_weights_are_refused_rather_than_stored():
+async def test_pre_baked_weights_are_refused_rather_than_stored(empty_vchord_template):
     """A caller that bypasses the plumbing gets an error, not a corpus indexed
     at the wrong scale — and the error says "this row is wrong", not "the
     database is down".
@@ -629,7 +619,7 @@ async def test_pre_baked_weights_are_refused_rather_than_stored():
     classification would halt indexing and report the wrong cause. `ValueError`
     reaches the per-row failure path instead, which is where
     `_bm25vector_literal` already sends the same class of mistake."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             with pytest.raises(ValueError, match="non-integral"):
                 await store.upsert_one(
@@ -640,7 +630,7 @@ async def test_pre_baked_weights_are_refused_rather_than_stored():
                 )
 
 
-async def test_the_statistics_read_happens_outside_the_transaction():
+async def test_the_statistics_read_happens_outside_the_transaction(empty_vchord_template):
     """Where the read sits is the whole of finding 3, and rows cannot show it.
 
     Inside the transaction, a server-side error aborts it; catching the Python
@@ -651,7 +641,7 @@ async def test_the_statistics_read_happens_outside_the_transaction():
 
     Forcing the estimate to raise is what separates the two placements: outside,
     the search still runs; inside, the transaction is already dead."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         vid = uuid.uuid4()
         async with pool.acquire() as conn:
             await store.upsert_one(
@@ -682,13 +672,13 @@ async def test_the_statistics_read_happens_outside_the_transaction():
             assert await conn.fetchval("SELECT 1") == 1
 
 
-async def test_a_statistics_failure_leaves_the_connection_usable():
+async def test_a_statistics_failure_leaves_the_connection_usable(empty_vchord_template):
     """The estimate is read before the transaction opens, because a server-side
     error inside one aborts it and catching the exception in Python does not
     un-abort it — the next statement would fail with
     InFailedSQLTransactionError, which `hybrid_search` turns into
     VectorStoreUnavailable and which takes the dense leg down too."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         vid = uuid.uuid4()
         async with pool.acquire() as conn:
             await store.upsert_one(
@@ -714,7 +704,7 @@ async def test_a_statistics_failure_leaves_the_connection_usable():
             assert await conn.fetchval("SELECT 1") == 1
 
 
-async def test_the_two_shapes_really_do_produce_different_plans():
+async def test_the_two_shapes_really_do_produce_different_plans(empty_vchord_template):
     """What the SQL text cannot show: that the barrier does its job.
 
     `AS MATERIALIZED` is the whole mechanism — a CTE's output carries no index,
@@ -729,7 +719,7 @@ async def test_the_two_shapes_really_do_produce_different_plans():
     200k. (The *latency* difference does need scale — the index-led form only
     becomes the slow one somewhere between 50k and 200k rows — but that is a
     benchmark's job, not this test's.)"""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         vid = uuid.uuid4()
         async with pool.acquire() as conn:
             for i in range(1, 31):
@@ -785,7 +775,7 @@ async def test_the_two_shapes_really_do_produce_different_plans():
 
 @pytest.mark.parametrize("selective", [True, False, None],
                          ids=["materialised", "index-led", "unfiltered"])
-async def test_source_type_filters_in_every_branch(selective):
+async def test_source_type_filters_in_every_branch(empty_vchord_template, selective):
     """The branch that never ran.
 
     Each of the three shapes spells its own `$n`, and `source_type` is the last
@@ -796,7 +786,7 @@ async def test_source_type_filters_in_every_branch(selective):
     Both directions are exercised: a type that matches must keep the rows, and
     one that does not must remove them. Asserting only the first would pass for
     a predicate that was silently dropped."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         vid = uuid.uuid4()
         async with pool.acquire() as conn:
             for i in range(1, 11):
@@ -831,7 +821,7 @@ async def test_source_type_filters_in_every_branch(selective):
             assert await hits(["memory"]) == [], "없는 source_type 이 안 걸러졌다"
 
 
-async def test_a_term_in_almost_every_document_is_not_filtered_away():
+async def test_a_term_in_almost_every_document_is_not_filtered_away(empty_vchord_template):
     """The other direction of `WHERE score < 0`.
 
     The page-padding test asserts that non-matching documents stay out. The
@@ -844,7 +834,7 @@ async def test_a_term_in_almost_every_document_is_not_filtered_away():
     safe. That is a property of the pinned extension rather than of this code,
     so `deploy/postgres/README.md` carries it on the pin-bump checklist — but a
     checklist only works if somebody reads it."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         vid = uuid.uuid4()
         async with pool.acquire() as conn:
             for i in range(1, 51):
@@ -866,7 +856,7 @@ async def test_a_term_in_almost_every_document_is_not_filtered_away():
 
 
 @pytest.mark.parametrize("scale", [1, 10], ids=["small", "large"])
-async def test_the_selectivity_estimate_works_outside_the_common_values(scale):
+async def test_the_selectivity_estimate_works_outside_the_common_values(empty_vchord_template, scale):
     """The branch production actually takes — at both scales, because they are
     not the same branch.
 
@@ -888,7 +878,7 @@ async def test_the_selectivity_estimate_works_outside_the_common_values(scale):
     Rows go in with `executemany` rather than `upsert_one`: this test needs a
     `vault_id` distribution, not vectors, and the driver loop costs 45x as much
     (32.8s against 0.73s) for nothing it asserts."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         head, second = uuid.uuid4(), uuid.uuid4()
         tails = [uuid.uuid4() for _ in range(398)]
         rows = (

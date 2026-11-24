@@ -52,6 +52,9 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 pytestmark = pytest.mark.asyncio
 
@@ -76,15 +79,6 @@ ALTER TABLE documents DROP CONSTRAINT documents_id_vault_id_key;
 """
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 def _load(filename: str):
     """Load a migration from source (NOT import_module, which could honour a
     stale __pycache__ .pyc and mask a source regression)."""
@@ -96,26 +90,39 @@ def _load(filename: str):
     return module
 
 
+async def _initialize(conn):
+    await conn.execute(_INIT_SQL)
+
+
+async def _initialize_before_058(conn):
+    await _initialize(conn)
+    await conn.execute(_UNDO_058)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def publication_identity_template():
+    async with database_template(_DSN, "akb_pub_identity_template_", _initialize) as template:
+        yield template
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def before_058_template():
+    async with database_template(
+        _DSN, "akb_pub_before_058_template_", _initialize_before_058,
+    ) as template:
+        yield template
+
+
 @asynccontextmanager
-async def _fresh_database(*, undo_058: bool = False):
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_pub_identity_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    base, _ = _DSN.rsplit("/", 1)
-    conn = await asyncpg.connect(f"{base}/{name}")
-    try:
-        await conn.execute(_INIT_SQL)
-        if undo_058:
-            await conn.execute(_UNDO_058)
-        yield conn
-    finally:
-        await conn.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
+async def _database(template=None):
+    async with temporary_database(_DSN, "akb_pub_identity_", template=template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            if template is None:
+                await _initialize(conn)
+            yield conn
+        finally:
+            await conn.close()
 
 
 async def _apply(conn) -> dict:
@@ -195,11 +202,11 @@ async def _shape(conn) -> dict:
     }
 
 
-async def test_migrated_database_matches_a_fresh_init_sql_database():
-    async with _fresh_database() as fresh:
+async def test_migrated_database_matches_a_fresh_init_sql_database(before_058_template):
+    async with _database() as fresh:
         expected = await _shape(fresh)
 
-    async with _fresh_database(undo_058=True) as migrated:
+    async with _database(before_058_template) as migrated:
         # Sanity: the undo really did reconstruct a pre-058 shape.
         assert await _shape(migrated) != expected
         await _apply(migrated)
@@ -225,10 +232,10 @@ async def test_migrated_database_matches_a_fresh_init_sql_database():
     assert all(validated for *_, validated in expected["constraints"])
 
 
-async def test_init_sql_still_runs_against_a_database_that_predates_the_migration():
+async def test_init_sql_still_runs_against_a_database_that_predates_the_migration(before_058_template):
     """The boot loop the document_id guard in init.sql exists to prevent — see
     the note at that guard for why an unguarded statement there is fatal."""
-    async with _fresh_database(undo_058=True) as conn:
+    async with _database(before_058_template) as conn:
         assert await conn.fetchval(
             "SELECT 1 FROM information_schema.columns WHERE table_name = 'publications' "
             "AND column_name = 'document_id'"
@@ -283,7 +290,7 @@ _MIGRATION_ADDED_COLUMNS = [
 
 @pytest.mark.parametrize("table,column,index", _MIGRATION_ADDED_COLUMNS)
 async def test_init_sql_survives_a_database_missing_a_migration_added_column(
-    table, column, index,
+    table, column, index, publication_identity_template,
 ):
     """The boot-loop class (see the note at init.sql's document_id guard), as a
     rule rather than one instance of it.
@@ -293,7 +300,7 @@ async def test_init_sql_survives_a_database_missing_a_migration_added_column(
     being unevenly applied is that the next person reads the guarded
     statements as optional.
     """
-    async with _fresh_database() as conn:
+    async with _database(publication_identity_template) as conn:
         await conn.execute(f"ALTER TABLE {table} DROP COLUMN {column} CASCADE")
 
         await conn.execute(_INIT_SQL)  # must not raise
@@ -301,10 +308,10 @@ async def test_init_sql_survives_a_database_missing_a_migration_added_column(
         assert await conn.fetchval(f"SELECT to_regclass('public.{index}')") is None
 
 
-async def test_a_document_cannot_be_moved_out_from_under_a_publication():
+async def test_a_document_cannot_be_moved_out_from_under_a_publication(publication_identity_template):
     """The FK's ON UPDATE is NO ACTION (the default), so the vault half of the
     key cannot be changed to break the pairing either."""
-    async with _fresh_database() as conn:
+    async with _database(publication_identity_template) as conn:
         vault_a = await _vault(conn, f"stay-{uuid.uuid4().hex[:8]}")
         vault_b = await _vault(conn, f"move-{uuid.uuid4().hex[:8]}")
         doc = await _document(conn, vault_a, "notes.md")
@@ -319,8 +326,8 @@ async def test_a_document_cannot_be_moved_out_from_under_a_publication():
             )
 
 
-async def test_deleting_the_document_row_in_sql_takes_the_publication_with_it():
-    async with _fresh_database(undo_058=True) as conn:
+async def test_deleting_the_document_row_in_sql_takes_the_publication_with_it(before_058_template):
+    async with _database(before_058_template) as conn:
         vault = await _vault(conn, f"cascade-{uuid.uuid4().hex[:8]}")
         doc = await _document(conn, vault, "reports/q3.md")
         pub = await _publication(
@@ -342,8 +349,8 @@ async def test_deleting_the_document_row_in_sql_takes_the_publication_with_it():
         ) == 0
 
 
-async def test_composite_fk_refuses_a_document_from_another_vault():
-    async with _fresh_database() as conn:
+async def test_composite_fk_refuses_a_document_from_another_vault(publication_identity_template):
+    async with _database(publication_identity_template) as conn:
         vault_a = await _vault(conn, f"own-{uuid.uuid4().hex[:8]}")
         vault_b = await _vault(conn, f"other-{uuid.uuid4().hex[:8]}")
         doc_a = await _document(conn, vault_a, "notes.md")
@@ -377,8 +384,8 @@ async def test_composite_fk_refuses_a_document_from_another_vault():
         ) == doc_a
 
 
-async def test_backfill_binds_only_unambiguous_rows_and_deletes_nothing():
-    async with _fresh_database(undo_058=True) as conn:
+async def test_backfill_binds_only_unambiguous_rows_and_deletes_nothing(before_058_template):
+    async with _database(before_058_template) as conn:
         own = f"own-{uuid.uuid4().hex[:8]}"
         elsewhere = f"elsewhere-{uuid.uuid4().hex[:8]}"
         vault = await _vault(conn, own)
@@ -446,7 +453,7 @@ async def test_backfill_binds_only_unambiguous_rows_and_deletes_nothing():
         assert await conn.fetchval("SELECT COUNT(*) FROM publications") == before
 
 
-async def test_the_backfill_reports_a_count_for_every_category(caplog):
+async def test_the_backfill_reports_a_count_for_every_category(caplog, before_058_template):
     """The per-category counts are a contract, not debug output.
 
     They are what an operator reads to decide whether a backfill can be
@@ -456,7 +463,7 @@ async def test_the_backfill_reports_a_count_for_every_category(caplog):
     different decisions. Asserting only that unbindable rows end up NULL
     cannot tell those apart.
     """
-    async with _fresh_database(undo_058=True) as conn:
+    async with _database(before_058_template) as conn:
         own = f"counts-{uuid.uuid4().hex[:8]}"
         elsewhere = f"counts-other-{uuid.uuid4().hex[:8]}"
         vault = await _vault(conn, own)
@@ -514,8 +521,8 @@ async def test_the_backfill_reports_a_count_for_every_category(caplog):
         assert second == {**first, "examined": 4, "bound": 0, "already_bound": 1}
 
 
-async def test_rerunning_changes_nothing():
-    async with _fresh_database(undo_058=True) as conn:
+async def test_rerunning_changes_nothing(before_058_template):
+    async with _database(before_058_template) as conn:
         own = f"idem-{uuid.uuid4().hex[:8]}"
         vault = await _vault(conn, own)
         await _document(conn, vault, "notes.md")
@@ -532,8 +539,8 @@ async def test_rerunning_changes_nothing():
         assert await conn.fetch("SELECT * FROM publications ORDER BY id") == rows
 
 
-async def test_index_left_invalid_by_a_cancelled_build_is_replaced():
-    async with _fresh_database(undo_058=True) as conn:
+async def test_index_left_invalid_by_a_cancelled_build_is_replaced(before_058_template):
+    async with _database(before_058_template) as conn:
         await conn.execute(
             "CREATE UNIQUE INDEX documents_id_vault_id_key ON documents (id, vault_id)"
         )
@@ -556,8 +563,8 @@ async def test_index_left_invalid_by_a_cancelled_build_is_replaced():
         ) == 1
 
 
-async def test_a_valid_index_built_out_of_band_is_adopted_not_rebuilt():
-    async with _fresh_database(undo_058=True) as conn:
+async def test_a_valid_index_built_out_of_band_is_adopted_not_rebuilt(before_058_template):
+    async with _database(before_058_template) as conn:
         await conn.execute(
             "CREATE UNIQUE INDEX documents_id_vault_id_key ON documents (id, vault_id)"
         )
@@ -577,8 +584,8 @@ async def test_a_valid_index_built_out_of_band_is_adopted_not_rebuilt():
         ) == before
 
 
-async def test_an_unrelated_index_wearing_the_name_fails_loudly():
-    async with _fresh_database(undo_058=True) as conn:
+async def test_an_unrelated_index_wearing_the_name_fails_loudly(before_058_template):
+    async with _database(before_058_template) as conn:
         await conn.execute(
             "CREATE INDEX documents_id_vault_id_key ON documents (vault_id, path)"
         )
@@ -589,7 +596,7 @@ async def test_an_unrelated_index_wearing_the_name_fails_loudly():
 @pytest.mark.parametrize("valid", [True, False])
 @pytest.mark.parametrize("right_shape", [True, False])
 async def test_an_index_of_that_name_on_another_table_is_never_touched(
-    valid, right_shape,
+    valid, right_shape, before_058_template,
 ):
     """Relation names are unique per schema, not per table.
 
@@ -599,7 +606,7 @@ async def test_an_index_of_that_name_on_another_table_is_never_touched(
     decoy and reported success. Every combination is checked because the
     branch taken depends on both validity and shape.
     """
-    async with _fresh_database(undo_058=True) as conn:
+    async with _database(before_058_template) as conn:
         columns = "(id, vault_id)" if right_shape else "(vault_id, path)"
         await conn.execute(
             "CREATE TABLE decoy (id UUID, vault_id UUID, path TEXT)"
@@ -626,12 +633,12 @@ async def test_an_index_of_that_name_on_another_table_is_never_touched(
         assert survivor["indisvalid"] is valid
 
 
-async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
+async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted(before_058_template):
     """Idempotency is not "something by that name exists". Index and constraint
     names are unique per schema, not per table, so a name says nothing about
     what is behind it."""
     # A CHECK constraint wearing the FK's name.
-    async with _fresh_database(undo_058=True) as conn:
+    async with _database(before_058_template) as conn:
         await conn.execute(
             "ALTER TABLE publications ADD COLUMN document_id UUID, "
             "ADD CONSTRAINT publications_document_fk CHECK (view_count >= 0)"
@@ -641,7 +648,7 @@ async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
 
     # An FK of the right name on the right table, but single-column — the
     # shape this whole change exists to replace.
-    async with _fresh_database(undo_058=True) as conn:
+    async with _database(before_058_template) as conn:
         await conn.execute(
             "ALTER TABLE publications ADD COLUMN document_id UUID, "
             "ADD CONSTRAINT publications_document_fk "
@@ -651,7 +658,7 @@ async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
             await _apply(conn)
 
     # An index of the right name and columns, but on another table.
-    async with _fresh_database(undo_058=True) as conn:
+    async with _database(before_058_template) as conn:
         await conn.execute(
             "CREATE TABLE decoy (document_id UUID, vault_id UUID); "
             "CREATE INDEX idx_publications_document_id "
@@ -662,7 +669,7 @@ async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
 
     # Right name, right table, right columns — but UNIQUE, which would let a
     # document be published exactly once.
-    async with _fresh_database(undo_058=True) as conn:
+    async with _database(before_058_template) as conn:
         await conn.execute("ALTER TABLE publications ADD COLUMN document_id UUID")
         await conn.execute(
             "CREATE UNIQUE INDEX idx_publications_document_id "
@@ -672,8 +679,8 @@ async def test_a_constraint_that_only_borrowed_the_name_is_not_accepted():
             await _apply(conn)
 
 
-async def test_an_invalid_cascade_index_is_rebuilt_not_stepped_over():
-    async with _fresh_database(undo_058=True) as conn:
+async def test_an_invalid_cascade_index_is_rebuilt_not_stepped_over(before_058_template):
+    async with _database(before_058_template) as conn:
         await conn.execute("ALTER TABLE publications ADD COLUMN document_id UUID")
         await conn.execute(
             "CREATE INDEX idx_publications_document_id "
@@ -692,11 +699,11 @@ async def test_an_invalid_cascade_index_is_rebuilt_not_stepped_over():
         ) is True
 
 
-async def test_a_pre_existing_bad_binding_stops_the_migration_without_touching_it():
+async def test_a_pre_existing_bad_binding_stops_the_migration_without_touching_it(before_058_template):
     """If document_id already holds a value the composite key would reject, the
     migration fails loudly and changes nothing. Blanking or deleting those rows
     is a decision for a human, not a side effect of a boot."""
-    async with _fresh_database(undo_058=True) as conn:
+    async with _database(before_058_template) as conn:
         vault_a = await _vault(conn, f"bad-a-{uuid.uuid4().hex[:8]}")
         vault_b = await _vault(conn, f"bad-b-{uuid.uuid4().hex[:8]}")
         other_doc = await _document(conn, vault_b, "notes.md")
@@ -718,7 +725,7 @@ async def test_a_pre_existing_bad_binding_stops_the_migration_without_touching_i
         ) == 0
 
 
-async def test_the_backfill_pages_through_more_rows_than_one_batch():
+async def test_the_backfill_pages_through_more_rows_than_one_batch(before_058_template):
     """_BATCH is 500; the paging loop has to visit everything, exactly once.
 
     Including the row whose id is all zeroes. Nothing generates that id, but
@@ -729,7 +736,7 @@ async def test_the_backfill_pages_through_more_rows_than_one_batch():
     total = module._BATCH * 2 + 7
     zero_id = uuid.UUID(int=0)
 
-    async with _fresh_database(undo_058=True) as conn:
+    async with _database(before_058_template) as conn:
         name = f"paged-{uuid.uuid4().hex[:8]}"
         vault = await _vault(conn, name)
         await conn.execute(
@@ -776,11 +783,11 @@ async def test_the_backfill_pages_through_more_rows_than_one_batch():
         ) == total + 1
 
 
-async def test_migration_022_does_not_drop_the_identity_column():
+async def test_migration_022_does_not_drop_the_identity_column(publication_identity_template):
     """022 drops a column called document_id. 058 adds a different one, and
     init.sql declares it — so on a fresh database 022 runs against a table
     that already has one. It must leave it alone."""
-    async with _fresh_database() as conn:
+    async with _database(publication_identity_template) as conn:
         await _load("022_publications_resource_uri.py").migrate(conn=conn)
 
         assert await conn.fetchval(

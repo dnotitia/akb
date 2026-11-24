@@ -71,18 +71,8 @@ async def _service_token(pool, username: str, scopes: list[str]) -> tuple[uuid.U
 
 
 @pytest.fixture
-async def lane(monkeypatch):
-    async with _fresh_database() as pool:
-        from app.db.postgres import _load_migration
-
-        async with pool.acquire() as conn:
-            for name in ("082_pending_admissions.py", "121_sso_identity_operations.py",
-                         "127_sso_operation_requests.py", "127_sso_operation_requests.py",
-                         "129_sso_request_recovery.py", "129_sso_request_recovery.py"):
-                migration = _load_migration(name)
-                assert migration is not None
-                await migration.migrate(conn=conn)
-
+async def lane(monkeypatch, operation_requests_template):
+    async with _fresh_database(operation_requests_template) as pool:
         async def get_test_pool():
             return pool
 

@@ -22,7 +22,11 @@ from app.services.native_revision_service import NativeRevisionService
 from app.services.search_filters import DocumentTimeRange
 from app.services.vector_store import VectorHit, VectorStoreUnavailable
 from app.services.vector_store.pgvector import PgvectorStore
-from tests.test_event_tail_postgres import _database_dsn, _fresh_database, _make_vault
+from tests.test_event_tail_postgres import (
+    _database_dsn,
+    _fresh_database,
+    _make_vault,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -37,9 +41,9 @@ def _document_service(native, pool, tmp_path, *vault_names):
 
 
 @pytest.mark.parametrize("native", [False, True], ids=["bare-git", "native"])
-async def test_document_timestamps_across_lifecycle(native, tmp_path):
+async def test_document_timestamps_across_lifecycle(application_schema_template, native, tmp_path):
     vault = "time-contract"
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, vault)
         service = _document_service(native, pool, tmp_path, vault)
 
@@ -79,9 +83,9 @@ async def test_document_timestamps_across_lifecycle(native, tmp_path):
 
 
 @pytest.mark.parametrize("native", [False, True], ids=["bare-git", "native"])
-async def test_time_candidates_precede_pgvector_prefetch_and_intersect_acl(native, tmp_path, monkeypatch):
+async def test_time_candidates_precede_pgvector_prefetch_and_intersect_acl(application_schema_template, native, tmp_path, monkeypatch):
     vault = "time-ranking"
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         visible = await _make_vault(pool, vault)
         private = await _make_vault(pool, "private")
         reader = await pool.fetchval(
@@ -183,10 +187,10 @@ async def test_time_candidates_precede_pgvector_prefetch_and_intersect_acl(nativ
             await index_pool.close()
 
 
-async def test_migrated_native_creation_uses_the_same_precedence_as_get():
+async def test_migrated_native_creation_uses_the_same_precedence_as_get(application_schema_template):
     legacy_date = datetime(2003, 2, 1, tzinfo=UTC)
     authored_date = datetime(1998, 7, 6, tzinfo=UTC)
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "migration")
         native = NativeRevisionService(pool)
         facade = NativeDocumentService(pool=pool)
@@ -226,10 +230,10 @@ async def test_migrated_native_creation_uses_the_same_precedence_as_get():
                 )
 
 
-async def test_external_git_catalog_uses_first_and_last_sync_times():
+async def test_external_git_catalog_uses_first_and_last_sync_times(application_schema_template):
     first = datetime(2004, 3, 1, tzinfo=UTC)
     second = first + timedelta(days=1)
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "mirror")
         repo = DocumentRepository(pool)
         args = dict(vault_id=vault, vault_name="mirror", collection_id=None, path="external.md",
@@ -244,8 +248,8 @@ async def test_external_git_catalog_uses_first_and_last_sync_times():
             assert (row["created_at"], row["updated_at"]) == (first, now)
 
 
-async def test_date_candidate_deadline_and_cancellation_release_the_pool(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_date_candidate_deadline_and_cancellation_release_the_pool(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         await _make_vault(pool, "timeout")
         monkeypatch.setattr(search_module, "_configured_document_source_type", lambda: "document")
         monkeypatch.setattr(search_module, "generate_embeddings", AsyncMock(return_value=[]))

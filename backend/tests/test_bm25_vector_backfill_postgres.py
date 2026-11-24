@@ -19,11 +19,11 @@ import uuid
 import asyncpg
 import pytest
 
-from app.db.postgres import _load_migration
 from app.services import sparse_encoder
 from app.services.vector_store.pgvector import PgvectorStore
-
 from scripts.backfill_bm25_vector import _build_index, _counts, _pass, _prepare
+from tests.helpers.pg_database import TestDatabase, temporary_database
+from tests.helpers.vector_database import initialize_backfill_vocabulary
 
 pytestmark = pytest.mark.asyncio
 
@@ -31,92 +31,35 @@ _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _SCHEMA = "vector_index"
 
 
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
-
-
-async def _vocab_ddl(conn) -> None:
-    """The slice of migration 005 the encoder needs — nothing else of it."""
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bm25_vocab (
-            term TEXT PRIMARY KEY,
-            term_id BIGINT NOT NULL UNIQUE,
-            df BIGINT NOT NULL DEFAULT 0,
-            first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """
-    )
-    await conn.execute("CREATE SEQUENCE IF NOT EXISTS bm25_term_id_seq AS BIGINT START 1")
-    # The encoder reports, and the writers check, the numbering its ids are in
-    # (akb#687) — migration 113 itself rather than a copy of it.
-    await _load_migration("113_bm25_vocab_epoch.py").migrate(conn)
-    # The pre-flip write path saturates against these, so they have to be
-    # readable — the values do not matter here, only that `posting` encoding
-    # produces something and `vchord` encoding ignores them.
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bm25_stats (
-            id INTEGER PRIMARY KEY DEFAULT 1,
-            total_docs BIGINT NOT NULL DEFAULT 0,
-            avgdl DOUBLE PRECISION NOT NULL DEFAULT 0,
-            tokenizer_name TEXT NOT NULL DEFAULT 'kiwi',
-            tokenizer_version TEXT NOT NULL DEFAULT '0',
-            k1 DOUBLE PRECISION NOT NULL DEFAULT 1.5,
-            b DOUBLE PRECISION NOT NULL DEFAULT 0.75,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            CHECK (id = 1)
-        )
-        """
-    )
-    await conn.execute(
-        "INSERT INTO bm25_stats (id, total_docs, avgdl) VALUES (1, 100, 3) "
-        "ON CONFLICT (id) DO NOTHING"
-    )
-
-
 @contextlib.asynccontextmanager
-async def _corpus(monkeypatch, *, shape: str = "posting"):
-    """A database holding a corpus written the OLD way, plus a live vocab.
-
-    The store is built with `shape` so the rows land exactly as a deployment
-    that has not flipped yet would have them: no `sparse_bm25` column at all.
-    """
+async def _corpus(monkeypatch, corpus_template: TestDatabase | None, *, shape: str = "posting"):
+    """Give each case its own vocabulary and posting or VChord schema."""
     if not _DSN:
         pytest.skip("AKB_VCHORD_TEST_DSN 미설정 — 확장이 있는 PostgreSQL 이 필요하다")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_bfill_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=8)
-    try:
-        async with pool.acquire() as conn:
-            await _vocab_ddl(conn)
+    async with (
+        temporary_database(_DSN, "akb_bfill_", template=corpus_template, required=True) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool,
+    ):
+        store = PgvectorStore(
+            dsn=database.dsn, schema=_SCHEMA, dense_dim=4, sparse_shape=shape,
+        )
+        if corpus_template is None:
+            # The encoding contract starts with a fresh VChord schema.
+            async with pool.acquire() as conn:
+                await initialize_backfill_vocabulary(conn)
+                await store._do_ensure(conn)
 
         # The encoder's vocab lives in the main pool; here both are this
         # database, which is what lets the backfill run end to end.
         async def _main_pool():
             return pool
 
-        monkeypatch.setattr(sparse_encoder, "get_pool", _main_pool)
-
         async def _split(text: str) -> list[str]:
             return [w for w in text.lower().split() if w]
 
+        monkeypatch.setattr(sparse_encoder, "get_pool", _main_pool)
         monkeypatch.setattr(sparse_encoder, "tokenize", _split)
-
-        store = PgvectorStore(
-            dsn=_database_dsn(name), schema=_SCHEMA, dense_dim=4, sparse_shape=shape,
-        )
-        async with pool.acquire() as conn:
-            await store._do_ensure(conn)
         yield store, pool
-    finally:
-        await pool.close()
-        with contextlib.suppress(asyncpg.PostgresError):
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 async def _no_sleep(_seconds):
@@ -158,7 +101,7 @@ async def _column_count(pool):
         ))
 
 
-async def test_prepare_adds_the_column_and_deliberately_not_the_index(monkeypatch):
+async def test_prepare_adds_the_column_and_deliberately_not_the_index(corpus_template, monkeypatch):
     """The order is the whole performance story, so it is pinned here.
 
     Measured on a 2.1M-chunk corpus: one 500-row batch took 103 seconds with the
@@ -168,7 +111,7 @@ async def test_prepare_adds_the_column_and_deliberately_not_the_index(monkeypatc
     created the index would put the sweep back on the slow path with nothing
     failing to say so — which is exactly what happened before this assertion
     existed."""
-    async with _corpus(monkeypatch) as (_store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (_store, pool):
         assert await _column_count(pool) == 0
 
         await _prepare(pool, _SCHEMA)
@@ -180,10 +123,10 @@ async def test_prepare_adds_the_column_and_deliberately_not_the_index(monkeypatc
         )
 
 
-async def test_the_index_build_refuses_a_half_filled_column(monkeypatch):
+async def test_the_index_build_refuses_a_half_filled_column(corpus_template, monkeypatch):
     """Building early is not wrong, it is slow — and slow in a way that looks
     like nothing. Refusing names the remaining work instead."""
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         await _write_old(store, pool, uuid.uuid4(), "one chunk", 0)
         await _prepare(pool, _SCHEMA)
 
@@ -196,7 +139,7 @@ async def test_the_index_build_refuses_a_half_filled_column(monkeypatch):
         assert len(await _bm25_indexes(pool)) == 1
 
 
-async def test_the_index_build_uses_the_name_the_store_will_look_for(monkeypatch):
+async def test_the_index_build_uses_the_name_the_store_will_look_for(corpus_template, monkeypatch):
     """The name is written down in two places and they have to agree.
 
     `_do_ensure` creates `idx_vi_chunks_bm25 IF NOT EXISTS` on boot and
@@ -210,7 +153,7 @@ async def test_the_index_build_uses_the_name_the_store_will_look_for(monkeypatch
     `_do_ensure` for the `vchord` shape over an already-prepared table and
     require that it adds no index.
     """
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         await _write_old(store, pool, uuid.uuid4(), "anything at all", 0)
         await _prepare(pool, _SCHEMA)
         await _pass(pool, _SCHEMA, None)
@@ -232,13 +175,13 @@ async def test_the_index_build_uses_the_name_the_store_will_look_for(monkeypatch
 
 
 async def test_the_sweep_empties_the_queue_and_an_empty_document_does_not_stall_it(
-    monkeypatch,
+    corpus_template, monkeypatch,
 ):
     """`IS NULL` is the queue, so it has to reach zero — including for a chunk
     whose content yields no terms. If such a row stayed NULL the sweep would
     still terminate (it walks forward), but `--check` would never read 0 and an
     operator would have no completion signal at all."""
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         ids = [uuid.UUID(int=i) for i in range(1, 12)]
         for n, cid in enumerate(ids):
             # The last one is deliberately empty.
@@ -267,7 +210,7 @@ async def test_the_sweep_empties_the_queue_and_an_empty_document_does_not_stall_
 
 @pytest.mark.parametrize("writers", [1, 3, 7], ids=["one", "three", "seven"])
 async def test_splitting_the_write_changes_nothing_but_the_wall_clock(
-    monkeypatch, writers
+    corpus_template, monkeypatch, writers,
 ):
     """The batch is cut into `writers` parts that run at once, because the write
     is disk-latency bound on a table carrying a large HNSW index — one writer
@@ -279,7 +222,7 @@ async def test_splitting_the_write_changes_nothing_but_the_wall_clock(
     from scripts import backfill_bm25_vector as bf
 
     monkeypatch.setattr(bf, "_BATCH", 5)
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         ids = [uuid.UUID(int=i) for i in range(1, 18)]
         for n, cid in enumerate(ids):
             await _write_old(store, pool, cid, f"alpha beta{n} gamma{n % 3}", n)
@@ -330,7 +273,7 @@ async def test_splitting_the_write_changes_nothing_but_the_wall_clock(
         assert got == serial, f"writers={writers} 가 다른 벡터를 썼다"
 
 
-async def test_a_deadlock_is_retried_rather_than_ending_the_sweep(monkeypatch):
+async def test_a_deadlock_is_retried_rather_than_ending_the_sweep(corpus_template, monkeypatch):
     """Concurrency made this reachable, so the sweep has to survive it.
 
     Every writer's encoding upserts into `bm25_vocab`, and so does the stats
@@ -345,7 +288,7 @@ async def test_a_deadlock_is_retried_rather_than_ending_the_sweep(monkeypatch):
     """
     from scripts import backfill_bm25_vector as bf
 
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         ids = [uuid.UUID(int=i) for i in range(1, 7)]
         for n, cid in enumerate(ids):
             await _write_old(store, pool, cid, f"term{n} shared", n)
@@ -370,12 +313,12 @@ async def test_a_deadlock_is_retried_rather_than_ending_the_sweep(monkeypatch):
         assert nulls == 0
 
 
-async def test_a_deadlock_that_never_clears_is_reported_not_swallowed(monkeypatch):
+async def test_a_deadlock_that_never_clears_is_reported_not_swallowed(corpus_template, monkeypatch):
     """Retrying forever would turn a real problem into a silent stall — which
     is the shape this whole episode already took once."""
     from scripts import backfill_bm25_vector as bf
 
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         await _write_old(store, pool, uuid.uuid4(), "anything", 0)
         await _prepare(pool, _SCHEMA)
 
@@ -393,7 +336,7 @@ async def test_a_deadlock_that_never_clears_is_reported_not_swallowed(monkeypatc
         assert len(tries) == bf._DEADLOCK_RETRIES
 
 
-async def test_the_sweep_walks_past_a_batch_boundary(monkeypatch):
+async def test_the_sweep_walks_past_a_batch_boundary(corpus_template, monkeypatch):
     """The forward cursor is the thing that could silently truncate: a sweep
     that restarted at the first unfilled row each time would still finish, and
     one that failed to advance would fill only the first batch and report a
@@ -401,7 +344,7 @@ async def test_the_sweep_walks_past_a_batch_boundary(monkeypatch):
     from scripts import backfill_bm25_vector as bf
 
     monkeypatch.setattr(bf, "_BATCH", 7)
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         n = 23
         for i in range(n):
             await _write_old(store, pool, uuid.uuid4(), f"term{i} shared", i)
@@ -414,7 +357,7 @@ async def test_the_sweep_walks_past_a_batch_boundary(monkeypatch):
 
 @pytest.mark.parametrize("windowed", [False, True], ids=["null-pass", "since-pass"])
 async def test_a_chunk_rewritten_between_read_and_write_is_left_alone(
-    monkeypatch, windowed
+    corpus_template, monkeypatch, windowed,
 ):
     """The indexer keeps running, and the dangerous moment is inside a batch.
 
@@ -430,7 +373,7 @@ async def test_a_chunk_rewritten_between_read_and_write_is_left_alone(
     """
     from scripts import backfill_bm25_vector as bf
 
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         cid = uuid.UUID(int=7)
         await _write_old(store, pool, cid, "words as read", 0)
         await _prepare(pool, _SCHEMA)
@@ -474,11 +417,11 @@ async def test_a_chunk_rewritten_between_read_and_write_is_left_alone(
         assert owed >= 1
 
 
-async def test_a_rewrite_during_the_window_is_caught_by_since(monkeypatch):
+async def test_a_rewrite_during_the_window_is_caught_by_since(corpus_template, monkeypatch):
     """A chunk edited after the sweep passed it keeps a vector describing the
     OLD content, and no `IS NULL` will ever find it. `--since` is the only thing
     that does."""
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         cid = uuid.UUID(int=3)
         await _write_old(store, pool, cid, "before", 0)
         await _prepare(pool, _SCHEMA)
@@ -513,14 +456,14 @@ async def test_a_rewrite_during_the_window_is_caught_by_since(monkeypatch):
         assert fixed != before, "--since 가 낡은 벡터를 그대로 뒀다"
 
 
-async def test_the_since_pass_leaves_a_row_rewritten_under_it_alone(monkeypatch):
+async def test_the_since_pass_leaves_a_row_rewritten_under_it_alone(corpus_template, monkeypatch):
     """Optimistic on `indexed_at`: if the chunk moved again between the read and
     the write, the encoding in hand is already stale and writing it would be the
     very thing this pass exists to undo. Skipping is correct — the next pass
     covers it, because its window starts before this one's write."""
     from scripts import backfill_bm25_vector as bf
 
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         cid = uuid.UUID(int=5)
         await _write_old(store, pool, cid, "first", 0)
         await _prepare(pool, _SCHEMA)
@@ -552,7 +495,7 @@ async def test_the_since_pass_leaves_a_row_rewritten_under_it_alone(monkeypatch)
         assert stale == 1
 
 
-async def test_a_window_pass_also_takes_rows_that_appeared_during_it(monkeypatch):
+async def test_a_window_pass_also_takes_rows_that_appeared_during_it(corpus_template, monkeypatch):
     """A convergence pass has two kinds of debt, and reading for only one leaves
     the other with nothing that will ever find it.
 
@@ -561,7 +504,7 @@ async def test_a_window_pass_also_takes_rows_that_appeared_during_it(monkeypatch
     A chunk REWRITTEN while it ran carries a vector and no NULL at all. Both
     have to be in the same question, or the operator converges one to zero
     while the other quietly stays."""
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         old = uuid.UUID(int=1)
         await _write_old(store, pool, old, "already here", 0)
         await _prepare(pool, _SCHEMA)
@@ -595,10 +538,10 @@ async def test_a_window_pass_also_takes_rows_that_appeared_during_it(monkeypatch
         assert nulls == 0
 
 
-async def test_the_backfilled_corpus_answers_a_search(monkeypatch):
+async def test_the_backfilled_corpus_answers_a_search(corpus_template, monkeypatch):
     """The point of all of it. Rows written before the flip must be findable
     through the index afterwards, and only the ones that hold the term."""
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         hits = [uuid.UUID(int=i) for i in (1, 2)]
         misses = [uuid.UUID(int=i) for i in (3, 4, 5)]
         for i, cid in enumerate(hits):

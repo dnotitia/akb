@@ -23,8 +23,8 @@ PASSWORD = "fixture-confirmation-only"  # pragma: allowlist secret
 
 
 @pytest.fixture
-async def pool(monkeypatch):
-    async with _fresh_database() as pool:
+async def pool(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         async def get_pool():
             return pool
         for module in (service, worker, auth_service):

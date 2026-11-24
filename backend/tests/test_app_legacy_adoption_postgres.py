@@ -14,6 +14,9 @@ import uuid
 
 import asyncpg
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 from app.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.services import access_service
@@ -47,20 +50,6 @@ _DSN = os.environ.get(
 )
 
 
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
-
-
 def _load_migration(path: Path):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
@@ -69,28 +58,38 @@ def _load_migration(path: Path):
     return module
 
 
+async def _initialize_pre_history(conn):
+    await conn.execute(_INIT_SQL)
+    for path in _MIGRATIONS[:-1]:
+        await _load_migration(path).migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def pre_history_template():
+    async with database_template(_DSN, "akb_adoption_pre_history_", _initialize_pre_history) as template:
+        yield template
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def db_template(pre_history_template):
+    async with temporary_database(
+        _DSN, "akb_adoption_template_", template=pre_history_template
+    ) as template:
+        conn = await asyncpg.connect(template.dsn)
+        try:
+            await _load_migration(_MIGRATIONS[-1]).migrate(conn=conn)
+        finally:
+            await conn.close()
+        yield template
+
+
 @asynccontextmanager
-async def _fresh_database(*, history_migration=True):
-    if not await _can_connect():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_legacy_adoption_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=8)
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(_INIT_SQL)
-            for path in _MIGRATIONS:
-                if not history_migration and path.name == "115_legacy_adoption_history.py":
-                    continue
-                await _load_migration(path).migrate(conn=conn)
+async def _fresh_database(db_template):
+    async with (
+        temporary_database(_DSN, "akb_legacy_adoption_", template=db_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool,
+    ):
         yield pool
-    finally:
-        await pool.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 def _admin() -> AuthenticatedUser:
@@ -261,8 +260,8 @@ async def _insert_orders_table(
 
 
 @pytest.mark.parametrize("state", ["planned", "applied", "blocked"])
-async def test_vault_deletion_retains_adoption_history_without_replay(monkeypatch, state):
-    async with _fresh_database() as pool:
+async def test_vault_deletion_retains_adoption_history_without_replay(monkeypatch, state, db_template):
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(adoption, "get_pool", lambda: pool)
         fixture = await _fixture(pool, label=f"delete-{state}")
         user = _admin()
@@ -324,8 +323,8 @@ async def test_vault_deletion_retains_adoption_history_without_replay(monkeypatc
             )
 
 
-async def test_history_upgrade_preserves_rows_and_validates_new_live_references(monkeypatch):
-    async with _fresh_database(history_migration=False) as pool:
+async def test_history_upgrade_preserves_rows_and_validates_new_live_references(monkeypatch, pre_history_template):
+    async with _fresh_database(pre_history_template) as pool:
         monkeypatch.setattr(adoption, "get_pool", lambda: pool)
         fixture = await _fixture(pool, label="history-upgrade")
         other = await _fixture(pool, label="history-other")
@@ -386,8 +385,8 @@ async def test_history_upgrade_preserves_rows_and_validates_new_live_references(
 
 
 @pytest.mark.parametrize("operation", ["apply", "create_replay", "fresh_create"])
-async def test_vault_delete_serializes_with_adoption_writes(monkeypatch, operation):
-    async with _fresh_database() as pool:
+async def test_vault_delete_serializes_with_adoption_writes(monkeypatch, operation, db_template):
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(adoption, "get_pool", lambda: pool)
         fixture = await _fixture(pool, label="delete-race")
         args = dict(
@@ -436,8 +435,8 @@ async def test_vault_delete_serializes_with_adoption_writes(monkeypatch, operati
 
 
 @pytest.mark.parametrize("operation", ["apply", "create_replay", "fresh_create"])
-async def test_adoption_holds_parent_until_commit_then_allows_delete(monkeypatch, operation):
-    async with _fresh_database() as pool:
+async def test_adoption_holds_parent_until_commit_then_allows_delete(monkeypatch, operation, db_template):
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(adoption, "get_pool", lambda: pool)
         fixture = await _fixture(pool, label="adopt-first")
         user = _admin()
@@ -506,9 +505,9 @@ async def test_adoption_holds_parent_until_commit_then_allows_delete(monkeypatch
             assert await conn.fetchval("SELECT count(*) FROM vault_app_installations") == 0
 
 
-async def test_mixed_deleted_targets_preserve_per_target_progress(monkeypatch):
+async def test_mixed_deleted_targets_preserve_per_target_progress(monkeypatch, db_template):
     # Apply is deliberately resumable per target, not a whole-plan transaction.
-    async with _fresh_database() as pool:
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(adoption, "get_pool", lambda: pool)
         fixtures = [await _fixture(pool, label=label) for label in ("live", "deleted")]
         user = _admin()
@@ -543,8 +542,8 @@ async def test_mixed_deleted_targets_preserve_per_target_progress(monkeypatch):
                        for row in after if row not in before)
 
 
-async def test_migration_reapply_plan_read_only_apply_and_owned_table_protection(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_migration_reapply_plan_read_only_apply_and_owned_table_protection(monkeypatch, db_template):
+    async with _fresh_database(db_template) as pool:
         # A second invocation exercises fresh + reapply idempotency for 077.
         async with pool.acquire() as conn:
             await _load_migration(_MIGRATIONS[-1]).migrate(conn=conn)
@@ -688,9 +687,9 @@ async def test_migration_reapply_plan_read_only_apply_and_owned_table_protection
 
 
 async def test_initial_grant_approval_preserves_adoption_and_rejects_drift_or_replay(
-    monkeypatch,
+    monkeypatch, db_template,
 ):
-    async with _fresh_database() as pool:
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(adoption, "get_pool", lambda: pool)
         monkeypatch.setattr(table_service, "get_pool", lambda: pool)
         monkeypatch.setattr(table_migration_service, "get_pool", lambda: pool)
@@ -951,8 +950,8 @@ async def test_initial_grant_approval_preserves_adoption_and_rejects_drift_or_re
             )
 
 
-async def test_post_plan_schema_drift_blocks_without_partial_metadata(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_post_plan_schema_drift_blocks_without_partial_metadata(monkeypatch, db_template):
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(adoption, "get_pool", lambda: pool)
         fixture = await _fixture(pool, label="drift")
         user = _admin()
@@ -1002,9 +1001,9 @@ async def test_post_plan_schema_drift_blocks_without_partial_metadata(monkeypatc
 
 
 async def test_concurrent_apply_partial_resume_cross_app_conflict_and_audit_immutability(
-    monkeypatch,
+    monkeypatch, db_template,
 ):
-    async with _fresh_database() as pool:
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(adoption, "get_pool", lambda: pool)
         monkeypatch.setattr(inventory, "get_pool", lambda: pool)
         fixture = await _fixture(pool, label="partial")

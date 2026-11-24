@@ -14,7 +14,11 @@ import pytest
 from app.exceptions import ValidationError
 from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
-from tests.test_event_tail_postgres import _database_dsn, _fresh_database, _make_vault
+from tests.test_event_tail_postgres import (
+    _database_dsn,
+    _fresh_database,
+    _make_vault,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -30,8 +34,8 @@ async def _seed(pool, vault, paths):
         )
 
 
-async def test_pages_are_stable_bounded_and_do_not_hydrate_the_whole_vault():
-    async with _fresh_database() as pool:
+async def test_pages_are_stable_bounded_and_do_not_hydrate_the_whole_vault(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-pages")
         await _seed(pool, vault, [f"guides/{i:03}.md" for i in range(13)])
         facade = NativeDocumentService(pool=pool)
@@ -65,8 +69,8 @@ async def test_pages_are_stable_bounded_and_do_not_hydrate_the_whole_vault():
         assert max(sizes) <= 4
 
 
-async def test_empty_filtered_page_still_has_a_continuation():
-    async with _fresh_database() as pool:
+async def test_empty_filtered_page_still_has_a_continuation(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-filtered")
         await _seed(pool, vault, ["a.md", "b.md", "c.md", "d.md"])
         facade = NativeDocumentService(pool=pool)
@@ -80,8 +84,8 @@ async def test_empty_filtered_page_still_has_a_continuation():
         assert [item.path for item in second.items] == ["b.md"]
 
 
-async def test_cursor_is_bound_to_vault_scope_and_options():
-    async with _fresh_database() as pool:
+async def test_cursor_is_bound_to_vault_scope_and_options(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-cursor")
         await _make_vault(pool, "browse-other")
         await _seed(pool, vault, ["a.md", "b.md"])
@@ -95,8 +99,8 @@ async def test_cursor_is_bound_to_vault_scope_and_options():
                 await facade.browse(**options, page_size=1, cursor=page.next_cursor)
 
 
-async def test_depth_zero_scopes_collections_too_and_escapes_prefixes():
-    async with _fresh_database() as pool:
+async def test_depth_zero_scopes_collections_too_and_escapes_prefixes(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-depth")
         async with pool.acquire() as conn:
             for path in ("a_b", "a_b/child", "a_b/child/deep", "axb/other"):
@@ -113,8 +117,8 @@ async def test_depth_zero_scopes_collections_too_and_escapes_prefixes():
         assert page.complete is True
 
 
-async def test_page_rejects_malformed_cursor_and_invalid_sizes():
-    async with _fresh_database() as pool:
+async def test_page_rejects_malformed_cursor_and_invalid_sizes(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         await _make_vault(pool, "browse-invalid")
         facade = NativeDocumentService(pool=pool)
         for size in (0, -1, 201, True):
@@ -124,8 +128,8 @@ async def test_page_rejects_malformed_cursor_and_invalid_sizes():
             await facade.browse("browse-invalid", page_size=1, cursor="not-a-cursor")
 
 
-async def test_wrong_json_cursor_field_types_are_validation_errors():
-    async with _fresh_database() as pool:
+async def test_wrong_json_cursor_field_types_are_validation_errors(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-cursor-types")
         await _seed(pool, vault, ["a.md", "b.md"])
         facade = NativeDocumentService(pool=pool)
@@ -141,10 +145,10 @@ async def test_wrong_json_cursor_field_types_are_validation_errors():
                 await facade.browse("browse-cursor-types", page_size=1, cursor=encoded, archive_scope="all")
 
 
-async def test_body_byte_budget_pages_without_skipping_or_dropping_integrity(monkeypatch):
+async def test_body_byte_budget_pages_without_skipping_or_dropping_integrity(application_schema_template, monkeypatch):
     from app.services import browse_pages
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-byte-budget")
         await _seed(pool, vault, ["a.md", "b.md", "c.md"])
         # Each fixture fits, but two together exceed this small test budget.
@@ -165,10 +169,10 @@ async def test_body_byte_budget_pages_without_skipping_or_dropping_integrity(mon
             await facade.browse("browse-byte-budget", page_size=100, archive_scope="all")
 
 
-async def test_legacy_hash_repair_uses_the_existing_connection(monkeypatch):
+async def test_legacy_hash_repair_uses_the_existing_connection(application_schema_template, monkeypatch):
     from app.services import document_service
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-legacy")
         async with pool.acquire() as conn:
             database = await conn.fetchval("SELECT current_database()")
@@ -190,10 +194,10 @@ async def test_legacy_hash_repair_uses_the_existing_connection(monkeypatch):
             await single.close()
 
 
-async def test_byte_guard_and_hydration_pin_the_same_head(monkeypatch):
+async def test_byte_guard_and_hydration_pin_the_same_head(application_schema_template, monkeypatch):
     from app.services import browse_pages
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-head-snapshot")
         await _seed(pool, vault, ["a.md", "b.md"])
         native = NativeRevisionService(pool)
@@ -222,8 +226,8 @@ async def test_byte_guard_and_hydration_pin_the_same_head(monkeypatch):
         assert new_head.revision_id != old.revision_id
 
 
-async def test_mixed_kind_pages_keep_duplicate_names_and_hide_unconfirmed_files():
-    async with _fresh_database() as pool:
+async def test_mixed_kind_pages_keep_duplicate_names_and_hide_unconfirmed_files(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-mixed")
         async with pool.acquire() as conn:
             collection = await conn.fetchval(
@@ -254,8 +258,8 @@ async def test_mixed_kind_pages_keep_duplicate_names_and_hide_unconfirmed_files(
         assert len(scoped.items) == 2 and all(item.type == "file" for item in scoped.items)
 
 
-async def test_name_search_finds_current_native_titles_after_empty_pages():
-    async with _fresh_database() as pool:
+async def test_name_search_finds_current_native_titles_after_empty_pages(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-name")
         await _seed(pool, vault, ["a.md", "b.md", "c.md"])
         native = NativeRevisionService(pool)
@@ -284,8 +288,8 @@ async def test_name_search_finds_current_native_titles_after_empty_pages():
         assert old.complete and old.items == []
 
 
-async def test_name_search_cursor_is_bound_and_resource_pages_exclude_collections():
-    async with _fresh_database() as pool:
+async def test_name_search_cursor_is_bound_and_resource_pages_exclude_collections(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-name-cursor")
         await _seed(pool, vault, ["a.md", "b.md"])
         async with pool.acquire() as conn:
@@ -299,10 +303,10 @@ async def test_name_search_cursor_is_bound_and_resource_pages_exclude_collection
         assert [item.type for item in all_resources.items] == ["document", "document"]
 
 
-async def test_catalog_name_search_filters_before_limit_and_escapes_wildcards(monkeypatch):
+async def test_catalog_name_search_filters_before_limit_and_escapes_wildcards(application_schema_template, monkeypatch):
     from app.services import document_service
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "browse-literal-name")
         async with pool.acquire() as conn:
             for path, title in (("a.md", "Straße"), ("b.md", "Literal 50%_\\ title"), ("c.md", "Literal 50abc title"),

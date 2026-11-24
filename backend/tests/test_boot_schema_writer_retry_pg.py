@@ -4,11 +4,23 @@ from functools import partial
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.db import postgres as pg
-from tests.test_boot_schema_serialization_pg import _empty_database, _INIT_SQL
+from tests.helpers.pg_database import database_template, temporary_database
+from tests.test_boot_schema_serialization_pg import _DSN, _INIT_SQL
 
 pytestmark = pytest.mark.asyncio
+
+
+async def _initialize(conn):
+    await conn.execute(_INIT_SQL)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def writer_retry_template():
+    async with database_template(_DSN, "akb_boot_writer_template_", _initialize) as template:
+        yield template
 
 
 async def _no_migrations(conn, applied):
@@ -24,17 +36,16 @@ async def _blocked_on_chunks(observer, pid):
             await asyncio.sleep(0.005)
 
 
-async def test_writer_lock_cycle_recovers_in_the_same_boot_without_replaying_migrations(monkeypatch, caplog):
+async def test_writer_lock_cycle_recovers_in_the_same_boot_without_replaying_migrations(monkeypatch, caplog, writer_retry_template):
     migrations = []
     async def applied(conn, filenames):
         migrations.append(filenames)
     monkeypatch.setattr(pg, "_apply_pending_migrations", applied)
     monkeypatch.setattr(pg, "_run_init_schema", partial(pg._run_init_schema, lock_timeout=0.1, backoff=0.02))
-    async with _empty_database() as dsn:
-        boot, writer, observer = await asyncio.gather(*(asyncpg.connect(dsn) for _ in range(3)))
+    async with temporary_database(_DSN, "akb_boot_writer_", template=writer_retry_template) as database:
+        boot, writer, observer = await asyncio.gather(*(asyncpg.connect(database.dsn) for _ in range(3)))
         task = None
         try:
-            await observer.execute(_INIT_SQL)
             await writer.execute("BEGIN; LOCK TABLE chunks IN ROW EXCLUSIVE MODE")
             task = asyncio.create_task(pg._run_boot_schema(boot, init_sql=_INIT_SQL))
             await _blocked_on_chunks(observer, boot.get_server_pid())
@@ -58,13 +69,12 @@ async def test_writer_lock_cycle_recovers_in_the_same_boot_without_replaying_mig
             await asyncio.gather(*(conn.close() for conn in (boot, writer, observer)))
 
 
-async def test_exhaustion_rolls_back_schema_effects_and_releases_the_outer_lock(monkeypatch):
+async def test_exhaustion_rolls_back_schema_effects_and_releases_the_outer_lock(monkeypatch, writer_retry_template):
     monkeypatch.setattr(pg, "_apply_pending_migrations", _no_migrations)
     monkeypatch.setattr(pg, "_run_init_schema", partial(pg._run_init_schema, retries=2, lock_timeout=0.02, backoff=0))
-    async with _empty_database() as dsn:
-        boot, writer = await asyncio.gather(asyncpg.connect(dsn), asyncpg.connect(dsn))
+    async with temporary_database(_DSN, "akb_boot_writer_", template=writer_retry_template) as database:
+        boot, writer = await asyncio.gather(asyncpg.connect(database.dsn), asyncpg.connect(database.dsn))
         try:
-            await writer.execute(_INIT_SQL)
             await writer.execute("BEGIN; LOCK TABLE chunks IN ROW EXCLUSIVE MODE")
             with pytest.raises(asyncpg.LockNotAvailableError):
                 await pg._run_boot_schema(boot, init_sql="CREATE TABLE boot_attempt_receipt(id int);" + _INIT_SQL)
@@ -76,13 +86,12 @@ async def test_exhaustion_rolls_back_schema_effects_and_releases_the_outer_lock(
             await asyncio.gather(boot.close(), writer.close())
 
 
-async def test_cancellation_releases_schema_and_boot_locks_for_the_next_caller(monkeypatch):
+async def test_cancellation_releases_schema_and_boot_locks_for_the_next_caller(monkeypatch, writer_retry_template):
     monkeypatch.setattr(pg, "_apply_pending_migrations", _no_migrations)
-    async with _empty_database() as dsn:
-        boot, writer, observer = await asyncio.gather(*(asyncpg.connect(dsn) for _ in range(3)))
+    async with temporary_database(_DSN, "akb_boot_writer_", template=writer_retry_template) as database:
+        boot, writer, observer = await asyncio.gather(*(asyncpg.connect(database.dsn) for _ in range(3)))
         task = None
         try:
-            await observer.execute(_INIT_SQL)
             await writer.execute("BEGIN; LOCK TABLE chunks IN ROW EXCLUSIVE MODE")
             task = asyncio.create_task(pg._run_boot_schema(boot, init_sql=_INIT_SQL))
             await _blocked_on_chunks(observer, boot.get_server_pid())
@@ -98,13 +107,12 @@ async def test_cancellation_releases_schema_and_boot_locks_for_the_next_caller(m
             await asyncio.gather(*(conn.close() for conn in (boot, writer, observer)))
 
 
-async def test_deadlock_retry_is_atomic_and_non_lock_errors_are_not_retried(monkeypatch):
+async def test_deadlock_retry_is_atomic_and_non_lock_errors_are_not_retried(monkeypatch, writer_retry_template):
     monkeypatch.setattr(pg, "_apply_pending_migrations", _no_migrations)
     monkeypatch.setattr(pg, "_run_init_schema", partial(pg._run_init_schema, backoff=0))
-    async with _empty_database() as dsn:
-        conn = await asyncpg.connect(dsn)
+    async with temporary_database(_DSN, "akb_boot_writer_", template=writer_retry_template) as database:
+        conn = await asyncpg.connect(database.dsn)
         try:
-            await conn.execute(_INIT_SQL)
             await conn.execute("CREATE SEQUENCE boot_retry_sequence")
             await pg._run_boot_schema(conn, init_sql="""
                 CREATE TABLE boot_atomic_receipt(id int);

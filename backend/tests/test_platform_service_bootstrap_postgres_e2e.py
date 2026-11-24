@@ -3,11 +3,13 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 import asyncpg
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 from app.config import settings
 from app.services import auth_service, platform_service_bootstrap as bootstrap
@@ -18,69 +20,77 @@ from tests.test_platform_service_bootstrap_unit import wire
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.fixture
-async def lane(monkeypatch):
+async def _initialize(conn):
+    from app.db.postgres import _load_migration
+
+    await conn.execute((Path(__file__).parents[1] / "app/db/init.sql").read_text())
+    for filename in ("015_events_outbox.py", "126_platform_service_bootstrap.py"):
+        await _load_migration(filename).migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def bootstrap_template():
     dsn = os.environ.get("AKB_TEST_DSN")
     if not dsn:
         pytest.fail("AKB_TEST_DSN required; this lane never skips")
+    async with database_template(dsn, "akb_service_cli_template_", _initialize, required=True) as template:
+        yield template
+
+
+@pytest.fixture
+async def lane(monkeypatch, bootstrap_template):
+    dsn = os.environ["AKB_TEST_DSN"]
     admin = await asyncpg.connect(dsn, timeout=5)
-    database = "akb_service_cli_" + uuid.uuid4().hex
-    pool = None
-    owned_roles = {}
-    authenticated_before = await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE)
-    authenticated_created = None
-    original_project = RoleSync.on_user_create_in_conn
-
-    async def tracked_project(sync, conn, user_id):
-        nonlocal authenticated_created
-        role = user_role_name(user_id)
-        assert await conn.fetchval("SELECT current_database()") == database
-        assert await conn.fetchval("SELECT id FROM users WHERE id=$1 AND username='platform-bot'", uuid.UUID(str(user_id)))
-        if role not in owned_roles:
-            assert not await conn.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
-        await original_project(sync, conn, user_id)
-        owned_roles[role] = await conn.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
-        if authenticated_before is None:
-            authenticated_created = await conn.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE)
-
-    monkeypatch.setattr(RoleSync, "on_user_create_in_conn", tracked_project)
     try:
-        await admin.execute(f'CREATE DATABASE "{database}"')
-        target = urlunsplit(urlsplit(dsn)._replace(path="/"+database))
-        pool = await asyncpg.create_pool(target, min_size=1, max_size=5)
-        await pool.execute((Path(__file__).parents[1]/"app/db/init.sql").read_text())
-        from app.db.postgres import _load_migration
-        async with pool.acquire() as conn:
-            for filename in ("015_events_outbox.py", "126_platform_service_bootstrap.py"):
-                await _load_migration(filename).migrate(conn=conn)
-        epoch = uuid.uuid4()
-        await pool.execute("INSERT INTO auth_runtime_state(singleton,runtime_generation,auth_mode,sso_session_epoch) VALUES(true,1,'sso',$1)", epoch)
-        async def get_pool():
-            return pool
-        monkeypatch.setattr(bootstrap, "get_pool", get_pool)
-        monkeypatch.setattr(auth_service, "get_pool", get_pool)
-        for key, value in {"auth_mode":"sso", "keycloak_enabled":True, "keycloak_server_url":"https://identity.example",
-            "keycloak_realm":"akb", "keycloak_service_admin_client_id":"akb-sso-manager", "auth_runtime_generation":1, "sso_session_epoch":epoch,
-            "document_revision_backend":"postgres_native"}.items():
-            monkeypatch.setattr(settings, key, value)
-        yield pool, bootstrap.parse_intent(wire())
+        owned_roles = {}
+        authenticated_before = await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE)
+        authenticated_created = None
+        original_project = RoleSync.on_user_create_in_conn
+
+        async def tracked_project(sync, conn, user_id):
+            nonlocal authenticated_created
+            role = user_role_name(user_id)
+            assert await conn.fetchval("SELECT current_database()") == database.name
+            assert await conn.fetchval("SELECT id FROM users WHERE id=$1 AND username='platform-bot'", uuid.UUID(str(user_id)))
+            if role not in owned_roles:
+                assert not await conn.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
+            await original_project(sync, conn, user_id)
+            owned_roles[role] = await conn.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
+            if authenticated_before is None:
+                authenticated_created = await conn.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE)
+
+        monkeypatch.setattr(RoleSync, "on_user_create_in_conn", tracked_project)
+        try:
+            async with (
+                temporary_database(dsn, "akb_service_cli_", template=bootstrap_template) as database,
+                asyncpg.create_pool(database.dsn, min_size=1, max_size=5) as pool,
+            ):
+                epoch = uuid.uuid4()
+                await pool.execute("INSERT INTO auth_runtime_state(singleton,runtime_generation,auth_mode,sso_session_epoch) VALUES(true,1,'sso',$1)", epoch)
+                async def get_pool():
+                    return pool
+                monkeypatch.setattr(bootstrap, "get_pool", get_pool)
+                monkeypatch.setattr(auth_service, "get_pool", get_pool)
+                for key, value in {"auth_mode":"sso", "keycloak_enabled":True, "keycloak_server_url":"https://identity.example",
+                    "keycloak_realm":"akb", "keycloak_service_admin_client_id":"akb-sso-manager", "auth_runtime_generation":1, "sso_session_epoch":epoch,
+                    "document_revision_backend":"postgres_native"}.items():
+                    monkeypatch.setattr(settings, key, value)
+                yield pool, bootstrap.parse_intent(wire())
+        finally:
+            # Roles are cluster-wide: exact UUID/OID ownership, never a prefix sweep.
+            for role, oid in owned_roles.items():
+                current = await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
+                if current is not None:
+                    assert current == oid and user_role_name(uuid.UUID(role.removeprefix("akb_user_").replace("_", "-"))) == role
+                    await admin.execute(f'DROP ROLE "{role}"')
+            if authenticated_before is None and authenticated_created is not None:
+                current = await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE)
+                if current == authenticated_created:
+                    assert not await admin.fetchval("SELECT EXISTS(SELECT 1 FROM pg_auth_members WHERE roleid=$1 OR member=$1)", current)
+                    await admin.execute(f'DROP ROLE "{AUTHENTICATED_ROLE}"')
+            else:
+                assert await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE) == authenticated_before
     finally:
-        if pool:
-            await pool.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{database}"')
-        # Roles are cluster-wide: exact UUID/OID ownership, never a prefix sweep.
-        for role, oid in owned_roles.items():
-            current = await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
-            if current is not None:
-                assert current == oid and user_role_name(uuid.UUID(role.removeprefix("akb_user_").replace("_", "-"))) == role
-                await admin.execute(f'DROP ROLE "{role}"')
-        if authenticated_before is None and authenticated_created is not None:
-            current = await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE)
-            if current == authenticated_created:
-                assert not await admin.fetchval("SELECT EXISTS(SELECT 1 FROM pg_auth_members WHERE roleid=$1 OR member=$1)", current)
-                await admin.execute(f'DROP ROLE "{AUTHENTICATED_ROLE}"')
-        else:
-            assert await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", AUTHENTICATED_ROLE) == authenticated_before
         await admin.close()
 
 

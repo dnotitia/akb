@@ -54,6 +54,8 @@ import pytest_asyncio
 
 from tests.source_scan import BACKEND as _BACKEND, enclosing_function, python_files
 
+from tests.helpers.pg_database import database_template, initialize_application_schema, temporary_database
+
 from app.exceptions import ForbiddenError
 from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 from app.repositories.vault_repo import VaultRepository
@@ -73,35 +75,24 @@ _MIRRORED_PATH = "reports/q3.md"
 _MIRRORED_BODY = "# Q3\n\nUpstream content that a public link points at.\n"
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    async with database_template(_DSN, "akb_ext_git_cascade_template_", initialize_application_schema) as template:
+        yield template
 
 
 @pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=2, max_size=10)
-    async with pool.acquire() as conn:
-        await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-    from app.db import postgres as pg_mod
-    prev = pg_mod._pool
-    pg_mod._pool = pool
-    try:
-        # `reconcile` writes events, chunks and the mirror sidecar's scheduler
-        # columns — all of which arrive by migration, not init.sql.
-        await pg_mod._apply_migrations()
-        yield pool
-    finally:
-        pg_mod._pool = prev
-        await pool.close()
+async def pool(schema_template):
+    async with temporary_database(_DSN, "akb_ext_git_cascade_", template=schema_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=2, max_size=10) as pool:
+            from app.db import postgres as pg_mod
+
+            previous_pool = pg_mod._pool
+            pg_mod._pool = pool
+            try:
+                yield pool
+            finally:
+                pg_mod._pool = previous_pool
 
 
 @pytest.fixture(autouse=True)

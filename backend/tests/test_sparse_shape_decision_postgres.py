@@ -23,9 +23,11 @@ from __future__ import annotations
 import contextlib
 import os
 import uuid
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.services.vector_store.pgvector import PgvectorStore
 from app.services.vector_store.sparse_shape_state import (
@@ -33,6 +35,7 @@ from app.services.vector_store.sparse_shape_state import (
     decide_sparse_shape,
     recorded_sparse_shape,
 )
+from tests.helpers.pg_database import TestDatabase, database_template
 
 pytestmark = pytest.mark.asyncio
 
@@ -64,7 +67,12 @@ def _dsn(server: str, database: str, *, user: str | None = None, password: str |
 
 @contextlib.asynccontextmanager
 async def _database(
-    server: str, *, plain_role: bool = False, precreate: tuple[str, ...] = (), grant_usage: bool = False
+    server: str,
+    *,
+    plain_role: bool = False,
+    precreate: tuple[str, ...] = (),
+    grant_usage: bool = False,
+    template: TestDatabase | None = None,
 ):
     """A fresh database; with `plain_role`, a connection as a non-superuser owner.
 
@@ -75,7 +83,8 @@ async def _database(
     name = f"akb_shape_{uuid.uuid4().hex[:12]}"
     role = f"akb_shape_role_{uuid.uuid4().hex[:8]}"
     password = uuid.uuid4().hex
-    await admin.execute(f'CREATE DATABASE "{name}"')
+    template_sql = f' TEMPLATE "{template.name}"' if template is not None else ""
+    await admin.execute(f'CREATE DATABASE "{name}"{template_sql}')
     try:
         if plain_role:
             await admin.execute(f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}' NOSUPERUSER")
@@ -109,6 +118,18 @@ async def _ensure(conn, shape: str) -> None:
     """Schema setup as startup runs it, for one shape."""
     async with conn.transaction():
         await PgvectorStore(dsn=None, schema=_SCHEMA, dense_dim=4, sparse_shape=shape)._do_ensure(conn)
+
+
+async def _initialize_posting(conn: asyncpg.Connection) -> None:
+    await _ensure(conn, "posting")
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def posting_template() -> AsyncIterator[TestDatabase]:
+    if not _VCHORD:
+        pytest.skip("이 서버의 DSN 이 없다 — AKB_VCHORD_TEST_DSN/AKB_TEST_DSN 을 설정할 것")
+    async with database_template(_VCHORD, "akb_shape_posting_template_", _initialize_posting) as template:
+        yield template
 
 
 async def _forget_the_record(conn) -> None:
@@ -178,10 +199,9 @@ async def test_an_extension_the_role_cannot_use_is_refused_with_the_grant():
             await decide_sparse_shape(conn, schema=_SCHEMA, configured="auto")
 
 
-async def test_an_installation_that_serves_posting_keeps_it():
+async def test_an_installation_that_serves_posting_keeps_it(posting_template):
     """The upgrade: no record, a populated posting schema, a server that could do vchord."""
-    async with _database(_VCHORD) as conn:
-        await _ensure(conn, "posting")
+    async with _database(_VCHORD, template=posting_template) as conn:
         await _put_chunk(conn)
         await _forget_the_record(conn)
         decision = await decide_sparse_shape(conn, schema=_SCHEMA, configured="auto")
@@ -201,10 +221,9 @@ async def test_an_installation_that_serves_vchord_keeps_it():
         )
 
 
-async def test_a_migration_in_progress_stays_on_posting_until_switched_explicitly():
+async def test_a_migration_in_progress_stays_on_posting_until_switched_explicitly(posting_template):
     """Both tables exist while the backfill runbook runs; the index is not the signal."""
-    async with _database(_VCHORD) as conn:
-        await _ensure(conn, "posting")
+    async with _database(_VCHORD, template=posting_template) as conn:
         await _put_chunk(conn)
         await _forget_the_record(conn)
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vchord_bm25")
@@ -220,10 +239,9 @@ async def test_a_migration_in_progress_stays_on_posting_until_switched_explicitl
         )
 
 
-async def test_a_later_auto_follows_the_last_configured_shape():
+async def test_a_later_auto_follows_the_last_configured_shape(posting_template):
     """Switching to `vchord` by setting records it; going back to `auto` keeps it."""
-    async with _database(_VCHORD) as conn:
-        await _ensure(conn, "posting")
+    async with _database(_VCHORD, template=posting_template) as conn:
         # The runbook's end state, then the explicit switch.
         await _ensure(conn, "vchord")
         assert await recorded_sparse_shape(conn, schema=_SCHEMA) == "vchord"

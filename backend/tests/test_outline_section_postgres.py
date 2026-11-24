@@ -8,8 +8,10 @@ from tests.test_event_tail_postgres import _fresh_database, _make_vault
 
 
 @pytest.mark.asyncio
-async def test_legacy_outline_filters_literal_paths_before_grouping_and_limit(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_legacy_outline_filters_literal_paths_before_grouping_and_limit(
+    monkeypatch, application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, "outline")
         async with pool.acquire() as conn:
             doc_id = await conn.fetchval(

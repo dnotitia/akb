@@ -1,7 +1,7 @@
 """Exercise cancellation and pool reuse with asyncpg's real protocol and reset.
 
 Uses AKB_VCHORD_TEST_DSN like the existing driver PostgreSQL suites. Each case
-creates a disposable database with the vocabulary fence required by retrieval.
+opens fresh sessions against a disposable database with a fixed vocabulary epoch.
 Only SQL I/O at the search-leg boundary is replaced; cancellation/reset is real.
 """
 from contextlib import asynccontextmanager
@@ -9,43 +9,47 @@ import asyncio
 import os
 import time
 import uuid
-from urllib.parse import urlsplit, urlunsplit
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.services.vector_store import VectorSearchDegraded
 from app.services.vector_store.pgvector import PgvectorStore
+from tests.helpers.pg_database import TestDatabase, database_template
 
 pytestmark = pytest.mark.asyncio
 HIT_ID = str(uuid.UUID(int=1))
 
 
-@asynccontextmanager
-async def _store(monkeypatch, *, statement_timeout=None):
+async def _initialize_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute("""
+        CREATE TABLE bm25_vocab_epoch (id integer PRIMARY KEY, epoch bigint NOT NULL);
+        INSERT INTO bm25_vocab_epoch VALUES (1, 0)
+    """)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def deadline_database() -> AsyncIterator[TestDatabase]:
     dsn = os.environ.get("AKB_VCHORD_TEST_DSN")
     if not dsn:
         pytest.skip("AKB_VCHORD_TEST_DSN is required for asyncpg cancellation coverage")
-    # The root CI database has no application tables. Keep each protocol test
-    # independent of suite ordering and of any pre-existing installation.
-    name = f"akb_search_deadline_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(dsn)
-    pool = None
+    # The vocabulary epoch is read-only here. Only the real sessions are
+    # per-test, and schema setup stays outside their tiny statement timeout.
+    async with database_template(
+        dsn, "akb_search_deadline_", _initialize_schema, required=True,
+    ) as database:
+        yield database
+
+
+@asynccontextmanager
+async def _store(monkeypatch, deadline_database: TestDatabase, *, statement_timeout=None):
+    pool = await asyncpg.create_pool(
+        deadline_database.dsn, min_size=2, max_size=2, command_timeout=30,
+        server_settings={"statement_timeout": statement_timeout} if statement_timeout else None,
+    )
     try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        test_dsn = urlunsplit(urlsplit(dsn)._replace(path=f"/{name}"))
-        # Schema setup is outside the retrieval session's deliberately tiny
-        # timeout. Slow DDL must not fail before the cancellation oracle runs.
-        setup = await asyncpg.connect(test_dsn)
-        try:
-            await setup.execute("CREATE TABLE bm25_vocab_epoch (id integer PRIMARY KEY, epoch bigint NOT NULL)")
-            await setup.execute("INSERT INTO bm25_vocab_epoch VALUES (1, 0)")
-        finally:
-            await setup.close()
-        pool = await asyncpg.create_pool(
-            test_dsn, min_size=2, max_size=2, command_timeout=30,
-            server_settings={"statement_timeout": statement_timeout} if statement_timeout else None,
-        )
         store = PgvectorStore(dsn=None, schema="vector_index", dense_dim=2, sparse_shape="vchord",
                               retrieval_timeout_secs=0.4)
 
@@ -74,12 +78,7 @@ async def _store(monkeypatch, *, statement_timeout=None):
         monkeypatch.setattr(store, "_fetch_payloads", payloads)
         yield store, pool
     finally:
-        try:
-            if pool is not None:
-                await asyncio.wait_for(pool.close(), timeout=2)
-        finally:
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-            await admin.close()
+        await asyncio.wait_for(pool.close(), timeout=2)
 
 
 async def _search(store):
@@ -100,8 +99,10 @@ async def _assert_pool_reusable(pool, original_timeout):
 
 
 @pytest.mark.parametrize("slow_leg", ["dense", "sparse"])
-async def test_pg_sleep_timeout_preserves_peer_and_resets_both_connections(monkeypatch, slow_leg):
-    async with _store(monkeypatch) as (store, pool):
+async def test_pg_sleep_timeout_preserves_peer_and_resets_both_connections(
+    monkeypatch, deadline_database, slow_leg,
+):
+    async with _store(monkeypatch, deadline_database) as (store, pool):
         async with pool.acquire() as conn:
             original_timeout = await conn.fetchval("SHOW statement_timeout")
 
@@ -120,8 +121,10 @@ async def test_pg_sleep_timeout_preserves_peer_and_resets_both_connections(monke
 
 
 @pytest.mark.parametrize("failed_leg", ["dense", "sparse"])
-async def test_connection_loss_during_timeout_setup_preserves_peer(monkeypatch, failed_leg):
-    async with _store(monkeypatch) as (store, pool):
+async def test_connection_loss_during_timeout_setup_preserves_peer(
+    monkeypatch, deadline_database, failed_leg,
+):
+    async with _store(monkeypatch, deadline_database) as (store, pool):
         async with pool.acquire() as conn:
             original_timeout = await conn.fetchval("SHOW statement_timeout")
 
@@ -154,8 +157,8 @@ async def test_connection_loss_during_timeout_setup_preserves_peer(monkeypatch, 
         assert not [t for t in asyncio.all_tasks() if t.get_name().startswith("pgvector-search-")]
 
 
-async def test_exhausted_pool_stops_before_starting_queries(monkeypatch):
-    async with _store(monkeypatch) as (store, pool):
+async def test_exhausted_pool_stops_before_starting_queries(monkeypatch, deadline_database):
+    async with _store(monkeypatch, deadline_database) as (store, pool):
         async with pool.acquire() as first, pool.acquire() as second:
             started = time.monotonic()
             with pytest.raises(VectorSearchDegraded) as caught:
@@ -166,8 +169,8 @@ async def test_exhausted_pool_stops_before_starting_queries(monkeypatch):
             assert await first.fetchval("SELECT 1") == await second.fetchval("SELECT 1") == 1
 
 
-async def test_caller_cancellation_drains_active_postgres_queries(monkeypatch):
-    async with _store(monkeypatch) as (store, pool):
+async def test_caller_cancellation_drains_active_postgres_queries(monkeypatch, deadline_database):
+    async with _store(monkeypatch, deadline_database) as (store, pool):
         async with pool.acquire() as conn:
             original_timeout = await conn.fetchval("SHOW statement_timeout")
         both_started = asyncio.Event()
@@ -210,8 +213,10 @@ class _StatsReadConnection:
         return await self.conn.fetchrow(sql, *args)
 
 
-async def test_failed_best_effort_statistics_read_does_not_abort_hybrid_transaction(monkeypatch):
-    async with _store(monkeypatch) as (store, pool):
+async def test_failed_best_effort_statistics_read_does_not_abort_hybrid_transaction(
+    monkeypatch, deadline_database,
+):
+    async with _store(monkeypatch, deadline_database) as (store, pool):
         sparse_id = str(uuid.UUID(int=3))
         async with pool.acquire() as conn:
             original_timeout = await conn.fetchval("SHOW statement_timeout")
@@ -232,8 +237,10 @@ async def test_failed_best_effort_statistics_read_does_not_abort_hybrid_transact
         await _assert_pool_reusable(pool, original_timeout)
 
 
-async def test_statistics_statement_timeout_preserves_dense_peer_and_timeout_reason(monkeypatch):
-    async with _store(monkeypatch) as (store, pool):
+async def test_statistics_statement_timeout_preserves_dense_peer_and_timeout_reason(
+    monkeypatch, deadline_database,
+):
+    async with _store(monkeypatch, deadline_database) as (store, pool):
         async with pool.acquire() as conn:
             original_timeout = await conn.fetchval("SHOW statement_timeout")
 
@@ -251,8 +258,10 @@ async def test_statistics_statement_timeout_preserves_dense_peer_and_timeout_rea
         await _assert_pool_reusable(pool, original_timeout)
 
 
-async def test_retrieval_deadline_preserves_stricter_session_statement_timeout(monkeypatch):
-    async with _store(monkeypatch, statement_timeout="10ms") as (store, pool):
+async def test_retrieval_deadline_preserves_stricter_session_statement_timeout(
+    monkeypatch, deadline_database,
+):
+    async with _store(monkeypatch, deadline_database, statement_timeout="10ms") as (store, pool):
         sparse_id = str(uuid.UUID(int=3))
 
         async def sparse(conn, **kwargs):

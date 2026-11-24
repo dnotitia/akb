@@ -2,7 +2,7 @@
 
 These talk to a real Postgres (no mocks); pgvector isn't required because
 CollectionRepository only touches `collections`, `documents`, and
-`vault_files`. The test bootstraps schema from `backend/app/db/init.sql`
+`vault_files`. The database template bootstraps schema from `backend/app/db/init.sql`
 and tears down each test's ephemeral vault.
 
 DSN comes from `AKB_TEST_DSN` (default
@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import os
 import uuid
-from pathlib import Path
 
 import asyncpg
 import pytest
 import pytest_asyncio
+
+from tests.helpers.pg_database import (
+    temporary_database,
+)
 
 from app.repositories.document_repo import CollectionRepository
 from app.repositories.vault_repo import VaultRepository
@@ -30,31 +33,11 @@ _DSN = os.environ.get(
 )
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 @pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=1, max_size=4)
-    # Apply schema. init.sql is idempotent (uses CREATE TABLE IF NOT
-    # EXISTS), so it's safe to re-run against an existing DB.
-    init_sql = (
-        Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
-    ).read_text()
-    async with pool.acquire() as conn:
-        await conn.execute(init_sql)
-    try:
-        yield pool
-    finally:
-        await pool.close()
+async def pool(base_schema_template):
+    async with temporary_database(_DSN, "akb_collection_repo_", template=base_schema_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            yield pool
 
 
 @pytest_asyncio.fixture

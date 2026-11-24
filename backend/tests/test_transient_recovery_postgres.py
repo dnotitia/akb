@@ -8,61 +8,78 @@ import asyncio
 from contextlib import asynccontextmanager
 import os
 import time
-from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 import asyncpg
 from fastapi import FastAPI
 import pytest
+import pytest_asyncio
 
 from app.exceptions import TransientDependencyError
 from app.http_middleware import CancelDisconnectedReadMiddleware, NoStorePublicSurfacesMiddleware
 from app.services.user_sql_executor import UserSqlExecutor, user_role_name
+from tests.helpers.pg_database import database_template, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
 
 
-@asynccontextmanager
-async def _runtime(*, statement_timeout="0", command_timeout=3):
+def _test_dsn():
     dsn = os.environ.get("AKB_TEST_DSN") or os.environ.get("AKB_VCHORD_TEST_DSN")
     if not dsn:
         if os.environ.get("REQUIRE_REAL_PG") == "1":
             pytest.fail("A test-cluster DSN is required")
         pytest.skip("A test-cluster DSN is required")
-    name = f"akb_transient_{uuid.uuid4().hex[:12]}"
+    return dsn
+
+
+async def _initialize(conn):
+    await conn.execute("CREATE TABLE fixture(id int PRIMARY KEY, value int NOT NULL)")
+    await conn.execute("INSERT INTO fixture VALUES (1, 0)")
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def transient_template():
+    async with database_template(
+        _test_dsn(), "akb_transient_template_", _initialize, required=True,
+    ) as template:
+        yield template
+
+
+@asynccontextmanager
+async def _runtime(template, *, statement_timeout="0", command_timeout=3):
+    dsn = _test_dsn()
     uid = uuid.uuid4()
     role = user_role_name(uid)
     admin = await asyncpg.connect(dsn)
-    pool = None
     try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        await admin.execute(f'CREATE ROLE "{role}" NOLOGIN')
-        pool = await asyncpg.create_pool(
-            urlunsplit(urlsplit(dsn)._replace(path=f"/{name}")),
-            min_size=1, max_size=1, command_timeout=command_timeout,
-            server_settings={"statement_timeout": statement_timeout},
-        )
-        async with pool.acquire() as conn:
-            await conn.execute("CREATE TABLE fixture(id int PRIMARY KEY, value int NOT NULL)")
-            await conn.execute("INSERT INTO fixture VALUES (1, 0)")
-            await conn.execute(f'GRANT USAGE ON SCHEMA public TO "{role}"')
-            await conn.execute(f'GRANT SELECT, UPDATE ON fixture TO "{role}"')
-        executor = UserSqlExecutor(pool)
-
-        async def execute(sql):
-            return await executor.execute(user_id=uid, actor_id="recovery-test", sql=sql)
-
-        yield admin, pool, name, execute
-    finally:
-        if pool is not None:
+        async with temporary_database(dsn, "akb_transient_", template=template) as database:
+            await admin.execute(f'CREATE ROLE "{role}" NOLOGIN')
+            pool = await asyncpg.create_pool(
+                database.dsn,
+                min_size=1, max_size=1, command_timeout=command_timeout,
+                server_settings={"statement_timeout": statement_timeout},
+            )
             try:
-                await asyncio.wait_for(pool.close(), 2)
-            except TimeoutError:
-                pool.terminate()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
-        await admin.close()
+                async with pool.acquire() as conn:
+                    await conn.execute(f'GRANT USAGE ON SCHEMA public TO "{role}"')
+                    await conn.execute(f'GRANT SELECT, UPDATE ON fixture TO "{role}"')
+                executor = UserSqlExecutor(pool)
+
+                async def execute(sql):
+                    return await executor.execute(user_id=uid, actor_id="recovery-test", sql=sql)
+
+                yield admin, pool, database.name, execute
+            finally:
+                try:
+                    await asyncio.wait_for(pool.close(), 2)
+                except TimeoutError:
+                    pool.terminate()
+    finally:
+        try:
+            await admin.execute(f'DROP ROLE IF EXISTS "{role}"')
+        finally:
+            await admin.close()
 
 
 async def _active(admin, database, marker):
@@ -89,8 +106,8 @@ async def _assert_clean(pool, *, value=0):
 
 
 @pytest.mark.parametrize("timeout_kind", ["statement", "command"])
-async def test_actual_deadline_rolls_back_write_and_pool_is_reusable(timeout_kind):
-    async with _runtime(statement_timeout="100ms" if timeout_kind == "statement" else "0",
+async def test_actual_deadline_rolls_back_write_and_pool_is_reusable(timeout_kind, transient_template):
+    async with _runtime(transient_template, statement_timeout="100ms" if timeout_kind == "statement" else "0",
                         command_timeout=3 if timeout_kind == "statement" else 0.1) as (_, pool, _, execute):
         started = time.monotonic()
         with pytest.raises(TransientDependencyError) as caught:
@@ -101,8 +118,8 @@ async def test_actual_deadline_rolls_back_write_and_pool_is_reusable(timeout_kin
         await _assert_clean(pool)
 
 
-async def test_actual_connection_loss_returns_transient_and_reconnects():
-    async with _runtime() as (admin, pool, database, execute):
+async def test_actual_connection_loss_returns_transient_and_reconnects(transient_template):
+    async with _runtime(transient_template) as (admin, pool, database, execute):
         marker = "connection_loss_probe"
         task = asyncio.create_task(execute(f"SELECT pg_sleep(10) /* {marker} */"))
         try:
@@ -121,8 +138,8 @@ async def test_actual_connection_loss_returns_transient_and_reconnects():
                 await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_http_read_disconnect_cancels_actual_query_and_drains_pool():
-    async with _runtime() as (admin, pool, database, execute):
+async def test_http_read_disconnect_cancels_actual_query_and_drains_pool(transient_template):
+    async with _runtime(transient_template) as (admin, pool, database, execute):
         marker = "read_disconnect_probe"
         app = FastAPI()
 
@@ -158,8 +175,8 @@ async def test_http_read_disconnect_cancels_actual_query_and_drains_pool():
                 await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_http_write_disconnect_does_not_replay_or_pretend_to_abort():
-    async with _runtime() as (admin, pool, database, execute):
+async def test_http_write_disconnect_does_not_replay_or_pretend_to_abort(transient_template):
+    async with _runtime(transient_template) as (admin, pool, database, execute):
         marker = "write_completion_probe"
         calls = []
         app = FastAPI()

@@ -7,7 +7,7 @@ from app.services.native_revision_backend import NativeRevisionBackend
 from tests.test_event_tail_postgres import _fresh_database, _make_vault
 
 
-async def test_native_activity_window_and_ties(monkeypatch):
+async def test_native_activity_window_and_ties(monkeypatch, application_schema_template):
     start = datetime(2026, 4, 1, tzinfo=UTC)
     stamp = start
 
@@ -17,7 +17,7 @@ async def test_native_activity_window_and_ties(monkeypatch):
             return stamp
 
     monkeypatch.setattr(native_revision_service, "datetime", Clock)
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "activity")
         native = native_revision_service.NativeRevisionService(pool)
         ids = []

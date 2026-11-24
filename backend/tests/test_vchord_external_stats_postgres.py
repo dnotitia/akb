@@ -10,13 +10,16 @@ import contextlib
 import os
 import uuid
 from collections import Counter
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.db.postgres import _load_migration
 from app.services import sparse_encoder
 from app.services.vector_store.pgvector import PgvectorStore
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 pytestmark = pytest.mark.asyncio
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
@@ -24,44 +27,50 @@ _VAULT = uuid.UUID(int=1)
 _OTHER = uuid.UUID(int=2)
 
 
-@contextlib.asynccontextmanager
-async def _database(monkeypatch):
+async def _initialize_schema(conn: asyncpg.Connection) -> None:
+    store = PgvectorStore(dsn=None, schema="vector_index", dense_dim=4, sparse_shape="vchord")
+    await store._do_ensure(conn)
+    version = await conn.fetchval(
+        "SELECT extversion FROM pg_extension WHERE extname='vchord_bm25'"
+    )
+    assert version == "0.3.0", "Revalidate the scoring contract on pin changes"
+    await conn.execute("""
+        CREATE SEQUENCE bm25_term_id_seq;
+        CREATE TABLE bm25_vocab (
+            term text PRIMARY KEY, term_id bigint UNIQUE NOT NULL,
+            df bigint NOT NULL DEFAULT 0,
+            updated_at timestamptz NOT NULL DEFAULT now()
+        );
+    """)
+    # The numbering the encoder reports its ids in (akb#687).
+    await _load_migration("113_bm25_vocab_epoch.py").migrate(conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template() -> AsyncIterator[TestDatabase]:
     if not _DSN:
         pytest.skip("AKB_VCHORD_TEST_DSN is required for VectorChord coverage")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_vchord_stats_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    dsn = f"{_DSN.rsplit('/', 1)[0]}/{name}"
-    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
-    try:
-        store = PgvectorStore(dsn=dsn, schema="vector_index", dense_dim=4,
-                              sparse_shape="vchord")
-        async with pool.acquire() as conn:
-            await store._do_ensure(conn)
-            version = await conn.fetchval(
-                "SELECT extversion FROM pg_extension WHERE extname='vchord_bm25'"
-            )
-            assert version == "0.3.0", "Revalidate the scoring contract on pin changes"
-            await conn.execute("""
-                CREATE SEQUENCE bm25_term_id_seq;
-                CREATE TABLE bm25_vocab (
-                    term text PRIMARY KEY, term_id bigint UNIQUE NOT NULL,
-                    df bigint NOT NULL DEFAULT 0,
-                    updated_at timestamptz NOT NULL DEFAULT now()
-                );
-            """)
-            # The numbering the encoder reports its ids in (akb#687).
-            await _load_migration("113_bm25_vocab_epoch.py").migrate(conn)
+    async with database_template(
+        _DSN, "akb_vchord_stats_template_", _initialize_schema, required=True,
+    ) as template:
+        yield template
+
+
+@contextlib.asynccontextmanager
+async def _database(monkeypatch, schema_template: TestDatabase):
+    async with (
+        temporary_database(_DSN, "akb_vchord_stats_", template=schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
+    ):
+        store = PgvectorStore(dsn=database.dsn, schema="vector_index", dense_dim=4, sparse_shape="vchord")
+
         async def get_pool():
             return pool
+
         monkeypatch.setattr(sparse_encoder, "get_pool", get_pool)
         monkeypatch.setattr(sparse_encoder.settings, "vector_store_driver", "pgvector")
         monkeypatch.setattr(sparse_encoder, "_stats_cache", None)
         yield store, pool
-    finally:
-        await pool.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 async def _put(store, conn, ordinal, content, *, vault=_VAULT, kind="document"):
@@ -128,8 +137,8 @@ async def _check(store, conn, query, *, vaults=None, kinds=None, limit=5):
     return hits
 
 
-async def test_kiwi_index_scoring_ignores_absent_and_stale_external_stats(monkeypatch):
-    async with _database(monkeypatch) as (store, pool):
+async def test_kiwi_index_scoring_ignores_absent_and_stale_external_stats(monkeypatch, schema_template):
+    async with _database(monkeypatch, schema_template) as (store, pool):
         async with pool.acquire() as conn:
             await _seed(store, conn)
             await conn.execute("SET enable_seqscan = off")
@@ -169,8 +178,8 @@ async def test_kiwi_index_scoring_ignores_absent_and_stale_external_stats(monkey
             assert "Index Scan using idx_vi_chunks_bm25" in "\n".join(r[0] for r in plan)
 
 
-async def test_built_index_insert_update_delete_and_mvcc_match_exact_oracle(monkeypatch):
-    async with _database(monkeypatch) as (store, pool):
+async def test_built_index_insert_update_delete_and_mvcc_match_exact_oracle(monkeypatch, schema_template):
+    async with _database(monkeypatch, schema_template) as (store, pool):
         async with pool.acquire() as conn, pool.acquire() as writer:
             await _seed(store, conn)
             await conn.execute("SET enable_seqscan = off")

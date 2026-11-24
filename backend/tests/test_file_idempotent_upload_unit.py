@@ -30,6 +30,8 @@ import pytest
 import pytest_asyncio
 from starlette.requests import Request
 
+from tests.helpers.pg_database import database_template, temporary_database
+
 from app.api import file_write_context
 from app.exceptions import AKBError, ConflictError
 from app.repositories import vault_files_repo
@@ -244,34 +246,11 @@ async def test_default_s3_facade_file_envelope_is_unchanged(monkeypatch):
 # ── the constraint itself, against a real Postgres ───────────────
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+async def _initialize(conn: asyncpg.Connection) -> None:
+    from app.db.postgres import _load_migration
 
-
-@pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=1, max_size=6)
-    backend_dir = Path(__file__).resolve().parents[1]
-    init_sql = (backend_dir / "app" / "db" / "init.sql").read_text()
-    async with pool.acquire() as conn:
-        await conn.execute(init_sql)
-    # `events` (migration 015) and `s3_delete_outbox` (019) are not in
-    # init.sql but are part of the confirm/cleanup contract. Idempotent.
-    #
-    # 055 and 104 join them because reserving an upload now also writes the
-    # capability that authorizes its bytes, into `m1_file_transfer_intents`
-    # and its `object_key` column. Without them the reservation raises
-    # UndefinedTable — and only when this file happens to run before whatever
-    # else creates that table, which randomized ordering makes a coin toss.
-    import importlib.util
-    for mig_name in (
+    await conn.execute((Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql").read_text())
+    for filename in (
         "015_events_outbox.py",
         "019_s3_delete_outbox.py",
         "055_native_revision_m1_file_storage.py",
@@ -280,16 +259,22 @@ async def pool():
         "079_worker_claim_lifecycle.py",
         "104_file_write_capability_key.py",
     ):
-        mig_path = backend_dir / "app" / "db" / "migrations" / mig_name
-        spec = importlib.util.spec_from_file_location(mig_name, str(mig_path))
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        async with pool.acquire() as conn:
-            await module.migrate(conn=conn)
-    try:
-        yield pool
-    finally:
-        await pool.close()
+        migration = _load_migration(filename)
+        assert migration is not None
+        await migration.migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    async with database_template(_DSN, "akb_file_upload_template_", _initialize) as template:
+        yield template
+
+
+@pytest_asyncio.fixture
+async def pool(schema_template):
+    async with temporary_database(_DSN, "akb_file_upload_", template=schema_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=6) as pool:
+            yield pool
 
 
 @pytest_asyncio.fixture

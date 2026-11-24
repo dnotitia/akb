@@ -21,8 +21,10 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.config import settings
+from tests.helpers.pg_database import database_template, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
@@ -30,13 +32,7 @@ _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb"
 _INIT_SQL_PATH = Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
 
 
-@pytest.fixture
-async def pool(monkeypatch):
-    try:
-        pg_pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=5)
-    except Exception:
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
-
+async def _initialize(conn):
     # Fresh-DB bootstrap: init.sql folds forward MOST prior migrations'
     # schema, but not all — notably NOT `vault_external_git` (010) or the
     # `events` outbox (015). Task 8's tests never exercised
@@ -45,12 +41,9 @@ async def pool(monkeypatch):
     # mirror check in `check_vault_access` unconditionally queries
     # `vault_external_git` for any writer-role check, and the guard's own
     # audit event needs `events`), so those two are applied here too.
-    async with pg_pool.acquire() as conn:
-        await conn.execute(_INIT_SQL_PATH.read_text())
+    await conn.execute(_INIT_SQL_PATH.read_text())
 
     from app.db.postgres import _load_migration
-    from app.repositories import vault_write_policy_repo
-    from app.services import access_service, auth_service, table_service
 
     for filename in (
         "010_external_git_mirror.py",
@@ -60,33 +53,43 @@ async def pool(monkeypatch):
     ):
         migration = _load_migration(filename)
         assert migration is not None
-        async with pg_pool.acquire() as conn:
-            await migration.migrate(conn=conn)
+        await migration.migrate(conn=conn)
 
-    async def _get_pool():
-        return pg_pool
 
-    # Every module resolves `get_pool` as a name bound into its own
-    # namespace at import time (`from app.db.postgres import get_pool`),
-    # so each needs its own patch target — patching only one leaves the
-    # others' conn=None fallback hitting the real (unreachable-from-here)
-    # app.db.postgres singleton pool. access_service/table_service are
-    # needed from Task 9 on (the write-policy guard + akb_sql dual
-    # enforcement live there).
-    monkeypatch.setattr(auth_service, "get_pool", _get_pool)
-    monkeypatch.setattr(vault_write_policy_repo, "get_pool", _get_pool)
-    monkeypatch.setattr(access_service, "get_pool", _get_pool)
-    monkeypatch.setattr(table_service, "get_pool", _get_pool)
-    monkeypatch.setattr(
-        settings, "system_hmac_secret", "vwp-test-secret-at-least-32-bytes-long", raising=False
-    )
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def write_policy_template():
+    async with database_template(_DSN, "akb_write_policy_template_", _initialize) as template:
+        yield template
 
-    yield pg_pool
 
-    async with pg_pool.acquire() as conn:
-        await conn.execute("DELETE FROM vaults WHERE name LIKE 'vwp-%'")
-        await conn.execute("DELETE FROM users WHERE username LIKE 'vwp-%'")
-    await pg_pool.close()
+@pytest_asyncio.fixture
+async def pool(monkeypatch, write_policy_template):
+    from app.repositories import vault_write_policy_repo
+    from app.services import access_service, auth_service, table_service
+
+    async with (
+        temporary_database(_DSN, "akb_write_policy_", template=write_policy_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=5) as pg_pool,
+    ):
+        async def _get_pool():
+            return pg_pool
+
+        # Every module resolves `get_pool` as a name bound into its own
+        # namespace at import time (`from app.db.postgres import get_pool`),
+        # so each needs its own patch target — patching only one leaves the
+        # others' conn=None fallback hitting the real (unreachable-from-here)
+        # app.db.postgres singleton pool. access_service/table_service are
+        # needed from Task 9 on (the write-policy guard + akb_sql dual
+        # enforcement live there).
+        monkeypatch.setattr(auth_service, "get_pool", _get_pool)
+        monkeypatch.setattr(vault_write_policy_repo, "get_pool", _get_pool)
+        monkeypatch.setattr(access_service, "get_pool", _get_pool)
+        monkeypatch.setattr(table_service, "get_pool", _get_pool)
+        monkeypatch.setattr(
+            settings, "system_hmac_secret", "vwp-test-secret-at-least-32-bytes-long", raising=False
+        )
+
+        yield pg_pool
 
 
 async def _create_user(pg_pool) -> uuid.UUID:

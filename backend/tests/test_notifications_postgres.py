@@ -38,8 +38,8 @@ async def inbox(conn, user, *, cursor=None, limit=20, state="all", category="all
     return await service.list_notifications(conn, user, state, cursor, limit, category)
 
 
-async def test_category_filter_precedes_pagination_and_combines_with_unread():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_category_filter_precedes_pagination_and_combines_with_unread(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, _, vault, doc = await seed(conn)
         for index in range(5):
             await queue(conn, f"category-doc-{index}", owner, vault, doc, "document.move")
@@ -69,8 +69,8 @@ async def test_category_filter_precedes_pagination_and_combines_with_unread():
         assert len(access["items"]) == 5
 
 
-async def test_category_filter_preserves_current_acl_and_safe_access_redaction():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_category_filter_preserves_current_acl_and_safe_access_redaction(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, stranger, vault, doc = await seed(conn)
         await queue(conn, "category-private", owner, vault, doc)
         await queue(conn, "category-revoked", owner, vault, None, "access.revoked", [str(reader)])
@@ -87,12 +87,12 @@ async def test_category_filter_preserves_current_acl_and_safe_access_redaction()
         assert (await inbox(conn, stranger, category="access"))["items"] == []
 
 
-async def test_read_snapshot_does_not_swallow_later_updates_or_other_users():
+async def test_read_snapshot_does_not_swallow_later_updates_or_other_users(application_schema_template):
     from app.api.routes.notifications import ReadChange, ReadSnapshot, change_read, mark_read
     from app.exceptions import AKBError
     from app.services.auth_service import AuthenticatedUser
 
-    async with _fresh_database() as pool, pool.acquire() as conn:
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, stranger, vault, doc = await seed(conn)
         user = AuthenticatedUser(user_id=str(reader), username="reader", email="reader@example.invalid",
                                  display_name=None, is_admin=False, auth_method="jwt")
@@ -120,10 +120,12 @@ async def test_read_snapshot_does_not_swallow_later_updates_or_other_users():
         assert (await inbox(conn, reader))["unread_count"] == 1
 
 
-async def test_worker_recovers_expired_claim_and_rolls_back_failed_delivery(monkeypatch):
+async def test_worker_recovers_expired_claim_and_rolls_back_failed_delivery(
+    monkeypatch, application_schema_template,
+):
     from app.services import notification_worker as worker
 
-    async with _fresh_database() as pool, pool.acquire() as conn:
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, _, vault, doc = await seed(conn)
         await queue(conn, "worker-recovery", owner, vault, doc)
         await conn.execute("UPDATE notification_work SET lease_until=now()-interval '1 minute',attempts=1")
@@ -144,8 +146,8 @@ async def test_worker_recovers_expired_claim_and_rolls_back_failed_delivery(monk
         assert not await worker.run_once()
 
 
-async def test_domain_rollback_discards_notification_work():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_domain_rollback_discards_notification_work(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, _, _, vault, doc = await seed(conn)
         with pytest.raises(RuntimeError, match="rollback"):
             async with conn.transaction():
@@ -154,8 +156,8 @@ async def test_domain_rollback_discards_notification_work():
         assert await conn.fetchval("SELECT count(*) FROM notification_work") == 0
 
 
-async def test_watch_started_during_long_domain_transaction_receives_later_enqueue():
-    async with _fresh_database() as pool, pool.acquire() as first, pool.acquire() as second:
+async def test_watch_started_during_long_domain_transaction_receives_later_enqueue(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as first, pool.acquire() as second:
         owner, reader, _, vault, doc = await seed(first)
         await first.execute("DELETE FROM notification_subscriptions WHERE user_id=$1", reader)
         async with first.transaction():
@@ -166,8 +168,8 @@ async def test_watch_started_during_long_domain_transaction_receives_later_enque
         assert (await inbox(second, reader))["unread_count"] == 1
 
 
-async def test_late_committing_lower_id_is_not_skipped_and_replay_is_idempotent():
-    async with _fresh_database() as pool, pool.acquire() as first, pool.acquire() as second:
+async def test_late_committing_lower_id_is_not_skipped_and_replay_is_idempotent(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as first, pool.acquire() as second:
         owner, reader, _, vault, doc = await seed(first)
         transaction = first.transaction()
         await transaction.start()
@@ -191,8 +193,8 @@ async def test_late_committing_lower_id_is_not_skipped_and_replay_is_idempotent(
         assert await second.fetchval("SELECT count(*) FROM notification_deliveries") == 2
 
 
-async def test_grouped_update_reopens_read_item_without_duplicate_rows():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_grouped_update_reopens_read_item_without_duplicate_rows(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, _, vault, doc = await seed(conn)
         await queue(conn, "update-1", owner, vault, doc)
         await drain(conn)
@@ -209,8 +211,10 @@ async def test_grouped_update_reopens_read_item_without_duplicate_rows():
         assert int(result["items"][0]["version"]) > int(initial["snapshot"])
 
 
-async def test_revocation_removes_content_from_list_count_but_keeps_safe_account_notice():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_revocation_removes_content_from_list_count_but_keeps_safe_account_notice(
+    application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, stranger, vault, doc = await seed(conn)
         await queue(conn, "private-update", owner, vault, doc)
         await drain(conn)
@@ -229,8 +233,10 @@ async def test_revocation_removes_content_from_list_count_but_keeps_safe_account
         assert "notify-vault" not in str(result)
 
 
-async def test_subscription_is_explicit_and_new_watchers_do_not_receive_queued_history():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_subscription_is_explicit_and_new_watchers_do_not_receive_queued_history(
+    application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, stranger, vault, doc = await seed(conn)
         await queue(conn, "before-watch", owner, vault, doc)
         await conn.execute("INSERT INTO vault_access(vault_id,user_id,role) VALUES($1,$2,'reader')", vault, stranger)
@@ -243,8 +249,8 @@ async def test_subscription_is_explicit_and_new_watchers_do_not_receive_queued_h
         assert (await inbox(conn, stranger))["unread_count"] == 1
 
 
-async def test_own_change_is_suppressed_and_subscription_survives_document_move():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_own_change_is_suppressed_and_subscription_survives_document_move(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, _, vault, doc = await seed(conn)
         await queue(conn, "own", reader, vault, doc)
         await drain(conn)
@@ -258,8 +264,8 @@ async def test_own_change_is_suppressed_and_subscription_survives_document_move(
         assert await conn.fetchval("SELECT resource_id FROM notification_subscriptions WHERE user_id=$1", reader) == doc
 
 
-async def test_deleted_document_has_safe_notice_without_stale_target():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_deleted_document_has_safe_notice_without_stale_target(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, _, vault, doc = await seed(conn)
         async with conn.transaction():
             await queue(conn, "deleted", owner, vault, doc, "document.delete")
@@ -271,8 +277,8 @@ async def test_deleted_document_has_safe_notice_without_stale_target():
         assert "Private example" not in str(items)
 
 
-async def test_pagination_returns_disjoint_pages_and_rejects_invalid_cursor():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_pagination_returns_disjoint_pages_and_rejects_invalid_cursor(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, _, vault, doc = await seed(conn)
         for index in range(5):
             await queue(conn, f"page-{index}", owner, vault, doc, "document.move")
@@ -287,8 +293,10 @@ async def test_pagination_returns_disjoint_pages_and_rejects_invalid_cursor():
             await inbox(conn, reader, cursor="not-a-cursor")
 
 
-async def test_cleanup_preserves_pending_and_failed_work_independent_of_source_events():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_cleanup_preserves_pending_and_failed_work_independent_of_source_events(
+    application_schema_template,
+):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, _, _, vault, doc = await seed(conn)
         await queue(conn, "pending", owner, vault, doc)
         await queue(conn, "failed", owner, vault, doc)
@@ -298,8 +306,8 @@ async def test_cleanup_preserves_pending_and_failed_work_independent_of_source_e
         assert await conn.fetchval("SELECT count(*) FROM notification_work") == 2
 
 
-async def test_notification_schema_is_idempotent_on_existing_install():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_notification_schema_is_idempotent_on_existing_install(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         import importlib.util
         from pathlib import Path
         path = Path(__file__).parents[1] / "app/db/migrations/099_personal_notifications.py"
