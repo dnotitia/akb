@@ -31,6 +31,7 @@ from tests.helpers.auth_database import (
     identity_operations_template as identity_operations_template,
     operation_requests_template as operation_requests_template,
 )
+from tests.helpers.file_database import file_capability_schema_template as file_capability_schema_template
 from tests.helpers.native_revision_database import (
     derived_pipeline_template as derived_pipeline_template,
     native_template as native_template,
