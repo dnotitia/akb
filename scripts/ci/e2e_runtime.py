@@ -416,7 +416,7 @@ class RuntimeConfig:
     capabilities: tuple[str, ...] = ()
     frontend_enabled: bool = False
     storage_generation: int = 0
-    suite: Literal["backend", "mcp", "frontend"] | None = None
+    suite: Literal["backend", "mcp", "frontend", "runtime"] | None = None
 
     @property
     def capability_profile(self) -> CapabilityProfile:
@@ -4831,6 +4831,9 @@ class E2ERuntime:
             },
         )
         match self.config.suite:
+            case "runtime":
+                await self._run_backend_gate()
+                await self._run_mcp_gate()
             case "backend":
                 await self._run_backend_gate()
             case "mcp":
@@ -5085,7 +5088,7 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     default_checkout = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("gate", "serve"))
-    parser.add_argument("--suite", choices=("backend", "mcp", "frontend"))
+    parser.add_argument("--suite", choices=("backend", "mcp", "frontend", "runtime"))
     parser.add_argument("--checkout", type=Path, default=default_checkout)
     parser.add_argument("--runtime-root", type=Path)
     parser.add_argument(

@@ -59,7 +59,7 @@ The suite uses the official Python SDK for authenticated product scenarios
 and checks the HTTP transport directly where the wire format matters. It also
 checks OAuth, the Node stdio proxy, and MCP Inspector over both transports.
 
-The lifecycle job runs the reset-isolation scenario. It holds an active
+The runtime job also runs the reset-isolation scenario. It holds an active
 PostgreSQL writer across reset and checks that storage is isolated while
 PostgreSQL and MinIO stay up.
 
@@ -110,7 +110,7 @@ revision and verifies that the event omits the display title in Native mode.
 
 ### Publication replica budget phase
 
-Before pytest, `gate --suite backend` runs `publication_budget_probe.py`
+Before backend pytest, the runtime and backend gates run `publication_budget_probe.py`
 against two runtime-owned API processes that share PostgreSQL. The supervisor
 starts an API-only replica, checks readiness, and holds the fixture reset lock
 until the replica acknowledges graceful shutdown. Missing setup or failures in
@@ -189,8 +189,9 @@ unchanged for the canonical local and CI paths.
 The supervisor has two modes.
 
 - `gate` starts the stack, waits for readiness, and prints the schema-v2
-  descriptor. It runs exactly one suite from `--suite backend`, `--suite mcp`,
-  or `--suite frontend`, then stops its processes and dependencies. The
+  descriptor. Select `--suite backend`, `--suite mcp`, or `--suite frontend`
+  for an individual suite. Use `--suite runtime` to run backend HTTP and MCP
+  on one stack, then stop its processes and dependencies. The
   frontend suite starts Vite automatically.
 - `serve` starts the stack and prints the ready descriptor. The stack runs
   in the foreground until SIGINT or SIGTERM. Pass `--with-frontend` to start
@@ -263,7 +264,7 @@ These before/after samples are the relevant comparison for the cache change;
 startup latency differs from the earlier three-sample run above.
 
 The E2E workflow runs the Docker-backed reset and readiness checks in the
-**AKB runtime lifecycle** job. Run those checks locally with the Node and npm
+**AKB runtime E2E** job. Run those checks locally with the Node and npm
 setup for the MCP gate.
 
 ```bash
@@ -388,7 +389,7 @@ entrypoint with a synthetic marker and verifies config removal and redaction.
 Run these commands from the repository root. Install Docker with Compose v2
 and `uv`. Prepare the Node dependencies for the suite you select.
 
-- For `mcp`, use the Node version in `.nvmrc`. Run
+- For `mcp` and `runtime`, use the Node version in `.nvmrc`. Run
   `(cd packages/akb-mcp-client && npm ci)` to install the Inspector dependency.
 - For `frontend`, use the Node and pnpm versions in `frontend/package.json`.
   Run `(cd frontend && pnpm install --frozen-lockfile && pnpm exec playwright install chromium)`.
@@ -414,6 +415,11 @@ uv run --locked --extra dev --project backend python scripts/ci/e2e_runtime.py g
 ```bash
 uv run --locked --extra dev --project backend python scripts/ci/e2e_runtime.py gate \
   --suite mcp --profile transport-oidc --runtime-root "$RUNTIME_ROOT"
+```
+
+```bash
+uv run --locked --extra dev --project backend python scripts/ci/e2e_runtime.py gate \
+  --suite runtime --profile transport-oidc --runtime-root "$RUNTIME_ROOT"
 ```
 
 ```bash
@@ -474,16 +480,15 @@ or teardown endpoints.
 
 ### GitHub Actions
 
-GitHub Actions runs each live suite in its own disposable runtime. The
-**Backend HTTP E2E** job runs `--suite backend --profile tool-only`.
-**MCP E2E** runs `--suite mcp --profile transport-oidc`.
-**Frontend E2E (real AKB)** runs `--suite frontend --profile tool-only`.
-**AKB runtime lifecycle** checks reset and readiness in a separate job.
+GitHub Actions runs reset isolation, live backend HTTP, and MCP in the
+**AKB runtime E2E** job. The HTTP and MCP suites share one stack through
+`--suite runtime --profile transport-oidc`. The job has a 30-minute budget.
 
-The workflow supplies the fixture credential environment. Each live gate
-has a 30-minute job budget. The frontend gate gives Playwright 10 minutes
-for the required browser specs that use AKB. Optional live browser specs
-can be run separately from a local checkout.
+Shard 2 of **frontend e2e** reuses the installed Playwright browser for the
+required browser smoke against AKB. It starts a disposable stack through
+`--suite frontend --profile tool-only` after running the fixture tests.
+Playwright gives the live smoke 10 minutes. Optional live browser specs can
+run separately from a local checkout.
 
 Three fixture shards run the browser specs that answer their own HTTP against
 a production build served by `vite preview`. Each fixture suite has one
@@ -499,10 +504,9 @@ suite and the Markdown reference scenario with MSW. Each mock command has a
 10-minute Playwright budget. Shard 3 has a 50-minute job budget. Shards 1
 and 2 each have a 30-minute job budget.
 
-A suite timeout fails the job. The connected frontend job uploads
-`frontend-e2e.log` on failure. Each fixture shard uploads traces and screenshots
-on failure. Shard 3 uploads its fixture results before
-running mock mode.
+A suite timeout fails the job. Shard 2 uploads the runtime logs and live
+browser results on failure. Each shard uploads its fixture traces and
+screenshots on failure before running any other browser suite.
 
 ### Clean Ubuntu 24.04 host
 
@@ -561,9 +565,9 @@ repository contribution guide before committing runtime changes.
 ## CI checks and packaging coverage
 
 Every PR runs static analysis and package tests, frontend Vitest, backend
-unit tests, live PostgreSQL tests, three live E2E suites, runtime lifecycle
-checks, three frontend fixture E2E shards with mock E2E on shard 3, and the
-Keycloak login theme check.
+unit tests, backend integration tests, AKB runtime E2E, three frontend E2E
+shards, and the Keycloak login theme check. Frontend shard 2 adds live smoke
+and shard 3 runs the mock suites.
 Application packaging is one additional **Docker images** check, rather than
 four independent image jobs.
 

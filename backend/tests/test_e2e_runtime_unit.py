@@ -1169,22 +1169,26 @@ def test_gate_events_leave_stdout_available_for_the_descriptor(capsys):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("suite", "method"), [
-    ("backend", "_run_backend_gate"),
-    ("mcp", "_run_mcp_gate"),
-    ("frontend", "_run_frontend_smoke"),
+@pytest.mark.parametrize(("suite", "methods"), [
+    ("backend", ("_run_backend_gate",)),
+    ("mcp", ("_run_mcp_gate",)),
+    ("frontend", ("_run_frontend_smoke",)),
+    ("runtime", ("_run_backend_gate", "_run_mcp_gate")),
 ])
-async def test_gate_runs_the_selected_suite(tmp_path, monkeypatch, suite, method):
+async def test_gate_runs_the_selected_suite(tmp_path, monkeypatch, suite, methods):
     runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path, mode="gate"), suite=suite))
     called = []
 
-    async def run():
-        called.append(method)
+    def record(method):
+        async def run():
+            called.append(method)
+        return run
 
     monkeypatch.setenv(SOURCE_REVISION_ENV, "d" * 40)
-    monkeypatch.setattr(runtime, method, run)
+    for method in ("_run_backend_gate", "_run_mcp_gate", "_run_frontend_smoke"):
+        monkeypatch.setattr(runtime, method, record(method))
     assert await runtime._run_gate() == 0
-    assert called == [method]
+    assert called == list(methods)
 
 
 @pytest.mark.asyncio
@@ -1760,18 +1764,20 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
     ]
 
     workflow = yaml.safe_load(WORKFLOW.read_text())
-    job = workflow["jobs"]["live-e2e"]
-    assert "services" not in job
-    suites = job["strategy"]["matrix"]["include"]
-    assert {item["suite"]: item["profile"] for item in suites} == {
-        "backend": "tool-only",
-        "mcp": "transport-oidc",
-        "frontend": "tool-only",
-        "lifecycle": "transport-proxy",
-    }
-    run = next(step["run"] for step in job["steps"] if step.get("name") == "Run selected E2E suite")
+    jobs = workflow["jobs"]
+    assert set(jobs) == {"runtime-e2e", "frontend-e2e", "keycloak-theme"}
+    job = jobs["runtime-e2e"]
+    assert "services" not in job and "strategy" not in job
+    run = next(step["run"] for step in job["steps"] if step.get("name") == "Run HTTP and MCP on the same AKB runtime")
     assert "scripts/ci/e2e_runtime.py gate" in run
-    assert '--suite "${{ matrix.suite }}"' in run
+    assert "--suite runtime --profile transport-oidc" in run
+
+    frontend = jobs["frontend-e2e"]
+    assert frontend["strategy"]["matrix"]["shard"] == [1, 2, 3]
+    steps = {step["id"]: step for step in frontend["steps"] if "id" in step}
+    assert "matrix.shard == 2" in steps["live-python"]["if"]
+    assert "--suite frontend --profile tool-only" in steps["live-browser"]["run"]
+
 
 def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     result = subprocess.run(["bash", "-n", str(BOOTSTRAP)], check=False)

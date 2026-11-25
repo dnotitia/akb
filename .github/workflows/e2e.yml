@@ -13,26 +13,10 @@ concurrency:
 jobs:
   # The locked Playwright runtime supports Ubuntu 24.04, not Ubuntu 26.04.
   # Keep browser jobs stable when ubuntu-latest advances to a new release.
-  live-e2e:
-    name: ${{ matrix.name }}
+  runtime-e2e:
+    name: AKB runtime E2E
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - suite: backend
-            name: Backend HTTP E2E
-            profile: tool-only
-          - suite: mcp
-            name: MCP E2E
-            profile: transport-oidc
-          - suite: frontend
-            name: Frontend E2E (real AKB)
-            profile: tool-only
-          - suite: lifecycle
-            name: AKB runtime lifecycle
-            profile: transport-proxy
 
     steps:
       - uses: actions/checkout@v4
@@ -43,27 +27,11 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
-      - uses: pnpm/action-setup@v4
-        if: matrix.suite == 'frontend'
-        with:
-          package_json_file: frontend/package.json
-
       - uses: actions/setup-node@v4
-        if: matrix.suite != 'backend'
         with:
           node-version: "22.23.4"
 
-      - name: Install frontend dependencies
-        if: matrix.suite == 'frontend'
-        working-directory: frontend
-        run: pnpm install --frozen-lockfile
-
-      - name: Start Playwright browser from the official image
-        if: matrix.suite == 'frontend'
-        uses: ./.github/actions/playwright-browser
-
       - name: Install stdio proxy and Inspector deps
-        if: matrix.suite == 'mcp' || matrix.suite == 'lifecycle'
         working-directory: packages/akb-mcp-client
         run: npm ci
 
@@ -80,7 +48,6 @@ jobs:
             'import sys; assert sys.version_info[:2] == (3, 14), sys.version'
 
       - name: Verify reusable reset waits for an active writer
-        if: matrix.suite == 'lifecycle'
         env:
           AKB_TEST_RESET_ISOLATION: "1"
           AKB_TEST_FAIL_ON_SKIP: "1"
@@ -89,44 +56,34 @@ jobs:
             backend/tests/test_e2e_runtime_reset_isolation.py -v --tb=short --strict-markers \
             --basetemp "$RUNNER_TEMP/akb-reset-test"
 
-      - name: Run selected E2E suite
-        if: matrix.suite != 'lifecycle'
+      - name: Run HTTP and MCP on the same AKB runtime
         env:
           AKB_TEST_FAIL_ON_SKIP: '1'
           AKB_E2E_USERNAME: akb-e2e-fixture
         run: |
           export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c 'import secrets; print(secrets.token_urlsafe(24))')"
           uv run --locked --project backend python scripts/ci/e2e_runtime.py gate \
-            --suite "${{ matrix.suite }}" \
-            --profile "${{ matrix.profile }}" \
+            --suite runtime --profile transport-oidc \
             --scenario empty \
             --checkout "$GITHUB_WORKSPACE" \
             --runtime-root "${{ runner.temp }}/akb-e2e-runtime"
-
-      - name: Upload live browser traces on failure
-        if: failure() && matrix.suite == 'frontend'
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-live-e2e-results
-          path: frontend/test-results
-          if-no-files-found: ignore
 
       - name: Upload repository runtime logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: akb-e2e-${{ matrix.suite }}-logs
+          name: akb-runtime-e2e-logs
           path: |
             ${{ runner.temp }}/akb-e2e-runtime/logs
             ${{ runner.temp }}/akb-reset-test/*/runtime/logs
           if-no-files-found: ignore
 
-  frontend-fixture-e2e:
+  frontend-e2e:
     name: frontend e2e (${{ matrix.shard }}/3)
     runs-on: ubuntu-24.04
     # The specs that answer their own HTTP need no backend. They run against a
     # production build, one test at a time per job, split across shards.
-    # Shard 3 also runs two mock commands with a 10-minute budget each.
+    # Shard 2 reuses Chromium for live browser smoke. Shard 3 runs two mock commands.
     timeout-minutes: ${{ matrix.shard == 3 && 50 || 30 }}
     strategy:
       fail-fast: false
@@ -167,6 +124,41 @@ jobs:
           name: frontend-fixture-e2e-results-${{ matrix.shard }}
           path: frontend/test-results
           retention-days: 7
+          if-no-files-found: ignore
+
+      # Playwright clears test-results when the next suite starts.
+      - uses: actions/setup-python@v5
+        id: live-python
+        if: ${{ !cancelled() && matrix.shard == 2 && steps.browser.outcome == 'success' }}
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v6
+        id: live-uv
+        if: ${{ !cancelled() && steps.live-python.outcome == 'success' }}
+
+      - name: Run browser smoke against real AKB
+        id: live-browser
+        if: ${{ !cancelled() && steps.live-uv.outcome == 'success' }}
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/akb-e2e-python
+          AKB_E2E_USERNAME: akb-e2e-fixture
+        run: |
+          AKB_E2E_PASSWORD="$(uv run --locked --extra dev --project backend python -c 'import secrets; print(secrets.token_urlsafe(24))')"
+          export AKB_E2E_PASSWORD
+          uv run --locked --project backend python scripts/ci/e2e_runtime.py gate \
+            --suite frontend --profile tool-only --scenario empty \
+            --checkout "$GITHUB_WORKSPACE" \
+            --runtime-root "$RUNNER_TEMP/akb-e2e-runtime"
+
+      - name: Upload live browser traces and runtime logs on failure
+        if: ${{ failure() && steps.live-browser.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-live-e2e-results
+          path: |
+            frontend/test-results
+            ${{ runner.temp }}/akb-e2e-runtime/logs
           if-no-files-found: ignore
 
       # Run mock mode even if fixture tests fail. Upload the fixture results
