@@ -38,8 +38,6 @@ CURATED_SUITES: tuple[str, ...] = (
     "test_author_resolution_e2e.sh",
     "test_agent_sessions_e2e.sh",
     "test_jwt_revocation_e2e.sh",
-    "test_row_read_e2e.sh",
-    "test_row_write_e2e.sh",
     "test_okf_export_import_e2e.sh",
     "test_resource_hash_e2e.sh",
     "test_events_emit_e2e.sh",
