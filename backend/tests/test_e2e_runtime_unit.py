@@ -37,28 +37,13 @@ from e2e_runtime import (  # noqa: E402
     terminate_process,
 )
 import e2e_runtime  # noqa: E402
-from e2e_gate_observability import (  # noqa: E402
-    EVENT_PREFIX,
-    emit_gate_event,
-    shell_exit_code,
-    signal_from_returncode,
-)
-import e2e_suite_runner  # noqa: E402
-from e2e_suite_runner import (  # noqa: E402
-    CURATED_SUITES,
-    DEFERRED_SUITE_GROUPS,
-    DeferredSuiteGroup,
-    SuiteResult,
-    parse_assertion_summary,
-    validate_suite_manifest,
-)
+from e2e_gate_observability import EVENT_PREFIX, emit_gate_event  # noqa: E402
 from fixture_control import create_app  # noqa: E402
 
 
 COMPOSE_FILE = CI_DIR / "dependency-compose.yaml"
 BOOTSTRAP = CI_DIR / "ubuntu_e2e_bootstrap.sh"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e.yml"
-LOCAL_CANONICAL_RUNNER = REPO_ROOT / "scripts" / "run_canonical_e2e.sh"
 
 
 def test_stdio_sample_image_fixture_is_a_small_decodable_png() -> None:
@@ -282,7 +267,6 @@ def test_runtime_assets_live_in_repository_common_layer():
     for name in (
         "e2e_runtime.py",
         "e2e_backend.py",
-        "e2e_suite_runner.py",
         "fixture_control.py",
         "oidc_fixture.py",
         "embed_stub.py",
@@ -1113,14 +1097,10 @@ def test_legacy_noop_release_fixture_has_fresh_and_exact_source_plans():
 def test_suite_sql_uses_compose_psql_by_default_and_preserves_override(tmp_path, monkeypatch):
     runtime = E2ERuntime(make_config(tmp_path))
     assert runtime._child_environment()["PYTHONFAULTHANDLER"] == "1"
-    monkeypatch.delenv("AKB_PG_EXEC", raising=False)
     child_env = runtime._child_environment()
-    assert child_env["AKB_PG_EXEC"].endswith("exec -T postgres")
     assert child_env["AKB_E2E_POSTGRES_PORT"] == "15432"
     assert child_env["AKB_E2E_MINIO_PORT"] == "9000"
 
-    monkeypatch.setenv("AKB_PG_EXEC", "custom-pg-command")
-    assert runtime._child_environment()["AKB_PG_EXEC"] == "custom-pg-command"
 
 
 def test_runtime_uses_selected_dependency_ports_consistently(tmp_path):
@@ -1178,169 +1158,61 @@ def test_runtime_configures_local_auth_mode_keys_and_distinct_app_token_secret(t
     assert secret_config["app_token_secret"] != secret_config["system_hmac_secret"]
 
 
-def test_suite_summary_uses_last_complete_line_and_fails_closed():
-    output = "Results: 1 passed, 0 failed\nnoise\nResults: 3 passed, 1 failed\n"
-    assert parse_assertion_summary(output) == (3, 1, "Results: 3 passed, 1 failed")
-    assert parse_assertion_summary("Results: 5 passed") is None
-    assert SuiteResult("suite.sh", 0, 0, 0, None, "").gate_failed
-    assert SuiteResult("suite.sh", 0, 2, 0, "Results: 2 passed, 0 failed", "").gate_failed is False
-    assert SuiteResult("suite.sh", -4, 0, 0, None, "").signal == 4
-    assert len(CURATED_SUITES) == 7
-
-
-def test_shell_e2e_manifest_classifies_every_suite_exactly_once():
-    assert validate_suite_manifest(REPO_ROOT) == ()
-    discovered = {
-        path.name for path in (REPO_ROOT / "backend" / "tests").glob("*_e2e.sh")
-    }
-    deferred = {
-        suite for group in DEFERRED_SUITE_GROUPS for suite in group.suites
-    }
-    assert discovered == set(CURATED_SUITES) | deferred
-    assert set(CURATED_SUITES).isdisjoint(deferred)
-
-
-def test_shell_e2e_manifest_reports_unclassified_overlap_and_missing(
-    tmp_path, monkeypatch
-):
-    tests_dir = tmp_path / "backend" / "tests"
-    tests_dir.mkdir(parents=True)
-    for name in ("test_run_e2e.sh", "test_defer_e2e.sh", "test_new_e2e.sh"):
-        (tests_dir / name).touch()
-
-    monkeypatch.setattr(
-        e2e_suite_runner,
-        "CURATED_SUITES",
-        ("test_run_e2e.sh", "test_overlap_e2e.sh"),
-    )
-    monkeypatch.setattr(
-        e2e_suite_runner,
-        "DEFERRED_SUITE_GROUPS",
-        (
-            DeferredSuiteGroup(
-                reason="fixture",
-                suites=("test_defer_e2e.sh", "test_overlap_e2e.sh"),
-            ),
-        ),
-    )
-
-    errors = validate_suite_manifest(tmp_path)
-    assert any(
-        "unclassified E2E suites" in error and "test_new_e2e.sh" in error
-        for error in errors
-    )
-    assert any(
-        "both curated and deferred" in error and "test_overlap_e2e.sh" in error
-        for error in errors
-    )
-    assert any(
-        "without a matching suite file" in error and "test_overlap_e2e.sh" in error
-        for error in errors
-    )
-
-
-def test_gate_events_are_safe_and_shell_signal_aware(capsys):
-    emit_gate_event(
-        {
-            "event": "suite_complete",
-            "process": "suite_runner",
-            "suite": "test_publications_e2e.sh",
-            "returncode": -4,
-            "passed": 0,
-            "failed": 0,
-            "summary": None,
-            "signal": 4,
-        }
-    )
+def test_gate_events_leave_stdout_available_for_the_descriptor(capsys):
+    emit_gate_event({"event": "gate_start", "process": "supervisor", "suite": "mcp"})
 
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.startswith(EVENT_PREFIX)
-    stderr_event = json.loads(captured.err[len(EVENT_PREFIX) :])
-    assert stderr_event["suite"] == "test_publications_e2e.sh"
-    assert stderr_event["signal"] == 4
-    assert signal_from_returncode(-4) == 4
-    assert shell_exit_code(-4) == 132
-    assert "external-password-value" not in captured.err
-
-
-def test_suite_runner_emits_suite_and_gate_events(monkeypatch, capsys):
-    monkeypatch.setattr(e2e_suite_runner, "CURATED_SUITES", ("test_fake.sh",))
-    monkeypatch.setattr(e2e_suite_runner, "check_suite_manifest", lambda _repo_root: 0)
-    monkeypatch.setattr(
-        e2e_suite_runner,
-        "run_suite",
-        lambda *_args, **_kwargs: SuiteResult(
-            "test_fake.sh", 0, 2, 0, "Results: 2 passed, 0 failed", ""
-        ),
-    )
-    assert e2e_suite_runner.run_curated(REPO_ROOT) == 0
-
-    events = [
-        json.loads(line[len(EVENT_PREFIX) :])
-        for line in capsys.readouterr().err.splitlines()
-        if line.startswith(EVENT_PREFIX)
-    ]
-    assert [event["event"] for event in events] == [
-        "suite_start",
-        "suite_complete",
-        "gate_complete",
-    ]
-    assert events[1]["suite"] == "test_fake.sh"
-    assert events[1]["summary"] == "Results: 2 passed, 0 failed"
-    assert events[2]["passed"] == 2
+    event = json.loads(captured.err[len(EVENT_PREFIX):])
+    assert event["suite"] == "mcp"
 
 
 @pytest.mark.asyncio
-async def test_gate_child_stdout_is_private_and_stderr_is_inherited(tmp_path, capfd, monkeypatch):
+@pytest.mark.parametrize(("suite", "method"), [
+    ("backend", "_run_backend_gate"),
+    ("mcp", "_run_mcp_gate"),
+    ("frontend", "_run_frontend_smoke"),
+])
+async def test_gate_runs_the_selected_suite(tmp_path, monkeypatch, suite, method):
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path, mode="gate"), suite=suite))
+    called = []
+
+    async def run():
+        called.append(method)
+
     monkeypatch.setenv(SOURCE_REVISION_ENV, "d" * 40)
-    checkout = tmp_path / "checkout"
-    suite_path = checkout / "scripts" / "ci" / "e2e_suite_runner.py"
-    suite_path.parent.mkdir(parents=True)
-    suite_path.write_text(
-        "import sys\n"
-        "print('credential-looking suite output')\n"
-        "print('AKB_E2E_GATE {\"event\":\"suite_complete\","
-        "\"suite\":\"test_fake.sh\",\"returncode\":132}', file=sys.stderr)\n",
-        encoding="utf-8",
-    )
-    mcp_pytest_path = checkout / "backend" / "tests" / "mcp_e2e"
-    mcp_pytest_path.mkdir(parents=True)
-    (mcp_pytest_path / "conftest.py").write_text(
-        "def pytest_addoption(parser):\n"
-        "    parser.addoption('--runtime-descriptor')\n",
-        encoding="utf-8",
-    )
-    (mcp_pytest_path / "test_fake.py").write_text(
-        "def test_fake():\n"
-        "    pass\n",
-        encoding="utf-8",
-    )
-    config = RuntimeConfig(
-        checkout=checkout,
-        runtime_root=tmp_path / "runtime",
-        mode="gate",
-        compose_file=COMPOSE_FILE,
-        compose_project="akb-e2e-io-unit",
-    )
-    prepare_private_runtime_root(config.runtime_root)
-    runtime = E2ERuntime(config)
-
-    phase_called = []
-
-    async def fake_publication_phase():
-        phase_called.append(True)
-
-    runtime._run_publication_budget_check = fake_publication_phase
+    monkeypatch.setattr(runtime, method, run)
     assert await runtime._run_gate() == 0
-    assert phase_called == [True]
+    assert called == [method]
 
-    captured = capfd.readouterr()
-    gate_log = (config.logs_dir / "gate.log").read_text(encoding="utf-8")
-    assert "credential-looking suite output" in gate_log
-    assert "credential-looking suite output" not in captured.err
-    assert '"event":"suite_complete"' in captured.err
-    assert '"returncode":132' in captured.err
+
+@pytest.mark.asyncio
+async def test_gate_stop_terminates_child_and_keeps_its_output_private(tmp_path, capfd, monkeypatch):
+    runtime = E2ERuntime(make_config(tmp_path, mode="gate"))
+    log_path = runtime.config.logs_dir / "stopped-gate.log"
+
+    async def run():
+        return await runtime._run_logged_command(
+            [sys.executable, "-c", "import time; print('private test output', flush=True); time.sleep(60)"],
+            log_path=log_path,
+        )
+
+    monkeypatch.setattr(runtime, "_run_gate", run)
+    gate = asyncio.create_task(runtime._run_gate_until_stopped())
+    try:
+        async with asyncio.timeout(5):
+            while not log_path.exists() or not log_path.read_text():
+                await asyncio.sleep(0.01)
+        runtime.request_stop()
+        assert await asyncio.wait_for(gate, 5) == 130
+    finally:
+        gate.cancel()
+        await asyncio.gather(gate, return_exceptions=True)
+
+    assert not runtime._active_commands
+    assert "private test output" in log_path.read_text()
+    assert "private test output" not in capfd.readouterr().out
 
 
 @pytest.mark.asyncio
@@ -1887,19 +1759,19 @@ def test_compose_and_hosted_workflow_preserve_the_live_topology():
         "${AKB_E2E_MINIO_PORT:-9000}:9000"
     ]
 
-    workflow = WORKFLOW.read_text()
-    assert "scripts/ci/e2e_runtime.py gate" in workflow
-    assert "--scenario empty" in workflow
-    assert "app-installation-lifecycle" in (CI_DIR / "e2e_runtime.py").read_text()
-    assert "uv sync --locked --extra dev --project backend" in workflow
-    assert "services:" not in workflow
-    for suite in CURATED_SUITES:
-        assert suite not in workflow
-    assert "akb-e2e-runtime-logs" in workflow
-
-    local_runner = LOCAL_CANONICAL_RUNNER.read_text()
-    assert "scripts/ci/e2e_suite_runner.py" in local_runner
-    assert "SUITES=(" not in local_runner
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    job = workflow["jobs"]["live-e2e"]
+    assert "services" not in job
+    suites = job["strategy"]["matrix"]["include"]
+    assert {item["suite"]: item["profile"] for item in suites} == {
+        "backend": "tool-only",
+        "mcp": "transport-oidc",
+        "frontend": "tool-only",
+        "lifecycle": "transport-proxy",
+    }
+    run = next(step["run"] for step in job["steps"] if step.get("name") == "Run selected E2E suite")
+    assert "scripts/ci/e2e_runtime.py gate" in run
+    assert '--suite "${{ matrix.suite }}"' in run
 
 def test_ubuntu_bootstrap_is_bash_safe_and_keeps_descriptor_stdout_clean():
     result = subprocess.run(["bash", "-n", str(BOOTSTRAP)], check=False)
@@ -3042,7 +2914,7 @@ async def test_supervisor_distinguishes_intentional_stop_from_unexpected_child_e
 
 @pytest.mark.asyncio
 async def test_publication_phase_failure_prevents_later_gate_suites(tmp_path, monkeypatch):
-    runtime = E2ERuntime(make_config(tmp_path, mode="gate"))
+    runtime = E2ERuntime(dataclasses.replace(make_config(tmp_path, mode="gate"), suite="backend"))
     monkeypatch.setenv(SOURCE_REVISION_ENV, "d" * 40)
 
     async def fail():

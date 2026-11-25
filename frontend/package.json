@@ -20,10 +20,10 @@
     "test:watch": "vitest",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit",
-    "test:e2e": "AKB_FE_E2E_MODE=real playwright test",
     "test:e2e:mock": "AKB_FE_E2E_MODE=mock playwright test",
     "test:e2e:fixture": "AKB_FE_E2E_MODE=fixture playwright test",
-    "test:e2e:real": "AKB_FE_E2E_MODE=real playwright test",
+    "test:e2e:real": "AKB_FE_E2E_MODE=real playwright test --project=chromium",
+    "test:e2e:real:optional": "AKB_FE_E2E_MODE=real playwright test --project=chromium-live-optional",
     "theme:tokens": "node keycloak-theme/scripts/theme-tokens.mjs",
     "theme:assemble": "node keycloak-theme/scripts/assemble.mjs",
     "theme:harness": "keycloak-theme/harness/run.sh"

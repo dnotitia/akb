@@ -93,8 +93,8 @@ Two supported paths:
 
 1. Build + push + apply (mechanism depends on the target cluster).
 2. Verify pods: `kubectl get pods -n <ns>`.
-3. Run E2E against the deployed URL:
-   `AKB_URL=https://<your-host> bash backend/tests/test_mcp_e2e.sh`.
+3. Run the [read-only MCP transport smoke](scripts/ci/README.md#deployed-mcp-transport-smoke)
+   against the deployed URL with a fixture PAT.
 
 ### Deploy checklist (proxy changes)
 
@@ -111,20 +111,16 @@ Two supported paths:
 
 ## Testing
 
-The endpoint-driven suites, isolated repository-owned runtime, and optional
-Ubuntu host bootstrap are documented in
-[`scripts/ci/README.md`](scripts/ci/README.md).
+Read the [test runtime guide](scripts/ci/README.md) when running or changing
+backend integration tests, live E2E suites, or the Ubuntu host bootstrap.
 
-- The canonical gate and setup commands live in [scripts/ci/README.md](scripts/ci/README.md).
-- `backend/tests/mcp_e2e/` covers authenticated MCP product behavior through
-  the Python SDK; `test_detail_e2e.py` includes exact-text editing, OCC,
-  Unicode, graph and replacement regressions.
-- Shell suites retain transport, REST, PostgreSQL ACL and local-file
-  boundaries. `test_mcp_e2e.sh` is a transport boundary suite, not the full
-  product gate. Do not substitute it for the SDK suite.
-- Use the repository-owned isolated runtime for the complete gate. Tests
-  create ephemeral data; follow its cleanup contract rather than targeting
-  an unrelated installation.
+- `backend/tests/rest_integration/` exercises REST and MCP through the app in
+  process with real PostgreSQL. Run it with the live PostgreSQL tests.
+- `backend/tests/runtime_e2e/` exercises backend boundaries that require a live
+  server or external storage. `backend/tests/mcp_e2e/` exercises MCP against a
+  live server, including the stdio proxy and transport contracts.
+- Run live E2E with the repository-owned isolated runtime. Use a disposable
+  endpoint when a test creates fixtures outside that runtime.
 
 ## Key Conventions
 

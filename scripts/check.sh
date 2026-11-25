@@ -211,12 +211,6 @@ if [ "${#missing_installs[@]}" -ne 0 ]; then
 fi
 echo "  node deps present in ${#node_projects[@]} node projects"
 
-# ─── E2E suite manifest ───────────────────────────────────────────
-# Fails fast when a new shell E2E suite is neither run by the hosted gate nor
-# deliberately deferred with a reviewed reason.
-step "E2E suite manifest"
-python scripts/ci/e2e_suite_runner.py --check-manifest --repo-root "${REPO_ROOT}"
-
 # ─── coding-agent roles ────────────────────────────────────────────
 # .codex/ and .claude/ are rendered from .agents/roles.toml so both agents
 # read one contract. A hand edit to a rendered file, or a source edit without

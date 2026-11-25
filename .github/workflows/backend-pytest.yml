@@ -38,10 +38,10 @@ jobs:
 
       - name: Run unit tests
         working-directory: backend
-        run: pytest tests/ --ignore=tests/mcp_e2e --strict-markers -m 'not live_services and not needs_resource' -v --tb=short
+        run: pytest tests/ --ignore=tests/mcp_e2e --ignore=tests/runtime_e2e --strict-markers -m 'not live_services and not needs_resource' -v --tb=short
 
   pgvector-e2e:
-    # Tests that use PostgreSQL, the BM25 extension, or Redis declare
+    # Tests that use PostgreSQL, the BM25 extension, Redis, or MinIO declare
     # live_services. The PostgreSQL image makes pgvector available so tests
     # can exercise extension creation on a fresh database.
     #
@@ -51,7 +51,7 @@ jobs:
     # trigger is a startup concurrency race a single-threaded test can't
     # recreate (see backend/CHANGELOG.md 0.8.3). That case is covered by
     # a deploy-time reset-cycle check, not here.
-    name: Backend integration tests (PostgreSQL + Redis)
+    name: Backend integration tests
     runs-on: ubuntu-latest
     env:
       AKB_TEST_FAIL_ON_SKIP: '1'
@@ -214,4 +214,4 @@ jobs:
         # triggers, row locks, rollback and cancellation, the catalog after a
         # migration. A fake agrees with whatever SQL it is handed, so those
         # claims are only checked here.
-        run: pytest tests/ --ignore=tests/mcp_e2e --strict-markers -m 'live_services and not needs_resource' -v --tb=short
+        run: pytest tests/ --ignore=tests/mcp_e2e --ignore=tests/runtime_e2e --strict-markers -m 'live_services and not needs_resource' -v --tb=short

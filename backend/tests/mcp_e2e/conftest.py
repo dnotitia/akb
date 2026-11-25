@@ -18,6 +18,11 @@ import pytest
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
+from tests.helpers.required_outcomes import (
+    pytest_make_collect_report as pytest_make_collect_report,
+    pytest_runtest_makereport as pytest_runtest_makereport,
+)
+
 from .runtime import RuntimeContext, RuntimeDescriptor, RuntimeSetupError, redact_error
 
 

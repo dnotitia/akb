@@ -11,7 +11,7 @@ from mcp import Client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from .runtime import RuntimeContext
-from .test_product_e2e import _call_json, _create_vault, _text_content
+from .tools import _call_json, _create_vault, _text_content
 
 
 async def test_file_inputs_preserve_metadata_and_original_read_protection(

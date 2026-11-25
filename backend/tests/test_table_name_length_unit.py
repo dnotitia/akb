@@ -168,12 +168,8 @@ async def test_create_table_still_refuses_a_table_name_over_the_limit(monkeypatc
     theirs, it is what `pg_short_name` hands back as `sql_name`, and one
     longer than any identifier can be is a mistake they can fix.
 
-    This was found by CI, not here: `tests/test_mcp_e2e.sh` asserts a
-    70-character name comes back `invalid_argument`, and removing the
-    composed-length check removed the only thing refusing it — because the
-    other two length checks in this module guard constraint and index
-    names, not the table's. A local sweep grepping for the message text
-    missed it; the shell suite asserts the error CODE.
+    The MCP product integration suite checks that a 70-character table
+    name returns invalid_argument through the tool interface.
     """
     vault_name = "short"
     table_name = "a" * 70

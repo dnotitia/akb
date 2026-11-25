@@ -1,6 +1,6 @@
 """Mandatory real-worker rollout recovery and current job authority proof.
 
-The shared runtime owns reset, credentials and disposable audit history.
+The runtime starts the real rollout worker and owns disposable audit history.
 """
 
 from __future__ import annotations
@@ -8,14 +8,14 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import os
 import time
 import uuid
 
 import httpx
 import pytest
 
-from .conftest import _prepare_secondary_user
-from .runtime import RuntimeContext
+from .fixtures import Actor
 
 _CAPABILITIES = ["installation:read", "inventory:read", "rollout:read", "rollout:request"]
 
@@ -65,14 +65,19 @@ def _poll(client, path, field, terminal):
 
 
 @pytest.fixture
-def rollout_clients(runtime_session: RuntimeContext):
-    origin = runtime_session.descriptor.app_origin
-    _name, owner, _secrets = _prepare_secondary_user(runtime_session)
-    admin = runtime_session.pat
+async def rollout_member(create_actor) -> Actor:
+    return await create_actor("rollout-authority")
+
+
+@pytest.fixture
+def rollout_clients(api_origin: str, rollout_member: Actor):
+    admin = os.environ.get("AKB_E2E_PAT")
+    if not admin:
+        pytest.fail("The backend runtime must provide an administrator PAT")
     with (
-        httpx.Client(base_url=origin, headers={"Authorization": "Bearer " + owner}, trust_env=False, timeout=30) as member,
-        httpx.Client(base_url=origin, headers={"Authorization": "Bearer " + admin}, trust_env=False, timeout=30) as operator,
-        httpx.Client(base_url=origin, trust_env=False, timeout=30) as app,
+        httpx.Client(base_url=api_origin, headers=rollout_member.headers, trust_env=False, timeout=30) as member,
+        httpx.Client(base_url=api_origin, headers={"Authorization": "Bearer " + admin}, trust_env=False, timeout=30) as operator,
+        httpx.Client(base_url=api_origin, trust_env=False, timeout=30) as app,
     ):
         assert _ok(member.get("/api/v1/auth/me"))["is_admin"] is False
         assert _ok(operator.get("/api/v1/auth/me"))["is_admin"] is True

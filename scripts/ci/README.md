@@ -1,8 +1,7 @@
 # Repository-owned E2E test runtime
 
-This document is the source of truth for AKB's endpoint-driven E2E suites, the
-isolated repository-owned runtime used by hosted CI, and the optional clean
-Ubuntu 24.04 host bootstrap. It describes repository behavior only.
+This guide covers backend pytest, the isolated runtime for live E2E, and how
+to prepare an Ubuntu 24.04 host for the runtime.
 
 ## Backend pytest jobs
 
@@ -10,213 +9,136 @@ The unit job runs tests that need neither the live CI services nor extra setup.
 It includes the repository runtime contract tests.
 
 Use `pytestmark = pytest.mark.live_services` when a whole module uses
-PostgreSQL, the BM25 extension, or Redis from the live-PG job. In a mixed
+PostgreSQL, the BM25 extension, Redis, or MinIO from the integration job. In a mixed
 module, add `@pytest.mark.live_services` to each test that uses those services.
 For extra setup, use `@pytest.mark.needs_resource("resource and how to provide it")`.
 Both jobs exclude tests marked `needs_resource`. The live-PG job runs the
 exclusive role-prune test separately, before other tests create managed roles.
 
-Both jobs exclude `backend/tests/mcp_e2e`. The repository-owned runtime runs
-that suite. Both jobs reject unregistered markers, skips during collection,
-and skips and expected failures for selected tests.
+The backend integration job runs `backend/tests/rest_integration/`. These tests
+call the REST and MCP routes in process through ASGI and use disposable
+databases on real PostgreSQL. They cover product behavior such as document
+edits and idempotency, browse and search filters, activity, and table schemas.
+
+Both jobs exclude `backend/tests/runtime_e2e/` and `backend/tests/mcp_e2e/`.
+The isolated runtime runs those suites. The unit and live PostgreSQL jobs
+reject unregistered markers, skips during collection, and skips and expected
+failures for selected tests.
 
 Run the unit selection locally from `backend/`. The deployment contract tests
 need Helm, `kubectl`, and Docker Compose.
 
 ```bash
-AKB_TEST_FAIL_ON_SKIP=1 pytest tests/ --ignore=tests/mcp_e2e --strict-markers \
+AKB_TEST_FAIL_ON_SKIP=1 uv run --locked --extra dev python -m pytest tests/ \
+  --ignore=tests/mcp_e2e --ignore=tests/runtime_e2e --strict-markers \
   -m 'not live_services and not needs_resource'
 ```
 
-## Three layers
-
-### 1. Endpoint-driven E2E suites
-
-The shell suites under `backend/tests/` are HTTP clients. They target the
-endpoint in `AKB_URL` (defaulting in each suite to `http://localhost:8000`),
-create ephemeral users/vaults, and clean up their own data. They do not need to
-know whether the endpoint is a normal local Compose backend, a deployed
-backend, or the repository-owned runtime backend.
-
-Run one suite against a reachable endpoint:
+To run the in-process API suite locally, point `AKB_TEST_DSN` at a disposable
+PostgreSQL instance with pgvector. The test connection must be able to create
+and drop databases and roles. Set `AKB_TEST_S3_ENDPOINT` to a disposable MinIO
+instance for the publication tests. Run this from `backend/`.
 
 ```bash
-AKB_URL=http://localhost:8000 bash backend/tests/test_mcp_e2e.sh
-AKB_URL=http://localhost:8000 bash backend/tests/test_publications_e2e.sh
+REQUIRE_REAL_PG=1 AKB_TEST_FAIL_ON_SKIP=1 uv run --locked --extra dev \
+  python -m pytest tests/rest_integration --strict-markers -m live_services
 ```
 
-The Event Tail suite also supports an authorized disposable Native endpoint:
+The [backend pytest workflow](../../.github/workflows/backend-pytest.yml)
+shows the extra services and environment variables for the full integration job.
+
+## Live E2E suites
+
+The backend gate runs `backend/tests/runtime_e2e/`. Its tests use a live HTTP
+server, PostgreSQL, and S3-compatible storage for checks such as streaming
+responses, PostgreSQL role enforcement, file byte round-trips, and
+rollout recovery through the background worker.
+
+The MCP gate runs `backend/tests/mcp_e2e/` against a running AKB backend.
+The suite uses the official Python SDK for authenticated product scenarios
+and checks the HTTP transport directly where the wire format matters. It also
+checks OAuth, the Node stdio proxy, and MCP Inspector over both transports.
+
+The lifecycle job runs the reset-isolation scenario. It holds an active
+PostgreSQL writer across reset and checks that storage is isolated while
+PostgreSQL and MinIO stay up.
+
+The frontend gate starts the web app and runs the required Playwright tests
+against the running AKB backend. Its Vite proxy forwards `/api` and `/mcp`
+to that backend.
+
+### Deployed MCP transport smoke
+
+Run the read-only MCP transport smoke from the repository root. Set `AKB_URL`
+to the deployed origin and export `AKB_E2E_PAT` from your credential manager.
+Use a PAT for a fixture account. For an endpoint with a private certificate
+authority, set `AKB_E2E_CA_FILE` to its CA bundle.
+
+```bash
+AKB_URL=https://akb.example.com uv run --locked --extra dev --project backend \
+  python -m pytest backend/tests/mcp_e2e/test_transport_e2e.py \
+  --confcutdir=backend/tests/mcp_e2e
+```
+
+The smoke checks authentication, protocol negotiation, and tool discovery
+with the fixture account.
+
+### Event Tail on a disposable endpoint
+
+Use an authorized disposable endpoint for Event Tail. The tests create users
+and Vaults, write data, and open real HTTP event streams. Set
+`AKB_EVENT_TAIL_EXPECT_NATIVE=1` to require the PostgreSQL Native revision
+fields. The repository runtime exercises Bare Git by default.
 
 ```bash
 AKB_URL=http://localhost:8000 AKB_EVENT_TAIL_EXPECT_NATIVE=1 \
-  bash backend/tests/test_event_tail_e2e.sh
+  uv run --locked --extra dev --project backend python -m pytest \
+  backend/tests/runtime_e2e/test_event_tail.py \
+  --confcutdir=backend/tests/runtime_e2e
 ```
 
-For an SSO-only test endpoint, export `AKB_EVENT_TAIL_TOKEN` and
-`AKB_EVENT_TAIL_OTHER_TOKEN` through your credential manager before running
-that command. Supply both or neither. The first fixture user must be able to
-create/delete disposable Vaults; the second must not have access to them. With
-neither token the suite creates its usual local test users. These are fixture
-credentials, not a way to bypass the endpoint's authentication policy.
+For an SSO-only endpoint, export both `AKB_EVENT_TAIL_TOKEN` and
+`AKB_EVENT_TAIL_OTHER_TOKEN` through your credential manager. The first fixture
+user must be able to create and delete disposable Vaults. The second must
+lack access to those Vaults. Leave both variables unset to have the tests
+register local fixture users.
 
-`AKB_EVENT_TAIL_EXPECT_NATIVE=1` requires Native resource/revision fields and
-their title-free payload contract; the default retains the explicitly Legacy
-repository runtime. The oracle checks the successful write receipt's Vault,
-URI, path and opaque revision, not display titles. A live connection observes
-its initial heartbeat before writing, rather than sleeping and assuming the
-connection has opened. On failure, the suite log retains bounded structural
-JSON (frame counts, validity and field-presence flags). Raw captures, content,
-titles, tokens, cursors, identities and resource paths are not printed and the
-private temporary captures are removed on exit.
-
-The shared curated gate is implemented by
-`scripts/ci/e2e_suite_runner.py`. `CURATED_SUITES` is the executable
-list, while `DEFERRED_SUITE_GROUPS` is the explicit opt-out list with reviewed
-reasons. Every `backend/tests/*_e2e.sh` file must appear in exactly one side of
-that manifest. The static check and the live gate both fail when a suite is
-unclassified, duplicated, overlaps both sides, or no longer exists.
-
-Validate the manifest without starting any services:
-
-```bash
-python scripts/ci/e2e_suite_runner.py --check-manifest
-```
-
-The runner is fail-closed. Each suite must finish successfully and provide a
-complete `Results: N passed, M failed` line. A missing summary, a non-zero
-suite return code, any failed assertion, or an unexpected zero-count suite
-fails the gate. `EMPTY_COUNT_ALLOWED` is intentionally empty. Hosted CI,
-the isolated runtime, and `scripts/run_canonical_e2e.sh` all execute this same
-runner, so there is no second suite array to keep synchronized.
+The tests check replay, cursor resume, and access restrictions. The live
+check waits for the first heartbeat before writing a document, then compares
+the event to the write receipt. It checks the Vault, URI, path, and opaque
+revision and verifies that the event omits the display title in Native mode.
 
 ### Publication replica budget phase
 
-Before the MCP/shell suites, every isolated `gate` runs
-`publication_budget_probe.py` against two distinct runtime-owned API processes
-sharing PostgreSQL. The supervisor starts an API-only replica, checks readiness,
-and holds the fixture reset lock until that replica has acknowledged graceful
-shutdown. Missing setup or failed startup, assertions, replacement or drain fail
-the gate; there are no optional credentials or single-origin fallbacks.
+Before pytest, `gate --suite backend` runs `publication_budget_probe.py`
+against two runtime-owned API processes that share PostgreSQL. The supervisor
+starts an API-only replica, checks readiness, and holds the fixture reset lock
+until the replica acknowledges graceful shutdown. Missing setup or failures in
+startup, assertions, replacement, or drain fail the gate.
 
 Five required groups check publication-wide attempts distributed 16/15 between
 processes, concurrent admission, correct-password refunds at both boundaries,
-actual replica process replacement with unchanged storage and retained backoff
-escalation, and a deliberately held budget row lock. Contention must return 503
-for both anonymous and manager password attempts while valid-token access and
-another publication continue to work; releasing the lock restores access.
+replica replacement with unchanged storage and retained backoff escalation,
+and a held budget row lock. Contention must return 503 for anonymous and manager
+password attempts while valid-token access and another publication still work.
+Releasing the lock restores access.
 Completion evidence records routing counts, statuses, PID/launch identities and
-storage generation, never passwords or tokens. Replacement reuses the same
-port and database without a fixture reset. The replica is drained before any
-MCP fixture reset or shell suite starts; failure leaves the fixture unavailable
-and retains process ownership for cleanup.
+storage generation. Replacement reuses the same port and database without
+a fixture reset. The supervisor drains the replica before pytest starts. On
+failure it keeps the fixture unavailable and retains the process for cleanup.
 
 The live-PG CI lane additionally requires `test_publication_budget_postgres.py`
 for atomic counters, decay, bounded state, deletion/expiry and contention.
 Migration 116 must be installed before serving the new API. A rolling upgrade
 has installation-wide protection only after every old API replica is replaced.
 
-### MCP pytest behavior suite
+### Run focused MCP tests with a descriptor
 
-The authenticated MCP behavior suite runs through the official Python SDK.
-`test_list_vaults_e2e.py` remains the small typed `akb_list_vaults({})`
-canary, while `test_product_e2e.py` covers the baseline product scenarios and
-`test_detail_e2e.py` covers the migrated detailed regressions: exact-text edit,
-body hash/OCC, collection boundaries, Unicode search, graph link/unlink, grep
-replacement, and ownership transfer. `test_publication_okf_e2e.py` covers
-detailed publication lifecycle and public-resolution oracles, the MCP-only
-move regression, and OKF export/import round-trips with their writer boundary.
-The baseline suite covers vault and document lifecycle, browse/search/
-drill-down, move and aliases, relations/activity/history/diff, access roles
-and public levels, tables/SQL/DDL, basic publication, help, and deletion.
-Each pytest test receives the existing fixture's reset/login/SDK lifecycle;
-scenarios that need role boundaries add a second user through the same
-authenticated endpoint and client lifecycle.
-The HTTP fixture uses the SDK's public `Client` and Streamable HTTP transport
-in the pytest process. `test_document_file_input_e2e.py` additionally owns a
-short-lived SDK stdio client of the checkout's proxy against that same isolated
-backend. It requires a supported Node runtime on PATH (CI uses `.nvmrc`), even
-when running the complete pytest suite against a `tool-only` runtime. It does
-not start another backend or database, and closes the proxy before fixture reset.
-This file-input boundary checks the served schema, metadata-only/null updates,
-empty-file replacement and both revision/hash conflict predicates. No Inspector
-or alternate MCP driver is involved.
-
-`test_document_idempotency_e2e.py` exercises the unsupported retry-key contract
-through authenticated HTTP MCP and REST in the same mandatory Bare Git runtime
-gate. It checks advertised lack of support, explicit rejection without writes,
-and unchanged keyless behavior. Native receipt interchange, concurrency and
-response-loss oracles run separately in the live-PG lane through
-`test_document_idempotency_postgres.py`.
-
-`test_table_schema_e2e.py` checks the real table and Vault schema HTTP responses
-against the same runtime's served OpenAPI contract after create, alter, and
-migration, including replay of the same migration key. These six cases run in
-the mandatory pytest gate with the shared descriptor/reset/PAT lifecycle;
-missing runtime setup fails preparation rather than skipping coverage. To run
-only these cases against a repository-owned `serve` runtime, use the pytest
-command below with `backend/tests/mcp_e2e/test_table_schema_e2e.py` as the test
-path and keep `--confcutdir=backend/tests/mcp_e2e` and `--runtime-descriptor`.
-
-`test_graph_catalog_e2e.py` checks provenance, orphan membership and titles,
-link/unlink/move/delete identity, MCP results and actual Reader/Outsider access
-through the same mandatory runtime fixture lifecycle. It creates its secondary
-users in the disposable fixture and does not skip ACL checks for missing PATs.
-The selected runtime backend is exercised through HTTP; Native catalog paging,
-concurrent edits and stable endpoint identity are additionally checked by
-`test_graph_native_catalog_pg.py` and `test_native_graph_resource_identity_pg.py`
-in the live-PG job.
-
-`test_adoption_vault_delete_e2e.py` requires planned, applied and blocked
-adoption deletion through HTTP, with a non-admin owner, Reader and system
-operator. It checks denied deletion, retained UUIDs, same-name recreation and
-rejected replay through the same reset/PAT fixtures. The live-PG adoption suite
-also checks upgrade retention and both deletion/adoption lock orders. Apply
-commits each target separately: a deleted later target returns 409 after earlier
-live targets may have committed; read the retained plan to inspect partial progress.
-
-`test_rollout_authority_e2e.py` requires one- and two-installation recovery
-through the real worker, with a non-admin owner and registry operator. A NULL
-canary makes a real NOT NULL migration fail; authorized row repair and resume
-must preserve the source job, checksum, grant and data. The cases also cover
-original-request replay while blocked, denial of new requests without active
-authority, credential rotation/revocation and denial of historical reads/replays
-after uninstall even when an unrelated installation becomes active. They use
-the mandatory descriptor/reset/PAT lifecycle without optional credentials.
-
-`test_read_capacity_e2e.py` requires six real HTTP checks for counted and
-schema-only catalogs, page/sentinel ordering, exact and filtered count-only
-requests, row CAS, index/schema compatibility, and Reader/Outsider ACLs.
-Each case uses the descriptor/reset lifecycle and mints a real non-admin owner;
-ACL actors are also created through the isolated API, with no optional PATs or
-endpoint variables. Live-PG tests separately verify that schema-only catalogs
-never call row counting and both fresh/existing Tables receive the page index.
-
-The detailed security suite also covers declarative table constraints and
-indexes, stable permission envelopes, private-document and graph boundaries,
-SQL failure-state integrity, and PAT write scopes. The PG-native ACL backstops
-remain in `test_pg_rbac_e2e.sh` and `test_vault_scope_sql_e2e.sh`; the retained
-shell security suite keeps only REST, health, and role-source checks plus the
-MCP setup calls needed to seed those REST assertions.
-
-The mixed shell suites retain only their non-migrated boundaries: transport and
-protocol/session checks, direct REST comparisons and ACLs, file byte hashes,
-and SQL/cross-vault checks. Their migrated MCP product assertions and unused
-raw JSON-RPC helpers were removed so each detailed MCP behavior has one
-SDK-based execution path. MCP setup calls that seed data for a retained REST
-or SQL check remain. The separate stdio/Inspector boundaries remain in their
-existing lanes.
-
-The repository runtime remains the owner of backend startup, readiness,
-fixture reset, credentials, and teardown. Give the same schema-v2 descriptor
-to the local and hosted command through stdin:
-
-```bash
-uv run --locked --extra dev --project backend python -m pytest \
-  backend/tests/mcp_e2e -v --tb=short \
-  --confcutdir=backend/tests/mcp_e2e --runtime-descriptor -
-```
-
-To consume a descriptor file instead, pass its path to the same option:
+Reuse a running stack by passing the ready schema-v2 descriptor from `serve`
+to pytest. Use `--profile transport-oidc` for
+`serve` when running the full MCP selection. The descriptor supplies the app
+and fixture origins, reset and discovery operations, and the fixture credential
+variable names. Keep those environment variables exported in the pytest shell.
 
 ```bash
 uv run --locked --extra dev --project backend python -m pytest \
@@ -225,15 +147,12 @@ uv run --locked --extra dev --project backend python -m pytest \
   --runtime-descriptor /path/to/descriptor.json
 ```
 
-The descriptor must come from `scripts/ci/e2e_runtime.py serve` or the
-Ubuntu bootstrap. The fixture consumes the descriptor's app/fixture origins,
-health and reset operations, discovery-declared credential environment names,
-and the existing `empty` reset contract. A normal descriptor does not create
-another backend, database, port topology, or credential fixture. The native
-catalog benchmark launcher is documented in `eval/mcp-catalog/README.md` and
-composes this runtime through its CLI and descriptor contract.
+Replace the suite directory in the first argument with a test file or node ID
+to run a smaller selection. Pass `--runtime-descriptor -` to read the descriptor
+from stdin. Run one consumer at a time against a runtime whose fixtures it can
+reset.
 
-### 2. Repository-owned isolated runtime
+## Repository-owned isolated runtime
 
 The runtime supervisor is `e2e_runtime.py`. It owns the test infrastructure
 around AKB and keeps state outside the checkout. Its private runtime root
@@ -251,10 +170,9 @@ The topology is deliberately small:
 | MinIO | dependency Compose | digest-pinned [`docker.io/dappros/minio`](#minio-image-provenance) (RELEASE.2025-09-07T16-13-09Z), `127.0.0.1:9000` by default | S3-compatible file storage |
 | embedding stub | Ubuntu host process | `127.0.0.1:8888` | deterministic `/v1/embeddings` responses |
 | backend | Ubuntu host process | `127.0.0.1:8000` | AKB application under test |
-| frontend (`--with-frontend`) | Ubuntu host process | `127.0.0.1:3000` by default | existing Vite SPA and per-run backend proxy |
+| frontend | Ubuntu host process | `127.0.0.1:3000` by default | Vite app with a proxy to the current run's backend |
 | fixture control | supervisor-owned in-process app | `127.0.0.1:8889` | health, discovery, and isolated scenario reset |
-| MCP pytest behavior suite | Ubuntu host process | no public listener | authenticated MCP product scenarios through the official Python SDK |
-| curated suite runner | Ubuntu host process | no public listener | curated shell gate and count semantics |
+| test suite | Ubuntu host process | no public listener | pytest or Playwright for the selected gate |
 
 Only PostgreSQL and MinIO are managed by
 `scripts/ci/dependency-compose.yaml`. The root `docker-compose.yaml`
@@ -268,17 +186,15 @@ supervisor passes those exact values to Compose, generated AKB configuration,
 readiness probes, and fixture database/S3 clients; the defaults above remain
 unchanged for the canonical local and CI paths.
 
-The supervisor has two modes:
+The supervisor has two modes.
 
-- `gate`: starts dependencies, fixture control, embedding stub, and backend;
-  waits for readiness; prints the schema v2 descriptor; runs the shared
-  pytest behavior scenario and curated suite runner; then stops child
-  processes and dependency resources.
-- `serve`: starts the same stack, prints the ready descriptor, and remains in
-  the foreground until SIGINT/SIGTERM. Pass `--with-frontend` to also start
-  the existing frontend package's `pnpm run dev` contract on `--frontend-port`
-  (default `3000`), with its `/api` and `/mcp` proxy pointed at this run's
-  backend origin. The fixture's
+- `gate` starts the stack, waits for readiness, and prints the schema-v2
+  descriptor. It runs exactly one suite from `--suite backend`, `--suite mcp`,
+  or `--suite frontend`, then stops its processes and dependencies. The
+  frontend suite starts Vite automatically.
+- `serve` starts the stack and prints the ready descriptor. The stack runs
+  in the foreground until SIGINT or SIGTERM. Pass `--with-frontend` to start
+  Vite on `--frontend-port` (default `3000`). The fixture's
   `POST /reset` reuses PostgreSQL, MinIO, their volumes/network, and the
   embedding process. It closes fixture-control admission and stops stdio, then
   asks the backend to stop accepting requests and claiming new worker work.
@@ -346,10 +262,12 @@ preparation plus five resets, supervisor bcrypt calls fell from six to one.
 These before/after samples are the relevant comparison for the cache change;
 startup latency differs from the earlier three-sample run above.
 
-The E2E workflow also runs the Docker-backed reset regression explicitly:
+The E2E workflow runs the Docker-backed reset and readiness checks in the
+**AKB runtime lifecycle** job. Run those checks locally with the Node and npm
+setup for the MCP gate.
 
 ```bash
-AKB_TEST_RESET_ISOLATION=1 uv run --locked --project backend python -m pytest \
+AKB_TEST_RESET_ISOLATION=1 uv run --locked --extra dev --project backend python -m pytest \
   backend/tests/test_e2e_runtime_reset_isolation.py -v --tb=short
 ```
 
@@ -416,12 +334,11 @@ name `AKB_FRONTEND_URL`, and the backend proxy target. This keeps the web
 address, readiness check, and API connection source-neutral while preserving
 the existing `app` and `fixture` services.
 
-`gate` runs the curated shell suites and Python MCP SDK tests against the
-same runtime for every profile. Profiles with stdio also probe `tools/list`
-and a read-only `tools/call` through the real proxy and run the Inspector
-smoke over HTTP and stdio. The standalone client package tests (`npm test`)
-run in `scripts/check.sh`. Provisioning failures and live product-assertion
-failures are emitted as separate gate events.
+The MCP gate with the `transport-oidc` profile also probes `tools/list` and a
+read-only `tools/call` through the real proxy. It runs the Inspector smoke
+over HTTP and stdio. `scripts/check.sh` runs the standalone client package
+tests. The supervisor reports provisioning failures and test failures as
+separate gate events.
 
 ### MCP Inspector consumer smoke
 
@@ -466,54 +383,69 @@ cleanup. The PAT is not placed in argv, logs, command output, reports, or
 uploaded artifacts. The focused package regression exercises the same public
 entrypoint with a synthetic marker and verifies config removal and redaction.
 
-For a direct local gate, use the uv-managed Python environment to generate
-per-run values and export them without placing a credential value in the
-command line or repository files:
+### Run a live suite
+
+Run these commands from the repository root. Install Docker with Compose v2
+and `uv`. Prepare the Node dependencies for the suite you select.
+
+- For `mcp`, use the Node version in `.nvmrc`. Run
+  `(cd packages/akb-mcp-client && npm ci)` to install the Inspector dependency.
+- For `frontend`, use the Node and pnpm versions in `frontend/package.json`.
+  Run `(cd frontend && pnpm install --frozen-lockfile && pnpm exec playwright install chromium)`.
+
+Generate private fixture credentials and name a directory for the runtime logs.
+Use a fresh directory for each run.
 
 ```bash
-uv sync --locked --extra dev --project backend
-(cd packages/akb-mcp-client && npm ci)
 RUNTIME_ROOT="$(mktemp -d /tmp/akb-e2e-runtime.XXXXXX)"
 export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
   'import secrets; print(f"akb-e2e-{secrets.token_hex(8)}")')"
 export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c \
   'import secrets; print(secrets.token_urlsafe(24))')"
-uv run --locked --project backend python \
-  scripts/ci/e2e_runtime.py gate \
-  --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
-unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
 ```
 
-To run the existing frontend against that isolated backend, install the
-frontend's locked dependencies first, then use the public `serve` entrypoint:
+Run one of the following commands for the suite you want to check.
 
 ```bash
-(cd frontend && pnpm install --frozen-lockfile)
-RUNTIME_ROOT="$(mktemp -d /tmp/akb-fe-runtime.XXXXXX)"
-export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
-  'import secrets; print(f"akb-fe-{secrets.token_hex(8)}")')"
-export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c \
-  'import secrets; print(secrets.token_urlsafe(24))')"
-uv run --locked --project backend python \
-  scripts/ci/e2e_runtime.py serve \
-  --with-frontend --frontend-port 3000 \
-  --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
+uv run --locked --extra dev --project backend python scripts/ci/e2e_runtime.py gate \
+  --suite backend --profile tool-only --runtime-root "$RUNTIME_ROOT"
 ```
 
-The first stdout line containing the ready schema-v2 JSON is the public
-descriptor. Set `AKB_FRONTEND_URL` to its `services.web.origin` when running
-the existing browser smoke (`cd frontend && pnpm run test:e2e:real`). Stop
-the foreground command with SIGINT/SIGTERM; the supervisor then cleans the
-frontend, backend, embedding process, fixture control, and dependency Compose
-resources for that run only.
+```bash
+uv run --locked --extra dev --project backend python scripts/ci/e2e_runtime.py gate \
+  --suite mcp --profile transport-oidc --runtime-root "$RUNTIME_ROOT"
+```
 
-On gate completion or SIGINT/SIGTERM, the supervisor stops its child
-processes and dependency Compose resources. It intentionally leaves the
-private runtime root and logs for inspection; the caller removes the
-explicit temporary root after collecting logs. No credential value is written
-to the descriptor, logs, argv, or committed files.
+```bash
+uv run --locked --extra dev --project backend python scripts/ci/e2e_runtime.py gate \
+  --suite frontend --profile tool-only --runtime-root "$RUNTIME_ROOT"
+```
 
-### 3. Optional Ubuntu 24.04 environment bootstrap
+The supervisor stops its processes and dependency containers when the gate
+ends. It leaves the private runtime root and logs for inspection. Remove the
+root after collecting the logs and unset `AKB_E2E_USERNAME` and
+`AKB_E2E_PASSWORD` in your shell.
+
+### Keep a runtime running
+
+Set up the per-run credentials and runtime root as for a live gate. Run `serve`
+to keep the backend available for a second terminal. Pass `--with-frontend`
+after installing the frontend dependencies if you need the web app.
+
+```bash
+uv run --locked --extra dev --project backend python scripts/ci/e2e_runtime.py serve \
+  --with-frontend --frontend-port 3000 --runtime-root "$RUNTIME_ROOT" \
+  > "$RUNTIME_ROOT/descriptor.json"
+```
+
+The descriptor file contains one JSON line when the runtime is ready. Use its
+`services.web.origin` as `AKB_FRONTEND_URL` for
+`(cd frontend && pnpm run test:e2e:real)`. To run the opt-in browser tests,
+use `(cd frontend && pnpm run test:e2e:real:optional)` with the same URL and
+any fixture credentials required by those tests. Send SIGINT or SIGTERM to
+stop the runtime and clean up its processes and dependencies.
+
+## Optional Ubuntu 24.04 environment bootstrap
 
 `ubuntu_e2e_bootstrap.sh` is an optional host-preparation wrapper. It does not
 contain runtime lifecycle logic. On a clean Ubuntu 24.04 host it:
@@ -527,9 +459,11 @@ contain runtime lifecycle logic. On a clean Ubuntu 24.04 host it:
    version, then installs the locked MCP client test dependencies when the
    selected profile or capability includes stdio;
 4. installs and starts Docker Engine plus Compose v2 idempotently;
-5. installs/verifies `uv` and Python 3.14 under the private runtime root;
-6. runs `uv sync --locked --extra dev --project backend`; and
-7. `exec`s the same Python supervisor in `gate` or `serve` mode.
+5. installs and verifies `uv` and Python 3.14 under the private runtime root;
+6. runs `uv sync --locked --extra dev --project backend`;
+7. installs the pinned pnpm and frontend dependencies for `--suite frontend`
+   or `--with-frontend`; and
+8. starts the same Python supervisor in `gate` or `serve` mode.
 
 Package, network, Docker, uv, and Python failures are provisioning failures
 and stop immediately with an actionable stderr message. The bootstrap does
@@ -538,45 +472,18 @@ or teardown endpoints.
 
 ## Environment-specific flows
 
-### Normal local development
-
-The root Compose stack is the default contributor path:
-
-```bash
-docker compose up -d
-AKB_URL=http://localhost:8000 bash backend/tests/test_mcp_e2e.sh
-```
-
-Use any individual suite against the running backend. This path uses the
-normal root Compose services and is independent of the isolated runtime.
-
 ### GitHub Actions
 
-The **AKB runtime E2E** job shares one isolated AKB stack across the shell
-transport, REST, and PostgreSQL ACL suites, the Python MCP SDK suite with
-its stdio proxy file checks, and the connected browser smoke. The job first
-checks that a fixture reset waits for an active writer. With its
-dependencies installed, it calls the runtime supervisor directly:
+GitHub Actions runs each live suite in its own disposable runtime. The
+**Backend HTTP E2E** job runs `--suite backend --profile tool-only`.
+**MCP E2E** runs `--suite mcp --profile transport-oidc`.
+**Frontend E2E (real AKB)** runs `--suite frontend --profile tool-only`.
+**AKB runtime lifecycle** checks reset and readiness in a separate job.
 
-```bash
-uv sync --locked --extra dev --project backend
-uv run --locked --project backend python \
-  scripts/ci/e2e_runtime.py gate \
-  --with-frontend \
-  --profile transport-oidc \
-  --scenario empty \
-  --checkout "$GITHUB_WORKSPACE" \
-  --runtime-root "${RUNNER_TEMP}/akb-e2e-runtime"
-```
-
-The workflow supplies the fixture credential environment and the PostgreSQL
-execution command without exposing credential values to the descriptor or
-runtime files. The curated list and assertion-count behavior come from the
-shared suite runner, not from duplicated workflow shell steps.
-
-The connected browser suite covers `smoke.spec.ts` and any opt-in live specs.
-The runtime job has a 30-minute budget and gives Playwright 10 minutes.
-Preparation and the API suites took 11-15 minutes in recent runs.
+The workflow supplies the fixture credential environment. Each live gate
+has a 30-minute job budget. The frontend gate gives Playwright 10 minutes
+for the required browser specs that use AKB. Optional live browser specs
+can be run separately from a local checkout.
 
 Three fixture shards run the browser specs that answer their own HTTP against
 a production build served by `vite preview`. Each fixture suite has one
@@ -592,9 +499,9 @@ suite and the Markdown reference scenario with MSW. Each mock command has a
 10-minute Playwright budget. Shard 3 has a 50-minute job budget. Shards 1
 and 2 each have a 30-minute job budget.
 
-A suite timeout fails the job. The runtime job keeps its browser diagnostics
-in `frontend-e2e.log` within its failure artifacts. Each fixture shard uploads
-traces and screenshots on failure. Shard 3 uploads its fixture results before
+A suite timeout fails the job. The connected frontend job uploads
+`frontend-e2e.log` on failure. Each fixture shard uploads traces and screenshots
+on failure. Shard 3 uploads its fixture results before
 running mock mode.
 
 ### Clean Ubuntu 24.04 host
@@ -610,7 +517,7 @@ following guards make that requirement explicit without assuming a system
 : "${AKB_E2E_USERNAME:?inject a private per-run username before bootstrap}"
 : "${AKB_E2E_PASSWORD:?inject a private per-run password before bootstrap}"
 bash scripts/ci/ubuntu_e2e_bootstrap.sh gate \
-  --scenario empty --checkout "$PWD"
+  --suite backend --profile tool-only --scenario empty --checkout "$PWD"
 
 : "${AKB_E2E_USERNAME:?inject a private per-run username before bootstrap}"
 : "${AKB_E2E_PASSWORD:?inject a private per-run password before bootstrap}"
@@ -631,22 +538,22 @@ network activity so VPN paths can recover from black-holed packet sizes.
 
 ## Runtime change checklist
 
-When changing this area, preserve all of the following:
+Preserve these contracts when changing the runtime.
 
-- endpoint-driven suites continue to use `AKB_URL`;
-- dependency Compose remains limited to pgvector/PostgreSQL and pinned MinIO;
-- backend, embedding stub, fixture control, and suite runner remain host-side
-  processes;
-- Python `>=3.14` and `backend/uv.lock` are used with `uv sync --locked`;
-- the suite manifest and fail-closed assertion-count semantics remain shared;
-- the optional frontend process uses an explicit `--with-frontend` flag, an
-  isolated `--frontend-port`, and the run's backend origin for Vite proxying;
-- descriptor stdout stays parseable as one schema v2 JSON line; and
-- fixture reset acknowledges backend drain before reusing PostgreSQL/MinIO,
-  fences SQL admission, publishes phase evidence, and fails closed; and
-- the catalog benchmark's four cell runtimes remain isolated, with parallel
-  cells and serial mutable-state trials inside each cell; and
-- runtime state stays private and outside the checkout.
+- The live HTTP tests use `AKB_URL`.
+- Dependency Compose runs PostgreSQL with pgvector and pinned MinIO. The
+  backend, embedding stub, fixture control, and tests run on the host.
+- Use Python 3.14 and install dependencies from `backend/uv.lock`.
+- Each `gate` invocation selects one suite and fails on test errors.
+- `gate --suite frontend` starts Vite. `serve` starts Vite with
+  `--with-frontend`. Both use the selected `--frontend-port` and forward API
+  requests to the run's backend.
+- Stdout contains one schema-v2 JSON descriptor.
+- Fixture reset acknowledges backend drain before reusing PostgreSQL and
+  MinIO. It closes SQL admission, reports each phase, and fails closed.
+- The catalog benchmark runs each of its four cells in isolation. Cells can
+  run in parallel, and trials that mutate state in one cell run in sequence.
+- Runtime state stays private and outside the checkout.
 
 Run the focused runtime tests and the static checks described in the
 repository contribution guide before committing runtime changes.
@@ -654,8 +561,8 @@ repository contribution guide before committing runtime changes.
 ## CI checks and packaging coverage
 
 Every PR runs static analysis and package tests, frontend Vitest, backend
-unit tests, live PostgreSQL tests, AKB runtime E2E,
-three frontend fixture E2E shards with mock E2E on shard 3, and the
+unit tests, live PostgreSQL tests, three live E2E suites, runtime lifecycle
+checks, three frontend fixture E2E shards with mock E2E on shard 3, and the
 Keycloak login theme check.
 Application packaging is one additional **Docker images** check, rather than
 four independent image jobs.

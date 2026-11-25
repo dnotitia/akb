@@ -1,7 +1,7 @@
 """Unit test: doc_service.get_at_commit reads body from a specific commit."""
 
 # Test focuses on the strip-frontmatter + commit-pinning logic.
-# Full git integration is covered by e2e (test_mcp_e2e.sh's akb_get version).
+# The MCP product integration suite exercises akb_get with a recorded version.
 
 
 def test_get_at_commit_strips_frontmatter():

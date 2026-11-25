@@ -27,7 +27,6 @@ import logging
 import os
 import re
 import secrets
-import shlex
 import shutil
 import signal
 import socket
@@ -43,7 +42,6 @@ from urllib.request import Request, urlopen
 
 from e2e_gate_observability import (
     emit_gate_event,
-    shell_exit_code,
 )
 from fixture_control import create_app
 from oidc_fixture import OIDCFixture
@@ -418,6 +416,7 @@ class RuntimeConfig:
     capabilities: tuple[str, ...] = ()
     frontend_enabled: bool = False
     storage_generation: int = 0
+    suite: Literal["backend", "mcp", "frontend"] | None = None
 
     @property
     def capability_profile(self) -> CapabilityProfile:
@@ -650,7 +649,6 @@ class E2ERuntime:
         self._reset_task: asyncio.Task[Any] | None = None
         self._fixture_server: Any | None = None
         self._fixture_task: asyncio.Task[Any] | None = None
-        self._suite_process: ManagedProcess | None = None
         self._stop_event = asyncio.Event()
         self._reset_lock = asyncio.Lock()
         self._resetting = False
@@ -1875,7 +1873,6 @@ class E2ERuntime:
             self.config.backend_dir / "pyproject.toml",
             self.config.runtime_scripts_dir / "embed_stub.py",
             self.config.runtime_scripts_dir / "e2e_backend.py",
-            self.config.runtime_scripts_dir / "e2e_suite_runner.py",
         )
         if self.profile.needs_stdio:
             required += (
@@ -1988,22 +1985,6 @@ class E2ERuntime:
         env["AKB_URL"] = self.config.app_origin
         env["AKB_E2E_POSTGRES_PORT"] = str(self.config.postgres_port)
         env["AKB_E2E_MINIO_PORT"] = str(self.config.minio_port)
-        if not env.get("AKB_PG_EXEC"):
-            env["AKB_PG_EXEC"] = shlex.join(
-                [
-                    os.environ.get("AKB_DOCKER_BIN", "docker"),
-                    "compose",
-                    "--project-name",
-                    self.config.compose_project,
-                    "--file",
-                    str(self.config.compose_file),
-                    "exec",
-                    "-T",
-                    "postgres",
-                ]
-            )
-        env.setdefault("AKB_PG_USER", "akb")
-        env.setdefault("AKB_PG_DB", "akb")
         if overrides:
             env.update(overrides)
         return env
@@ -4838,29 +4819,55 @@ class E2ERuntime:
                              "returncode": 0, "checks": 5, "evidence": evidence})
 
     async def _run_gate(self) -> int:
-        import httpx
-
-        suite_path = self.config.runtime_scripts_dir / "e2e_suite_runner.py"
-        mcp_pytest_path = self.config.checkout / "backend" / "tests" / "mcp_e2e"
-        log_path = self.config.logs_dir / "gate.log"
         emit_gate_event(
             {
                 "event": "gate_start",
                 "process": "supervisor",
-                "suite_runner": str(suite_path),
-                "gate_log": str(log_path),
+                "suite": self.config.suite,
                 "stage": "product_assertion",
                 "profile": self.profile.name,
                 "capabilities": list(self.selected_capabilities),
                 "source_revision": self._source_revision(),
             },
         )
+        match self.config.suite:
+            case "backend":
+                await self._run_backend_gate()
+            case "mcp":
+                await self._run_mcp_gate()
+            case "frontend":
+                await self._run_frontend_smoke()
+            case _:
+                raise ProvisioningFailure("gate requires a test suite")
+        return 0
+
+    async def _run_backend_gate(self) -> None:
+        import httpx
 
         try:
             await self._run_publication_budget_check()
         except (AssertionError, TimeoutError, httpx.HTTPError) as exc:
             raise ProductAssertionFailure("publication replica budget check failed") from exc
 
+        suite = self.config.backend_dir / "tests" / "runtime_e2e"
+        database_url = f"postgresql://akb:akb@127.0.0.1:{self.config.postgres_port}/akb"  # pragma: allowlist secret
+        try:
+            await self._run_logged_command(
+                [
+                    sys.executable, "-m", "pytest", str(suite), "-v", "--tb=short",
+                    "--strict-markers", "--confcutdir", str(suite),
+                ],
+                log_path=self.config.logs_dir / "backend-pytest.log",
+                environment={
+                    "AKB_E2E_DATABASE_URL": database_url,
+                    "AKB_E2E_PAT": self._pat_value,
+                },
+            )
+        except ProvisioningFailure as exc:
+            raise ProductAssertionFailure("backend live pytest failed") from exc
+
+    async def _run_mcp_gate(self) -> None:
+        mcp_pytest_path = self.config.backend_dir / "tests" / "mcp_e2e"
         emit_gate_event(
             {
                 "event": "mcp_pytest_start",
@@ -4880,6 +4887,7 @@ class E2ERuntime:
                     str(mcp_pytest_path),
                     "-v",
                     "--tb=short",
+                    "--strict-markers",
                     "--confcutdir",
                     str(mcp_pytest_path),
                     "--runtime-descriptor",
@@ -4929,51 +4937,6 @@ class E2ERuntime:
                 )
             except ProvisioningFailure as exc:
                 raise ProductAssertionFailure("MCP Inspector consumer smoke failed") from exc
-
-        child_env = self._child_environment()
-        with log_path.open("ab", buffering=0) as handle:
-            os.chmod(log_path, 0o600)
-            process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                str(suite_path),
-                "--repo-root",
-                str(self.config.checkout),
-                cwd=str(self.config.runtime_root),
-                env=child_env,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=handle,
-                start_new_session=True,
-            )
-            self._suite_process = ManagedProcess(process)
-            wait_task = asyncio.create_task(process.wait(), name="e2e-suite")
-            stop_task = asyncio.create_task(self._stop_event.wait(), name="e2e-stop")
-            try:
-                done, _pending = await asyncio.wait(
-                    (wait_task, stop_task), return_when=asyncio.FIRST_COMPLETED
-                )
-                if stop_task in done and not wait_task.done():
-                    emit_gate_event(
-                        {
-                            "event": "runner_stop_requested",
-                            "process": "supervisor",
-                            "child": "suite_runner",
-                        },
-                    )
-                    await terminate_process(process, owned_groups=self._suite_process.owned_groups)
-                raw_returncode = process.returncode
-                if raw_returncode is None:
-                    raw_returncode = await wait_task
-
-                suite_result = shell_exit_code(raw_returncode)
-                if suite_result != 0 or not self.config.frontend_enabled or self._stop_event.is_set():
-                    return suite_result
-
-                await self._run_frontend_smoke()
-                return suite_result
-            finally:
-                stop_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await stop_task
 
     async def _run_frontend_smoke(self) -> None:
         try:
@@ -5040,11 +5003,6 @@ class E2ERuntime:
             if await attempt("command", terminate_process(process, owned_groups=groups)):
                 self._active_commands.discard(process)
                 self._active_command_groups.pop(process, None)
-        if self._suite_process is not None:
-            if await attempt("suite", terminate_process(
-                self._suite_process.process, owned_groups=self._suite_process.owned_groups,
-            )):
-                self._suite_process = None
         await attempt("fixture", self._stop_fixture_control())
         if "publication-replica" in self._children:
             await attempt("publication-replica", self._stop_named_process("publication-replica"))
@@ -5058,6 +5016,19 @@ class E2ERuntime:
     def request_stop(self) -> None:
         self._stop_event.set()
 
+    async def _run_gate_until_stopped(self) -> int:
+        gate = asyncio.create_task(self._run_gate(), name="runtime-gate")
+        stop = asyncio.create_task(self._stop_event.wait(), name="runtime-gate-stop")
+        try:
+            done, _ = await asyncio.wait((gate, stop), return_when=asyncio.FIRST_COMPLETED)
+            if gate in done:
+                return gate.result()
+            return 130
+        finally:
+            gate.cancel()
+            stop.cancel()
+            await asyncio.gather(gate, stop, return_exceptions=True)
+
     async def run(self) -> int:
         try:
             # Validate before any process/resource is created.  The values are
@@ -5068,7 +5039,7 @@ class E2ERuntime:
             await self.prepare()
             print(json.dumps(self.descriptor(), separators=(",", ":"), ensure_ascii=False), flush=True)
             if self.config.mode == "gate":
-                return await self._run_gate()
+                return await self._run_gate_until_stopped()
             return await self._serve_foreground()
         except ProductAssertionFailure as exc:
             emit_gate_event(
@@ -5114,6 +5085,7 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
     default_checkout = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("gate", "serve"))
+    parser.add_argument("--suite", choices=("backend", "mcp", "frontend"))
     parser.add_argument("--checkout", type=Path, default=default_checkout)
     parser.add_argument("--runtime-root", type=Path)
     parser.add_argument(
@@ -5162,6 +5134,10 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
         default=SCENARIO,
     )
     args = parser.parse_args(argv)
+    if args.mode == "gate" and not args.suite:
+        parser.error("gate requires --suite")
+    if args.mode == "serve" and args.suite:
+        parser.error("--suite is only used with gate")
 
     try:
         select_capability_profile(args.profile, args.capability)
@@ -5193,7 +5169,8 @@ def _parse_args(argv: list[str] | None = None) -> RuntimeConfig:
         scenario=args.scenario,
         profile=args.profile,
         capabilities=tuple(args.capability),
-        frontend_enabled=args.with_frontend,
+        frontend_enabled=args.with_frontend or args.suite == "frontend",
+        suite=args.suite,
     )
 
 

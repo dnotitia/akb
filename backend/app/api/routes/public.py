@@ -408,11 +408,8 @@ async def list_publications_route(
     - `frontend/src/lib/api.ts` `listPublications` renders the vault's
       publication list from one unbounded response, so a bound would silently
       hide rows from the owner.
-    - `backend/tests/test_publications_e2e.sh` asserts the cascade on document
-      and file delete by counting matching rows here. A surviving row that fell
-      off the first page would count as zero and read as "cascade removed it" —
-      the assertion would pass for the wrong reason rather than fail, which is
-      the one failure mode a test cannot report on itself.
+    - The publication tests check that deleting a document or file removes its
+      row from the complete list. A partial response could hide a surviving row.
 
     Paginating is fine; doing it without changing both is not.
     """
