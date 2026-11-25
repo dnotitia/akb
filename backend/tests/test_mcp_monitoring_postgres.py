@@ -11,11 +11,13 @@ from app.mcp_monitoring.collector import Collector, Observation
 from app.mcp_monitoring.report import read_report
 from tests.test_event_tail_postgres import _fresh_database
 
+pytestmark = pytest.mark.live_services
 
-async def test_upgrade_preserves_existing_observations_and_metric_definitions():
+
+async def test_upgrade_preserves_existing_observations_and_metric_definitions(application_schema_template):
     from app.db import postgres
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         observation, actor, trace = uuid4(), uuid4(), uuid4()
         await pool.execute("""
             INSERT INTO mcp_monitoring.tool_calls
@@ -48,8 +50,8 @@ async def test_upgrade_preserves_existing_observations_and_metric_definitions():
         """) == "Empty"
 
 
-async def test_replica_flush_replay_and_retention():
-    async with _fresh_database() as pool:
+async def test_replica_flush_replay_and_retention(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         now = datetime.now(UTC)
         actor, pat = uuid4(), uuid4()
         original = Observation(uuid4(), now, actor, "human", "pat", pat, "akb_help", "ok", 2)
@@ -87,8 +89,8 @@ async def test_replica_flush_replay_and_retention():
         """)
 
 
-async def test_credential_status_uses_current_catalog_for_a_historical_window():
-    async with _fresh_database() as pool:
+async def test_credential_status_uses_current_catalog_for_a_historical_window(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         start = datetime.now(UTC) - timedelta(days=2)
         end = start + timedelta(hours=1)
         owner = await pool.fetchval(
@@ -134,10 +136,10 @@ async def test_credential_status_uses_current_catalog_for_a_historical_window():
         }
 
 
-async def test_coverage_gaps_and_untruncated_totals():
+async def test_coverage_gaps_and_untruncated_totals(application_schema_template):
     start = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=6)
     hour = timedelta(hours=1)
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         writer = uuid4()
         await pool.execute(
             "INSERT INTO mcp_monitoring.writers VALUES ($1,$2,$3,$3,true,1)", writer, start + hour, start + 4 * hour
@@ -190,8 +192,8 @@ async def test_coverage_gaps_and_untruncated_totals():
         assert paused["series"][0]["calls"] is None and paused["series"][0]["coverage"] == "unmeasured"
 
 
-async def test_usage_groups_from_observations_and_old_rows():
-    async with _fresh_database() as pool:
+async def test_usage_groups_from_observations_and_old_rows(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         since = datetime.now(UTC)
         user, pat = uuid4(), uuid4()
         # Older replicas can still flush their own column layout during rollout.
@@ -224,13 +226,13 @@ async def test_usage_groups_from_observations_and_old_rows():
         ]
 
 
-async def test_added_and_retired_metric_history(monkeypatch):
+async def test_added_and_retired_metric_history(monkeypatch, application_schema_template):
     import json
 
     from app.mcp_monitoring.usage import ZeroRate
     from mcp_server.tools import TOOL_METRICS
 
-    async with _fresh_database():
+    async with _fresh_database(application_schema_template):
         tool = "fixture_lookup"
         monkeypatch.setitem(TOOL_METRICS, tool, (ZeroRate("miss", "Lookup misses", "returned"),))
         since = datetime.now(UTC)
@@ -247,10 +249,10 @@ async def test_added_and_retired_metric_history(monkeypatch):
         assert archived == {**active, "active": False}
 
 
-async def test_operations_are_actor_scoped_ordered_and_independent_of_recent_limit():
+async def test_operations_are_actor_scoped_ordered_and_independent_of_recent_limit(application_schema_template):
     from app.mcp_monitoring.report import read_operation_calls
 
-    async with _fresh_database():
+    async with _fresh_database(application_schema_template):
         start = datetime.now(UTC) - timedelta(minutes=5)
         end = start + timedelta(minutes=4)
         actor, other, pat, trace = (uuid4() for _ in range(4))
@@ -295,11 +297,11 @@ async def test_operations_are_actor_scoped_ordered_and_independent_of_recent_lim
         assert [(r["calls"], r["elapsed_ms"]) for r in subset["operations"]] == [(50, 50)]
 
 
-async def test_turn_and_trace_with_equal_keys_have_separate_sequences(monkeypatch):
+async def test_turn_and_trace_with_equal_keys_have_separate_sequences(monkeypatch, application_schema_template):
     from app.config import settings
     from app.mcp_monitoring.report import read_operation_calls
 
-    async with _fresh_database():
+    async with _fresh_database(application_schema_template):
         start = datetime.now(UTC) - timedelta(minutes=1)
         end = datetime.now(UTC)
         key, actor, other, pat = (uuid4() for _ in range(4))
@@ -325,10 +327,10 @@ async def test_turn_and_trace_with_equal_keys_have_separate_sequences(monkeypatc
         assert len((await read_operation_calls(start, end, actor, None, None, None, refs["trace"], 0))["calls"]) == 1
 
 
-async def test_conversation_takes_precedence_and_preserves_unlabelled_history():
+async def test_conversation_takes_precedence_and_preserves_unlabelled_history(application_schema_template):
     from app.mcp_monitoring.report import read_operation_calls
 
-    async with _fresh_database():
+    async with _fresh_database(application_schema_template):
         start = datetime.now(UTC) - timedelta(minutes=1)
         actor, key, pat, first_turn, parent = (uuid4() for _ in range(5))
         base = Observation(uuid4(), start, actor, "human", "oauth", None, "akb_help", "ok", 1,
@@ -363,10 +365,10 @@ async def test_conversation_takes_precedence_and_preserves_unlabelled_history():
         assert [r["observation_id"] for r in filtered["calls"]] == [e.observation_id for e in events[:3]]
 
 
-async def test_service_jobs_and_details_stay_out_of_human_reports():
+async def test_service_jobs_and_details_stay_out_of_human_reports(application_schema_template):
     from app.mcp_monitoring.report import read_operation_calls
 
-    async with _fresh_database():
+    async with _fresh_database(application_schema_template):
         actor, job, pat = uuid4(), uuid4(), uuid4()
         start = datetime.now(UTC) - timedelta(minutes=1)
         service = Observation(uuid4(), start, actor, "service", "service", None, "akb_put", "ok", 2,

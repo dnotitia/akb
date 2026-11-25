@@ -1,6 +1,6 @@
 """Fake OpenAI-compatible /v1/embeddings server for CI.
 
-The shell e2e suite needs the backend to boot and the write path to
+The AKB runtime E2E suites need the backend to boot and the write path to
 exercise indexing without depending on a real embedding provider —
 otherwise CI would silently degrade (no key → indexing skipped → some
 search tests fail) or require a hosted credential. This stub answers
@@ -8,7 +8,7 @@ the /v1/embeddings contract with deterministic fixed-dim vectors so
 the indexer pipeline runs end-to-end. Search relevance is meaningless
 under this stub (every vector is the same shape), but every test we
 gate in CI either skips search or tolerates "0 results" — see
-`.github/workflows/e2e.yml` for the CI gate's suite list.
+`scripts/ci/README.md` for the gate's suite coverage.
 
 Not for production use.
 """

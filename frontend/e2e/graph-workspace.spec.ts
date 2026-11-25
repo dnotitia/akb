@@ -192,7 +192,9 @@ async function expectNonblankCanvas(page: Page) {
 
 async function graphReady(page: Page, count: number) {
   const host = page.getByTestId("graph-canvas");
-  await expect(host).toBeVisible();
+  // The 3D viewer is a lazy chunk on software WebGL. On a 4-vCPU runner it
+  // mounts about 5 s after navigation, which is the default expect timeout.
+  await expect(host).toBeVisible({ timeout: 15_000 });
   await expect(host).toHaveAccessibleName(new RegExp("^3D knowledge graph: " + count + " resources?\\b"));
   const canvas = host.locator("canvas").first();
   await expect(canvas).toBeVisible();

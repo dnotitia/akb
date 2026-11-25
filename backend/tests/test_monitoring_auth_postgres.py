@@ -14,11 +14,13 @@ from app.services.sso_browser_session_service import revoke_sso_browser_sessions
 from app.services.sso_session_epoch import reconcile_sso_session_epoch
 from tests.test_event_tail_postgres import _fresh_database
 
+pytestmark = pytest.mark.live_services
+
 
 REPORT = "/api/v1/admin/mcp-monitoring"
 
 
-async def test_sso_monitoring_callback_issues_only_monitoring_authority(monkeypatch, tmp_path):
+async def test_sso_monitoring_callback_issues_only_monitoring_authority(monkeypatch, tmp_path, application_schema_template):
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
     from app.main import app
 
@@ -39,7 +41,7 @@ async def test_sso_monitoring_callback_issues_only_monitoring_authority(monkeypa
         "exp": int((now + timedelta(minutes=5)).timestamp()),
     }
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         await reconcile_sso_session_epoch()
         await pool.executemany(
             """

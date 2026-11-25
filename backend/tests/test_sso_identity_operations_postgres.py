@@ -25,26 +25,14 @@ from tests.test_admin_auth_postgres import _SSO_SESSION_EPOCH, _fresh_database
 from tests.test_admin_sso_routes_unit import Control, _provider
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 OLD = "https://accounts.example.com/realms/workforce"
 NEW = "https://auth.akb.example.com/realms/akb"
 
 
 @pytest.fixture
-async def lane(monkeypatch):
-    async with _fresh_database() as pool:
-        from app.db.postgres import _load_migration
-
-        admission_migration = _load_migration("082_pending_admissions.py")
-        operation_migration = _load_migration("121_sso_identity_operations.py")
-        assert admission_migration is not None
-        assert operation_migration is not None
-        async with pool.acquire() as conn:
-            await admission_migration.migrate(conn=conn)
-            installation = await conn.fetchval("SELECT installation_id FROM sso_operation_installation")
-            await operation_migration.migrate(conn=conn)
-            await operation_migration.migrate(conn=conn)
-            assert await conn.fetchval("SELECT installation_id FROM sso_operation_installation") == installation
+async def lane(monkeypatch, identity_operations_template):
+    async with _fresh_database(identity_operations_template) as pool:
         async def get_test_pool():
             return pool
 

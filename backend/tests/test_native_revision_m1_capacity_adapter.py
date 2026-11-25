@@ -5,16 +5,19 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sys
-from typing import Any
 import uuid
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -406,6 +409,7 @@ async def _reachable() -> bool:
     return True
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
     if not await _reachable():
@@ -522,18 +526,30 @@ async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
         await admin.close()
 
 
+_PROBE_DATABASE_PREFIX = "akb_revision_m1_measurement_cleanup_"
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def capacity_probe_template() -> AsyncIterator[tuple[TestDatabase, uuid.UUID]]:
+    async with temporary_database(DSN, _PROBE_DATABASE_PREFIX) as template:
+        pool, _, owner, _ = await CAPACITY._setup(template.dsn)
+        await pool.close()
+        yield template, owner
+
+
+@pytest_asyncio.fixture
+async def capacity_probe_database(capacity_probe_template):
+    template, owner = capacity_probe_template
+    async with temporary_database(DSN, _PROBE_DATABASE_PREFIX, template=template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=24) as pool:
+            yield pool, owner
+
+
+@pytest.mark.live_services
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["read_error", "timeout", "cancel"])
-async def test_derived_probe_joins_delayed_delivery_before_leaving(monkeypatch, failure):
-    if not await _reachable():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail("REQUIRE_REAL_PG=1 but Postgres is not reachable for focused M1 capacity test")
-        pytest.skip("Postgres is not reachable for focused M1 capacity test")
-    base, _ = DSN.rsplit("/", 1)
-    name = f"akb_revision_m1_measurement_cleanup_{uuid.uuid4().hex[:10]}"
-    admin = await asyncpg.connect(DSN)
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = None
+async def test_derived_probe_joins_delayed_delivery_before_leaving(monkeypatch, failure, capacity_probe_database):
+    pool, owner = capacity_probe_database
     delayed_tasks = []
     original_create_task = asyncio.create_task
     original_grep = CAPACITY.M1NativeGrepService.grep
@@ -560,7 +576,6 @@ async def test_derived_probe_joins_delayed_delivery_before_leaving(monkeypatch, 
     monkeypatch.setattr(asyncio, "create_task", capture_task)
     monkeypatch.setattr(CAPACITY.M1NativeGrepService, "grep", probe_grep)
     try:
-        pool, _database, owner, _ = await CAPACITY._setup(f"{base}/{name}")
         cell = CAPACITY.Cell("test", "probe-cleanup", 1, "same-vault", 1024,
                              "localized", "closed-loop", None, 1,
                              CAPACITY.Timing(0, 1, 1, 1, 3, .01))
@@ -585,7 +600,3 @@ async def test_derived_probe_joins_delayed_delivery_before_leaving(monkeypatch, 
         for delayed in delayed_tasks:
             delayed.cancel()
         await asyncio.gather(*delayed_tasks, return_exceptions=True)
-        if pool is not None:
-            await pool.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()

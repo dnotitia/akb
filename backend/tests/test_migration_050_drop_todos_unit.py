@@ -26,6 +26,7 @@ job would otherwise skip it in both jobs, making it a gate that never fires.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import importlib.util
 import os
 import uuid
@@ -33,6 +34,11 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
+
+pytestmark = pytest.mark.live_services
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")
 
@@ -73,15 +79,6 @@ CREATE TABLE publications (
 """
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 def _load_migration():
     """Load 050 from source (NOT import_module, which could honour a stale
     __pycache__ .pyc and mask a source regression)."""
@@ -95,28 +92,36 @@ def _load_migration():
     return mod
 
 
-class _Fixture:
-    """A disposable database with the minimal pre-change schema."""
-
-    def __init__(self, admin, conn, dbname):
-        self.admin, self.conn, self.dbname = admin, conn, dbname
-
-
-async def _make_db():
-    admin = await asyncpg.connect(_DSN)
-    dbname = f"akb_mig050_{uuid.uuid4().hex[:8]}"
-    await admin.execute(f'CREATE DATABASE "{dbname}"')
-    base, _ = _DSN.rsplit("/", 1)
-    conn = await asyncpg.connect(f"{base}/{dbname}")
+async def _initialize_dependencies(conn):
     await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
     await conn.execute(_MINIMAL_DEPS)
-    return _Fixture(admin, conn, dbname)
 
 
-async def _drop_db(fx: _Fixture):
-    await fx.conn.close()
-    await fx.admin.execute(f'DROP DATABASE "{fx.dbname}" WITH (FORCE)')
-    await fx.admin.close()
+async def _initialize_todos(conn):
+    await _initialize_dependencies(conn)
+    await conn.execute(_PRE_CHANGE_TODOS)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def deps_template():
+    async with database_template(_DSN, "akb_todos_deps_template_", _initialize_dependencies) as template:
+        yield template
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def todos_template():
+    async with database_template(_DSN, "akb_todos_template_", _initialize_todos) as template:
+        yield template
+
+
+@asynccontextmanager
+async def _database(template):
+    async with temporary_database(_DSN, "akb_mig050_", template=template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            yield conn
+        finally:
+            await conn.close()
 
 
 async def _seed_blocked_user(conn) -> str:
@@ -151,14 +156,9 @@ async def _new_delete_user_account(conn, uid):
 
 
 @pytest.mark.asyncio
-async def test_migration_050_unblocks_account_deletion():
+async def test_migration_050_unblocks_account_deletion(todos_template):
     """The regression this migration exists for, end to end."""
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    fx = await _make_db()
-    try:
-        conn = fx.conn
-        await conn.execute(_PRE_CHANGE_TODOS)
+    async with _database(todos_template) as conn:
         uid = await _seed_blocked_user(conn)
 
         # BEFORE: the NOT NULL write aborts the sequence and the account lives.
@@ -176,18 +176,11 @@ async def test_migration_050_unblocks_account_deletion():
         # AFTER: the same account deletes cleanly.
         await _new_delete_user_account(conn, uid)
         assert await conn.fetchval("SELECT count(*) FROM users WHERE id = $1", uid) == 0
-    finally:
-        await _drop_db(fx)
 
 
 @pytest.mark.asyncio
-async def test_migration_050_archive_preserves_rows_without_the_faulty_coupling():
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    fx = await _make_db()
-    try:
-        conn = fx.conn
-        await conn.execute(_PRE_CHANGE_TODOS)
+async def test_migration_050_archive_preserves_rows_without_the_faulty_coupling(todos_template):
+    async with _database(todos_template) as conn:
         for _ in range(3):
             await _seed_blocked_user(conn)
         before = await conn.fetchval("SELECT count(*) FROM todos")
@@ -212,53 +205,39 @@ async def test_migration_050_archive_preserves_rows_without_the_faulty_coupling(
             "SELECT count(*) FROM pg_constraint "
             "WHERE conrelid = 'todos_archive'::regclass AND contype = 'f'"
         ) == 0
-    finally:
-        await _drop_db(fx)
 
 
 @pytest.mark.asyncio
-async def test_migration_050_state_matrix():
+async def test_migration_050_state_matrix(deps_template, todos_template):
     """Neither table / source only / archive only — all safe and idempotent."""
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
     mig = _load_migration()
 
     # (a) neither table — fresh install, must no-op.
-    fx = await _make_db()
-    try:
-        await mig.migrate(conn=fx.conn)
-        assert await fx.conn.fetchval("SELECT to_regclass('public.todos')") is None
-        assert await fx.conn.fetchval("SELECT to_regclass('public.todos_archive')") is None
-    finally:
-        await _drop_db(fx)
+    async with _database(deps_template) as conn:
+        await mig.migrate(conn=conn)
+        assert await conn.fetchval("SELECT to_regclass('public.todos')") is None
+        assert await conn.fetchval("SELECT to_regclass('public.todos_archive')") is None
 
     # (b) source only — the normal path, then a re-run that must not disturb it.
-    fx = await _make_db()
-    try:
-        await fx.conn.execute(_PRE_CHANGE_TODOS)
-        await _seed_blocked_user(fx.conn)
-        await mig.migrate(conn=fx.conn)
-        archived = await fx.conn.fetchval("SELECT count(*) FROM todos_archive")
-        await mig.migrate(conn=fx.conn)  # no-op
-        assert await fx.conn.fetchval("SELECT count(*) FROM todos_archive") == archived
-        assert await fx.conn.fetchval("SELECT to_regclass('public.todos')") is None
-    finally:
-        await _drop_db(fx)
+    async with _database(todos_template) as conn:
+        await _seed_blocked_user(conn)
+        await mig.migrate(conn=conn)
+        archived = await conn.fetchval("SELECT count(*) FROM todos_archive")
+        await mig.migrate(conn=conn)  # no-op
+        assert await conn.fetchval("SELECT count(*) FROM todos_archive") == archived
+        assert await conn.fetchval("SELECT to_regclass('public.todos')") is None
 
     # (c) archive only — already migrated; must not recreate or touch anything.
-    fx = await _make_db()
-    try:
-        await fx.conn.execute("CREATE TABLE todos_archive (id uuid, title text)")
-        await fx.conn.execute("INSERT INTO todos_archive VALUES (uuid_generate_v4(), 'kept')")
-        await mig.migrate(conn=fx.conn)
-        assert await fx.conn.fetchval("SELECT count(*) FROM todos_archive") == 1
-        assert await fx.conn.fetchval("SELECT to_regclass('public.todos')") is None
-    finally:
-        await _drop_db(fx)
+    async with _database(deps_template) as conn:
+        await conn.execute("CREATE TABLE todos_archive (id uuid, title text)")
+        await conn.execute("INSERT INTO todos_archive VALUES (uuid_generate_v4(), 'kept')")
+        await mig.migrate(conn=conn)
+        assert await conn.fetchval("SELECT count(*) FROM todos_archive") == 1
+        assert await conn.fetchval("SELECT to_regclass('public.todos')") is None
 
 
 @pytest.mark.asyncio
-async def test_migration_050_fails_closed_when_both_tables_exist():
+async def test_migration_050_fails_closed_when_both_tables_exist(todos_template):
     """A pre-existing archive is NOT evidence the rows are already saved.
 
     This migration commits the archive and the drop together, so it can never
@@ -266,12 +245,7 @@ async def test_migration_050_fails_closed_when_both_tables_exist():
     somewhere else and may not contain what `todos` currently holds — dropping
     the source would silently lose rows.
     """
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    fx = await _make_db()
-    try:
-        conn = fx.conn
-        await conn.execute(_PRE_CHANGE_TODOS)
+    async with _database(todos_template) as conn:
         await _seed_blocked_user(conn)
         # An unrelated / stale archive that does NOT hold the live row.
         await conn.execute("CREATE TABLE todos_archive (id uuid, title text)")
@@ -282,19 +256,12 @@ async def test_migration_050_fails_closed_when_both_tables_exist():
         # The source survives untouched — nothing was discarded.
         assert await conn.fetchval("SELECT count(*) FROM todos") == 1
         assert await conn.fetchval("SELECT count(*) FROM todos_archive") == 0
-    finally:
-        await _drop_db(fx)
 
 
 @pytest.mark.asyncio
-async def test_migration_050_refuses_to_cascade_away_an_unexpected_dependent():
+async def test_migration_050_refuses_to_cascade_away_an_unexpected_dependent(todos_template):
     """A site-local view on `todos` must break the drop, not vanish silently."""
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    fx = await _make_db()
-    try:
-        conn = fx.conn
-        await conn.execute(_PRE_CHANGE_TODOS)
+    async with _database(todos_template) as conn:
         await _seed_blocked_user(conn)
         await conn.execute("CREATE VIEW ops_open_todos AS SELECT id, title FROM todos")
 
@@ -304,5 +271,3 @@ async def test_migration_050_refuses_to_cascade_away_an_unexpected_dependent():
         # Transactional: the aborted run left neither a half-archive nor a drop.
         assert await conn.fetchval("SELECT to_regclass('public.todos')") is not None
         assert await conn.fetchval("SELECT to_regclass('public.todos_archive')") is None
-    finally:
-        await _drop_db(fx)

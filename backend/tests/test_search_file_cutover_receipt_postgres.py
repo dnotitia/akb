@@ -1,35 +1,18 @@
 """Execute the hydration receipt predicate against isolated temporary PG rows."""
 import os
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.services.search_service import _VERIFIED_FILE_CUTOVER_PATH_SQL
 
+pytestmark = pytest.mark.live_services
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", [
-    None,
-    "UPDATE native_revision_cutover_runs SET status = 'pending'",
-    "UPDATE native_revision_cutover_files SET status = 'pending'",
-    "UPDATE native_revision_cutover_files SET disposition = 'preserved_binary'",
-    "UPDATE native_revision_cutover_files SET file_id = 'other'",
-    "UPDATE native_revision_cutover_files SET namespace_id = 'other'",
-    "UPDATE f SET name = 'renamed.txt'",
-    "UPDATE f SET mime_type = 'text/markdown'",
-    "UPDATE f SET content_hash = 'new-content'",
-    "UPDATE f SET size_bytes = 12",
-    "UPDATE f SET s3_key = 'new-object'",
-    "UPDATE f SET etag = 'new-etag'",
-    "UPDATE f SET storage_version = 'new-version'",
-    "UPDATE f SET hash_verified_at = NULL",
-    "UPDATE r SET current_path = 'other-path'",
-    "UPDATE r SET head_revision_id = 'new-head'",
-    "UPDATE p SET digest = 'wrong-body'",
-    "UPDATE p SET byte_size = 12",
-    "INSERT INTO native_file_projection_outbox VALUES ('file')",
-])
-async def test_verified_collision_receipt_requires_exact_current_source_and_head(mutation):
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def receipt_connection() -> AsyncIterator[asyncpg.Connection]:
     dsn = os.environ.get("AKB_TEST_DSN")
     if not dsn:
         pytest.skip("AKB_TEST_DSN required for PostgreSQL receipt verification")
@@ -61,11 +44,44 @@ async def test_verified_collision_receipt_requires_exact_current_source_and_head
                 'head', 'text/plain', 'hash', 4, 'key', NULL, NULL);
             CREATE TEMP TABLE native_file_projection_outbox (file_id text);
         """)
+        yield conn
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("mutation", [
+    None,
+    "UPDATE native_revision_cutover_runs SET status = 'pending'",
+    "UPDATE native_revision_cutover_files SET status = 'pending'",
+    "UPDATE native_revision_cutover_files SET disposition = 'preserved_binary'",
+    "UPDATE native_revision_cutover_files SET file_id = 'other'",
+    "UPDATE native_revision_cutover_files SET namespace_id = 'other'",
+    "UPDATE f SET name = 'renamed.txt'",
+    "UPDATE f SET mime_type = 'text/markdown'",
+    "UPDATE f SET content_hash = 'new-content'",
+    "UPDATE f SET size_bytes = 12",
+    "UPDATE f SET s3_key = 'new-object'",
+    "UPDATE f SET etag = 'new-etag'",
+    "UPDATE f SET storage_version = 'new-version'",
+    "UPDATE f SET hash_verified_at = NULL",
+    "UPDATE r SET current_path = 'other-path'",
+    "UPDATE r SET head_revision_id = 'new-head'",
+    "UPDATE p SET digest = 'wrong-body'",
+    "UPDATE p SET byte_size = 12",
+    "INSERT INTO native_file_projection_outbox VALUES ('file')",
+])
+async def test_verified_collision_receipt_requires_exact_current_source_and_head(
+    receipt_connection, mutation,
+):
+    transaction = receipt_connection.transaction()
+    await transaction.start()
+    try:
         if mutation:
-            await conn.execute(mutation)
-        actual = await conn.fetchval(
+            await receipt_connection.execute(mutation)
+        actual = await receipt_connection.fetchval(
             f"SELECT {_VERIFIED_FILE_CUTOVER_PATH_SQL} FROM f CROSS JOIN col CROSS JOIN r CROSS JOIN p"
         )
         assert actual is (mutation is None)
     finally:
-        await conn.close()
+        await transaction.rollback()

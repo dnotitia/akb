@@ -43,7 +43,6 @@ static tests at the bottom need no database and run everywhere.
 from __future__ import annotations
 
 import ast
-import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,12 +54,8 @@ import pytest_asyncio
 from app.exceptions import ConflictError
 from app.repositories.document_repo import DocumentRepository
 from app.repositories.vault_repo import VaultRepository
+from tests.helpers.pg_database import AUDIT_TEST_DSN, temporary_database
 
-
-_DSN = os.environ.get(
-    "AKB_TEST_DSN",
-    "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
-)
 
 _BACKEND = Path(__file__).resolve().parents[1]
 
@@ -75,40 +70,21 @@ _PATH_SHAPES = [
 ]
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 @pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=2, max_size=10)
-    init_sql = (_BACKEND / "app" / "db" / "init.sql").read_text()
-    async with pool.acquire() as conn:
-        await conn.execute(init_sql)
-    # Services under test resolve their connection through the module-global
-    # `get_pool()`; wire it to this pool for the duration of the test.
+async def pool(audit_application_schema_template):
     from app.db import postgres as pg_mod
-    prev = pg_mod._pool
-    pg_mod._pool = pool
-    try:
-        # init.sql is only half the schema — `events`, `resource_aliases`,
-        # `chunks.vault_id` and friends arrive by migration, and the writes
-        # exercised here touch all of them. Drive the app's own runner rather
-        # than a hand-copied DDL list that would rot on the next migration.
-        await pg_mod._apply_migrations()
-        yield pool
-    finally:
-        pg_mod._pool = prev
-        await pool.close()
+
+    async with (
+        temporary_database(AUDIT_TEST_DSN, "akb_publication_path_", template=audit_application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=2, max_size=10) as pool,
+    ):
+        # Services resolve their connection through the module-global get_pool.
+        prev = pg_mod._pool
+        pg_mod._pool = pool
+        try:
+            yield pool
+        finally:
+            pg_mod._pool = prev
 
 
 @pytest_asyncio.fixture
@@ -218,6 +194,7 @@ async def _publication_exists(pool, slug: str) -> bool:
 # ── 1. Ordinary create ───────────────────────────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("path", _PATH_SHAPES)
 async def test_create_refuses_a_path_armed_by_an_orphan_publication(pool, vault, path):
     """The core case: a slug outlived its document, and a new document at
@@ -241,6 +218,7 @@ async def test_create_refuses_a_path_armed_by_an_orphan_publication(pool, vault,
     )
 
 
+@pytest.mark.live_services
 async def test_create_refuses_a_path_armed_by_a_pre_026_legacy_uri(pool, vault):
     """The guard matches stored URIs by equality, so every shape the RESOLVER
     still accepts has to be one of the strings it probes.
@@ -279,6 +257,7 @@ async def test_create_refuses_a_path_armed_by_a_pre_026_legacy_uri(pool, vault):
     assert await _doc_count(pool, vault, path) == 0
 
 
+@pytest.mark.live_services
 async def test_create_allows_a_path_with_no_publication(pool, vault):
     """The overwhelmingly common case. A guard that rejects too much is
     worse than none."""
@@ -287,6 +266,7 @@ async def test_create_allows_a_path_with_no_publication(pool, vault):
     assert await _doc_count(pool, vault, "reports/q3.md") == 1
 
 
+@pytest.mark.live_services
 async def test_create_allows_a_path_whose_neighbour_is_published(pool, vault):
     """A live publication elsewhere in the vault — even in the same
     collection — says nothing about this path."""
@@ -300,6 +280,7 @@ async def test_create_allows_a_path_whose_neighbour_is_published(pool, vault):
     assert live is not None
 
 
+@pytest.mark.live_services
 async def test_create_over_a_live_published_document_is_still_a_path_collision(pool, vault):
     """A publication whose document is ALIVE is not an orphan, so the guard
     must stay out of the way and let the ordinary `UNIQUE(vault_id, path)`
@@ -319,6 +300,7 @@ async def test_create_over_a_live_published_document_is_still_a_path_collision(p
     assert await _doc_count(pool, vault, "reports/q3.md") == 1
 
 
+@pytest.mark.live_services
 async def test_create_allows_a_path_freed_by_a_proper_delete(pool, vault):
     """Delete-then-recreate at the same path is an ordinary operation, and
     a delete through the chokepoint takes the publication with it. Nothing
@@ -366,6 +348,7 @@ def _document_service(git: _StubGit):
     return DocumentService(git=git)
 
 
+@pytest.mark.live_services
 async def test_move_refuses_a_destination_armed_by_an_orphan_publication(pool, vault):
     """`move` rewrites publications at the SOURCE uri so they follow the
     document; it has never looked at the destination. Moving an unpublished
@@ -391,6 +374,7 @@ async def test_move_refuses_a_destination_armed_by_an_orphan_publication(pool, v
     assert await _publication_exists(pool, slug)
 
 
+@pytest.mark.live_services
 async def test_move_allows_a_clean_destination_and_carries_its_publication(pool, vault):
     """The ordinary move, including of a PUBLISHED document: it must still
     work, and its own publication must follow it to the new path."""
@@ -412,6 +396,7 @@ async def test_move_allows_a_clean_destination_and_carries_its_publication(pool,
     assert uri == f"akb://{vault['name']}/coll/reports/doc/plan-final.md"
 
 
+@pytest.mark.live_services
 async def test_move_to_a_path_freed_by_a_proper_delete_is_allowed(pool, vault):
     """Same negative as for create: a destination whose publication was
     cleaned up with its document is just an empty path."""
@@ -448,6 +433,7 @@ async def _upsert_external(pool, vault, path: str, *, blob: str = "blob1"):
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("path", _PATH_SHAPES)
 async def test_external_import_refuses_a_path_armed_by_an_orphan_publication(
     pool, vault, path,
@@ -465,12 +451,14 @@ async def test_external_import_refuses_a_path_armed_by_an_orphan_publication(
     assert await _publication_exists(pool, slug)
 
 
+@pytest.mark.live_services
 async def test_external_import_of_a_free_path_is_allowed(pool, vault):
     doc_id, inserted = await _upsert_external(pool, vault, "mirror/readme.md")
     assert inserted is True
     assert doc_id is not None
 
 
+@pytest.mark.live_services
 async def test_a_path_with_no_parseable_uri_still_imports(pool, vault):
     """`parse_uri` rejects braces — they are template placeholders — so a
     mirrored upstream path like `{{cookiecutter.project}}/README.md` has no
@@ -494,6 +482,7 @@ async def test_a_path_with_no_parseable_uri_still_imports(pool, vault):
     assert await _doc_count(pool, vault, "{braces}.md") == 1
 
 
+@pytest.mark.live_services
 async def test_external_resync_of_a_published_mirror_is_not_blocked(pool, vault):
     """The ON CONFLICT arm: the document exists, so its publication is not an
     orphan and re-syncing it must go through. This is the case a guard

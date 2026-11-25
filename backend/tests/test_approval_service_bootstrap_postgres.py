@@ -13,8 +13,8 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-async def pool(monkeypatch):
-    async with _fresh_database() as database:
+async def pool(monkeypatch, admin_auth_template):
+    async with _fresh_database(admin_auth_template) as database:
         async def get_pool():
             return database
         monkeypatch.setattr(bootstrap, "get_pool", get_pool)
@@ -22,6 +22,7 @@ async def pool(monkeypatch):
         yield database
 
 
+@pytest.mark.live_services
 async def test_bootstrap_replay_rotation_and_retired_tombstone(pool):
     key, _, _ = auth_service.generate_pat("service")
     token_id = uuid.uuid4()
@@ -64,6 +65,7 @@ async def test_bootstrap_replay_rotation_and_retired_tombstone(pool):
     assert await pool.fetchval("SELECT COUNT(*) FROM tokens WHERE user_id=$1", user_id) == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("kind,admin", [("human", True), ("human", False), ("service", True)])
 async def test_existing_name_cannot_be_adopted(pool, kind, admin):
     key, _, _ = auth_service.generate_pat("service")
@@ -77,6 +79,7 @@ async def test_existing_name_cannot_be_adopted(pool, kind, admin):
     assert await pool.fetchval("SELECT COUNT(*) FROM approval_service_bootstrap") == 0
 
 
+@pytest.mark.live_services
 async def test_changed_account_cannot_rotate_or_replay(pool):
     key, _, _ = auth_service.generate_pat("service")
     token_id = uuid.uuid4()
@@ -115,6 +118,7 @@ async def test_pipe_input_rejects_regular_files_and_malformed_values(tmp_path):
                 os.close(write_fd)
 
 
+@pytest.mark.live_services
 async def test_bootstrap_audit_failure_rolls_back_and_retry_succeeds(pool, monkeypatch):
     from unittest.mock import AsyncMock
 
@@ -131,6 +135,7 @@ async def test_bootstrap_audit_failure_rolls_back_and_retry_succeeds(pool, monke
     assert (await bootstrap.provision(token_id, key))["status"] == "issued"
 
 
+@pytest.mark.live_services
 async def test_concurrent_first_provision_replays_same_identity(pool):
     import asyncio
 
@@ -171,6 +176,7 @@ async def test_cli_pipe_writes_only_secret_free_receipt(monkeypatch, tmp_path, c
     assert receipt_path.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.live_services
 async def test_migration_keeps_existing_requests_and_is_idempotent(pool):
     from app.db.postgres import _load_migration
 

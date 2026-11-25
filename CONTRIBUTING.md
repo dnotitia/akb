@@ -37,11 +37,10 @@ Dnotitia, Inc. and are not covered by the software license. See
 
 ## Development Setup
 
-`config/app.yaml.example` is a **new-install Native template**: its identity
-fields are deliberately empty, so a straight copy does not start — Settings
-refuses it before the API boots. The endpoint and shell E2E suites exercise the
-Bare Git contract (see `backend/tests/conftest.py` and
-`scripts/ci/e2e_runtime.py`), so a development stack pins the same selector:
+The example `config/app.yaml.example` is a template for a new Native
+installation. The API requires identity fields that the template leaves blank.
+The repository-owned E2E runtime exercises Bare Git. To use Bare Git in your
+development stack, set `document_revision_backend` to `bare_git`.
 
 ```bash
 # 1. Configure
@@ -97,86 +96,42 @@ need a new application setting:
 
 ## Running Tests
 
-```bash
-# Individual endpoint-driven suites against the normal local Compose stack
-AKB_URL=http://localhost:8000 bash backend/tests/test_e2e.sh
-AKB_URL=http://localhost:8000 bash backend/tests/test_security_edge_e2e.sh
-# … see backend/tests/ for the full list
+From the repository root, run the suite for the boundary you changed.
 
-# CI-equivalent isolated full gate (uses the repository-owned runtime and
-# its private PostgreSQL/MinIO dependency stack, not the root Compose app)
-uv sync --locked --extra dev --project backend
-RUNTIME_ROOT="$(mktemp -d /tmp/akb-e2e-runtime.XXXXXX)"
-export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
-  'import secrets; print(f"akb-e2e-{secrets.token_hex(8)}")')"
-export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c \
-  'import secrets; print(secrets.token_urlsafe(24))')"
-uv run --locked --project backend python \
-  scripts/ci/e2e_runtime.py gate \
-  --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
-unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
+| Change | Tests |
+| --- | --- |
+| Backend code without live dependencies | Backend unit pytest selection |
+| REST or MCP behavior that needs PostgreSQL | Live PostgreSQL pytest selection, including `backend/tests/rest_integration/` |
+| Backend behavior that needs a running API or storage service | Runtime gate with `--suite backend` |
+| Live MCP protocol or proxy behavior | Runtime gate with `--suite mcp` |
+| A browser flow connected to AKB | Runtime gate with `--suite frontend` |
 
-# Frontend
-cd frontend && pnpm test
-```
+Use the [backend pytest commands](scripts/ci/README.md#backend-pytest-jobs) for
+unit and integration tests. For live checks, the runtime starts a disposable
+AKB instance and cleans up its processes and dependencies when the suite ends.
+Follow the [runtime setup and gate commands](scripts/ci/README.md#run-a-live-suite).
 
-The authenticated MCP pytest behavior suite is run by the repository-owned
-runtime gate and can also consume a ready schema-v2 descriptor directly.
-Local and hosted CI use the same pytest entrypoint: the list-vaults canary and
-the migrated MCP product scenarios consume the same descriptor and fixture
-lifecycle. Transport/session and direct REST checks remain in the shell suite:
+The frontend also has unit tests and browser specs that provide their own HTTP
+fixtures. Once the frontend dependencies and Playwright Chromium are installed,
+run these from the repository root.
 
 ```bash
-uv run --locked --extra dev --project backend python -m pytest \
-  backend/tests/mcp_e2e -v --tb=short \
-  --confcutdir=backend/tests/mcp_e2e --runtime-descriptor -
+(cd frontend && pnpm test)
+(cd frontend && pnpm run test:e2e:fixture)
 ```
 
-For a descriptor file, replace `-` with its path:
-
-```bash
-uv run --locked --extra dev --project backend python -m pytest \
-  backend/tests/mcp_e2e -v --tb=short \
-  --confcutdir=backend/tests/mcp_e2e \
-  --runtime-descriptor /path/to/descriptor.json
-```
-
-The descriptor must come from `scripts/ci/e2e_runtime.py serve` or the
-Ubuntu bootstrap. This pytest command consumes the existing runtime; it does
-not start or tear down a backend, database, or fixture service.
-
-For an isolated browser session, the same runtime can own the existing Vite
-frontend and point its `/api` and `/mcp` proxy at the run's backend:
-
-```bash
-(cd frontend && pnpm install --frozen-lockfile)
-uv run --locked --project backend python \
-  scripts/ci/e2e_runtime.py serve \
-  --with-frontend --frontend-port 3000 \
-  --scenario empty --checkout "$PWD" --runtime-root "$RUNTIME_ROOT"
-```
-
-Use `services.web.origin` from the ready schema-v2 descriptor as
-`AKB_FRONTEND_URL` for `cd frontend && pnpm run test:e2e:real`. The
-frontend flag is opt-in so the existing backend/MCP `gate` and `serve` paths
-keep their current process and dependency requirements.
-
-The E2E suites create ephemeral users and vaults and clean up after
-themselves. They poll `/health` for indexing completion before running search
-assertions, so a slow remote embedding endpoint won't cause flakes. An
-individual suite targets whatever `AKB_URL` points at; the isolated full gate
-starts its own host-process backend/embed/fixture topology. Read the detailed
-runtime contract before changing CI or host bootstrap behavior. The supervisor
-cleans child processes and dependency resources on exit, but leaves the
-private `RUNTIME_ROOT` and its logs for inspection; the caller owns removing
-that explicit temporary directory after collecting what it needs.
+Use `serve` when you need a running backend for a focused SDK test or browser
+session. See [how to keep a runtime running](scripts/ci/README.md#keep-a-runtime-running).
 
 ## Static Analysis Gate
 
-`scripts/check.sh` is the single entry point CI runs (`.github/workflows/check.yml`)
-and the one to run before opening a PR. It has two prerequisites it now
-checks for itself and refuses to start without — both used to fail as
-something other than "you are missing a prerequisite":
+Run `bash scripts/check.sh` before opening a PR. It includes the frontend
+app's Vitest suite. In CI, the **Frontend unit and component tests (Vitest)**
+job runs that suite. The **Static analysis and package tests** job runs the
+script with `--skip-frontend-vitest` and still tests the SDK, Markdown
+editor, and stdio proxy packages.
+
+The script checks two prerequisites before running the gate.
 
 **1. Python analyzers on the version this repo requires.** `backend/pyproject.toml`
 declares `requires-python = ">=3.14"` and the code uses syntax older

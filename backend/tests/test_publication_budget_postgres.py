@@ -10,14 +10,16 @@ import itertools
 import json
 import os
 from pathlib import Path
-import uuid
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.services import publication_rate_limit as rl
+from tests.helpers.pg_database import database_template, temporary_database
 
-pytestmark = pytest.mark.asyncio
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _BACKEND = Path(__file__).resolve().parents[1]
 _DSN = os.getenv("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 
@@ -31,24 +33,26 @@ async def _migrate(conn):
     await module.migrate(conn=conn)
 
 
+async def _initialize(conn):
+    await conn.execute((_BACKEND / "app/db/init.sql").read_text())
+    await _migrate(conn)
+    await _migrate(conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def budget_template():
+    async with database_template(_DSN, "akb_pub_budget_template_", _initialize) as template:
+        yield template
+
+
 @asynccontextmanager
-async def _database(monkeypatch):
-    try:
-        admin = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        if os.getenv("REQUIRE_REAL_PG") == "1":
-            pytest.fail("required PostgreSQL is unavailable")
-        pytest.skip("PostgreSQL unavailable")
-    name = "akb_pub_budget_" + uuid.uuid4().hex[:12]
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    dsn = _DSN.rsplit("/", 1)[0] + "/" + name
-    first = await asyncpg.create_pool(dsn, min_size=1, max_size=8)
-    second = await asyncpg.create_pool(dsn, min_size=1, max_size=8)
-    try:
+async def _database(monkeypatch, template):
+    async with (
+        temporary_database(_DSN, "akb_pub_budget_", template=template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as first,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as second,
+    ):
         async with first.acquire() as conn:
-            await conn.execute((_BACKEND / "app/db/init.sql").read_text())
-            await _migrate(conn)
-            await _migrate(conn)
             vault = await conn.fetchval("INSERT INTO vaults(name,git_path) VALUES('budget-test','/tmp/budget.git') RETURNING id")
             for slug, protected in (("protected", True), ("other", True), ("plain", False)):
                 await conn.execute(
@@ -61,16 +65,11 @@ async def _database(monkeypatch):
             return next(pools)
 
         monkeypatch.setattr(rl, "get_pool", pool)
-        yield first, second, dsn
-    finally:
-        await first.close()
-        await second.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
+        yield first, second, database.dsn
 
 
-async def test_two_pools_atomically_reserve_and_locked_retries_do_not_rewrite(monkeypatch):
-    async with _database(monkeypatch) as (pool, _other, _dsn):
+async def test_two_pools_atomically_reserve_and_locked_retries_do_not_rewrite(monkeypatch, budget_template):
+    async with _database(monkeypatch, budget_template) as (pool, _other, _dsn):
         attempts = await asyncio.gather(*[rl.reserve("protected", f"rotating-ip-{i}") for i in range(50)])
         assert attempts.count(0) == rl._FREE_SLUG + 1
         assert all(wait > 0 for wait in attempts if wait != 0)
@@ -86,8 +85,8 @@ async def test_two_pools_atomically_reserve_and_locked_retries_do_not_rewrite(mo
         assert await rl.reserve("other", "follower") == 0
 
 
-async def test_successful_refunds_are_atomic_and_recreated_client_preserves_lock(monkeypatch):
-    async with _database(monkeypatch) as (pool, _other, dsn):
+async def test_successful_refunds_are_atomic_and_recreated_client_preserves_lock(monkeypatch, budget_template):
+    async with _database(monkeypatch, budget_template) as (pool, _other, dsn):
         for _ in range(rl._FREE_IP + 1):
             assert await rl.reserve("protected", "same-ip") == 0
         replacement = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
@@ -108,8 +107,8 @@ async def test_successful_refunds_are_atomic_and_recreated_client_preserves_lock
             await replacement.close()
 
 
-async def test_quiet_expiry_unknown_slugs_and_cascade_cleanup(monkeypatch):
-    async with _database(monkeypatch) as (pool, _other, _dsn):
+async def test_quiet_expiry_unknown_slugs_and_cascade_cleanup(monkeypatch, budget_template):
+    async with _database(monkeypatch, budget_template) as (pool, _other, _dsn):
         for _ in range(rl._FREE_IP + 1):
             await rl.reserve("protected", "ip")
         async with pool.acquire() as conn:
@@ -130,8 +129,8 @@ async def test_quiet_expiry_unknown_slugs_and_cascade_cleanup(monkeypatch):
             assert await conn.fetchval("SELECT count(*) FROM publication_password_budgets") == 0
 
 
-async def test_concurrent_per_ip_budget_and_expired_publication_do_not_allocate(monkeypatch):
-    async with _database(monkeypatch) as (pool, _other, _dsn):
+async def test_concurrent_per_ip_budget_and_expired_publication_do_not_allocate(monkeypatch, budget_template):
+    async with _database(monkeypatch, budget_template) as (pool, _other, _dsn):
         results = await asyncio.gather(*[rl.reserve("protected", "same-ip") for _ in range(20)])
         assert results.count(0) == rl._FREE_IP + 1
         assert sum(wait > 0 for wait in results) == 14
@@ -142,8 +141,8 @@ async def test_concurrent_per_ip_budget_and_expired_publication_do_not_allocate(
             assert await conn.fetchval("SELECT count(*) FROM publication_password_budgets") == 1
 
 
-async def test_contended_budget_fails_closed_without_blocking_other_publications(monkeypatch):
-    async with _database(monkeypatch) as (pool, _other, _dsn):
+async def test_contended_budget_fails_closed_without_blocking_other_publications(monkeypatch, budget_template):
+    async with _database(monkeypatch, budget_template) as (pool, _other, _dsn):
         await rl.reserve("protected", "ip")
         async with pool.acquire() as conn:
             before = await conn.fetchval("SELECT state FROM publication_password_budgets")

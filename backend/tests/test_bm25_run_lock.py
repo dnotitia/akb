@@ -300,6 +300,7 @@ async def test_nested_guard_loss_cannot_interrupt_inner_operation_drain():
     assert outer_released.is_set()
 
 
+@pytest.mark.live_services
 async def test_database_bulk_guards_exclude_recompute_and_peer_bulk_locks(monkeypatch):
     dsn = os.environ.get("AKB_VCHORD_TEST_DSN")
     if not dsn:
@@ -356,6 +357,7 @@ async def test_database_bulk_guards_exclude_recompute_and_peer_bulk_locks(monkey
         await probe.close()
 
 
+@pytest.mark.live_services
 async def test_active_recompute_observes_exclusive_legacy_lock_only():
     dsn = os.environ.get("AKB_VCHORD_TEST_DSN")
     if not dsn:
@@ -393,6 +395,7 @@ async def test_active_recompute_observes_exclusive_legacy_lock_only():
         await observer.close()
 
 
+@pytest.mark.live_services
 async def test_database_lock_excludes_other_process_connections_and_releases():
     dsn = os.environ.get("AKB_VCHORD_TEST_DSN")
     if not dsn:
@@ -424,6 +427,7 @@ async def test_database_lock_excludes_other_process_connections_and_releases():
         await pool.close()
 
 
+@pytest.mark.live_services
 async def test_control_session_stop_holds_owner_guard_until_drain(capsys):
     import json
     dsn = os.environ.get("AKB_VCHORD_TEST_DSN")

@@ -18,7 +18,7 @@ from tests.test_vchord_candidate_budget_postgres import (
     _store,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _VAULT = uuid.UUID(int=1)
 _SOURCE = uuid.UUID(int=2)
@@ -76,8 +76,10 @@ async def _ranked(conn, predicate, *, budget, prefilter=True):
     ("source", f"AND source_id='{_SOURCE}'::uuid"),
     ("type", "AND source_type='document'"),
 ])
-async def test_growing_distractors_do_not_displace_authorized_finite_results(scope, predicate):
-    async with _store() as (store, pool):
+async def test_growing_distractors_do_not_displace_authorized_finite_results(
+    empty_vchord_template, scope, predicate,
+):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             await _seed(conn)
             async with _candidate_budget(conn, budget=5):
@@ -106,8 +108,10 @@ async def test_growing_distractors_do_not_displace_authorized_finite_results(sco
 
 
 @pytest.mark.parametrize("visibility", ["deleted", "uncommitted", "old-snapshot"])
-async def test_invisible_growing_tids_do_not_raise_the_pruning_threshold(visibility):
-    async with _store() as (_, pool):
+async def test_invisible_growing_tids_do_not_raise_the_pruning_threshold(
+    empty_vchord_template, visibility,
+):
+    async with _store(empty_vchord_template) as (_, pool):
         async with pool.acquire() as conn, pool.acquire() as writer:
             await _insert(conn, 0, 6)
             await conn.execute("REINDEX INDEX vector_index.idx_vi_chunks_bm25")
@@ -138,8 +142,8 @@ async def test_invisible_growing_tids_do_not_raise_the_pruning_threshold(visibil
                         await tx.rollback()
 
 
-async def test_growing_prefilter_uses_the_snapshot_visible_hot_tuple():
-    async with _store() as (_, pool):
+async def test_growing_prefilter_uses_the_snapshot_visible_hot_tuple(empty_vchord_template):
+    async with _store(empty_vchord_template) as (_, pool):
         async with pool.acquire() as conn, pool.acquire() as writer:
             await _seed(conn)
             predicate = "AND source_type='document'"
@@ -161,8 +165,8 @@ async def test_growing_prefilter_uses_the_snapshot_visible_hot_tuple():
                 assert [r['score'] for r in bounded] == pytest.approx([r['score'] for r in expected])
 
 
-async def test_no_overlap_growing_rows_do_not_evaluate_heap_quals():
-    async with _store() as (_, pool):
+async def test_no_overlap_growing_rows_do_not_evaluate_heap_quals(empty_vchord_template):
+    async with _store(empty_vchord_template) as (_, pool):
         async with pool.acquire() as conn:
             await _seed(conn)
             await conn.execute("CREATE SEQUENCE growing_heap_checks")
@@ -181,8 +185,8 @@ async def test_no_overlap_growing_rows_do_not_evaluate_heap_quals():
                 assert await conn.fetchval("SELECT is_called FROM growing_heap_checks") is False
 
 
-async def test_growing_search_observes_upsert_and_delete_without_reindex():
-    async with _store() as (store, pool):
+async def test_growing_search_observes_upsert_and_delete_without_reindex(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             await _seed(conn)
             chunk = str(uuid.UUID(int=1000))

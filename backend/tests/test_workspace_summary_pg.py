@@ -18,6 +18,8 @@ import pytest
 
 from app.services import access_service, document_counters, workspace_summary
 
+pytestmark = pytest.mark.live_services
+
 
 class _Pool:
     def __init__(self, conn):

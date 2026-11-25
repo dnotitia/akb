@@ -25,28 +25,20 @@ from app.services.native_revision_authority import (
     pre_migration_revision_authority_guard,
     startup_revision_authority_preflight,
 )
+from tests.helpers.pg_database import (
+    TestDatabase,
+    temporary_database,
+)
 
-pytestmark = pytest.mark.asyncio
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _ADMIN_DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
+_DATABASE_PREFIX = "akb_native_authority_"
 _IMAGE = "sha256:" + "a" * 64
-
-
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(_ADMIN_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    base, _ = _ADMIN_DSN.rsplit("/", 1)
-    return f"{base}/{name}"
 
 
 def _settings(name: str, git_root, *, backend: str = "postgres_native") -> Settings:
@@ -71,23 +63,21 @@ def _settings(name: str, git_root, *, backend: str = "postgres_native") -> Setti
 
 
 @asynccontextmanager
-async def _fresh_database(tmp_path, monkeypatch, *, backend: str = "postgres_native"):
-    if not await _can_connect():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {_ADMIN_DSN}")
-        pytest.skip(f"PostgreSQL is not reachable at {_ADMIN_DSN}")
-    admin = await asyncpg.connect(_ADMIN_DSN)
-    name = f"akb_native_authority_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    configured = _settings(name, tmp_path / "git", backend=backend)
-    monkeypatch.setattr(postgres, "settings", configured)
-    await postgres.close_pool()
-    try:
-        yield configured, _database_dsn(name)
-    finally:
+async def _fresh_database(
+    tmp_path,
+    monkeypatch,
+    *,
+    backend: str = "postgres_native",
+    template: TestDatabase | None = None,
+):
+    async with temporary_database(_ADMIN_DSN, _DATABASE_PREFIX, template=template) as database:
+        configured = _settings(database.name, tmp_path / "git", backend=backend)
+        monkeypatch.setattr(postgres, "settings", configured)
         await postgres.close_pool()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
+        try:
+            yield configured, database.dsn
+        finally:
+            await postgres.close_pool()
 
 
 async def _verified_cutover(conn: asyncpg.Connection, tmp_path) -> tuple[uuid.UUID, uuid.UUID]:
@@ -146,9 +136,8 @@ async def _verified_cutover(conn: asyncpg.Connection, tmp_path) -> tuple[uuid.UU
     return cutover_id, namespace_id
 
 
-async def test_existing_authority_fence_is_resumable_and_finalizable(tmp_path, monkeypatch):
-    async with _fresh_database(tmp_path, monkeypatch) as (configured, dsn):
-        await postgres.init_db()
+async def test_existing_authority_fence_is_resumable_and_finalizable(application_schema_template, tmp_path, monkeypatch):
+    async with _fresh_database(tmp_path, monkeypatch, template=application_schema_template) as (configured, dsn):
         conn = await asyncpg.connect(dsn)
         try:
             cutover_id, namespace_id = await _verified_cutover(conn, tmp_path)
@@ -242,11 +231,11 @@ async def test_existing_authority_fence_is_resumable_and_finalizable(tmp_path, m
 
 
 async def test_existing_authority_phase_a_failure_rolls_back_to_open_and_fence_is_exact(
+    application_schema_template,
     tmp_path,
     monkeypatch,
 ):
-    async with _fresh_database(tmp_path, monkeypatch) as (configured, dsn):
-        await postgres.init_db()
+    async with _fresh_database(tmp_path, monkeypatch, template=application_schema_template) as (configured, dsn):
         conn = await asyncpg.connect(dsn)
         try:
             cutover_id, _ = await _verified_cutover(conn, tmp_path)
@@ -377,9 +366,10 @@ async def test_failpoint_rolls_back_to_reusable_pending_authority(tmp_path, monk
             await conn.close()
 
 
-async def test_rejects_old_empty_schema_mismatch_and_bare_git_reuse(tmp_path, monkeypatch):
-    async with _fresh_database(tmp_path, monkeypatch, backend="bare_git") as (legacy, dsn):
-        await postgres.init_db()
+async def test_rejects_old_empty_schema_mismatch_and_bare_git_reuse(application_schema_template, tmp_path, monkeypatch):
+    async with _fresh_database(
+        tmp_path, monkeypatch, backend="bare_git", template=application_schema_template,
+    ) as (legacy, dsn):
         native = _settings(legacy.db_name, legacy.git_storage_path)
         conn = await asyncpg.connect(dsn)
         try:

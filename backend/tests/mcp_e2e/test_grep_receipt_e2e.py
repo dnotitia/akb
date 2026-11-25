@@ -8,7 +8,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from .conftest import _prepare_secondary_user
 from .runtime import RuntimeContext
-from .test_product_e2e import _call_json, _create_vault, _text_content
+from .tools import _call_json, _create_vault, _text_content
 
 
 async def test_grep_writer_receipt_over_stdio(mcp_client: Client, runtime_session: RuntimeContext):

@@ -35,13 +35,15 @@ import os
 import random
 import re
 import time
-import uuid
 from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
-pytestmark = pytest.mark.asyncio
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _SEARCH = """
@@ -51,26 +53,29 @@ _SEARCH = """
 """
 
 
-@contextlib.asynccontextmanager
-async def _database() -> AsyncIterator[tuple[asyncpg.Connection, str]]:
-    """A database with one table and its BM25 index, the only index VACUUM visits."""
+async def _initialize_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS vchord_bm25")
+    await conn.execute("CREATE TABLE vacuum_probe (id int, v bm25_catalog.bm25vector)")
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template() -> AsyncIterator[TestDatabase]:
     if not _DSN:
         pytest.skip("AKB_VCHORD_TEST_DSN is required for VectorChord coverage")
-    base, _ = _DSN.rsplit("/", 1)
-    name = f"akb_vchord_vacuum_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    dsn = f"{base}/{name}"
-    conn = await asyncpg.connect(dsn)
-    try:
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS vchord_bm25")
-        await conn.execute("CREATE TABLE vacuum_probe (id int, v bm25_catalog.bm25vector)")
-        yield conn, dsn
-    finally:
-        await conn.close()
-        with contextlib.suppress(asyncpg.PostgresError):
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+    async with database_template(
+        _DSN, "akb_vchord_vacuum_template_", _initialize_schema, required=True,
+    ) as template:
+        yield template
+
+
+@contextlib.asynccontextmanager
+async def _database(schema_template: TestDatabase) -> AsyncIterator[tuple[asyncpg.Connection, str]]:
+    async with temporary_database(_DSN, "akb_vchord_vacuum_", template=schema_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            yield conn, database.dsn
+        finally:
+            await conn.close()
 
 
 async def _index(conn: asyncpg.Connection) -> None:
@@ -163,7 +168,7 @@ async def _vacuum_while_searching(dsn: str, *, cost_delay_ms: int) -> tuple[floa
             await conn.close()
 
 
-async def test_a_cancelled_bulk_delete_stops_at_once_and_the_next_vacuum_counts_exactly():
+async def test_a_cancelled_bulk_delete_stops_at_once_and_the_next_vacuum_counts_exactly(schema_template):
     """A cancel lands inside the bulk delete, and the counts follow the marks.
 
     0.3.0 held the metapage for the whole pass, which also held off the cancel
@@ -173,7 +178,7 @@ async def test_a_cancelled_bulk_delete_stops_at_once_and_the_next_vacuum_counts_
     marks. The next VACUUM then marks the rest and takes each document off
     once. Autovacuum's cost delay keeps the pass long enough to cancel.
     """
-    async with _database() as (conn, dsn):
+    async with _database(schema_template) as (conn, dsn):
         await _fill_million(conn)
         vac = await asyncpg.connect(dsn)
         try:
@@ -201,14 +206,14 @@ async def test_a_cancelled_bulk_delete_stops_at_once_and_the_next_vacuum_counts_
     assert after["doc_term_cnt"] == 2_000_000  # length 10, stored as is
 
 
-async def test_no_search_waits_for_the_bulk_delete():
+async def test_no_search_waits_for_the_bulk_delete(schema_template):
     """A search during the bulk delete takes as long as a search at any other time.
 
     0.3.0 held the metapage for the whole pass, 800,000 deletions over a
     million documents here, and a search that started meanwhile waited until
     it ended: 3 s without cost delay, longer with it.
     """
-    async with _database() as (conn, dsn):
+    async with _database(schema_template) as (conn, dsn):
         await _fill_million(conn)
         took, longest = await _vacuum_while_searching(dsn, cost_delay_ms=2)
         after = await _metapage(conn)
@@ -218,7 +223,7 @@ async def test_no_search_waits_for_the_bulk_delete():
     assert after["doc_cnt"] == 200_000
 
 
-async def test_the_cleanup_over_a_sparse_term_id_space_is_quick_and_exact():
+async def test_the_cleanup_over_a_sparse_term_id_space_is_quick_and_exact(schema_template):
     """The cleanup's work follows the terms, and every term's statistic matches the rows.
 
     One document holds term 20,000,000, so term ids run to 20,000,001 while
@@ -236,7 +241,7 @@ async def test_the_cleanup_over_a_sparse_term_id_space_is_quick_and_exact():
     def vector(terms: list[int]) -> str:
         return "{" + ",".join(f"{t}:1" for t in terms) + "}"
 
-    async with _database() as (conn, dsn):
+    async with _database(schema_template) as (conn, dsn):
         insert = "INSERT INTO vacuum_probe VALUES ($1, $2::bm25_catalog.bm25vector)"
         await conn.executemany(insert, [(i, vector(t)) for i, t in rows.items() if i < 20_000])
         await _index(conn)
@@ -296,7 +301,7 @@ async def _rows_found(conn: asyncpg.Connection, query: str) -> int:
         return len(await conn.fetch(_SEARCH, query))
 
 
-async def test_a_vacuum_that_removes_nothing_finishes_a_recount_an_interrupted_one_owed():
+async def test_a_vacuum_that_removes_nothing_finishes_a_recount_an_interrupted_one_owed(schema_template):
     """Statistics left counting deleted documents are recounted by the next VACUUM, whatever it removes.
 
     Term 1 is in every document, terms 2 to 5,001 in one document of every
@@ -315,7 +320,7 @@ async def test_a_vacuum_that_removes_nothing_finishes_a_recount_an_interrupted_o
       recount, and every statistic matches the rows.
     """
     rare = 600_000
-    async with _database() as (conn, dsn):
+    async with _database(schema_template) as (conn, dsn):
         await conn.execute("ALTER TABLE vacuum_probe SET (autovacuum_enabled = off)")
         await conn.execute(
             "INSERT INTO vacuum_probe SELECT i, ('{1:1,' || (i % 5000 + 2) || ':1,'"

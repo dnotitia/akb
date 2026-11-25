@@ -19,7 +19,7 @@ Skips when `AKB_TEST_DSN` is unset so a plain `pytest tests/` stays green.
 If a DSN IS set and is unreachable the suite FAILS: a gate that green-skips
 on a broken database is not a gate.
 
-Isolation: a dedicated schema per run, dropped in teardown.
+The constraint test creates a dedicated schema and drops it in teardown.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ import pytest
 DSN = os.getenv("AKB_TEST_DSN")
 
 pytestmark = [
+    pytest.mark.live_services,
     pytest.mark.asyncio,
     pytest.mark.skipif(not DSN, reason="AKB_TEST_DSN not set"),
 ]
@@ -46,11 +47,10 @@ async def _conn():
         c = await asyncpg.connect(DSN)
     except (OSError, asyncpg.PostgresError) as e:  # pragma: no cover
         pytest.fail(f"AKB_TEST_DSN is set but unreachable: {e}")
-    await c.execute(f"SET search_path TO {_SCHEMA}, public")
     return c
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 async def _schema():
     c = await asyncpg.connect(DSN)
     await c.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE")
@@ -162,7 +162,7 @@ async def test_lock_is_released_by_rollback_not_just_commit():
 # ── the reason the original design was not implementable ─────────
 
 
-async def test_reread_after_constraint_violation_is_impossible():
+async def test_reread_after_constraint_violation_is_impossible(_schema):
     """Pins the fact that motivated the lock.
 
     The first design caught `UniqueViolationError` and re-read the winner's

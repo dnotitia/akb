@@ -26,8 +26,9 @@ import pytest
 
 from app.services.vector_store import pgvector as pgvector_module
 from app.services.vector_store.pgvector import PgvectorStore
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _BUDGET = 2
@@ -36,34 +37,16 @@ _RARE_TERM = 7_777
 _UNKNOWN_TERM = 9_999_999
 
 
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
-
-
 @contextlib.asynccontextmanager
-async def _store() -> AsyncIterator[tuple[PgvectorStore, asyncpg.Pool]]:
-    if not _DSN:
-        pytest.skip("AKB_VCHORD_TEST_DSN is required for VectorChord coverage")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_vchord_budget_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=4)
-    try:
-        store = PgvectorStore(
-            dsn=_database_dsn(name),
-            schema="vector_index",
-            dense_dim=4,
-            sparse_shape="vchord",
-        )
-        async with pool.acquire() as conn:
-            await store._do_ensure(conn)
+async def _store(
+    empty_vchord_template: TestDatabase,
+) -> AsyncIterator[tuple[PgvectorStore, asyncpg.Pool]]:
+    async with (
+        temporary_database(_DSN, "akb_vchord_budget_", template=empty_vchord_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
+    ):
+        store = PgvectorStore(dsn=database.dsn, schema="vector_index", dense_dim=4, sparse_shape="vchord")
         yield store, pool
-    finally:
-        await pool.close()
-        with contextlib.suppress(asyncpg.PostgresError):
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 @contextlib.asynccontextmanager
@@ -185,8 +168,8 @@ async def _acl_hits(
         )
 
 
-async def test_low_budget_preserves_materialized_acl_matches():
-    async with _store() as (store, pool):
+async def test_low_budget_preserves_materialized_acl_matches(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             target_vault, scoped_ids, _ = await _seed(store, conn)
             async with _candidate_budget(conn):
@@ -197,8 +180,8 @@ async def test_low_budget_preserves_materialized_acl_matches():
     assert set(hits) == scoped_ids
 
 
-async def test_low_budget_preserves_index_led_acl_matches():
-    async with _store() as (store, pool):
+async def test_low_budget_preserves_index_led_acl_matches(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             target_vault, scoped_ids, _ = await _seed(store, conn)
             async with _candidate_budget(conn):
@@ -209,8 +192,8 @@ async def test_low_budget_preserves_index_led_acl_matches():
     assert set(hits) == scoped_ids
 
 
-async def test_low_budget_preserves_source_type_matches():
-    async with _store() as (store, pool):
+async def test_low_budget_preserves_source_type_matches(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             _, scoped_ids, _ = await _seed(store, conn)
             async with _candidate_budget(conn):
@@ -227,8 +210,8 @@ async def test_low_budget_preserves_source_type_matches():
     assert set(hits) == scoped_ids
 
 
-async def test_low_budget_fills_requested_unfiltered_top_k():
-    async with _store() as (store, pool):
+async def test_low_budget_fills_requested_unfiltered_top_k(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             _, _, distractor_ids = await _seed(store, conn)
             async with _candidate_budget(conn):
@@ -327,8 +310,10 @@ async def _seed_rare(
 
 
 @pytest.mark.parametrize("prefilter", [True, False])
-async def test_index_led_acl_respects_prefilter_and_restores_pooled_budget(prefilter):
-    async with _store() as (store, pool):
+async def test_index_led_acl_respects_prefilter_and_restores_pooled_budget(
+    empty_vchord_template, prefilter,
+):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             target_vault, scoped_ids, _ = await _seed(store, conn)
             async with _record_queries(conn) as queries:
@@ -358,8 +343,8 @@ async def test_index_led_acl_respects_prefilter_and_restores_pooled_budget(prefi
 
 
 @pytest.mark.parametrize("prefilter", [True, False])
-async def test_source_type_filter_adapts_candidate_budget(prefilter):
-    async with _store() as (store, pool):
+async def test_source_type_filter_adapts_candidate_budget(empty_vchord_template, prefilter):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             _, scoped_ids, _ = await _seed(store, conn)
             async with _record_budget_calls() as budgets:
@@ -378,8 +363,8 @@ async def test_source_type_filter_adapts_candidate_budget(prefilter):
     assert budgets == ([5] if prefilter else [5, -1])
 
 
-async def test_filtered_short_page_uses_exact_fallback_in_order():
-    async with _store() as (store, pool):
+async def test_filtered_short_page_uses_exact_fallback_in_order(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             target_vault, scoped_ids = await _seed_rare(store, conn)
             async with _record_budget_calls() as budgets:
@@ -405,8 +390,8 @@ async def test_filtered_short_page_uses_exact_fallback_in_order():
     assert budgets == [5, -1]
 
 
-async def test_unknown_terms_use_exact_empty_fallback():
-    async with _store() as (store, pool):
+async def test_unknown_terms_use_exact_empty_fallback(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             await _seed(store, conn)
             async with _record_budget_calls() as budgets:
@@ -424,8 +409,8 @@ async def test_unknown_terms_use_exact_empty_fallback():
     assert budgets == [5, -1]
 
 
-async def test_zero_configured_budget_does_not_override_requested_top_k():
-    async with _store() as (store, pool):
+async def test_zero_configured_budget_does_not_override_requested_top_k(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             _, _, distractor_ids = await _seed(store, conn)
             async with _record_budget_calls() as budgets:
@@ -444,8 +429,8 @@ async def test_zero_configured_budget_does_not_override_requested_top_k():
     assert budgets == [5]
 
 
-async def test_overlarge_page_uses_exact_budget():
-    async with _store() as (store, pool):
+async def test_overlarge_page_uses_exact_budget(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             _, scoped_ids, distractor_ids = await _seed(store, conn)
             async with _record_budget_calls() as budgets:
@@ -463,8 +448,8 @@ async def test_overlarge_page_uses_exact_budget():
     assert budgets == [-1]
 
 
-async def test_configured_exact_budget_stays_on_direct_filtered_path():
-    async with _store() as (store, pool):
+async def test_configured_exact_budget_stays_on_direct_filtered_path(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             target_vault, scoped_ids, _ = await _seed(store, conn)
             async with _record_budget_calls() as budgets:
@@ -483,8 +468,8 @@ async def test_configured_exact_budget_stays_on_direct_filtered_path():
     assert restored == -1
 
 
-async def test_local_budget_restores_after_error():
-    async with _store() as (store, pool):
+async def test_local_budget_restores_after_error(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             await _seed(store, conn)
             original = pgvector_module._set_vchord_candidate_budget
@@ -525,8 +510,8 @@ async def test_local_budget_restores_after_error():
 
 
 @pytest.mark.parametrize("prefilter", [True, False])
-async def test_dead_index_entries_respect_prefilter_and_exact_fallback(prefilter):
-    async with _store() as (store, pool):
+async def test_dead_index_entries_respect_prefilter_and_exact_fallback(empty_vchord_template, prefilter):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             _, scoped_ids, distractor_ids = await _seed(store, conn)
             # Keep obsolete high-scoring index TIDs until the scan. No VACUUM:
@@ -560,13 +545,15 @@ async def test_dead_index_entries_respect_prefilter_and_exact_fallback(prefilter
     # Five scoped rows over a materialise cap of four: searched index-led.
     ("materialized", [5, -1]),
 ])
-async def test_every_exact_route_completes_and_restores_the_session(mode, expected_budgets):
+async def test_every_exact_route_completes_and_restores_the_session(
+    empty_vchord_template, mode, expected_budgets,
+):
     """A short page is completed, never refused, whatever led to exact work.
 
     The query term is in no row, so the complete answer is empty. Until akb#673
     each of these routes refused instead, because it measured the corpus.
     """
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             vault, _, _ = await _seed(store, conn)
             original_plan = await conn.fetchval("SHOW plan_cache_mode")
@@ -591,8 +578,8 @@ async def test_every_exact_route_completes_and_restores_the_session(mode, expect
             assert await conn.fetchval("SHOW search_path") == original_path
 
 
-async def test_small_materialized_scope_survives_large_global_corpus():
-    async with _store() as (store, pool):
+async def test_small_materialized_scope_survives_large_global_corpus(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             vault, scoped, _ = await _seed(store, conn)
             with pytest.MonkeyPatch.context() as mp:
@@ -601,7 +588,7 @@ async def test_small_materialized_scope_survives_large_global_corpus():
             assert set(hits) == scoped
 
 
-async def test_selective_scope_over_the_materialise_cap_is_answered_index_led():
+async def test_selective_scope_over_the_materialise_cap_is_answered_index_led(empty_vchord_template):
     """Which shape runs decides latency, never the rows (akb#626).
 
     A scope the estimator calls selective is materialised, and materialising is
@@ -618,7 +605,7 @@ async def test_selective_scope_over_the_materialise_cap_is_answered_index_led():
     target = uuid.UUID(int=0xA)
     other = uuid.UUID(int=0xB)
     scoped_ids: set[str] = set()
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             # Distinct lengths give distinct scores, so the top-k is one answer
             # rather than a choice among ties.
@@ -666,7 +653,7 @@ async def test_selective_scope_over_the_materialise_cap_is_answered_index_led():
 
 
 @pytest.mark.parametrize("filtered", [True, False], ids=["index-led", "unfiltered"])
-async def test_first_search_on_a_fresh_connection_reads_the_budget(filtered):
+async def test_first_search_on_a_fresh_connection_reads_the_budget(empty_vchord_template, filtered):
     """A connection's first search must not depend on an earlier one (akb#615).
 
     `vchord_bm25` defines `bm25_catalog.*` when its library loads, and the image
@@ -677,7 +664,7 @@ async def test_first_search_on_a_fresh_connection_reads_the_budget(filtered):
     branches that read the setting before their first extension call each run
     here on a connection that has never touched the extension.
     """
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             vault, scoped, distractors = await _seed(store, conn)
         fresh = await asyncpg.connect(store._dsn)
@@ -704,8 +691,8 @@ async def test_first_search_on_a_fresh_connection_reads_the_budget(filtered):
         assert set(hits) <= distractors
 
 
-async def test_exact_scan_timeout_restores_connection_and_stricter_server_budget():
-    async with _store() as (store, pool):
+async def test_exact_scan_timeout_restores_connection_and_stricter_server_budget(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             await _seed(store, conn)
             # Warm the extension and prepared statements before applying the
@@ -746,8 +733,8 @@ async def test_exact_scan_timeout_restores_connection_and_stricter_server_budget
 
 
 @pytest.mark.parametrize("phase", ["estimate", "ranking"])
-async def test_caller_deadline_cancels_and_restores_connection(phase):
-    async with _store() as (store, pool):
+async def test_caller_deadline_cancels_and_restores_connection(empty_vchord_template, phase):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             vault, _, _ = await _seed(store, conn)
             before = {key: await conn.fetchval(f"SHOW {key}") for key in (
@@ -783,9 +770,11 @@ async def test_caller_deadline_cancels_and_restores_connection(phase):
                 assert await conn.fetchval(f"SHOW {key}") == value
 
 
-async def test_real_large_corpus_keeps_finite_search_and_answers_an_unknown_term_exactly():
+async def test_real_large_corpus_keeps_finite_search_and_answers_an_unknown_term_exactly(
+    empty_vchord_template,
+):
     """10,001 rows: more than the 10,000-row corpus cap that used to refuse this."""
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO vector_index.chunks
@@ -815,8 +804,8 @@ async def test_real_large_corpus_keeps_finite_search_and_answers_an_unknown_term
                 assert int(await conn.fetchval("SHOW bm25_catalog.bm25_limit")) == 5
 
 
-async def test_finite_index_search_can_exceed_five_seconds_under_caller_budget():
-    async with _store() as (store, pool):
+async def test_finite_index_search_can_exceed_five_seconds_under_caller_budget(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             await _seed(store, conn)
             original = type(conn).fetch
@@ -845,14 +834,14 @@ async def test_finite_index_search_can_exceed_five_seconds_under_caller_budget()
 
 
 @pytest.mark.parametrize("dense_first", [True, False])
-async def test_short_sparse_page_is_completed_beside_the_dense_leg(dense_first):
+async def test_short_sparse_page_is_completed_beside_the_dense_leg(empty_vchord_template, dense_first):
     """A short sparse page used to end the search degraded; now it is completed.
 
     The sparse leg's finite page is short (thirty higher-scoring distractors
     outside the scope take its slots), so it runs the exact scan and returns
     every scoped match. Neither leg is lost, whichever finishes first.
     """
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             vault, scoped, distractors = await _seed(store, conn)
             dense_id = str(uuid.UUID(int=50))
@@ -904,8 +893,8 @@ async def test_short_sparse_page_is_completed_beside_the_dense_leg(dense_first):
             assert await conn.fetchval("SELECT 1") == 1
 
 
-async def test_sparse_only_search_with_a_short_page_is_complete():
-    async with _store() as (store, pool):
+async def test_sparse_only_search_with_a_short_page_is_complete(empty_vchord_template):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             vault, scoped, _ = await _seed(store, conn)
 
@@ -923,7 +912,7 @@ async def test_sparse_only_search_with_a_short_page_is_complete():
         assert {hit.chunk_id for hit in hits} == scoped
 
 
-async def test_rare_term_in_a_scope_over_the_cap_completes_exactly():
+async def test_rare_term_in_a_scope_over_the_cap_completes_exactly(empty_vchord_template):
     """akb#673: exact completion is sized by the query's matches, not the corpus.
 
     Two rows of the target vault hold the rare term, and no other row does; the
@@ -935,7 +924,7 @@ async def test_rare_term_in_a_scope_over_the_cap_completes_exactly():
     """
     target = uuid.UUID(int=0x73)
     scoped_ids: set[str] = set()
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             for ordinal in range(1, 3):
                 chunk_id = uuid.UUID(int=0x7300 + ordinal)
@@ -967,7 +956,7 @@ async def test_rare_term_in_a_scope_over_the_cap_completes_exactly():
     assert budgets == [5, -1]
 
 
-async def test_a_rebuilt_index_answers_a_bounded_page_in_full():
+async def test_a_rebuilt_index_answers_a_bounded_page_in_full(empty_vchord_template):
     """An index built over existing rows keeps every block reachable (akb#679).
 
     vchord_bm25 0.3.0 saved a full 128-posting block's summary before it
@@ -979,7 +968,7 @@ async def test_a_rebuilt_index_answers_a_bounded_page_in_full():
     completion.
     """
     target = uuid.UUID(int=0x75)
-    async with _store() as (store, pool):
+    async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO vector_index.chunks

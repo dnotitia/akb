@@ -31,7 +31,7 @@ from tests.test_sso_identity_operations_postgres import (
 )
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _PATH = "/api/v1/admin/sso/providers/workforce/client-credentials"
 _SECRET = "rotated-fixture-secret-must-never-be-stored"  # pragma: allowlist secret
 
@@ -75,16 +75,8 @@ class StatefulControl(Control):
 
 
 @pytest.fixture
-async def standalone(monkeypatch):
-    async with _fresh_database() as pool:
-        from app.db.postgres import _load_migration
-
-        for name in ("082_pending_admissions.py", "121_sso_identity_operations.py"):
-            migration = _load_migration(name)
-            assert migration is not None
-            async with pool.acquire() as conn:
-                await migration.migrate(conn=conn)
-
+async def standalone(monkeypatch, identity_operations_template):
+    async with _fresh_database(identity_operations_template) as pool:
         async def get_test_pool():
             return pool
 

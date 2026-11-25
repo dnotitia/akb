@@ -8,11 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib.util
 import inspect
-import os
 import uuid
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
@@ -41,109 +38,15 @@ from app.services.native_revision_service import (
     FAILPOINT_BOUNDARIES,
     NativeRevisionService,
 )
+from tests.helpers.native_revision_database import (
+    cloned_ledger_database,
+    native_derived_template as native_derived_template,
+)
 
 
 pytestmark = pytest.mark.asyncio
 
 _BACKEND = Path(__file__).resolve().parents[2]
-_INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
-_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "048_native_revision_core.py"
-_INDEXABLE_MIGRATIONS = (
-    _BACKEND / "app" / "db" / "migrations" / "005_qdrant_index.py",
-    _BACKEND / "app" / "db" / "migrations" / "006_indexable_chunks.py",
-)
-_BODY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "053_native_revision_m1_pg_body.py"
-_PLACEMENT_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "057_native_revision_m1_payload_placement.py"
-_DERIVED_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "054_native_revision_searchable_derived.py"
-_FILE_DERIVED_MIGRATION = (
-    _BACKEND / "app" / "db" / "migrations" / "059_native_file_searchable_derived.py"
-)
-_WRITE_POLICY_MIGRATION = _BACKEND / "app" / "db" / "migrations" / "044_vault_write_policy.py"
-# The document write path publishes image references; 107 is what gives a
-# Native document a column to publish into.
-_ASSET_REF_MIGRATION = (
-    _BACKEND / "app" / "db" / "migrations" / "107_native_document_asset_refs.py"
-)
-_DSN = os.environ.get(
-    "AKB_TEST_DSN",
-    "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
-)
-
-
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
-
-
-def _load_migration(path: Path = _MIGRATION):
-    spec = importlib.util.spec_from_file_location("native_revision_migration", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-@asynccontextmanager
-async def _fresh_database(*, with_derived: bool = False, pool_max_size: int = 8):
-    if not await _can_connect():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    admin = await asyncpg.connect(_DSN)
-    # The disposable database must carry the measurement prefix. Migration 057
-    # self-disables on any other name, so a fixture called `akb_native_*`
-    # silently kept migration 053's one-placement-per-namespace trigger — a
-    # schema no native write can ever actually meet, because `app/config.py`
-    # and `revision_backend._assert_native_measurement_safety()` refuse the
-    # native arm unless `db_name` is exactly `akb_revision_m1_measurement`.
-    # Naming the fixture this way makes it the same 048+053+057 schema the
-    # only legal native-write deployment has, which is what P1's deliberately
-    # mixed-placement namespaces need.
-    name = f"akb_revision_m1_measurement_bcore_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    dsn = _database_dsn(name)
-    conn = await asyncpg.connect(dsn)
-    pool = None
-    try:
-        await conn.execute(_INIT_SQL)
-        await _load_migration(_MIGRATION.with_name("015_events_outbox.py")).migrate(conn=conn)
-        migration = _load_migration()
-        await migration.migrate(conn=conn)
-        await migration.migrate(conn=conn)  # idempotent startup/retry
-        await _load_migration(_BODY_MIGRATION).migrate(conn=conn)
-        await _load_migration(_PLACEMENT_MIGRATION).migrate(conn=conn)
-        await _load_migration(_ASSET_REF_MIGRATION).migrate(conn=conn)
-        if with_derived:
-            for path in _INDEXABLE_MIGRATIONS:
-                await _load_migration(path).migrate(conn=conn)
-            await _load_migration(_WRITE_POLICY_MIGRATION).migrate(conn=conn)
-            await _load_migration(_DERIVED_MIGRATION).migrate(conn=conn)
-            await _load_migration(_FILE_DERIVED_MIGRATION).migrate(conn=conn)
-        await conn.close()
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=pool_max_size)
-        async with pool.acquire() as seeded:
-            vault_id = await seeded.fetchval(
-                "INSERT INTO vaults (name, git_path) VALUES ($1, $2) RETURNING id",
-                f"native-{uuid.uuid4().hex}",
-                "/tmp/legacy-unused.git",
-            )
-        yield pool, vault_id
-    finally:
-        if pool is not None:
-            await pool.close()
-        elif not conn.is_closed():
-            await conn.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 def _create_args(vault_id: uuid.UUID, *, mutation_id: uuid.UUID | None = None) -> dict:
@@ -192,8 +95,9 @@ async def test_create_text_public_signature_does_not_expose_a_connection() -> No
     assert "conn" not in inspect.signature(NativeRevisionService.create_text).parameters
 
 
-async def test_create_text_in_conn_rejects_connection_outside_a_transaction() -> None:
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_create_text_in_conn_rejects_connection_outside_a_transaction(native_template) -> None:
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         async with pool.acquire() as conn:
             with pytest.raises(ValidationError, match="active transaction"):
@@ -210,8 +114,9 @@ async def test_create_text_in_conn_rejects_connection_outside_a_transaction() ->
             assert await conn.fetchval("SELECT COUNT(*) FROM m1_reference_payloads") == 0
 
 
-async def test_create_text_in_conn_rejects_default_reference_payload_store() -> None:
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_create_text_in_conn_rejects_default_reference_payload_store(native_template) -> None:
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -229,8 +134,9 @@ async def test_create_text_in_conn_rejects_default_reference_payload_store() -> 
             assert await conn.fetchval("SELECT COUNT(*) FROM m1_reference_payloads") == 0
 
 
-async def test_create_text_in_conn_does_not_report_caller_transaction_as_committed() -> None:
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_create_text_in_conn_does_not_report_caller_transaction_as_committed(native_template) -> None:
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         seen: list[str] = []
 
         async def record(name: str) -> None:
@@ -263,8 +169,9 @@ async def test_create_text_in_conn_does_not_report_caller_transaction_as_committ
         ]
 
 
-async def test_create_get_replace_are_native_atomic_and_leave_legacy_projection_untouched():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_create_get_replace_are_native_atomic_and_leave_legacy_projection_untouched(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             legacy_id = await conn.fetchval(
                 """
@@ -345,8 +252,9 @@ async def test_create_get_replace_are_native_atomic_and_leave_legacy_projection_
         assert all(row["revision_id"] == row["activity_revision"] == row["intent_revision"] for row in rows)
 
 
-async def test_same_base_replace_has_one_winner_without_vault_write_lane():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_same_base_replace_has_one_winner_without_vault_write_lane(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         created = await service.create_text(**_create_args(vault_id))
 
@@ -382,8 +290,9 @@ async def test_same_base_replace_has_one_winner_without_vault_write_lane():
         }
 
 
-async def test_same_path_create_has_one_winner_and_distinct_paths_do_not_share_a_vault_lock():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_same_path_create_has_one_winner_and_distinct_paths_do_not_share_a_vault_lock(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
 
         same_path = await asyncio.gather(
@@ -402,8 +311,9 @@ async def test_same_path_create_has_one_winner_and_distinct_paths_do_not_share_a
         assert {item.path for item in extra} == {"notes/left.md", "notes/right.md"}
 
 
-async def test_document_and_file_cannot_own_the_same_namespace_path():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_document_and_file_cannot_own_the_same_namespace_path(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         document = _create_args(vault_id)
         file = _create_args(vault_id)
@@ -431,8 +341,9 @@ async def test_document_and_file_cannot_own_the_same_namespace_path():
             )
 
 
-async def test_create_retires_a_cross_surface_alias_before_claiming_its_path():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_create_retires_a_cross_surface_alias_before_claiming_its_path(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         file_args = _create_args(vault_id)
         file_args["surface"] = "file"
@@ -482,8 +393,9 @@ async def test_create_retires_a_cross_surface_alias_before_claiming_its_path():
         assert retired["retired_revision_id"] == document.revision_id
 
 
-async def test_move_rejects_a_destination_alias_owned_by_another_surface():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_move_rejects_a_destination_alias_owned_by_another_surface(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         file_args = _create_args(vault_id)
         file_args["surface"] = "file"
@@ -520,8 +432,9 @@ async def test_move_rejects_a_destination_alias_owned_by_another_surface():
         assert current.revision_id == document.revision_id
 
 
-async def test_waiting_unpinned_replacements_publish_monotonic_lineage_time():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_waiting_unpinned_replacements_publish_monotonic_lineage_time(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         created = await NativeRevisionService(pool).create_text(**_create_args(vault_id))
         first_holds_lock = asyncio.Event()
         release_first = asyncio.Event()
@@ -570,8 +483,9 @@ async def test_waiting_unpinned_replacements_publish_monotonic_lineage_time():
         assert [row["occurred_at"] for row in chronological] == sorted(row["occurred_at"] for row in chronological)
 
 
-async def test_public_metadata_and_hash_pinned_body_updates_recompute_and_serialize():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_public_metadata_and_hash_pinned_body_updates_recompute_and_serialize(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -646,12 +560,14 @@ async def test_public_metadata_and_hash_pinned_body_updates_recompute_and_serial
         assert current.content == "second"
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_is_postgres_only_and_wires_owner_and_public_access(
+    native_template,
     monkeypatch,
     tmp_path,
 ):
     """The guarded public create path must not materialize legacy Git state."""
-    async with _fresh_database() as (pool, _):
+    async with cloned_ledger_database(native_template) as (pool, _):
         from app.config import settings
         from app.services import native_document_service as native_documents
 
@@ -704,8 +620,11 @@ async def test_native_vault_create_is_postgres_only_and_wires_owner_and_public_a
         assert list(tmp_path.iterdir()) == []
 
 
-async def test_native_vault_create_seeds_exact_canonical_skill_in_one_pg_slot(tmp_path, monkeypatch):
-    async with _fresh_database(pool_max_size=1) as (pool, _):
+@pytest.mark.live_services
+async def test_native_vault_create_seeds_exact_canonical_skill_in_one_pg_slot(
+    native_template, tmp_path, monkeypatch,
+):
+    async with cloned_ledger_database(native_template, pool_max_size=1) as (pool, _):
         from app.config import settings
         from app.services import native_document_service as native_documents
 
@@ -807,9 +726,10 @@ async def test_native_vault_create_seeds_exact_canonical_skill_in_one_pg_slot(tm
         assert list(tmp_path.iterdir()) == []
 
 
-async def test_native_vault_create_syncs_scoped_pat_inside_one_connection(monkeypatch):
+@pytest.mark.live_services
+async def test_native_vault_create_syncs_scoped_pat_inside_one_connection(native_template, monkeypatch):
     """A one-slot pool proves strict RoleSync never acquires a second slot."""
-    async with _fresh_database(pool_max_size=1) as (pool, _):
+    async with cloned_ledger_database(native_template, pool_max_size=1) as (pool, _):
         from app.services import native_document_service as native_documents
         from app.services.role_sync import (
             RoleSync,
@@ -870,8 +790,9 @@ async def test_native_vault_create_syncs_scoped_pat_inside_one_connection(monkey
                 await role_sync._drop_role_if_present(conn, user_role_name(owner_id))
 
 
-async def test_role_sync_concurrent_missing_owner_and_token_roles_are_idempotent():
-    async with _fresh_database(pool_max_size=4) as (pool, _):
+@pytest.mark.live_services
+async def test_role_sync_concurrent_missing_owner_and_token_roles_are_idempotent(native_template):
+    async with cloned_ledger_database(native_template, pool_max_size=4) as (pool, _):
         from app.services.role_sync import RoleSync, token_role_name, user_role_name
 
         role_sync = RoleSync(pool)
@@ -909,8 +830,9 @@ async def test_role_sync_concurrent_missing_owner_and_token_roles_are_idempotent
                     await role_sync._drop_role_if_present(conn, role)
 
 
-async def test_native_vault_create_concurrent_same_name_returns_one_conflict(monkeypatch):
-    async with _fresh_database(pool_max_size=2) as (pool, _):
+@pytest.mark.live_services
+async def test_native_vault_create_concurrent_same_name_returns_one_conflict(native_template, monkeypatch):
+    async with cloned_ledger_database(native_template, pool_max_size=2) as (pool, _):
         from app.repositories.vault_repo import VaultRepository
         from app.services import native_document_service as native_documents
 
@@ -963,12 +885,14 @@ async def test_native_vault_create_concurrent_same_name_returns_one_conflict(mon
             ) == 1
 
 
+@pytest.mark.live_services
 async def test_public_delete_removes_native_vault_authority_and_derived_state(
+    native_derived_template,
     monkeypatch,
     tmp_path,
 ):
     """The normal public delete path must close the entire native vault tree."""
-    async with _fresh_database(with_derived=True) as (pool, _):
+    async with cloned_ledger_database(native_derived_template) as (pool, _):
         from app.config import settings
         from app.db import postgres as postgres
         from app.services import access_service, native_document_service as native_documents
@@ -1071,7 +995,9 @@ async def test_public_delete_removes_native_vault_authority_and_derived_state(
         assert created.path == "notes/native.md"
 
 
+@pytest.mark.live_services
 async def test_public_delete_tombstones_native_text_file_derived_chunks(
+    native_derived_template,
     monkeypatch,
     tmp_path,
 ):
@@ -1083,7 +1009,7 @@ async def test_public_delete_tombstones_native_text_file_derived_chunks(
     ``vector_delete_outbox``.  ``index_service.delete_vault_chunks`` is the only
     thing standing between that and orphaned vector points.
     """
-    async with _fresh_database(with_derived=True) as (pool, _):
+    async with cloned_ledger_database(native_derived_template) as (pool, _):
         from app.config import settings
         from app.db import postgres as postgres
         from app.services import access_service, native_document_service as native_documents
@@ -1202,8 +1128,9 @@ async def test_public_delete_tombstones_native_text_file_derived_chunks(
                 ) == 0
 
 
-async def test_native_vault_create_rolls_back_catalog_row_when_role_sync_raises(monkeypatch):
-    async with _fresh_database() as (pool, _):
+@pytest.mark.live_services
+async def test_native_vault_create_rolls_back_catalog_row_when_role_sync_raises(native_template, monkeypatch):
+    async with cloned_ledger_database(native_template) as (pool, _):
         from app.services import native_document_service as native_documents
 
         class _FailingRoleSync:
@@ -1220,10 +1147,12 @@ async def test_native_vault_create_rolls_back_catalog_row_when_role_sync_raises(
         await _assert_native_vault_creation_rolled_back(pool, vault_name)
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_rolls_back_catalog_row_when_strict_role_sync_is_cancelled(
+    native_template,
     monkeypatch,
 ):
-    async with _fresh_database() as (pool, _):
+    async with cloned_ledger_database(native_template) as (pool, _):
         from app.services import native_document_service as native_documents
 
         started = asyncio.Event()
@@ -1244,8 +1173,11 @@ async def test_native_vault_create_rolls_back_catalog_row_when_strict_role_sync_
         await _assert_native_vault_creation_rolled_back(pool, vault_name)
 
 
-async def test_native_vault_create_seed_failure_rolls_back_every_fact_and_payload(monkeypatch):
-    async with _fresh_database() as (pool, _):
+@pytest.mark.live_services
+async def test_native_vault_create_seed_failure_rolls_back_every_fact_and_payload(
+    native_template, monkeypatch,
+):
+    async with cloned_ledger_database(native_template) as (pool, _):
         from app.services import native_document_service as native_documents
 
         class _RoleSync:
@@ -1267,8 +1199,11 @@ async def test_native_vault_create_seed_failure_rolls_back_every_fact_and_payloa
         await _assert_native_vault_creation_rolled_back(pool, vault_name)
 
 
-async def test_native_vault_create_seed_cancellation_rolls_back_every_fact_and_payload(monkeypatch):
-    async with _fresh_database(pool_max_size=1) as (pool, _):
+@pytest.mark.live_services
+async def test_native_vault_create_seed_cancellation_rolls_back_every_fact_and_payload(
+    native_template, monkeypatch,
+):
+    async with cloned_ledger_database(native_template, pool_max_size=1) as (pool, _):
         from app.services import native_document_service as native_documents
 
         class _RoleSync:
@@ -1298,8 +1233,11 @@ async def test_native_vault_create_seed_cancellation_rolls_back_every_fact_and_p
         await _assert_native_vault_creation_rolled_back(pool, vault_name)
 
 
-async def test_native_vault_create_cancellation_rolls_back_actual_role_sync_state(monkeypatch):
-    async with _fresh_database() as (pool, _):
+@pytest.mark.live_services
+async def test_native_vault_create_cancellation_rolls_back_actual_role_sync_state(
+    native_template, monkeypatch,
+):
+    async with cloned_ledger_database(native_template) as (pool, _):
         from app.services import native_document_service as native_documents
         from app.services.role_sync import (
             RoleSync,
@@ -1371,8 +1309,9 @@ async def test_native_vault_create_cancellation_rolls_back_actual_role_sync_stat
         assert live_roles == set()
 
 
-async def test_concurrent_unpinned_disjoint_edits_recompute_and_both_survive():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_concurrent_unpinned_disjoint_edits_recompute_and_both_survive(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -1426,11 +1365,13 @@ async def test_concurrent_unpinned_disjoint_edits_recompute_and_both_survive():
         assert current.content == "ALPHA one\nBETA two"
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("operation", ["update", "edit"])
 async def test_unpinned_public_mutation_survives_more_than_four_successive_head_races(
+    native_template,
     operation: str,
 ):
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -1499,8 +1440,9 @@ async def test_unpinned_public_mutation_survives_more_than_four_successive_head_
             assert current.content == "omega body"
 
 
-async def test_content_hash_only_update_retries_across_metadata_head_change():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_content_hash_only_update_retries_across_metadata_head_change(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -1555,8 +1497,9 @@ async def test_content_hash_only_update_retries_across_metadata_head_change():
         assert current.content == "stable body"
 
 
-async def test_content_hash_only_update_conflicts_after_concurrent_body_change():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_content_hash_only_update_conflicts_after_concurrent_body_change(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -1611,8 +1554,9 @@ async def test_content_hash_only_update_conflicts_after_concurrent_body_change()
         assert current.content == "changed body"
 
 
-async def test_expected_commit_update_remains_single_attempt_across_head_race():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_expected_commit_update_remains_single_attempt_across_head_race(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -1672,8 +1616,9 @@ async def test_expected_commit_update_remains_single_attempt_across_head_race():
         assert current.title == "Original title"
 
 
-async def test_public_move_retries_a_concurrent_rename_and_preserves_unspecified_slug():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_public_move_retries_a_concurrent_rename_and_preserves_unspecified_slug(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -1726,8 +1671,9 @@ async def test_public_move_retries_a_concurrent_rename_and_preserves_unspecified
         assert moved.current_commit == current.current_commit
 
 
-async def test_public_move_retry_keeps_resource_identity_after_alias_shadowing_create():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_public_move_retry_keeps_resource_identity_after_alias_shadowing_create(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -1804,8 +1750,9 @@ async def test_public_move_retry_keeps_resource_identity_after_alias_shadowing_c
         assert "replacement body" in replacement.text
 
 
-async def test_collection_only_move_reallocates_after_destination_authority_race():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_collection_only_move_reallocates_after_destination_authority_race(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -1890,8 +1837,9 @@ async def test_collection_only_move_reallocates_after_destination_authority_race
             )
 
 
-async def test_collection_only_move_searches_beyond_all_uuid_path_candidates():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_collection_only_move_searches_beyond_all_uuid_path_candidates(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -1953,8 +1901,9 @@ async def test_collection_only_move_searches_beyond_all_uuid_path_candidates():
         ).path == expected
 
 
-async def test_public_move_response_hash_is_derived_from_the_committed_head():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_public_move_response_hash_is_derived_from_the_committed_head(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -2010,8 +1959,9 @@ async def test_public_move_response_hash_is_derived_from_the_committed_head():
         assert moved.content_hash == current.content_hash
 
 
-async def test_explicit_slug_put_conflicts_when_base_is_claimed_after_precheck():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_explicit_slug_put_conflicts_when_base_is_claimed_after_precheck(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -2066,8 +2016,9 @@ async def test_explicit_slug_put_conflicts_when_base_is_claimed_after_precheck()
         ]
 
 
-async def test_concurrent_title_derived_puts_allocate_distinct_paths():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_concurrent_title_derived_puts_allocate_distinct_paths(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -2113,8 +2064,9 @@ async def test_concurrent_title_derived_puts_allocate_distinct_paths():
             )
 
 
-async def test_create_reuses_a_move_alias_and_atomically_retires_the_redirect():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_create_reuses_a_move_alias_and_atomically_retires_the_redirect(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         created = await service.create_text(**_create_args(vault_id))
         moved = await service.move_text(
@@ -2158,8 +2110,9 @@ async def test_create_reuses_a_move_alias_and_atomically_retires_the_redirect():
         assert retired["retired_at"] is not None
 
 
-async def test_alias_delete_competing_with_current_path_update_has_no_raw_pg_deadlock():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_alias_delete_competing_with_current_path_update_has_no_raw_pg_deadlock(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         await service.create_text(**_create_args(vault_id))
         await service.move_text(
@@ -2235,8 +2188,9 @@ async def test_alias_delete_competing_with_current_path_update_has_no_raw_pg_dea
         )
 
 
-async def test_post_prepare_failpoint_is_distinct_and_precedes_authority_entry():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_post_prepare_failpoint_is_distinct_and_precedes_authority_entry(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         seen: list[str] = []
 
         async def stop_before_authority(name: str) -> None:
@@ -2261,6 +2215,7 @@ async def test_post_prepare_failpoint_is_distinct_and_precedes_authority_entry()
         }
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     "boundary",
     [
@@ -2274,8 +2229,8 @@ async def test_post_prepare_failpoint_is_distinct_and_precedes_authority_entry()
         "authority.before_commit",
     ],
 )
-async def test_authority_failpoints_rollback_every_published_fact(boundary: str):
-    async with _fresh_database() as (pool, vault_id):
+async def test_authority_failpoints_rollback_every_published_fact(native_template, boundary: str):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         seen: list[str] = []
 
         async def failpoint(name: str) -> None:
@@ -2302,6 +2257,7 @@ async def test_authority_failpoints_rollback_every_published_fact(boundary: str)
             assert await conn.fetchval("SELECT count(*) FROM m1_reference_payloads") == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     "boundary",
     [
@@ -2310,8 +2266,8 @@ async def test_authority_failpoints_rollback_every_published_fact(boundary: str)
         "authority.before_commit",
     ],
 )
-async def test_move_failpoints_rollback_head_path_alias_and_activity(boundary: str):
-    async with _fresh_database() as (pool, vault_id):
+async def test_move_failpoints_rollback_head_path_alias_and_activity(native_template, boundary: str):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         created = await NativeRevisionService(pool).create_text(**_create_args(vault_id))
 
         async def failpoint(name: str) -> None:
@@ -2347,9 +2303,10 @@ async def test_move_failpoints_rollback_head_path_alias_and_activity(boundary: s
         }
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("boundary", ["authority.after_alias", "authority.before_commit"])
-async def test_delete_failpoints_preserve_live_resource_and_alias(boundary: str):
-    async with _fresh_database() as (pool, vault_id):
+async def test_delete_failpoints_preserve_live_resource_and_alias(native_template, boundary: str):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         created = await service.create_text(**_create_args(vault_id))
         moved = await service.move_text(
@@ -2394,8 +2351,9 @@ async def test_delete_failpoints_preserve_live_resource_and_alias(boundary: str)
             )
 
 
-async def test_committed_response_lost_retry_returns_same_revision_once():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_committed_response_lost_retry_returns_same_revision_once(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         fired = False
 
         async def failpoint(name: str) -> None:
@@ -2424,7 +2382,8 @@ async def test_committed_response_lost_retry_returns_same_revision_once():
             await service.create_text(**changed)
 
 
-async def test_document_facade_failpoint_seam_reaches_put_and_update_boundaries():
+@pytest.mark.live_services
+async def test_document_facade_failpoint_seam_reaches_put_and_update_boundaries(native_template):
     """C5 must be injectable through the Document facade, not only under it.
 
     The facade builds its own ``NativeRevisionService`` per call, so before
@@ -2433,7 +2392,7 @@ async def test_document_facade_failpoint_seam_reaches_put_and_update_boundaries(
     order for both mutations so a boundary that stops firing is a failure
     rather than a silently shorter list.
     """
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -2500,6 +2459,7 @@ async def test_document_facade_failpoint_seam_reaches_put_and_update_boundaries(
         }
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     ("boundary", "error"),
     [
@@ -2512,10 +2472,11 @@ async def test_document_facade_failpoint_seam_reaches_put_and_update_boundaries(
     ],
 )
 async def test_document_facade_injected_failure_surfaces_without_a_retry_loop_hang(
+    native_template,
     boundary: str, error: Exception,
 ):
     assert boundary in FAILPOINT_BOUNDARIES
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -2548,8 +2509,9 @@ async def test_document_facade_injected_failure_surfaces_without_a_retry_loop_ha
         }
 
 
-async def test_create_idempotency_fingerprint_includes_requested_resource_identity():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_create_idempotency_fingerprint_includes_requested_resource_identity(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         mutation_id = uuid.uuid4()
         first_resource_id = uuid.uuid4()
         second_resource_id = uuid.uuid4()
@@ -2565,8 +2527,9 @@ async def test_create_idempotency_fingerprint_includes_requested_resource_identi
             await service.create_text(**changed)
 
 
-async def test_reference_payload_verifies_digest_size_and_utf8_before_authority_tx():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_reference_payload_verifies_digest_size_and_utf8_before_authority_tx(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         store = M1ReferencePayloadStore(pool)
         body = "한글 payload\n".encode()
         digest = hashlib.sha256(body).hexdigest()
@@ -2592,9 +2555,12 @@ async def test_reference_payload_verifies_digest_size_and_utf8_before_authority_
             await store.prepare_text(namespace_id=vault_id, payload=body, expected_size=len(body) + 1)
 
 
-async def test_default_reference_payload_document_is_applied_to_searchable_derived_state():
+@pytest.mark.live_services
+async def test_default_reference_payload_document_is_applied_to_searchable_derived_state(
+    native_derived_template,
+):
     """Default M1 reference placement must be verified by its own adapter."""
-    async with _fresh_database(with_derived=True) as (pool, vault_id):
+    async with cloned_ledger_database(native_derived_template) as (pool, vault_id):
         created = await NativeRevisionService(pool).create_text(
             namespace_id=vault_id,
             surface="document",
@@ -2679,9 +2645,10 @@ async def _head_placement(pool: asyncpg.Pool, resource_id: uuid.UUID) -> str:
         )
 
 
-async def test_facade_document_body_lands_on_the_pg_body_store_and_still_deduplicates():
+@pytest.mark.live_services
+async def test_facade_document_body_lands_on_the_pg_body_store_and_still_deduplicates(native_template):
     """P1 unification: a Document written through the facade is a PG BodyStore body."""
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         _owner_id, vault = await _owned_vault(pool, vault_id)
         documents = NativeDocumentService(pool=pool)
         created = await documents.put(
@@ -2750,7 +2717,8 @@ async def test_facade_document_body_lands_on_the_pg_body_store_and_still_dedupli
         ]
 
 
-async def test_mixed_placement_namespace_stays_readable_across_every_native_reader():
+@pytest.mark.live_services
+async def test_mixed_placement_namespace_stays_readable_across_every_native_reader(native_template):
     """A pre-P1 body and a post-P1 body must coexist in one namespace.
 
     Migrating historical rows is explicitly not part of P1, so the reference
@@ -2759,7 +2727,7 @@ async def test_mixed_placement_namespace_stays_readable_across_every_native_read
     a pinned read of the old Revision, a diff that spans the placement change,
     the recent-changes list, and grep all have to keep verifying.
     """
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         owner_id, vault = await _owned_vault(pool, vault_id)
         documents = NativeDocumentService(pool=pool)
         backend = NativeRevisionBackend(pool=pool, document_service=documents)
@@ -2878,7 +2846,8 @@ async def test_mixed_placement_namespace_stays_readable_across_every_native_read
         }
 
 
-async def test_recent_changes_refuses_a_body_that_no_longer_matches_its_manifest():
+@pytest.mark.live_services
+async def test_recent_changes_refuses_a_body_that_no_longer_matches_its_manifest(native_template):
     """recent_changes must verify, not decode-and-trust.
 
     The schema already blocks this corruption (a CHECK on the stored digest
@@ -2886,7 +2855,7 @@ async def test_recent_changes_refuses_a_body_that_no_longer_matches_its_manifest
     its disposable database to prove the read path does not depend on them —
     the same fail-closed contract grep, search, and the derived worker hold.
     """
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         owner_id, vault = await _owned_vault(pool, vault_id)
         documents = NativeDocumentService(pool=pool)
         backend = NativeRevisionBackend(pool=pool, document_service=documents)
@@ -2932,8 +2901,9 @@ async def test_recent_changes_refuses_a_body_that_no_longer_matches_its_manifest
             await backend.recent_changes(str(owner_id), vault=vault, limit=5)
 
 
-async def test_schema_enforces_revision_identity_head_ownership_and_immutable_facts():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_schema_enforces_revision_identity_head_ownership_and_immutable_facts(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         one = await service.create_text(**_create_args(vault_id))
         other_args = _create_args(vault_id)
@@ -2969,8 +2939,9 @@ async def test_schema_enforces_revision_identity_head_ownership_and_immutable_fa
                 )
 
 
-async def test_revision_id_collision_is_retried_as_identity_not_path_conflict(monkeypatch):
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_revision_id_collision_is_retried_as_identity_not_path_conflict(native_template, monkeypatch):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         first = await service.create_text(**_create_args(vault_id))
         allocated_after_retry = "f" * 40
@@ -2985,8 +2956,9 @@ async def test_revision_id_collision_is_retried_as_identity_not_path_conflict(mo
         assert (await _authority_counts(pool))["native_revisions"] == 2
 
 
-async def test_vault_delete_cascades_the_experimental_native_subtree():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_vault_delete_cascades_the_experimental_native_subtree(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
         await service.create_text(**_create_args(vault_id))
         async with pool.acquire() as conn:
@@ -3013,8 +2985,11 @@ async def test_native_substrate_has_no_git_legacy_projection_or_write_lane_depen
         assert forbidden not in source
 
 
-async def test_full_native_document_lifecycle_preserves_compatibility_without_git_or_legacy_projection():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_full_native_document_lifecycle_preserves_compatibility_without_git_or_legacy_projection(
+    native_template,
+):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -3202,8 +3177,9 @@ async def test_full_native_document_lifecycle_preserves_compatibility_without_gi
         assert browsed.items[0].content_hash
 
 
-async def test_native_browse_uses_native_heads_for_collection_root_and_depth():
-    async with _fresh_database() as (pool, vault_id):
+@pytest.mark.live_services
+async def test_native_browse_uses_native_heads_for_collection_root_and_depth(native_template):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
             await conn.execute(
@@ -3292,7 +3268,8 @@ async def test_native_browse_uses_native_heads_for_collection_root_and_depth():
         }
 
 
-async def test_vault_activity_and_recent_changes_are_scoped_to_the_document_surface():
+@pytest.mark.live_services
+async def test_vault_activity_and_recent_changes_are_scoped_to_the_document_surface(native_template):
     """R5: a bridged text-File publication must not leak into a Document feed.
 
     Legacy's ``vault_log`` never emits a text-File revision as a Document
@@ -3301,7 +3278,7 @@ async def test_vault_activity_and_recent_changes_are_scoped_to_the_document_surf
     ``native_revision_activity`` table (the File row is real C3 provenance,
     not a bug), so the Document-facing reads must filter it back out.
     """
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -3364,7 +3341,10 @@ async def test_vault_activity_and_recent_changes_are_scoped_to_the_document_surf
         assert [entry["hash"] for entry in doc_scoped] == [created.commit_hash]
 
 
-async def test_resolve_live_reference_treats_a_uuid_shaped_ref_as_resource_id_scoped_to_surface():
+@pytest.mark.live_services
+async def test_resolve_live_reference_treats_a_uuid_shaped_ref_as_resource_id_scoped_to_surface(
+    native_template,
+):
     """R6: mirror legacy's dual (id OR path) reference semantics natively.
 
     ``document_repo.DocumentRepository._MATCH_WHERE`` accepts either the
@@ -3373,7 +3353,7 @@ async def test_resolve_live_reference_treats_a_uuid_shaped_ref_as_resource_id_sc
     `find_by_ref`). The native resolver must do the same, without letting a
     File's resource_id resolve as a Document reference (or vice versa).
     """
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         repository = NativeRevisionRepository(pool)
         service = NativeRevisionService(pool)
 
@@ -3430,7 +3410,8 @@ async def test_resolve_live_reference_treats_a_uuid_shaped_ref_as_resource_id_sc
         assert by_path["resource_id"] == document.resource_id
 
 
-async def test_recent_changes_doc_id_round_trips_through_get_and_get_at_commit():
+@pytest.mark.live_services
+async def test_recent_changes_doc_id_round_trips_through_get_and_get_at_commit(native_template):
     """R6: the ``doc_id`` recent_changes hands out must feed back into akb_get.
 
     ``NativeRevisionBackend.recent_changes`` returns
@@ -3438,7 +3419,7 @@ async def test_recent_changes_doc_id_round_trips_through_get_and_get_at_commit()
     ``doc_ref`` used to 404 on the native arm even though the identical
     round-trip works on legacy (`_MATCH_WHERE` accepts the id form too).
     """
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
             vault = await conn.fetchval("SELECT name FROM vaults WHERE id = $1", vault_id)
 
@@ -3490,7 +3471,8 @@ async def test_recent_changes_doc_id_round_trips_through_get_and_get_at_commit()
             await document_service.get(vault, str(uuid.uuid4()))
 
 
-async def test_uuid_named_text_file_publishes_and_deletes_through_the_bridge():
+@pytest.mark.live_services
+async def test_uuid_named_text_file_publishes_and_deletes_through_the_bridge(native_template):
     """R6 fall-through regression guard: a File's logical path may itself be
     a bare UUID string, and its delete must still resolve it — by path.
 
@@ -3508,7 +3490,7 @@ async def test_uuid_named_text_file_publishes_and_deletes_through_the_bridge():
     functions, not just NativeRevisionService, to reproduce the exact call
     shape production hits.
     """
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         uuid_name = "550e8400-e29b-41d4-a716-446655440000"
         data = b"uuid-named file body\n"
         digest = hashlib.sha256(data).hexdigest()
@@ -3558,7 +3540,8 @@ async def test_uuid_named_text_file_publishes_and_deletes_through_the_bridge():
             )
 
 
-async def test_resolve_live_reference_id_branch_respects_lifecycle_and_namespace():
+@pytest.mark.live_services
+async def test_resolve_live_reference_id_branch_respects_lifecycle_and_namespace(native_template):
     """The id branch must not resurrect a deleted Resource or leak across vaults.
 
     A live, correctly-surfaced resource_id resolves (already covered
@@ -3566,7 +3549,7 @@ async def test_resolve_live_reference_id_branch_respects_lifecycle_and_namespace
     Resource has since been deleted, and a resource_id that is live but
     belongs to a different namespace.
     """
-    async with _fresh_database() as (pool, vault_id):
+    async with cloned_ledger_database(native_template) as (pool, vault_id):
         repository = NativeRevisionRepository(pool)
         service = NativeRevisionService(pool)
 

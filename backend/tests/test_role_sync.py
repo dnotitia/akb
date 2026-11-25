@@ -2,8 +2,8 @@
 
 Talk to a real Postgres (mocks don't catch GRANT semantics) but stay
 focused on RoleSync invariants — no service layer, no HTTP, no
-lifecycle wiring. Each test acquires its own pool, applies init.sql
-to a throwaway DB or the dev DB, and cleans up after itself.
+lifecycle wiring. Each test opens its own pool on a disposable clone
+of the schema initialized by init.sql.
 
 DSN comes from ``AKB_TEST_DSN`` (default
 ``postgresql://akb:akb@localhost:15432/akb`` to match the dev override).  # pragma: allowlist secret
@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import os
 import uuid
-from pathlib import Path
 
 import asyncpg
 import pytest
 import pytest_asyncio
+
+from tests.helpers.pg_database import (
+    temporary_database,
+)
 
 from app.services.role_sync import (
     AUTHENTICATED_ROLE,
@@ -39,27 +42,11 @@ _DSN = os.environ.get(
 )
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 @pytest_asyncio.fixture
-async def pool():
-    from tests.test_boot_schema_serialization_pg import _empty_database
-    async with _empty_database() as dsn:
-        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
-        init_sql = (Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql").read_text()
-        async with pool.acquire() as conn:
-            await conn.execute(init_sql)
-        try:
+async def pool(base_schema_template):
+    async with temporary_database(_DSN, "akb_role_sync_", template=base_schema_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
             yield pool
-        finally:
-            await pool.close()
 
 
 async def _seed_catalog(pool, *, uid=None, vid=None, owner=None):
@@ -168,6 +155,7 @@ def test_hook_metrics_counts():
 # ── PG-touching tests ─────────────────────────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_on_user_create_idempotent(pool, role_sync, cleanup_roles):
     created, prefix = cleanup_roles
@@ -197,6 +185,7 @@ async def test_on_user_create_idempotent(pool, role_sync, cleanup_roles):
     assert role_sync.metrics.total_failures() == 0
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_on_vault_create_owner_gets_admin(pool, role_sync, cleanup_roles):
     """`on_vault_create(vault_id, owner_user_id=...)` grants admin
@@ -224,6 +213,7 @@ async def test_on_vault_create_owner_gets_admin(pool, role_sync, cleanup_roles):
         assert mem == 1, "owner should be member of vault admin group"
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_on_grant_clears_other_scopes_on_downgrade(
     pool, role_sync, cleanup_roles,
@@ -269,6 +259,7 @@ async def test_on_grant_clears_other_scopes_on_downgrade(
         assert reader_mem == 1, "reader grant missing after downgrade"
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_on_public_access_change_transitions(
     pool, role_sync, cleanup_roles,
@@ -319,6 +310,7 @@ async def test_on_public_access_change_transitions(
     assert not await auth_has("writer")
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_on_vault_delete_drops_group_roles(pool, role_sync, cleanup_roles):
     created, _ = cleanup_roles
@@ -340,6 +332,7 @@ async def test_on_vault_delete_drops_group_roles(pool, role_sync, cleanup_roles)
             assert exists is None, f"role {r} should be dropped"
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_diff_against_catalog_detects_drift(pool, role_sync, cleanup_roles):
     """Insert a fake users row, then check diff reports the missing PG role."""
@@ -374,6 +367,7 @@ async def test_diff_against_catalog_detects_drift(pool, role_sync, cleanup_roles
             await conn.execute("DELETE FROM users WHERE id = $1", uid)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_metrics_records_failure_on_invalid_scope(pool, role_sync):
     starting = role_sync.metrics.total_failures()
@@ -382,6 +376,7 @@ async def test_metrics_records_failure_on_invalid_scope(pool, role_sync):
     assert role_sync.metrics.failures.get("on_grant", 0) >= 1
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_diff_detects_missing_table_grant(pool, role_sync, cleanup_roles):
     """Manually REVOKE SELECT from a vault reader role on a vt_* table;

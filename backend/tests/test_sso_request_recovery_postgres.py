@@ -13,7 +13,7 @@ from tests.test_sso_operation_requests_postgres import lane as request_lane_fixt
 
 
 lane = request_lane_fixture
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def claim_body():

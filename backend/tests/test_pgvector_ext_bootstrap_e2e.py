@@ -51,6 +51,8 @@ import pytest_asyncio
 
 from app.services.vector_store.pgvector import PgvectorStore
 
+pytestmark = pytest.mark.live_services
+
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret

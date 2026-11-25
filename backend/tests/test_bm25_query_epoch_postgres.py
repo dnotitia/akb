@@ -10,9 +10,11 @@ from app.db import postgres
 from app.services import search_service, sparse_encoder
 from app.services.bm25_maintenance import BM25_VOCAB_EPOCH_LOCK_KEY
 from scripts import compact_bm25_term_ids as compact
-from tests.test_bm25_term_id_compaction_postgres import _installation
+from tests.test_bm25_term_id_compaction_postgres import (
+    _installation,
+)
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def _seed(install, shape):
@@ -46,8 +48,10 @@ async def _search(install, encoded, *, epoch=True):
 
 
 @pytest.mark.parametrize("shape", ["vchord", "posting"])
-async def test_stale_query_is_refused_instead_of_returning_another_terms_document(monkeypatch, shape):
-    async with _installation(monkeypatch, shape=shape) as install:
+async def test_stale_query_is_refused_instead_of_returning_another_terms_document(
+    compaction_template, monkeypatch, shape,
+):
+    async with _installation(compaction_template, monkeypatch, shape=shape) as install:
         await _seed(install, shape)
         encoded = await sparse_encoder.encode_query_at_epoch("alpha", sparse_shape=shape)
         assert [h.chunk_id for h in await _search(install, encoded)] == [str(uuid.UUID(int=1))]
@@ -62,8 +66,10 @@ async def test_stale_query_is_refused_instead_of_returning_another_terms_documen
 
 
 @pytest.mark.parametrize("shape", ["vchord", "posting"])
-async def test_service_reencodes_after_compaction_between_encoding_and_execution(monkeypatch, shape):
-    async with _installation(monkeypatch, shape=shape) as install:
+async def test_service_reencodes_after_compaction_between_encoding_and_execution(
+    compaction_template, monkeypatch, shape,
+):
+    async with _installation(compaction_template, monkeypatch, shape=shape) as install:
         await _seed(install, shape)
         search = install.store.hybrid_search
         attempts = []
@@ -86,8 +92,10 @@ async def test_service_reencodes_after_compaction_between_encoding_and_execution
 
 
 @pytest.mark.parametrize("shape", ["vchord", "posting"])
-async def test_held_fence_degrades_service_and_refuses_direct_search(monkeypatch, shape):
-    async with _installation(monkeypatch, shape=shape) as install:
+async def test_held_fence_degrades_service_and_refuses_direct_search(
+    compaction_template, monkeypatch, shape,
+):
+    async with _installation(compaction_template, monkeypatch, shape=shape) as install:
         await _seed(install, shape)
         encoded = await sparse_encoder.encode_query_at_epoch("alpha", sparse_shape=shape)
         holder = await asyncpg.connect(install.dsn)
@@ -104,8 +112,8 @@ async def test_held_fence_degrades_service_and_refuses_direct_search(monkeypatch
             await holder.close()
 
 
-async def test_sparse_search_needs_no_nested_pool_acquire(monkeypatch):
-    async with _installation(monkeypatch) as install:
+async def test_sparse_search_needs_no_nested_pool_acquire(compaction_template, monkeypatch):
+    async with _installation(compaction_template, monkeypatch) as install:
         await _seed(install, "vchord")
         encoded = await sparse_encoder.encode_query_at_epoch("alpha", sparse_shape="vchord")
         tiny_pool = await asyncpg.create_pool(install.dsn, min_size=1, max_size=1)
@@ -119,8 +127,8 @@ async def test_sparse_search_needs_no_nested_pool_acquire(monkeypatch):
             await tiny_pool.close()
 
 
-async def test_refused_sparse_leg_drains_its_concurrent_dense_leg(monkeypatch):
-    async with _installation(monkeypatch) as install:
+async def test_refused_sparse_leg_drains_its_concurrent_dense_leg(compaction_template, monkeypatch):
+    async with _installation(compaction_template, monkeypatch) as install:
         await _seed(install, "vchord")
         encoded = await sparse_encoder.encode_query_at_epoch("alpha", sparse_shape="vchord")
         cancelled = asyncio.Event()
@@ -153,8 +161,10 @@ async def test_refused_sparse_leg_drains_its_concurrent_dense_leg(monkeypatch):
             await holder.close()
 
 
-async def test_sparse_execution_holds_the_fence_until_its_query_finishes(monkeypatch):
-    async with _installation(monkeypatch) as install:
+async def test_sparse_execution_holds_the_fence_until_its_query_finishes(
+    compaction_template, monkeypatch,
+):
+    async with _installation(compaction_template, monkeypatch) as install:
         await _seed(install, "vchord")
         encoded = await sparse_encoder.encode_query_at_epoch("alpha", sparse_shape="vchord")
         entered, finish = asyncio.Event(), asyncio.Event()

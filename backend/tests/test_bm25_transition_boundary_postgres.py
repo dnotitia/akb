@@ -12,7 +12,7 @@ from app.services import sparse_encoder
 from scripts import backfill_bm25_vector as bf
 from tests.test_bm25_vector_backfill_postgres import _SCHEMA, _corpus, _write_old
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def _clock(pool):
@@ -44,9 +44,9 @@ async def _posting_write(store, conn, chunk_id, content):
     )
 
 
-async def test_identity_skip_is_repaired_after_the_writer_drains(monkeypatch):
+async def test_identity_skip_is_repaired_after_the_writer_drains(corpus_template, monkeypatch):
     """Existing tests prove skip; this proves exact content repair afterward."""
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         cid = uuid.UUID(int=7)
         protected = await _clock(pool)
         await _write_old(store, pool, cid, "original text", 0)
@@ -77,8 +77,8 @@ async def test_identity_skip_is_repaired_after_the_writer_drains(monkeypatch):
         assert fixed["vector"] != old["vector"]
 
 
-async def test_advancing_mark_misses_late_commit_but_protected_mark_catches(monkeypatch):
-    async with _corpus(monkeypatch) as (store, pool):
+async def test_advancing_mark_misses_late_commit_but_protected_mark_catches(corpus_template, monkeypatch):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         cid = uuid.UUID(int=3)
         await _write_old(store, pool, cid, "old content", 0)
         await bf._prepare(pool, _SCHEMA)
@@ -108,8 +108,8 @@ async def test_advancing_mark_misses_late_commit_but_protected_mark_catches(monk
         assert fixed["vector"] == await _expected(pool, fixed["content"])
 
 
-async def test_valid_concurrent_index_does_not_close_posting_write_window(monkeypatch):
-    async with _corpus(monkeypatch) as (store, pool):
+async def test_valid_concurrent_index_does_not_close_posting_write_window(corpus_template, monkeypatch):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         cid = uuid.UUID(int=11)
         await _write_old(store, pool, cid, "before index construction", 0)
         await bf._prepare(pool, _SCHEMA)
@@ -158,9 +158,9 @@ async def test_valid_concurrent_index_does_not_close_posting_write_window(monkey
                 await asyncio.gather(build, return_exceptions=True)
 
 
-async def test_cancelled_concurrent_index_requires_drop_before_rebuild(monkeypatch):
+async def test_cancelled_concurrent_index_requires_drop_before_rebuild(corpus_template, monkeypatch):
     """Cancel real DDL at its writer barrier, not a synthetic pg_index edit."""
-    async with _corpus(monkeypatch) as (store, pool):
+    async with _corpus(monkeypatch, corpus_template) as (store, pool):
         cid = uuid.UUID(int=17)
         await _write_old(store, pool, cid, "index cancellation fixture", 0)
         await bf._prepare(pool, _SCHEMA)

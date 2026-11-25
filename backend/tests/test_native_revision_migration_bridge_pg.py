@@ -7,12 +7,14 @@ import hashlib
 import importlib.util
 import os
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 from git import Repo
 
 from app.exceptions import ConflictError
@@ -45,6 +47,7 @@ from app.services.native_revision_backfill import (
     NativeRevisionBackfill,
 )
 from app.services.native_revision_backend import NativeRevisionBackend
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
@@ -56,19 +59,7 @@ _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
 )
-
-
-async def _reachable() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except OSError, asyncpg.PostgresError:
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    return f"{_DSN.rsplit('/', 1)[0]}/{name}"
+_DATABASE_PREFIX = "akb_c9_bridge_"
 
 
 def _load(filename: str):
@@ -80,51 +71,35 @@ def _load(filename: str):
     return module
 
 
-@asynccontextmanager
-async def _fresh_schema(tmp_path: Path):
-    if not await _reachable():
-        # The DB-free unit job has nothing on the default DSN, so skipping
-        # there is correct. On the live-PG gate it is not: a skip and a pass
-        # read the same, and every assertion in this file is about what
-        # PostgreSQL stores.
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"the real-PG gate requires a reachable Postgres at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
+async def _initialize_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(_INIT_SQL)
+    for filename in (
+        "010_external_git_mirror.py",
+        "015_events_outbox.py",
+        "048_native_revision_core.py",
+        "053_native_revision_m1_pg_body.py",
+        "060_native_revision_migration_bridge.py",
+        "097_native_revision_migration_inventory.py",
+        "098_native_revision_nul_payload.py",
+        "105_bridge_body_digest.py",
+        # The document write path publishes image references, and 107
+        # is what gives a Native document a column to publish into.
+        "107_native_document_asset_refs.py",
+    ):
+        await _load(filename).migrate(conn=conn)
 
-    name = f"akb_c9_bridge_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    conn = None
-    pool = None
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        dsn = _database_dsn(name)
-        conn = await asyncpg.connect(dsn)
-        await conn.execute(_INIT_SQL)
-        for filename in (
-            "010_external_git_mirror.py",
-            "015_events_outbox.py",
-            "048_native_revision_core.py",
-            "053_native_revision_m1_pg_body.py",
-            "060_native_revision_migration_bridge.py",
-            "097_native_revision_migration_inventory.py",
-            "098_native_revision_nul_payload.py",
-            "105_bridge_body_digest.py",
-            # The document write path publishes image references, and 107
-            # is what gives a Native document a column to publish into.
-            "107_native_document_asset_refs.py",
-        ):
-            await _load(filename).migrate(conn=conn)
-        await conn.close()
-        conn = None
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
-        yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        if conn is not None and not conn.is_closed():
-            await conn.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template() -> AsyncIterator[TestDatabase]:
+    async with database_template(_DSN, _DATABASE_PREFIX, _initialize_schema) as template:
+        yield template
+
+
+@asynccontextmanager
+async def _fresh_schema(template: TestDatabase):
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            yield pool
 
 
 async def _make_fixture(pool, tmp_path: Path) -> dict:
@@ -132,43 +107,51 @@ async def _make_fixture(pool, tmp_path: Path) -> dict:
     vault_name = f"c9-{uuid.uuid4().hex}"
     git.init_vault(vault_name)
 
-    old_oid = git.commit_file(vault_name, "same.md", "old resource\n", "old")
-    await asyncio.sleep(1.05)
-    initial_oid = git.commit_file(
-        vault_name,
-        "same.md",
-        "new v1\n",
-        "[create] same.md\n\nagent: legacy-writer\naction: create\nsummary: create same document",
-    )
-    initial_dt = Repo(str(git._bare_path(vault_name))).commit(initial_oid).committed_datetime
-    created_at = initial_dt - timedelta(milliseconds=100)
-    await asyncio.sleep(1.05)
-    move_oid = git.move_file(
-        vault_name,
-        "same.md",
-        "renamed.md",
-        "[move] same.md -> renamed.md\n\nagent: legacy-writer\naction: move\nsummary: move same document",
-    )
-    await asyncio.sleep(1.05)
-    current_oid = git.commit_file(
-        vault_name,
-        "renamed.md",
-        "new v2\n",
-        "[update] renamed.md\n\nagent: legacy-writer\naction: update\nsummary: update renamed document",
-    )
-    current_dt = Repo(str(git._bare_path(vault_name))).commit(current_oid).committed_datetime
-    await asyncio.sleep(1.05)
-    other_oid = git.commit_file(
-        vault_name,
-        "other.md",
-        "other\n",
-        "[create] other.md\n\nagent: legacy-writer\naction: create\nsummary: create other document",
-    )
-    other_dt = Repo(str(git._bare_path(vault_name))).commit(other_oid).committed_datetime
-    await asyncio.sleep(1.05)
-    unrelated_tip = git.commit_file(vault_name, "unrelated.md", "tip\n", "unrelated")
-    await asyncio.sleep(1.05)
-    later_file_tip = git.commit_file(vault_name, "renamed.md", "post-head\n", "later file")
+    # The bridge compares Git's second-resolution times with the catalog timestamps.
+    with pytest.MonkeyPatch.context() as commit_env:
+        def set_commit_time(step: int) -> None:
+            instant = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=step)
+            commit_env.setenv("GIT_AUTHOR_DATE", instant.isoformat())
+            commit_env.setenv("GIT_COMMITTER_DATE", instant.isoformat())
+
+        set_commit_time(0)
+        old_oid = git.commit_file(vault_name, "same.md", "old resource\n", "old")
+        set_commit_time(1)
+        initial_oid = git.commit_file(
+            vault_name,
+            "same.md",
+            "new v1\n",
+            "[create] same.md\n\nagent: legacy-writer\naction: create\nsummary: create same document",
+        )
+        initial_dt = Repo(str(git._bare_path(vault_name))).commit(initial_oid).committed_datetime
+        created_at = initial_dt - timedelta(milliseconds=100)
+        set_commit_time(2)
+        move_oid = git.move_file(
+            vault_name,
+            "same.md",
+            "renamed.md",
+            "[move] same.md -> renamed.md\n\nagent: legacy-writer\naction: move\nsummary: move same document",
+        )
+        set_commit_time(3)
+        current_oid = git.commit_file(
+            vault_name,
+            "renamed.md",
+            "new v2\n",
+            "[update] renamed.md\n\nagent: legacy-writer\naction: update\nsummary: update renamed document",
+        )
+        current_dt = Repo(str(git._bare_path(vault_name))).commit(current_oid).committed_datetime
+        set_commit_time(4)
+        other_oid = git.commit_file(
+            vault_name,
+            "other.md",
+            "other\n",
+            "[create] other.md\n\nagent: legacy-writer\naction: create\nsummary: create other document",
+        )
+        other_dt = Repo(str(git._bare_path(vault_name))).commit(other_oid).committed_datetime
+        set_commit_time(5)
+        unrelated_tip = git.commit_file(vault_name, "unrelated.md", "tip\n", "unrelated")
+        set_commit_time(6)
+        later_file_tip = git.commit_file(vault_name, "renamed.md", "post-head\n", "later file")
 
     async with pool.acquire() as conn:
         namespace_id = await conn.fetchval(
@@ -233,12 +216,7 @@ async def _make_fixture(pool, tmp_path: Path) -> dict:
 
 
 async def _make_compact_failpoint_fixtures(pool, tmp_path: Path) -> tuple[GitService, list[dict]]:
-    """Build one short manual-vault case per registered failpoint.
-
-    The loop intentionally avoids the multi-second chronology fixture above:
-    each case has one current file commit and one unrelated fixed-ref tip, so
-    the table exercises every atomic boundary without repeating six sleeps.
-    """
+    """Build one vault with two commits per registered failpoint."""
     git = GitService(storage_path=str(tmp_path / "git-failpoints"))
     fixtures: list[dict] = []
     async with pool.acquire() as conn:
@@ -303,8 +281,9 @@ async def _make_compact_failpoint_fixtures(pool, tmp_path: Path) -> tuple[GitSer
     return git, fixtures
 
 
-async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vaults(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vaults(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         bridge = LegacyRevisionBridge(
             pool,
@@ -423,8 +402,9 @@ async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vault
             )
 
 
-async def test_inventory_and_pg_body_store_preserve_utf8_nul_bytes(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_inventory_and_pg_body_store_preserve_utf8_nul_bytes(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         text = "before\x00after\n"
         current_oid = fixture["git"].commit_file(
@@ -472,8 +452,9 @@ async def test_inventory_and_pg_body_store_preserve_utf8_nul_bytes(tmp_path):
             )
 
 
-async def test_inventory_accepts_plain_git_activity_without_akb_footers(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_inventory_accepts_plain_git_activity_without_akb_footers(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         git = GitService(storage_path=str(tmp_path / "plain-import-git"))
         vault_name = f"plain-import-{uuid.uuid4().hex}"
         git.init_vault(vault_name)
@@ -532,8 +513,9 @@ async def test_inventory_accepts_plain_git_activity_without_akb_footers(tmp_path
         assert document.activity.summary == ""
 
 
-async def test_inventory_rejects_duplicate_completed_ordinal_zero_anchor(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_inventory_rejects_duplicate_completed_ordinal_zero_anchor(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         bridge = LegacyRevisionBridge(pool, git=fixture["git"])
         backfill = NativeRevisionBackfill(pool, git=fixture["git"], bridge=bridge)
@@ -580,7 +562,9 @@ async def test_inventory_rejects_duplicate_completed_ordinal_zero_anchor(tmp_pat
             )
 
 
+@pytest.mark.live_services
 async def test_backfill_inventory_is_metadata_only_and_materializes_one_body_at_a_time(
+    schema_template,
     tmp_path,
 ):
     class TrackingBodyBridge(LegacyRevisionBridge):
@@ -602,7 +586,7 @@ async def test_backfill_inventory_is_metadata_only_and_materializes_one_body_at_
                 finally:
                     self.active_bodies -= 1
 
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         bridge = TrackingBodyBridge(pool, git=fixture["git"])
         backfill = NativeRevisionBackfill(pool, git=fixture["git"], bridge=bridge)
@@ -622,8 +606,9 @@ async def test_backfill_inventory_is_metadata_only_and_materializes_one_body_at_
         assert bridge.active_bodies == 0
 
 
-async def test_capture_releases_each_source_body_before_reading_the_next(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_capture_releases_each_source_body_before_reading_the_next(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         original_batch = fixture["git"].manual_fixed_ref_history_batch
         observed_snapshots = []
@@ -649,7 +634,9 @@ async def test_capture_releases_each_source_body_before_reading_the_next(tmp_pat
         assert all("byte_size" in snapshot for snapshot in observed_snapshots)
 
 
+@pytest.mark.live_services
 async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item(
+    schema_template,
     tmp_path,
     monkeypatch,
 ):
@@ -770,7 +757,7 @@ async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item
         classmethod(counted_canonical_digest),
     )
 
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         git = CountingGit()
         vault_name = f"c9-p95-{uuid.uuid4().hex}"
         async with pool.acquire() as conn:
@@ -855,8 +842,9 @@ async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item
         assert git.history_batch_calls == 1
 
 
-async def test_every_backfill_failpoint_rolls_back_then_retries_once(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_every_backfill_failpoint_rolls_back_then_retries_once(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         git, fixtures = await _make_compact_failpoint_fixtures(pool, tmp_path)
 
         for fixture in fixtures:
@@ -999,8 +987,9 @@ async def test_every_backfill_failpoint_rolls_back_then_retries_once(tmp_path):
                 )
 
 
-async def test_mixed_manual_and_external_documents_exclude_external_noop(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_mixed_manual_and_external_documents_exclude_external_noop(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         async with pool.acquire() as conn:
             await conn.execute(
@@ -1078,8 +1067,9 @@ async def test_mixed_manual_and_external_documents_exclude_external_noop(tmp_pat
             )
 
 
-async def test_current_move_activity_semantics_are_preserved(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_current_move_activity_semantics_are_preserved(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-current-move"))
         vault_name = f"c9-move-{uuid.uuid4().hex}"
         git.init_vault(vault_name)
@@ -1172,8 +1162,9 @@ async def test_current_move_activity_semantics_are_preserved(tmp_path):
         }
 
 
-async def test_selector_is_hidden_until_run_complete(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_selector_is_hidden_until_run_complete(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         backfill = NativeRevisionBackfill(pool, git=fixture["git"])
         run, inventory = await backfill.prepare_run(
@@ -1250,8 +1241,9 @@ async def test_selector_is_hidden_until_run_complete(tmp_path):
             )
 
 
-async def test_atomic_retry_chronology_selector_shapes_and_legacy_unchanged(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_atomic_retry_chronology_selector_shapes_and_legacy_unchanged(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         bridge = LegacyRevisionBridge(pool, git=fixture["git"])
         backfill = NativeRevisionBackfill(pool, git=fixture["git"], bridge=bridge)
@@ -1534,8 +1526,9 @@ async def test_atomic_retry_chronology_selector_shapes_and_legacy_unchanged(tmp_
                 )
 
 
-async def test_completed_item_is_not_demoted_by_a_queued_failure(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_completed_item_is_not_demoted_by_a_queued_failure(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         git, fixtures = await _make_compact_failpoint_fixtures(pool, tmp_path)
         fixture = fixtures[0]
         repository = NativeRevisionMigrationRepository(pool)
@@ -1581,8 +1574,9 @@ async def test_completed_item_is_not_demoted_by_a_queued_failure(tmp_path):
         assert item.error_code is None
 
 
-async def test_completed_run_replay_preserves_terminal_state_and_selector(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_completed_run_replay_preserves_terminal_state_and_selector(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         git, fixtures = await _make_compact_failpoint_fixtures(pool, tmp_path)
         fixture = fixtures[0]
         repository = NativeRevisionMigrationRepository(pool)
@@ -1636,8 +1630,9 @@ async def test_completed_run_replay_preserves_terminal_state_and_selector(tmp_pa
         assert visible_after.kind == "native"
 
 
-async def test_alias_mutation_after_prepare_fails_closed_before_publication(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_alias_mutation_after_prepare_fails_closed_before_publication(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         git, fixtures = await _make_compact_failpoint_fixtures(pool, tmp_path)
         fixture = fixtures[0]
         repository = NativeRevisionMigrationRepository(pool)
@@ -1691,8 +1686,9 @@ async def test_alias_mutation_after_prepare_fails_closed_before_publication(tmp_
             )
 
 
-async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics(tmp_path, monkeypatch):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics(schema_template, tmp_path, monkeypatch):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         backfill = NativeRevisionBackfill(pool, git=fixture["git"])
         run, _ = await backfill.prepare_run(
@@ -1753,8 +1749,9 @@ async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics
         assert [e["hash"] for e in results] == [older.revision_id]
 
 
-async def test_completed_backfill_preserves_pg_only_public_document_metadata(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_completed_backfill_preserves_pg_only_public_document_metadata(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         async with pool.acquire() as conn:
             await conn.execute(
@@ -1787,10 +1784,12 @@ async def test_completed_backfill_preserves_pg_only_public_document_metadata(tmp
         assert current.content == "new v2"
 
 
+@pytest.mark.live_services
 async def test_completed_backfill_accepts_only_the_mapped_legacy_head_for_first_native_update(
+    schema_template,
     tmp_path,
 ):
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         backfill = NativeRevisionBackfill(pool, git=fixture["git"])
         run, _ = await backfill.prepare_run(
@@ -1859,8 +1858,9 @@ async def test_completed_backfill_accepts_only_the_mapped_legacy_head_for_first_
             )
 
 
-async def test_native_move_keeps_completed_legacy_paths_for_historical_reads(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_native_move_keeps_completed_legacy_paths_for_historical_reads(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
         backfill = NativeRevisionBackfill(pool, git=fixture["git"])
         run, _ = await backfill.prepare_run(
@@ -1953,13 +1953,14 @@ async def _pending(pool, namespace_id) -> tuple[int, int]:
         )
 
 
-async def test_bridged_bodies_move_to_postgres_and_read_identically_without_git(tmp_path):
+@pytest.mark.live_services
+async def test_bridged_bodies_move_to_postgres_and_read_identically_without_git(schema_template, tmp_path):
     """The whole point: after the backfill the git volume is not consulted.
 
     Proven by removing it. A read that still needed git would raise here
     instead of returning the same bytes.
     """
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-move")
         backend = NativeRevisionBackend(pool=pool, legacy_git=fixture["git"])
 
@@ -1995,9 +1996,10 @@ async def test_bridged_bodies_move_to_postgres_and_read_identically_without_git(
         assert after[1] == before[1]
 
 
-async def test_backfill_is_incremental_so_a_half_migrated_vault_still_reads(tmp_path):
+@pytest.mark.live_services
+async def test_backfill_is_incremental_so_a_half_migrated_vault_still_reads(schema_template, tmp_path):
     """Stopping halfway is a supported state, not a broken one."""
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-partial")
         pending_before, _ = await _pending(pool, fixture["namespace_id"])
         assert pending_before >= 2
@@ -2024,8 +2026,9 @@ async def test_backfill_is_incremental_so_a_half_migrated_vault_still_reads(tmp_
         assert rest.migrated == pending_before - 1
 
 
-async def test_a_dry_run_reads_everything_and_writes_nothing(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_a_dry_run_reads_everything_and_writes_nothing(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-dry")
         pending_before, _ = await _pending(pool, fixture["namespace_id"])
         async with pool.acquire() as conn:
@@ -2050,8 +2053,9 @@ async def test_a_dry_run_reads_everything_and_writes_nothing(tmp_path):
             ) == 0
 
 
-async def test_a_body_git_cannot_answer_for_is_left_pending_never_invented(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_a_body_git_cannot_answer_for_is_left_pending_never_invented(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-absent")
         async with pool.acquire() as conn:
             await conn.execute(
@@ -2080,8 +2084,9 @@ async def test_a_body_git_cannot_answer_for_is_left_pending_never_invented(tmp_p
         assert any("absent in git" in line for line in report.samples)
 
 
-async def test_backfill_stays_inside_the_vault_it_was_given(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_backfill_stays_inside_the_vault_it_was_given(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         one = await _bridged_fixture(pool, tmp_path / "one", coverage="c9-bridge-scope-one")
         two = await _bridged_fixture(pool, tmp_path / "two", coverage="c9-bridge-scope-two")
         other_before, _ = await _pending(pool, two["namespace_id"])
@@ -2096,8 +2101,9 @@ async def test_backfill_stays_inside_the_vault_it_was_given(tmp_path):
         assert other_after == other_before
 
 
-async def test_two_passes_cannot_claim_the_same_mapping(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_two_passes_cannot_claim_the_same_mapping(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-race")
         repo = NativeRevisionMigrationRepository(pool)
         claimed = await repo.claim_unmigrated_bridge_bodies(
@@ -2130,8 +2136,9 @@ async def test_two_passes_cannot_claim_the_same_mapping(tmp_path):
                 )
 
 
-async def test_a_digest_with_no_payload_falls_back_to_git_rather_than_failing(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_a_digest_with_no_payload_falls_back_to_git_rather_than_failing(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-orphan")
         async with pool.acquire() as conn:
             await conn.execute(
@@ -2152,14 +2159,15 @@ async def test_a_digest_with_no_payload_falls_back_to_git_rather_than_failing(tm
         assert version[1] == "new v1\n"
 
 
-async def test_bytes_that_do_not_hash_to_their_digest_are_refused_not_served(tmp_path):
+@pytest.mark.live_services
+async def test_bytes_that_do_not_hash_to_their_digest_are_refused_not_served(schema_template, tmp_path):
     """Defense in depth, proven with the database guard removed.
 
     The table's own CHECK makes this unreachable in production, which is
     exactly why the guard has to be tested without it — otherwise the only
     evidence that it works is that it has never been asked to.
     """
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-corrupt")
         report = await backfill_bridge_bodies(
             pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
@@ -2211,14 +2219,15 @@ async def test_bytes_that_do_not_hash_to_their_digest_are_refused_not_served(tmp
         assert version[1] == "new v1\n"
 
 
-async def test_one_unreadable_body_does_not_block_the_ones_behind_it(tmp_path):
+@pytest.mark.live_services
+async def test_one_unreadable_body_does_not_block_the_ones_behind_it(schema_template, tmp_path):
     """The claim order puts an unmovable row first and leaves it there.
 
     It keeps `body_digest IS NULL`, so it is first in that order for the whole
     run. Without a cursor the batch would be spent re-reading it and nothing
     behind it would ever move.
     """
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-head-block")
         repo = NativeRevisionMigrationRepository(pool)
         head = (await repo.claim_unmigrated_bridge_bodies(
@@ -2248,14 +2257,15 @@ async def test_one_unreadable_body_does_not_block_the_ones_behind_it(tmp_path):
         assert report.pending_after == 1
 
 
-async def test_verify_re_derives_every_migrated_body_from_git(tmp_path):
+@pytest.mark.live_services
+async def test_verify_re_derives_every_migrated_body_from_git(schema_template, tmp_path):
     """Whole-population, not a sample.
 
     The migration copies; verify re-reads the source and hashes it again. It
     is only possible because nothing was deleted — which is the same property
     that makes the migration reversible.
     """
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-verify")
         moved = await backfill_bridge_bodies(
             pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
@@ -2272,14 +2282,15 @@ async def test_verify_re_derives_every_migrated_body_from_git(tmp_path):
         assert report.ok is True
 
 
-async def test_verify_names_a_body_that_stopped_agreeing_with_git(tmp_path):
+@pytest.mark.live_services
+async def test_verify_names_a_body_that_stopped_agreeing_with_git(schema_template, tmp_path):
     """The finding the command exists to produce.
 
     Repointing a mapping at a payload holding different bytes is the shape of
     every way this could go wrong, whatever the cause. Verify has to call it,
     and has to say which revision.
     """
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-verify-bad")
         await backfill_bridge_bodies(
             pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
@@ -2311,9 +2322,10 @@ async def test_verify_names_a_body_that_stopped_agreeing_with_git(tmp_path):
         assert any(victim[:8] in line for line in report.findings)
 
 
-async def test_verify_reports_a_digest_whose_payload_is_gone(tmp_path):
+@pytest.mark.live_services
+async def test_verify_reports_a_digest_whose_payload_is_gone(schema_template, tmp_path):
     """Distinct from a mismatch: the comparison has nothing to compare."""
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-verify-orphan")
         await backfill_bridge_bodies(
             pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
@@ -2335,14 +2347,15 @@ async def test_verify_reports_a_digest_whose_payload_is_gone(tmp_path):
         assert report.ok is False
 
 
-async def test_verify_reports_a_payload_that_does_not_hash_to_its_own_digest(tmp_path):
+@pytest.mark.live_services
+async def test_verify_reports_a_payload_that_does_not_hash_to_its_own_digest(schema_template, tmp_path):
     """Corruption is the finding, not a reason to stop reporting.
 
     `read_bridge_body` raises on bytes that do not match their digest — the
     right answer for a read, and the wrong one for a command whose whole job
     is to survey the population and say what it found.
     """
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-verify-corrupt")
         moved = await backfill_bridge_bodies(
             pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000
@@ -2386,14 +2399,15 @@ async def test_verify_reports_a_payload_that_does_not_hash_to_its_own_digest(tmp
         assert any("does not hash to its own digest" in line for line in report.findings)
 
 
-async def test_verify_reports_the_share_of_the_population_it_actually_saw(tmp_path):
+@pytest.mark.live_services
+async def test_verify_reports_the_share_of_the_population_it_actually_saw(schema_template, tmp_path):
     """`ok` on a fraction is the failure this reports against.
 
     Measured live before this existed: a survey stopped at the backfill's
     batch default, saw 1,000 of 2,191, and printed `ok: true` with nothing
     saying it had looked at less than half.
     """
-    async with _fresh_schema(tmp_path) as pool:
+    async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-verify-coverage")
         moved = await backfill_bridge_bodies(
             pool=pool, git=fixture["git"], vault=fixture["vault_name"], limit=1000

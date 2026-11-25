@@ -2,14 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib.util
 import logging
-import os
 import uuid
-from contextlib import asynccontextmanager
-from pathlib import Path
 
-import asyncpg
 import pytest
 
 from app.config import settings
@@ -24,76 +19,13 @@ from app.services.native_derived_worker import (
     NativeDerivedWorker,
 )
 from app.services.native_revision_service import NativeRevisionService
+from tests.helpers.native_revision_database import cloned_derived_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
-_BACKEND = Path(__file__).resolve().parents[2]
-_DSN = os.environ.get(
-    "AKB_TEST_DSN",
-    "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
-)
-
-
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
-@asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    admin = await asyncpg.connect(_DSN)
-    # Measurement-prefixed on purpose: migration 057 is name-gated, and only a
-    # database named for the measurement arm can ever receive a native write
-    # (see `app/config.py`). Under any other name 057 self-disables and the
-    # fixture silently keeps migration 053's one-placement-per-namespace
-    # trigger — a schema no real native write ever meets, and one P1's mixed
-    # placements would trip the moment this pipeline covers a facade write.
-    name = f"akb_revision_m1_measurement_derived_{uuid.uuid4().hex[:10]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    dsn = f"{_DSN.rsplit('/', 1)[0]}/{name}"
-    conn = await asyncpg.connect(dsn)
-    pool = None
-    try:
-        await conn.execute((_BACKEND / "app" / "db" / "init.sql").read_text())
-        # 112 is here because the derived pipeline now writes `edges`, and that
-        # table's resource-identity foreign keys and partial indexes come from
-        # the migration, not from init.sql (init.sql re-runs against existing
-        # databases, where an index on a column `CREATE TABLE IF NOT EXISTS`
-        # never added would fail the boot schema). Without it this fixture
-        # builds an `edges` no deployment has. 113 is the vocabulary epoch the
-        # embed worker's write reads under the term-id fence (akb#687).
-        for number in (5, 6, 15, 48, 53, 54, 55, 56, 57, 59, 89, 107, 112, 113):
-            path = next((_BACKEND / "app" / "db" / "migrations").glob(f"{number:03d}_*.py"))
-            spec = importlib.util.spec_from_file_location(f"native_derived_{number}", path)
-            assert spec is not None and spec.loader is not None
-            migration = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(migration)
-            await migration.migrate(conn=conn)
-            if number in (54, 59):
-                await migration.migrate(conn=conn)  # startup retry is idempotent
-        await conn.close()
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=8)
-        yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        elif not conn.is_closed():
-            await conn.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
-
-
-async def test_worker_coalesces_to_current_head_and_closes_chunk_mapping_residue():
-    async with _fresh_database() as pool:
+async def test_worker_coalesces_to_current_head_and_closes_chunk_mapping_residue(derived_pipeline_template):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         async with pool.acquire() as conn:
             owner = await conn.fetchval(
                 """
@@ -197,7 +129,7 @@ async def _owned_vault(pool, prefix: str) -> tuple[uuid.UUID, uuid.UUID]:
     return owner, vault_id
 
 
-async def test_text_file_intent_applies_the_document_parity_derived_path():
+async def test_text_file_intent_applies_the_document_parity_derived_path(derived_pipeline_template):
     """Successor to the pre-parity `direct_grep` closure test.
 
     A text File intent used to close on an explicit no-op delivery, which left
@@ -205,7 +137,7 @@ async def test_text_file_intent_applies_the_document_parity_derived_path():
     the same derived state a Document does — chunks, a derived Head, and
     Revision/intent provenance — on the same Resource/Revision basis.
     """
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         _owner, vault_id = await _owned_vault(pool, "file-parity")
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         worker = NativeDerivedWorker(pool)
@@ -355,7 +287,7 @@ async def _bind_native_file_catalogue(pool, *, namespace_id, path, payload, crea
         )
 
 
-async def test_file_grep_reads_the_head_even_when_derived_chunks_disagree():
+async def test_file_grep_reads_the_head_even_when_derived_chunks_disagree(derived_pipeline_template):
     """Derived output is never an exact-grep oracle.
 
     Text Files have no update path today, so the disagreement is manufactured
@@ -363,7 +295,7 @@ async def test_file_grep_reads_the_head_even_when_derived_chunks_disagree():
     claim a token the Head never contained and to drop the token it does.  Grep
     must still answer from the verified Head bytes.
     """
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         owner, vault_id = await _owned_vault(pool, "grep-head")
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         created = await service.create_text(
@@ -402,14 +334,14 @@ async def test_file_grep_reads_the_head_even_when_derived_chunks_disagree():
         assert lied["results"] == []
 
 
-async def test_native_file_chunks_are_claimed_and_upserted_by_the_embed_worker(monkeypatch):
+async def test_native_file_chunks_are_claimed_and_upserted_by_the_embed_worker(derived_pipeline_template, monkeypatch):
     """The embeddability the frozen spec requires, proven end to end.
 
     Admitted text File create → intent → derived worker → chunks with the
     File's Revision/intent provenance → the embed worker's own selection query
     claims them and drives them through to a vector-store upsert.
     """
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         _owner, vault_id = await _owned_vault(pool, "embed-file")
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         created = await service.create_text(
@@ -510,8 +442,8 @@ async def _create_document(
     )
 
 
-async def test_failed_intent_retries_then_reclaims_and_applies(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_failed_intent_retries_then_reclaims_and_applies(derived_pipeline_template, monkeypatch):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         async with pool.acquire() as conn:
             vault_id = await conn.fetchval(
                 "INSERT INTO vaults (name, git_path) VALUES ($1, '/tmp/unused.git') RETURNING id",
@@ -552,8 +484,8 @@ async def test_failed_intent_retries_then_reclaims_and_applies(monkeypatch):
             assert recovered["last_error"] is None
 
 
-async def test_retry_exhaustion_is_terminal_abandoned_and_settlement_reports_it(monkeypatch, caplog):
-    async with _fresh_database() as pool:
+async def test_retry_exhaustion_is_terminal_abandoned_and_settlement_reports_it(derived_pipeline_template, monkeypatch, caplog):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         async with pool.acquire() as conn:
             vault_id = await conn.fetchval(
                 "INSERT INTO vaults (name, git_path) VALUES ($1, '/tmp/unused.git') RETURNING id",
@@ -623,7 +555,7 @@ async def test_retry_exhaustion_is_terminal_abandoned_and_settlement_reports_it(
             assert terminal["last_error"] == "RuntimeError"
 
 
-async def test_a_body_carrying_nul_is_indexed_rather_than_lost():
+async def test_a_body_carrying_nul_is_indexed_rather_than_lost(derived_pipeline_template):
     """akb#527, closed — through the real substrate rather than a fake.
 
     A `0x00` sits where a space belongs, which is what a conversion upstream
@@ -637,7 +569,7 @@ async def test_a_body_carrying_nul_is_indexed_rather_than_lost():
     with one is indexed on the first attempt. What the derived index holds is
     the text without the byte; what it used to hold was nothing at all.
     """
-    async with _fresh_database() as pool:
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         async with pool.acquire() as conn:
             vault_id = await conn.fetchval(
                 "INSERT INTO vaults (name, git_path) VALUES ($1, '/tmp/unused.git') RETURNING id",
@@ -679,8 +611,8 @@ async def test_a_body_carrying_nul_is_indexed_rather_than_lost():
         assert stats["status"] == "ok"
 
 
-async def test_multiworker_skip_locked_claims_intent_once():
-    async with _fresh_database() as pool:
+async def test_multiworker_skip_locked_claims_intent_once(derived_pipeline_template):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         async with pool.acquire() as conn:
             vault_id = await conn.fetchval(
                 "INSERT INTO vaults (name, git_path) VALUES ($1, '/tmp/unused.git') RETURNING id",
@@ -696,8 +628,8 @@ async def test_multiworker_skip_locked_claims_intent_once():
         assert claimed[0]["revision_id"] == created.revision_id
 
 
-async def test_expired_claim_lease_is_reclaimed_by_another_worker():
-    async with _fresh_database() as pool:
+async def test_expired_claim_lease_is_reclaimed_by_another_worker(derived_pipeline_template):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         async with pool.acquire() as conn:
             vault_id = await conn.fetchval(
                 "INSERT INTO vaults (name, git_path) VALUES ($1, '/tmp/unused.git') RETURNING id",
@@ -722,8 +654,8 @@ async def test_expired_claim_lease_is_reclaimed_by_another_worker():
         assert reclaimed["retry_count"] == 2
 
 
-async def test_direct_pg_grep_default_and_additive_modes_preserve_acl_and_collection_boundaries():
-    async with _fresh_database() as pool:
+async def test_direct_pg_grep_default_and_additive_modes_preserve_acl_and_collection_boundaries(derived_pipeline_template):
+    async with cloned_derived_database(derived_pipeline_template) as pool:
         async with pool.acquire() as conn:
             owner = await conn.fetchval(
                 """

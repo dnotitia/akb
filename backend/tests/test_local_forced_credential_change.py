@@ -12,12 +12,12 @@ import asyncio
 import os
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 import httpx
 import pytest
+
+from tests.helpers.pg_database import temporary_database
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -25,10 +25,8 @@ from app.config import settings
 from app.exceptions import AKBError, CredentialChangeRequiredError
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
-_BACKEND = Path(__file__).resolve().parents[1]
-_INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
@@ -39,59 +37,15 @@ _REPLACEMENT_PASSWORD = "replacement-chosen-now"  # pragma: allowlist secret
 _INSTALLER_PASSWORD = "the-installer-already-had-this"  # pragma: allowlist secret
 
 
-def _dsn_for_database(dsn: str, database: str) -> str:
-    parsed = urlsplit(dsn)
-    return urlunsplit(parsed._replace(path=f"/{database}"))
-
-
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except OSError, asyncpg.PostgresError:
-        return False
-    await conn.close()
-    return True
-
-
 @asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
+async def _fresh_database(auth_schema_template):
     from app.db import postgres
 
     handle_before = postgres._pool
-    database = f"akb_forced_change_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    await admin.execute(f'CREATE DATABASE "{database}"')
-    pool: asyncpg.Pool | None = None
-    try:
-        target_dsn = _dsn_for_database(_DSN, database)
-        conn = await asyncpg.connect(target_dsn)
-        try:
-            await conn.execute(_INIT_SQL)
-            from app.db.postgres import _load_migration
-
-            events_migration = _load_migration("015_events_outbox.py")
-            assert events_migration is not None
-            await events_migration.migrate(conn=conn)
-        finally:
-            await conn.close()
-        pool = await asyncpg.create_pool(target_dsn, min_size=1, max_size=8)
-        yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        await admin.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
-            " WHERE datname = $1 AND pid <> pg_backend_pid()",
-            database,
-        )
+    async with temporary_database(_DSN, "akb_forced_change_", template=auth_schema_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool:
+            yield pool
         handle_at_drop = postgres._pool
-        await admin.execute(f'DROP DATABASE "{database}"')
-        await admin.close()
     # Whatever routed the process to this database had to hand the handle back
     # before the database went; a handle left behind points every later
     # ``get_pool()`` at a closed pool on a dropped database.
@@ -114,8 +68,8 @@ class _RoleSync:
 
 
 @pytest.fixture
-async def pool(monkeypatch):
-    async with _fresh_database() as pool:
+async def pool(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         from app.db import postgres
         from app.services import (
             access_service,

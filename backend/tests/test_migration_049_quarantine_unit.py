@@ -22,9 +22,14 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.services import external_git_poller as poller
 from app.services._backfill import MAX_RETRIES
+
+from tests.helpers.pg_database import database_template, temporary_database
+
+pytestmark = pytest.mark.live_services
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")  # pragma: allowlist secret
 
@@ -348,8 +353,21 @@ async def test_migration_049_fences_old_poller_and_builds_state_machine():
         await admin.close()
 
 
+async def _initialize_migrated_schema(conn):
+    await conn.execute(_PRE_049_SCHEMA)
+    await _load_migration_049().migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def quarantine_template():
+    async with database_template(
+        _DSN, "akb_quarantine_template_", _initialize_migrated_schema,
+    ) as template:
+        yield template
+
+
 @pytest.mark.asyncio
-async def test_scrub_legacy_credential_old_value_cas_on_live_pg():
+async def test_scrub_legacy_credential_old_value_cas_on_live_pg(quarantine_template):
     """DB-backed proof: the credential scrub is an
     OLD-VALUE CAS, so against a REAL Postgres it —
 
@@ -364,23 +382,10 @@ async def test_scrub_legacy_credential_old_value_cas_on_live_pg():
           one (``IS NOT DISTINCT FROM`` semantics).
 
     Skips when Postgres is unreachable so the suite still runs unattended."""
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
     from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 
-    admin = await asyncpg.connect(_DSN)
-    dbname = f"akb_scrub_{uuid.uuid4().hex[:8]}"
-    await admin.execute(f'CREATE DATABASE "{dbname}"')
-    try:
-        base, _ = _DSN.rsplit("/", 1)
-        conn = await asyncpg.connect(f"{base}/{dbname}")
-        try:
-            await conn.execute(_PRE_049_SCHEMA)
-            await _load_migration_049().migrate(conn=conn)
-        finally:
-            await conn.close()
-
-        pool = await asyncpg.create_pool(f"{base}/{dbname}", min_size=1, max_size=2)
+    async with temporary_database(_DSN, "akb_quarantine_", template=quarantine_template) as database:
+        pool = await asyncpg.create_pool(database.dsn, min_size=1, max_size=2)
         try:
             ext_repo = VaultExternalGitRepository(pool)
 
@@ -443,36 +448,20 @@ async def test_scrub_legacy_credential_old_value_cas_on_live_pg():
             ) == "https://h/r.git"
         finally:
             await pool.close()
-    finally:
-        await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
-        await admin.close()
 
 
 @pytest.mark.asyncio
-async def test_snapshot_cas_no_clobber_on_live_pg():
+async def test_snapshot_cas_no_clobber_on_live_pg(quarantine_template):
     """DB-backed proof: every preflight
     state transition is a snapshot-CAS on the exact ``(remote_url, auth_token)`` it
     validated, so an operator reconfigure mid-flight makes the stale transition a
     0-row no-op that leaves the new config intact — only the matching config
     transitions. Proven against a REAL Postgres across activate / mark_success /
     quarantine. Skips when Postgres is unreachable."""
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
     from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 
-    admin = await asyncpg.connect(_DSN)
-    dbname = f"akb_snapcas_{uuid.uuid4().hex[:8]}"
-    await admin.execute(f'CREATE DATABASE "{dbname}"')
-    try:
-        base, _ = _DSN.rsplit("/", 1)
-        conn = await asyncpg.connect(f"{base}/{dbname}")
-        try:
-            await conn.execute(_PRE_049_SCHEMA)
-            await _load_migration_049().migrate(conn=conn)
-        finally:
-            await conn.close()
-
-        pool = await asyncpg.create_pool(f"{base}/{dbname}", min_size=1, max_size=2)
+    async with temporary_database(_DSN, "akb_quarantine_", template=quarantine_template) as database:
+        pool = await asyncpg.create_pool(database.dsn, min_size=1, max_size=2)
         try:
             ext_repo = VaultExternalGitRepository(pool)
 
@@ -548,39 +537,23 @@ async def test_snapshot_cas_no_clobber_on_live_pg():
             ) == "pending_preflight"  # NOT terminalized on a stale validation
         finally:
             await pool.close()
-    finally:
-        await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
-        await admin.close()
 
 
 @pytest.mark.asyncio
-async def test_redact_malformed_and_quarantine_atomic_on_live_pg():
+async def test_redact_malformed_and_quarantine_atomic_on_live_pg(quarantine_template):
     """DB-backed proof: a malformed, credential-bearing URL
     is redacted (remote_url → sentinel, auth_token → NULL) AND quarantined in ONE
     atomic UPDATE, so the terminal row carries no secret in EITHER column. A
     reconfigure (old value gone) is a 0-row no-op that keeps the new config; an
     already-quarantined same-value row is hygiene-scrubbed while its FIRST reason is
     preserved. Skips when Postgres is unreachable."""
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
     from app.repositories.vault_external_git_repo import (
         _MALFORMED_URL_SENTINEL,
         VaultExternalGitRepository,
     )
 
-    admin = await asyncpg.connect(_DSN)
-    dbname = f"akb_redact_{uuid.uuid4().hex[:8]}"
-    await admin.execute(f'CREATE DATABASE "{dbname}"')
-    try:
-        base, _ = _DSN.rsplit("/", 1)
-        conn = await asyncpg.connect(f"{base}/{dbname}")
-        try:
-            await conn.execute(_PRE_049_SCHEMA)
-            await _load_migration_049().migrate(conn=conn)
-        finally:
-            await conn.close()
-
-        pool = await asyncpg.create_pool(f"{base}/{dbname}", min_size=1, max_size=2)
+    async with temporary_database(_DSN, "akb_quarantine_", template=quarantine_template) as database:
+        pool = await asyncpg.create_pool(database.dsn, min_size=1, max_size=2)
         try:
             ext_repo = VaultExternalGitRepository(pool)
             malformed = "https://x-access-token:ghp_secret@[::1"  # pragma: allowlist secret
@@ -660,13 +633,10 @@ async def test_redact_malformed_and_quarantine_atomic_on_live_pg():
             assert row["sync_state_reason"] == "policy_violation"  # FIRST reason kept
         finally:
             await pool.close()
-    finally:
-        await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
-        await admin.close()
 
 
 @pytest.mark.asyncio
-async def test_reconcile_quarantine_exact_expected_state_cas_on_live_pg():
+async def test_reconcile_quarantine_exact_expected_state_cas_on_live_pg(quarantine_template):
     """DB-backed proof: ``quarantine``
     is a CAS on the caller's EXACT expected ``sync_state``, so a stale
     reconcile-path policy quarantine (which expects 'active') cannot terminalize a
@@ -679,27 +649,14 @@ async def test_reconcile_quarantine_exact_expected_state_cas_on_live_pg():
     'pending_preflight' terminalizes), that an already-quarantined row is immutable
     under EITHER expected state, and that a still-active row is terminalized by the
     reconcile path (no over-fencing). Skips when Postgres is unreachable."""
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
     from app.repositories.vault_external_git_repo import VaultExternalGitRepository
 
-    admin = await asyncpg.connect(_DSN)
-    dbname = f"akb_qexp_{uuid.uuid4().hex[:8]}"
-    await admin.execute(f'CREATE DATABASE "{dbname}"')
-    try:
-        base, _ = _DSN.rsplit("/", 1)
-        conn = await asyncpg.connect(f"{base}/{dbname}")
-        try:
-            await conn.execute(_PRE_049_SCHEMA)
-            await _load_migration_049().migrate(conn=conn)
-        finally:
-            await conn.close()
-
+    async with temporary_database(_DSN, "akb_quarantine_", template=quarantine_template) as database:
         # Two independent connections model the real race: the reconcile worker and
         # the operator each hold their own session and commit independently.
-        worker = await asyncpg.connect(f"{base}/{dbname}")
-        operator = await asyncpg.connect(f"{base}/{dbname}")
-        pool = await asyncpg.create_pool(f"{base}/{dbname}", min_size=1, max_size=2)
+        worker = await asyncpg.connect(database.dsn)
+        operator = await asyncpg.connect(database.dsn)
+        pool = await asyncpg.create_pool(database.dsn, min_size=1, max_size=2)
         try:
             ext_repo = VaultExternalGitRepository(pool)
 
@@ -801,6 +758,3 @@ async def test_reconcile_quarantine_exact_expected_state_cas_on_live_pg():
             await worker.close()
             await operator.close()
             await pool.close()
-    finally:
-        await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
-        await admin.close()

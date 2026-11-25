@@ -11,7 +11,7 @@ from app.services.native_revision_service import NativeRevisionService
 from tests.test_event_tail_postgres import _fresh_database
 from tests.test_notifications_postgres import drain
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.fixture(autouse=True)
@@ -40,8 +40,8 @@ async def setup_native(pool):
     return service, created, owner, reader, vault
 
 
-async def test_native_move_archive_restore_delete_inbox_and_cleanup():
-    async with _fresh_database() as pool:
+async def test_native_move_archive_restore_delete_inbox_and_cleanup(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         native, current, _, reader, vault = await setup_native(pool)
         doc_id = current.resource_id
         current = await native.move_text(namespace_id=vault, surface="document", path="first.md", path_to="renamed.md",
@@ -72,8 +72,8 @@ async def test_native_move_archive_restore_delete_inbox_and_cleanup():
             assert "Updated native title" not in str(page)
 
 
-async def test_native_cleanup_preserves_watch_through_delete_and_restore():
-    async with _fresh_database() as pool:
+async def test_native_cleanup_preserves_watch_through_delete_and_restore(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         native, current, _, reader, vault = await setup_native(pool)
         doc_id = current.resource_id
         deleted = await native.delete_resource(
@@ -112,8 +112,8 @@ async def test_native_cleanup_preserves_watch_through_delete_and_restore():
                     assert item["target"]["uri"] == "akb://native-notify/doc/first.md"
 
 
-async def test_native_transaction_rollback_and_mutation_replay_do_not_duplicate():
-    async with _fresh_database() as pool:
+async def test_native_transaction_rollback_and_mutation_replay_do_not_duplicate(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         native, current, _, _, vault = await setup_native(pool)
         def fail(boundary):
             if boundary == "authority.after_activity":
@@ -133,9 +133,9 @@ async def test_native_transaction_rollback_and_mutation_replay_do_not_duplicate(
             assert await conn.fetchval("SELECT count(*) FROM notification_work") == 1
 
 
-async def test_native_subscription_api_resolves_current_authority_and_move_alias():
+async def test_native_subscription_api_resolves_current_authority_and_move_alias(application_schema_template):
     from app.api.routes import notifications as routes
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         native, current, _, reader, vault = await setup_native(pool)
         user = SimpleNamespace(user_id=str(reader))
         uri = "akb://native-notify/doc/first.md"

@@ -7,20 +7,23 @@ import importlib.util
 import json
 import os
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.config import settings
 from app.services import file_service as files
 from app.services import native_file_projection as projection
 from app.services import publication_service
 from app.services.uri_service import file_uri
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8")
@@ -29,15 +32,7 @@ _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
 )
-
-
-async def _reachable() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+_DATABASE_PREFIX = "akb_native_file_projection_"
 
 
 def _load(filename: str):
@@ -49,41 +44,32 @@ def _load(filename: str):
     return module
 
 
+async def _initialize_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(_INIT_SQL)
+    for filename in (
+        "015_events_outbox.py",
+        "019_s3_delete_outbox.py",
+        "048_native_revision_core.py",
+        "053_native_revision_m1_pg_body.py",
+        "055_native_revision_m1_file_storage.py",
+        "057_native_revision_m1_payload_placement.py",
+        "079_worker_claim_lifecycle.py",
+        "089_native_file_projection_outbox.py",
+    ):
+        await _load(filename).migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template() -> AsyncIterator[TestDatabase]:
+    async with database_template(_DSN, _DATABASE_PREFIX, _initialize_schema) as template:
+        yield template
+
+
 @asynccontextmanager
-async def _fresh_schema():
-    if not await _reachable():
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    name = f"akb_native_file_projection_{uuid.uuid4().hex[:10]}"
-    admin = await asyncpg.connect(_DSN)
-    conn = None
-    pool = None
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        dsn = f"{_DSN.rsplit('/', 1)[0]}/{name}"
-        conn = await asyncpg.connect(dsn)
-        await conn.execute(_INIT_SQL)
-        for filename in (
-            "015_events_outbox.py",
-            "019_s3_delete_outbox.py",
-            "048_native_revision_core.py",
-            "053_native_revision_m1_pg_body.py",
-            "055_native_revision_m1_file_storage.py",
-            "057_native_revision_m1_payload_placement.py",
-            "079_worker_claim_lifecycle.py",
-            "089_native_file_projection_outbox.py",
-        ):
-            await _load(filename).migrate(conn=conn)
-        await conn.close()
-        conn = None
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
-        yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        if conn is not None and not conn.is_closed():
-            await conn.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+async def _fresh_schema(template: TestDatabase):
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            yield pool
 
 
 def _sha(payload: bytes) -> str:
@@ -134,9 +120,10 @@ async def _publish_source(
 
 
 async def test_file_text_binary_text_delete_projection_is_durable_and_idempotent(
+    schema_template,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with _fresh_schema() as pool:
+    async with _fresh_schema(schema_template) as pool:
         monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
         payloads = {
             "fixture/v1": b"native file version one\n",
@@ -355,10 +342,11 @@ async def test_file_text_binary_text_delete_projection_is_durable_and_idempotent
 
 
 async def test_final_projection_claim_is_visible_as_exhausted_until_its_lease_closes(
+    schema_template,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The last claim is diagnostic, but cannot be requeued while it is live."""
-    async with _fresh_schema() as pool:
+    async with _fresh_schema(schema_template) as pool:
         monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
         monkeypatch.setattr(projection, "MAX_RETRIES", 1)
         payload = b"final claim lease\n"
@@ -405,6 +393,7 @@ async def test_final_projection_claim_is_visible_as_exhausted_until_its_lease_cl
 
 
 async def test_abandoned_projection_is_visible_requeued_and_recovers(
+    schema_template,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A transient S3 read failure stays diagnosable until an explicit requeue.
@@ -413,7 +402,7 @@ async def test_abandoned_projection_is_visible_requeued_and_recovers(
     again there is still no Native resource, so it cannot be mistaken for a
     fresh projection.
     """
-    async with _fresh_schema() as pool:
+    async with _fresh_schema(schema_template) as pool:
         monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
         monkeypatch.setattr(projection, "MAX_RETRIES", 2)
         monkeypatch.setattr(projection, "next_attempt_delay", lambda _attempt: 0)
@@ -544,11 +533,11 @@ async def test_abandoned_projection_is_visible_requeued_and_recovers(
         }
 
 
-async def test_grep_file_coverage_tracks_current_catalogue_and_not_just_live_heads(monkeypatch, tmp_path):
+async def test_grep_file_coverage_tracks_current_catalogue_and_not_just_live_heads(schema_template, monkeypatch, tmp_path):
     from app.exceptions import AKBError
     from app.services.m1_native_grep_service import M1NativeGrepService
 
-    async with _fresh_schema() as pool:
+    async with _fresh_schema(schema_template) as pool:
         monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
         payloads = {"v1": b"old needle\n", "v2": b"new needle\n", "invalid": b"\x00bad"}
         monkeypatch.setattr(projection.s3_adapter, "iter_chunks", lambda key: iter([payloads[key]]))

@@ -26,8 +26,7 @@ Docker stack default is `postgresql://akb:akb@localhost:5433/akb`.
 This file runs in the live-PG job of `backend-pytest.yml`, which
 sets `AKB_TEST_DSN` and `REQUIRE_REAL_PG=1` — under that flag an
 unreachable DB fails instead of skipping, so the gate cannot go quietly
-green. The `pool` fixture applies init.sql *and* the migrations, because
-CI hands it an empty database.
+green. Each test clones the initialized application schema.
 """
 
 from __future__ import annotations
@@ -36,11 +35,12 @@ import asyncio
 import os
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import asyncpg
 import pytest
 import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, initialize_application_schema, temporary_database
 
 from app.repositories.document_repo import DocumentRepository
 from app.repositories.vault_repo import VaultRepository
@@ -52,50 +52,29 @@ _DSN = os.environ.get(
 )
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    async with database_template(_DSN, "akb_concurrency_invariants_template_", initialize_application_schema) as template:
+        yield template
 
 
 @pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect(_DSN):
-        # This file is in the DB-backed CI job, where an unreachable
-        # Postgres means the gate silently stopped firing — fail loudly
-        # rather than skip into a false green. Locally it still skips.
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=2, max_size=10)
-    init_sql = (
-        Path(__file__).resolve().parents[2] / "app" / "db" / "init.sql"
-    ).read_text()
-    async with pool.acquire() as conn:
-        await conn.execute(init_sql)
-    # The session_service uses get_pool() (module-global). Wire it to
-    # this test pool for the duration of the test.
-    from app.db import postgres as pg_mod
-    prev = pg_mod._pool
-    pg_mod._pool = pool
-    try:
-        # init.sql is only half the schema: `events` (migration 015),
-        # `s3_delete_outbox` (019), `chunks.vault_id` (014) and friends are
-        # created by migrations, and tests below need them. Against the
-        # empty database CI creates, init.sql alone leaves this file red.
-        # Drive the app's own runner rather than a hand-copied DDL list
-        # that would rot the first time someone adds a migration. This has
-        # to run AFTER the _pool wiring above — _apply_migrations resolves
-        # its connection through get_pool(). The schema_migrations ledger
-        # makes every run after the first a single SELECT.
-        await pg_mod._apply_migrations()
-        yield pool
-    finally:
-        pg_mod._pool = prev
-        await pool.close()
+async def database(schema_template):
+    async with temporary_database(_DSN, "akb_concurrency_invariants_", template=schema_template) as database:
+        yield database
+
+
+@pytest_asyncio.fixture
+async def pool(database):
+    async with asyncpg.create_pool(database.dsn, min_size=2, max_size=10) as pool:
+        from app.db import postgres as pg_mod
+
+        previous_pool = pg_mod._pool
+        pg_mod._pool = pool
+        try:
+            yield pool
+        finally:
+            pg_mod._pool = previous_pool
 
 
 @pytest_asyncio.fixture
@@ -118,6 +97,7 @@ async def vault(pool):
 # ── INV-5: BM25 recompute_stats try_advisory_lock ──────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_inv5_bm25_recompute_lock(pool, vault):
     """Concurrent recompute_stats: exactly one runs, the rest skip
@@ -151,6 +131,7 @@ async def test_inv5_bm25_recompute_lock(pool, vault):
     assert len(skipped) == N - 1, f"expected {N-1} skipped, got {len(skipped)}"
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_document_image_write_and_vault_lock_share_one_order(pool, vault):
     """A manifest write finishes while a concurrent vault lifecycle lock waits.
@@ -229,6 +210,7 @@ async def test_document_image_write_and_vault_lock_share_one_order(pool, vault):
 # ── INV-6: metadata_worker stale guard via expected_blob ───────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_inv6_mark_llm_metadata_stale_guard(pool, vault):
     """mark_llm_metadata_filled honours expected_blob: a worker that
@@ -283,6 +265,7 @@ async def test_inv6_mark_llm_metadata_stale_guard(pool, vault):
 # ── INV-7: delete_vault orphan chunks ──────────────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_inv7_delete_vault_no_orphan_chunks(pool, tmp_path, monkeypatch):
     """After delete_vault, no chunks remain that point at
@@ -397,6 +380,7 @@ async def test_inv7_delete_vault_no_orphan_chunks(pool, tmp_path, monkeypatch):
 # ── INV-7b: delete_vault file-chunk outbox with S3 CONFIGURED (P1-1) ─
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native_cloud", [False, True])
 async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatch, native_cloud):
@@ -518,6 +502,7 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
 # ── P1-2: FileService.delete must roll back on chunk-delete failure ──
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_p1_2_file_delete_rolls_back_on_chunk_failure(pool, monkeypatch):
     """FileService.delete wraps the chunk/outbox cleanup in the file-delete
@@ -562,6 +547,7 @@ async def test_p1_2_file_delete_rolls_back_on_chunk_failure(pool, monkeypatch):
 # ── The cascade must delete under the CANONICAL URI ──
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_chokepoint_materializes_the_canonical_uri(pool):
     """A caller holding only a document id has to resolve it to the
@@ -622,6 +608,7 @@ async def test_chokepoint_materializes_the_canonical_uri(pool):
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_delete_publications_for_document_rejects_a_bare_id(pool, vault):
     """The helper takes a canonical URI and nothing else.
@@ -651,6 +638,7 @@ async def test_delete_publications_for_document_rejects_a_bare_id(pool, vault):
     assert await delete_publications_for_document(uri, expected_vault_id=vid) == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_deleting_a_brace_path_document_is_not_blocked_by_uri_validation(
     pool, vault,
@@ -717,6 +705,7 @@ async def _publication_exists(pool, slug: str) -> bool:
         ))
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_delete_publications_for_document_joins_caller_tx(pool, vault):
     """`conn=` makes the DELETE part of the caller's transaction: rolling
@@ -772,6 +761,7 @@ async def test_delete_publications_for_document_joins_caller_tx(pool, vault):
     assert await _publication_exists(pool, slug)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_delete_publications_for_file_joins_caller_tx(pool, vault):
     """Same contract for the file helper. File publications carry a UUID
@@ -810,6 +800,7 @@ async def test_delete_publications_for_file_joins_caller_tx(pool, vault):
     assert not await _publication_exists(pool, slug)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_delete_publications_for_file_without_conn(pool, vault):
     """Omitting `conn` keeps the pre-existing self-acquiring behaviour —
@@ -879,6 +870,7 @@ async def test_p2_embed_index_reorder():
 # ── P2: alter_table reserved-column guard ─────────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_p2_alter_table_reserved_guard(pool):
     from app.services import table_service
@@ -916,6 +908,7 @@ async def test_p2_alter_table_reserved_guard(pool):
 # ── P2: create_table reserved/duplicate/malformed column → 422 ────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_p2_create_table_bad_columns_are_validation_errors(pool):
     """Every reserved / duplicate / malformed / missing-name column on create
@@ -968,6 +961,7 @@ async def test_p2_create_table_bad_columns_are_validation_errors(pool):
 # ── P2: archived vault is read-only via akb_sql ───────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_p2_archived_vault_blocks_writes(pool):
     from app.services import table_service
@@ -1012,6 +1006,7 @@ async def test_p2_archived_vault_blocks_writes(pool):
 # ── P2: collection delete handles tables ──────────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_p2_collection_delete_handles_tables(pool):
     from app.services import table_service
@@ -1079,6 +1074,7 @@ async def test_p2_collection_delete_handles_tables(pool):
 # ── E06: collection-retirement vs PUT FK race ──────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_create_with_deleted_collection_raises_conflict(pool, vault):
     """A document insert whose `collection_id` references a collection that no
@@ -1168,8 +1164,10 @@ async def _await_blocked(watch, *, count: int, contains: str | None = None,
         await asyncio.sleep(0.02)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publication_waits_for_vault_before_locking_document(
+    database,
     pool, vault, monkeypatch,
 ):
     """Publication creation follows the vault -> document lifecycle order."""
@@ -1194,7 +1192,7 @@ async def test_publication_waits_for_vault_before_locking_document(
         )
 
     doc_repo = DocumentRepository(pool)
-    watch = await asyncpg.connect(_DSN)
+    watch = await asyncpg.connect(database.dsn)
     try:
         async with pool.acquire() as lifecycle:
             tx = lifecycle.transaction()
@@ -1235,8 +1233,9 @@ async def test_publication_waits_for_vault_before_locking_document(
         await watch.close()
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
-async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, monkeypatch):
+async def test_publish_delete_race_leaves_no_orphan_publication(database, pool, vault, monkeypatch):
     """A publisher that commits *while a delete is in flight* must not leave
     its publication behind.
 
@@ -1286,8 +1285,8 @@ async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, mon
         )
 
     doc_repo = DocumentRepository(pool)
-    blocker = await asyncpg.connect(_DSN)   # holds the row so we can order the queue
-    watch = await asyncpg.connect(_DSN)     # observes who is parked on it
+    blocker = await asyncpg.connect(database.dsn)   # holds the row so we can order the queue
+    watch = await asyncpg.connect(database.dsn)     # observes who is parked on it
     pub_result: dict | None = None
     pub_error: Exception | None = None
     try:
@@ -1381,8 +1380,10 @@ async def test_publish_delete_race_leaves_no_orphan_publication(pool, vault, mon
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_reach(
+    database,
     pool, vault,
 ):
     """The same lock-ordering proof, on the one population the FK is blind to.
@@ -1414,8 +1415,8 @@ async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_re
     await _insert_doc(pool, doc_id=did, vault_id=vid, path=path, title="Legacy")
 
     doc_repo = DocumentRepository(pool)
-    blocker = await asyncpg.connect(_DSN)
-    watch = await asyncpg.connect(_DSN)
+    blocker = await asyncpg.connect(database.dsn)
+    watch = await asyncpg.connect(database.dsn)
     try:
         btx = blocker.transaction()
         await btx.start()
@@ -1495,8 +1496,9 @@ async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_re
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
-async def test_publish_aborts_when_the_delete_holds_the_row(pool, vault, monkeypatch):
+async def test_publish_aborts_when_the_delete_holds_the_row(database, pool, vault, monkeypatch):
     """The other interleaving: the deleter wins the row, so the publisher's
     FOR SHARE re-check finds nothing and `create_publication` fails closed
     instead of inserting a publication for a document that is already gone.
@@ -1528,7 +1530,7 @@ async def test_publish_aborts_when_the_delete_holds_the_row(pool, vault, monkeyp
         )
 
     doc_repo = DocumentRepository(pool)
-    watch = await asyncpg.connect(_DSN)
+    watch = await asyncpg.connect(database.dsn)
     try:
         async with pool.acquire() as c:
             tx = c.transaction()
@@ -1599,6 +1601,7 @@ async def _insert_doc(pool, *, doc_id, vault_id, path, title) -> None:
         )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publish_binds_the_publication_to_the_document_it_resolved(
     pool, vault, monkeypatch,
@@ -1651,6 +1654,7 @@ async def test_publish_binds_the_publication_to_the_document_it_resolved(
     assert row["resource_uri"] == doc_uri(vname, path)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publish_refuses_when_another_document_takes_the_resolved_path(
     pool, vault, monkeypatch,
@@ -1726,6 +1730,7 @@ async def test_publish_refuses_when_another_document_takes_the_resolved_path(
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publish_refuses_when_the_resolved_document_moves_off_its_path(
     pool, vault, monkeypatch,
@@ -1816,6 +1821,7 @@ async def test_publish_refuses_when_the_resolved_document_moves_off_its_path(
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publish_refuses_a_uri_that_names_another_vault(
     pool, vault, monkeypatch,

@@ -10,6 +10,10 @@ import uuid
 import asyncpg
 import pytest
 
+from tests.helpers.pg_database import (
+    temporary_database,
+)
+
 from app.config import settings
 from app.exceptions import (
     ExternalAuthDisabledError,
@@ -17,7 +21,7 @@ from app.exceptions import (
 )
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 _ISSUER = "https://id.example.com/realms/akb"
 _SSO_SESSION_EPOCH = uuid.UUID("8dbce581-ea57-47ca-ae8f-3c3ddb05e787")
@@ -40,78 +44,55 @@ class RecordingRoleSync:
 
 
 @pytest.fixture
-async def services(monkeypatch):
-    try:
-        pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=3)
-    except Exception:
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
+async def services(monkeypatch, application_schema_template):
+    async with (
+        temporary_database(_DSN, "akb_workspace_account_admin_", template=application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=3) as pool,
+    ):
+        from app.services import account_service, auth_service, password_service
 
-    from app.db.postgres import _load_migration
-    from app.services import account_service, auth_service, password_service
-
-    async with pool.acquire() as conn:
-        for filename in (
-            "043_workspace_account_governance.py",
-            "071_recovery_admin.py",
-            "072_admin_browser_sessions.py",
-            "074_sso_browser_sessions.py",
-            "076_sso_session_epoch.py",
-        ):
-            migration = _load_migration(filename)
-            assert migration is not None
-            await migration.migrate(conn=conn)
-        await conn.execute(
-            """
-            INSERT INTO auth_runtime_state (
-                singleton, runtime_generation, auth_mode, sso_session_epoch
-            ) VALUES (TRUE, 1, 'sso', $1)
-            ON CONFLICT (singleton) DO UPDATE
-               SET runtime_generation = EXCLUDED.runtime_generation,
-                   auth_mode = EXCLUDED.auth_mode,
-                   sso_session_epoch = EXCLUDED.sso_session_epoch,
-                   updated_at = NOW()
-            """,
-            _SSO_SESSION_EPOCH,
-        )
-        await conn.execute(
-            """
-            UPDATE auth_runtime_epoch_upgrade
-               SET state = 'enforced'
-             WHERE singleton = TRUE
-            """
-        )
-
-    role_sync = RecordingRoleSync()
-
-    async def _get_pool():
-        return pool
-
-    # The prelink write path now refuses an issuer this runtime would never
-    # present, so a fixture has to say what it presents. Until it did, every
-    # test here passed an issuer nobody had claimed was ours — which is the
-    # shape the defect hid in.
-    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
-    monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "keycloak_server_url", "https://id.example.com", raising=False)
-    monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
-    assert settings.keycloak_issuer == _ISSUER
-
-    monkeypatch.setattr(account_service, "get_pool", _get_pool)
-    monkeypatch.setattr(auth_service, "get_pool", _get_pool)
-    monkeypatch.setattr(password_service, "get_pool", _get_pool)
-    monkeypatch.setattr(account_service, "get_role_sync", lambda: role_sync)
-    yield pool, role_sync, account_service
-
-    async with pool.acquire() as conn:
-        user_ids = await conn.fetch("SELECT id FROM users WHERE username LIKE 'governance-%'")
-        ids = [str(row["id"]) for row in user_ids]
-        await conn.execute("DELETE FROM users WHERE username LIKE 'governance-%'")
-        if ids:
+        async with pool.acquire() as conn:
             await conn.execute(
-                "DELETE FROM events WHERE payload->>'user_id' = ANY($1::text[])",
-                ids,
+                """
+                INSERT INTO auth_runtime_state (
+                    singleton, runtime_generation, auth_mode, sso_session_epoch
+                ) VALUES (TRUE, 1, 'sso', $1)
+                ON CONFLICT (singleton) DO UPDATE
+                   SET runtime_generation = EXCLUDED.runtime_generation,
+                       auth_mode = EXCLUDED.auth_mode,
+                       sso_session_epoch = EXCLUDED.sso_session_epoch,
+                       updated_at = NOW()
+                """,
+                _SSO_SESSION_EPOCH,
             )
-    await pool.close()
+            await conn.execute(
+                """
+                UPDATE auth_runtime_epoch_upgrade
+                   SET state = 'enforced'
+                 WHERE singleton = TRUE
+                """
+            )
+
+        role_sync = RecordingRoleSync()
+
+        async def _get_pool():
+            return pool
+
+        # The prelink write path now refuses an issuer this runtime would never
+        # present, so a fixture has to say what it presents. Until it did, every
+        # test here passed an issuer nobody had claimed was ours — which is the
+        # shape the defect hid in.
+        monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+        monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
+        monkeypatch.setattr(settings, "keycloak_server_url", "https://id.example.com", raising=False)
+        monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
+        assert settings.keycloak_issuer == _ISSUER
+
+        monkeypatch.setattr(account_service, "get_pool", _get_pool)
+        monkeypatch.setattr(auth_service, "get_pool", _get_pool)
+        monkeypatch.setattr(password_service, "get_pool", _get_pool)
+        monkeypatch.setattr(account_service, "get_role_sync", lambda: role_sync)
+        yield pool, role_sync, account_service
 
 
 async def test_ensure_human_binding_is_idempotent_and_never_bootstrap_admin(services):

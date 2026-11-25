@@ -229,6 +229,7 @@ async def _fresh_measurement_database(label: str):
 # a setup that cannot carry the writer fails here rather than on a measurement.
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_adapter_setup_carries_its_native_write_workload():
     adapter = _load_adapter()
@@ -244,6 +245,7 @@ async def test_adapter_setup_carries_its_native_write_workload():
     assert cases["C4"]["independent"]["overlap_observed"] is True
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_text_grep_adapter_setup_carries_its_document_grep_workload():
     adapter = _load_script("native_revision_m1_text_grep_adapter", _TEXT_GREP_SCRIPT)

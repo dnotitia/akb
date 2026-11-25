@@ -6,24 +6,47 @@ from contextlib import asynccontextmanager
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.services.role_sync import ReconcileReport, RoleStateDiff, RoleSync, _is_catalog_role, user_role_name, vault_group_role_name
-from tests.test_boot_schema_serialization_pg import _empty_database
+from tests.helpers.pg_database import database_template, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
+
+
+_DSN = os.environ.get(
+    "AKB_TEST_DSN",
+    "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
+)
+
+
+async def _initialize(conn: asyncpg.Connection) -> None:
+    await conn.execute("""
+        CREATE TABLE users(id uuid PRIMARY KEY, account_status text, is_admin boolean DEFAULT false);
+        CREATE TABLE tokens(id uuid, user_id uuid, vault_scope jsonb, expires_at timestamptz);
+        CREATE TABLE vaults(id uuid PRIMARY KEY, owner_id uuid, status text, name text, public_access text DEFAULT 'none', description text, updated_at timestamptz);
+        CREATE TABLE vault_access(vault_id uuid,user_id uuid,role text);
+        CREATE TABLE fixture_private(id int);
+        INSERT INTO fixture_private VALUES(42);
+    """)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    async with database_template(_DSN, "akb_role_delta_template_", _initialize) as template:
+        yield template
 
 
 @asynccontextmanager
-async def _fixture():
-    async with _empty_database() as dsn:
-        conn = await asyncpg.connect(dsn)
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=1)
+async def _fixture(schema_template):
+    async with temporary_database(_DSN, "akb_role_delta_", template=schema_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        pool = await asyncpg.create_pool(database.dsn, min_size=1, max_size=1)
         owner, member, vault = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
         users = [user_role_name(x) for x in (owner, member)]
         groups = [vault_group_role_name(vault, x) for x in ('reader', 'writer', 'admin')]
         external = 'operator_fixture_' + uuid.uuid4().hex
         try:
-            await conn.execute("""CREATE TABLE users(id uuid PRIMARY KEY, account_status text, is_admin boolean DEFAULT false); CREATE TABLE tokens(id uuid, user_id uuid, vault_scope jsonb, expires_at timestamptz); CREATE TABLE vaults(id uuid PRIMARY KEY, owner_id uuid, status text, name text, public_access text DEFAULT 'none', description text, updated_at timestamptz); CREATE TABLE vault_access(vault_id uuid,user_id uuid,role text); CREATE TABLE fixture_private(id int); INSERT INTO fixture_private VALUES(42)""")
             await conn.execute("INSERT INTO users(id,account_status) VALUES($1,'active'),($2,'active')", owner, member)
             await conn.execute("INSERT INTO vaults(id,owner_id,status,name) VALUES($1,$2,'archived',$3)", vault, owner, str(vault))
             for role in users + groups + [external]:
@@ -46,8 +69,8 @@ async def _can_read(conn, role):
         return False
 
 
-async def test_downgrade_removes_stale_admin_and_diff_reports_it():
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+async def test_downgrade_removes_stale_admin_and_diff_reports_it(schema_template):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         await conn.execute("INSERT INTO vault_access VALUES($1,$2,'reader')", vault, member)
         await conn.execute(f'GRANT "{groups[2]}" TO "{users[1]}"')
         diff = RoleStateDiff()
@@ -61,8 +84,8 @@ async def test_downgrade_removes_stale_admin_and_diff_reports_it():
         assert await _can_read(conn, users[1])
 
 
-async def test_absent_catalog_membership_revokes_actual_sql_access():
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+async def test_absent_catalog_membership_revokes_actual_sql_access(schema_template):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         await conn.execute(f'GRANT "{groups[2]}" TO "{users[1]}"')
         assert await _can_read(conn, users[1])
         report = ReconcileReport()
@@ -72,8 +95,8 @@ async def test_absent_catalog_membership_revokes_actual_sql_access():
         assert await _can_read(conn, users[0])
 
 
-async def test_owner_archived_hierarchy_and_operator_membership_survive():
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+async def test_owner_archived_hierarchy_and_operator_membership_survive(schema_template):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         # A leftover weaker catalog row must not replace owner's admin authority.
         await conn.execute("INSERT INTO vault_access VALUES($1,$2,'reader')", vault, owner)
         await conn.execute(f'GRANT "{groups[1]}" TO "{external}"; GRANT "{external}" TO "{users[1]}"')
@@ -90,8 +113,8 @@ async def test_owner_archived_hierarchy_and_operator_membership_survive():
         assert not diff.missing_memberships and not diff.stale_memberships
 
 
-async def test_repeated_convergence_applies_no_membership_ddl_or_warning():
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+async def test_repeated_convergence_applies_no_membership_ddl_or_warning(schema_template):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         await conn.execute("INSERT INTO vault_access VALUES($1,$2,'writer')", vault, member)
         report = ReconcileReport()
         await sync._reconcile_memberships(conn, report)
@@ -108,9 +131,9 @@ async def test_repeated_convergence_applies_no_membership_ddl_or_warning():
         assert not messages
 
 
-async def test_waiting_reconcile_observes_committed_revoke_not_pre_lock_snapshot(monkeypatch):
+async def test_waiting_reconcile_observes_committed_revoke_not_pre_lock_snapshot(schema_template, monkeypatch):
     from app.services.role_authority import role_authority_transaction
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         await conn.execute("INSERT INTO vault_access VALUES($1,$2,'reader')", vault, member)
         await conn.execute(f'GRANT "{groups[0]}" TO "{users[1]}"')
         async def no_op(conn, report):
@@ -136,8 +159,8 @@ async def test_waiting_reconcile_observes_committed_revoke_not_pre_lock_snapshot
                 await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_delayed_grant_callback_cannot_reinstate_revoked_access_with_pool_one():
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+async def test_delayed_grant_callback_cannot_reinstate_revoked_access_with_pool_one(schema_template):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         # Callback was produced by an old writer grant, catalog has since revoked.
         await asyncio.wait_for(sync.on_grant(vault, member, 'admin'), 3)
         assert not sync.metrics.total_failures()
@@ -150,9 +173,9 @@ async def test_delayed_grant_callback_cannot_reinstate_revoked_access_with_pool_
         assert not await conn.fetchval('SELECT pg_has_role($1,$2,$3)', users[1], groups[2], 'MEMBER')
 
 
-async def test_other_grantor_residual_rolls_back_catalog_revoke():
+async def test_other_grantor_residual_rolls_back_catalog_revoke(schema_template):
     from app.services.role_authority import role_authority_transaction
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         await conn.execute("INSERT INTO vault_access VALUES($1,$2,'admin')", vault, member)
         await conn.execute(f'GRANT "{groups[2]}" TO "{external}" WITH ADMIN TRUE')
         async with conn.transaction():
@@ -174,8 +197,8 @@ async def test_other_grantor_residual_rolls_back_catalog_revoke():
 
 
 @pytest.mark.parametrize('option', ['ADMIN TRUE', 'INHERIT FALSE', 'SET FALSE'])
-async def test_noncanonical_grant_options_are_visible_and_refused(option):
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+async def test_noncanonical_grant_options_are_visible_and_refused(schema_template, option):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         await conn.execute("INSERT INTO vault_access VALUES($1,$2,'reader')", vault, member)
         await conn.execute(f'GRANT "{groups[0]}" TO "{users[1]}" WITH {option}')
         diff = RoleStateDiff()
@@ -188,10 +211,10 @@ async def test_noncanonical_grant_options_are_visible_and_refused(option):
         assert report.errors and not report.grants_added
 
 
-async def test_foreign_public_membership_prevents_false_success_and_rolls_back():
+async def test_foreign_public_membership_prevents_false_success_and_rolls_back(schema_template):
     from app.services.role_authority import role_authority_transaction
     from app.services.role_sync import AUTHENTICATED_ROLE
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         await sync._create_role_if_missing(conn, AUTHENTICATED_ROLE)
         await conn.execute("UPDATE vaults SET public_access='reader' WHERE id=$1", vault)
         await conn.execute(f'GRANT "{groups[0]}" TO "{external}" WITH ADMIN TRUE')
@@ -205,12 +228,12 @@ async def test_foreign_public_membership_prevents_false_success_and_rolls_back()
         assert await conn.fetchval('SELECT public_access FROM vaults WHERE id=$1', vault) == 'reader'
 
 
-async def test_foreign_token_membership_prevents_false_success_and_rolls_back():
+async def test_foreign_token_membership_prevents_false_success_and_rolls_back(schema_template):
     from app.models.vault_scope import VaultScope
     from app.services.role_authority import role_authority_transaction
     from app.services.role_sync import token_role_name
     import json
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         tid = uuid.uuid4()
         token = token_role_name(tid)
         scope = VaultScope(prefixes=(), extra_vaults=frozenset({str(vault)}))
@@ -235,12 +258,12 @@ async def test_foreign_token_membership_prevents_false_success_and_rolls_back():
     "an exclusively owned PostgreSQL cluster (AKB_ROLE_CLUSTER_EXCLUSIVE=1); "
     "the live-PG job runs it in its own step before any other DB fixture"
 )
-async def test_full_reconcile_preserves_similarly_prefixed_operator_roles():
+async def test_full_reconcile_preserves_similarly_prefixed_operator_roles(schema_template):
     # PostgreSQL roles are cluster-global. This full prune oracle must run
     # separately before other fixtures allocate UUID roles in another DB.
     if os.environ.get("AKB_ROLE_CLUSTER_EXCLUSIVE") != "1":
         pytest.skip("full role-prune oracle requires an exclusively owned PG cluster")
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         managed = {
             row["rolname"] for row in await conn.fetch("SELECT rolname FROM pg_roles")
             if any(_is_catalog_role(row["rolname"], kind) for kind in ("user", "vault", "token"))
@@ -276,8 +299,8 @@ async def test_full_reconcile_preserves_similarly_prefixed_operator_roles():
                 await conn.execute(f'DROP OWNED BY "{role}"; DROP ROLE "{role}"')
 
 
-async def test_stale_table_callback_cannot_grant_an_unregistered_table():
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+async def test_stale_table_callback_cannot_grant_an_unregistered_table(schema_template):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         await conn.execute('CREATE TABLE vault_tables(vault_id uuid, name text); CREATE TABLE vt_fixture__unregistered(id int)')
         await asyncio.wait_for(sync.on_table_create(vault, 'vt_fixture__unregistered'), 3)
         assert not sync.metrics.total_failures()
@@ -285,12 +308,12 @@ async def test_stale_table_callback_cannot_grant_an_unregistered_table():
 
 
 @pytest.mark.parametrize("setter", ["public", "metadata"])
-async def test_public_mutation_rechecks_owner_after_waiting_for_authority(monkeypatch, setter):
+async def test_public_mutation_rechecks_owner_after_waiting_for_authority(schema_template, monkeypatch, setter):
     from app.exceptions import ForbiddenError
     from app.services import access_service
     from app.services.role_authority import role_authority_transaction
 
-    async with _fixture() as (conn, sync, owner, member, vault, users, groups, external):
+    async with _fixture(schema_template) as (conn, sync, owner, member, vault, users, groups, external):
         async def get_pool():
             return sync.pool
         async def no_policy(vault_id, *, conn):

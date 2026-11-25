@@ -13,8 +13,11 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
-pytestmark = pytest.mark.asyncio
+from tests.helpers.pg_database import database_template, temporary_database
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
@@ -25,20 +28,6 @@ _DSN = os.environ.get(
 )
 
 
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
-
-
 def _load_migration():
     spec = importlib.util.spec_from_file_location("app_registry_migration", _MIGRATION)
     assert spec is not None and spec.loader is not None
@@ -47,23 +36,24 @@ def _load_migration():
     return module
 
 
+async def _initialize(conn):
+    await conn.execute(_INIT_SQL)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def db_template():
+    async with database_template(_DSN, "akb_registry_template_", _initialize) as template:
+        yield template
+
+
 @asynccontextmanager
-async def _fresh_database(*, initialize: bool = True):
-    if not await _can_connect():
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_registry_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    dsn = _database_dsn(name)
-    conn = await asyncpg.connect(dsn)
-    try:
-        if initialize:
-            await conn.execute(_INIT_SQL)
-        yield conn, dsn, name
-    finally:
-        await conn.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
+async def _fresh_database(db_template):
+    async with temporary_database(_DSN, "akb_registry_", template=db_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            yield conn, database.dsn, database.name
+        finally:
+            await conn.close()
 
 
 async def _apply(conn: asyncpg.Connection) -> None:
@@ -148,8 +138,8 @@ async def _resource(
     )
 
 
-async def test_fresh_apply_second_apply_and_compatible_partial_object():
-    async with _fresh_database() as (conn, _, _):
+async def test_fresh_apply_second_apply_and_compatible_partial_object(db_template):
+    async with _fresh_database(db_template) as (conn, _, _):
         await _apply(conn)
         app_id = await _app(conn, f"idempotent-{uuid.uuid4().hex}")
         before_objects = await conn.fetch(
@@ -218,7 +208,7 @@ async def test_fresh_apply_second_apply_and_compatible_partial_object():
         )
         assert await conn.fetchrow("SELECT * FROM app_definitions WHERE id = $1", app_id) == before_row
 
-    async with _fresh_database() as (conn, _, _):
+    async with _fresh_database(db_template) as (conn, _, _):
         await conn.execute(
             """
             CREATE TABLE app_definitions (
@@ -240,8 +230,8 @@ async def test_fresh_apply_second_apply_and_compatible_partial_object():
         assert row["metadata"] == "{}"
 
 
-async def test_app_release_ownership_duplicate_installation_and_lifecycle_coherence():
-    async with _fresh_database() as (conn, _, _):
+async def test_app_release_ownership_duplicate_installation_and_lifecycle_coherence(db_template):
+    async with _fresh_database(db_template) as (conn, _, _):
         await _apply(conn)
         app_a = await _app(conn, f"app-a-{uuid.uuid4().hex}")
         app_b = await _app(conn, f"app-b-{uuid.uuid4().hex}")
@@ -340,8 +330,8 @@ async def test_app_release_ownership_duplicate_installation_and_lifecycle_cohere
         )
 
 
-async def test_release_rows_are_immutable_including_manifest_order_and_checksum():
-    async with _fresh_database() as (conn, _, _):
+async def test_release_rows_are_immutable_including_manifest_order_and_checksum(db_template):
+    async with _fresh_database(db_template) as (conn, _, _):
         await _apply(conn)
         app_a = await _app(conn, f"release-a-{uuid.uuid4().hex}")
         app_b = await _app(conn, f"release-b-{uuid.uuid4().hex}")
@@ -387,8 +377,8 @@ async def test_release_rows_are_immutable_including_manifest_order_and_checksum(
         )
 
 
-async def test_grant_generation_rejects_stale_skipped_duplicate_and_racing_writers():
-    async with _fresh_database() as (conn, dsn, _):
+async def test_grant_generation_rejects_stale_skipped_duplicate_and_racing_writers(db_template):
+    async with _fresh_database(db_template) as (conn, dsn, _):
         await _apply(conn)
         app_id = await _app(conn, f"generation-{uuid.uuid4().hex}")
         release_id = await _release(conn, app_id, "1.0.0")
@@ -471,8 +461,8 @@ async def test_grant_generation_rejects_stale_skipped_duplicate_and_racing_write
         assert sum(row["status"] == "active" for row in rows) == 1
 
 
-async def test_grant_capability_and_issuer_are_immutable_and_revoke_is_one_way():
-    async with _fresh_database() as (conn, _, _):
+async def test_grant_capability_and_issuer_are_immutable_and_revoke_is_one_way(db_template):
+    async with _fresh_database(db_template) as (conn, _, _):
         await _apply(conn)
         app_id = await _app(conn, f"grant-{uuid.uuid4().hex}")
         release_id = await _release(conn, app_id, "1.0.0")
@@ -542,8 +532,8 @@ async def test_grant_capability_and_issuer_are_immutable_and_revoke_is_one_way()
         )
 
 
-async def test_uninstall_retains_owned_resources_and_registry_view_is_complete():
-    async with _fresh_database() as (conn, _, _):
+async def test_uninstall_retains_owned_resources_and_registry_view_is_complete(db_template):
+    async with _fresh_database(db_template) as (conn, _, _):
         await _apply(conn)
         app_id = await _app(conn, f"resources-{uuid.uuid4().hex}")
         release_id = await _release(conn, app_id, "1.0.0")
@@ -595,8 +585,8 @@ async def test_uninstall_retains_owned_resources_and_registry_view_is_complete()
         }
 
 
-async def test_resource_identity_is_unique_within_a_vault_but_reusable_across_vaults():
-    async with _fresh_database() as (conn, _, _):
+async def test_resource_identity_is_unique_within_a_vault_but_reusable_across_vaults(db_template):
+    async with _fresh_database(db_template) as (conn, _, _):
         await _apply(conn)
         app_a = await _app(conn, f"owner-a-{uuid.uuid4().hex}")
         app_b = await _app(conn, f"owner-b-{uuid.uuid4().hex}")
@@ -636,8 +626,8 @@ async def test_resource_identity_is_unique_within_a_vault_but_reusable_across_va
         )
 
 
-async def test_upgrade_from_previous_registry_shape_preserves_registry_rows():
-    async with _fresh_database() as (conn, _, _):
+async def test_upgrade_from_previous_registry_shape_preserves_registry_rows(db_template):
+    async with _fresh_database(db_template) as (conn, _, _):
         await conn.execute(
             """
             CREATE TABLE app_definitions (
@@ -754,8 +744,8 @@ async def test_upgrade_from_previous_registry_shape_preserves_registry_rows():
         assert after_second == after_first
 
 
-async def test_registry_identities_are_immutable_but_mutable_fields_still_update():
-    async with _fresh_database() as (conn, _, _):
+async def test_registry_identities_are_immutable_but_mutable_fields_still_update(db_template):
+    async with _fresh_database(db_template) as (conn, _, _):
         await _apply(conn)
         app_a_key = f"identity-a-{uuid.uuid4().hex}"
         app_a = await _app(conn, app_a_key)
@@ -857,8 +847,8 @@ async def test_registry_identities_are_immutable_but_mutable_fields_still_update
         assert json.loads(resource["metadata"]) == {"reason": "uninstall"}
 
 
-async def test_vault_delete_cascades_only_its_registry_state_and_direct_deletes_fail():
-    async with _fresh_database() as (conn, _, _):
+async def test_vault_delete_cascades_only_its_registry_state_and_direct_deletes_fail(db_template):
+    async with _fresh_database(db_template) as (conn, _, _):
         await _apply(conn)
         app_id = await _app(conn, f"delete-{uuid.uuid4().hex}")
         release_id = await _release(conn, app_id, "1.0.0")
@@ -961,8 +951,8 @@ async def test_vault_delete_cascades_only_its_registry_state_and_direct_deletes_
         )
 
 
-async def test_existing_data_is_unchanged_and_ordinary_role_gets_no_registry_access():
-    async with _fresh_database() as (conn, _, name):
+async def test_existing_data_is_unchanged_and_ordinary_role_gets_no_registry_access(db_template):
+    async with _fresh_database(db_template) as (conn, _, name):
         user_id = await conn.fetchval(
             "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, 'sentinel-hash') RETURNING id",
             f"user-{uuid.uuid4().hex}",
@@ -1017,11 +1007,13 @@ async def test_existing_data_is_unchanged_and_ordinary_role_gets_no_registry_acc
 
         role = f"akb_registry_probe_{uuid.uuid4().hex[:12]}"
         await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
-        await conn.execute(f'GRANT CONNECT ON DATABASE "{name}" TO "{role}"')
-        await conn.execute(f'GRANT USAGE ON SCHEMA public TO "{role}"')
-        await conn.execute(f'SET ROLE "{role}"')
         try:
+            await conn.execute(f'GRANT CONNECT ON DATABASE "{name}" TO "{role}"')
+            await conn.execute(f'GRANT USAGE ON SCHEMA public TO "{role}"')
+            await conn.execute(f'SET ROLE "{role}"')
             assert await _error_state(conn, "SELECT count(*) FROM app_definitions") == "42501"
             assert await _error_state(conn, "SELECT count(*) FROM app_installation_registry") == "42501"
         finally:
             await conn.execute("RESET ROLE")
+            await conn.execute(f'DROP OWNED BY "{role}"')
+            await conn.execute(f'DROP ROLE "{role}"')

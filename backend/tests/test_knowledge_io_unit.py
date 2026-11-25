@@ -2,8 +2,8 @@
 
 Covers the pure pieces of `app.services.knowledge_io` — zip (de)serialisation
 round-trip, the runaway-archive guards, and the format registry — without a DB
-(export_vault / import_bundle need one and are exercised by the e2e suite
-`test_okf_export_import_e2e.sh`).
+(export_vault and import_bundle use a real database in
+`rest_integration/test_okf_export_import.py`).
 """
 from __future__ import annotations
 

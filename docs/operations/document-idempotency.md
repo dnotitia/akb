@@ -92,6 +92,7 @@ instance, stale original-read tokens, actor/Vault isolation, cross-surface
 receipts, revoked membership and token scope. Unit tests cover malformed keys,
 discovery and Bare Git rejection. The proxy contract tests cover local-file key
 forwarding; existing write-precondition and metadata suites remain applicable.
-`mcp_e2e/test_document_idempotency_e2e.py` also verifies that the common Bare Git
-HTTP runtime advertises no support and rejects keys through authenticated
-MCP/REST without mutating documents, while keyless calls remain usable.
+`backend/tests/rest_integration/test_document_idempotency.py` uses the Bare Git
+app with real PostgreSQL. It checks that authenticated MCP and REST reject
+idempotency keys without mutating documents and accept keyless calls. It also
+checks that the app advertises no idempotency support.

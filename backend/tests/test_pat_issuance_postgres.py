@@ -21,7 +21,7 @@ from app.services import auth_service
 from app.services.auth_service import AuthenticatedUser
 from tests.test_recovery_admin_provisioning_postgres import _fresh_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.fixture(autouse=True)
@@ -65,8 +65,8 @@ async def client_for(actor):
         yield client
 
 
-async def test_receipt_scope_list_expiry_and_legacy_defaults(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_receipt_scope_list_expiry_and_legacy_defaults(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         actor = await person(pool)
         async with client_for(actor) as client:
@@ -107,8 +107,8 @@ async def test_receipt_scope_list_expiry_and_legacy_defaults(monkeypatch):
     ({"expires_days": 10**30}, "expires_days"), ({"scopes": ["admin"]}, "scopes"),
     ({"vault_scope": {"prefixes": ["bad*"], "extra_vaults": []}}, "vault_scope.prefixes.0"),
     ({"unexpected": "never-echo-this"}, "unexpected")])
-async def test_422_fields_and_no_insert(monkeypatch, changes, field):
-    async with _fresh_database() as pool:
+async def test_422_fields_and_no_insert(monkeypatch, auth_schema_template, changes, field):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         actor = await person(pool)
         async with client_for(actor) as client:
@@ -120,8 +120,8 @@ async def test_422_fields_and_no_insert(monkeypatch, changes, field):
         assert await pool.fetchval("SELECT count(*) FROM tokens") == 0
 
 
-async def test_identity_and_authoritative_human_guards(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_identity_and_authoritative_human_guards(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         actor = await person(pool)
         async with client_for(actor) as client:
@@ -135,8 +135,8 @@ async def test_identity_and_authoritative_human_guards(monkeypatch):
 
 
 @pytest.mark.parametrize("key_class", ["pat", "service"])
-async def test_token_carriers_cannot_mint_through_any_alias(monkeypatch, key_class):
-    async with _fresh_database() as pool:
+async def test_token_carriers_cannot_mint_through_any_alias(monkeypatch, auth_schema_template, key_class):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         human = await person(pool, admin=True)
         credential = await auth_service.create_pat(human.user_id, "issuer", key_class=key_class)
@@ -152,8 +152,8 @@ async def test_token_carriers_cannot_mint_through_any_alias(monkeypatch, key_cla
         assert await pool.fetchval("SELECT count(*) FROM tokens") == 1
 
 
-async def test_allowlisted_machine_admin_aliases_and_live_revalidation(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_allowlisted_machine_admin_aliases_and_live_revalidation(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         human, target = await person(pool, admin=True), await person(pool)
         credential = await auth_service.create_pat(human.user_id, "approved", key_class="service")
@@ -175,8 +175,8 @@ async def test_allowlisted_machine_admin_aliases_and_live_revalidation(monkeypat
         assert await pool.fetchval("SELECT count(*) FROM tokens WHERE user_id=$1", uuid.UUID(target.user_id)) == 2
 
 
-async def test_expiration_rechecked_after_waiting_for_user_lock(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_expiration_rechecked_after_waiting_for_user_lock(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         actor = await person(pool)
         async with pool.acquire() as conn:
@@ -191,8 +191,8 @@ async def test_expiration_rechecked_after_waiting_for_user_lock(monkeypatch):
         assert await pool.fetchval("SELECT count(*) FROM tokens") == 0
 
 
-async def test_audit_failure_rolls_back_mint(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_audit_failure_rolls_back_mint(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         actor = await person(pool)
         monkeypatch.setattr(auth_service, "emit_event", AsyncMock(side_effect=RuntimeError("audit unavailable")))
@@ -201,8 +201,8 @@ async def test_audit_failure_rolls_back_mint(monkeypatch):
         assert await pool.fetchval("SELECT count(*) FROM tokens") == 0
 
 
-async def test_trusted_absolute_utc_overflow_never_inserts(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_trusted_absolute_utc_overflow_never_inserts(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         actor = await person(pool)
         for instant in ("9999-12-31T23:59:59-01:00", "0001-01-01T00:00:00+01:00"):
@@ -214,12 +214,12 @@ async def test_trusted_absolute_utc_overflow_never_inserts(monkeypatch):
         assert await pool.fetchval("SELECT count(*) FROM tokens") == 0
 
 
-async def test_sso_human_issuance_and_browser_csrf(monkeypatch):
+async def test_sso_human_issuance_and_browser_csrf(monkeypatch, browser_auth_template):
     from app.api import deps
     from app.services import sso_browser_session_service as sessions
     from tests.test_sso_account_lifecycle_postgres import configure, issue
     from tests.test_sso_browser_session_postgres import _seed_identity, _actor, _fresh_database as sso_database
-    async with sso_database() as pool:
+    async with sso_database(browser_auth_template) as pool:
         wire(monkeypatch, pool)
         configure(monkeypatch, pool)
         monkeypatch.setattr(deps, "sso_browser_session_ready", lambda: True)
@@ -253,8 +253,8 @@ async def test_sso_human_issuance_and_browser_csrf(monkeypatch):
 
 
 @pytest.mark.parametrize("mutation", ["is_admin=false", "account_status='suspended'"])
-async def test_admin_owner_changes_deny_captured_authorization(monkeypatch, mutation):
-    async with _fresh_database() as pool:
+async def test_admin_owner_changes_deny_captured_authorization(monkeypatch, auth_schema_template, mutation):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         admin, target = await person(pool, admin=True), await person(pool)
         credential = await auth_service.create_pat(admin.user_id, "approved", key_class="service")
@@ -268,8 +268,8 @@ async def test_admin_owner_changes_deny_captured_authorization(monkeypatch, muta
         assert await pool.fetchval("SELECT count(*) FROM tokens WHERE user_id=$1", uuid.UUID(target.user_id)) == 0
 
 
-async def test_human_admin_both_aliases_and_suspended_target(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_human_admin_both_aliases_and_suspended_target(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         admin, target = await person(pool, admin=True), await person(pool)
         async with client_for(admin) as client:
@@ -282,8 +282,8 @@ async def test_human_admin_both_aliases_and_suspended_target(monkeypatch):
         assert await pool.fetchval("SELECT count(*) FROM tokens WHERE user_id=$1", uuid.UUID(target.user_id)) == 2
 
 
-async def test_special_scope_cannot_be_minted_by_admin_or_allowlisted_machine(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_special_scope_cannot_be_minted_by_admin_or_allowlisted_machine(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         admin, target = await person(pool, admin=True), await person(pool)
         await pool.execute("UPDATE users SET account_kind='service' WHERE id=$1", uuid.UUID(target.user_id))
@@ -307,8 +307,8 @@ async def test_special_scope_cannot_be_minted_by_admin_or_allowlisted_machine(mo
         assert await pool.fetchval("SELECT COUNT(*) FROM tokens WHERE user_id=$1", uuid.UUID(target.user_id)) == 0
 
 
-async def test_disabled_pat_issuance_aliases_and_management(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_disabled_pat_issuance_aliases_and_management(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         admin = await person(pool, admin=True)
         existing = await auth_service.create_pat(admin.user_id, "existing")
@@ -340,8 +340,8 @@ async def test_disabled_pat_issuance_aliases_and_management(monkeypatch):
         assert await auth_service.resolve_rest_user_authorization(f"Bearer {existing['token']}") is None
 
 
-async def test_disabled_pat_preserves_atomic_verification_and_stored_class(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_disabled_pat_preserves_atomic_verification_and_stored_class(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         wire(monkeypatch, pool)
         admin = await person(pool, admin=True)
         saved = await auth_service.create_pat(admin.user_id, "saved")

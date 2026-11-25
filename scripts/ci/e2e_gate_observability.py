@@ -11,30 +11,6 @@ from typing import TextIO
 EVENT_PREFIX = "AKB_E2E_GATE "
 
 
-def signal_from_returncode(returncode: int) -> int | None:
-    """Return the POSIX signal represented by a negative child return code."""
-
-    return -returncode if returncode < 0 else None
-
-
-def signal_name(signum: int) -> str:
-    """Return a stable signal label without making event emission fail."""
-
-    try:
-        import signal
-
-        return signal.Signals(signum).name
-    except ValueError:
-        return f"SIG{signum}"
-
-
-def shell_exit_code(returncode: int) -> int:
-    """Map a Python subprocess return code to the shell-visible exit code."""
-
-    signum = signal_from_returncode(returncode)
-    return 128 + signum if signum is not None else returncode
-
-
 def _event_line(event: dict[str, object]) -> bytes:
     payload = {"timestamp": round(time.time(), 3), **event}
     return (

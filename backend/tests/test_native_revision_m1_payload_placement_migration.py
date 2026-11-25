@@ -5,15 +5,20 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
-from pathlib import Path
 import uuid
+from collections.abc import AsyncIterator
+from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.services.m1_pg_body_store import M1PgBodyStore
 from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_revision_service import NativeRevisionService
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
+
+pytestmark = pytest.mark.live_services
 
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -35,46 +40,41 @@ def _migration(filename: str):
     return module
 
 
-async def _reachable() -> bool:
-    try:
-        conn = await asyncpg.connect(DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+async def _initialize_pre_057_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(INIT_SQL)
+    await _migration("015_events_outbox.py").migrate(conn=conn)
+    await _migration("048_native_revision_core.py").migrate(conn=conn)
+    await _migration("053_native_revision_m1_pg_body.py").migrate(conn=conn)
+    await _migration("107_native_document_asset_refs.py").migrate(conn=conn)
 
 
-def _database_dsn(name: str) -> str:
-    base, _ = DSN.rsplit("/", 1)
-    return f"{base}/{name}"
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def pre_057_template() -> AsyncIterator[TestDatabase]:
+    async with database_template(DSN, "akb_pre_057_", _initialize_pre_057_schema) as template:
+        yield template
 
 
-async def _create_database(admin: asyncpg.Connection, name: str) -> str:
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    dsn = _database_dsn(name)
-    conn = await asyncpg.connect(dsn)
-    try:
-        await conn.execute(INIT_SQL)
-        await _migration("015_events_outbox.py").migrate(conn=conn)
-        await _migration("048_native_revision_core.py").migrate(conn=conn)
-        await _migration("053_native_revision_m1_pg_body.py").migrate(conn=conn)
-        await _migration("107_native_document_asset_refs.py").migrate(conn=conn)
-    finally:
-        await conn.close()
-    return dsn
+@pytest_asyncio.fixture
+async def measurement_dsn(pre_057_template: TestDatabase) -> AsyncIterator[str]:
+    async with temporary_database(
+        DSN, "akb_revision_m1_measurement_upgrade_", template=pre_057_template,
+    ) as database:
+        yield database.dsn
+
+
+@pytest_asyncio.fixture
+async def non_measurement_dsn(pre_057_template: TestDatabase) -> AsyncIterator[str]:
+    async with temporary_database(
+        DSN, "akb_non_measurement_guard_", template=pre_057_template,
+    ) as database:
+        yield database.dsn
 
 
 @pytest.mark.asyncio
-async def test_seeded_pre_057_database_upgrades_idempotently_and_deduplicates_per_placement():
-    if not await _reachable():
-        pytest.skip("Postgres is not reachable for the M1 placement upgrade test")
-
-    name = f"akb_revision_m1_measurement_upgrade_{uuid.uuid4().hex[:10]}"
-    admin = await asyncpg.connect(DSN)
+async def test_seeded_pre_057_database_upgrades_idempotently_and_deduplicates_per_placement(measurement_dsn):
     pool = None
     try:
-        dsn = await _create_database(admin, name)
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=16)
+        pool = await asyncpg.create_pool(measurement_dsn, min_size=1, max_size=16)
         async with pool.acquire() as conn:
             vault_id = await conn.fetchval(
                 "INSERT INTO vaults (name, git_path) VALUES ($1, $2) RETURNING id",
@@ -101,7 +101,7 @@ async def test_seeded_pre_057_database_upgrades_idempotently_and_deduplicates_pe
 
         await pool.close()
         pool = None
-        conn = await asyncpg.connect(dsn)
+        conn = await asyncpg.connect(measurement_dsn)
         try:
             placement = _migration("057_native_revision_m1_payload_placement.py")
             await placement.migrate(conn=conn)
@@ -109,7 +109,7 @@ async def test_seeded_pre_057_database_upgrades_idempotently_and_deduplicates_pe
         finally:
             await conn.close()
 
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=16)
+        pool = await asyncpg.create_pool(measurement_dsn, min_size=1, max_size=16)
         reference_store = M1ReferencePayloadStore(pool)
         pg_store = M1PgBodyStore(pool)
 
@@ -169,56 +169,44 @@ async def test_seeded_pre_057_database_upgrades_idempotently_and_deduplicates_pe
     finally:
         if pool is not None:
             await pool.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 @pytest.mark.asyncio
-async def test_placement_migration_leaves_non_measurement_database_unchanged():
-    if not await _reachable():
-        pytest.skip("Postgres is not reachable for the M1 placement guard test")
-
-    name = f"akb_non_measurement_guard_{uuid.uuid4().hex[:10]}"
-    admin = await asyncpg.connect(DSN)
+async def test_placement_migration_leaves_non_measurement_database_unchanged(non_measurement_dsn):
+    conn = await asyncpg.connect(non_measurement_dsn)
     try:
-        dsn = await _create_database(admin, name)
-        conn = await asyncpg.connect(dsn)
-        try:
-            before = await conn.fetchval(
-                """
-                SELECT pg_get_constraintdef(oid)
-                  FROM pg_constraint
-                 WHERE conrelid = 'm1_reference_payloads'::regclass
-                   AND conname = 'm1_reference_payloads_dedup_key'
-                """
+        before = await conn.fetchval(
+            """
+            SELECT pg_get_constraintdef(oid)
+              FROM pg_constraint
+             WHERE conrelid = 'm1_reference_payloads'::regclass
+               AND conname = 'm1_reference_payloads_dedup_key'
+            """
+        )
+        await _migration("057_native_revision_m1_payload_placement.py").migrate(conn=conn)
+        after = await conn.fetchval(
+            """
+            SELECT pg_get_constraintdef(oid)
+              FROM pg_constraint
+             WHERE conrelid = 'm1_reference_payloads'::regclass
+               AND conname = 'm1_reference_payloads_dedup_key'
+            """
+        )
+        trigger_exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM pg_trigger
+                 WHERE tgrelid = 'm1_reference_payloads'::regclass
+                   AND tgname = 'trg_m1_namespace_payload_placement'
+                   AND NOT tgisinternal
             )
-            await _migration("057_native_revision_m1_payload_placement.py").migrate(conn=conn)
-            after = await conn.fetchval(
-                """
-                SELECT pg_get_constraintdef(oid)
-                  FROM pg_constraint
-                 WHERE conrelid = 'm1_reference_payloads'::regclass
-                   AND conname = 'm1_reference_payloads_dedup_key'
-                """
-            )
-            trigger_exists = await conn.fetchval(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                      FROM pg_trigger
-                     WHERE tgrelid = 'm1_reference_payloads'::regclass
-                       AND tgname = 'trg_m1_namespace_payload_placement'
-                       AND NOT tgisinternal
-                )
-                """
-            )
-        finally:
-            await conn.close()
-
-        assert before == after
-        assert "namespace_id, digest, byte_size" in after
-        assert "selected_placement" not in after
-        assert trigger_exists is True
+            """
+        )
     finally:
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+        await conn.close()
+
+    assert before == after
+    assert "namespace_id, digest, byte_size" in after
+    assert "selected_placement" not in after
+    assert trigger_exists is True

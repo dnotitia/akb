@@ -8,6 +8,9 @@ import uuid
 
 import asyncpg
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
@@ -38,72 +41,65 @@ async def test_migration_rejects_non_utf8_subject_before_database(monkeypatch):
     assert captured.value.code == "identity_migration_subject_invalid"
 
 
-@pytest.fixture
-async def migration_store(monkeypatch):
-    try:
-        admin = await asyncpg.connect(_DSN, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(
-                "REQUIRE_REAL_PG=1 but Postgres is not reachable at AKB_TEST_DSN"
-            )
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
-
-    schema = "sso_identity_migration_" + uuid.uuid4().hex
-    await admin.execute(f'CREATE SCHEMA "{schema}"')
-    pool = await asyncpg.create_pool(
-        _DSN,
-        min_size=1,
-        max_size=4,
-        server_settings={"search_path": schema},
+async def _initialize(conn):
+    await conn.execute(
+        """
+        CREATE TABLE users (
+            id UUID PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            email TEXT NOT NULL UNIQUE,
+            display_name TEXT,
+            is_admin BOOLEAN NOT NULL DEFAULT false,
+            auth_provider TEXT NOT NULL,
+            account_status TEXT NOT NULL,
+            account_kind TEXT NOT NULL
+        );
+        CREATE TABLE external_identities (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            issuer TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            username_snapshot TEXT,
+            email_snapshot TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (issuer, subject)
+        );
+        CREATE TABLE tokens (
+            id UUID PRIMARY KEY,
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            token_prefix TEXT NOT NULL
+        );
+        CREATE TABLE vaults (
+            id UUID PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            owner_id UUID REFERENCES users(id)
+        );
+        CREATE TABLE vault_access (
+            vault_id UUID NOT NULL REFERENCES vaults(id),
+            user_id UUID NOT NULL REFERENCES users(id),
+            role TEXT NOT NULL,
+            UNIQUE (vault_id, user_id)
+        );
+        """
     )
-    events: list[tuple[str, str, dict[str, object]]] = []
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE users (
-                    id UUID PRIMARY KEY,
-                    username TEXT NOT NULL UNIQUE,
-                    email TEXT NOT NULL UNIQUE,
-                    display_name TEXT,
-                    is_admin BOOLEAN NOT NULL DEFAULT false,
-                    auth_provider TEXT NOT NULL,
-                    account_status TEXT NOT NULL,
-                    account_kind TEXT NOT NULL
-                );
-                CREATE TABLE external_identities (
-                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    issuer TEXT NOT NULL,
-                    subject TEXT NOT NULL,
-                    username_snapshot TEXT,
-                    email_snapshot TEXT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE (issuer, subject)
-                );
-                CREATE TABLE tokens (
-                    id UUID PRIMARY KEY,
-                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    name TEXT NOT NULL,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    token_prefix TEXT NOT NULL
-                );
-                CREATE TABLE vaults (
-                    id UUID PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
-                    owner_id UUID REFERENCES users(id)
-                );
-                CREATE TABLE vault_access (
-                    vault_id UUID NOT NULL REFERENCES vaults(id),
-                    user_id UUID NOT NULL REFERENCES users(id),
-                    role TEXT NOT NULL,
-                    UNIQUE (vault_id, user_id)
-                );
-                """
-            )
 
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def identity_migration_template():
+    async with database_template(_DSN, "akb_identity_migration_template_", _initialize) as template:
+        yield template
+
+
+@pytest.fixture
+async def migration_store(monkeypatch, identity_migration_template):
+    async with (
+        temporary_database(_DSN, "akb_identity_migration_", template=identity_migration_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
+    ):
+        events: list[tuple[str, str, dict[str, object]]] = []
         from app.sso import identity_migration
 
         async def _get_pool():
@@ -115,10 +111,6 @@ async def migration_store(monkeypatch):
         monkeypatch.setattr(identity_migration, "get_pool", _get_pool)
         monkeypatch.setattr(identity_migration, "emit_event", _emit_event)
         yield pool, events, identity_migration
-    finally:
-        await pool.close()
-        await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
-        await admin.close()
 
 
 async def _seed_continuity_state(pool):
@@ -167,6 +159,7 @@ async def _seed_continuity_state(pool):
     return user_id, token_id, vault_id
 
 
+@pytest.mark.live_services
 async def test_exact_migration_is_dry_run_first_idempotent_and_preserves_account_state(
     migration_store,
 ):
@@ -302,6 +295,7 @@ async def test_exact_migration_is_dry_run_first_idempotent_and_preserves_account
     ]
 
 
+@pytest.mark.live_services
 async def test_migration_never_adopts_by_email_or_crosses_an_existing_binding(
     migration_store,
 ):
@@ -347,6 +341,7 @@ async def test_migration_never_adopts_by_email_or_crosses_an_existing_binding(
         ) == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     ("column", "value", "code"),
     [
@@ -378,6 +373,7 @@ async def test_migration_requires_the_exact_active_external_human(
     assert captured.value.code == code
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     ("issuer", "subject"),
     [

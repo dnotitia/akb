@@ -12,36 +12,21 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit
 
 import asyncpg
 import pytest
 
+from tests.helpers.pg_database import temporary_database
 
-pytestmark = pytest.mark.asyncio
 
-_BACKEND = Path(__file__).resolve().parents[1]
-_INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
+
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
 _SSO_SESSION_EPOCH = uuid.UUID("80af20c6-6f9e-452e-9693-98b6ae0ea213")
-
-
-def _dsn_for_database(dsn: str, database: str) -> str:
-    parsed = urlsplit(dsn)
-    return urlunsplit(parsed._replace(path=f"/{database}"))
-
-
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except OSError, asyncpg.PostgresError:
-        return False
-    await conn.close()
-    return True
 
 
 async def _admin_schema_shape(conn) -> dict[str, tuple[tuple[object, ...], ...]]:
@@ -79,86 +64,77 @@ async def _admin_schema_shape(conn) -> dict[str, tuple[tuple[object, ...], ...]]
     }
 
 
+async def _verify_admin_schema_migration(conn):
+    from app.db.postgres import _load_migration
+
+    fresh_admin_shape = await _admin_schema_shape(conn)
+    # Migration 074 intentionally reuses the composite
+    # external-identity/user key. Remove its dependent table while
+    # reconstructing the older 072 migration in isolation.
+    await conn.execute("DROP TABLE sso_browser_sessions")
+    await conn.execute("DROP TABLE admin_browser_sessions")
+    await conn.execute("DROP INDEX external_identities_id_user_key")
+    admin_session_migration = _load_migration("072_admin_browser_sessions.py")
+    assert admin_session_migration is not None
+    await admin_session_migration.migrate(conn=conn)
+    await admin_session_migration.migrate(conn=conn)
+    ordinary_session_migration = _load_migration("074_sso_browser_sessions.py")
+    assert ordinary_session_migration is not None
+    await ordinary_session_migration.migrate(conn=conn)
+    epoch_migration = _load_migration("076_sso_session_epoch.py")
+    assert epoch_migration is not None
+    await epoch_migration.migrate(conn=conn)
+    await epoch_migration.migrate(conn=conn)
+    assert await _admin_schema_shape(conn) == fresh_admin_shape
+
+
+async def _seed_runtime(conn):
+    # Each clone represents a separate installation.
+    await conn.execute(
+        "UPDATE sso_operation_installation SET installation_id = DEFAULT, legacy_target_id = DEFAULT"
+    )
+    await conn.execute(
+        """
+        INSERT INTO auth_runtime_state (
+            singleton, runtime_generation, auth_mode,
+            sso_session_epoch
+        ) VALUES (TRUE, 1, 'sso', $1)
+        """,
+        _SSO_SESSION_EPOCH,
+    )
+    await conn.execute(
+        """
+        UPDATE auth_runtime_epoch_upgrade
+           SET state = 'enforced'
+         WHERE singleton = TRUE
+        """
+    )
+
+
 @asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    database = f"akb_admin_auth_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    await admin.execute(f'CREATE DATABASE "{database}"')
-    pool: asyncpg.Pool | None = None
-    try:
-        target_dsn = _dsn_for_database(_DSN, database)
-        conn = await asyncpg.connect(target_dsn)
-        try:
-            await conn.execute(_INIT_SQL)
-            from app.db.postgres import _load_migration
-
-            fresh_admin_shape = await _admin_schema_shape(conn)
-            # Migration 074 intentionally reuses the composite
-            # external-identity/user key. Remove its dependent table while
-            # reconstructing the older 072 migration in isolation.
-            await conn.execute("DROP TABLE sso_browser_sessions")
-            await conn.execute("DROP TABLE admin_browser_sessions")
-            await conn.execute("DROP INDEX external_identities_id_user_key")
-            admin_session_migration = _load_migration("072_admin_browser_sessions.py")
-            assert admin_session_migration is not None
-            await admin_session_migration.migrate(conn=conn)
-            await admin_session_migration.migrate(conn=conn)
-            ordinary_session_migration = _load_migration("074_sso_browser_sessions.py")
-            assert ordinary_session_migration is not None
-            await ordinary_session_migration.migrate(conn=conn)
-            epoch_migration = _load_migration("076_sso_session_epoch.py")
-            assert epoch_migration is not None
-            await epoch_migration.migrate(conn=conn)
-            await epoch_migration.migrate(conn=conn)
-            assert await _admin_schema_shape(conn) == fresh_admin_shape
-
-            events_migration = _load_migration("015_events_outbox.py")
-            assert events_migration is not None
-            await events_migration.migrate(conn=conn)
-            await conn.execute(
-                """
-                INSERT INTO auth_runtime_state (
-                    singleton, runtime_generation, auth_mode,
-                    sso_session_epoch
-                ) VALUES (TRUE, 1, 'sso', $1)
-                """,
-                _SSO_SESSION_EPOCH,
-            )
-            await conn.execute(
-                """
-                UPDATE auth_runtime_epoch_upgrade
-                   SET state = 'enforced'
-                 WHERE singleton = TRUE
-                """
-            )
-        finally:
-            await conn.close()
-        pool = await asyncpg.create_pool(target_dsn, min_size=1, max_size=4)
+async def _fresh_database(admin_auth_template):
+    async with (
+        temporary_database(_DSN, "akb_admin_auth_", template=admin_auth_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
+    ):
+        await _seed_runtime(pool)
         yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        await admin.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
-            database,
-        )
-        await admin.execute(f'DROP DATABASE "{database}"')
-        await admin.close()
 
 
 async def test_sso_admin_is_exact_prebound_opaque_and_live_rechecked(
-    monkeypatch,
+    monkeypatch, auth_schema_template,
 ) -> None:
     from app.config import settings
     from app.exceptions import AuthenticationError, ForbiddenError, MembershipRequiredError
     from app.services import admin_auth_service, keycloak_oidc
 
-    async with _fresh_database() as pool:
+    async with (
+        temporary_database(_DSN, "akb_admin_auth_upgrade_", template=auth_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
+    ):
+        async with pool.acquire() as conn:
+            await _verify_admin_schema_migration(conn)
+            await _seed_runtime(conn)
 
         async def get_test_pool():
             return pool

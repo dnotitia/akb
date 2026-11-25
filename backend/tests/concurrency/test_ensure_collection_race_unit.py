@@ -38,6 +38,8 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+pytestmark = pytest.mark.live_services
+
 
 _DSN = os.environ.get(
     "AKB_TEST_DSN",

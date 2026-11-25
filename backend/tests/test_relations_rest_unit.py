@@ -1,8 +1,8 @@
-"""CI-runnable unit coverage for the REST relation write surface
-(POST / DELETE /relations) — the err-bridge, the FastAPI request
-validation, and the authz gate, none of which the shell e2e
-(`test_relations_rest_e2e.sh`) can exercise in CI (it needs a live
-deployed backend).
+"""Unit coverage for the REST relation write surface (POST and DELETE).
+
+These tests exercise error translation, FastAPI request validation, and the
+authorization gate. The real database flow lives in
+`rest_integration/test_relations_rest.py`.
 
 DB-free by construction: every rejection path in
 `kg_service.link_resources` / `unlink_resources` returns its err()

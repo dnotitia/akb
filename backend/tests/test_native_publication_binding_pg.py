@@ -20,6 +20,7 @@ async def test_missing_publication_column_skips_narrow_fixture():
     conn.execute.assert_not_awaited()
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_verified_binding_uses_identity_and_current_path_after_head_advances():
     dsn = os.environ.get('AKB_TEST_DSN')

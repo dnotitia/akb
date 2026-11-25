@@ -8,27 +8,22 @@ import uuid
 import asyncpg
 import pytest
 
-pytestmark = pytest.mark.asyncio
+from tests.helpers.pg_database import (
+    temporary_database,
+)
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 
 
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN)
-        await conn.close()
-        return True
-    except Exception:
-        return False
-
-
 @pytest.fixture
-async def pool():
-    if not await _can_connect():
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
-    pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=2)
-    yield pool
-    await pool.close()
+async def pool(application_schema_template):
+    async with (
+        temporary_database(_DSN, "akb_password_", template=application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=2) as pool,
+    ):
+        yield pool
 
 
 @pytest.fixture(autouse=True)

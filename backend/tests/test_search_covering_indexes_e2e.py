@@ -15,6 +15,8 @@ import pytest_asyncio
 
 from app.services.vector_store.pgvector import PgvectorStore
 
+pytestmark = pytest.mark.live_services
+
 
 @pytest_asyncio.fixture
 async def local_store():

@@ -7,12 +7,14 @@ import importlib.util
 import json
 import os
 import uuid
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
 import httpx
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 from app.config import settings
 from app.exceptions import ConflictError, ForbiddenError
@@ -25,7 +27,7 @@ from app.services import auth_service
 from app.services.app_identity_service import AppPrincipal
 from app.services.auth_service import AuthenticatedUser
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
@@ -46,20 +48,6 @@ _DSN = os.environ.get(
 _ADMIN_ID = uuid.uuid4()
 
 
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
-
-
 def _load_migration(path: Path):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
@@ -68,26 +56,16 @@ def _load_migration(path: Path):
     return module
 
 
-@asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_app_installation_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=12)
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(_INIT_SQL)
-            for path in _MIGRATIONS:
-                await _load_migration(path).migrate(conn=conn)
-        yield pool
-    finally:
-        await pool.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
+async def _initialize(conn):
+    await conn.execute(_INIT_SQL)
+    for path in _MIGRATIONS:
+        await _load_migration(path).migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def db_template():
+    async with database_template(_DSN, "akb_app_installation_template_", _initialize) as template:
+        yield template
 
 
 async def _app(pool, label: str) -> uuid.UUID:
@@ -189,8 +167,11 @@ async def _command(pool, app_id, vault_id, release_id, *, mode="install", capabi
 
 
 @pytest.fixture
-async def lifecycle_pool(monkeypatch):
-    async with _fresh_database() as pool:
+async def lifecycle_pool(monkeypatch, db_template):
+    async with (
+        temporary_database(_DSN, "akb_app_installation_", template=db_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=12) as pool,
+    ):
         async with pool.acquire() as conn:
             await conn.execute(
                 """

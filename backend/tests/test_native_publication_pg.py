@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import asyncpg
@@ -14,70 +15,63 @@ from app.config import settings
 from app.services import publication_service as publications
 from app.services.native_revision_service import NativeRevisionService
 from app.services.uri_service import doc_uri
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
-pytestmark = pytest.mark.asyncio
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _BACKEND = Path(__file__).resolve().parents[1]
 _DSN = os.environ.get(
     "AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
 )
+_DATABASE_PREFIX = "akb_native_publication_"
+
+
+async def _initialize_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute((_BACKEND / "app/db/init.sql").read_text())
+    for filename in (
+        "015_events_outbox.py",
+        "048_native_revision_core.py",
+        "053_native_revision_m1_pg_body.py",
+        "055_native_revision_m1_file_storage.py",
+        "057_native_revision_m1_payload_placement.py",
+        "106_native_document_publications.py",
+        "107_native_document_asset_refs.py",
+    ):
+        spec = importlib.util.spec_from_file_location(
+            f"publication_fixture_{filename}", _BACKEND / "app/db/migrations" / filename,
+        )
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        await module.migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def publication_template() -> AsyncIterator[TestDatabase]:
+    required = os.environ.get("AKB_REQUIRE_PG_TESTS") == "1"
+    async with database_template(_DSN, _DATABASE_PREFIX, _initialize_schema, required=required) as template:
+        yield template
 
 
 @pytest_asyncio.fixture
-async def native_publications(monkeypatch):
-    try:
-        admin = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        if os.environ.get("AKB_REQUIRE_PG_TESTS") == "1" or os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail("Required publication PostgreSQL fixture is unreachable")
-        pytest.skip("Publication PostgreSQL fixture is unreachable")
-    name = f"akb_native_publication_{uuid.uuid4().hex[:12]}"
-    pool = None
-    conn = None
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        dsn = f"{_DSN.rsplit('/', 1)[0]}/{name}"
-        conn = await asyncpg.connect(dsn)
-        await conn.execute((_BACKEND / "app/db/init.sql").read_text())
-        for filename in (
-            "015_events_outbox.py",
-            "048_native_revision_core.py",
-            "053_native_revision_m1_pg_body.py",
-            "055_native_revision_m1_file_storage.py",
-            "057_native_revision_m1_payload_placement.py",
-            "106_native_document_publications.py",
-            "107_native_document_asset_refs.py",
-        ):
-            spec = importlib.util.spec_from_file_location(
-                f"publication_fixture_{filename}", _BACKEND / "app/db/migrations" / filename,
-            )
-            assert spec and spec.loader
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            await module.migrate(conn=conn)
-        vault_id = await conn.fetchval(
-            "INSERT INTO vaults (name, git_path) VALUES ('publication-native', '/tmp/unused.git') RETURNING id",
-        )
-        other_vault_id = await conn.fetchval(
-            "INSERT INTO vaults (name, git_path) VALUES ('publication-other', '/tmp/other-unused.git') RETURNING id",
-        )
-        await conn.close()
-        conn = None
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+async def native_publications(monkeypatch, publication_template):
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=publication_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            async with pool.acquire() as conn:
+                vault_id = await conn.fetchval(
+                    "INSERT INTO vaults (name, git_path) VALUES ('publication-native', '/tmp/unused.git') RETURNING id",
+                )
+                other_vault_id = await conn.fetchval(
+                    "INSERT INTO vaults (name, git_path) VALUES ('publication-other', '/tmp/other-unused.git') RETURNING id",
+                )
 
-        async def get_pool():
-            return pool
+            async def get_pool():
+                return pool
 
-        monkeypatch.setattr(publications, "get_pool", get_pool)
-        monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
-        monkeypatch.setattr(settings, "public_base_url", "https://publication.example.invalid")
-        yield pool, vault_id, other_vault_id, NativeRevisionService(pool)
-    finally:
-        if pool is not None:
-            await pool.close()
-        if conn is not None and not conn.is_closed():
-            await conn.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+            monkeypatch.setattr(publications, "get_pool", get_pool)
+            monkeypatch.setattr(settings, "document_revision_backend", "postgres_native")
+            monkeypatch.setattr(settings, "public_base_url", "https://publication.example.invalid")
+            yield pool, vault_id, other_vault_id, NativeRevisionService(pool)
 
 
 async def _create(service, vault_id, body, *, path="published.md", surface="document"):

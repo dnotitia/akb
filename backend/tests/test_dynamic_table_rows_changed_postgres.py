@@ -12,67 +12,48 @@ from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.repositories import table_data_repo
 from app.services.user_sql_executor import UserSqlExecutor
+from tests.helpers.pg_database import database_template, temporary_database
 
-pytestmark = pytest.mark.asyncio
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+async def _initialize(conn):
+    init_sql = (Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql").read_text()
+    await conn.execute(init_sql)
 
 
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def rows_changed_template():
+    async with database_template(_DSN, "akb_rows_changed_template_", _initialize) as template:
+        yield template
 
 
 @contextlib.asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
+async def _fresh_database(template):
+    from app.db import postgres as postgres_module
 
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_rows_changed_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=8)
-    previous_pool = None
-    try:
-        init_sql = (
-            Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
-        ).read_text()
-        async with pool.acquire() as conn:
-            await conn.execute(init_sql)
-        # Admin SQL bypass is reserved for a live human administrator, not
-        # an arbitrary caller-supplied name or an absent UUID.
-        async with pool.acquire() as conn:
-            await conn.execute(
+    async with temporary_database(_DSN, "akb_rows_changed_", template=template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool:
+            # Admin SQL bypass is reserved for a live human administrator, not
+            # an arbitrary caller-supplied name or an absent UUID.
+            await pool.execute(
                 "INSERT INTO users (id, username, email, password_hash, is_admin) "
                 "VALUES ($1, 'rows-changed-admin', 'rows-changed-admin@example.com', '!fixture!', true)",
                 uuid.UUID(int=221),
             )
-        from app.db import postgres as postgres_module
-
-        previous_pool = postgres_module._pool
-        postgres_module._pool = pool
-        yield pool, postgres_module
-    finally:
-        from app.db import postgres as postgres_module
-
-        postgres_module._pool = previous_pool
-        await pool.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
+            previous_pool = postgres_module._pool
+            postgres_module._pool = pool
+            try:
+                yield pool, postgres_module
+            finally:
+                postgres_module._pool = previous_pool
 
 
 async def _event_rows(conn: Any, vault_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -204,8 +185,8 @@ async def _assert_mutation_contract(
         assert await conn.fetchval(f"SELECT COUNT(*) FROM {pg_name}") == 1
 
 
-async def test_existing_and_new_dynamic_tables_emit_bounded_committed_events():
-    async with _fresh_database() as (pool, postgres_module):
+async def test_existing_and_new_dynamic_tables_emit_bounded_committed_events(rows_changed_template):
+    async with _fresh_database(rows_changed_template) as (pool, postgres_module):
         vault_id = await _make_vault(pool)
         await _seed_legacy_table(pool, vault_id, "legacy")
         await postgres_module._apply_migrations()
@@ -234,8 +215,8 @@ async def test_existing_and_new_dynamic_tables_emit_bounded_committed_events():
         await _assert_mutation_contract(pool, vault_id, new_name, actor="alice")
 
 
-async def test_publisher_fanout_preserves_rows_changed_envelope(monkeypatch):
-    async with _fresh_database() as (pool, postgres_module):
+async def test_publisher_fanout_preserves_rows_changed_envelope(monkeypatch, rows_changed_template):
+    async with _fresh_database(rows_changed_template) as (pool, postgres_module):
         await postgres_module._apply_migrations()
         vault_id = await _make_vault(pool)
         table_name = "streamed"
@@ -300,12 +281,12 @@ async def _make_named_vault(pool: asyncpg.Pool, name: str) -> uuid.UUID:
         )
 
 
-async def test_publisher_suppresses_gardener_bookkeeping_without_xadd(monkeypatch):
+async def test_publisher_suppresses_gardener_bookkeeping_without_xadd(monkeypatch, rows_changed_template):
     """sweep_log / gardener_event_log / gardener_kv rows_changed events in a
     gdn-* vault are marked published WITHOUT an XADD (self-feedback
     suppression, SKH 2026-09-30: the daemon's own bookkeeping flooded
     akb:events at ~60%). A user vault's same-named tables still publish."""
-    async with _fresh_database() as (pool, postgres_module):
+    async with _fresh_database(rows_changed_template) as (pool, postgres_module):
         await postgres_module._apply_migrations()
         gdn_vault_id = await _make_named_vault(pool, "gdn-state")
         user_vault_id = await _make_named_vault(pool, "user-vault")
@@ -384,14 +365,14 @@ async def test_publisher_suppresses_gardener_bookkeeping_without_xadd(monkeypatc
         assert len(redis.calls) == 6
 
 
-async def test_publisher_fanout_reaches_a_real_redis_stream(monkeypatch):
+async def test_publisher_fanout_reaches_a_real_redis_stream(monkeypatch, rows_changed_template):
     redis_url = os.environ.get("AKB_TEST_REDIS_URL")
     if not redis_url:
         pytest.skip("AKB_TEST_REDIS_URL not set")
 
     import redis.asyncio as redis_async
 
-    async with _fresh_database() as (pool, postgres_module):
+    async with _fresh_database(rows_changed_template) as (pool, postgres_module):
         await postgres_module._apply_migrations()
         vault_id = await _make_vault(pool)
         table_name = "redis_streamed"

@@ -8,36 +8,20 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 import pytest
 
+from tests.helpers.pg_database import temporary_database
 
-pytestmark = pytest.mark.asyncio
 
-_BACKEND = Path(__file__).resolve().parents[1]
-_INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
+
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
 _SSO_SESSION_EPOCH = uuid.UUID("8db8b1f8-5f70-43ec-b9c6-039effe26b38")
-
-
-def _dsn_for_database(dsn: str, database: str) -> str:
-    parsed = urlsplit(dsn)
-    return urlunsplit(parsed._replace(path=f"/{database}"))
-
-
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except OSError, asyncpg.PostgresError:
-        return False
-    await conn.close()
-    return True
 
 
 async def _schema_shape(conn) -> dict[str, tuple[tuple[object, ...], ...]]:
@@ -76,70 +60,52 @@ async def _schema_shape(conn) -> dict[str, tuple[tuple[object, ...], ...]]:
     return shape
 
 
+async def _verify_browser_schema_migration(conn):
+    from app.db.postgres import _load_migration
+
+    epoch_migration = _load_migration("076_sso_session_epoch.py")
+    assert epoch_migration is not None
+    fresh_shape = await _schema_shape(conn)
+    await conn.execute("DROP TABLE sso_browser_sessions, sso_browser_logout_fences")
+    migration = _load_migration("074_sso_browser_sessions.py")
+    assert migration is not None
+    await migration.migrate(conn=conn)
+    await migration.migrate(conn=conn)
+    await epoch_migration.migrate(conn=conn)
+    await epoch_migration.migrate(conn=conn)
+    assert await _schema_shape(conn) == fresh_shape
+
+
+async def _seed_runtime(conn):
+    await conn.execute(
+        """
+        INSERT INTO auth_runtime_state (
+            singleton, runtime_generation, auth_mode,
+            sso_session_epoch
+        ) VALUES (TRUE, 1, 'sso', $1)
+        """,
+        _SSO_SESSION_EPOCH,
+    )
+    await conn.execute(
+        """
+        UPDATE auth_runtime_epoch_upgrade
+           SET state = 'enforced'
+         WHERE singleton = TRUE
+        """
+    )
+
+
 @asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    database = f"akb_sso_browser_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    await admin.execute(f'CREATE DATABASE "{database}"')
-    pool: asyncpg.Pool | None = None
-    try:
-        target_dsn = _dsn_for_database(_DSN, database)
-        conn = await asyncpg.connect(target_dsn)
-        try:
-            await conn.execute(_INIT_SQL)
-            from app.db.postgres import _load_migration
-
-            epoch_migration = _load_migration("076_sso_session_epoch.py")
-            assert epoch_migration is not None
-            await epoch_migration.migrate(conn=conn)
-            fresh_shape = await _schema_shape(conn)
-            await conn.execute("DROP TABLE sso_browser_sessions, sso_browser_logout_fences")
-            migration = _load_migration("074_sso_browser_sessions.py")
-            assert migration is not None
-            await migration.migrate(conn=conn)
-            await migration.migrate(conn=conn)
-            await epoch_migration.migrate(conn=conn)
-            await epoch_migration.migrate(conn=conn)
-            assert await _schema_shape(conn) == fresh_shape
-
-            for filename in ("015_events_outbox.py", "137_mcp_monitoring.py", "138_monitoring_access.py"):
-                dependency = _load_migration(filename)
-                assert dependency is not None
-                await dependency.migrate(conn=conn)
-            await conn.execute(
-                """
-                INSERT INTO auth_runtime_state (
-                    singleton, runtime_generation, auth_mode,
-                    sso_session_epoch
-                ) VALUES (TRUE, 1, 'sso', $1)
-                """,
-                _SSO_SESSION_EPOCH,
-            )
-            await conn.execute(
-                """
-                UPDATE auth_runtime_epoch_upgrade
-                   SET state = 'enforced'
-                 WHERE singleton = TRUE
-                """
-            )
-        finally:
-            await conn.close()
-        pool = await asyncpg.create_pool(target_dsn, min_size=1, max_size=8)
+async def _fresh_database(browser_auth_template, *, verify_upgrade=False):
+    async with (
+        temporary_database(_DSN, "akb_sso_browser_", template=browser_auth_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool,
+    ):
+        if verify_upgrade:
+            async with pool.acquire() as conn:
+                await _verify_browser_schema_migration(conn)
+        await _seed_runtime(pool)
         yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        await admin.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
-            database,
-        )
-        await admin.execute(f'DROP DATABASE "{database}"')
-        await admin.close()
 
 
 def _encoded_key(byte: int = 23) -> str:
@@ -257,12 +223,12 @@ def _configure(monkeypatch, service, pool) -> None:
 
 
 async def test_opaque_session_is_exact_bound_csrf_safe_and_locally_revocable(
-    monkeypatch,
+    monkeypatch, browser_auth_template,
 ) -> None:
     from app.exceptions import AuthenticationError, ForbiddenError
     from app.services import sso_browser_session_service as service
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(browser_auth_template, verify_upgrade=True) as pool:
         _configure(monkeypatch, service, pool)
         user_id, identity_id = await _seed_identity(pool)
         principal = _principal()
@@ -328,10 +294,10 @@ async def test_opaque_session_is_exact_bound_csrf_safe_and_locally_revocable(
             await service.resolve_sso_browser_session(issued.token)
 
 
-async def test_rotation_is_serialized_and_persists_only_new_ciphertext(monkeypatch) -> None:
+async def test_rotation_is_serialized_and_persists_only_new_ciphertext(monkeypatch, browser_auth_template) -> None:
     from app.services import sso_browser_session_service as service
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(browser_auth_template) as pool:
         _configure(monkeypatch, service, pool)
         user_id, _ = await _seed_identity(pool)
         initial = _principal(expiry_seconds=5)
@@ -409,12 +375,12 @@ async def test_rotation_is_serialized_and_persists_only_new_ciphertext(monkeypat
 
 
 async def test_refresh_denial_deletes_but_upstream_outage_preserves_session(
-    monkeypatch,
+    monkeypatch, browser_auth_template,
 ) -> None:
     from app.exceptions import AKBError, AuthenticationError
     from app.services import sso_browser_session_service as service
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(browser_auth_template) as pool:
         _configure(monkeypatch, service, pool)
         user_id, _ = await _seed_identity(pool)
 
@@ -483,12 +449,12 @@ async def test_refresh_denial_deletes_but_upstream_outage_preserves_session(
 
 
 async def test_identity_state_and_verified_backchannel_selector_revoke_immediately(
-    monkeypatch,
+    monkeypatch, browser_auth_template,
 ) -> None:
     from app.exceptions import AuthenticationError
     from app.services import sso_browser_session_service as service
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(browser_auth_template) as pool:
         _configure(monkeypatch, service, pool)
         user_id, identity_id = await _seed_identity(pool)
         principal = _principal()
@@ -585,14 +551,14 @@ async def test_identity_state_and_verified_backchannel_selector_revoke_immediate
 
 
 async def test_runtime_epoch_reconcile_prevents_mode_transition_resurrection(
-    monkeypatch,
+    monkeypatch, browser_auth_template,
 ) -> None:
     from app.config import settings
     from app.exceptions import AuthenticationError
     from app.services import sso_browser_session_service as service
     from app.services import sso_session_epoch as epoch_service
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(browser_auth_template) as pool:
         _configure(monkeypatch, service, pool)
 
         async def get_test_pool():

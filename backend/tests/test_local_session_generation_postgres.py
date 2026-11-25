@@ -11,50 +11,53 @@ from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 from app.db.postgres import _load_migration
 from app.services import auth_service
+from tests.test_recovery_admin_provisioning_postgres import _fresh_database
+
+pytestmark = pytest.mark.live_services
+
+
+_DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
+
+
+async def _initialize(conn):
+    await conn.execute("""CREATE TABLE users (
+        id UUID PRIMARY KEY, username TEXT DEFAULT 'session-test',
+        email TEXT DEFAULT 'session-test@example.test',
+        display_name TEXT, is_admin BOOLEAN DEFAULT false,
+        password_hash TEXT, auth_provider TEXT DEFAULT 'local',
+        account_status TEXT DEFAULT 'active', account_kind TEXT DEFAULT 'human',
+        monitoring_access BOOLEAN,
+        credential_change_required BOOLEAN DEFAULT false,
+        tokens_revoked_before TIMESTAMPTZ NOT NULL DEFAULT 'epoch',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""")
+    migration = _load_migration("101_local_session_generation.py")
+    await migration.migrate(conn=conn)
+    await migration.migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def session_generation_template():
+    async with database_template(_DSN, "akb_session_gen_template_", _initialize) as template:
+        yield template
 
 
 @pytest.fixture
-async def database(monkeypatch):
-    dsn = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
-    try:
-        admin = await asyncpg.connect(dsn, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail("REQUIRE_REAL_PG=1 but test PostgreSQL is unavailable")
-        pytest.skip("Test PostgreSQL unavailable")
-    schema = "session_gen_" + uuid.uuid4().hex
-    await admin.execute(f'CREATE SCHEMA "{schema}"')
-    pool = None
-    try:
-        pool = await asyncpg.create_pool(dsn, min_size=2, max_size=3,
-                                        server_settings={"search_path": schema})
-        async with pool.acquire() as conn:
-            await conn.execute("""CREATE TABLE users (
-                id UUID PRIMARY KEY, username TEXT DEFAULT 'session-test',
-                email TEXT DEFAULT 'session-test@example.test',
-                display_name TEXT, is_admin BOOLEAN DEFAULT false,
-                password_hash TEXT, auth_provider TEXT DEFAULT 'local',
-                account_status TEXT DEFAULT 'active', account_kind TEXT DEFAULT 'human',
-                monitoring_access BOOLEAN,
-                credential_change_required BOOLEAN DEFAULT false,
-                tokens_revoked_before TIMESTAMPTZ NOT NULL DEFAULT 'epoch',
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )""")
-            migration = _load_migration("101_local_session_generation.py")
-            await migration.migrate(conn=conn)
-            await migration.migrate(conn=conn)
-            user_id = uuid.uuid4()
-            await conn.execute("INSERT INTO users(id) VALUES ($1)", user_id)
+async def database(monkeypatch, session_generation_template):
+    async with (
+        temporary_database(_DSN, "akb_session_gen_", template=session_generation_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=2, max_size=3) as pool,
+    ):
+        user_id = uuid.uuid4()
+        await pool.execute("INSERT INTO users(id) VALUES ($1)", user_id)
         monkeypatch.setattr(auth_service, "emit_event", AsyncMock())
         yield pool, user_id
-    finally:
-        if pool is not None:
-            await pool.close()
-        await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
-        await admin.close()
 
 
 async def _revoke(conn, user_id):
@@ -194,10 +197,8 @@ async def test_legacy_cutoff_fence_handles_equal_backdated_and_rolled_back_write
     assert await pool.fetchval("SELECT session_generation FROM users WHERE id=$1", user_id) == 3
 
 
-async def test_init_before_migration_keeps_legacy_revoker_working():
-    from tests.test_recovery_admin_provisioning_postgres import _fresh_database
-
-    async with _fresh_database() as pool:
+async def test_init_before_migration_keeps_legacy_revoker_working(auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         async with pool.acquire() as conn:
             await conn.execute("DROP TRIGGER users_local_session_cutoff_fence ON users")
             await conn.execute("ALTER TABLE users DROP COLUMN session_generation")

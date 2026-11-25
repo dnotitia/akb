@@ -22,7 +22,7 @@ from tests.test_sso_management_targets_postgres import (  # noqa: F401
     preparation, lane, target_grant, switch_target, application, TARGET_ISSUER,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.fixture

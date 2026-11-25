@@ -21,31 +21,35 @@ from app.models.vault_scope import VaultScope
 from app.services import publication_directory as directory
 from app.services.auth_service import AuthenticatedUser
 from app.services.native_revision_service import NativeRevisionService
+from tests.helpers.pg_database import database_template, temporary_database
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")  # pragma: allowlist secret
 
 
+async def _initialize(conn):
+    await conn.execute((ROOT / "app/db/init.sql").read_text())
+    for filename in ("010_external_git_mirror.py", "015_events_outbox.py", "044_vault_write_policy.py", "045_vault_write_grant_actions.py", "048_native_revision_core.py", "053_native_revision_m1_pg_body.py", "055_native_revision_m1_file_storage.py", "057_native_revision_m1_payload_placement.py", "106_native_document_publications.py", "107_native_document_asset_refs.py"):
+        spec = importlib.util.spec_from_file_location(f"directory_fixture_{filename}", ROOT / "app/db/migrations" / filename)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        await module.migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def directory_template():
+    async with database_template(DSN, "akb_public_directory_template_", _initialize) as template:
+        yield template
+
+
 @pytest_asyncio.fixture
-async def inventory(monkeypatch):
-    try:
-        admin = await asyncpg.connect(DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail("Required directory PostgreSQL fixture is unreachable")
-        pytest.skip("Directory PostgreSQL fixture is unreachable")
-    name = f"akb_public_directory_{uuid.uuid4().hex[:12]}"
-    pool = None
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        pool = await asyncpg.create_pool(f"{DSN.rsplit('/', 1)[0]}/{name}", min_size=1, max_size=3)
+async def inventory(monkeypatch, directory_template):
+    async with (
+        temporary_database(DSN, "akb_public_directory_", template=directory_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=3) as pool,
+    ):
         async with pool.acquire() as conn:
-            await conn.execute((ROOT / "app/db/init.sql").read_text())
-            for filename in ("010_external_git_mirror.py", "015_events_outbox.py", "044_vault_write_policy.py", "045_vault_write_grant_actions.py", "048_native_revision_core.py", "053_native_revision_m1_pg_body.py", "055_native_revision_m1_file_storage.py", "057_native_revision_m1_payload_placement.py", "106_native_document_publications.py", "107_native_document_asset_refs.py"):
-                spec = importlib.util.spec_from_file_location(f"directory_fixture_{filename}", ROOT / "app/db/migrations" / filename)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                await module.migrate(conn=conn)
             owner, other = uuid.uuid4(), uuid.uuid4()
             for uid, username in ((owner, "owner"), (other, "other")):
                 await conn.execute("INSERT INTO users(id, username, email, password_hash) VALUES($1,$2,$2 || '@example.invalid','unusable')", uid, username)
@@ -74,13 +78,9 @@ async def inventory(monkeypatch):
         monkeypatch.setattr(directory, "get_pool", get_pool)
         monkeypatch.setattr(settings, "public_base_url", "https://publication.example.invalid")
         yield pool, AuthenticatedUser(str(owner), "owner", "owner@example.invalid", None, False, "jwt"), vaults
-    finally:
-        if pool:
-            await pool.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_visibility_capabilities_and_safe_response(inventory):
     _, user, _ = inventory
@@ -100,6 +100,7 @@ async def test_visibility_capabilities_and_safe_response(inventory):
         await directory.list_directory(user, vault="hidden")
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_server_filters_precede_paging_and_literal_search(inventory):
     _, user, _ = inventory
@@ -117,6 +118,7 @@ async def test_server_filters_precede_paging_and_literal_search(inventory):
     assert all(p["expires_at"] is None for p in no_expiry["publications"])
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_cursor_ties_binding_and_acl_recheck(inventory):
     pool, user, vaults = inventory
@@ -145,6 +147,7 @@ async def test_cursor_ties_binding_and_acl_recheck(inventory):
     assert (await directory.list_directory(user, status="all", page_size=1, cursor=first["next_cursor"]))["total"] == 7
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_managed_grants_admin_changes_and_scoped_credentials(inventory):
     pool, user, vaults = inventory
@@ -175,6 +178,7 @@ async def test_managed_grants_admin_changes_and_scoped_credentials(inventory):
     assert not (await directory.list_directory(user, vault="managed"))["publications"][0]["can_unpublish"]
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_native_identity_title_does_not_follow_reused_uri(inventory):
     pool, user, vaults = inventory
@@ -190,6 +194,7 @@ async def test_native_identity_title_does_not_follow_reused_uri(inventory):
     assert result["publications"][0]["resource_uri"] == "akb://owned/doc/moved.md"
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_http_inventory_uses_real_database_and_registered_route(inventory):
     from app.api.routes.public import router

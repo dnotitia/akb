@@ -18,14 +18,16 @@ from __future__ import annotations
 import contextlib
 import os
 import uuid
-from pathlib import Path
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
 
+from app.db import postgres as postgres_module
 from app.services import sparse_encoder
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 
@@ -45,54 +47,20 @@ _EXPECTED_DF = {"alpha": 12, "beta": 6, "gamma": 4, "delta": 3}
 _EXPECTED_TOTAL_LENGTH = sum(len(d.split()) for d in _CORPUS)
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
-
-
 @contextlib.asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_bm25_resume_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=4)
-    previous_pool = None
-    try:
-        init_sql = (
-            Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
-        ).read_text()
-        async with pool.acquire() as conn:
-            await conn.execute(init_sql)
-        from app.db import postgres as postgres_module
-
+async def _fresh_database(application_schema_template: TestDatabase) -> AsyncIterator[asyncpg.Pool]:
+    async with (
+        temporary_database(_DSN, "akb_bm25_resume_", template=application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
+    ):
         previous_pool = postgres_module._pool
         postgres_module._pool = pool
-        await postgres_module._apply_migrations()
-        async with pool.acquire() as conn:
-            await _seed(conn)
-        yield pool
-    finally:
-        from app.db import postgres as postgres_module
-
-        postgres_module._pool = previous_pool
-        await pool.close()
-        with contextlib.suppress(asyncpg.PostgresError):
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+        try:
+            async with pool.acquire() as conn:
+                await _seed(conn)
+            yield pool
+        finally:
+            postgres_module._pool = previous_pool
 
 
 async def _seed(conn) -> None:
@@ -161,8 +129,8 @@ async def _published(pool) -> dict:
     return stats
 
 
-async def test_an_interrupted_scan_publishes_nothing_but_keeps_its_progress(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_an_interrupted_scan_publishes_nothing_but_keeps_its_progress(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         tok = _Tokenizer(fail_after=7)
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", tok)
 
@@ -194,8 +162,8 @@ async def test_an_interrupted_scan_publishes_nothing_but_keeps_its_progress(monk
         )
 
 
-async def test_the_second_pass_tokenizes_only_what_is_left(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_the_second_pass_tokenizes_only_what_is_left(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer(fail_after=7))
         with pytest.raises(RuntimeError):
             await sparse_encoder.recompute_stats(batch_size=3)
@@ -212,13 +180,13 @@ async def test_the_second_pass_tokenizes_only_what_is_left(monkeypatch):
         assert (await _published(pool))["df"] == _EXPECTED_DF
 
 
-async def test_a_resumed_run_publishes_what_an_uninterrupted_one_would(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_resumed_run_publishes_what_an_uninterrupted_one_would(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer())
         clean = await sparse_encoder.recompute_stats(batch_size=3)
         clean_published = await _published(pool)
 
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         # Each substitute counts its OWN calls, and a resumed pass only sees
         # what is left — so the second cut is at 4 of the remaining 9, not at 9
         # of the original 12. Getting this wrong makes the run finish quietly
@@ -246,8 +214,8 @@ async def test_a_resumed_run_publishes_what_an_uninterrupted_one_would(monkeypat
     assert resumed_published["df"] == clean_published["df"] == _EXPECTED_DF
 
 
-async def test_a_finished_run_leaves_no_progress_behind(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_finished_run_leaves_no_progress_behind(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer())
         await sparse_encoder.recompute_stats(batch_size=5)
 
@@ -259,8 +227,8 @@ async def test_a_finished_run_leaves_no_progress_behind(monkeypatch):
             assert await conn.fetchval("SELECT count(*) FROM bm25_recompute_terms") == 0
 
 
-async def test_a_tokenizer_change_discards_the_partial_run_instead_of_resuming(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_a_tokenizer_change_discards_the_partial_run_instead_of_resuming(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer(fail_after=7))
         with pytest.raises(RuntimeError):
             await sparse_encoder.recompute_stats(batch_size=3)
@@ -279,8 +247,8 @@ async def test_a_tokenizer_change_discards_the_partial_run_instead_of_resuming(m
         assert (await _published(pool))["df"] == _EXPECTED_DF
 
 
-async def test_the_invalidation_boundary_is_the_one_the_run_started_with(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_the_invalidation_boundary_is_the_one_the_run_started_with(application_schema_template, monkeypatch):
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer(fail_after=7))
         with pytest.raises(RuntimeError):
             await sparse_encoder.recompute_stats(batch_size=3)
@@ -312,7 +280,7 @@ async def test_the_invalidation_boundary_is_the_one_the_run_started_with(monkeyp
         )
 
 
-async def test_a_recompute_draws_term_ids_only_for_new_terms(monkeypatch):
+async def test_a_recompute_draws_term_ids_only_for_new_terms(application_schema_template, monkeypatch):
     """A pass over known terms leaves `bm25_term_id_seq` where it was (akb#687).
 
     The recompute used to call `nextval()` for every term it saw and let
@@ -321,7 +289,7 @@ async def test_a_recompute_draws_term_ids_only_for_new_terms(monkeypatch):
     sizes its per-term arrays by the largest id, and its VACUUM cleanup walks
     all of them with the metapage locked.
     """
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         monkeypatch.setattr(sparse_encoder, "_tokenize_uncached", _Tokenizer())
 
         async def vocab_and_sequence():

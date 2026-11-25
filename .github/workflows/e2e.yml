@@ -1,8 +1,6 @@
 name: e2e
 
-# The repository-owned runtime is shared with the clean Ubuntu host bootstrap.  Compose
-# owns only pgvector/PostgreSQL and pinned MinIO; the embedding stub, backend,
-# fixture control, and curated shell suites stay host processes.
+# The repository-owned runtime prepares the dependencies for each live suite.
 on:
   push:
     branches: [main]
@@ -15,53 +13,35 @@ concurrency:
 jobs:
   # The locked Playwright runtime supports Ubuntu 24.04, not Ubuntu 26.04.
   # Keep browser jobs stable when ubuntu-latest advances to a new release.
-  shell-e2e:
-    name: shell e2e (repository runtime)
+  runtime-e2e:
+    name: AKB runtime E2E
     runs-on: ubuntu-24.04
-    # Includes runtime preparation, API suites, and the full browser regression.
-    # Playwright has a shorter global budget so failures can upload diagnostics.
-    timeout-minutes: 75
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
 
-      # No `cache: pip`: this job installs with uv (cached by setup-uv), so
-      # pip's cache directory never exists, and setup-python's post step fails
-      # the job whenever its cache key misses (e.g. a new runner Python).
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
 
       - uses: astral-sh/setup-uv@v6
 
-      - uses: pnpm/action-setup@v4
-        with:
-          package_json_file: frontend/package.json
-
       - uses: actions/setup-node@v4
         with:
           node-version: "22.23.4"
-          cache: npm
-          cache-dependency-path: packages/akb-mcp-client/package-lock.json
-
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: pnpm install --frozen-lockfile
-
-      - name: Install Chromium for the real frontend smoke
-        working-directory: frontend
-        run: pnpm exec playwright install --with-deps chromium
 
       - name: Install stdio proxy and Inspector deps
         working-directory: packages/akb-mcp-client
         run: npm ci
 
       - name: Install backend from the locked contract
-        env:
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/akb-e2e-python
-          UV_CACHE_DIR: ${{ runner.temp }}/akb-e2e-uv-cache
         run: |
-          mkdir -p "$UV_CACHE_DIR" "${{ runner.temp }}/akb-e2e-runtime"
+          export UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/akb-e2e-python"
+          export UV_CACHE_DIR="$RUNNER_TEMP/akb-e2e-uv-cache"
+          printf 'UV_PROJECT_ENVIRONMENT=%s\nUV_CACHE_DIR=%s\n' \
+            "$UV_PROJECT_ENVIRONMENT" "$UV_CACHE_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$UV_CACHE_DIR" "$RUNNER_TEMP/akb-e2e-runtime"
           chmod 700 "$UV_CACHE_DIR" "${{ runner.temp }}/akb-e2e-runtime"
           uv sync --locked --extra dev --project backend
           uv run --locked --project backend python -c \
@@ -69,29 +49,21 @@ jobs:
 
       - name: Verify reusable reset waits for an active writer
         env:
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/akb-e2e-python
-          UV_CACHE_DIR: ${{ runner.temp }}/akb-e2e-uv-cache
           AKB_TEST_RESET_ISOLATION: "1"
+          AKB_TEST_FAIL_ON_SKIP: "1"
         run: |
           uv run --locked --project backend python -m pytest \
-            backend/tests/test_e2e_runtime_reset_isolation.py -v --tb=short
+            backend/tests/test_e2e_runtime_reset_isolation.py -v --tb=short --strict-markers \
+            --basetemp "$RUNNER_TEMP/akb-reset-test"
 
-      - name: Run repository-owned pytest and shell E2E runtime
+      - name: Run HTTP and MCP on the same AKB runtime
         env:
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/akb-e2e-python
-          UV_CACHE_DIR: ${{ runner.temp }}/akb-e2e-uv-cache
-          # This is generated inside the step and is never written to the
-          # descriptor, runtime logs, or a child argv.
+          AKB_TEST_FAIL_ON_SKIP: '1'
           AKB_E2E_USERNAME: akb-e2e-fixture
-          AKB_PG_EXEC: env PGHOST=127.0.0.1 PGPORT=15432 PGPASSWORD=akb  # pragma: allowlist secret
-          AKB_PG_USER: akb
-          AKB_PG_DB: akb
         run: |
           export AKB_E2E_PASSWORD="$(uv run --locked --project backend python -c 'import secrets; print(secrets.token_urlsafe(24))')"
-          uv run --locked --project backend python \
-            scripts/ci/e2e_runtime.py gate \
-            --with-frontend \
-            --profile transport-oidc \
+          uv run --locked --project backend python scripts/ci/e2e_runtime.py gate \
+            --suite runtime --profile transport-oidc \
             --scenario empty \
             --checkout "$GITHUB_WORKSPACE" \
             --runtime-root "${{ runner.temp }}/akb-e2e-runtime"
@@ -100,14 +72,23 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: akb-e2e-runtime-logs
-          path: ${{ runner.temp }}/akb-e2e-runtime/logs
+          name: akb-runtime-e2e-logs
+          path: |
+            ${{ runner.temp }}/akb-e2e-runtime/logs
+            ${{ runner.temp }}/akb-reset-test/*/runtime/logs
           if-no-files-found: ignore
 
   frontend-e2e:
-    name: frontend e2e (mock)
+    name: frontend e2e (${{ matrix.shard }}/3)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The specs that answer their own HTTP need no backend. They run against a
+    # production build, one test at a time per job, split across shards.
+    # Shard 2 reuses Chromium for live browser smoke. Shard 3 runs two mock commands.
+    timeout-minutes: ${{ matrix.shard == 3 && 50 || 30 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
 
     steps:
       - uses: actions/checkout@v4
@@ -126,21 +107,78 @@ jobs:
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
+      - name: Start Playwright browser from the official image
+        id: browser
+        uses: ./.github/actions/playwright-browser
+
+      - name: Run fixture-owned browser specs
+        working-directory: frontend
+        env:
+          CI: "1"
+        run: pnpm run test:e2e:fixture --shard=${{ matrix.shard }}/3
+
+      - name: Keep failing tests' traces and screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-fixture-e2e-results-${{ matrix.shard }}
+          path: frontend/test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Playwright clears test-results when the next suite starts.
+      - uses: actions/setup-python@v5
+        id: live-python
+        if: ${{ !cancelled() && matrix.shard == 2 && steps.browser.outcome == 'success' }}
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v6
+        id: live-uv
+        if: ${{ !cancelled() && steps.live-python.outcome == 'success' }}
+
+      - name: Run browser smoke against real AKB
+        id: live-browser
+        if: ${{ !cancelled() && steps.live-uv.outcome == 'success' }}
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/akb-e2e-python
+          AKB_E2E_USERNAME: akb-e2e-fixture
+        run: |
+          AKB_E2E_PASSWORD="$(uv run --locked --extra dev --project backend python -c 'import secrets; print(secrets.token_urlsafe(24))')"
+          export AKB_E2E_PASSWORD
+          uv run --locked --project backend python scripts/ci/e2e_runtime.py gate \
+            --suite frontend --profile tool-only --scenario empty \
+            --checkout "$GITHUB_WORKSPACE" \
+            --runtime-root "$RUNNER_TEMP/akb-e2e-runtime"
+
+      - name: Upload live browser traces and runtime logs on failure
+        if: ${{ failure() && steps.live-browser.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-live-e2e-results
+          path: |
+            frontend/test-results
+            ${{ runner.temp }}/akb-e2e-runtime/logs
+          if-no-files-found: ignore
+
+      # Run mock mode even if fixture tests fail. Upload the fixture results
+      # first because the next Playwright run clears its output directory.
       - name: Build frontend production bundle
+        if: ${{ !cancelled() && matrix.shard == 3 && steps.browser.outcome == 'success' }}
+        id: mock-build
         working-directory: frontend
         run: pnpm run build
 
-      - name: Install Chromium for frontend E2E
-        working-directory: frontend
-        run: pnpm exec playwright install --with-deps chromium
-
       - name: Run frontend E2E in explicit mock mode
+        if: ${{ !cancelled() && steps.mock-build.outcome == 'success' }}
+        id: mock
         working-directory: frontend
         env:
           CI: "1"
         run: pnpm run test:e2e:mock
 
       - name: Check Markdown links and plain-text affordance in both themes
+        if: ${{ !cancelled() && steps.mock.outcome == 'success' }}
         working-directory: frontend
         env:
           CI: "1"
@@ -169,9 +207,8 @@ jobs:
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
-      - name: Install Chromium for the theme harness
-        working-directory: frontend
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Start Playwright browser from the official image
+        uses: ./.github/actions/playwright-browser
 
       # Starts the pinned Keycloak with the assembled theme, checks the
       # replaced originals against that image, then walks every page.

@@ -27,13 +27,18 @@ from __future__ import annotations
 import importlib.util
 import os
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
-pytestmark = pytest.mark.asyncio
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
+
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
@@ -42,6 +47,7 @@ _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
 )
+_DATABASE_PREFIX = "akb_native_asset_refs_"
 
 
 def _load(filename: str):
@@ -55,49 +61,49 @@ def _load(filename: str):
     return module
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+async def _initialize_pre_107_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(_INIT_SQL)
+    # `native_resources` is created by 048; 107's FK points at it.
+    await _load("048_native_revision_core.py").migrate(conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def pre_107_template() -> AsyncIterator[TestDatabase]:
+    async with database_template(_DSN, _DATABASE_PREFIX, _initialize_pre_107_schema) as template:
+        yield template
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def asset_refs_template(pre_107_template: TestDatabase) -> AsyncIterator[TestDatabase]:
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=pre_107_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            await _load("107_native_document_asset_refs.py").migrate(conn)
+        finally:
+            await conn.close()
+        yield database
 
 
 @asynccontextmanager
-async def _migrated_database(*, apply_107: bool = True):
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_native_asset_refs_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    base, _ = _DSN.rsplit("/", 1)
-    conn = await asyncpg.connect(f"{base}/{name}")
-    try:
-        await conn.execute(_INIT_SQL)
-        # `native_resources` is created by 048; 107's FK points at it.
-        await _load("048_native_revision_core.py").migrate(conn)
-        if apply_107:
-            await _load("107_native_document_asset_refs.py").migrate(conn)
-        # Every test's rows live in a transaction that is always rolled back.
-        # 048 guards `native_resources` with a DEFERRABLE INITIALLY DEFERRED
-        # trigger demanding a published Head, and publishing one means a valid
-        # `native_revisions` row — which needs a payload manifest, an activity
-        # event and an invalidation intent, four interlocking tables that 107
-        # does not constrain. Staying inside an uncommitted transaction keeps
-        # the fixture about this migration instead of about that ledger.
-        tx = conn.transaction()
-        await tx.start()
+async def _migrated_database(template: TestDatabase):
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=template) as database:
+        conn = await asyncpg.connect(database.dsn)
         try:
-            yield conn
+            # Every test's rows live in a transaction that is always rolled back.
+            # 048 guards `native_resources` with a DEFERRABLE INITIALLY DEFERRED
+            # trigger demanding a published Head, and publishing one means a valid
+            # `native_revisions` row — which needs a payload manifest, an activity
+            # event and an invalidation intent, four interlocking tables that 107
+            # does not constrain. Staying inside an uncommitted transaction keeps
+            # the fixture about this migration instead of about that ledger.
+            tx = conn.transaction()
+            await tx.start()
+            try:
+                yield conn
+            finally:
+                await tx.rollback()
         finally:
-            await tx.rollback()
-    finally:
-        await conn.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
+            await conn.close()
 
 
 async def _fixture(conn) -> dict:
@@ -145,8 +151,8 @@ async def _refs(conn, vault_id) -> int:
     )
 
 
-async def test_migration_is_idempotent_and_keeps_both_arms_unique():
-    async with _migrated_database() as conn:
+async def test_migration_is_idempotent_and_keeps_both_arms_unique(asset_refs_template):
+    async with _migrated_database(asset_refs_template) as conn:
         await _load("107_native_document_asset_refs.py").migrate(conn)
         indexes = {
             row["indexname"]
@@ -171,8 +177,8 @@ async def test_migration_is_idempotent_and_keeps_both_arms_unique():
                 )
 
 
-async def test_the_git_arm_still_inserts_and_still_cascades():
-    async with _migrated_database() as conn:
+async def test_the_git_arm_still_inserts_and_still_cascades(asset_refs_template):
+    async with _migrated_database(asset_refs_template) as conn:
         f = await _fixture(conn)
         await conn.execute(
             "INSERT INTO document_asset_refs (document_id, vault_id, asset_id)"
@@ -184,8 +190,8 @@ async def test_the_git_arm_still_inserts_and_still_cascades():
         assert await _refs(conn, f["vault_id"]) == 0
 
 
-async def test_a_native_reference_may_name_a_document_but_never_a_file():
-    async with _migrated_database() as conn:
+async def test_a_native_reference_may_name_a_document_but_never_a_file(asset_refs_template):
+    async with _migrated_database(asset_refs_template) as conn:
         f = await _fixture(conn)
         await conn.execute(
             "INSERT INTO document_asset_refs (native_document_id, vault_id, asset_id)"
@@ -205,8 +211,8 @@ async def test_a_native_reference_may_name_a_document_but_never_a_file():
                 )
 
 
-async def test_a_reference_names_exactly_one_arm():
-    async with _migrated_database() as conn:
+async def test_a_reference_names_exactly_one_arm(asset_refs_template):
+    async with _migrated_database(asset_refs_template) as conn:
         f = await _fixture(conn)
         with pytest.raises(asyncpg.CheckViolationError):
             async with conn.transaction():          # savepoint
@@ -224,9 +230,9 @@ async def test_a_reference_names_exactly_one_arm():
                 )
 
 
-async def test_retiring_a_native_document_drops_its_live_refs_and_no_others():
+async def test_retiring_a_native_document_drops_its_live_refs_and_no_others(asset_refs_template):
     """`delete_resource` sets lifecycle; the row stays, so no cascade fires."""
-    async with _migrated_database() as conn:
+    async with _migrated_database(asset_refs_template) as conn:
         f = await _fixture(conn)
         for doc, asset in ((f["native_doc"], f["asset_id"]), (f["other_doc"], f["other_asset"])):
             await conn.execute(
@@ -247,8 +253,8 @@ async def test_retiring_a_native_document_drops_its_live_refs_and_no_others():
         assert [row["native_document_id"] for row in survivors] == [f["other_doc"]]
 
 
-async def test_deleting_the_native_resource_row_cascades():
-    async with _migrated_database() as conn:
+async def test_deleting_the_native_resource_row_cascades(asset_refs_template):
+    async with _migrated_database(asset_refs_template) as conn:
         f = await _fixture(conn)
         await conn.execute(
             "INSERT INTO document_asset_refs (native_document_id, vault_id, asset_id)"
@@ -261,7 +267,7 @@ async def test_deleting_the_native_resource_row_cascades():
         assert await _refs(conn, f["vault_id"]) == 0
 
 
-async def test_publishing_the_same_reference_twice_is_a_no_op_for_either_arm():
+async def test_publishing_the_same_reference_twice_is_a_no_op_for_either_arm(asset_refs_template):
     """The repository's own upsert, run against PostgreSQL rather than a fake.
 
     Each arm's uniqueness is a PARTIAL unique index, and `ON CONFLICT` refuses
@@ -276,7 +282,7 @@ async def test_publishing_the_same_reference_twice_is_a_no_op_for_either_arm():
     from app.repositories import vault_files_repo
     from app.repositories.vault_files_repo import DocumentAssetOwner
 
-    async with _migrated_database() as conn:
+    async with _migrated_database(asset_refs_template) as conn:
         f = await _fixture(conn)
         retain = datetime.now(timezone.utc) + timedelta(days=1)
         owners = (
@@ -314,9 +320,9 @@ async def test_publishing_the_same_reference_twice_is_a_no_op_for_either_arm():
         ]
 
 
-async def test_without_the_migration_a_native_reference_is_impossible():
+async def test_without_the_migration_a_native_reference_is_impossible(pre_107_template):
     """The negative control: this is the state that broke every inline image."""
-    async with _migrated_database(apply_107=False) as conn:
+    async with _migrated_database(pre_107_template) as conn:
         columns = {
             row["column_name"]
             for row in await conn.fetch(

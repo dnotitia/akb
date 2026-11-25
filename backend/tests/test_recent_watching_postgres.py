@@ -12,7 +12,7 @@ from tests.test_event_tail_postgres import _fresh_database
 from tests.test_notification_native_postgres import setup_native
 from tests.test_notifications_postgres import seed, queue, drain, inbox
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.fixture
@@ -27,11 +27,13 @@ def principal(user_id):
                              display_name=None, is_admin=False, auth_method="jwt")
 
 
-async def test_watching_filters_before_limit_and_pages_ties_without_touching_inbox(monkeypatch, tmp_path, activity):
+async def test_watching_filters_before_limit_and_pages_ties_without_touching_inbox(
+    monkeypatch, tmp_path, activity, application_schema_template,
+):
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
     monkeypatch.setattr(settings, "notifications_enabled", True)
     monkeypatch.setattr(activity, "revision_backend", LegacyRevisionBackend())
-    async with _fresh_database() as pool, pool.acquire() as conn:
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         owner, reader, _, vault, first = await seed(conn)
         second = await conn.fetchval("""INSERT INTO documents(vault_id,path,title)
             VALUES($1,'other.md','Other') RETURNING id""", vault)
@@ -71,9 +73,11 @@ async def test_watching_filters_before_limit_and_pages_ties_without_touching_inb
         assert (await activity.recent_changes(vault=None, limit=20, user=user, scope="watching"))["changes"] == []
 
 
-async def test_native_watching_uses_live_native_identity_and_acl(monkeypatch, activity):
+async def test_native_watching_uses_live_native_identity_and_acl(
+    monkeypatch, activity, application_schema_template,
+):
     monkeypatch.setattr(settings, "notifications_enabled", True)
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         native, current, _, reader, vault = await setup_native(pool)
         backend = NativeRevisionBackend(pool=pool)
         monkeypatch.setattr(activity, "revision_backend", backend)
@@ -99,9 +103,9 @@ async def test_native_watching_uses_live_native_identity_and_acl(monkeypatch, ac
         assert (await activity.recent_changes(vault=None, limit=20, user=user, scope="watching"))["changes"] == []
 
 
-async def test_native_cursor_pages_equal_timestamps(monkeypatch, activity):
+async def test_native_cursor_pages_equal_timestamps(monkeypatch, activity, application_schema_template):
     monkeypatch.setattr(settings, "notifications_enabled", True)
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         native, first, _, reader, vault = await setup_native(pool)
         second = await native.create_text(namespace_id=vault, surface="document", path="second.md",
                                           payload="Second", actor="native-owner", mutation_id=uuid.uuid4())

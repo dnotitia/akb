@@ -13,6 +13,9 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 from app.exceptions import ConflictError, ForbiddenError, ValidationError
 from app.services import app_identity_service as identity
@@ -21,7 +24,7 @@ from app.services import app_rollout_worker as worker
 from app.services import app_resource_service as resources
 from app.repositories.table_data_repo import pg_table_name
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
@@ -45,40 +48,25 @@ def _load_migration(path: Path):
     return module
 
 
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+async def _initialize(conn):
+    await conn.execute(_INIT_SQL)
+    for path in _MIGRATIONS:
+        await _load_migration(path).migrate(conn=conn)
 
 
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def db_template():
+    async with database_template(_DSN, "akb_app_rollout_template_", _initialize) as template:
+        yield template
 
 
 @asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_app_rollout_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=8)
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(_INIT_SQL)
-            for path in _MIGRATIONS:
-                await _load_migration(path).migrate(conn=conn)
+async def _fresh_database(db_template):
+    async with (
+        temporary_database(_DSN, "akb_app_rollout_", template=db_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool,
+    ):
         yield pool
-    finally:
-        await pool.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
 
 
 def _manifest(app_key: str = "rollout-test") -> tuple[dict, str]:
@@ -142,8 +130,8 @@ def _principal(app_id):
     )
 
 
-async def test_rollout_request_is_idempotent_and_worker_resumes_backfill(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_rollout_request_is_idempotent_and_worker_resumes_backfill(monkeypatch, db_template):
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(rollout, "get_pool", lambda: pool)
         monkeypatch.setattr(worker, "get_pool", lambda: pool)
         monkeypatch.setattr(identity, "get_pool", lambda: pool)
@@ -249,8 +237,8 @@ async def test_rollout_request_is_idempotent_and_worker_resumes_backfill(monkeyp
             )
 
 
-async def test_app_rollout_does_not_duplicate_a_pending_installation_target(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_app_rollout_does_not_duplicate_a_pending_installation_target(monkeypatch, db_template):
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(rollout, "get_pool", lambda: pool)
         manifest, checksum = _manifest("pending-install")
         async with pool.acquire() as conn:
@@ -342,8 +330,8 @@ async def test_app_rollout_does_not_duplicate_a_pending_installation_target(monk
             ) == 1
 
 
-async def test_fresh_plan_creates_complete_descriptor_and_postflight_fingerprint(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_fresh_plan_creates_complete_descriptor_and_postflight_fingerprint(monkeypatch, db_template):
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(rollout, "get_pool", lambda: pool)
         monkeypatch.setattr(worker, "get_pool", lambda: pool)
         class _RoleSync:
@@ -490,8 +478,8 @@ async def test_fresh_plan_creates_complete_descriptor_and_postflight_fingerprint
             ) == 0
 
 
-async def test_missing_exact_source_plan_rejects_before_desired_state_mutation(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_missing_exact_source_plan_rejects_before_desired_state_mutation(monkeypatch, db_template):
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(rollout, "get_pool", lambda: pool)
         manifest, _ = _manifest("source-plan-test")
         manifest["transition_plans"] = [manifest["transition_plans"][0]]
@@ -577,9 +565,9 @@ async def test_missing_exact_source_plan_rejects_before_desired_state_mutation(m
             ) == 0
 
 
-async def test_blocked_resume_creates_immutable_new_attempt_and_replays(monkeypatch):
+async def test_blocked_resume_creates_immutable_new_attempt_and_replays(monkeypatch, db_template):
     """A recovery retry never rewrites the blocked source ledger."""
-    async with _fresh_database() as pool:
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(rollout, "get_pool", lambda: pool)
         monkeypatch.setattr(identity, "get_pool", lambda: pool)
         manifest, checksum = _manifest("resume-test")
@@ -787,9 +775,9 @@ async def test_blocked_resume_creates_immutable_new_attempt_and_replays(monkeypa
             )
 
 
-async def test_blocked_resume_accepts_mixed_source_target_lifecycles(monkeypatch):
+async def test_blocked_resume_accepts_mixed_source_target_lifecycles(monkeypatch, db_template):
     """A blocked source may leave failed and untouched targets in mixed states."""
-    async with _fresh_database() as pool:
+    async with _fresh_database(db_template) as pool:
         monkeypatch.setattr(rollout, "get_pool", lambda: pool)
         manifest, checksum = _manifest("resume-mixed-test")
         async with pool.acquire() as conn:

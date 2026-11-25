@@ -9,7 +9,11 @@ import asyncpg
 import pytest
 
 
-pytestmark = pytest.mark.asyncio
+from tests.helpers.pg_database import (
+    temporary_database,
+)
+
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
@@ -17,37 +21,25 @@ _DSN = os.environ.get(
 
 
 @pytest.fixture
-async def connection():
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    from app.db.postgres import _load_migration
-
-    migration = _load_migration("083_edge_vault_boundary.py")
-    assert migration is not None
-    await migration.migrate(conn)
-
-    names = [
-        f"edge-boundary-a-{uuid.uuid4().hex[:10]}",
-        f"edge-boundary-b-{uuid.uuid4().hex[:10]}",
-    ]
-    ids = [
-        await conn.fetchval(
-            "INSERT INTO vaults(name, git_path) VALUES($1, $2) RETURNING id",
-            name,
-            f"/tmp/{name}.git",
-        )
-        for name in names
-    ]
-    try:
-        yield conn, names, ids
-    finally:
-        await conn.execute("DELETE FROM vaults WHERE id = ANY($1::uuid[])", ids)
-        await conn.close()
+async def connection(application_schema_template):
+    async with temporary_database(_DSN, "akb_edge_boundary_", template=application_schema_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            names = [
+                f"edge-boundary-a-{uuid.uuid4().hex[:10]}",
+                f"edge-boundary-b-{uuid.uuid4().hex[:10]}",
+            ]
+            ids = [
+                await conn.fetchval(
+                    "INSERT INTO vaults(name, git_path) VALUES($1, $2) RETURNING id",
+                    name,
+                    f"/tmp/{name}.git",
+                )
+                for name in names
+            ]
+            yield conn, names, ids
+        finally:
+            await conn.close()
 
 
 async def _insert_edge(conn, vault_id, source: str, target: str) -> uuid.UUID:

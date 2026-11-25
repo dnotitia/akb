@@ -20,65 +20,32 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import uuid
-from pathlib import Path
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
 
+from app.db import postgres as postgres_module
 from app.services import sparse_encoder
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    base, _ = _DSN.rsplit("/", 1)
-    return f"{base}/{name}"
-
-
 @contextlib.asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    admin = await asyncpg.connect(_DSN)
-    name = f"akb_bm25_vocab_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    pool = await asyncpg.create_pool(_database_dsn(name), min_size=1, max_size=8)
-    previous_pool = None
-    try:
-        init_sql = (
-            Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
-        ).read_text()
-        async with pool.acquire() as conn:
-            await conn.execute(init_sql)
-        from app.db import postgres as postgres_module
-
+async def _fresh_database(application_schema_template: TestDatabase) -> AsyncIterator[asyncpg.Pool]:
+    async with (
+        temporary_database(_DSN, "akb_bm25_vocab_", template=application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool,
+    ):
         previous_pool = postgres_module._pool
         postgres_module._pool = pool
-        await postgres_module._apply_migrations()
-        yield pool
-    finally:
-        from app.db import postgres as postgres_module
-
-        postgres_module._pool = previous_pool
-        await pool.close()
-        with contextlib.suppress(asyncpg.PostgresError):
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+        try:
+            yield pool
+        finally:
+            postgres_module._pool = previous_pool
 
 
 async def _snapshot(pool, terms):
@@ -92,8 +59,8 @@ async def _snapshot(pool, terms):
     return {r["term"]: (r["term_id"], r["version"]) for r in rows}, sequence
 
 
-async def test_a_locked_existing_term_is_resolved_without_waiting():
-    async with _fresh_database() as pool:
+async def test_a_locked_existing_term_is_resolved_without_waiting(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         known = await sparse_encoder.get_or_create_term_ids(["alpha", "beta"])
         holder = await pool.acquire()
         try:
@@ -112,8 +79,8 @@ async def test_a_locked_existing_term_is_resolved_without_waiting():
         assert resolved == known
 
 
-async def test_existing_terms_keep_their_row_version_and_burn_no_ids():
-    async with _fresh_database() as pool:
+async def test_existing_terms_keep_their_row_version_and_burn_no_ids(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         await sparse_encoder.get_or_create_term_ids(["alpha", "beta", "gamma"])
         before, sequence_before = await _snapshot(pool, ["alpha", "beta", "gamma"])
         for _ in range(3):
@@ -123,8 +90,8 @@ async def test_existing_terms_keep_their_row_version_and_burn_no_ids():
         assert sequence_after == sequence_before
 
 
-async def test_new_terms_get_fresh_ids_next_to_existing_ones():
-    async with _fresh_database() as pool:
+async def test_new_terms_get_fresh_ids_next_to_existing_ones(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         first = await sparse_encoder.get_or_create_term_ids(["alpha", "beta"])
         mixed = await sparse_encoder.get_or_create_term_ids(["beta", "delta", "", "alpha", "epsilon"])
         assert set(mixed) == {"alpha", "beta", "delta", "epsilon"}
@@ -134,8 +101,8 @@ async def test_new_terms_get_fresh_ids_next_to_existing_ones():
         assert {term: row[0] for term, row in rows.items()} == mixed
 
 
-async def test_concurrent_callers_agree_on_one_id_per_new_term():
-    async with _fresh_database() as pool:
+async def test_concurrent_callers_agree_on_one_id_per_new_term(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         words = [f"w{i:02d}" for i in range(40)]
         results = await asyncio.gather(*(
             sparse_encoder.get_or_create_term_ids(words[i % 7:] + words[: i % 7])
@@ -148,8 +115,8 @@ async def test_concurrent_callers_agree_on_one_id_per_new_term():
             ) == len(words)
 
 
-async def test_a_term_another_session_commits_mid_call_resolves_to_its_id():
-    async with _fresh_database() as pool:
+async def test_a_term_another_session_commits_mid_call_resolves_to_its_id(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         other = await pool.acquire()
         try:
             transaction = other.transaction()

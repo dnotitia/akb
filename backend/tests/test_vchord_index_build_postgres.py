@@ -31,9 +31,9 @@ from collections.abc import AsyncIterator
 import asyncpg
 import pytest
 
-from app.services.vector_store.pgvector import PgvectorStore
+from tests.helpers.pg_database import TestDatabase, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _INDEX = "vector_index.idx_vi_chunks_bm25"
@@ -42,23 +42,13 @@ _BOUNDED = 100
 
 
 @contextlib.asynccontextmanager
-async def _database() -> AsyncIterator[asyncpg.Connection]:
-    if not _DSN:
-        pytest.skip("AKB_VCHORD_TEST_DSN is required for VectorChord coverage")
-    base, _ = _DSN.rsplit("/", 1)
-    name = f"akb_vchord_build_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    conn = await asyncpg.connect(f"{base}/{name}")
-    try:
-        store = PgvectorStore(dsn=f"{base}/{name}", schema="vector_index", dense_dim=4, sparse_shape="vchord")
-        await store._do_ensure(conn)  # the index, built empty as a new database builds it
-        yield conn
-    finally:
-        await conn.close()
-        with contextlib.suppress(asyncpg.PostgresError):
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+async def _database(empty_vchord_template: TestDatabase) -> AsyncIterator[asyncpg.Connection]:
+    async with temporary_database(_DSN, "akb_vchord_build_", template=empty_vchord_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            yield conn
+        finally:
+            await conn.close()
 
 
 async def _insert(conn: asyncpg.Connection, vectors: list[str], *, first: int = 0) -> None:
@@ -122,7 +112,7 @@ def _worse_ranks(bounded: list[float], exact: list[float]) -> int:
     return sum(1 for b, e in zip(padded, exact) if b > e + abs(e) * 1e-5)
 
 
-async def test_blocks_whose_best_posting_comes_last_stay_reachable():
+async def test_blocks_whose_best_posting_comes_last_stay_reachable(empty_vchord_template):
     """Every full block's best posting is its last one, the case the build got wrong.
 
     Term 10 appears in 400 rows: three full blocks and a partial one. The rows
@@ -136,7 +126,7 @@ async def test_blocks_whose_best_posting_comes_last_stay_reachable():
         "{10:1}" if i in ends else "{10:1,%d:19}" % (100_000 + i)
         for i in range(400)
     ]
-    async with _database() as conn:
+    async with _database(empty_vchord_template) as conn:
         await _load(conn, vectors)
         exact = await _top_scores(conn, "{10:1}", -1)
         bounded = await _top_scores(conn, "{10:1}", _BOUNDED)
@@ -146,7 +136,7 @@ async def test_blocks_whose_best_posting_comes_last_stay_reachable():
     assert bounded == exact
 
 
-async def test_blocks_the_seal_writes_keep_their_best_posting():
+async def test_blocks_the_seal_writes_keep_their_best_posting(empty_vchord_template):
     """Rows that arrive by insert reach sealed blocks through the seal path.
 
     That path records a block's best posting before it flushes the block, so it
@@ -159,7 +149,7 @@ async def test_blocks_the_seal_writes_keep_their_best_posting():
         "{10:1}" if i in ends else "{10:1,%d:19}" % (100_000 + i)
         for i in range(400)
     ] + ["{30:1,%d:19}" % (200_000 + i) for i in range(1_000)]
-    async with _database() as conn:
+    async with _database(empty_vchord_template) as conn:
         await conn.execute("LOAD 'vchord_bm25'")  # its settings exist once the library is loaded
         await conn.execute("SET bm25_catalog.segment_growing_max_page_size = 1")
         await _insert(conn, vectors)
@@ -173,7 +163,7 @@ async def test_blocks_the_seal_writes_keep_their_best_posting():
     assert bounded == exact
 
 
-async def test_vacuum_takes_back_the_length_an_insert_added():
+async def test_vacuum_takes_back_the_length_an_insert_added(empty_vchord_template):
     """VACUUM subtracts exactly what the build and the insert added (akb#684).
 
     The metapage's doc_term_cnt is the sum of document lengths, and BM25 takes
@@ -184,7 +174,7 @@ async def test_vacuum_takes_back_the_length_an_insert_added():
     every update left length behind. Every side now counts the stored length,
     so a sum survives any number of replacements unchanged.
     """
-    async with _database() as conn:
+    async with _database(empty_vchord_template) as conn:
         await _load(conn, ["{10:1,%d:138}" % (100_000 + i) for i in range(200)])  # length 139
         before = await _metapage(conn)
         assert before["doc_term_cnt"] == 200 * 136  # the build counts stored lengths
@@ -200,7 +190,7 @@ async def test_vacuum_takes_back_the_length_an_insert_added():
     assert after["doc_term_cnt"] == before["doc_term_cnt"], after["doc_term_cnt"] - before["doc_term_cnt"]
 
 
-async def test_a_corpus_built_over_existing_rows_ranks_like_the_exact_scan():
+async def test_a_corpus_built_over_existing_rows_ranks_like_the_exact_scan(empty_vchord_template):
     """A skewed random corpus, compared with the exact scan query by query.
 
     The same shape as the measurement on a production-sized index. With this
@@ -228,7 +218,7 @@ async def test_a_corpus_built_over_existing_rows_ranks_like_the_exact_scan():
         picked = sorted(rnd.sample(terms, rnd.randint(2, 3)))
         queries.append("{" + ",".join(f"{t}:1" for t in picked) + "}")
 
-    async with _database() as conn:
+    async with _database(empty_vchord_template) as conn:
         await _load(conn, vectors)
         worse = {}
         for query in queries:

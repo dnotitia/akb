@@ -18,13 +18,13 @@ from app.services import account_self_service as service, account_deletion_worke
 from app.services.auth_service import AuthenticatedUser
 from tests.test_recovery_admin_provisioning_postgres import _fresh_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 PASSWORD = "fixture-confirmation-only"  # pragma: allowlist secret
 
 
 @pytest.fixture
-async def pool(monkeypatch):
-    async with _fresh_database() as pool:
+async def pool(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         async def get_pool():
             return pool
         for module in (service, worker, auth_service):

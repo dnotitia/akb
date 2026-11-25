@@ -261,6 +261,7 @@ async def _can_connect(dsn: str) -> bool:
     return True
 
 
+@pytest.mark.live_services
 async def test_cross_vault_fusion_end_to_end_pg(monkeypatch):
     if not await _can_connect(_DSN):
         pytest.skip(f"Postgres not reachable at {_DSN}")

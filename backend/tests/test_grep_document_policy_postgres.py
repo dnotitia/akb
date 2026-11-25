@@ -9,16 +9,20 @@ from app.services.git_service import GitService
 from app.services.native_document_service import NativeDocumentService
 from tests.test_event_tail_postgres import _fresh_database, _make_vault
 
+pytestmark = pytest.mark.live_services
+
 
 @pytest.mark.parametrize("backend", ["postgres_native", "bare_git"])
-async def test_writer_grep_reads_and_partial_replacement_match_storage(backend, tmp_path, monkeypatch):
+async def test_writer_grep_reads_and_partial_replacement_match_storage(
+    backend, tmp_path, monkeypatch, application_schema_template,
+):
     monkeypatch.setattr(settings, "git_storage_path", str(tmp_path))
     monkeypatch.setattr(settings, "document_revision_backend", backend)
     from mcp_server import server
 
     vault = "grep-policy"
     pattern = "catalog marker"
-    async with _fresh_database() as pool:
+    async with _fresh_database(application_schema_template) as pool:
         vault_id = await _make_vault(pool, vault)
         writer = await pool.fetchval(
             "INSERT INTO users(username,email,password_hash) VALUES('writer','writer@example.invalid','disabled') RETURNING id"

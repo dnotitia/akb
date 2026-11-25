@@ -17,7 +17,7 @@ from mcp import types as mcp_types
 
 import tests.mcp_e2e.conftest as mcp_conftest
 from tests.mcp_e2e.conftest import mcp_client as mcp_client_fixture
-from tests.mcp_e2e.test_product_e2e import _call_json as product_call_json
+from tests.mcp_e2e.tools import _call_json as product_call_json
 from tests.mcp_e2e.runtime import RuntimeContext, RuntimeDescriptor
 
 
@@ -55,7 +55,7 @@ def test_descriptor_stdin_read_is_compatible_with_pytest_capture(tmp_path: Path)
     probe = tmp_path / "test_descriptor_pipe.py"
     probe.write_text(
         "import json\n"
-        "from mcp_e2e.conftest import _read_descriptor\n"
+        "from tests.mcp_e2e.conftest import _read_descriptor\n"
         "\n"
         "def test_pipe(request):\n"
         "    manager = request.config.pluginmanager.getplugin('capturemanager')\n"
@@ -63,8 +63,8 @@ def test_descriptor_stdin_read_is_compatible_with_pytest_capture(tmp_path: Path)
         encoding="utf-8",
     )
     env = os.environ.copy()
-    tests_root = Path(__file__).resolve().parent
-    env["PYTHONPATH"] = f"{tests_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    backend_root = Path(__file__).resolve().parents[1]
+    env["PYTHONPATH"] = f"{backend_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
     result = subprocess.run(
         [sys.executable, "-m", "pytest", str(probe), "-q"],
         cwd=tmp_path,
@@ -75,7 +75,7 @@ def test_descriptor_stdin_read_is_compatible_with_pytest_capture(tmp_path: Path)
         check=False,
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_runtime_descriptor_stdin_is_reused_across_function_scoped_sessions(

@@ -12,6 +12,9 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 from app.exceptions import ConflictError, ValidationError
 from app.services import app_resource_service as resources
@@ -19,7 +22,7 @@ from app.services import app_registry_service as registry
 from app.services import app_rollout_service as rollout
 from app.services.auth_service import AuthenticatedUser
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 BACKEND = Path(__file__).resolve().parents[1]
 INIT_SQL = (BACKEND / "app" / "db" / "init.sql").read_text()
@@ -41,39 +44,26 @@ def _load_migration(path: Path):
     return module
 
 
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncpg.connect(DSN, timeout=2)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+async def _initialize(conn):
+    await conn.execute(INIT_SQL)
+    for migration in MIGRATIONS:
+        await _load_migration(migration).migrate(conn=conn)
 
 
-def _database_dsn(name: str) -> str:
-    base, _ = DSN.rsplit("/", 1)
-    return f"{base}/{name}"
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def db_template():
+    async with database_template(DSN, "akb_app_registry_v2_template_", _initialize) as template:
+        yield template
 
 
 @asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect():
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"Required PostgreSQL is not reachable at {DSN}")
-        pytest.skip(f"Postgres not reachable at {DSN}")
-    admin = await asyncpg.connect(DSN)
-    name = f"akb_app_registry_v2_{uuid.uuid4().hex[:12]}"
-    await admin.execute(f'CREATE DATABASE "{name}"')
-    conn = await asyncpg.connect(_database_dsn(name))
-    try:
-        await conn.execute(INIT_SQL)
-        for migration in MIGRATIONS:
-            await _load_migration(migration).migrate(conn=conn)
-        yield conn
-    finally:
-        await conn.close()
-        await admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
-        await admin.close()
+async def _fresh_database(db_template):
+    async with temporary_database(DSN, "akb_app_registry_v2_", template=db_template) as database:
+        conn = await asyncpg.connect(database.dsn)
+        try:
+            yield conn
+        finally:
+            await conn.close()
 
 
 def _admin() -> AuthenticatedUser:
@@ -153,9 +143,9 @@ def _manifest_with_reordered_create_columns(app_key: str, version: str) -> dict:
 
 
 async def test_v2_release_replays_byte_equivalent_and_conflicts_without_partial_state(
-    monkeypatch,
+    monkeypatch, db_template,
 ):
-    async with _fresh_database() as conn:
+    async with _fresh_database(db_template) as conn:
         class _Pool:
             def acquire(self):
                 return self
@@ -256,8 +246,8 @@ async def test_v2_release_replays_byte_equivalent_and_conflicts_without_partial_
             )
 
 
-async def test_v2_release_replays_canonical_equivalent_stored_manifest(monkeypatch):
-    async with _fresh_database() as conn:
+async def test_v2_release_replays_canonical_equivalent_stored_manifest(monkeypatch, db_template):
+    async with _fresh_database(db_template) as conn:
         class _Pool:
             def acquire(self):
                 return self

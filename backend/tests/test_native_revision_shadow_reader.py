@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
@@ -17,6 +18,7 @@ from typing import Any
 
 import asyncpg
 import pytest
+import pytest_asyncio
 from git import Repo
 
 from app.repositories.native_revision_migration_repo import (
@@ -49,6 +51,7 @@ from app.services.native_revision_shadow_reader import (
 )
 from app.services.native_revision_backfill import NativeRevisionBackfill
 from app.services.native_revision_reconcile import NativeRevisionReconcile
+from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 
 pytestmark = pytest.mark.asyncio
@@ -60,19 +63,7 @@ _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@127.0.0.1:54913/akb_p2_native_revision_test",  # pragma: allowlist secret
 )
-
-
-async def _reachable() -> bool:
-    try:
-        conn = await asyncpg.connect(_DSN, timeout=2)
-    except OSError, asyncpg.PostgresError:
-        return False
-    await conn.close()
-    return True
-
-
-def _database_dsn(name: str) -> str:
-    return f"{_DSN.rsplit('/', 1)[0]}/{name}"
+_DATABASE_PREFIX = "akb_shadow_reader_"
 
 
 def _load_migration(filename: str):
@@ -84,39 +75,30 @@ def _load_migration(filename: str):
     return module
 
 
+async def _initialize_schema(conn: asyncpg.Connection) -> None:
+    await conn.execute(_INIT_SQL)
+    for filename in (
+        "010_external_git_mirror.py",
+        "048_native_revision_core.py",
+        "053_native_revision_m1_pg_body.py",
+        "060_native_revision_migration_bridge.py",
+        "097_native_revision_migration_inventory.py",
+        "105_bridge_body_digest.py",
+    ):
+        await _load_migration(filename).migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template() -> AsyncIterator[TestDatabase]:
+    async with database_template(_DSN, _DATABASE_PREFIX, _initialize_schema) as template:
+        yield template
+
+
 @asynccontextmanager
-async def _fresh_schema(tmp_path: Path):
-    if not await _reachable():
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    name = f"akb_shadow_reader_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    connection = None
-    pool = None
-    try:
-        await admin.execute(f'CREATE DATABASE "{name}"')
-        dsn = _database_dsn(name)
-        connection = await asyncpg.connect(dsn)
-        await connection.execute(_INIT_SQL)
-        for filename in (
-            "010_external_git_mirror.py",
-            "048_native_revision_core.py",
-            "053_native_revision_m1_pg_body.py",
-            "060_native_revision_migration_bridge.py",
-            "097_native_revision_migration_inventory.py",
-            "105_bridge_body_digest.py",
-        ):
-            await _load_migration(filename).migrate(conn=connection)
-        await connection.close()
-        connection = None
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
-        yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        if connection is not None and not connection.is_closed():
-            await connection.close()
-        await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        await admin.close()
+async def _fresh_schema(template: TestDatabase):
+    async with temporary_database(_DSN, _DATABASE_PREFIX, template=template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            yield pool
 
 
 async def _authority_counts(pool) -> tuple[tuple[str, int], ...]:
@@ -2078,8 +2060,9 @@ async def test_comparator_rejects_profile_only_activity_evidence():
         await comparator.compare_run(run.run_id)
 
 
-async def test_product_readers_compare_a_completed_pg_backfill_without_writes(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_product_readers_compare_a_completed_pg_backfill_without_writes(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git"))
         vault_name = f"shadow-{uuid.uuid4().hex}"
         git.init_vault(vault_name)
@@ -2169,8 +2152,9 @@ async def test_product_readers_compare_a_completed_pg_backfill_without_writes(tm
         assert fixed_ref not in encoded
 
 
-async def test_reconcile_c10_resolves_changed_and_unchanged_heads_across_runs(tmp_path):
-    async with _fresh_schema(tmp_path) as pool:
+@pytest.mark.live_services
+async def test_reconcile_c10_resolves_changed_and_unchanged_heads_across_runs(schema_template, tmp_path):
+    async with _fresh_schema(schema_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git"))
         vault_name = f"shadow-reconcile-{uuid.uuid4().hex}"
         git.init_vault(vault_name)

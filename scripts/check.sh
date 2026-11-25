@@ -7,6 +7,16 @@
 # Resist adding "warnings-only" steps — they always rot into noise.
 set -euo pipefail
 
+run_frontend_vitest=true
+if [[ "${1:-}" == "--skip-frontend-vitest" ]]; then
+  run_frontend_vitest=false
+  shift
+fi
+if (( $# != 0 )); then
+  echo "Usage: bash scripts/check.sh [--skip-frontend-vitest]" >&2
+  exit 2
+fi
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${REPO_ROOT}"
 
@@ -201,12 +211,6 @@ if [ "${#missing_installs[@]}" -ne 0 ]; then
 fi
 echo "  node deps present in ${#node_projects[@]} node projects"
 
-# ─── E2E suite manifest ───────────────────────────────────────────
-# Fails fast when a new shell E2E suite is neither run by the hosted gate nor
-# deliberately deferred with a reviewed reason.
-step "E2E suite manifest"
-python scripts/ci/e2e_suite_runner.py --check-manifest --repo-root "${REPO_ROOT}"
-
 # ─── coding-agent roles ────────────────────────────────────────────
 # .codex/ and .claude/ are rendered from .agents/roles.toml so both agents
 # read one contract. A hand edit to a rendered file, or a source edit without
@@ -315,12 +319,11 @@ step "stdio proxy + MCP Inspector contract"
 (cd packages/akb-mcp-client && npm test)
 
 # ─── frontend: vitest (unit + RTL + MSW) ──────────────────────────
-# Closes the biggest gate gap: previously a broken test could merge
-# because check.sh only ran lint/type. Stage 3 (Playwright) lives
-# behind `npm run test:e2e` and needs a live docker-compose stack —
-# wire that into a separate e2e workflow when it's ready.
-step "vitest (frontend)"
-(cd frontend && pnpm run test)
+# CI runs the frontend app's Vitest suite in a separate job.
+if "$run_frontend_vitest"; then
+  step "vitest (frontend)"
+  (cd frontend && pnpm run test)
+fi
 
 # ─── secrets: detect-secrets ──────────────────────────────────────
 # Catches accidental commits of API keys, JWTs, AWS credentials, etc.

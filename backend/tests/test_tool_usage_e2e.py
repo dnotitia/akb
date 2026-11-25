@@ -13,10 +13,7 @@ Excluded from the unit job by the `_e2e` filename filter; run by the
 and it is unreachable the suite FAILS, because a gate that green-skips is not
 a gate.
 
-Isolation: everything runs in a dedicated schema created and dropped per
-module, so the suite can never touch application data (an earlier revision
-issued a bare `TRUNCATE tool_calls` against whatever database the app config
-happened to resolve).
+Each test clones a database template containing the tool-usage schema.
 """
 from __future__ import annotations
 
@@ -30,8 +27,12 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from tests.helpers.pg_database import database_template, temporary_database
+
 from app.config import settings
 from app.services import tool_usage
+
+pytestmark = pytest.mark.live_services
 
 # When CI sets the DSN explicitly, an unreachable database is a BROKEN GATE,
 # not a reason to pass: a wrong password or port would otherwise turn into
@@ -43,15 +44,6 @@ _DSN = _DSN_FROM_ENV or "postgresql://akb:akb@localhost:15432/akb"  # pragma: al
 _SCHEMA = "tool_usage_e2e"
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 def _migration():
     path = pathlib.Path(__file__).resolve().parents[1] / "app/db/migrations/046_tool_usage.py"
     spec = importlib.util.spec_from_file_location("m046", path)
@@ -60,38 +52,33 @@ def _migration():
     return mod
 
 
+async def _initialize(conn: asyncpg.Connection) -> None:
+    await conn.execute(f"CREATE SCHEMA {_SCHEMA}")
+    await conn.execute(f"SET search_path TO {_SCHEMA}")
+    await _migration().migrate(conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    async with database_template(
+        _DSN, "akb_tool_usage_template_", _initialize, required=bool(_DSN_FROM_ENV),
+    ) as template:
+        yield template
+
+
 @pytest_asyncio.fixture
-async def db(monkeypatch):
-    """A pool bound to a throwaway schema, with the service pointed at it.
+async def db(monkeypatch, schema_template):
+    async with (
+        temporary_database(_DSN, "akb_tool_usage_", template=schema_template) as database,
+        asyncpg.create_pool(
+            database.dsn, min_size=1, max_size=8, server_settings={"search_path": _SCHEMA},
+        ) as pool,
+    ):
+        async def _get_pool():
+            return pool
 
-    Function-scoped because each test gets its own event loop and an asyncpg
-    pool cannot be shared across loops. The migration is `IF NOT EXISTS`
-    throughout, so re-applying per test is a no-op after the first.
-    """
-    if not await _can_connect(_DSN):
-        if _DSN_FROM_ENV:
-            pytest.fail(
-                f"AKB_TEST_DSN was set but is unreachable ({_DSN_FROM_ENV}) — "
-                "this suite is a merge gate and must not skip when CI configured it"
-            )
-        pytest.skip("Postgres unreachable and no AKB_TEST_DSN set")
-    pool = await asyncpg.create_pool(
-        _DSN, min_size=1, max_size=8,
-        server_settings={"search_path": _SCHEMA},
-    )
-    async with pool.acquire() as c:
-        await c.execute(f"CREATE SCHEMA IF NOT EXISTS {_SCHEMA}")
-        await _migration().migrate(c)
-        await c.execute("TRUNCATE tool_calls, tool_usage_daily")
-
-    async def _get_pool():
-        return pool
-
-    monkeypatch.setattr(tool_usage, "get_pool", _get_pool)
-    yield pool
-    async with pool.acquire() as c:
-        await c.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE")
-    await pool.close()
+        monkeypatch.setattr(tool_usage, "get_pool", _get_pool)
+        yield pool
 
 
 async def _seed(conn, *, days: float, tool: str, outcome: str = "ok", n: int = 1) -> None:

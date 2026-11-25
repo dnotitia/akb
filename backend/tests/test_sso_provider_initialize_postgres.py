@@ -22,7 +22,7 @@ from tests.test_sso_provider_client_credentials_postgres import standalone as st
 
 
 standalone = standalone_fixture
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _PATH = "/api/v1/admin/sso/providers/workforce/initialize"
 _SECRET = "initial-fixture-secret-never-returned"  # pragma: allowlist secret
 

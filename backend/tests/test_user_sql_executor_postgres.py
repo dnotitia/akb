@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 
 import asyncpg
@@ -9,7 +10,12 @@ import pytest
 
 from app.services.role_sync import user_role_name
 from app.services.user_sql_executor import PermissionDeniedError, UserSqlExecutor
-from tests.test_table_row_cas_postgres import _database_dsn, _DSN, _fresh_database
+from tests.helpers.pg_database import temporary_database
+
+pytestmark = pytest.mark.live_services
+
+
+_DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")
 
 
 @pytest.mark.asyncio
@@ -18,16 +24,19 @@ async def test_reused_connection_resets_read_only_and_role_after_success_and_fai
     role = user_role_name(user_id)
     admin = None
     try:
-        async with _fresh_database() as fixture_pool:
+        async with temporary_database(_DSN, "akb_sql_executor_") as database:
             admin = await asyncpg.connect(_DSN)
-            async with fixture_pool.acquire() as conn:
-                database = await conn.fetchval("SELECT current_database()")
+            conn = await asyncpg.connect(database.dsn)
+            try:
                 await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
                 await conn.execute("CREATE TABLE executor_pool_test (value text NOT NULL)")
                 await conn.execute("INSERT INTO executor_pool_test VALUES ('original')")
                 await conn.execute(f'GRANT SELECT, UPDATE ON executor_pool_test TO "{role}"')
 
-            pool = await asyncpg.create_pool(_database_dsn(database), min_size=1, max_size=1)
+            finally:
+                await conn.close()
+
+            pool = await asyncpg.create_pool(database.dsn, min_size=1, max_size=1)
             try:
                 executor = UserSqlExecutor(pool)
                 async with pool.acquire() as conn:

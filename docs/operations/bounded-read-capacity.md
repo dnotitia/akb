@@ -183,12 +183,13 @@ recount returning 403/404 now clears the previous successful count, and a later
 503 cannot resurrect it. A fresh authorized count may populate it again;
 regressions cover that sequence without a focus change or access-revision bump.
 
-The six catalog/page/count/CAS/ACL HTTP contracts run in the mandatory
-`backend/tests/mcp_e2e/test_read_capacity_e2e.py` runtime lane. Every case uses a
-new non-admin owner; Reader and Outsider actors are minted through the same
-isolated API. No optional endpoint or actor PAT can skip this coverage. The
-historical large-corpus measurements above are separate from this review's
-focused correctness validation; they are not claimed as newly rerun results.
+The live PostgreSQL job runs the catalog, page, count, CAS, and ACL contracts
+in `backend/tests/rest_integration/test_read_capacity.py`. The tests use the
+REST API in process with a disposable PostgreSQL database. Each case creates
+a non-admin owner. The ACL case also creates Reader and Outsider accounts
+through the API. The historical large-corpus measurements above are separate
+from this review's focused correctness validation; they are not claimed as
+newly rerun results.
 
 Integration with PR #761 preserves sanitized transient errors and cancellation
 of selected abandoned GET reads, including Table catalog/page requests. Counted

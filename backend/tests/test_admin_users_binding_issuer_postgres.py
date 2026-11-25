@@ -19,7 +19,9 @@ import uuid
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
+from tests.helpers.pg_database import database_template, temporary_database
 
 pytestmark = pytest.mark.asyncio
 _DSN = os.environ.get(
@@ -30,65 +32,57 @@ _PRESENTED = "https://auth-team1.example.invalid/realms/akb"
 _LEFT_BEHIND = "https://shared.example.invalid/realms/akb-platform"
 
 
+async def _initialize(conn: asyncpg.Connection) -> None:
+    await conn.execute("""
+        CREATE TABLE users (
+            id UUID PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            email TEXT NOT NULL UNIQUE,
+            display_name TEXT,
+            is_admin BOOLEAN NOT NULL DEFAULT false,
+            auth_provider TEXT NOT NULL,
+            account_status TEXT NOT NULL,
+            account_kind TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE external_identities (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            issuer TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            username_snapshot TEXT,
+            email_snapshot TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (issuer, subject)
+        );
+        CREATE TABLE vaults (
+            id UUID PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            owner_id UUID REFERENCES users(id)
+        );
+    """)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    async with database_template(_DSN, "akb_admin_binding_template_", _initialize) as template:
+        yield template
+
+
 @pytest.fixture
-async def listing(monkeypatch):
-    try:
-        admin = await asyncpg.connect(_DSN, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail("REQUIRE_REAL_PG=1 but Postgres is not reachable at AKB_TEST_DSN")
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
+async def listing(monkeypatch, schema_template):
+    from app.services import access_service
 
-    schema = "admin_users_binding_issuer_" + uuid.uuid4().hex
-    await admin.execute(f'CREATE SCHEMA "{schema}"')
-    pool = await asyncpg.create_pool(
-        _DSN, min_size=1, max_size=4, server_settings={"search_path": schema}
-    )
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE users (
-                    id UUID PRIMARY KEY,
-                    username TEXT NOT NULL UNIQUE,
-                    email TEXT NOT NULL UNIQUE,
-                    display_name TEXT,
-                    is_admin BOOLEAN NOT NULL DEFAULT false,
-                    auth_provider TEXT NOT NULL,
-                    account_status TEXT NOT NULL,
-                    account_kind TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                CREATE TABLE external_identities (
-                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    issuer TEXT NOT NULL,
-                    subject TEXT NOT NULL,
-                    username_snapshot TEXT,
-                    email_snapshot TEXT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE (issuer, subject)
-                );
-                CREATE TABLE vaults (
-                    id UUID PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
-                    owner_id UUID REFERENCES users(id)
-                );
-                """
-            )
-
-        from app.services import access_service
-
+    async with (
+        temporary_database(_DSN, "akb_admin_binding_", template=schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool,
+    ):
         async def _get_pool():
             return pool
 
         monkeypatch.setattr(access_service, "get_pool", _get_pool)
         yield pool, access_service
-    finally:
-        await pool.close()
-        await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
-        await admin.close()
 
 
 async def _seed(pool) -> dict[str, uuid.UUID]:
@@ -120,6 +114,7 @@ def _by_username(users: list[dict]) -> dict[str, dict]:
     return {u["username"]: u for u in users}
 
 
+@pytest.mark.live_services
 async def test_listing_distinguishes_a_carried_binding_from_one_left_behind(
     listing, monkeypatch
 ):
@@ -141,6 +136,7 @@ async def test_listing_distinguishes_a_carried_binding_from_one_left_behind(
     assert users["unbound"]["bound_to_presented_issuer"] is False
 
 
+@pytest.mark.live_services
 async def test_a_runtime_that_presents_no_issuer_answers_unknown_not_false(
     listing, monkeypatch
 ):

@@ -115,7 +115,7 @@ test("image file selection stays in the preview and uploading blocks every exit"
     await upload;
     await route.fulfill({ json: { id: assetId, name: "diagram.png", mime_type: "image/png", size_bytes: bytes.length, target: `/api/assets/${assetId}`, unclaimed_expires_at: "2099-01-01T00:00:00Z" } });
   });
-  await page.route(`**/api/assets/${assetId}?*`, route => route.fulfill({ contentType: "image/png", body: bytes }));
+  await page.route(`**/api/assets/${assetId}*`, route => route.fulfill({ contentType: "image/png", body: bytes }));
   const preview = await openPreview(page);
   await preview.getByRole("button", { name: "Edit", exact: true }).click();
   await expect(preview.locator('input[type="file"]')).toHaveCount(1);

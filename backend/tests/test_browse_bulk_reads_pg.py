@@ -6,13 +6,16 @@ import pytest
 from app.repositories.table_data_repo import EXACT_ROW_COUNT_LIMIT, row_counts
 from app.services.m1_pg_body_store import M1PgBodyStore, PgBodyIntegrityError
 from app.services.native_revision_service import NativeRevisionService
-from tests.test_event_tail_postgres import _fresh_database, _make_vault
+from tests.test_event_tail_postgres import (
+    _fresh_database,
+    _make_vault,
+)
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
-async def test_live_head_snapshots_match_per_resource_reads_and_fail_closed():
-    async with _fresh_database() as pool:
+async def test_live_head_snapshots_match_per_resource_reads_and_fail_closed(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool:
         vault = await _make_vault(pool, "bulk-heads")
         native = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
         common = dict(namespace_id=vault, surface="document", actor="writer")
@@ -52,8 +55,8 @@ async def test_live_head_snapshots_match_per_resource_reads_and_fail_closed():
             NativeRevisionService._verify_head_rows(rows, stores)
 
 
-async def test_row_counts_are_exact_for_small_tables_and_estimated_for_large():
-    async with _fresh_database() as pool, pool.acquire() as conn:
+async def test_row_counts_are_exact_for_small_tables_and_estimated_for_large(application_schema_template):
+    async with _fresh_database(application_schema_template) as pool, pool.acquire() as conn:
         await conn.execute("CREATE TABLE vt_small__t (v int)")
         await conn.execute("CREATE TABLE vt_large__t (v int)")
         await conn.execute("INSERT INTO vt_small__t SELECT generate_series(1, 3)")

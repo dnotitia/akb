@@ -13,9 +13,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 import pytest
+import pytest_asyncio
+
+from tests.helpers.pg_database import database_template, temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
@@ -188,56 +191,44 @@ async def test_current_init_db_fresh_schema_finishes_with_epoch_indexes(monkeypa
         }
 
 
+async def _initialize(conn):
+    await conn.execute(_INIT_SQL)
+    await conn.execute(
+        """
+        DROP TABLE sso_browser_sessions, sso_browser_logout_fences,
+                   admin_browser_sessions, auth_runtime_state
+        """
+    )
+    await conn.execute("DROP TABLE IF EXISTS auth_runtime_epoch_upgrade")
+    from app.db.postgres import _load_migration
+
+    admin_migration = _load_migration("072_admin_browser_sessions.py")
+    browser_migration = _load_migration("074_sso_browser_sessions.py")
+    epoch_migration = _load_migration("076_sso_session_epoch.py")
+    events_migration = _load_migration("015_events_outbox.py")
+    assert admin_migration is not None
+    assert browser_migration is not None
+    assert epoch_migration is not None
+    assert events_migration is not None
+    await events_migration.migrate(conn=conn)
+    await admin_migration.migrate(conn=conn)
+    await browser_migration.migrate(conn=conn)
+    await epoch_migration.migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def epoch_bridge_template():
+    async with database_template(_DSN, "akb_sso_epoch_bridge_template_", _initialize) as template:
+        yield template
+
+
 @asynccontextmanager
-async def _pre_epoch_bridge_database():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    database = f"akb_sso_epoch_upgrade_{uuid.uuid4().hex[:10]}"
-    admin = await asyncpg.connect(_DSN)
-    await admin.execute(f'CREATE DATABASE "{database}"')
-    pool: asyncpg.Pool | None = None
-    try:
-        target_dsn = _dsn_for_database(_DSN, database)
-        conn = await asyncpg.connect(target_dsn)
-        try:
-            await conn.execute(_INIT_SQL)
-            await conn.execute(
-                """
-                DROP TABLE sso_browser_sessions, sso_browser_logout_fences,
-                           admin_browser_sessions, auth_runtime_state
-                """
-            )
-            await conn.execute("DROP TABLE IF EXISTS auth_runtime_epoch_upgrade")
-            from app.db.postgres import _load_migration
-
-            admin_migration = _load_migration("072_admin_browser_sessions.py")
-            browser_migration = _load_migration("074_sso_browser_sessions.py")
-            epoch_migration = _load_migration("076_sso_session_epoch.py")
-            events_migration = _load_migration("015_events_outbox.py")
-            assert admin_migration is not None
-            assert browser_migration is not None
-            assert epoch_migration is not None
-            assert events_migration is not None
-            await events_migration.migrate(conn=conn)
-            await admin_migration.migrate(conn=conn)
-            await browser_migration.migrate(conn=conn)
-            await epoch_migration.migrate(conn=conn)
-        finally:
-            await conn.close()
-        pool = await asyncpg.create_pool(target_dsn, min_size=1, max_size=12)
+async def _pre_epoch_bridge_database(epoch_bridge_template):
+    async with (
+        temporary_database(_DSN, "akb_sso_epoch_upgrade_", template=epoch_bridge_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=12) as pool,
+    ):
         yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        await admin.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
-            database,
-        )
-        await admin.execute(f'DROP DATABASE "{database}"')
-        await admin.close()
 
 
 async def _seed_identity(pool) -> tuple[uuid.UUID, uuid.UUID]:
@@ -373,14 +364,14 @@ def _configure(monkeypatch, epoch_service, pool) -> None:
 
 
 async def test_mixed_version_upgrade_guard_and_rollback_are_executable(
-    monkeypatch,
+    monkeypatch, epoch_bridge_template,
 ) -> None:
     from app.config import settings
     from app.exceptions import AuthenticationError
     from app.services import admin_auth_service
     from app.services import sso_session_epoch as epoch_service
 
-    async with _pre_epoch_bridge_database() as pool:
+    async with _pre_epoch_bridge_database(epoch_bridge_template) as pool:
         _configure(monkeypatch, epoch_service, pool)
         user_id, identity_id = await _seed_identity(pool)
         legacy_admin_token = "legacy-admin-session-token-value"
@@ -496,13 +487,13 @@ async def test_mixed_version_upgrade_guard_and_rollback_are_executable(
 
 
 async def test_runtime_generation_is_monotonic_exact_and_stale_proof(
-    monkeypatch,
+    monkeypatch, epoch_bridge_template,
 ) -> None:
     from app.config import settings
     from app.services import sso_session_epoch as epoch_service
     from app.services.sso_session_epoch import AuthRuntimeBoundary
 
-    async with _pre_epoch_bridge_database() as pool:
+    async with _pre_epoch_bridge_database(epoch_bridge_template) as pool:
         _configure(monkeypatch, epoch_service, pool)
         monkeypatch.setattr(
             settings,
@@ -579,14 +570,14 @@ async def test_runtime_generation_is_monotonic_exact_and_stale_proof(
 
 
 async def test_concurrent_migration_and_runtime_starts_do_not_deadlock(
-    monkeypatch,
+    monkeypatch, epoch_bridge_template,
 ) -> None:
     from app.config import settings
     from app.db.postgres import _load_migration
     from app.services import sso_session_epoch as epoch_service
     from app.services.sso_session_epoch import AuthRuntimeBoundary
 
-    async with _pre_epoch_bridge_database() as pool:
+    async with _pre_epoch_bridge_database(epoch_bridge_template) as pool:
         _configure(monkeypatch, epoch_service, pool)
         monkeypatch.setattr(
             settings,

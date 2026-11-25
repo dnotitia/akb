@@ -19,7 +19,7 @@ from app.sso.models import ProviderMutationReadback
 from tests.test_admin_sso_routes_unit import Control
 from tests.test_sso_identity_operations_postgres import lane, request, run, assert_continuity  # noqa: F401
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 TARGET_ISSUER = "https://workspace.example.test/realms/workspace"
 
 

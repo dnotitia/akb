@@ -59,10 +59,8 @@ database fails instead of skipping so the gate cannot go quietly green.
 
 from __future__ import annotations
 
-import os
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import asyncpg
 import pytest
@@ -71,14 +69,10 @@ import pytest_asyncio
 from app.exceptions import NotFoundError
 from app.repositories.document_repo import DocumentRepository
 from app.repositories.vault_repo import VaultRepository
+from tests.helpers.pg_database import AUDIT_TEST_DSN, temporary_database
 
+pytestmark = pytest.mark.live_services
 
-_DSN = os.environ.get(
-    "AKB_TEST_DSN",
-    "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret
-)
-
-_BACKEND = Path(__file__).resolve().parents[1]
 
 # The document lives at the same path in both vaults, so "which vault" is the
 # only thing that distinguishes the two rows. Shapes vary because `doc_uri`
@@ -91,36 +85,21 @@ _PATH_SHAPES = [
 ]
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
-
-
 @pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=2, max_size=10)
-    init_sql = (_BACKEND / "app" / "db" / "init.sql").read_text()
-    async with pool.acquire() as conn:
-        await conn.execute(init_sql)
-    # The service under test resolves its connection through the module-global
-    # `get_pool()`; wire it to this pool for the duration of the test.
+async def pool(audit_application_schema_template):
     from app.db import postgres as pg_mod
-    prev = pg_mod._pool
-    pg_mod._pool = pool
-    try:
-        await pg_mod._apply_migrations()
-        yield pool
-    finally:
-        pg_mod._pool = prev
-        await pool.close()
+
+    async with (
+        temporary_database(AUDIT_TEST_DSN, "akb_publication_binding_", template=audit_application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=2, max_size=10) as pool,
+    ):
+        # The service resolves its connection through the module-global get_pool.
+        prev = pg_mod._pool
+        pg_mod._pool = pool
+        try:
+            yield pool
+        finally:
+            pg_mod._pool = prev
 
 
 async def _make_vault(pool, label: str) -> dict:

@@ -16,7 +16,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DEFAULT_CHECKOUT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 MODE="${1:-}"
 [ "$MODE" = "gate" ] || [ "$MODE" = "serve" ] \
-  || die "usage: $0 {gate|serve} [--with-frontend] [--profile tool-only|transport-proxy|oidc-resource-server|transport-oidc] [--capability stdio|oidc] [--scenario empty|app-installation-lifecycle|app-release-rollout|app-control-plane] [--checkout PATH] [--runtime-root PATH] [supervisor options]"
+  || die "usage: $0 {gate|serve} [--suite backend|mcp|frontend|runtime] [--with-frontend] [--profile tool-only|transport-proxy|oidc-resource-server|transport-oidc] [--capability stdio|oidc] [--scenario empty|app-installation-lifecycle|app-release-rollout|app-control-plane] [--checkout PATH] [--runtime-root PATH] [supervisor options]"
 shift
 
 CHECKOUT="${AKB_CHECKOUT:-$DEFAULT_CHECKOUT}"
@@ -42,7 +42,7 @@ while [ "$#" -gt 0 ]; do
       FORWARD_ARGS+=("$1")
       shift
       ;;
-    --profile|--profile=*|--capability|--capability=*)
+    --profile|--profile=*|--capability|--capability=*|--suite|--suite=*)
       option=${1%%=*}
       if [ "$1" = "$option" ]; then
         [ "$#" -ge 2 ] || die "$option requires a value"
@@ -57,6 +57,10 @@ while [ "$#" -gt 0 ]; do
       value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
       if [ "$option" = "--profile" ]; then
         PROFILE=$value
+      elif [ "$option" = "--suite" ]; then
+        if [ "$value" = frontend ]; then
+          WITH_FRONTEND=1
+        fi
       elif [[ "$value" =~ (^[[:space:]]*|[,+])stdio([,+]|[[:space:]]*$) ]]; then
         WITH_STDIO=1
       fi

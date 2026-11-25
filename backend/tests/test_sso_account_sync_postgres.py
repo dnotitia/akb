@@ -9,12 +9,12 @@ from app.services import sso_account_sync as sync
 from app.sso.keycloak_admin import ProviderControlError
 from tests.test_recovery_admin_provisioning_postgres import _fresh_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.fixture
-async def fixture(monkeypatch):
-    async with _fresh_database() as pool:
+async def fixture(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         monkeypatch.setattr(sync, "get_pool", AsyncMock(return_value=pool))
         monkeypatch.setattr(sync, "cleanup_token_roles", AsyncMock())
         monkeypatch.setattr(sync, "_cursor", None)

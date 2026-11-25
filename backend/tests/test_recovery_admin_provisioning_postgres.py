@@ -7,18 +7,16 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 import pytest
 
+from tests.helpers.pg_database import temporary_database
 
 
-pytestmark = pytest.mark.asyncio
 
-_BACKEND = Path(__file__).resolve().parents[1]
-_INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
+
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",  # pragma: allowlist secret
@@ -27,54 +25,13 @@ _LOCAL_PASSWORD = "local-recovery-password"  # pragma: allowlist secret
 _CONCURRENT_PASSWORD = "concurrent-recovery-password"  # pragma: allowlist secret
 
 
-def _dsn_for_database(dsn: str, database: str) -> str:
-    parsed = urlsplit(dsn)
-    return urlunsplit(parsed._replace(path=f"/{database}"))
-
-
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except OSError, asyncpg.PostgresError:
-        return False
-    await conn.close()
-    return True
-
-
 @asynccontextmanager
-async def _fresh_database():
-    if not await _can_connect(_DSN):
-        if os.environ.get("REQUIRE_REAL_PG") == "1":
-            pytest.fail(f"REQUIRE_REAL_PG=1 but Postgres is not reachable at {_DSN}")
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-
-    database = f"akb_recovery_admin_{uuid.uuid4().hex[:12]}"
-    admin = await asyncpg.connect(_DSN)
-    await admin.execute(f'CREATE DATABASE "{database}"')
-    pool: asyncpg.Pool | None = None
-    try:
-        target_dsn = _dsn_for_database(_DSN, database)
-        conn = await asyncpg.connect(target_dsn)
-        try:
-            await conn.execute(_INIT_SQL)
-            from app.db.postgres import _load_migration
-
-            events_migration = _load_migration("015_events_outbox.py")
-            assert events_migration is not None
-            await events_migration.migrate(conn=conn)
-        finally:
-            await conn.close()
-        pool = await asyncpg.create_pool(target_dsn, min_size=1, max_size=8)
+async def _fresh_database(auth_schema_template):
+    async with (
+        temporary_database(_DSN, "akb_recovery_admin_", template=auth_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=8) as pool,
+    ):
         yield pool
-    finally:
-        if pool is not None:
-            await pool.close()
-        await admin.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
-            database,
-        )
-        await admin.execute(f'DROP DATABASE "{database}"')
-        await admin.close()
 
 
 class _RoleSync:
@@ -98,8 +55,8 @@ class _RoleSync:
 
 
 @pytest.fixture
-async def services(monkeypatch):
-    async with _fresh_database() as pool:
+async def services(monkeypatch, auth_schema_template):
+    async with _fresh_database(auth_schema_template) as pool:
         from app.services import (
             access_service,
             account_service,

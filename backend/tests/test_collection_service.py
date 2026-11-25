@@ -1,8 +1,8 @@
 """Tests for CollectionService.create.
 
 Mirrors the bootstrap pattern from `test_collection_repo.py`: hits a real
-Postgres reachable via `AKB_TEST_DSN` (auto-skip otherwise), applies the
-idempotent `init.sql`, and creates an ephemeral vault per test so the
+Postgres reachable via `AKB_TEST_DSN` (auto-skip otherwise). Each test clones
+a database template initialized from `init.sql` and creates a vault so the
 table cascade cleans everything up.
 
 `CollectionService` reaches into `app.db.postgres.get_pool()` for both
@@ -21,7 +21,11 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
+from tests.helpers.pg_database import database_template, temporary_database
+
 from app.repositories.vault_repo import VaultRepository
+
+pytestmark = pytest.mark.live_services
 
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
@@ -29,40 +33,30 @@ _DSN = os.environ.get(
 )
 
 
-async def _can_connect(dsn: str) -> bool:
-    try:
-        conn = await asyncpg.connect(dsn, timeout=2.0)
-    except (OSError, asyncpg.PostgresError):
-        return False
-    await conn.close()
-    return True
+async def _initialize(conn: asyncpg.Connection) -> None:
+    from app.db.postgres import _load_migration
+
+    await conn.execute((Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql").read_text())
+    for filename in (
+        "015_events_outbox.py",
+        "019_s3_delete_outbox.py",
+    ):
+        migration = _load_migration(filename)
+        assert migration is not None
+        await migration.migrate(conn=conn)
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def schema_template():
+    async with database_template(_DSN, "akb_collection_service_template_", _initialize) as template:
+        yield template
 
 
 @pytest_asyncio.fixture
-async def pool():
-    if not await _can_connect(_DSN):
-        pytest.skip(f"Postgres not reachable at {_DSN}")
-    pool = await asyncpg.create_pool(dsn=_DSN, min_size=1, max_size=4)
-    backend_dir = Path(__file__).resolve().parents[1]
-    init_sql = (backend_dir / "app" / "db" / "init.sql").read_text()
-    async with pool.acquire() as conn:
-        await conn.execute(init_sql)
-    # `events` lives in migration 015 and `s3_delete_outbox` in
-    # migration 019, neither in init.sql, but both are part of the
-    # service contract (emit_event + cascade file delete) — apply them
-    # so the tables exist. Migrations are idempotent.
-    import importlib.util
-    for mig_name in ("015_events_outbox.py", "019_s3_delete_outbox.py"):
-        mig_path = backend_dir / "app" / "db" / "migrations" / mig_name
-        spec = importlib.util.spec_from_file_location(mig_name, str(mig_path))
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        async with pool.acquire() as conn:
-            await module.migrate(conn=conn)
-    try:
-        yield pool
-    finally:
-        await pool.close()
+async def pool(schema_template):
+    async with temporary_database(_DSN, "akb_collection_service_", template=schema_template) as database:
+        async with asyncpg.create_pool(database.dsn, min_size=1, max_size=4) as pool:
+            yield pool
 
 
 @pytest_asyncio.fixture

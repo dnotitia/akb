@@ -14,7 +14,7 @@ from tests.test_sso_browser_session_postgres import (
     _fresh_database, _configure, _seed_identity, _actor, _principal, _tokens,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def issue(uid, sequence=None):
@@ -31,8 +31,8 @@ def configure(monkeypatch, pool):
     monkeypatch.setattr(lifecycle, "get_pool", sessions.get_pool)
 
 
-async def test_sso_all_logout_preserves_pat_account_vault_and_fences_callbacks(monkeypatch):
-    async with _fresh_database() as pool:
+async def test_sso_all_logout_preserves_pat_account_vault_and_fences_callbacks(monkeypatch, browser_auth_template):
+    async with _fresh_database(browser_auth_template) as pool:
         configure(monkeypatch, pool)
         uid, _ = await _seed_identity(pool)
         actor = replace(_actor(uid), auth_method="browser_session")
@@ -63,10 +63,10 @@ async def test_sso_all_logout_preserves_pat_account_vault_and_fences_callbacks(m
         assert exc.value.code == "managed_account"
 
 
-async def test_sso_http_requires_csrf_identity_and_does_not_clear_newer_cookies(monkeypatch):
+async def test_sso_http_requires_csrf_identity_and_does_not_clear_newer_cookies(monkeypatch, browser_auth_template):
     from app.api import deps
     from app.api.routes.access import router
-    async with _fresh_database() as pool:
+    async with _fresh_database(browser_auth_template) as pool:
         configure(monkeypatch, pool)
         monkeypatch.setattr(deps, "sso_browser_session_ready", lambda: True)
         uid, _ = await _seed_identity(pool)
@@ -88,9 +88,9 @@ async def test_sso_http_requires_csrf_identity_and_does_not_clear_newer_cookies(
             assert (await client.get("/api/v1/my/account/lifecycle")).status_code == 401
 
 
-async def test_sso_logout_audit_failure_rolls_back_handles_and_fence(monkeypatch):
+async def test_sso_logout_audit_failure_rolls_back_handles_and_fence(monkeypatch, browser_auth_template):
     from unittest.mock import AsyncMock
-    async with _fresh_database() as pool:
+    async with _fresh_database(browser_auth_template) as pool:
         configure(monkeypatch, pool)
         uid, _ = await _seed_identity(pool)
         handle = await issue(uid, await sessions.next_browser_login_sequence())
@@ -101,9 +101,9 @@ async def test_sso_logout_audit_failure_rolls_back_handles_and_fence(monkeypatch
         assert await sessions.resolve_sso_browser_session(handle.token) is not None
 
 
-async def test_concurrent_callback_cannot_survive_account_wide_logout(monkeypatch):
+async def test_concurrent_callback_cannot_survive_account_wide_logout(monkeypatch, browser_auth_template):
     import asyncio
-    async with _fresh_database() as pool:
+    async with _fresh_database(browser_auth_template) as pool:
         configure(monkeypatch, pool)
         uid, _ = await _seed_identity(pool)
         before = await sessions.next_browser_login_sequence()

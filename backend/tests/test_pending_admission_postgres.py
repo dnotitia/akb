@@ -13,6 +13,10 @@ import uuid
 import asyncpg
 import pytest
 
+from tests.helpers.pg_database import (
+    temporary_database,
+)
+
 from app.config import settings
 from app.exceptions import (
     ExternalIdentityAdoptionNotRequestedError,
@@ -23,53 +27,34 @@ from app.exceptions import (
 )
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 _ISSUER = "https://id.example.com/realms/akb"
 
-
 @pytest.fixture
-async def services(monkeypatch):
-    try:
-        pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=3)
-    except Exception:
-        pytest.skip("Postgres unreachable at AKB_TEST_DSN")
+async def services(monkeypatch, application_schema_template):
+    async with (
+        temporary_database(_DSN, "akb_pending_admission_", template=application_schema_template) as database,
+        asyncpg.create_pool(database.dsn, min_size=1, max_size=3) as pool,
+    ):
+        from app.services import account_service, admission_service, auth_service
 
-    from app.db.postgres import _load_migration
-    from app.services import account_service, admission_service, auth_service
+        async def _get_pool():
+            return pool
 
-    async with pool.acquire() as conn:
-        for filename in (
-            "043_workspace_account_governance.py",
-            "082_pending_admissions.py",
-        ):
-            migration = _load_migration(filename)
-            assert migration is not None
-            await migration.migrate(conn=conn)
-        await conn.execute("DELETE FROM pending_admissions WHERE issuer = $1", _ISSUER)
+        monkeypatch.setattr(auth_service, "get_pool", _get_pool)
+        monkeypatch.setattr(account_service, "get_pool", _get_pool)
+        monkeypatch.setattr(admission_service, "get_pool", _get_pool)
+        monkeypatch.setattr(account_service, "get_role_sync", lambda: _NoRoleSync())
+        monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
+        monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
+        monkeypatch.setattr(settings, "keycloak_server_url", "https://id.example.com", raising=False)
+        monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
+        monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
+        monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
+        assert settings.keycloak_issuer == _ISSUER
 
-    async def _get_pool():
-        return pool
-
-    monkeypatch.setattr(auth_service, "get_pool", _get_pool)
-    monkeypatch.setattr(account_service, "get_pool", _get_pool)
-    monkeypatch.setattr(admission_service, "get_pool", _get_pool)
-    monkeypatch.setattr(account_service, "get_role_sync", lambda: _NoRoleSync())
-    monkeypatch.setattr(settings, "auth_mode", "sso", raising=False)
-    monkeypatch.setattr(settings, "keycloak_enabled", True, raising=False)
-    monkeypatch.setattr(settings, "keycloak_server_url", "https://id.example.com", raising=False)
-    monkeypatch.setattr(settings, "keycloak_realm", "akb", raising=False)
-    monkeypatch.setattr(settings, "keycloak_enrollment_mode", "invite_only", raising=False)
-    monkeypatch.setattr(settings, "keycloak_require_verified_email", True, raising=False)
-    assert settings.keycloak_issuer == _ISSUER
-
-    yield pool, auth_service, admission_service, account_service
-
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM pending_admissions WHERE issuer LIKE 'https://id.example%'")
-        await conn.execute("DELETE FROM users WHERE username LIKE 'adm-%'")
-        await conn.execute("DELETE FROM events WHERE actor_id LIKE 'adm-%'")
-    await pool.close()
+        yield pool, auth_service, admission_service, account_service
 
 
 class _NoRoleSync:

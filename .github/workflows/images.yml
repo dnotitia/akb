@@ -14,7 +14,7 @@ concurrency:
   group: images-${{ github.ref }}
   cancel-in-progress: true
 
-# Keep one packaging check alongside the five existing test/static checks.
+# Keep one packaging check alongside the test and static checks.
 # PostgreSQL is already built and run in live-DB and runtime E2E; application
 # image builds still catch packaging failures that those jobs cannot (#669).
 jobs:

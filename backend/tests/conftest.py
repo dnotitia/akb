@@ -13,16 +13,44 @@ overwrite an existing config. Tests still pass their own paths/values
 into service constructors — settings here exist only to satisfy module
 import.
 
-It also owns the live-PG lane's skip rule (see `_FAIL_ON_SKIP_ENV`).
+It also enforces which test outcomes are required by the two backend CI jobs.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
 import yaml
+
+from tests.helpers.required_outcomes import (
+    _fail_on_skip,
+    pytest_make_collect_report as pytest_make_collect_report,
+    pytest_runtest_makereport as pytest_runtest_makereport,
+)
+from tests.helpers.auth_database import (
+    admin_auth_template as admin_auth_template,
+    auth_schema_template as auth_schema_template,
+    browser_auth_template as browser_auth_template,
+    identity_operations_template as identity_operations_template,
+    operation_requests_template as operation_requests_template,
+)
+from tests.helpers.file_database import file_capability_schema_template as file_capability_schema_template
+from tests.helpers.native_revision_database import (
+    derived_pipeline_template as derived_pipeline_template,
+    native_template as native_template,
+)
+from tests.helpers.pg_database import (
+    _local_audit_application_schema_template as _local_audit_application_schema_template,
+    audit_application_schema_template as audit_application_schema_template,
+    application_schema_template as application_schema_template,
+    base_schema_template as base_schema_template,
+)
+from tests.helpers.vector_database import (
+    compaction_template as compaction_template,
+    corpus_template as corpus_template,
+    empty_vchord_template as empty_vchord_template,
+)
 
 _BACKEND_DIR = Path(__file__).resolve().parents[1]
 _REPO_ROOT = _BACKEND_DIR.parent
@@ -77,68 +105,8 @@ def git_http():
         fx.close()
 
 
-# ── The live-PG lane's skip rule ─────────────────────────────────────────────
-#
-# The live-PG CI job runs the whole backend suite except the tests that declare
-# `@pytest.mark.needs_resource("...")`, and it sets AKB_TEST_FAIL_ON_SKIP=1.
-# Under that flag a skip is a failure. A test that skips there reads as green
-# while it gates nothing, which is how PostgreSQL-backed tests used to run in
-# no job at all. An expected failure (xfail, xpass) is treated the same way:
-# its result gates nothing either.
-
-_FAIL_ON_SKIP_ENV = "AKB_TEST_FAIL_ON_SKIP"
 _NEEDS_RESOURCE = "needs_resource"
-_HOW_TO_FIX = (
-    "Make it run in this lane, or declare what it needs with "
-    f'@pytest.mark.{_NEEDS_RESOURCE}("<the resource and how to provide it>"), '
-    "which this lane deselects."
-)
 _DESELECTED_RESOURCES = pytest.StashKey[dict[str, int]]()
-
-
-def _fail_on_skip() -> bool:
-    return os.environ.get(_FAIL_ON_SKIP_ENV) == "1"
-
-
-def _skip_reason(longrepr: object) -> str:
-    if isinstance(longrepr, tuple) and len(longrepr) == 3:
-        return str(longrepr[2])
-    return str(longrepr)
-
-
-@pytest.hookimpl(wrapper=True, tryfirst=True)
-def pytest_runtest_makereport(item, call):
-    report = yield
-    if not _fail_on_skip():
-        return report
-    if hasattr(report, "wasxfail"):
-        what = f"is marked as an expected failure ({report.wasxfail or 'xfail'})"
-        del report.wasxfail
-    elif report.skipped:
-        what = f"skipped ({_skip_reason(report.longrepr)})"
-    else:
-        return report
-    report.outcome = "failed"
-    report.longrepr = (
-        f"{item.nodeid} {what}, and {_FAIL_ON_SKIP_ENV}=1 makes that a "
-        f"failure. {_HOW_TO_FIX}"
-    )
-    return report
-
-
-@pytest.hookimpl(wrapper=True, tryfirst=True)
-def pytest_make_collect_report(collector):
-    report = yield
-    if _fail_on_skip() and report.skipped:
-        report.outcome = "failed"
-        report.longrepr = (
-            f"{collector.nodeid} skipped while it was collected "
-            f"({_skip_reason(report.longrepr)}), and {_FAIL_ON_SKIP_ENV}=1 "
-            "makes that a failure. A module that skips on import cannot be "
-            "deselected by a marker, so move that check into a fixture first. "
-            + _HOW_TO_FIX
-        )
-    return report
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -169,6 +137,22 @@ def pytest_deselected(items):
         if mark is not None:
             counts = item.config.stash.setdefault(_DESELECTED_RESOURCES, {})
             counts[mark.args[0]] = counts.get(mark.args[0], 0) + 1
+
+
+def pytest_sessionfinish(session):
+    config = session.config
+    if (workeroutput := getattr(config, "workeroutput", None)) is not None:
+        workeroutput["akb_deselected_resources"] = config.stash.get(_DESELECTED_RESOURCES, {})
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    if error is None:
+        # Each worker collects the same tests. Use one report so the counts
+        # describe the test suite once.
+        node.config.stash.setdefault(
+            _DESELECTED_RESOURCES, node.workeroutput["akb_deselected_resources"],
+        )
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
