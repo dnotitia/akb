@@ -50,9 +50,8 @@ jobs:
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
-      - name: Install Chromium for the real frontend smoke
-        working-directory: frontend
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Start Playwright browser from the official image
+        uses: ./.github/actions/playwright-browser
 
       - name: Install stdio proxy and Inspector deps
         working-directory: packages/akb-mcp-client
@@ -132,9 +131,8 @@ jobs:
         working-directory: frontend
         run: pnpm run build
 
-      - name: Install Chromium for frontend E2E
-        working-directory: frontend
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Start Playwright browser from the official image
+        uses: ./.github/actions/playwright-browser
 
       - name: Run frontend E2E in explicit mock mode
         working-directory: frontend
@@ -177,9 +175,8 @@ jobs:
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
-      - name: Install Chromium for frontend E2E
-        working-directory: frontend
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Start Playwright browser from the official image
+        uses: ./.github/actions/playwright-browser
 
       - name: Run fixture-owned browser specs
         working-directory: frontend
@@ -218,9 +215,8 @@ jobs:
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
-      - name: Install Chromium for the theme harness
-        working-directory: frontend
-        run: pnpm exec playwright install --with-deps chromium
+      - name: Start Playwright browser from the official image
+        uses: ./.github/actions/playwright-browser
 
       # Starts the pinned Keycloak with the assembled theme, checks the
       # replaced originals against that image, then walks every page.

@@ -1,0 +1,26 @@
+name: Start Playwright browser from the official image
+description: Share the runner network with a Playwright server using the locked browser version.
+runs:
+  using: composite
+  steps:
+    - name: Start Chromium in the Playwright image
+      shell: bash
+      run: |
+        frontend="$GITHUB_WORKSPACE/frontend"
+        version="$(node -p 'require(process.argv[1]).version' "$frontend/node_modules/@playwright/test/package.json")"
+        image="mcr.microsoft.com/playwright:v${version}-noble"
+        port=18934
+
+        # Playwright forwards the tests' launch arguments to this loopback-only server.
+        browser="$(docker run --detach --init --network host --ipc host \
+          --volume "$frontend:/work/frontend:ro" --workdir /work/frontend \
+          "$image" node node_modules/@playwright/test/cli.js run-server \
+          --host 127.0.0.1 --port "$port" --unsafe)"
+
+        if ! curl --fail --silent --show-error --max-time 2 \
+          --retry 15 --retry-connrefused --retry-delay 1 "http://127.0.0.1:$port/" >/dev/null; then
+          docker logs "$browser"
+          docker rm --force "$browser" >/dev/null
+          exit 1
+        fi
+        echo "PW_TEST_CONNECT_WS_ENDPOINT=ws://127.0.0.1:$port/" >> "$GITHUB_ENV"
