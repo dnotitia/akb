@@ -4906,30 +4906,6 @@ class E2ERuntime:
 
         if self.profile.needs_stdio:
             await self._probe_stdio_behavior()
-            emit_gate_event(
-                {
-                    "event": "stdio_contract_start",
-                    "process": "supervisor",
-                    "stage": "product_assertion",
-                    "profile": self.profile.name,
-                }
-            )
-            try:
-                await self._run_logged_command(
-                    ["npm", "test", "--prefix", str(self.config.proxy_package_dir)],
-                    log_path=self.config.logs_dir / "stdio-contract.log",
-                )
-            except ProvisioningFailure as exc:
-                raise ProductAssertionFailure("stdio contract/reconnect tests failed") from exc
-            emit_gate_event(
-                {
-                    "event": "stdio_contract_complete",
-                    "process": "supervisor",
-                    "stage": "product_assertion",
-                    "profile": self.profile.name,
-                    "returncode": 0,
-                }
-            )
 
             try:
                 await self._run_logged_command(

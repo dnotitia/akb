@@ -400,11 +400,12 @@ name `AKB_FRONTEND_URL`, and the backend proxy target. This keeps the web
 address, readiness check, and API connection source-neutral while preserving
 the existing `app` and `fixture` services.
 
-`gate` runs the existing curated HTTP suite runner for every profile. A
-transport profile additionally runs the existing proxy contract/reconnect
-tests after the clean install and observes `tools/list` plus a read-only
-`tools/call` through the real child process. Provisioning failures and live
-product-assertion failures are emitted as separate gate events.
+`gate` runs the curated shell suites and Python MCP SDK tests against the
+same runtime for every profile. Profiles with stdio also probe `tools/list`
+and a read-only `tools/call` through the real proxy and run the Inspector
+smoke over HTTP and stdio. The standalone client package tests (`npm test`)
+run in `scripts/check.sh`. Provisioning failures and live product-assertion
+failures are emitted as separate gate events.
 
 ### MCP Inspector consumer smoke
 
@@ -535,14 +536,18 @@ normal root Compose services and is independent of the isolated runtime.
 
 ### GitHub Actions
 
-The hosted runner is already provisioned with Docker, uv, and Python 3.14.
-The workflow keeps the locked dependency contract and calls the supervisor
-directly:
+The **AKB runtime E2E** job shares one isolated AKB stack across the shell
+transport, REST, and PostgreSQL ACL suites, the Python MCP SDK suite with
+its stdio proxy file checks, and the connected browser smoke. The job first
+checks that a fixture reset waits for an active writer. With its
+dependencies installed, it calls the runtime supervisor directly:
 
 ```bash
 uv sync --locked --extra dev --project backend
 uv run --locked --project backend python \
   scripts/ci/e2e_runtime.py gate \
+  --with-frontend \
+  --profile transport-oidc \
   --scenario empty \
   --checkout "$GITHUB_WORKSPACE" \
   --runtime-root "${RUNNER_TEMP}/akb-e2e-runtime"
@@ -553,9 +558,8 @@ execution command without exposing credential values to the descriptor or
 runtime files. The curated list and assertion-count behavior come from the
 shared suite runner, not from duplicated workflow shell steps.
 
-The runtime job runs preparation, the API suites, and only the browser specs
-that need its backend (`smoke.spec.ts` and the opt-in live specs). The job has
-a 30-minute budget, and its Playwright suite has a 10-minute budget.
+The connected browser suite covers `smoke.spec.ts` and any opt-in live specs.
+The runtime job has a 30-minute budget and gives Playwright 10 minutes.
 Preparation and the API suites took 11-15 minutes in recent runs.
 
 Three fixture shards run the browser specs that answer their own HTTP against
@@ -634,7 +638,7 @@ repository contribution guide before committing runtime changes.
 ## CI checks and packaging coverage
 
 Every PR runs static analysis and package tests, frontend Vitest, backend
-unit tests, live PostgreSQL tests, the repository runtime E2E gate,
+unit tests, live PostgreSQL tests, AKB runtime E2E,
 three frontend fixture E2E shards with mock E2E on shard 3, and the
 Keycloak login theme check.
 Application packaging is one additional **Docker images** check, rather than

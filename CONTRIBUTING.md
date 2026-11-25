@@ -103,8 +103,8 @@ AKB_URL=http://localhost:8000 bash backend/tests/test_e2e.sh
 AKB_URL=http://localhost:8000 bash backend/tests/test_security_edge_e2e.sh
 # … see backend/tests/ for the full list
 
-# CI-equivalent isolated full gate (uses the repository-owned runtime and
-# its private PostgreSQL/MinIO dependency stack, not the root Compose app)
+# Isolated API gate (uses the repository-owned runtime and its private
+# PostgreSQL/MinIO dependency stack)
 uv sync --locked --extra dev --project backend
 RUNTIME_ROOT="$(mktemp -d /tmp/akb-e2e-runtime.XXXXXX)"
 export AKB_E2E_USERNAME="$(uv run --locked --project backend python -c \
@@ -119,6 +119,11 @@ unset AKB_E2E_USERNAME AKB_E2E_PASSWORD
 # Frontend
 cd frontend && pnpm test
 ```
+
+The hosted **AKB runtime E2E** job runs the shell and Python MCP SDK suites,
+live stdio and Inspector checks, and connected browser smoke in the same
+isolated runtime. See [the runtime guide](scripts/ci/README.md#github-actions)
+for the hosted command and its profile.
 
 The authenticated MCP pytest behavior suite is run by the repository-owned
 runtime gate and can also consume a ready schema-v2 descriptor directly.
