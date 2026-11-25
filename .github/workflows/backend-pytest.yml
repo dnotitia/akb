@@ -184,7 +184,8 @@ jobs:
             -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD \
             docker.io/dappros/minio@sha256:624bad2fe79a8613aa3c5c9b765ebcab365080b8445cf1b05c357cc7753725f0 \
             server /data
-          curl --fail --silent --show-error --retry 30 --retry-connrefused \
+          curl --fail --silent --show-error --max-time 2 \
+            --retry 30 --retry-all-errors --retry-delay 1 --retry-max-time 30 \
             http://127.0.0.1:19000/minio/health/ready
 
       - name: Run the backend suite against the live services
