@@ -175,10 +175,13 @@ that explicit temporary directory after collecting what it needs.
 
 ## Static Analysis Gate
 
-`scripts/check.sh` is the single entry point CI runs (`.github/workflows/check.yml`)
-and the one to run before opening a PR. It has two prerequisites it now
-checks for itself and refuses to start without — both used to fail as
-something other than "you are missing a prerequisite":
+Run `bash scripts/check.sh` before opening a PR. It includes the frontend
+app's Vitest suite. In CI, the **Frontend unit and component tests (Vitest)**
+job runs that suite. The **Static analysis and package tests** job runs the
+script with `--skip-frontend-vitest` and still tests the SDK, Markdown
+editor, and stdio proxy packages.
+
+The script checks two prerequisites before running the gate.
 
 **1. Python analyzers on the version this repo requires.** `backend/pyproject.toml`
 declares `requires-python = ">=3.14"` and the code uses syntax older

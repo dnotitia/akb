@@ -554,25 +554,28 @@ runtime files. The curated list and assertion-count behavior come from the
 shared suite runner, not from duplicated workflow shell steps.
 
 The runtime job runs preparation, the API suites, and only the browser specs
-that need its backend (`smoke.spec.ts` and the opt-in live specs). Its budget is
-30 minutes and its Playwright budget 10 minutes; preparation and the API suites
-took 11-15 minutes in recent runs. Mock mode also has a 10-minute Playwright
-budget; it runs in about a minute.
+that need its backend (`smoke.spec.ts` and the opt-in live specs). The job has
+a 30-minute budget, and its Playwright suite has a 10-minute budget.
+Preparation and the API suites took 11-15 minutes in recent runs.
 
-The browser specs that answer their own HTTP run in the `frontend e2e
-(fixture)` jobs instead: no backend, a production build served by `vite
-preview`, three shards with one worker each, a 20-minute Playwright budget and
-a 30-minute job budget per shard. On four vCPUs the 633 fixture tests took
+Three fixture shards run the browser specs that answer their own HTTP against
+a production build served by `vite preview`. Each fixture suite has one
+worker and a 20-minute Playwright budget. On four vCPUs the 633 fixture tests took
 35.3-35.5 minutes one at a time against the Vite dev server (five runs), the
 same as in CI, and 18.3-18.6 minutes against the production build: a
 navigation there loads 10 scripts instead of 336. More workers on one runner
 did not scale: two to four workers saved a third of the time at most and broke
 timing assertions, so the suite scales by shards.
 
-Existing per-test timeouts and assertions remain unchanged. A suite timeout is
-a failing check, not a successful or skipped run. The runtime job keeps its
-browser diagnostics in `frontend-e2e.log` within its failure artifacts; each
-fixture shard uploads its failing tests' traces and screenshots.
+After fixture mode, shard 3 builds the frontend bundle and runs the mock
+suite and the Markdown reference scenario with MSW. Each mock command has a
+10-minute Playwright budget. Shard 3 has a 50-minute job budget. Shards 1
+and 2 each have a 30-minute job budget.
+
+A suite timeout fails the job. The runtime job keeps its browser diagnostics
+in `frontend-e2e.log` within its failure artifacts. Each fixture shard uploads
+traces and screenshots on failure. Shard 3 uploads its fixture results before
+running mock mode.
 
 ### Clean Ubuntu 24.04 host
 
@@ -630,9 +633,10 @@ repository contribution guide before committing runtime changes.
 
 ## CI checks and packaging coverage
 
-Every PR runs static analysis/package tests, backend unit tests, live
-PostgreSQL tests, the repository runtime E2E gate, frontend mock E2E, the
-three frontend fixture E2E shards, and the Keycloak login theme check.
+Every PR runs static analysis and package tests, frontend Vitest, backend
+unit tests, live PostgreSQL tests, the repository runtime E2E gate,
+three frontend fixture E2E shards with mock E2E on shard 3, and the
+Keycloak login theme check.
 Application packaging is one additional **Docker images** check, rather than
 four independent image jobs.
 

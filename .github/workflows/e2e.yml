@@ -105,54 +105,13 @@ jobs:
           path: ${{ runner.temp }}/akb-e2e-runtime/logs
           if-no-files-found: ignore
 
-  frontend-e2e:
-    name: frontend e2e (mock)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          package_json_file: frontend/package.json
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22.23.4"
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: pnpm install --frozen-lockfile
-
-      - name: Build frontend production bundle
-        working-directory: frontend
-        run: pnpm run build
-
-      - name: Start Playwright browser from the official image
-        uses: ./.github/actions/playwright-browser
-
-      - name: Run frontend E2E in explicit mock mode
-        working-directory: frontend
-        env:
-          CI: "1"
-        run: pnpm run test:e2e:mock
-
-      - name: Check Markdown links and plain-text affordance in both themes
-        working-directory: frontend
-        env:
-          CI: "1"
-          AKB_FE_E2E_SCENARIO: markdown-reference-adapters
-        run: pnpm run test:e2e:mock e2e/markdown-link-search.spec.ts
-
   frontend-fixture-e2e:
-    name: frontend e2e (fixture ${{ matrix.shard }}/3)
+    name: frontend e2e (fixture ${{ matrix.shard }}/3${{ matrix.shard == 3 && ' + mock' || '' }})
     runs-on: ubuntu-24.04
     # The specs that answer their own HTTP need no backend. They run against a
     # production build, one test at a time per job, split across shards.
-    timeout-minutes: 30
+    # Shard 3 also runs two mock commands with a 10-minute budget each.
+    timeout-minutes: ${{ matrix.shard == 3 && 50 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -176,6 +135,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Start Playwright browser from the official image
+        id: browser
         uses: ./.github/actions/playwright-browser
 
       - name: Run fixture-owned browser specs
@@ -192,6 +152,30 @@ jobs:
           path: frontend/test-results
           retention-days: 7
           if-no-files-found: ignore
+
+      # Run mock mode even if fixture tests fail. Upload the fixture results
+      # first because the next Playwright run clears its output directory.
+      - name: Build frontend production bundle
+        if: ${{ !cancelled() && matrix.shard == 3 && steps.browser.outcome == 'success' }}
+        id: mock-build
+        working-directory: frontend
+        run: pnpm run build
+
+      - name: Run frontend E2E in explicit mock mode
+        if: ${{ !cancelled() && steps.mock-build.outcome == 'success' }}
+        id: mock
+        working-directory: frontend
+        env:
+          CI: "1"
+        run: pnpm run test:e2e:mock
+
+      - name: Check Markdown links and plain-text affordance in both themes
+        if: ${{ !cancelled() && steps.mock.outcome == 'success' }}
+        working-directory: frontend
+        env:
+          CI: "1"
+          AKB_FE_E2E_SCENARIO: markdown-reference-adapters
+        run: pnpm run test:e2e:mock e2e/markdown-link-search.spec.ts
 
   keycloak-theme:
     name: keycloak login theme (real Keycloak)
