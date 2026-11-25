@@ -7,16 +7,6 @@
 # Resist adding "warnings-only" steps — they always rot into noise.
 set -euo pipefail
 
-run_frontend_vitest=true
-if [[ "${1:-}" == "--skip-frontend-vitest" ]]; then
-  run_frontend_vitest=false
-  shift
-fi
-if (( $# != 0 )); then
-  echo "Usage: bash scripts/check.sh [--skip-frontend-vitest]" >&2
-  exit 2
-fi
-
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${REPO_ROOT}"
 
@@ -329,10 +319,8 @@ step "stdio proxy + MCP Inspector contract"
 # because check.sh only ran lint/type. Playwright is not part of this
 # gate: the e2e workflow runs it in mock, fixture and real modes
 # (frontend/playwright.config.ts).
-if "$run_frontend_vitest"; then
-  step "vitest (frontend)"
-  (cd frontend && pnpm run test)
-fi
+step "vitest (frontend)"
+(cd frontend && pnpm run test)
 
 # ─── secrets: detect-secrets ──────────────────────────────────────
 # Catches accidental commits of API keys, JWTs, AWS credentials, etc.

@@ -630,10 +630,9 @@ repository contribution guide before committing runtime changes.
 
 ## CI checks and packaging coverage
 
-Every PR runs static analysis and package tests, frontend Vitest, backend
-unit tests, live PostgreSQL tests, the repository runtime E2E gate,
-frontend mock E2E, three frontend fixture E2E shards, and the Keycloak
-login theme check.
+Every PR runs static analysis/package tests, backend unit tests, live
+PostgreSQL tests, the repository runtime E2E gate, frontend mock E2E, the
+three frontend fixture E2E shards, and the Keycloak login theme check.
 Application packaging is one additional **Docker images** check, rather than
 four independent image jobs.
 
