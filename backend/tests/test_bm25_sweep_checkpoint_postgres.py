@@ -20,7 +20,7 @@ from tests.test_bm25_transition_boundary_postgres import (
 )
 from tests.test_bm25_vector_backfill_postgres import _SCHEMA, _corpus, _write_old
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _SINCE = datetime(2020, 1, 1, tzinfo=timezone.utc)
 _PROTECT = datetime(2020, 1, 2, tzinfo=timezone.utc)

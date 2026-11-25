@@ -12,7 +12,7 @@ from tests.test_event_tail_postgres import _fresh_database
 from tests.test_notification_native_postgres import setup_native
 from tests.test_notifications_postgres import seed, queue, drain, inbox
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.fixture

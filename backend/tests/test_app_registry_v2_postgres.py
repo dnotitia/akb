@@ -22,7 +22,7 @@ from app.services import app_registry_service as registry
 from app.services import app_rollout_service as rollout
 from app.services.auth_service import AuthenticatedUser
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 BACKEND = Path(__file__).resolve().parents[1]
 INIT_SQL = (BACKEND / "app" / "db" / "init.sql").read_text()

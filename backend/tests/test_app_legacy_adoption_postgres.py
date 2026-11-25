@@ -31,7 +31,7 @@ from app.services.app_resource_service import canonical_table_fingerprint
 from app.services.auth_service import AuthenticatedUser
 from app.repositories.table_data_repo import pg_table_name
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()

@@ -43,7 +43,7 @@ import pytest_asyncio
 
 from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _SEARCH = """

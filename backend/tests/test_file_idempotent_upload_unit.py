@@ -311,6 +311,7 @@ async def _row_count(conn, vault_id) -> int:
     )
 
 
+@pytest.mark.live_services
 async def test_file_initiation_losing_a_vault_delete_returns_conflict(
     pool, vault_id, monkeypatch,
 ):
@@ -340,6 +341,7 @@ async def test_file_initiation_losing_a_vault_delete_returns_conflict(
         )
 
 
+@pytest.mark.live_services
 async def test_file_initiation_serializes_with_a_concurrent_vault_delete(
     pool, vault_id, monkeypatch,
 ):
@@ -414,6 +416,7 @@ async def test_file_initiation_serializes_with_a_concurrent_vault_delete(
     assert await asyncio.wait_for(deletion, 2) == "DELETE 1"
 
 
+@pytest.mark.live_services
 async def test_same_bytes_same_name_twice_is_one_row(pool, vault_id):
     key = _s3_key("v", "IS", "page.html", content_hash=_HASH_A)
     async with pool.acquire() as conn:
@@ -424,6 +427,7 @@ async def test_same_bytes_same_name_twice_is_one_row(pool, vault_id):
         assert await _row_count(conn, vault_id) == 1
 
 
+@pytest.mark.live_services
 async def test_confirmation_replay_does_not_rewrite_saved_metadata_or_timestamp(pool, vault_id):
     key = _s3_key("v", "", "stable.txt")
     async with pool.acquire() as conn:
@@ -438,6 +442,7 @@ async def test_confirmation_replay_does_not_rewrite_saved_metadata_or_timestamp(
         assert before == after
 
 
+@pytest.mark.live_services
 async def test_pending_cancel_waiting_for_confirmation_never_deletes_the_winner(pool, vault_id):
     key = _s3_key("v", "", "race.txt")
     async with pool.acquire() as conn:
@@ -461,6 +466,7 @@ async def test_pending_cancel_waiting_for_confirmation_never_deletes_the_winner(
         assert await conn.fetchval("SELECT upload_state FROM vault_files WHERE id = $1", fid) == "confirmed"
 
 
+@pytest.mark.live_services
 async def test_pending_cancel_expired_reservation_is_scoped_and_idempotent(pool, vault_id):
     async with pool.acquire() as conn:
         fid = await _put(conn, vault_id, _s3_key("v", "", "expired.txt"))
@@ -470,6 +476,7 @@ async def test_pending_cancel_expired_reservation_is_scoped_and_idempotent(pool,
         assert await vault_files_repo.delete_pending_file(conn, vault_id, fid) is None
 
 
+@pytest.mark.live_services
 async def test_re_adopting_stale_pending_file_wins_gc_race(pool, vault_id):
     """An adopted upload refreshes its lease before stale-file GC can delete it."""
     key = _s3_key("v", "IS", "restarted.bin", content_hash=_HASH_A)
@@ -521,6 +528,7 @@ async def test_re_adopting_stale_pending_file_wins_gc_race(pool, vault_id):
         ) == 1
 
 
+@pytest.mark.live_services
 async def test_stale_delete_intent_skips_a_reused_live_key(
     pool, vault_id, monkeypatch,
 ):
@@ -571,6 +579,7 @@ async def test_stale_delete_intent_skips_a_reused_live_key(
         )
 
 
+@pytest.mark.live_services
 async def test_delete_and_key_registration_are_serialized(
     pool, vault_id, monkeypatch,
 ):
@@ -621,6 +630,7 @@ async def test_delete_and_key_registration_are_serialized(
         ) == registered_id
 
 
+@pytest.mark.live_services
 async def test_file_initiation_does_not_wait_for_same_key_cleanup(
     pool, vault_id, monkeypatch,
 ):
@@ -675,6 +685,7 @@ async def test_file_initiation_does_not_wait_for_same_key_cleanup(
     assert reserved_key.endswith("_nonblocking.bin")
 
 
+@pytest.mark.live_services
 async def test_unprocessed_delete_intent_is_a_durable_key_barrier(
     pool, vault_id,
 ):
@@ -706,6 +717,7 @@ async def test_unprocessed_delete_intent_is_a_durable_key_barrier(
             )
 
 
+@pytest.mark.live_services
 async def test_s3_key_probes_have_dedicated_indexes(pool):
     backend_dir = Path(__file__).resolve().parents[1]
     migration_path = (
@@ -737,6 +749,7 @@ async def test_s3_key_probes_have_dedicated_indexes(pool):
     assert "processed_at IS NULL" in by_name["idx_s3_delete_pending_key"]
 
 
+@pytest.mark.live_services
 async def test_legacy_confirm_write_advances_pending_upload_state(pool, vault_id):
     """An older pod only sets hash_verified_at; the migration trigger keeps a
     rolling deployment from leaving that successfully uploaded File hidden."""
@@ -765,6 +778,7 @@ async def test_legacy_confirm_write_advances_pending_upload_state(pool, vault_id
         ) == "confirmed"
 
 
+@pytest.mark.live_services
 async def test_different_bytes_same_name_is_two_rows(pool, vault_id):
     """The random prefix protected *this*: same name, genuinely different file.
 
@@ -779,6 +793,7 @@ async def test_different_bytes_same_name_is_two_rows(pool, vault_id):
         assert await _row_count(conn, vault_id) == 2
 
 
+@pytest.mark.live_services
 async def test_different_bytes_different_name_is_two_rows(pool, vault_id):
     async with pool.acquire() as conn:
         await _put(conn, vault_id, _s3_key("v", "IS", "a.html", content_hash=_HASH_A), name="a.html")
@@ -787,6 +802,7 @@ async def test_different_bytes_different_name_is_two_rows(pool, vault_id):
         assert await _row_count(conn, vault_id) == 2
 
 
+@pytest.mark.live_services
 async def test_same_bytes_different_name_stay_separate_files(pool, vault_id):
     """Each caller keeps the name it asked for; dedupe never renames a file."""
     async with pool.acquire() as conn:
@@ -800,6 +816,7 @@ async def test_same_bytes_different_name_stay_separate_files(pool, vault_id):
         assert [r["name"] for r in names] == ["a.html", "b.html"]
 
 
+@pytest.mark.live_services
 async def test_without_a_stated_hash_the_duplicate_still_happens(pool, vault_id):
     """The defect, reproduced — and left alone for callers that do not opt in.
 
@@ -813,6 +830,7 @@ async def test_without_a_stated_hash_the_duplicate_still_happens(pool, vault_id)
         assert await _row_count(conn, vault_id) == 2
 
 
+@pytest.mark.live_services
 async def test_adopt_leaves_first_writer_metadata_alone(pool, vault_id):
     key = _s3_key("v", "IS", "page.html", content_hash=_HASH_A)
     async with pool.acquire() as conn:
@@ -825,6 +843,7 @@ async def test_adopt_leaves_first_writer_metadata_alone(pool, vault_id):
         assert row["description"] == "original"
 
 
+@pytest.mark.live_services
 async def test_adopt_reattaches_a_collection_that_was_dropped(pool, vault_id):
     """`collections.id ON DELETE SET NULL` can strand a row at vault root.
 
@@ -886,6 +905,7 @@ async def confirmable(pool, monkeypatch):
     return confirm
 
 
+@pytest.mark.live_services
 async def test_confirm_certifies_bytes_that_match_the_key_they_are_under(
     pool, vault_id, confirmable,
 ):
@@ -906,6 +926,7 @@ async def test_confirm_certifies_bytes_that_match_the_key_they_are_under(
         ) == "confirmed"
 
 
+@pytest.mark.live_services
 async def test_confirm_rejects_bytes_stored_under_another_content_key(
     pool, vault_id, confirmable,
 ):
@@ -929,6 +950,7 @@ async def test_confirm_rejects_bytes_stored_under_another_content_key(
         assert await conn.fetchval("SELECT count(*) FROM s3_delete_outbox") >= 1
 
 
+@pytest.mark.live_services
 async def test_confirm_on_a_legacy_key_is_unchanged(pool, vault_id, confirmable):
     """A random key claims nothing, so any bytes confirm — as they always did."""
     key = _s3_key("v", "IS", "page.html")
@@ -940,6 +962,7 @@ async def test_confirm_on_a_legacy_key_is_unchanged(pool, vault_id, confirmable)
     assert result["content_hash"] == _HASH_B
 
 
+@pytest.mark.live_services
 async def test_confirm_response_loss_replay(pool, vault_id, confirmable, monkeypatch):
     from app.services import file_service as fs
 
@@ -957,6 +980,7 @@ async def test_confirm_response_loss_replay(pool, vault_id, confirmable, monkeyp
         assert await conn.fetchval("SELECT count(*) FROM events WHERE vault_id = $1 AND kind = 'file.put'", vault_id) == 1
 
 
+@pytest.mark.live_services
 async def test_confirmation_lease_refreshes_pending_file_gc_deadline(pool, vault_id):
     key = _s3_key("v", "IS", "leased.bin")
     async with pool.acquire() as conn:
@@ -977,6 +1001,7 @@ async def test_confirmation_lease_refreshes_pending_file_gc_deadline(pool, vault
     assert row["updated_at"] > before
 
 
+@pytest.mark.live_services
 async def test_confirmation_lease_wins_stale_gc_race(pool, vault_id):
     key = _s3_key("v", "IS", "racing.bin")
     async with pool.acquire() as conn:
@@ -1028,6 +1053,7 @@ async def test_confirmation_lease_wins_stale_gc_race(pool, vault_id):
         ) == "pending"
 
 
+@pytest.mark.live_services
 async def test_confirm_still_rejects_a_mismatched_client_hash(
     pool, vault_id, confirmable,
 ):
@@ -1087,6 +1113,7 @@ def _service_user():
     )
 
 
+@pytest.mark.live_services
 async def test_concurrent_uploads_of_the_same_artifact_settle_on_one_row(pool, vault_id):
     """Two writers, same artifact, overlapping transactions ⇒ still one row.
 

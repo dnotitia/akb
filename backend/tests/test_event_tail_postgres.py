@@ -16,7 +16,7 @@ from app.services.event_tail_service import EventBounds, EventCursorCodec, Event
 from tests.helpers.pg_database import TestDatabase, temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 
 

@@ -32,6 +32,8 @@ from tests.helpers.pg_database import database_template, temporary_database
 from app.config import settings
 from app.services import tool_usage
 
+pytestmark = pytest.mark.live_services
+
 # When CI sets the DSN explicitly, an unreachable database is a BROKEN GATE,
 # not a reason to pass: a wrong password or port would otherwise turn into
 # eight skips and a green job — exactly the "gate that never fires" the

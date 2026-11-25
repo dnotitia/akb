@@ -17,7 +17,7 @@ from app.services.native_revision_service import NativeRevisionService
 from tests.concurrency.test_native_ledger_b_core import _create_args
 from tests.helpers.native_revision_database import cloned_ledger_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def _asset(pool, vault_id):

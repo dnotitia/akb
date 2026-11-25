@@ -12,7 +12,7 @@ from app.services import sparse_encoder
 from scripts import backfill_bm25_vector as bf
 from tests.test_bm25_vector_backfill_postgres import _SCHEMA, _corpus, _write_old
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def _clock(pool):

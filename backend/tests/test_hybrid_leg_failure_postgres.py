@@ -11,7 +11,7 @@ from app.services.vector_store import VectorSearchDegraded
 from tests.test_bm25_query_epoch_postgres import _seed
 from tests.test_bm25_term_id_compaction_postgres import _installation
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def _prepare(install):

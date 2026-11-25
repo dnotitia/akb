@@ -95,6 +95,7 @@ async def test_create_text_public_signature_does_not_expose_a_connection() -> No
     assert "conn" not in inspect.signature(NativeRevisionService.create_text).parameters
 
 
+@pytest.mark.live_services
 async def test_create_text_in_conn_rejects_connection_outside_a_transaction(native_template) -> None:
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool, payload_store=M1PgBodyStore(pool))
@@ -113,6 +114,7 @@ async def test_create_text_in_conn_rejects_connection_outside_a_transaction(nati
             assert await conn.fetchval("SELECT COUNT(*) FROM m1_reference_payloads") == 0
 
 
+@pytest.mark.live_services
 async def test_create_text_in_conn_rejects_default_reference_payload_store(native_template) -> None:
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -132,6 +134,7 @@ async def test_create_text_in_conn_rejects_default_reference_payload_store(nativ
             assert await conn.fetchval("SELECT COUNT(*) FROM m1_reference_payloads") == 0
 
 
+@pytest.mark.live_services
 async def test_create_text_in_conn_does_not_report_caller_transaction_as_committed(native_template) -> None:
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         seen: list[str] = []
@@ -166,6 +169,7 @@ async def test_create_text_in_conn_does_not_report_caller_transaction_as_committ
         ]
 
 
+@pytest.mark.live_services
 async def test_create_get_replace_are_native_atomic_and_leave_legacy_projection_untouched(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -248,6 +252,7 @@ async def test_create_get_replace_are_native_atomic_and_leave_legacy_projection_
         assert all(row["revision_id"] == row["activity_revision"] == row["intent_revision"] for row in rows)
 
 
+@pytest.mark.live_services
 async def test_same_base_replace_has_one_winner_without_vault_write_lane(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -285,6 +290,7 @@ async def test_same_base_replace_has_one_winner_without_vault_write_lane(native_
         }
 
 
+@pytest.mark.live_services
 async def test_same_path_create_has_one_winner_and_distinct_paths_do_not_share_a_vault_lock(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -305,6 +311,7 @@ async def test_same_path_create_has_one_winner_and_distinct_paths_do_not_share_a
         assert {item.path for item in extra} == {"notes/left.md", "notes/right.md"}
 
 
+@pytest.mark.live_services
 async def test_document_and_file_cannot_own_the_same_namespace_path(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -334,6 +341,7 @@ async def test_document_and_file_cannot_own_the_same_namespace_path(native_templ
             )
 
 
+@pytest.mark.live_services
 async def test_create_retires_a_cross_surface_alias_before_claiming_its_path(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -385,6 +393,7 @@ async def test_create_retires_a_cross_surface_alias_before_claiming_its_path(nat
         assert retired["retired_revision_id"] == document.revision_id
 
 
+@pytest.mark.live_services
 async def test_move_rejects_a_destination_alias_owned_by_another_surface(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -423,6 +432,7 @@ async def test_move_rejects_a_destination_alias_owned_by_another_surface(native_
         assert current.revision_id == document.revision_id
 
 
+@pytest.mark.live_services
 async def test_waiting_unpinned_replacements_publish_monotonic_lineage_time(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         created = await NativeRevisionService(pool).create_text(**_create_args(vault_id))
@@ -473,6 +483,7 @@ async def test_waiting_unpinned_replacements_publish_monotonic_lineage_time(nati
         assert [row["occurred_at"] for row in chronological] == sorted(row["occurred_at"] for row in chronological)
 
 
+@pytest.mark.live_services
 async def test_public_metadata_and_hash_pinned_body_updates_recompute_and_serialize(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -549,6 +560,7 @@ async def test_public_metadata_and_hash_pinned_body_updates_recompute_and_serial
         assert current.content == "second"
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_is_postgres_only_and_wires_owner_and_public_access(
     native_template,
     monkeypatch,
@@ -608,6 +620,7 @@ async def test_native_vault_create_is_postgres_only_and_wires_owner_and_public_a
         assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_seeds_exact_canonical_skill_in_one_pg_slot(
     native_template, tmp_path, monkeypatch,
 ):
@@ -713,6 +726,7 @@ async def test_native_vault_create_seeds_exact_canonical_skill_in_one_pg_slot(
         assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_syncs_scoped_pat_inside_one_connection(native_template, monkeypatch):
     """A one-slot pool proves strict RoleSync never acquires a second slot."""
     async with cloned_ledger_database(native_template, pool_max_size=1) as (pool, _):
@@ -776,6 +790,7 @@ async def test_native_vault_create_syncs_scoped_pat_inside_one_connection(native
                 await role_sync._drop_role_if_present(conn, user_role_name(owner_id))
 
 
+@pytest.mark.live_services
 async def test_role_sync_concurrent_missing_owner_and_token_roles_are_idempotent(native_template):
     async with cloned_ledger_database(native_template, pool_max_size=4) as (pool, _):
         from app.services.role_sync import RoleSync, token_role_name, user_role_name
@@ -815,6 +830,7 @@ async def test_role_sync_concurrent_missing_owner_and_token_roles_are_idempotent
                     await role_sync._drop_role_if_present(conn, role)
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_concurrent_same_name_returns_one_conflict(native_template, monkeypatch):
     async with cloned_ledger_database(native_template, pool_max_size=2) as (pool, _):
         from app.repositories.vault_repo import VaultRepository
@@ -869,6 +885,7 @@ async def test_native_vault_create_concurrent_same_name_returns_one_conflict(nat
             ) == 1
 
 
+@pytest.mark.live_services
 async def test_public_delete_removes_native_vault_authority_and_derived_state(
     native_derived_template,
     monkeypatch,
@@ -978,6 +995,7 @@ async def test_public_delete_removes_native_vault_authority_and_derived_state(
         assert created.path == "notes/native.md"
 
 
+@pytest.mark.live_services
 async def test_public_delete_tombstones_native_text_file_derived_chunks(
     native_derived_template,
     monkeypatch,
@@ -1110,6 +1128,7 @@ async def test_public_delete_tombstones_native_text_file_derived_chunks(
                 ) == 0
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_rolls_back_catalog_row_when_role_sync_raises(native_template, monkeypatch):
     async with cloned_ledger_database(native_template) as (pool, _):
         from app.services import native_document_service as native_documents
@@ -1128,6 +1147,7 @@ async def test_native_vault_create_rolls_back_catalog_row_when_role_sync_raises(
         await _assert_native_vault_creation_rolled_back(pool, vault_name)
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_rolls_back_catalog_row_when_strict_role_sync_is_cancelled(
     native_template,
     monkeypatch,
@@ -1153,6 +1173,7 @@ async def test_native_vault_create_rolls_back_catalog_row_when_strict_role_sync_
         await _assert_native_vault_creation_rolled_back(pool, vault_name)
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_seed_failure_rolls_back_every_fact_and_payload(
     native_template, monkeypatch,
 ):
@@ -1178,6 +1199,7 @@ async def test_native_vault_create_seed_failure_rolls_back_every_fact_and_payloa
         await _assert_native_vault_creation_rolled_back(pool, vault_name)
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_seed_cancellation_rolls_back_every_fact_and_payload(
     native_template, monkeypatch,
 ):
@@ -1211,6 +1233,7 @@ async def test_native_vault_create_seed_cancellation_rolls_back_every_fact_and_p
         await _assert_native_vault_creation_rolled_back(pool, vault_name)
 
 
+@pytest.mark.live_services
 async def test_native_vault_create_cancellation_rolls_back_actual_role_sync_state(
     native_template, monkeypatch,
 ):
@@ -1286,6 +1309,7 @@ async def test_native_vault_create_cancellation_rolls_back_actual_role_sync_stat
         assert live_roles == set()
 
 
+@pytest.mark.live_services
 async def test_concurrent_unpinned_disjoint_edits_recompute_and_both_survive(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -1341,6 +1365,7 @@ async def test_concurrent_unpinned_disjoint_edits_recompute_and_both_survive(nat
         assert current.content == "ALPHA one\nBETA two"
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("operation", ["update", "edit"])
 async def test_unpinned_public_mutation_survives_more_than_four_successive_head_races(
     native_template,
@@ -1415,6 +1440,7 @@ async def test_unpinned_public_mutation_survives_more_than_four_successive_head_
             assert current.content == "omega body"
 
 
+@pytest.mark.live_services
 async def test_content_hash_only_update_retries_across_metadata_head_change(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -1471,6 +1497,7 @@ async def test_content_hash_only_update_retries_across_metadata_head_change(nati
         assert current.content == "stable body"
 
 
+@pytest.mark.live_services
 async def test_content_hash_only_update_conflicts_after_concurrent_body_change(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -1527,6 +1554,7 @@ async def test_content_hash_only_update_conflicts_after_concurrent_body_change(n
         assert current.content == "changed body"
 
 
+@pytest.mark.live_services
 async def test_expected_commit_update_remains_single_attempt_across_head_race(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -1588,6 +1616,7 @@ async def test_expected_commit_update_remains_single_attempt_across_head_race(na
         assert current.title == "Original title"
 
 
+@pytest.mark.live_services
 async def test_public_move_retries_a_concurrent_rename_and_preserves_unspecified_slug(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -1642,6 +1671,7 @@ async def test_public_move_retries_a_concurrent_rename_and_preserves_unspecified
         assert moved.current_commit == current.current_commit
 
 
+@pytest.mark.live_services
 async def test_public_move_retry_keeps_resource_identity_after_alias_shadowing_create(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -1720,6 +1750,7 @@ async def test_public_move_retry_keeps_resource_identity_after_alias_shadowing_c
         assert "replacement body" in replacement.text
 
 
+@pytest.mark.live_services
 async def test_collection_only_move_reallocates_after_destination_authority_race(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -1806,6 +1837,7 @@ async def test_collection_only_move_reallocates_after_destination_authority_race
             )
 
 
+@pytest.mark.live_services
 async def test_collection_only_move_searches_beyond_all_uuid_path_candidates(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -1869,6 +1901,7 @@ async def test_collection_only_move_searches_beyond_all_uuid_path_candidates(nat
         ).path == expected
 
 
+@pytest.mark.live_services
 async def test_public_move_response_hash_is_derived_from_the_committed_head(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -1926,6 +1959,7 @@ async def test_public_move_response_hash_is_derived_from_the_committed_head(nati
         assert moved.content_hash == current.content_hash
 
 
+@pytest.mark.live_services
 async def test_explicit_slug_put_conflicts_when_base_is_claimed_after_precheck(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -1982,6 +2016,7 @@ async def test_explicit_slug_put_conflicts_when_base_is_claimed_after_precheck(n
         ]
 
 
+@pytest.mark.live_services
 async def test_concurrent_title_derived_puts_allocate_distinct_paths(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -2029,6 +2064,7 @@ async def test_concurrent_title_derived_puts_allocate_distinct_paths(native_temp
             )
 
 
+@pytest.mark.live_services
 async def test_create_reuses_a_move_alias_and_atomically_retires_the_redirect(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -2074,6 +2110,7 @@ async def test_create_reuses_a_move_alias_and_atomically_retires_the_redirect(na
         assert retired["retired_at"] is not None
 
 
+@pytest.mark.live_services
 async def test_alias_delete_competing_with_current_path_update_has_no_raw_pg_deadlock(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -2151,6 +2188,7 @@ async def test_alias_delete_competing_with_current_path_update_has_no_raw_pg_dea
         )
 
 
+@pytest.mark.live_services
 async def test_post_prepare_failpoint_is_distinct_and_precedes_authority_entry(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         seen: list[str] = []
@@ -2177,6 +2215,7 @@ async def test_post_prepare_failpoint_is_distinct_and_precedes_authority_entry(n
         }
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     "boundary",
     [
@@ -2218,6 +2257,7 @@ async def test_authority_failpoints_rollback_every_published_fact(native_templat
             assert await conn.fetchval("SELECT count(*) FROM m1_reference_payloads") == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     "boundary",
     [
@@ -2263,6 +2303,7 @@ async def test_move_failpoints_rollback_head_path_alias_and_activity(native_temp
         }
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("boundary", ["authority.after_alias", "authority.before_commit"])
 async def test_delete_failpoints_preserve_live_resource_and_alias(native_template, boundary: str):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
@@ -2310,6 +2351,7 @@ async def test_delete_failpoints_preserve_live_resource_and_alias(native_templat
             )
 
 
+@pytest.mark.live_services
 async def test_committed_response_lost_retry_returns_same_revision_once(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         fired = False
@@ -2340,6 +2382,7 @@ async def test_committed_response_lost_retry_returns_same_revision_once(native_t
             await service.create_text(**changed)
 
 
+@pytest.mark.live_services
 async def test_document_facade_failpoint_seam_reaches_put_and_update_boundaries(native_template):
     """C5 must be injectable through the Document facade, not only under it.
 
@@ -2416,6 +2459,7 @@ async def test_document_facade_failpoint_seam_reaches_put_and_update_boundaries(
         }
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     ("boundary", "error"),
     [
@@ -2465,6 +2509,7 @@ async def test_document_facade_injected_failure_surfaces_without_a_retry_loop_ha
         }
 
 
+@pytest.mark.live_services
 async def test_create_idempotency_fingerprint_includes_requested_resource_identity(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         mutation_id = uuid.uuid4()
@@ -2482,6 +2527,7 @@ async def test_create_idempotency_fingerprint_includes_requested_resource_identi
             await service.create_text(**changed)
 
 
+@pytest.mark.live_services
 async def test_reference_payload_verifies_digest_size_and_utf8_before_authority_tx(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         store = M1ReferencePayloadStore(pool)
@@ -2509,6 +2555,7 @@ async def test_reference_payload_verifies_digest_size_and_utf8_before_authority_
             await store.prepare_text(namespace_id=vault_id, payload=body, expected_size=len(body) + 1)
 
 
+@pytest.mark.live_services
 async def test_default_reference_payload_document_is_applied_to_searchable_derived_state(
     native_derived_template,
 ):
@@ -2598,6 +2645,7 @@ async def _head_placement(pool: asyncpg.Pool, resource_id: uuid.UUID) -> str:
         )
 
 
+@pytest.mark.live_services
 async def test_facade_document_body_lands_on_the_pg_body_store_and_still_deduplicates(native_template):
     """P1 unification: a Document written through the facade is a PG BodyStore body."""
     async with cloned_ledger_database(native_template) as (pool, vault_id):
@@ -2669,6 +2717,7 @@ async def test_facade_document_body_lands_on_the_pg_body_store_and_still_dedupli
         ]
 
 
+@pytest.mark.live_services
 async def test_mixed_placement_namespace_stays_readable_across_every_native_reader(native_template):
     """A pre-P1 body and a post-P1 body must coexist in one namespace.
 
@@ -2797,6 +2846,7 @@ async def test_mixed_placement_namespace_stays_readable_across_every_native_read
         }
 
 
+@pytest.mark.live_services
 async def test_recent_changes_refuses_a_body_that_no_longer_matches_its_manifest(native_template):
     """recent_changes must verify, not decode-and-trust.
 
@@ -2851,6 +2901,7 @@ async def test_recent_changes_refuses_a_body_that_no_longer_matches_its_manifest
             await backend.recent_changes(str(owner_id), vault=vault, limit=5)
 
 
+@pytest.mark.live_services
 async def test_schema_enforces_revision_identity_head_ownership_and_immutable_facts(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -2888,6 +2939,7 @@ async def test_schema_enforces_revision_identity_head_ownership_and_immutable_fa
                 )
 
 
+@pytest.mark.live_services
 async def test_revision_id_collision_is_retried_as_identity_not_path_conflict(native_template, monkeypatch):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -2904,6 +2956,7 @@ async def test_revision_id_collision_is_retried_as_identity_not_path_conflict(na
         assert (await _authority_counts(pool))["native_revisions"] == 2
 
 
+@pytest.mark.live_services
 async def test_vault_delete_cascades_the_experimental_native_subtree(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         service = NativeRevisionService(pool)
@@ -2932,6 +2985,7 @@ async def test_native_substrate_has_no_git_legacy_projection_or_write_lane_depen
         assert forbidden not in source
 
 
+@pytest.mark.live_services
 async def test_full_native_document_lifecycle_preserves_compatibility_without_git_or_legacy_projection(
     native_template,
 ):
@@ -3123,6 +3177,7 @@ async def test_full_native_document_lifecycle_preserves_compatibility_without_gi
         assert browsed.items[0].content_hash
 
 
+@pytest.mark.live_services
 async def test_native_browse_uses_native_heads_for_collection_root_and_depth(native_template):
     async with cloned_ledger_database(native_template) as (pool, vault_id):
         async with pool.acquire() as conn:
@@ -3213,6 +3268,7 @@ async def test_native_browse_uses_native_heads_for_collection_root_and_depth(nat
         }
 
 
+@pytest.mark.live_services
 async def test_vault_activity_and_recent_changes_are_scoped_to_the_document_surface(native_template):
     """R5: a bridged text-File publication must not leak into a Document feed.
 
@@ -3285,6 +3341,7 @@ async def test_vault_activity_and_recent_changes_are_scoped_to_the_document_surf
         assert [entry["hash"] for entry in doc_scoped] == [created.commit_hash]
 
 
+@pytest.mark.live_services
 async def test_resolve_live_reference_treats_a_uuid_shaped_ref_as_resource_id_scoped_to_surface(
     native_template,
 ):
@@ -3353,6 +3410,7 @@ async def test_resolve_live_reference_treats_a_uuid_shaped_ref_as_resource_id_sc
         assert by_path["resource_id"] == document.resource_id
 
 
+@pytest.mark.live_services
 async def test_recent_changes_doc_id_round_trips_through_get_and_get_at_commit(native_template):
     """R6: the ``doc_id`` recent_changes hands out must feed back into akb_get.
 
@@ -3413,6 +3471,7 @@ async def test_recent_changes_doc_id_round_trips_through_get_and_get_at_commit(n
             await document_service.get(vault, str(uuid.uuid4()))
 
 
+@pytest.mark.live_services
 async def test_uuid_named_text_file_publishes_and_deletes_through_the_bridge(native_template):
     """R6 fall-through regression guard: a File's logical path may itself be
     a bare UUID string, and its delete must still resolve it — by path.
@@ -3481,6 +3540,7 @@ async def test_uuid_named_text_file_publishes_and_deletes_through_the_bridge(nat
             )
 
 
+@pytest.mark.live_services
 async def test_resolve_live_reference_id_branch_respects_lifecycle_and_namespace(native_template):
     """The id branch must not resurrect a deleted Resource or leak across vaults.
 

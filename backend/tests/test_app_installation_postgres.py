@@ -27,7 +27,7 @@ from app.services import auth_service
 from app.services.app_identity_service import AppPrincipal
 from app.services.auth_service import AuthenticatedUser
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()

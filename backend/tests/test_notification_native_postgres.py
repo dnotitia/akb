@@ -11,7 +11,7 @@ from app.services.native_revision_service import NativeRevisionService
 from tests.test_event_tail_postgres import _fresh_database
 from tests.test_notifications_postgres import drain
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.fixture(autouse=True)

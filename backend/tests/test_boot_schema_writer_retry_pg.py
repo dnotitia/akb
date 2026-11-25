@@ -10,7 +10,7 @@ from app.db import postgres as pg
 from tests.helpers.pg_database import database_template, temporary_database
 from tests.test_boot_schema_serialization_pg import _DSN, _INIT_SQL
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def _initialize(conn):

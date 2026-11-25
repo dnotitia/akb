@@ -102,23 +102,17 @@ def git_http():
 
 
 _FAIL_ON_SKIP_ENV = "AKB_TEST_FAIL_ON_SKIP"
-_REQUIRE_UNIT_ONLY_ENV = "AKB_TEST_REQUIRE_UNIT_ONLY"
 _NEEDS_RESOURCE = "needs_resource"
-_UNIT_ONLY = "unit_only"
 _HOW_TO_FIX = (
-    "Make it run in this lane, or declare what it needs with "
-    f'@pytest.mark.{_NEEDS_RESOURCE}("<the resource and how to provide it>"), '
-    "which this lane deselects."
+    "Make the test run, mark tests that use CI's PostgreSQL, BM25, or Redis services "
+    "with @pytest.mark.live_services, or declare other required setup with "
+    f'@pytest.mark.{_NEEDS_RESOURCE}("<the resource and how to provide it>").'
 )
 _DESELECTED_RESOURCES = pytest.StashKey[dict[str, int]]()
 
 
 def _fail_on_skip() -> bool:
     return os.environ.get(_FAIL_ON_SKIP_ENV) == "1"
-
-
-def _require_unit_only() -> bool:
-    return os.environ.get(_REQUIRE_UNIT_ONLY_ENV) == "1"
 
 
 def _skip_reason(longrepr: object) -> str:
@@ -130,13 +124,7 @@ def _skip_reason(longrepr: object) -> str:
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_runtest_makereport(item, call):
     report = yield
-    if _fail_on_skip():
-        setting = _FAIL_ON_SKIP_ENV
-        how_to_fix = _HOW_TO_FIX
-    elif _require_unit_only() and item.get_closest_marker(_UNIT_ONLY):
-        setting = _REQUIRE_UNIT_ONLY_ENV
-        how_to_fix = f"Make it run without the live services or remove @pytest.mark.{_UNIT_ONLY}."
-    else:
+    if not _fail_on_skip():
         return report
     if hasattr(report, "wasxfail"):
         what = f"is marked as an expected failure ({report.wasxfail or 'xfail'})"
@@ -146,29 +134,22 @@ def pytest_runtest_makereport(item, call):
     else:
         return report
     report.outcome = "failed"
-    report.longrepr = f"{item.nodeid} {what}, and {setting}=1 makes that a failure. {how_to_fix}"
+    report.longrepr = (
+        f"{item.nodeid} {what}, and {_FAIL_ON_SKIP_ENV}=1 makes that a failure. {_HOW_TO_FIX}"
+    )
     return report
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_make_collect_report(collector):
     report = yield
-    if not report.skipped:
-        return report
-    if _fail_on_skip():
-        setting = _FAIL_ON_SKIP_ENV
-        how_to_fix = " " + _HOW_TO_FIX
-    elif _require_unit_only():
-        setting = _REQUIRE_UNIT_ONLY_ENV
-        how_to_fix = ""
-    else:
+    if not report.skipped or not _fail_on_skip():
         return report
     report.outcome = "failed"
     report.longrepr = (
         f"{collector.nodeid} skipped while it was collected "
-        f"({_skip_reason(report.longrepr)}), and {setting}=1 makes that a failure. "
+        f"({_skip_reason(report.longrepr)}), and {_FAIL_ON_SKIP_ENV}=1 makes that a failure. "
         "Move import-time skips into a fixture so CI can collect and select the tests."
-        + how_to_fix
     )
     return report
 
@@ -196,13 +177,6 @@ def pytest_collection_modifyitems(config, items):
 
 
 def pytest_deselected(items):
-    if _require_unit_only():
-        excluded = sorted(item.nodeid for item in items if item.get_closest_marker(_UNIT_ONLY))
-        if excluded:
-            raise pytest.UsageError(
-                f"Unit CI must run every @{_UNIT_ONLY} test. The selector deselected: "
-                + ", ".join(excluded)
-            )
     for item in items:
         mark = item.get_closest_marker(_NEEDS_RESOURCE)
         if mark is not None:

@@ -93,6 +93,7 @@ def test_the_vector_literal_is_strictly_increasing_and_folded():
         _bm25vector_literal([10, 20], [])
 
 
+@pytest.mark.live_services
 async def test_the_ddl_creates_an_index_the_planner_can_use():
     async with _store(None) as (store, pool):
         async with pool.acquire() as conn:
@@ -108,6 +109,7 @@ async def test_the_ddl_creates_an_index_the_planner_can_use():
         )
 
 
+@pytest.mark.live_services
 async def test_the_ddl_leaves_a_populated_tables_index_to_the_backfill(empty_vchord_template):
     """Startup builds the BM25 index only for an empty table (akb#615).
 
@@ -165,6 +167,7 @@ async def _postings(conn, chunk: uuid.UUID) -> list[tuple[int, float]]:
     return [(r["term_id"], r["weight"]) for r in rows]
 
 
+@pytest.mark.live_services
 async def test_vchord_keeps_posting_current_while_the_way_back_is_retained():
     """The way back is kept while it is promised (akb#615).
 
@@ -203,6 +206,7 @@ async def test_vchord_keeps_posting_current_while_the_way_back_is_retained():
             assert await _postings(conn, chunk) == []
 
 
+@pytest.mark.live_services
 async def test_a_fresh_vchord_install_has_no_posting_to_keep():
     """Nothing to go back to, so nothing is written or created for it."""
     async with _store(None, posting_weights=_ten_times) as (store, pool):
@@ -218,6 +222,7 @@ async def test_a_fresh_vchord_install_has_no_posting_to_keep():
             ) is None
 
 
+@pytest.mark.live_services
 async def test_a_written_chunk_comes_back_from_a_search(empty_vchord_template):
     async with _store(empty_vchord_template) as (store, pool):
         vid = uuid.uuid4()
@@ -249,6 +254,7 @@ _PAST_INT4 = 3_000_000_000
 _PAST_U32 = 4_294_967_296
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("term", [_MAX_TERM_ID, _PAST_INT4], ids=["largest-held", "past-int4"])
 @pytest.mark.parametrize("shape", ["unfiltered", "index-led", "materialised"])
 async def test_a_large_query_term_fails_no_query_shape(empty_vchord_template, shape, term):
@@ -330,6 +336,7 @@ def test_a_query_keeps_the_ids_a_document_can_hold_and_drops_the_rest():
     assert _bm25query_literal([_PAST_INDEX]) is None
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("term", [_PAST_INDEX, _PAST_U32], ids=["past-index", "past-u32"])
 async def test_a_query_term_the_index_cannot_hold_matches_nothing(empty_vchord_template, term):
     """No document can hold such a term, so it cannot fail the search (akb#665).
@@ -357,6 +364,7 @@ async def test_a_query_term_the_index_cannot_hold_matches_nothing(empty_vchord_t
     assert mixed == [str(uuid.UUID(int=1))]
 
 
+@pytest.mark.live_services
 async def test_both_query_shapes_return_the_same_rows(empty_vchord_template):
     """The selectivity branch chooses for speed. If it also changed the answer,
     the threshold would be a correctness knob rather than a performance one.
@@ -407,6 +415,7 @@ async def _const(value):
     return value
 
 
+@pytest.mark.live_services
 async def test_the_selectivity_estimate_agrees_with_the_truth(empty_vchord_template):
     """A filter covering most rows is not selective; one covering a handful is.
     The estimate only has to be right about that, which is what is asserted."""
@@ -426,6 +435,7 @@ async def test_the_selectivity_estimate_agrees_with_the_truth(empty_vchord_templ
             assert await store._filter_is_selective(conn, "vault_id", [big]) is False
 
 
+@pytest.mark.live_services
 async def test_a_statistics_failure_does_not_take_the_search_with_it(empty_vchord_template):
     async with _store(empty_vchord_template) as (store, pool):
         async with pool.acquire() as conn:
@@ -436,6 +446,7 @@ async def test_a_statistics_failure_does_not_take_the_search_with_it(empty_vchor
             assert await broken._filter_is_selective(conn, "vault_id", [uuid.uuid4()]) is False
 
 
+@pytest.mark.live_services
 async def test_a_selective_filter_does_not_let_the_bm25_index_lead(empty_vchord_template):
     """The one thing the returned rows cannot show.
 
@@ -488,6 +499,7 @@ async def test_a_selective_filter_does_not_let_the_bm25_index_lead(empty_vchord_
         )
 
 
+@pytest.mark.live_services
 async def test_documents_without_the_query_term_never_fill_the_page(empty_vchord_template):
     """`<&>` orders the whole table, it does not filter.
 
@@ -536,6 +548,7 @@ async def test_documents_without_the_query_term_never_fill_the_page(empty_vchord
         assert set(unfiltered) == matching
 
 
+@pytest.mark.live_services
 async def test_an_empty_vector_is_stored_and_never_displaces_a_match(empty_vchord_template):
     """`'{}'` is written for a document with no terms, and costs nothing.
 
@@ -593,6 +606,7 @@ async def test_an_empty_vector_is_stored_and_never_displaces_a_match(empty_vchor
                 )
 
 
+@pytest.mark.live_services
 async def test_the_shape_reaches_the_encoder_from_the_store_not_the_setting(empty_vchord_template):
     """The bench harness builds one store per shape while `settings` never
     moves, and encodes its corpus once for all of them. Reading the setting
@@ -608,6 +622,7 @@ async def test_the_shape_reaches_the_encoder_from_the_store_not_the_setting(empt
             assert sparse_encoder._use_raw_weights() is False
 
 
+@pytest.mark.live_services
 async def test_pre_baked_weights_are_refused_rather_than_stored(empty_vchord_template):
     """A caller that bypasses the plumbing gets an error, not a corpus indexed
     at the wrong scale — and the error says "this row is wrong", not "the
@@ -630,6 +645,7 @@ async def test_pre_baked_weights_are_refused_rather_than_stored(empty_vchord_tem
                 )
 
 
+@pytest.mark.live_services
 async def test_the_statistics_read_happens_outside_the_transaction(empty_vchord_template):
     """Where the read sits is the whole of finding 3, and rows cannot show it.
 
@@ -672,6 +688,7 @@ async def test_the_statistics_read_happens_outside_the_transaction(empty_vchord_
             assert await conn.fetchval("SELECT 1") == 1
 
 
+@pytest.mark.live_services
 async def test_a_statistics_failure_leaves_the_connection_usable(empty_vchord_template):
     """The estimate is read before the transaction opens, because a server-side
     error inside one aborts it and catching the exception in Python does not
@@ -704,6 +721,7 @@ async def test_a_statistics_failure_leaves_the_connection_usable(empty_vchord_te
             assert await conn.fetchval("SELECT 1") == 1
 
 
+@pytest.mark.live_services
 async def test_the_two_shapes_really_do_produce_different_plans(empty_vchord_template):
     """What the SQL text cannot show: that the barrier does its job.
 
@@ -773,6 +791,7 @@ async def test_the_two_shapes_really_do_produce_different_plans(empty_vchord_tem
         assert "CTE candidate_chunks" in plans[True]
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("selective", [True, False, None],
                          ids=["materialised", "index-led", "unfiltered"])
 async def test_source_type_filters_in_every_branch(empty_vchord_template, selective):
@@ -821,6 +840,7 @@ async def test_source_type_filters_in_every_branch(empty_vchord_template, select
             assert await hits(["memory"]) == [], "없는 source_type 이 안 걸러졌다"
 
 
+@pytest.mark.live_services
 async def test_a_term_in_almost_every_document_is_not_filtered_away(empty_vchord_template):
     """The other direction of `WHERE score < 0`.
 
@@ -855,6 +875,7 @@ async def test_a_term_in_almost_every_document_is_not_filtered_away(empty_vchord
         )
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("scale", [1, 10], ids=["small", "large"])
 async def test_the_selectivity_estimate_works_outside_the_common_values(empty_vchord_template, scale):
     """The branch production actually takes — at both scales, because they are

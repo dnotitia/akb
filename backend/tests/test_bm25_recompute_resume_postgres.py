@@ -27,7 +27,7 @@ from app.db import postgres as postgres_module
 from app.services import sparse_encoder
 from tests.helpers.pg_database import TestDatabase, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 

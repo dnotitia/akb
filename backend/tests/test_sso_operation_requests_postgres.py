@@ -30,7 +30,7 @@ from tests.test_admin_sso_routes_unit import Control
 from tests.test_sso_identity_operations_postgres import NEW, OLD, review_http_client, review_human_cookies
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 BASE = "/api/v1/admin/sso/operation-requests"
 OWNER = "controller-instance"
 SECRET = "request-fixture-provider-secret-never-stored"  # pragma: allowlist secret

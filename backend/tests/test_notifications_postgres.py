@@ -8,7 +8,7 @@ from app.repositories.notifications_repo import enqueue_notification_event
 from app.services import notification_service as service
 from tests.test_event_tail_postgres import _fresh_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def seed(conn):

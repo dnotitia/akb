@@ -25,7 +25,7 @@ from app.config import settings
 from app.exceptions import AKBError, CredentialChangeRequiredError
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get(
     "AKB_TEST_DSN",

@@ -12,6 +12,8 @@ from app.services.native_document_service import NativeDocumentService
 from tests.test_document_idempotency_postgres import counts
 from tests.test_event_tail_postgres import _fresh_database, _make_vault
 
+pytestmark = pytest.mark.live_services
+
 
 @pytest.mark.asyncio
 async def test_native_title_conflicts_do_not_create_revisions_or_intents(application_schema_template):

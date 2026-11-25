@@ -16,7 +16,7 @@ from tests.test_event_tail_postgres import (
     _make_vault,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def events(pool):

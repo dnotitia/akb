@@ -25,7 +25,7 @@ from app.services.role_sync import RoleSync, user_role_name, vault_group_role_na
 from tests.helpers.pg_database import temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get(
     "AKB_TEST_DSN",

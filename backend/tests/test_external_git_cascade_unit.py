@@ -246,6 +246,7 @@ def mirror_doc_service(monkeypatch, tmp_path, git_http):
     )
 
 
+@pytest.mark.live_services
 async def test_upstream_delete_takes_the_publication_with_the_document(
     pool, git_http, tmp_path, created, mirror_doc_service,
 ):
@@ -321,6 +322,7 @@ async def test_upstream_delete_takes_the_publication_with_the_document(
         await resolve_publication(slug=slug)
 
 
+@pytest.mark.live_services
 async def test_an_upstream_revert_cannot_resurrect_the_old_slug(
     pool, git_http, tmp_path, created,
 ):
@@ -369,6 +371,7 @@ async def test_an_upstream_revert_cannot_resurrect_the_old_slug(
     )
 
 
+@pytest.mark.live_services
 async def test_an_untouched_publication_survives_an_unrelated_upstream_delete(
     pool, git_http, tmp_path, created,
 ):
@@ -434,6 +437,7 @@ async def _mirror_vault(pool, created, owner_id) -> str:
     return name
 
 
+@pytest.mark.live_services
 async def test_mirror_vault_refuses_writer_for_owner_and_for_system_admin(pool, created):
     """Invariant 1. The mirror guard sits BEFORE the owner and system-admin
     short-circuits, so neither can write — which is what stops any publication
@@ -460,6 +464,7 @@ async def test_mirror_vault_refuses_writer_for_owner_and_for_system_admin(pool, 
         )
 
 
+@pytest.mark.live_services
 async def test_mirror_vault_still_allows_readers(pool, created):
     """The same guard must not break the point of a mirror. If reads were
     refused too, the test above would pass for a reason that has nothing to do
@@ -472,6 +477,7 @@ async def test_mirror_vault_still_allows_readers(pool, created):
     assert access["role"] == "owner"
 
 
+@pytest.mark.live_services
 async def test_the_same_vault_without_the_sidecar_allows_writer(pool, created):
     """Control: the refusal above comes from the `vault_external_git` row and
     nothing else."""

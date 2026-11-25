@@ -28,6 +28,8 @@ from app.exceptions import ValidationError
 from app.repositories import table_data_repo
 from app.services import table_service
 
+pytestmark = pytest.mark.live_services
+
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")
 
 

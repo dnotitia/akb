@@ -17,7 +17,7 @@ from app.services.search_service import SearchService
 from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _DATABASE_PREFIX = "akb_native_scope_"
 _USER = uuid.UUID(int=100_001)
 

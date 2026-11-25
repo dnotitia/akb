@@ -15,7 +15,7 @@ from app.db import postgres
 from app.services.native_revision_service import NativeRevisionService
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8")

@@ -37,7 +37,7 @@ from app.services.vector_store.sparse_shape_state import (
 )
 from tests.helpers.pg_database import TestDatabase, database_template
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _VCHORD = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _PLAIN = os.environ.get("AKB_TEST_DSN", "")

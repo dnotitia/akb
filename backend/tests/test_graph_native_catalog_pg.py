@@ -27,7 +27,7 @@ from tests.helpers.native_revision_database import (
 from tests.helpers.pg_database import TestDatabase, temporary_database
 from tests.test_native_graph_resource_identity_pg import _args, _vault
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")

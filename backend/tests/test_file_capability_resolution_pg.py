@@ -25,6 +25,8 @@ from app.exceptions import NotFoundError
 from app.repositories.vault_repo import VaultRepository
 from app.services import file_service as fs
 
+pytestmark = pytest.mark.live_services
+
 _KEY = "team/deadbeef_report.bin"
 
 @pytest_asyncio.fixture

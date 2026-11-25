@@ -155,6 +155,7 @@ def test_hook_metrics_counts():
 # ── PG-touching tests ─────────────────────────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_on_user_create_idempotent(pool, role_sync, cleanup_roles):
     created, prefix = cleanup_roles
@@ -184,6 +185,7 @@ async def test_on_user_create_idempotent(pool, role_sync, cleanup_roles):
     assert role_sync.metrics.total_failures() == 0
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_on_vault_create_owner_gets_admin(pool, role_sync, cleanup_roles):
     """`on_vault_create(vault_id, owner_user_id=...)` grants admin
@@ -211,6 +213,7 @@ async def test_on_vault_create_owner_gets_admin(pool, role_sync, cleanup_roles):
         assert mem == 1, "owner should be member of vault admin group"
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_on_grant_clears_other_scopes_on_downgrade(
     pool, role_sync, cleanup_roles,
@@ -256,6 +259,7 @@ async def test_on_grant_clears_other_scopes_on_downgrade(
         assert reader_mem == 1, "reader grant missing after downgrade"
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_on_public_access_change_transitions(
     pool, role_sync, cleanup_roles,
@@ -306,6 +310,7 @@ async def test_on_public_access_change_transitions(
     assert not await auth_has("writer")
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_on_vault_delete_drops_group_roles(pool, role_sync, cleanup_roles):
     created, _ = cleanup_roles
@@ -327,6 +332,7 @@ async def test_on_vault_delete_drops_group_roles(pool, role_sync, cleanup_roles)
             assert exists is None, f"role {r} should be dropped"
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_diff_against_catalog_detects_drift(pool, role_sync, cleanup_roles):
     """Insert a fake users row, then check diff reports the missing PG role."""
@@ -361,6 +367,7 @@ async def test_diff_against_catalog_detects_drift(pool, role_sync, cleanup_roles
             await conn.execute("DELETE FROM users WHERE id = $1", uid)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_metrics_records_failure_on_invalid_scope(pool, role_sync):
     starting = role_sync.metrics.total_failures()
@@ -369,6 +376,7 @@ async def test_metrics_records_failure_on_invalid_scope(pool, role_sync):
     assert role_sync.metrics.failures.get("on_grant", 0) >= 1
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_diff_detects_missing_table_grant(pool, role_sync, cleanup_roles):
     """Manually REVOKE SELECT from a vault reader role on a vt_* table;

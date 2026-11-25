@@ -31,7 +31,7 @@ from tests.test_sso_identity_operations_postgres import (
 )
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _PATH = "/api/v1/admin/sso/providers/workforce/client-credentials"
 _SECRET = "rotated-fixture-secret-must-never-be-stored"  # pragma: allowlist secret
 

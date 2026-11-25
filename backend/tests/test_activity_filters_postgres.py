@@ -2,9 +2,13 @@
 from datetime import UTC, datetime, timedelta
 import uuid
 
+import pytest
+
 from app.services import native_revision_service
 from app.services.native_revision_backend import NativeRevisionBackend
 from tests.test_event_tail_postgres import _fresh_database, _make_vault
+
+pytestmark = pytest.mark.live_services
 
 
 async def test_native_activity_window_and_ties(monkeypatch, application_schema_template):

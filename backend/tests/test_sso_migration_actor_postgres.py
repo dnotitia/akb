@@ -21,7 +21,7 @@ from tests.test_admin_auth_postgres import _SSO_SESSION_EPOCH, _fresh_database
 from tests.test_admin_sso_routes_unit import Control
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.mark.parametrize("operation", ["preflight", "apply", "rollback"])

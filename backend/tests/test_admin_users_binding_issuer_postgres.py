@@ -114,6 +114,7 @@ def _by_username(users: list[dict]) -> dict[str, dict]:
     return {u["username"]: u for u in users}
 
 
+@pytest.mark.live_services
 async def test_listing_distinguishes_a_carried_binding_from_one_left_behind(
     listing, monkeypatch
 ):
@@ -135,6 +136,7 @@ async def test_listing_distinguishes_a_carried_binding_from_one_left_behind(
     assert users["unbound"]["bound_to_presented_issuer"] is False
 
 
+@pytest.mark.live_services
 async def test_a_runtime_that_presents_no_issuer_answers_unknown_not_false(
     listing, monkeypatch
 ):

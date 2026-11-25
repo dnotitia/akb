@@ -25,7 +25,7 @@ from app.sso import realm_residue
 from app.sso.models import RealmAccount, RealmAccountListing
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 _ISSUER = "https://residue.example.test/realms/akb"
 _OTHER_ISSUER = "https://upstream.example.test/realms/workforce"

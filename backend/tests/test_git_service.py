@@ -26,9 +26,6 @@ from app.services.git_service import FixedRefHistoryError, GitService
 from tests.extgit_http import build_runner
 
 
-pytestmark = pytest.mark.unit_only
-
-
 def _mirror_git(git_http, tmp_path) -> GitService:
     """A GitService whose external-git runner is pinned to the local smart-HTTP
     git fixture's test policy (fake host `mirror.test` → 127.0.0.1 on the

@@ -25,7 +25,7 @@ from tests.test_admin_auth_postgres import _SSO_SESSION_EPOCH, _fresh_database
 from tests.test_admin_sso_routes_unit import Control, _provider
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 OLD = "https://accounts.example.com/realms/workforce"
 NEW = "https://auth.akb.example.com/realms/akb"
 

@@ -16,9 +16,6 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from app.config import settings
 
 
-pytestmark = pytest.mark.unit_only
-
-
 @pytest.fixture
 def configured_keyset(tmp_path: Path, monkeypatch) -> dict[str, object]:
     from app.services.local_session_keys import (

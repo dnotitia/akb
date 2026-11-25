@@ -8,6 +8,8 @@ import pytest_asyncio
 
 from app.services.search_service import _VERIFIED_FILE_CUTOVER_PATH_SQL
 
+pytestmark = pytest.mark.live_services
+
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def receipt_connection() -> AsyncIterator[asyncpg.Connection]:

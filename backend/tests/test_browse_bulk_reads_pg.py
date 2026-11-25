@@ -11,7 +11,7 @@ from tests.test_event_tail_postgres import (
     _make_vault,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def test_live_head_snapshots_match_per_resource_reads_and_fail_closed(application_schema_template):

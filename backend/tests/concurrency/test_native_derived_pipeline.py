@@ -22,7 +22,7 @@ from app.services.native_revision_service import NativeRevisionService
 from tests.helpers.native_revision_database import cloned_derived_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 async def test_worker_coalesces_to_current_head_and_closes_chunk_mapping_residue(derived_pipeline_template):
     async with cloned_derived_database(derived_pipeline_template) as pool:

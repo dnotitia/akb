@@ -11,7 +11,7 @@ from tests.test_bm25_term_id_compaction_postgres import (
     _state,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 class _NoTableRewrite:

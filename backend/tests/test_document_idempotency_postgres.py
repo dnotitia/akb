@@ -11,7 +11,7 @@ from app.models.document import DocumentPutRequest, DocumentUpdateRequest
 from app.services.native_document_service import NativeDocumentService
 from tests.test_event_tail_postgres import _fresh_database, _make_vault
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 def put_request(vault="retry-documents", **values):

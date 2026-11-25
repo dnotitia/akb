@@ -17,7 +17,7 @@ from app.services.role_authority import role_authority_transaction
 from app.services.role_sync import AUTHENTICATED_ROLE, RoleSync, token_role_name, user_role_name
 from tests.test_platform_service_bootstrap_unit import wire
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def _initialize(conn):

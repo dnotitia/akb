@@ -344,6 +344,7 @@ async def test_operator_reconcile_is_explicitly_constructed():
     assert NativeRevisionReconcile.coverage_version == "c9-native-reconcile-v1"
 
 
+@pytest.mark.live_services
 async def test_update_only_publishes_one_replace_and_keeps_r1_immutable(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(await _make_fixture(pool, tmp_path), move=False)
@@ -408,6 +409,7 @@ async def test_update_only_publishes_one_replace_and_keeps_r1_immutable(schema_t
         )
 
 
+@pytest.mark.live_services
 async def test_update_then_final_move_collapses_to_one_move_and_binds_suffix(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(await _make_fixture(pool, tmp_path), move=True)
@@ -497,6 +499,7 @@ def _assert_history_is_the_chain(head_revision_id, history):
     assert history[1]["revision_id"] == history[0]["parent_revision_id"]
 
 
+@pytest.mark.live_services
 async def test_history_is_the_chain_when_two_revisions_share_one_second(schema_template, tmp_path, monkeypatch):
     """Git commit times are whole seconds, so one instant can hold both Revisions.
 
@@ -529,6 +532,7 @@ async def test_history_is_the_chain_when_two_revisions_share_one_second(schema_t
         _assert_history_is_the_chain(head_revision_id, history)
 
 
+@pytest.mark.live_services
 async def test_move_then_update_collapses_to_move_and_resolves_suffix_mappings(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_move_update_suffix(
@@ -593,6 +597,7 @@ async def test_move_then_update_collapses_to_move_and_resolves_suffix_mappings(s
         assert final.native_revision_id == revision["revision_id"]
 
 
+@pytest.mark.live_services
 async def test_repeated_move_update_suffix_resumes_replays_and_collapses_once(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_move_update_suffix(
@@ -723,6 +728,7 @@ async def test_repeated_move_update_suffix_resumes_replays_and_collapses_once(sc
         assert dict(after_replay) == dict(before_replay)
 
 
+@pytest.mark.live_services
 async def test_unchanged_final_ref_has_no_item_or_native_fact(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -747,6 +753,7 @@ async def test_unchanged_final_ref_has_no_item_or_native_fact(schema_template, t
             ) == 0
 
 
+@pytest.mark.live_services
 async def test_terminal_replay_is_a_noop_and_before_commit_resumes(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(await _make_fixture(pool, tmp_path), move=False)
@@ -815,6 +822,7 @@ async def test_terminal_replay_is_a_noop_and_before_commit_resumes(schema_templa
             ) == 2
 
 
+@pytest.mark.live_services
 async def test_multi_item_resume_sees_only_completed_current_run_items(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(
@@ -970,6 +978,7 @@ async def test_multi_item_resume_sees_only_completed_current_run_items(schema_te
         assert resolution.kind == "native"
 
 
+@pytest.mark.live_services
 async def test_successive_reconciles_preserve_run_item_and_mapping_ownership(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -1040,6 +1049,7 @@ async def test_successive_reconciles_preserve_run_item_and_mapping_ownership(sch
         assert all(row["native_head_revision_id"] is not None for row in items)
 
 
+@pytest.mark.live_services
 async def test_reconcile_rejects_missing_previously_migrated_document_without_facts(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -1094,6 +1104,7 @@ async def test_reconcile_rejects_missing_previously_migrated_document_without_fa
         assert await _authority_snapshot(pool, fixture["namespace_id"], fixture["document_id"]) == before
 
 
+@pytest.mark.live_services
 async def test_reconcile_rejects_missing_resource_without_facts(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(await _make_fixture(pool, tmp_path), move=True)
@@ -1136,6 +1147,7 @@ async def test_reconcile_rejects_missing_resource_without_facts(schema_template,
             ) == 0
 
 
+@pytest.mark.live_services
 async def test_legacy_documents_and_git_are_unchanged_by_reconcile(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _advance_fixture(await _make_fixture(pool, tmp_path), move=True)

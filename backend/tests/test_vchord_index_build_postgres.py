@@ -33,7 +33,7 @@ import pytest
 
 from tests.helpers.pg_database import TestDatabase, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _INDEX = "vector_index.idx_vi_chunks_bm25"

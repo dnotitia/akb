@@ -38,6 +38,8 @@ import pytest_asyncio
 
 from tests.helpers.pg_database import database_template, temporary_database
 
+pytestmark = pytest.mark.live_services
+
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")
 
 # The pre-change schema, verbatim from `main`'s init.sql:442-458 — the NOT NULL

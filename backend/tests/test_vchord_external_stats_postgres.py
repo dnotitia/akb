@@ -21,7 +21,7 @@ from app.services import sparse_encoder
 from app.services.vector_store.pgvector import PgvectorStore
 from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _VAULT = uuid.UUID(int=1)
 _OTHER = uuid.UUID(int=2)

@@ -575,6 +575,7 @@ async def _table_counts() -> tuple[tuple[str, int], ...]:
         await conn.close()
 
 
+@pytest.mark.live_services
 async def test_completed_run_compares_every_resource_and_is_immutable():
     run, inventory, items, native_ids = _fixtures()
     repository = _ReadRepository(run, items)

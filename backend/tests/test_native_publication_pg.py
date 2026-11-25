@@ -18,7 +18,7 @@ from app.services.uri_service import doc_uri
 from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _BACKEND = Path(__file__).resolve().parents[1]
 _DSN = os.environ.get(
     "AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb",  # pragma: allowlist secret

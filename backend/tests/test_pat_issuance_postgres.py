@@ -21,7 +21,7 @@ from app.services import auth_service
 from app.services.auth_service import AuthenticatedUser
 from tests.test_recovery_admin_provisioning_postgres import _fresh_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.fixture(autouse=True)

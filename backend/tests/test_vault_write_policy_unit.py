@@ -27,7 +27,7 @@ from app.config import settings
 from tests.helpers.pg_database import database_template, temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 _INIT_SQL_PATH = Path(__file__).resolve().parents[1] / "app" / "db" / "init.sql"
 

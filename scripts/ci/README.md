@@ -4,6 +4,30 @@ This document is the source of truth for AKB's endpoint-driven E2E suites, the
 isolated repository-owned runtime used by hosted CI, and the optional clean
 Ubuntu 24.04 host bootstrap. It describes repository behavior only.
 
+## Backend pytest jobs
+
+The unit job runs tests that need neither the live CI services nor extra setup.
+It includes the repository runtime contract tests.
+
+Use `pytestmark = pytest.mark.live_services` when a whole module uses
+PostgreSQL, the BM25 extension, or Redis from the live-PG job. In a mixed
+module, add `@pytest.mark.live_services` to each test that uses those services.
+For extra setup, use `@pytest.mark.needs_resource("resource and how to provide it")`.
+Both jobs exclude tests marked `needs_resource`. The live-PG job runs the
+exclusive role-prune test separately, before other tests create managed roles.
+
+Both jobs exclude `backend/tests/mcp_e2e`. The repository-owned runtime runs
+that suite. Both jobs reject unregistered markers, skips during collection,
+and skips and expected failures for selected tests.
+
+Run the unit selection locally from `backend/`. The deployment contract tests
+need Helm, `kubectl`, and Docker Compose.
+
+```bash
+AKB_TEST_FAIL_ON_SKIP=1 pytest tests/ --ignore=tests/mcp_e2e --strict-markers \
+  -m 'not live_services and not needs_resource'
+```
+
 ## Three layers
 
 ### 1. Endpoint-driven E2E suites
@@ -140,14 +164,6 @@ users in the disposable fixture and does not skip ACL checks for missing PATs.
 The selected runtime backend is exercised through HTTP; Native catalog paging,
 concurrent edits and stable endpoint identity are additionally checked by
 `test_graph_native_catalog_pg.py` and `test_native_graph_resource_identity_pg.py`
-in the live-PG job. This job excludes `backend/tests/mcp_e2e` and tests marked
-`needs_resource` or `unit_only`. It fails if any selected test skips or is
-marked as an expected failure.
-
-Use `@pytest.mark.unit_only` for cases verified to run without live services.
-The unit job fails if a module skips during collection or the selector drops
-a marked case. It also fails if a marked case skips or is marked as an expected
-failure. Mixed modules can mark individual tests so their live cases still run
 in the live-PG job.
 
 `test_adoption_vault_delete_e2e.py` requires planned, applied and blocked

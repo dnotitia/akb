@@ -11,7 +11,7 @@ import pytest_asyncio
 from app.services.role_sync import ReconcileReport, RoleStateDiff, RoleSync, _is_catalog_role, user_role_name, vault_group_role_name
 from tests.helpers.pg_database import database_template, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 _DSN = os.environ.get(

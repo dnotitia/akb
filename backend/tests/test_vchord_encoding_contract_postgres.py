@@ -13,7 +13,7 @@ from app.services import sparse_encoder
 from scripts.backfill_bm25_vector import _encode
 from tests.test_bm25_vector_backfill_postgres import _corpus
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def test_kiwi_ids_survive_reencoding_backfill_and_missing_external_stats(monkeypatch):

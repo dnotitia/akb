@@ -14,6 +14,8 @@ from app.services.sso_browser_session_service import revoke_sso_browser_sessions
 from app.services.sso_session_epoch import reconcile_sso_session_epoch
 from tests.test_event_tail_postgres import _fresh_database
 
+pytestmark = pytest.mark.live_services
+
 
 REPORT = "/api/v1/admin/mcp-monitoring"
 

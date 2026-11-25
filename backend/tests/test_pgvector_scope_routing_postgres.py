@@ -22,7 +22,7 @@ from app.services.vector_store import pgvector as pgvector_module
 from app.services.vector_store.pgvector import PgvectorStore
 from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _VAULT = uuid.UUID(int=100)
 _OTHER_VAULT = uuid.UUID(int=101)
 _SOURCE = uuid.UUID(int=200)

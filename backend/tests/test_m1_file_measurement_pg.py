@@ -129,6 +129,7 @@ def _token(url: str) -> str:
     return url.rsplit("/", 1)[-1]
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_pending_cancellation_never_deletes_a_confirmed_measurement_file(context):
     _pool, vault_id, denied_vault_id, vault_name = context
@@ -146,6 +147,7 @@ async def test_pending_cancellation_never_deletes_a_confirmed_measurement_file(c
     assert await service.confirm_upload(vault_id, reserved["file_id"], content_hash=digest) == saved
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_pending_cancellation_withdraws_expired_measurement_intent_only(context):
     pool, vault_id, _denied_vault_id, vault_name = context
@@ -208,6 +210,7 @@ async def test_measurement_upload_checks_the_parent_vault_lock(monkeypatch):
         )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_measurement_file_storage_driver_is_database_constrained(context):
     pool, vault_id, _denied, _vault_name = context
@@ -238,6 +241,7 @@ async def test_measurement_file_storage_driver_is_database_constrained(context):
             )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_pending_is_only_an_intent_and_survives_second_service_instance(context):
     pool, vault_id, denied_vault_id, vault_name = context
@@ -285,6 +289,7 @@ async def test_pending_is_only_an_intent_and_survives_second_service_instance(co
     assert (await second.confirm_upload(vault_id, str(file_id), content_hash=digest))["uri"] == initiated["uri"]
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_multiple_get_capabilities_and_shared_digest_survive_logical_delete(context):
     _pool, vault_id, _denied, vault_name = context
@@ -309,6 +314,7 @@ async def test_multiple_get_capabilities_and_shared_digest_survive_logical_delet
     assert await service.transfer(_token(third_get["download_url"]), method="GET") == data
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_mismatch_expiry_and_failed_publish_leave_no_public_file(context, monkeypatch):
     pool, vault_id, _denied, vault_name = context
@@ -361,6 +367,7 @@ async def test_mismatch_expiry_and_failed_publish_leave_no_public_file(context, 
         assert await conn.fetchval("SELECT count(*) FROM m1_file_transfer_intents WHERE file_id = $1", uuid.UUID(failed["file_id"])) == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("data", [b"declared text\x00body", b"declared text \xff body"])
 @pytest.mark.asyncio
 async def test_declared_text_rejects_non_text_bytes_without_publishing_authority(
@@ -404,6 +411,7 @@ async def test_declared_text_rejects_non_text_bytes_without_publishing_authority
         ) == 0
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("filename", ["nested/report.txt", "/absolute.txt"])
 @pytest.mark.asyncio
 async def test_measurement_file_rejects_name_that_is_not_one_segment(
@@ -433,6 +441,7 @@ async def test_measurement_file_rejects_name_that_is_not_one_segment(
         ) == before
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_non_text_mime_with_binary_bytes_remains_binary(context):
     _pool, vault_id, _denied, vault_name = context
@@ -459,6 +468,7 @@ async def test_non_text_mime_with_binary_bytes_remains_binary(context):
     assert confirmed["native_resource_id"] is None
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_binary_confirm_and_open_keep_slow_cas_io_off_the_event_loop(
     context, monkeypatch,
@@ -532,6 +542,7 @@ async def test_binary_confirm_and_open_keep_slow_cas_io_off_the_event_loop(
     assert store.open_thread != loop_thread
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_text_classification_runs_off_the_event_loop(context, monkeypatch):
     _pool, vault_id, _denied, vault_name = context
@@ -579,6 +590,7 @@ async def test_text_classification_runs_off_the_event_loop(context, monkeypatch)
     assert worker_thread != loop_thread
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_periodic_reaper_removes_expired_body_without_later_upload(
     context, monkeypatch,
@@ -623,6 +635,7 @@ async def test_periodic_reaper_removes_expired_body_without_later_upload(
         assert await m1_file_transfer_reaper.stop(timeout=1)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_native_text_requires_concrete_atomic_result_and_verified_open_delete(context):
     pool, vault_id, _denied, vault_name = context
@@ -684,6 +697,7 @@ async def test_native_text_requires_concrete_atomic_result_and_verified_open_del
         ) == 0
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_native_text_noop_publisher_cannot_confirm(context):
     pool, vault_id, _denied, vault_name = context
@@ -723,6 +737,7 @@ async def test_native_text_noop_publisher_cannot_confirm(context):
         ) == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_concurrent_confirm_adopts_one_exact_file(context):
     pool, vault_id, _denied, vault_name = context
@@ -743,6 +758,7 @@ async def test_concurrent_confirm_adopts_one_exact_file(context):
         assert await conn.fetchval("SELECT count(*) FROM vault_files WHERE id = $1", uuid.UUID(initiated["file_id"])) == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_late_dedup_resolves_exact_peer_after_its_intent_is_consumed(context, monkeypatch):
     """A late confirm must adopt the peer even when its pre-fetched intent vanished."""
@@ -814,6 +830,7 @@ async def test_late_dedup_resolves_exact_peer_after_its_intent_is_consumed(conte
         ) == 0
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_concrete_native_text_bridge_is_atomic_searchable_and_versioned(
     context, monkeypatch,
@@ -949,6 +966,7 @@ async def test_concrete_native_text_bridge_is_atomic_searchable_and_versioned(
         ) == 0
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_reference_document_and_native_text_file_deduplicate_per_placement(
     context, monkeypatch,
@@ -1114,6 +1132,7 @@ async def _confirmed_binary_file(
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_recursive_collection_delete_retains_binary_cas_without_legacy_s3_outbox(
     context, monkeypatch,
@@ -1162,6 +1181,7 @@ async def test_recursive_collection_delete_retains_binary_cas_without_legacy_s3_
     assert retained.is_file()
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_recursive_collection_delete_tombstones_native_text_lineage_and_exact_grep(
     context, monkeypatch,
@@ -1259,6 +1279,7 @@ async def test_recursive_collection_delete_tombstones_native_text_lineage_and_ex
     assert after["results"] == []
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_recursive_collection_delete_rolls_back_native_tombstone_on_later_failure(
     context, monkeypatch,
@@ -1347,6 +1368,7 @@ async def _native_authority_counts(pool, resource_id: uuid.UUID) -> dict[str, in
         }
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     "boundary",
     [
@@ -1495,6 +1517,7 @@ async def test_composite_file_confirm_failpoint_leaves_no_partial_authority_and_
     ]
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_composite_confirm_discards_a_ledger_publish_that_already_reported_commit(
     context, monkeypatch,
@@ -1579,6 +1602,7 @@ def _measurement_user() -> AuthenticatedUser:
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_file_envelope_observes_body_placement_without_any_locator(
     context, monkeypatch,
@@ -1637,6 +1661,7 @@ async def test_file_envelope_observes_body_placement_without_any_locator(
         assert forbidden.isdisjoint(envelope)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_namespace_placement_observation_counts_both_placements(
     context, monkeypatch,
@@ -1716,6 +1741,7 @@ async def test_namespace_placement_observation_counts_both_placements(
     }
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_body_placement_route_is_reader_guarded_and_absent_without_measurement(
     context, monkeypatch,
@@ -1772,6 +1798,7 @@ async def test_body_placement_route_is_reader_guarded_and_absent_without_measure
     assert missing.value.status_code == 404
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_native_grep_preview_replace_and_collection_receipts(context):
     pool, vault_id, _, vault_name = context
@@ -1819,6 +1846,7 @@ async def test_native_grep_preview_replace_and_collection_receipts(context):
     assert sibling.revision_id == originals["core-extra/c.md"].revision_id
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_native_grep_cas_conflict_preserves_partial_receipts(context, monkeypatch):
     pool, vault_id, _, vault_name = context
@@ -1858,6 +1886,7 @@ async def test_native_grep_cas_conflict_preserves_partial_receipts(context, monk
     assert after["total_docs"] == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_native_grep_rechecks_revoked_write_access_between_documents(context, monkeypatch):
     pool, vault_id, _, vault_name = context

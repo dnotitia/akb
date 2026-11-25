@@ -15,7 +15,7 @@ from tests.helpers.pg_database import temporary_database
 
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get(
     "AKB_TEST_DSN",

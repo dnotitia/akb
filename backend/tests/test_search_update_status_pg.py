@@ -17,6 +17,8 @@ import pytest
 from app.services import native_derived_worker
 from app.services._backfill import MAX_RETRIES
 
+pytestmark = pytest.mark.live_services
+
 
 class _ConnectionPool:
     def __init__(self, conn):

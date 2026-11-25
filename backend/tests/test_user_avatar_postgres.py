@@ -31,7 +31,7 @@ from tests.helpers.auth_database import apply_auth_migrations, auth_database_tem
 from tests.test_account_self_lifecycle_postgres import PASSWORD, person as account_person
 from tests.test_recovery_admin_provisioning_postgres import _fresh_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 def photo(color="red"):

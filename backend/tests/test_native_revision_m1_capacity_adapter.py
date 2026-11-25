@@ -409,6 +409,7 @@ async def _reachable() -> bool:
     return True
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_single_cell_real_pg_closes_authority_and_projection(monkeypatch):
     if not await _reachable():
@@ -544,6 +545,7 @@ async def capacity_probe_database(capacity_probe_template):
             yield pool, owner
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["read_error", "timeout", "cancel"])
 async def test_derived_probe_joins_delayed_delivery_before_leaving(monkeypatch, failure, capacity_probe_database):

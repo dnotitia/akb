@@ -7,7 +7,7 @@ from tests.test_event_tail_postgres import (
     _fresh_database,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def test_recent_index_matches_live_document_keyset_and_is_idempotent(application_schema_template):

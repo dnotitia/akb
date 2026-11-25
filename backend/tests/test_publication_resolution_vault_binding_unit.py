@@ -71,6 +71,8 @@ from app.repositories.document_repo import DocumentRepository
 from app.repositories.vault_repo import VaultRepository
 from tests.helpers.pg_database import AUDIT_TEST_DSN, temporary_database
 
+pytestmark = pytest.mark.live_services
+
 
 # The document lives at the same path in both vaults, so "which vault" is the
 # only thing that distinguishes the two rows. Shapes vary because `doc_uri`

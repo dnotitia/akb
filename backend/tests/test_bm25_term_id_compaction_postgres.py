@@ -43,7 +43,7 @@ from app.services.vector_store.pgvector import PgvectorStore
 from scripts import compact_bm25_term_ids as compact
 from tests.helpers.pg_database import TestDatabase, temporary_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _SCHEMA = "vector_index"

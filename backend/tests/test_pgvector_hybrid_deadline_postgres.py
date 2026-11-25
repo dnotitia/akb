@@ -19,7 +19,7 @@ from app.services.vector_store import VectorSearchDegraded
 from app.services.vector_store.pgvector import PgvectorStore
 from tests.helpers.pg_database import TestDatabase, database_template
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 HIT_ID = str(uuid.UUID(int=1))
 
 

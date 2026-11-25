@@ -19,7 +19,7 @@ from app.config import settings
 from app.exceptions import AuthenticationError, ConflictError, ForbiddenError
 from app.services import app_rollout_service as rollout
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text()

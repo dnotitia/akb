@@ -14,7 +14,7 @@ from tests.test_sso_browser_session_postgres import (
     _fresh_database, _configure, _seed_identity, _actor, _principal, _tokens,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def issue(uid, sequence=None):

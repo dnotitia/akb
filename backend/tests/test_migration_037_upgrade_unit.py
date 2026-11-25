@@ -22,6 +22,8 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+pytestmark = pytest.mark.live_services
+
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")
 
 

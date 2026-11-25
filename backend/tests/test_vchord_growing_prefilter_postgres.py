@@ -18,7 +18,7 @@ from tests.test_vchord_candidate_budget_postgres import (
     _store,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _VAULT = uuid.UUID(int=1)
 _SOURCE = uuid.UUID(int=2)

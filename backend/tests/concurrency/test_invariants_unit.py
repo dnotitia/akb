@@ -97,6 +97,7 @@ async def vault(pool):
 # ── INV-5: BM25 recompute_stats try_advisory_lock ──────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_inv5_bm25_recompute_lock(pool, vault):
     """Concurrent recompute_stats: exactly one runs, the rest skip
@@ -130,6 +131,7 @@ async def test_inv5_bm25_recompute_lock(pool, vault):
     assert len(skipped) == N - 1, f"expected {N-1} skipped, got {len(skipped)}"
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_document_image_write_and_vault_lock_share_one_order(pool, vault):
     """A manifest write finishes while a concurrent vault lifecycle lock waits.
@@ -208,6 +210,7 @@ async def test_document_image_write_and_vault_lock_share_one_order(pool, vault):
 # ── INV-6: metadata_worker stale guard via expected_blob ───────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_inv6_mark_llm_metadata_stale_guard(pool, vault):
     """mark_llm_metadata_filled honours expected_blob: a worker that
@@ -262,6 +265,7 @@ async def test_inv6_mark_llm_metadata_stale_guard(pool, vault):
 # ── INV-7: delete_vault orphan chunks ──────────────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_inv7_delete_vault_no_orphan_chunks(pool, tmp_path, monkeypatch):
     """After delete_vault, no chunks remain that point at
@@ -376,6 +380,7 @@ async def test_inv7_delete_vault_no_orphan_chunks(pool, tmp_path, monkeypatch):
 # ── INV-7b: delete_vault file-chunk outbox with S3 CONFIGURED (P1-1) ─
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native_cloud", [False, True])
 async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatch, native_cloud):
@@ -497,6 +502,7 @@ async def test_inv7b_delete_vault_file_outbox_with_s3(pool, tmp_path, monkeypatc
 # ── P1-2: FileService.delete must roll back on chunk-delete failure ──
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_p1_2_file_delete_rolls_back_on_chunk_failure(pool, monkeypatch):
     """FileService.delete wraps the chunk/outbox cleanup in the file-delete
@@ -541,6 +547,7 @@ async def test_p1_2_file_delete_rolls_back_on_chunk_failure(pool, monkeypatch):
 # ── The cascade must delete under the CANONICAL URI ──
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_chokepoint_materializes_the_canonical_uri(pool):
     """A caller holding only a document id has to resolve it to the
@@ -601,6 +608,7 @@ async def test_chokepoint_materializes_the_canonical_uri(pool):
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_delete_publications_for_document_rejects_a_bare_id(pool, vault):
     """The helper takes a canonical URI and nothing else.
@@ -630,6 +638,7 @@ async def test_delete_publications_for_document_rejects_a_bare_id(pool, vault):
     assert await delete_publications_for_document(uri, expected_vault_id=vid) == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_deleting_a_brace_path_document_is_not_blocked_by_uri_validation(
     pool, vault,
@@ -696,6 +705,7 @@ async def _publication_exists(pool, slug: str) -> bool:
         ))
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_delete_publications_for_document_joins_caller_tx(pool, vault):
     """`conn=` makes the DELETE part of the caller's transaction: rolling
@@ -751,6 +761,7 @@ async def test_delete_publications_for_document_joins_caller_tx(pool, vault):
     assert await _publication_exists(pool, slug)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_delete_publications_for_file_joins_caller_tx(pool, vault):
     """Same contract for the file helper. File publications carry a UUID
@@ -789,6 +800,7 @@ async def test_delete_publications_for_file_joins_caller_tx(pool, vault):
     assert not await _publication_exists(pool, slug)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_delete_publications_for_file_without_conn(pool, vault):
     """Omitting `conn` keeps the pre-existing self-acquiring behaviour —
@@ -858,6 +870,7 @@ async def test_p2_embed_index_reorder():
 # ── P2: alter_table reserved-column guard ─────────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_p2_alter_table_reserved_guard(pool):
     from app.services import table_service
@@ -895,6 +908,7 @@ async def test_p2_alter_table_reserved_guard(pool):
 # ── P2: create_table reserved/duplicate/malformed column → 422 ────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_p2_create_table_bad_columns_are_validation_errors(pool):
     """Every reserved / duplicate / malformed / missing-name column on create
@@ -947,6 +961,7 @@ async def test_p2_create_table_bad_columns_are_validation_errors(pool):
 # ── P2: archived vault is read-only via akb_sql ───────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_p2_archived_vault_blocks_writes(pool):
     from app.services import table_service
@@ -991,6 +1006,7 @@ async def test_p2_archived_vault_blocks_writes(pool):
 # ── P2: collection delete handles tables ──────────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_p2_collection_delete_handles_tables(pool):
     from app.services import table_service
@@ -1058,6 +1074,7 @@ async def test_p2_collection_delete_handles_tables(pool):
 # ── E06: collection-retirement vs PUT FK race ──────────────────────
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_create_with_deleted_collection_raises_conflict(pool, vault):
     """A document insert whose `collection_id` references a collection that no
@@ -1147,6 +1164,7 @@ async def _await_blocked(watch, *, count: int, contains: str | None = None,
         await asyncio.sleep(0.02)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publication_waits_for_vault_before_locking_document(
     database,
@@ -1215,6 +1233,7 @@ async def test_publication_waits_for_vault_before_locking_document(
         await watch.close()
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publish_delete_race_leaves_no_orphan_publication(database, pool, vault, monkeypatch):
     """A publisher that commits *while a delete is in flight* must not leave
@@ -1361,6 +1380,7 @@ async def test_publish_delete_race_leaves_no_orphan_publication(database, pool, 
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_reach(
     database,
@@ -1476,6 +1496,7 @@ async def test_delete_cleanup_removes_a_legacy_publication_the_cascade_cannot_re
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publish_aborts_when_the_delete_holds_the_row(database, pool, vault, monkeypatch):
     """The other interleaving: the deleter wins the row, so the publisher's
@@ -1580,6 +1601,7 @@ async def _insert_doc(pool, *, doc_id, vault_id, path, title) -> None:
         )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publish_binds_the_publication_to_the_document_it_resolved(
     pool, vault, monkeypatch,
@@ -1632,6 +1654,7 @@ async def test_publish_binds_the_publication_to_the_document_it_resolved(
     assert row["resource_uri"] == doc_uri(vname, path)
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publish_refuses_when_another_document_takes_the_resolved_path(
     pool, vault, monkeypatch,
@@ -1707,6 +1730,7 @@ async def test_publish_refuses_when_another_document_takes_the_resolved_path(
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publish_refuses_when_the_resolved_document_moves_off_its_path(
     pool, vault, monkeypatch,
@@ -1797,6 +1821,7 @@ async def test_publish_refuses_when_the_resolved_document_moves_off_its_path(
     )
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_publish_refuses_a_uri_that_names_another_vault(
     pool, vault, monkeypatch,

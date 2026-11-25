@@ -28,7 +28,7 @@ from tests.helpers.pg_database import (
     temporary_database,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _MIGRATION_085 = (

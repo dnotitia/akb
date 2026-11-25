@@ -25,6 +25,8 @@ from tests.helpers.pg_database import database_template, temporary_database
 
 from app.repositories.vault_repo import VaultRepository
 
+pytestmark = pytest.mark.live_services
+
 _DSN = os.environ.get(
     "AKB_TEST_DSN",
     "postgresql://akb:akb@localhost:15432/akb",

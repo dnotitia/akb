@@ -17,7 +17,7 @@ from app.services.native_revision_service import NativeRevisionService
 from tests.helpers.pg_database import AUDIT_TEST_DSN, TestDatabase, temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DATABASE_PREFIX = "akb_native_reference_ambiguity_"
 

@@ -15,7 +15,7 @@ from tests.test_sso_management_targets_postgres import (  # noqa: F401
 )
 from tests.test_sso_callback_evidence_postgres import browser  # noqa: F401
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def fresh(parent_id, pool, human, **overrides):

@@ -47,9 +47,6 @@ from app.config import settings
 from app.services import tool_usage
 
 
-pytestmark = pytest.mark.unit_only
-
-
 class _User:
     user_id = "00000000-0000-0000-0000-000000000001"
     username = "alice"

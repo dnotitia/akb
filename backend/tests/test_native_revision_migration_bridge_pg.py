@@ -281,6 +281,7 @@ async def _make_compact_failpoint_fixtures(pool, tmp_path: Path) -> tuple[GitSer
     return git, fixtures
 
 
+@pytest.mark.live_services
 async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vaults(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -401,6 +402,7 @@ async def test_inventory_is_fixed_ref_bounded_and_includes_archived_manual_vault
             )
 
 
+@pytest.mark.live_services
 async def test_inventory_and_pg_body_store_preserve_utf8_nul_bytes(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -450,6 +452,7 @@ async def test_inventory_and_pg_body_store_preserve_utf8_nul_bytes(schema_templa
             )
 
 
+@pytest.mark.live_services
 async def test_inventory_accepts_plain_git_activity_without_akb_footers(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         git = GitService(storage_path=str(tmp_path / "plain-import-git"))
@@ -510,6 +513,7 @@ async def test_inventory_accepts_plain_git_activity_without_akb_footers(schema_t
         assert document.activity.summary == ""
 
 
+@pytest.mark.live_services
 async def test_inventory_rejects_duplicate_completed_ordinal_zero_anchor(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -558,6 +562,7 @@ async def test_inventory_rejects_duplicate_completed_ordinal_zero_anchor(schema_
             )
 
 
+@pytest.mark.live_services
 async def test_backfill_inventory_is_metadata_only_and_materializes_one_body_at_a_time(
     schema_template,
     tmp_path,
@@ -601,6 +606,7 @@ async def test_backfill_inventory_is_metadata_only_and_materializes_one_body_at_
         assert bridge.active_bodies == 0
 
 
+@pytest.mark.live_services
 async def test_capture_releases_each_source_body_before_reading_the_next(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -628,6 +634,7 @@ async def test_capture_releases_each_source_body_before_reading_the_next(schema_
         assert all("byte_size" in snapshot for snapshot in observed_snapshots)
 
 
+@pytest.mark.live_services
 async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item(
     schema_template,
     tmp_path,
@@ -835,6 +842,7 @@ async def test_p95_inventory_uses_one_validated_scope_and_one_body_read_per_item
         assert git.history_batch_calls == 1
 
 
+@pytest.mark.live_services
 async def test_every_backfill_failpoint_rolls_back_then_retries_once(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         git, fixtures = await _make_compact_failpoint_fixtures(pool, tmp_path)
@@ -979,6 +987,7 @@ async def test_every_backfill_failpoint_rolls_back_then_retries_once(schema_temp
                 )
 
 
+@pytest.mark.live_services
 async def test_mixed_manual_and_external_documents_exclude_external_noop(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -1058,6 +1067,7 @@ async def test_mixed_manual_and_external_documents_exclude_external_noop(schema_
             )
 
 
+@pytest.mark.live_services
 async def test_current_move_activity_semantics_are_preserved(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git-current-move"))
@@ -1152,6 +1162,7 @@ async def test_current_move_activity_semantics_are_preserved(schema_template, tm
         }
 
 
+@pytest.mark.live_services
 async def test_selector_is_hidden_until_run_complete(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -1230,6 +1241,7 @@ async def test_selector_is_hidden_until_run_complete(schema_template, tmp_path):
             )
 
 
+@pytest.mark.live_services
 async def test_atomic_retry_chronology_selector_shapes_and_legacy_unchanged(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -1514,6 +1526,7 @@ async def test_atomic_retry_chronology_selector_shapes_and_legacy_unchanged(sche
                 )
 
 
+@pytest.mark.live_services
 async def test_completed_item_is_not_demoted_by_a_queued_failure(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         git, fixtures = await _make_compact_failpoint_fixtures(pool, tmp_path)
@@ -1561,6 +1574,7 @@ async def test_completed_item_is_not_demoted_by_a_queued_failure(schema_template
         assert item.error_code is None
 
 
+@pytest.mark.live_services
 async def test_completed_run_replay_preserves_terminal_state_and_selector(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         git, fixtures = await _make_compact_failpoint_fixtures(pool, tmp_path)
@@ -1616,6 +1630,7 @@ async def test_completed_run_replay_preserves_terminal_state_and_selector(schema
         assert visible_after.kind == "native"
 
 
+@pytest.mark.live_services
 async def test_alias_mutation_after_prepare_fails_closed_before_publication(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         git, fixtures = await _make_compact_failpoint_fixtures(pool, tmp_path)
@@ -1671,6 +1686,7 @@ async def test_alias_mutation_after_prepare_fails_closed_before_publication(sche
             )
 
 
+@pytest.mark.live_services
 async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics(schema_template, tmp_path, monkeypatch):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -1733,6 +1749,7 @@ async def test_completed_backfill_bridges_multi_commit_frozen_activity_semantics
         assert [e["hash"] for e in results] == [older.revision_id]
 
 
+@pytest.mark.live_services
 async def test_completed_backfill_preserves_pg_only_public_document_metadata(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -1767,6 +1784,7 @@ async def test_completed_backfill_preserves_pg_only_public_document_metadata(sch
         assert current.content == "new v2"
 
 
+@pytest.mark.live_services
 async def test_completed_backfill_accepts_only_the_mapped_legacy_head_for_first_native_update(
     schema_template,
     tmp_path,
@@ -1840,6 +1858,7 @@ async def test_completed_backfill_accepts_only_the_mapped_legacy_head_for_first_
             )
 
 
+@pytest.mark.live_services
 async def test_native_move_keeps_completed_legacy_paths_for_historical_reads(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _make_fixture(pool, tmp_path)
@@ -1934,6 +1953,7 @@ async def _pending(pool, namespace_id) -> tuple[int, int]:
         )
 
 
+@pytest.mark.live_services
 async def test_bridged_bodies_move_to_postgres_and_read_identically_without_git(schema_template, tmp_path):
     """The whole point: after the backfill the git volume is not consulted.
 
@@ -1976,6 +1996,7 @@ async def test_bridged_bodies_move_to_postgres_and_read_identically_without_git(
         assert after[1] == before[1]
 
 
+@pytest.mark.live_services
 async def test_backfill_is_incremental_so_a_half_migrated_vault_still_reads(schema_template, tmp_path):
     """Stopping halfway is a supported state, not a broken one."""
     async with _fresh_schema(schema_template) as pool:
@@ -2005,6 +2026,7 @@ async def test_backfill_is_incremental_so_a_half_migrated_vault_still_reads(sche
         assert rest.migrated == pending_before - 1
 
 
+@pytest.mark.live_services
 async def test_a_dry_run_reads_everything_and_writes_nothing(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-dry")
@@ -2031,6 +2053,7 @@ async def test_a_dry_run_reads_everything_and_writes_nothing(schema_template, tm
             ) == 0
 
 
+@pytest.mark.live_services
 async def test_a_body_git_cannot_answer_for_is_left_pending_never_invented(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-absent")
@@ -2061,6 +2084,7 @@ async def test_a_body_git_cannot_answer_for_is_left_pending_never_invented(schem
         assert any("absent in git" in line for line in report.samples)
 
 
+@pytest.mark.live_services
 async def test_backfill_stays_inside_the_vault_it_was_given(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         one = await _bridged_fixture(pool, tmp_path / "one", coverage="c9-bridge-scope-one")
@@ -2077,6 +2101,7 @@ async def test_backfill_stays_inside_the_vault_it_was_given(schema_template, tmp
         assert other_after == other_before
 
 
+@pytest.mark.live_services
 async def test_two_passes_cannot_claim_the_same_mapping(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-race")
@@ -2111,6 +2136,7 @@ async def test_two_passes_cannot_claim_the_same_mapping(schema_template, tmp_pat
                 )
 
 
+@pytest.mark.live_services
 async def test_a_digest_with_no_payload_falls_back_to_git_rather_than_failing(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         fixture = await _bridged_fixture(pool, tmp_path, coverage="c9-bridge-body-orphan")
@@ -2133,6 +2159,7 @@ async def test_a_digest_with_no_payload_falls_back_to_git_rather_than_failing(sc
         assert version[1] == "new v1\n"
 
 
+@pytest.mark.live_services
 async def test_bytes_that_do_not_hash_to_their_digest_are_refused_not_served(schema_template, tmp_path):
     """Defense in depth, proven with the database guard removed.
 
@@ -2192,6 +2219,7 @@ async def test_bytes_that_do_not_hash_to_their_digest_are_refused_not_served(sch
         assert version[1] == "new v1\n"
 
 
+@pytest.mark.live_services
 async def test_one_unreadable_body_does_not_block_the_ones_behind_it(schema_template, tmp_path):
     """The claim order puts an unmovable row first and leaves it there.
 
@@ -2229,6 +2257,7 @@ async def test_one_unreadable_body_does_not_block_the_ones_behind_it(schema_temp
         assert report.pending_after == 1
 
 
+@pytest.mark.live_services
 async def test_verify_re_derives_every_migrated_body_from_git(schema_template, tmp_path):
     """Whole-population, not a sample.
 
@@ -2253,6 +2282,7 @@ async def test_verify_re_derives_every_migrated_body_from_git(schema_template, t
         assert report.ok is True
 
 
+@pytest.mark.live_services
 async def test_verify_names_a_body_that_stopped_agreeing_with_git(schema_template, tmp_path):
     """The finding the command exists to produce.
 
@@ -2292,6 +2322,7 @@ async def test_verify_names_a_body_that_stopped_agreeing_with_git(schema_templat
         assert any(victim[:8] in line for line in report.findings)
 
 
+@pytest.mark.live_services
 async def test_verify_reports_a_digest_whose_payload_is_gone(schema_template, tmp_path):
     """Distinct from a mismatch: the comparison has nothing to compare."""
     async with _fresh_schema(schema_template) as pool:
@@ -2316,6 +2347,7 @@ async def test_verify_reports_a_digest_whose_payload_is_gone(schema_template, tm
         assert report.ok is False
 
 
+@pytest.mark.live_services
 async def test_verify_reports_a_payload_that_does_not_hash_to_its_own_digest(schema_template, tmp_path):
     """Corruption is the finding, not a reason to stop reporting.
 
@@ -2367,6 +2399,7 @@ async def test_verify_reports_a_payload_that_does_not_hash_to_its_own_digest(sch
         assert any("does not hash to its own digest" in line for line in report.findings)
 
 
+@pytest.mark.live_services
 async def test_verify_reports_the_share_of_the_population_it_actually_saw(schema_template, tmp_path):
     """`ok` on a fraction is the failure this reports against.
 

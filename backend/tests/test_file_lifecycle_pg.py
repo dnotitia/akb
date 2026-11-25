@@ -29,7 +29,7 @@ pool = capability_fixtures.pool
 service = capability_fixtures.service
 vault_id = capability_fixtures.vault_id
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 OLD, NEW = b"original file", b"replacement with different size"
 
 

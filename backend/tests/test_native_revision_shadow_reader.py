@@ -2060,6 +2060,7 @@ async def test_comparator_rejects_profile_only_activity_evidence():
         await comparator.compare_run(run.run_id)
 
 
+@pytest.mark.live_services
 async def test_product_readers_compare_a_completed_pg_backfill_without_writes(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git"))
@@ -2151,6 +2152,7 @@ async def test_product_readers_compare_a_completed_pg_backfill_without_writes(sc
         assert fixed_ref not in encoded
 
 
+@pytest.mark.live_services
 async def test_reconcile_c10_resolves_changed_and_unchanged_heads_across_runs(schema_template, tmp_path):
     async with _fresh_schema(schema_template) as pool:
         git = GitService(storage_path=str(tmp_path / "git"))

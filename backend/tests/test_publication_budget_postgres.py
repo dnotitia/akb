@@ -19,7 +19,7 @@ from app.services import publication_rate_limit as rl
 from tests.helpers.pg_database import database_template, temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 _BACKEND = Path(__file__).resolve().parents[1]
 _DSN = os.getenv("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 

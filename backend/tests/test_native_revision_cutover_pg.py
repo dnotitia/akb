@@ -56,7 +56,7 @@ from app.services.uri_service import doc_uri, split_uri
 from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _BACKEND = Path(__file__).resolve().parents[1]
 _INIT_SQL = (_BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8")

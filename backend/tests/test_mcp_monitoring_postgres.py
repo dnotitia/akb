@@ -11,6 +11,8 @@ from app.mcp_monitoring.collector import Collector, Observation
 from app.mcp_monitoring.report import read_report
 from tests.test_event_tail_postgres import _fresh_database
 
+pytestmark = pytest.mark.live_services
+
 
 async def test_upgrade_preserves_existing_observations_and_metric_definitions(application_schema_template):
     from app.db import postgres

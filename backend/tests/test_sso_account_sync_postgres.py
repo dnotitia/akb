@@ -9,7 +9,7 @@ from app.services import sso_account_sync as sync
 from app.sso.keycloak_admin import ProviderControlError
 from tests.test_recovery_admin_provisioning_postgres import _fresh_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.fixture

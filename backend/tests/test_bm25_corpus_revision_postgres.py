@@ -79,6 +79,7 @@ async def connection(schema_template: TestDatabase) -> AsyncIterator[tuple[async
             await conn.close()
 
 
+@pytest.mark.live_services
 async def test_only_bm25_relevant_chunk_mutations_advance_revision(connection):
     conn, vault_id = connection
     chunk_id = uuid.uuid4()
@@ -115,6 +116,7 @@ async def test_only_bm25_relevant_chunk_mutations_advance_revision(connection):
     assert await _revision(conn) == before + 3
 
 
+@pytest.mark.live_services
 async def test_recompute_uses_source_revision_not_token_bearing_doc_count(
     connection,
     monkeypatch,

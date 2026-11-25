@@ -159,6 +159,7 @@ async def _seed_continuity_state(pool):
     return user_id, token_id, vault_id
 
 
+@pytest.mark.live_services
 async def test_exact_migration_is_dry_run_first_idempotent_and_preserves_account_state(
     migration_store,
 ):
@@ -294,6 +295,7 @@ async def test_exact_migration_is_dry_run_first_idempotent_and_preserves_account
     ]
 
 
+@pytest.mark.live_services
 async def test_migration_never_adopts_by_email_or_crosses_an_existing_binding(
     migration_store,
 ):
@@ -339,6 +341,7 @@ async def test_migration_never_adopts_by_email_or_crosses_an_existing_binding(
         ) == 1
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     ("column", "value", "code"),
     [
@@ -370,6 +373,7 @@ async def test_migration_requires_the_exact_active_external_human(
     assert captured.value.code == code
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize(
     ("issuer", "subject"),
     [

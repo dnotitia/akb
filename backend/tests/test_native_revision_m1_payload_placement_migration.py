@@ -18,6 +18,8 @@ from app.services.m1_reference_payload_store import M1ReferencePayloadStore
 from app.services.native_revision_service import NativeRevisionService
 from tests.helpers.pg_database import TestDatabase, database_template, temporary_database
 
+pytestmark = pytest.mark.live_services
+
 
 BACKEND = Path(__file__).resolve().parents[1]
 INIT_SQL = (BACKEND / "app" / "db" / "init.sql").read_text(encoding="utf-8")

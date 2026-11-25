@@ -21,7 +21,7 @@ from app.services.user_sql_executor import UserSqlExecutor, user_role_name
 from tests.helpers.pg_database import database_template, temporary_database
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 def _test_dsn():

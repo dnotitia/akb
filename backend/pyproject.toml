@@ -120,6 +120,6 @@ skips = ["B104", "B608"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
-    "needs_resource(resource): the test needs a resource the live-PG CI job does not provide (that job's PostgreSQL, BM25 PostgreSQL and Redis services are provided); the job deselects it. Name the resource and how to provide it.",
-    "unit_only: the test runs without the live services. Unit CI requires it to run and live-PG CI deselects it.",
+    "live_services: the test uses the PostgreSQL, BM25 extension, or Redis services provided by the live-PG CI job.",
+    "needs_resource(resource): the test needs setup outside the shared unit and live-PG runs. Name the resource and how to provide it.",
 ]

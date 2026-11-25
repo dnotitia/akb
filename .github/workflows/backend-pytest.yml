@@ -1,9 +1,6 @@
 name: backend-pytest
 
-# Closes the gap that `check.yml` couldn't: unit tests under
-# `backend/tests/test_*.py` import asyncpg, kiwipiepy, etc., so they
-# need backend runtime deps installed. Lives in its own workflow so
-# the heavy install doesn't slow down the lint/type/vitest gate.
+# The backend tests need the application dependencies installed from uv.lock.
 
 on:
   push:
@@ -18,6 +15,8 @@ jobs:
   pytest:
     name: backend unit tests
     runs-on: ubuntu-latest
+    env:
+      AKB_TEST_FAIL_ON_SKIP: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -39,32 +38,12 @@ jobs:
 
       - name: Run unit tests
         working-directory: backend
-        env:
-          AKB_TEST_REQUIRE_UNIT_ONLY: '1'
-        # `-k 'not _e2e'` excludes live tests, including the authenticated
-        # MCP scenario under tests/mcp_e2e. The repository-owned runtime gate
-        # runs that scenario explicitly with its schema-v2 descriptor.
-        # Shell e2e suites under tests/*.sh aren't picked up by pytest.
-        run: pytest tests/ -k 'not _e2e' -v --tb=short
-
-      - name: Run repository runtime contract tests
-        working-directory: backend
-        # The filename contains `_e2e`, so the broad unit selector above
-        # intentionally excludes it. Keep this explicit so the runtime
-        # contract is collected and executed in every PR.
-        run: pytest tests/test_e2e_runtime_unit.py tests/test_e2e_backend_unit.py -v --tb=short
+        run: pytest tests/ --ignore=tests/mcp_e2e --strict-markers -m 'not live_services and not needs_resource' -v --tb=short
 
   pgvector-e2e:
-    # The backend suite against real services: PostgreSQL with pgvector
-    # available but not created (the fresh-DB scenario), the BM25 extension
-    # server and Redis. The unit job has none of them, so every test that
-    # needs a database skips there; this job is where those tests gate.
-    #
-    # The live job collects the suite and excludes tests/mcp_e2e, cases marked
-    # needs_resource, and cases marked unit_only. The unit job requires every
-    # unit_only case to run and fails on collection skips.
-    # AKB_TEST_FAIL_ON_SKIP=1 makes any skip or xfail
-    # in the live job a failure. The rules live in backend/tests/conftest.py.
+    # Tests that use PostgreSQL, the BM25 extension, or Redis declare
+    # live_services. The PostgreSQL image makes pgvector available so tests
+    # can exercise extension creation on a fresh database.
     #
     # Caveat: these tests do NOT reproduce the 0.8.3 shared-main-pool
     # `unknown type: public.vector` manifestation — it passes pre-fix in
@@ -72,7 +51,7 @@ jobs:
     # trigger is a startup concurrency race a single-threaded test can't
     # recreate (see backend/CHANGELOG.md 0.8.3). That case is covered by
     # a deploy-time reset-cycle check, not here.
-    name: pgvector e2e (live DB)
+    name: Backend integration tests (PostgreSQL + Redis)
     runs-on: ubuntu-latest
     env:
       AKB_TEST_FAIL_ON_SKIP: '1'
@@ -191,7 +170,10 @@ jobs:
           AKB_TEST_DSN: postgresql://akb:akb@localhost:15432/akb  # pragma: allowlist secret
           AKB_ROLE_CLUSTER_EXCLUSIVE: '1'
           REQUIRE_REAL_PG: '1'
-        run: pytest tests/test_role_membership_delta_pg.py -k full_reconcile -v --tb=short
+        run: >-
+          pytest --strict-markers
+          tests/test_role_membership_delta_pg.py::test_full_reconcile_preserves_similarly_prefixed_operator_roles
+          -v --tb=short
 
       - name: Run the backend suite against the live services
         working-directory: backend
@@ -218,4 +200,4 @@ jobs:
         # triggers, row locks, rollback and cancellation, the catalog after a
         # migration. A fake agrees with whatever SQL it is handed, so those
         # claims are only checked here.
-        run: pytest tests/ --ignore=tests/mcp_e2e -m "not needs_resource and not unit_only" -v --tb=short
+        run: pytest tests/ --ignore=tests/mcp_e2e --strict-markers -m 'live_services and not needs_resource' -v --tb=short

@@ -6,6 +6,8 @@ import pytest
 from app.services import search_service
 from tests.test_event_tail_postgres import _fresh_database, _make_vault
 
+pytestmark = pytest.mark.live_services
+
 
 @pytest.mark.asyncio
 async def test_legacy_outline_filters_literal_paths_before_grouping_and_limit(

@@ -42,7 +42,7 @@ from app.services.native_document_service import NativeDocumentService
 from app.services.native_revision_service import NativeRevisionService
 from tests.helpers.native_revision_database import cloned_derived_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 VAULT = "review"
 

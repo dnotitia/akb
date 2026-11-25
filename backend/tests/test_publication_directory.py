@@ -80,6 +80,7 @@ async def inventory(monkeypatch, directory_template):
         yield pool, AuthenticatedUser(str(owner), "owner", "owner@example.invalid", None, False, "jwt"), vaults
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_visibility_capabilities_and_safe_response(inventory):
     _, user, _ = inventory
@@ -99,6 +100,7 @@ async def test_visibility_capabilities_and_safe_response(inventory):
         await directory.list_directory(user, vault="hidden")
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_server_filters_precede_paging_and_literal_search(inventory):
     _, user, _ = inventory
@@ -116,6 +118,7 @@ async def test_server_filters_precede_paging_and_literal_search(inventory):
     assert all(p["expires_at"] is None for p in no_expiry["publications"])
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_cursor_ties_binding_and_acl_recheck(inventory):
     pool, user, vaults = inventory
@@ -144,6 +147,7 @@ async def test_cursor_ties_binding_and_acl_recheck(inventory):
     assert (await directory.list_directory(user, status="all", page_size=1, cursor=first["next_cursor"]))["total"] == 7
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_managed_grants_admin_changes_and_scoped_credentials(inventory):
     pool, user, vaults = inventory
@@ -174,6 +178,7 @@ async def test_managed_grants_admin_changes_and_scoped_credentials(inventory):
     assert not (await directory.list_directory(user, vault="managed"))["publications"][0]["can_unpublish"]
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_native_identity_title_does_not_follow_reused_uri(inventory):
     pool, user, vaults = inventory
@@ -189,6 +194,7 @@ async def test_native_identity_title_does_not_follow_reused_uri(inventory):
     assert result["publications"][0]["resource_uri"] == "akb://owned/doc/moved.md"
 
 
+@pytest.mark.live_services
 @pytest.mark.asyncio
 async def test_http_inventory_uses_real_database_and_registered_route(inventory):
     from app.api.routes.public import router

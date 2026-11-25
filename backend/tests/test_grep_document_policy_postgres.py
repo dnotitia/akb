@@ -9,6 +9,8 @@ from app.services.git_service import GitService
 from app.services.native_document_service import NativeDocumentService
 from tests.test_event_tail_postgres import _fresh_database, _make_vault
 
+pytestmark = pytest.mark.live_services
+
 
 @pytest.mark.parametrize("backend", ["postgres_native", "bare_git"])
 async def test_writer_grep_reads_and_partial_replacement_match_storage(

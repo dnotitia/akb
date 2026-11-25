@@ -25,7 +25,7 @@ from scripts.backfill_bm25_vector import _build_index, _counts, _pass, _prepare
 from tests.helpers.pg_database import TestDatabase, temporary_database
 from tests.helpers.vector_database import initialize_backfill_vocabulary
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get("AKB_VCHORD_TEST_DSN", "")
 _SCHEMA = "vector_index"

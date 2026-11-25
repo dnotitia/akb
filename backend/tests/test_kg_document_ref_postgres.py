@@ -16,7 +16,7 @@ from tests.helpers.pg_database import (
 from app.services.kg_service import _resolve_doc_ref, store_document_relations
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 _DSN = os.environ.get(
     "AKB_TEST_DSN",

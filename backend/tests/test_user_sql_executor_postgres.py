@@ -12,6 +12,8 @@ from app.services.role_sync import user_role_name
 from app.services.user_sql_executor import PermissionDeniedError, UserSqlExecutor
 from tests.helpers.pg_database import temporary_database
 
+pytestmark = pytest.mark.live_services
+
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")
 

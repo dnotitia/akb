@@ -11,7 +11,7 @@ from app.db.postgres import _load_migration
 from app.services import table_service
 from tests.test_event_tail_postgres import _fresh_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 @pytest.mark.parametrize("counted", [None, True, False])

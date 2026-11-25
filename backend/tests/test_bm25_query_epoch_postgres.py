@@ -14,7 +14,7 @@ from tests.test_bm25_term_id_compaction_postgres import (
     _installation,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 
 
 async def _seed(install, shape):

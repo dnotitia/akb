@@ -18,7 +18,7 @@ from app.services import account_self_service as service, account_deletion_worke
 from app.services.auth_service import AuthenticatedUser
 from tests.test_recovery_admin_provisioning_postgres import _fresh_database
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_services]
 PASSWORD = "fixture-confirmation-only"  # pragma: allowlist secret
 
 

@@ -34,6 +34,7 @@ import pytest
 DSN = os.getenv("AKB_TEST_DSN")
 
 pytestmark = [
+    pytest.mark.live_services,
     pytest.mark.asyncio,
     pytest.mark.skipif(not DSN, reason="AKB_TEST_DSN not set"),
 ]

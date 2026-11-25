@@ -18,6 +18,8 @@ import pytest
 
 from app.repositories import table_data_repo
 
+pytestmark = pytest.mark.live_services
+
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:5433/akb")
 
 

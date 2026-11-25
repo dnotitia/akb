@@ -10,9 +10,6 @@ from app.services import http_pool, index_service, llm_service, model_gateway, r
 from tests.test_workload_identity_config_unit import managed_values
 
 
-pytestmark = pytest.mark.unit_only
-
-
 class _Response:
     def __init__(self, status_code: int, payload: dict | None = None):
         self.status_code = status_code

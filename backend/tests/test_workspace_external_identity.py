@@ -143,6 +143,7 @@ async def test_enrollment_mode_defaults_to_open():
     assert type(settings).model_fields["keycloak_enrollment_mode"].default == "open"
 
 
+@pytest.mark.live_services
 async def test_invite_only_rejects_unbound_verified_realm_user(pool, monkeypatch):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
@@ -154,6 +155,7 @@ async def test_invite_only_rejects_unbound_verified_realm_user(pool, monkeypatch
     assert exc_info.value.code == "membership_required"
 
 
+@pytest.mark.live_services
 async def test_exact_subject_binding_preserves_user_id_across_email_change(pool, monkeypatch):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
@@ -188,6 +190,7 @@ async def test_exact_subject_binding_preserves_user_id_across_email_change(pool,
     assert row["email_snapshot"] == new_email
 
 
+@pytest.mark.live_services
 async def test_exact_binding_does_not_require_email_claim(pool, monkeypatch):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
@@ -202,6 +205,7 @@ async def test_exact_binding_does_not_require_email_claim(pool, monkeypatch):
     assert resolved["user_id"] == user_id
 
 
+@pytest.mark.live_services
 async def test_bound_identity_sanitizes_upstream_display_name_without_blocking_login(
     pool, monkeypatch
 ):
@@ -224,6 +228,7 @@ async def test_bound_identity_sanitizes_upstream_display_name_without_blocking_l
     assert "\n" not in resolved["display_name"]
 
 
+@pytest.mark.live_services
 async def test_jit_provisioning_sanitizes_upstream_display_name(pool):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
@@ -238,6 +243,7 @@ async def test_jit_provisioning_sanitizes_upstream_display_name(pool):
     assert "\n" not in resolved["display_name"]
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("auth_provider", ["local", "keycloak"])
 async def test_open_mode_never_adopts_existing_user_by_email(
     pool,
@@ -277,6 +283,7 @@ async def test_open_mode_never_adopts_existing_user_by_email(
         ) == auth_provider
 
 
+@pytest.mark.live_services
 async def test_concurrent_open_mode_creation_of_same_subject_is_idempotent(
     pool,
     monkeypatch,
@@ -342,6 +349,7 @@ async def test_concurrent_open_mode_creation_of_same_subject_is_idempotent(
         ) == 1
 
 
+@pytest.mark.live_services
 async def test_open_mode_jit_creates_user_and_subject_binding(pool):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
@@ -365,6 +373,7 @@ async def test_open_mode_jit_creates_user_and_subject_binding(pool):
     assert row["subject"] == "jit-new"
 
 
+@pytest.mark.live_services
 async def test_first_keycloak_api_principal_is_never_bootstrap_admin(
     monkeypatch,
 ):
@@ -494,6 +503,7 @@ async def test_first_keycloak_api_principal_is_never_bootstrap_admin(
         await admin.close()
 
 
+@pytest.mark.live_services
 async def test_second_subject_cannot_jit_bind_to_an_already_bound_email(pool):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
@@ -504,6 +514,7 @@ async def test_second_subject_cannot_jit_bind_to_an_already_bound_email(pool):
         await _resolve_or_provision_keycloak_user(_claims("subject-two", email))
 
 
+@pytest.mark.live_services
 async def test_open_mode_allocates_distinct_handle_on_username_collision(pool):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
@@ -534,6 +545,7 @@ async def test_open_mode_allocates_distinct_handle_on_username_collision(pool):
         ) == 2
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("legacy_stem", ["Straße", "ΑΟΣ"])
 async def test_open_mode_detects_legacy_unicode_handle_with_database_lowercase(
     pool, legacy_stem
@@ -570,6 +582,7 @@ async def test_open_mode_detects_legacy_unicode_handle_with_database_lowercase(
     assert resolved["username"].startswith(f"{database_lower}-")
 
 
+@pytest.mark.live_services
 async def test_local_registration_rejects_exact_legacy_greek_handle(
     pool, monkeypatch
 ):
@@ -602,6 +615,7 @@ async def test_local_registration_rejects_exact_legacy_greek_handle(
         )
 
 
+@pytest.mark.live_services
 async def test_login_prefers_exact_database_canonical_handle_among_legacy_variants(
     pool, monkeypatch
 ):
@@ -652,6 +666,7 @@ async def test_login_prefers_exact_database_canonical_handle_among_legacy_varian
     assert result["user"]["id"] == str(canonical_id)
 
 
+@pytest.mark.live_services
 async def test_suspended_bound_user_is_denied(pool, monkeypatch):
     from app.services.auth_service import _resolve_or_provision_keycloak_user
 
@@ -668,6 +683,7 @@ async def test_suspended_bound_user_is_denied(pool, monkeypatch):
     assert exc_info.value.code == "account_suspended"
 
 
+@pytest.mark.live_services
 async def test_disabled_mode_rejects_even_a_bound_external_identity(pool, monkeypatch):
     from app.exceptions import ExternalAuthDisabledError
     from app.services.auth_service import _resolve_or_provision_keycloak_user
@@ -699,6 +715,7 @@ async def _profile_rows(pool, *user_ids):
     )
 
 
+@pytest.mark.live_services
 async def test_bound_bearers_share_user_lock_without_advisory_locks_or_profile_writes(
     pool, bearer_client, monkeypatch,
 ):
@@ -787,6 +804,7 @@ class _RollBackGovernanceChange(Exception):
     pass
 
 
+@pytest.mark.live_services
 @pytest.mark.parametrize("commit", [True, False], ids=["commit", "rollback"])
 @pytest.mark.parametrize(("mutation", "committed_status"), [("suspend", 401), ("demote", 403)])
 async def test_bound_bearer_waits_for_same_user_governance_change(
@@ -858,6 +876,7 @@ async def test_bound_bearer_waits_for_same_user_governance_change(
         assert profile.json()["is_admin"] is False
 
 
+@pytest.mark.live_services
 async def test_bound_bearer_checks_binding_again_after_waiting_for_user_row(pool, bearer_client, monkeypatch):
     from app.services.role_authority import role_authority_transaction
 
@@ -878,6 +897,7 @@ async def test_bound_bearer_checks_binding_again_after_waiting_for_user_row(pool
     assert await pool.fetchval("SELECT id FROM external_identities WHERE user_id = $1", user_id) is None
 
 
+@pytest.mark.live_services
 async def test_external_identity_profile_snapshot_is_not_locally_editable(pool):
     from app.exceptions import ExternalProfileReadOnlyError
     from app.services.auth_service import update_profile

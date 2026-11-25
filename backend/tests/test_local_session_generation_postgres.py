@@ -19,6 +19,8 @@ from app.db.postgres import _load_migration
 from app.services import auth_service
 from tests.test_recovery_admin_provisioning_postgres import _fresh_database
 
+pytestmark = pytest.mark.live_services
+
 
 _DSN = os.environ.get("AKB_TEST_DSN", "postgresql://akb:akb@localhost:15432/akb")
 
