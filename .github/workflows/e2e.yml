@@ -103,7 +103,7 @@ jobs:
           if-no-files-found: ignore
 
   frontend-fixture-e2e:
-    name: frontend e2e (fixture ${{ matrix.shard }}/3${{ matrix.shard == 3 && ' + mock' || '' }})
+    name: frontend e2e (${{ matrix.shard }}/3)
     runs-on: ubuntu-24.04
     # The specs that answer their own HTTP need no backend. They run against a
     # production build, one test at a time per job, split across shards.
