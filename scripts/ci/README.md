@@ -12,8 +12,10 @@ Use `pytestmark = pytest.mark.live_services` when a whole module uses
 PostgreSQL, the BM25 extension, Redis, or MinIO from the integration job. In a mixed
 module, add `@pytest.mark.live_services` to each test that uses those services.
 For extra setup, use `@pytest.mark.needs_resource("resource and how to provide it")`.
-Both jobs exclude tests marked `needs_resource`. The live-PG job runs the
-exclusive role-prune test separately, before other tests create managed roles.
+Both jobs exclude tests marked `needs_resource`. Backend integration runs the
+exclusive role-prune test first, before other tests create managed roles.
+It then distributes test files across two pytest workers in the same job.
+Each test file stays with one worker so its database fixtures can be reused.
 
 The backend integration job runs `backend/tests/rest_integration/`. These tests
 call the REST and MCP routes in process through ASGI and use disposable

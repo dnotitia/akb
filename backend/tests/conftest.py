@@ -139,6 +139,22 @@ def pytest_deselected(items):
             counts[mark.args[0]] = counts.get(mark.args[0], 0) + 1
 
 
+def pytest_sessionfinish(session):
+    config = session.config
+    if (workeroutput := getattr(config, "workeroutput", None)) is not None:
+        workeroutput["akb_deselected_resources"] = config.stash.get(_DESELECTED_RESOURCES, {})
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    if error is None:
+        # Each worker collects the same tests. Use one report so the counts
+        # describe the test suite once.
+        node.config.stash.setdefault(
+            _DESELECTED_RESOURCES, node.workeroutput["akb_deselected_resources"],
+        )
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     counts = config.stash.get(_DESELECTED_RESOURCES, {})
     if _fail_on_skip() and counts:

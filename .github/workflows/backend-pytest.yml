@@ -214,4 +214,8 @@ jobs:
         # triggers, row locks, rollback and cancellation, the catalog after a
         # migration. A fake agrees with whatever SQL it is handed, so those
         # claims are only checked here.
-        run: pytest tests/ --ignore=tests/mcp_e2e --ignore=tests/runtime_e2e --strict-markers -m 'live_services and not needs_resource' -v --tb=short
+        # Keep each file in one worker so its database fixtures can be reused.
+        run: >-
+          pytest tests/ --ignore=tests/mcp_e2e --ignore=tests/runtime_e2e
+          -n 2 --dist loadfile --strict-markers
+          -m 'live_services and not needs_resource' -v --tb=short

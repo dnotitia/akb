@@ -12,10 +12,11 @@ _UNIT = "not live_services and not needs_resource"
 _LIVE = "live_services and not needs_resource"
 
 
-def _run_pytest(tmp_path, selector, source):
+def _run_pytest(tmp_path, selector, source, *options):
     (tmp_path / "conftest.py").write_text(
         "from tests.conftest import (pytest_collection_modifyitems, pytest_deselected, "
-        "pytest_make_collect_report, pytest_runtest_makereport, pytest_terminal_summary)\n",
+        "pytest_make_collect_report, pytest_runtest_makereport, pytest_sessionfinish, "
+        "pytest_terminal_summary, pytest_testnodedown)\n",
         encoding="utf-8",
     )
     (tmp_path / "test_cases.py").write_text("import pytest\n\n" + source, encoding="utf-8")
@@ -23,7 +24,7 @@ def _run_pytest(tmp_path, selector, source):
         [
             sys.executable, "-m", "pytest", "-v", "--tb=short", "--strict-markers",
             "-c", str(_BACKEND / "pyproject.toml"),
-            "--confcutdir", str(tmp_path), str(tmp_path), "-m", selector,
+            "--confcutdir", str(tmp_path), str(tmp_path), "-m", selector, *options,
         ],
         cwd=_BACKEND,
         env={**os.environ, "AKB_TEST_FAIL_ON_SKIP": "1"},
@@ -61,6 +62,26 @@ def test_external():
     assert f"::{selected} PASSED" in output, output
     assert "1 passed, 2 deselected" in output, output
     assert "a local object store at TEST_STORE_URL" in output, output
+
+
+
+def test_parallel_ci_reports_each_deselected_resource_once(tmp_path):
+    exit_code, output = _run_pytest(
+        tmp_path, _LIVE,
+        """
+@pytest.mark.live_services
+def test_selected():
+    pass
+
+@pytest.mark.needs_resource("a local object store at TEST_STORE_URL")
+def test_external():
+    pytest.skip("missing store")
+""",
+        "-n", "2", "--dist", "loadfile",
+    )
+    assert exit_code == 0, output
+    assert "1 passed" in output, output
+    assert output.count("    1  a local object store at TEST_STORE_URL") == 1, output
 
 
 @pytest.mark.parametrize(
