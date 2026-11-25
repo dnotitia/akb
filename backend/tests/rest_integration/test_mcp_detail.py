@@ -2,43 +2,25 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import os
+from collections.abc import Awaitable, Callable
 from typing import Any
 
+import pytest
 from mcp import Client
 
-from .conftest import SecondaryMcpSession
-from .runtime import RuntimeContext
-from .test_product_e2e import _call_json, _create_vault
+from .helpers import Actor
+from .mcp_client import (
+    SecondaryMcpSession,
+    call_json,
+    create_vault,
+    mcp_actor as mcp_actor,
+    mcp_client as mcp_client,
+    secondary_mcp_client as secondary_mcp_client,
+)
+from .search_fixtures import drain_search_index as drain_search_index
 
-
-async def _search_until_found(
-    client: Client,
-    runtime_session: RuntimeContext,
-    query: str,
-    *,
-    vault: str,
-) -> dict[str, Any]:
-    """Allow the derived search index to catch up without weakening the result."""
-
-    result: dict[str, Any] = {}
-    # akb_put commits PG before the repository-owned embed/index worker catches
-    # up. The shell E2E contract allows a 180-second indexing window; keep the
-    # same bound here so the fixed embedding stub's dense leg does not turn a
-    # valid BM25 match into a timing race.
-    for _ in range(90):
-        result = await _call_json(
-            client,
-            runtime_session,
-            "akb_search",
-            {"query": query, "vault": vault},
-        )
-        if int(result.get("total", 0)) >= 1 or result.get("results"):
-            return result
-        await asyncio.sleep(2)
-    return result
+pytestmark = pytest.mark.live_services
 
 
 def _relation_count(result: dict[str, Any]) -> int:
@@ -46,69 +28,68 @@ def _relation_count(result: dict[str, Any]) -> int:
 
 
 async def test_whole_body_update_requires_original_read_predicates(
-    mcp_client: Client, runtime_session: RuntimeContext,
+    mcp_client: Client,
 ) -> None:
-    vault = await _create_vault(mcp_client, runtime_session, "write-predicates")
+    vault = await create_vault(mcp_client, "write-predicates")
     for body in ({}, {"content": None}, {"content": False}, {"content": 1}, {"content": []}, {"content": {}}):
-        rejected = await _call_json(mcp_client, runtime_session, "akb_put", {
+        rejected = await call_json(mcp_client, "akb_put", {
             "vault": vault, "title": "Rejected input", **body,
         }, expect_error=True)
         assert rejected["code"] == "invalid_argument"
         assert rejected["details"]["field"] == "/content"
-    original = await _call_json(mcp_client, runtime_session, "akb_put", {
+    original = await call_json(mcp_client, "akb_put", {
         "vault": vault, "collection": "notes", "title": "Predicate contract", "content": "body A",
     })
     uri = original["uri"]
     for content in (False, 1, [], {}):
-        rejected = await _call_json(mcp_client, runtime_session, "akb_update", {
+        rejected = await call_json(mcp_client, "akb_update", {
             "uri": uri, "content": content, "expected_commit": original["current_commit"],
         }, expect_error=True)
         assert rejected["code"] == "invalid_argument"
         assert rejected["details"]["field"] == "/content"
-    await _call_json(mcp_client, runtime_session, "akb_update", {
+    await call_json(mcp_client, "akb_update", {
         "uri": uri, "title": "Metadata without body", "tags": [], "domain": "", "summary": "",
     })
-    unchanged_body = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": uri})
+    unchanged_body = await call_json(mcp_client, "akb_get", {"uri": uri})
     assert unchanged_body["content"] == "body A"
     assert unchanged_body["title"] == "Metadata without body"
     for content in ("stale body", ""):
-        rejected = await _call_json(mcp_client, runtime_session, "akb_update", {
+        rejected = await call_json(mcp_client, "akb_update", {
             "uri": uri, "content": content,
         }, expect_error=True)
         assert rejected["code"] == "invalid_argument"
     for token in ("", " ", "a" * 40 + "\x00"):
-        rejected = await _call_json(mcp_client, runtime_session, "akb_update", {
+        rejected = await call_json(mcp_client, "akb_update", {
             "uri": uri, "content": "private rejected body", "expected_commit": token,
         }, expect_error=True)
         assert rejected["code"] == "invalid_argument"
         assert "private rejected body" not in str(rejected)
 
-    await _call_json(mcp_client, runtime_session, "akb_update", {
+    await call_json(mcp_client, "akb_update", {
         "uri": uri, "content": None, "summary": "metadata only",
     })
-    changed = await _call_json(mcp_client, runtime_session, "akb_update", {
+    changed = await call_json(mcp_client, "akb_update", {
         "uri": uri, "content": "body B", "expected_content_hash": original["content_hash"],
     })
     for conditions in (
         {"expected_commit": original["current_commit"], "expected_content_hash": changed["content_hash"]},
         {"expected_commit": changed["current_commit"], "expected_content_hash": original["content_hash"]},
     ):
-        conflict = await _call_json(mcp_client, runtime_session, "akb_update", {
+        conflict = await call_json(mcp_client, "akb_update", {
             "uri": uri, "content": "must not publish", **conditions,
         }, expect_error=True)
         assert conflict["code"] == "conflict"
-    await _call_json(mcp_client, runtime_session, "akb_update", {
+    await call_json(mcp_client, "akb_update", {
         "uri": uri, "content": "", "expected_commit": changed["current_commit"],
         "expected_content_hash": changed["content_hash"],
     })
-    current = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": uri})
+    current = await call_json(mcp_client, "akb_get", {"uri": uri})
     assert current["content"] == "" and current["summary"] == "metadata only"
 
 
 async def test_exact_text_edit_contract_and_permissions(
     mcp_client: Client,
     secondary_mcp_client: SecondaryMcpSession,
-    runtime_session: RuntimeContext,
 ) -> None:
     """Preserve exact-text edit semantics, errors, history, and writer ACL."""
 
@@ -119,10 +100,9 @@ async def test_exact_text_edit_contract_and_permissions(
     edit_tool = next(tool for tool in catalog.tools if tool.name == "akb_edit")
     assert "old_string" in edit_tool.input_schema.get("required", [])
 
-    vault = await _create_vault(mcp_client, runtime_session, "edit-detail")
-    document = await _call_json(
+    vault = await create_vault(mcp_client, "edit-detail")
+    document = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {
             "vault": vault,
@@ -138,9 +118,8 @@ async def test_exact_text_edit_contract_and_permissions(
     )
     document_uri = document["uri"]
 
-    edited = await _call_json(
+    edited = await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {
             "uri": document_uri,
@@ -151,13 +130,12 @@ async def test_exact_text_edit_contract_and_permissions(
     )
     assert edited.get("commit_hash")
     assert edited.get("chunks_indexed", 0) > 0
-    current = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": document_uri})
+    current = await call_json(mcp_client, "akb_get", {"uri": document_uri})
     assert "Content of section A has been updated." in current["content"]
     assert "Content of section A is here." not in current["content"]
 
-    not_found = await _call_json(
+    not_found = await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {
             "uri": document_uri,
@@ -170,9 +148,8 @@ async def test_exact_text_edit_contract_and_permissions(
     assert "not found" in str(not_found.get("error", "")).lower()
     assert "hint" in not_found
 
-    duplicate = await _call_json(
+    duplicate = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {
             "vault": vault,
@@ -181,9 +158,8 @@ async def test_exact_text_edit_contract_and_permissions(
             "content": "# Doc\n\nDUPLICATE LINE\nother stuff\nDUPLICATE LINE\nmore stuff\nDUPLICATE LINE",
         },
     )
-    not_unique = await _call_json(
+    not_unique = await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {
             "uri": duplicate["uri"],
@@ -195,9 +171,8 @@ async def test_exact_text_edit_contract_and_permissions(
     assert not_unique.get("code") == "edit_failed"
     assert "appears 3 times" in str(not_unique.get("error", ""))
 
-    replaced = await _call_json(
+    replaced = await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {
             "uri": duplicate["uri"],
@@ -207,18 +182,16 @@ async def test_exact_text_edit_contract_and_permissions(
         },
     )
     assert replaced.get("commit_hash")
-    duplicate_body = await _call_json(
+    duplicate_body = await call_json(
         mcp_client,
-        runtime_session,
         "akb_get",
         {"uri": duplicate["uri"]},
     )
     assert duplicate_body["content"].count("REPLACED") == 3
     assert "DUPLICATE LINE" not in duplicate_body["content"]
 
-    empty_old = await _call_json(
+    empty_old = await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {"uri": document_uri, "old_string": "", "new_string": "anything"},
         expect_error=True,
@@ -226,9 +199,8 @@ async def test_exact_text_edit_contract_and_permissions(
     assert empty_old.get("code") == "edit_failed"
     assert "empty" in str(empty_old.get("error", "")).lower()
 
-    no_op = await _call_json(
+    no_op = await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {
             "uri": document_uri,
@@ -238,9 +210,8 @@ async def test_exact_text_edit_contract_and_permissions(
     )
     assert no_op.get("chunks_indexed") == 0
 
-    deletion = await _call_json(
+    deletion = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {
             "vault": vault,
@@ -249,9 +220,8 @@ async def test_exact_text_edit_contract_and_permissions(
             "content": "# Start\n\nkeep this\nDELETE_ME_LINE\nkeep that",
         },
     )
-    deletion_edit = await _call_json(
+    deletion_edit = await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {
             "uri": deletion["uri"],
@@ -260,18 +230,16 @@ async def test_exact_text_edit_contract_and_permissions(
         },
     )
     assert deletion_edit.get("commit_hash")
-    deletion_body = await _call_json(
+    deletion_body = await call_json(
         mcp_client,
-        runtime_session,
         "akb_get",
         {"uri": deletion["uri"]},
     )
     assert "DELETE_ME_LINE" not in deletion_body["content"]
     assert "keep this" in deletion_body["content"] and "keep that" in deletion_body["content"]
 
-    multiline = await _call_json(
+    multiline = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {
             "vault": vault,
@@ -280,9 +248,8 @@ async def test_exact_text_edit_contract_and_permissions(
             "content": "# Doc\n\n## Old Section\n\nLine one\nLine two\nLine three\n\n## Keep\n\nkeep me",
         },
     )
-    await _call_json(
+    await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {
             "uri": multiline["uri"],
@@ -290,9 +257,8 @@ async def test_exact_text_edit_contract_and_permissions(
             "new_string": "## New Section\n\nRewritten entirely.",
         },
     )
-    multiline_body = await _call_json(
+    multiline_body = await call_json(
         mcp_client,
-        runtime_session,
         "akb_get",
         {"uri": multiline["uri"]},
     )
@@ -300,9 +266,8 @@ async def test_exact_text_edit_contract_and_permissions(
     assert "Line one" not in multiline_body["content"]
     assert "keep me" in multiline_body["content"]
 
-    literal = await _call_json(
+    literal = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {
             "vault": vault,
@@ -311,9 +276,8 @@ async def test_exact_text_edit_contract_and_permissions(
             "content": "# Regex Test\n\nVersion check: foo.*bar\nPattern: a[bc]+d",
         },
     )
-    await _call_json(
+    await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {
             "uri": literal["uri"],
@@ -321,9 +285,8 @@ async def test_exact_text_edit_contract_and_permissions(
             "new_string": "REPLACED_FOO_BAR",
         },
     )
-    await _call_json(
+    await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {
             "uri": literal["uri"],
@@ -331,9 +294,8 @@ async def test_exact_text_edit_contract_and_permissions(
             "new_string": "CHARCLASS_GONE",
         },
     )
-    literal_body = await _call_json(
+    literal_body = await call_json(
         mcp_client,
-        runtime_session,
         "akb_get",
         {"uri": literal["uri"]},
     )
@@ -341,26 +303,23 @@ async def test_exact_text_edit_contract_and_permissions(
     assert "CHARCLASS_GONE" in literal_body["content"]
     assert "foo.*bar" not in literal_body["content"]
 
-    frontmatter = await _call_json(
+    frontmatter = await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {"uri": document_uri, "old_string": "Edit Target", "new_string": "Hacked Title"},
         expect_error=True,
     )
     assert frontmatter.get("code") == "edit_failed"
-    unchanged = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": document_uri})
+    unchanged = await call_json(mcp_client, "akb_get", {"uri": document_uri})
     assert unchanged.get("title") == "Edit Target"
 
-    await _call_json(
+    await call_json(
         mcp_client,
-        runtime_session,
         "akb_grant",
         {"vault": vault, "user": secondary_mcp_client.username, "role": "reader"},
     )
-    reader_edit = await _call_json(
+    reader_edit = await call_json(
         secondary_mcp_client.client,
-        runtime_session,
         "akb_edit",
         {
             "uri": document_uri,
@@ -371,12 +330,11 @@ async def test_exact_text_edit_contract_and_permissions(
     )
     assert any(marker in str(reader_edit).lower() for marker in ("403", "forbidden", "permission", "writer", "role"))
 
-    history = await _call_json(mcp_client, runtime_session, "akb_history", {"uri": document_uri})
+    history = await call_json(mcp_client, "akb_history", {"uri": document_uri})
     assert any("edit" in str(entry).lower() for entry in history.get("history", []))
 
-    missing_document = await _call_json(
+    missing_document = await call_json(
         mcp_client,
-        runtime_session,
         "akb_edit",
         {
             "uri": f"akb://{vault}/doc/nonexistent/missing.md",
@@ -387,17 +345,15 @@ async def test_exact_text_edit_contract_and_permissions(
     )
     assert "error" in missing_document or "not found" in str(missing_document).lower()
 
-    edit_help = await _call_json(
+    edit_help = await call_json(
         mcp_client,
-        runtime_session,
         "akb_help",
         {"topic": "akb_edit"},
     )
     assert "akb_edit" in edit_help.get("help", "")
     assert "old_string" in edit_help.get("help", "")
-    documents_help = await _call_json(
+    documents_help = await call_json(
         mcp_client,
-        runtime_session,
         "akb_help",
         {"topic": "documents"},
     )
@@ -407,16 +363,14 @@ async def test_exact_text_edit_contract_and_permissions(
 
 async def test_document_body_hash_and_expected_content_occ(
     mcp_client: Client,
-    runtime_session: RuntimeContext,
 ) -> None:
     """Keep body hashes stable across metadata updates and reject stale OCC."""
 
-    vault = await _create_vault(mcp_client, runtime_session, "hash-detail")
+    vault = await create_vault(mcp_client, "hash-detail")
     body = "# Hash Contract\n\nStable body for hashing."
     expected_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    created = await _call_json(
+    created = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {
             "vault": vault,
@@ -430,13 +384,12 @@ async def test_document_body_hash_and_expected_content_occ(
     assert created.get("content_hash") == expected_hash
     assert created.get("current_commit")
 
-    fetched = await _call_json(mcp_client, runtime_session, "akb_get", {"uri": document_uri})
+    fetched = await call_json(mcp_client, "akb_get", {"uri": document_uri})
     assert fetched.get("content_hash") == expected_hash
     assert fetched.get("current_commit") == created.get("current_commit")
 
-    metadata_update = await _call_json(
+    metadata_update = await call_json(
         mcp_client,
-        runtime_session,
         "akb_update",
         {
             "uri": document_uri,
@@ -447,9 +400,8 @@ async def test_document_body_hash_and_expected_content_occ(
     assert metadata_update.get("content_hash") == expected_hash
     assert metadata_update.get("current_commit") != created.get("current_commit")
 
-    stale = await _call_json(
+    stale = await call_json(
         mcp_client,
-        runtime_session,
         "akb_update",
         {
             "uri": document_uri,
@@ -460,9 +412,8 @@ async def test_document_body_hash_and_expected_content_occ(
     )
     assert "content_hash" in str(stale).lower()
 
-    browsed = await _call_json(
+    browsed = await call_json(
         mcp_client,
-        runtime_session,
         "akb_browse",
         {"vault": vault, "content_type": "documents", "include_hashes": True},
     )
@@ -472,15 +423,13 @@ async def test_document_body_hash_and_expected_content_occ(
 
 async def test_collection_lifecycle_boundaries(
     mcp_client: Client,
-    runtime_session: RuntimeContext,
 ) -> None:
     """Preserve collection normalization, idempotency, and deletion boundaries."""
 
-    vault = await _create_vault(mcp_client, runtime_session, "collection-detail")
+    vault = await create_vault(mcp_client, "collection-detail")
 
-    created = await _call_json(
+    created = await call_json(
         mcp_client,
-        runtime_session,
         "akb_create_collection",
         {"vault": vault, "path": "specs"},
     )
@@ -488,150 +437,135 @@ async def test_collection_lifecycle_boundaries(
     assert created.get("created") is True
     assert created.get("collection", {}).get("path") == "specs"
     assert created.get("collection", {}).get("doc_count") == 0
-    browsed = await _call_json(mcp_client, runtime_session, "akb_browse", {"vault": vault})
+    browsed = await call_json(mcp_client, "akb_browse", {"vault": vault})
     specs = next(item for item in browsed.get("items", []) if item.get("name") == "specs")
     assert specs.get("type") == "collection" and specs.get("doc_count") == 0
 
-    repeated = await _call_json(
+    repeated = await call_json(
         mcp_client,
-        runtime_session,
         "akb_create_collection",
         {"vault": vault, "path": "specs"},
     )
     assert repeated.get("created") is False
 
-    normalized = await _call_json(
+    normalized = await call_json(
         mcp_client,
-        runtime_session,
         "akb_create_collection",
         {"vault": vault, "path": "  /api-specs/  "},
     )
     assert normalized.get("collection", {}).get("path") == "api-specs"
-    browsed = await _call_json(mcp_client, runtime_session, "akb_browse", {"vault": vault})
+    browsed = await call_json(mcp_client, "akb_browse", {"vault": vault})
     assert any(item.get("name") == "api-specs" for item in browsed.get("items", []))
 
     for path in ("", "/", "../etc", "a/../b"):
-        invalid = await _call_json(
+        invalid = await call_json(
             mcp_client,
-            runtime_session,
             "akb_create_collection",
             {"vault": vault, "path": path},
             expect_error=True,
         )
         assert invalid.get("code") == "invalid_path"
 
-    deleted_empty = await _call_json(
+    deleted_empty = await call_json(
         mcp_client,
-        runtime_session,
         "akb_delete_collection",
         {"vault": vault, "path": "specs"},
     )
     assert deleted_empty.get("ok") is True
     assert deleted_empty.get("deleted_docs") == 0
     assert deleted_empty.get("deleted_files") == 0
-    browsed = await _call_json(mcp_client, runtime_session, "akb_browse", {"vault": vault})
+    browsed = await call_json(mcp_client, "akb_browse", {"vault": vault})
     assert not any(item.get("name") == "specs" for item in browsed.get("items", []))
 
-    await _call_json(
+    await call_json(
         mcp_client,
-        runtime_session,
         "akb_create_collection",
         {"vault": vault, "path": "docs"},
     )
-    document = await _call_json(
+    document = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {"vault": vault, "collection": "docs", "title": "DocsDoc", "content": "## body"},
     )
-    conflict = await _call_json(
+    conflict = await call_json(
         mcp_client,
-        runtime_session,
         "akb_delete_collection",
         {"vault": vault, "path": "docs"},
         expect_error=True,
     )
     assert conflict.get("code") == "conflict"
     assert conflict.get("details", {}).get("doc_count", 0) >= 1
-    still_exists = await _call_json(
+    still_exists = await call_json(
         mcp_client,
-        runtime_session,
         "akb_get",
         {"uri": document["uri"]},
     )
     assert still_exists.get("title") == "DocsDoc"
 
-    cascaded = await _call_json(
+    cascaded = await call_json(
         mcp_client,
-        runtime_session,
         "akb_delete_collection",
         {"vault": vault, "path": "docs", "recursive": True},
     )
     assert cascaded.get("ok") is True and cascaded.get("deleted_docs", 0) >= 1
-    gone = await _call_json(
+    gone = await call_json(
         mcp_client,
-        runtime_session,
         "akb_get",
         {"uri": document["uri"]},
         expect_error=True,
     )
     assert gone.get("code") == "not_found"
 
-    await _call_json(
+    await call_json(
         mcp_client,
-        runtime_session,
         "akb_create_collection",
         {"vault": vault, "path": "keepempty"},
     )
-    empty_document = await _call_json(
+    empty_document = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {"vault": vault, "collection": "keepempty", "title": "OnlyDoc", "content": "## c"},
     )
-    await _call_json(mcp_client, runtime_session, "akb_delete", {"uri": empty_document["uri"]})
-    browsed = await _call_json(mcp_client, runtime_session, "akb_browse", {"vault": vault})
+    await call_json(mcp_client, "akb_delete", {"uri": empty_document["uri"]})
+    browsed = await call_json(mcp_client, "akb_browse", {"vault": vault})
     keepempty = next(item for item in browsed.get("items", []) if item.get("name") == "keepempty")
     assert keepempty.get("doc_count") == 0
 
-    await _call_json(
+    await call_json(
         mcp_client,
-        runtime_session,
         "akb_create_collection",
         {"vault": vault, "path": "nested/inner"},
     )
-    nested_conflict = await _call_json(
+    nested_conflict = await call_json(
         mcp_client,
-        runtime_session,
         "akb_delete_collection",
         {"vault": vault, "path": "nested"},
         expect_error=True,
     )
     assert nested_conflict.get("code") == "conflict"
     assert nested_conflict.get("details", {}).get("sub_collection_count", 0) >= 1
-    nested_deleted = await _call_json(
+    nested_deleted = await call_json(
         mcp_client,
-        runtime_session,
         "akb_delete_collection",
         {"vault": vault, "path": "nested", "recursive": True},
     )
     assert nested_deleted.get("ok") is True
     assert nested_deleted.get("deleted_sub_collections", 0) >= 1
-    browsed = await _call_json(mcp_client, runtime_session, "akb_browse", {"vault": vault})
+    browsed = await call_json(mcp_client, "akb_browse", {"vault": vault})
     assert not any(str(item.get("path", "")).startswith("nested") for item in browsed.get("items", []))
 
 
 async def test_unicode_graph_grep_and_ownership(
     mcp_client: Client,
     secondary_mcp_client: SecondaryMcpSession,
-    runtime_session: RuntimeContext,
+    mcp_actor: Actor,
+    drain_search_index: Callable[[], Awaitable[None]],
 ) -> None:
     """Preserve Unicode search, graph edges, bounded grep replacement, and transfer."""
 
-    vault = await _create_vault(mcp_client, runtime_session, "graph-detail")
-    unicode_document = await _call_json(
+    vault = await create_vault(mcp_client, "graph-detail")
+    unicode_document = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {
             "vault": vault,
@@ -641,82 +575,72 @@ async def test_unicode_graph_grep_and_ownership(
             "tags": ["한글", "테스트", "유니코드"],
         },
     )
-    unicode_body = await _call_json(
+    unicode_body = await call_json(
         mcp_client,
-        runtime_session,
         "akb_get",
         {"uri": unicode_document["uri"]},
     )
     assert "가나다라" in unicode_body["content"]
     assert "中文" in unicode_body["content"]
-    exact_unicode = await _call_json(
+    exact_unicode = await call_json(
         mcp_client,
-        runtime_session,
         "akb_grep",
         {"pattern": "가나다라", "vault": vault},
     )
     assert exact_unicode.get("total_matches", 0) >= 1
-    semantic_unicode = await _search_until_found(
+    await drain_search_index()
+    semantic_unicode = await call_json(
         mcp_client,
-        runtime_session,
-        "기술 요건 가나다라",
-        vault=vault,
+        "akb_search",
+        {"query": "기술 요건 가나다라", "vault": vault},
     )
     assert int(semantic_unicode.get("total", 0)) >= 1 or semantic_unicode.get("results")
 
-    first = await _call_json(
+    first = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {"vault": vault, "collection": "specs", "title": "API Spec", "content": "# API Spec\nEndpoint definitions"},
     )
-    second = await _call_json(
+    second = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {"vault": vault, "collection": "specs", "title": "Data Model", "content": "# Data Model\nSchema definitions"},
     )
-    linked = await _call_json(
+    linked = await call_json(
         mcp_client,
-        runtime_session,
         "akb_link",
         {"source": first["uri"], "target": second["uri"], "relation": "depends_on"},
     )
     assert linked.get("linked") or linked.get("created") or linked.get("edge_id")
-    relations = await _call_json(
+    relations = await call_json(
         mcp_client,
-        runtime_session,
         "akb_relations",
         {"uri": first["uri"]},
     )
     assert _relation_count(relations) >= 1
-    graph = await _call_json(
+    graph = await call_json(
         mcp_client,
-        runtime_session,
         "akb_graph",
         {"uri": first["uri"], "hops": 1},
     )
     assert len(graph.get("nodes", [])) >= 2
     assert len(graph.get("edges", [])) >= 1
-    unlinked = await _call_json(
+    unlinked = await call_json(
         mcp_client,
-        runtime_session,
         "akb_unlink",
         {"source": first["uri"], "target": second["uri"], "relation": "depends_on"},
     )
     assert unlinked.get("unlinked", 0) >= 1 or unlinked.get("removed", 0) >= 1 or unlinked.get("deleted")
-    relations_after = await _call_json(
+    relations_after = await call_json(
         mcp_client,
-        runtime_session,
         "akb_relations",
         {"uri": first["uri"]},
     )
     assert _relation_count(relations_after) == 0
 
     for index in range(1, 4):
-        await _call_json(
+        await call_json(
             mcp_client,
-            runtime_session,
             "akb_put",
             {
                 "vault": vault,
@@ -725,9 +649,8 @@ async def test_unicode_graph_grep_and_ownership(
                 "content": f"# Doc {index}\nThis uses OLD_PLACEHOLDER text.\nAnother line with OLD_PLACEHOLDER here.",
             },
         )
-    budget = await _call_json(
+    budget = await call_json(
         mcp_client,
-        runtime_session,
         "akb_grep",
         {
             "pattern": "OLD_PLACEHOLDER",
@@ -742,9 +665,8 @@ async def test_unicode_graph_grep_and_ownership(
     assert budget.get("replacement_complete") is False
     assert budget.get("replacements") == []
 
-    replacement = await _call_json(
+    replacement = await call_json(
         mcp_client,
-        runtime_session,
         "akb_grep",
         {
             "pattern": "OLD_PLACEHOLDER",
@@ -761,24 +683,21 @@ async def test_unicode_graph_grep_and_ownership(
     assert replacement.get("replacement_complete") is True
     assert len(replacement.get("replacements", [])) == 3
     assert all(item.get("previous_commit") for item in replacement["replacements"])
-    old_remaining = await _call_json(
+    old_remaining = await call_json(
         mcp_client,
-        runtime_session,
         "akb_grep",
         {"pattern": "OLD_PLACEHOLDER", "vault": vault, "count_only": True},
     )
-    new_found = await _call_json(
+    new_found = await call_json(
         mcp_client,
-        runtime_session,
         "akb_grep",
         {"pattern": "NEW_VALUE", "vault": vault, "count_only": True},
     )
     assert old_remaining.get("total_matches") == 0
     assert new_found.get("total_matches", 0) >= 6
 
-    regex_document = await _call_json(
+    regex_document = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {
             "vault": vault,
@@ -787,9 +706,8 @@ async def test_unicode_graph_grep_and_ownership(
             "content": "# Regex\nVersion: v1.2.3\nRelease: v4.5.6",
         },
     )
-    regex_replacement = await _call_json(
+    regex_replacement = await call_json(
         mcp_client,
-        runtime_session,
         "akb_grep",
         {
             "pattern": r"v(\d+)\.(\d+)\.(\d+)",
@@ -800,31 +718,26 @@ async def test_unicode_graph_grep_and_ownership(
         },
     )
     assert regex_replacement.get("replaced_docs", 0) >= 1
-    regex_body = await _call_json(
+    regex_body = await call_json(
         mcp_client,
-        runtime_session,
         "akb_get",
         {"uri": regex_document["uri"]},
     )
     assert "v1.2.99" in regex_body["content"]
     assert "v4.5.99" in regex_body["content"]
 
-    ownership_vault = await _create_vault(
+    ownership_vault = await create_vault(
         secondary_mcp_client.client,
-        runtime_session,
         "ownership-detail",
     )
-    primary_username = os.environ[runtime_session.descriptor.username_env]
-    transferred = await _call_json(
+    transferred = await call_json(
         secondary_mcp_client.client,
-        runtime_session,
         "akb_transfer_ownership",
-        {"vault": ownership_vault, "new_owner": primary_username},
+        {"vault": ownership_vault, "new_owner": mcp_actor.username},
     )
     assert transferred.get("transferred") is True
-    owner_write = await _call_json(
+    owner_write = await call_json(
         mcp_client,
-        runtime_session,
         "akb_put",
         {
             "vault": ownership_vault,
@@ -834,9 +747,8 @@ async def test_unicode_graph_grep_and_ownership(
         },
     )
     assert isinstance(owner_write.get("uri"), str)
-    old_owner_transfer = await _call_json(
+    old_owner_transfer = await call_json(
         secondary_mcp_client.client,
-        runtime_session,
         "akb_transfer_ownership",
         {"vault": ownership_vault, "new_owner": secondary_mcp_client.username},
         expect_error=True,

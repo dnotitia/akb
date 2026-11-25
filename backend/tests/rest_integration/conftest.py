@@ -81,9 +81,10 @@ async def asgi_app(
         runtime.setattr(settings, "document_revision_backend", "bare_git")
         runtime.setattr(settings, "git_storage_path", str(tmp_path / "vaults"))
 
-        from app.api.routes import activity, collections, documents, help, knowledge_io
+        from app.api.routes import activity, agent_sessions, collections, documents, help, knowledge_io
         from app.main import app, mcp_app
         from app.services import publication_service, revision_backend
+        from app.services.agent_memory_service import AgentMemoryService
         from app.services.collection_service import CollectionService
         from app.services.revision_backend import LegacyRevisionBackend
         from mcp_server import server
@@ -94,6 +95,7 @@ async def asgi_app(
         runtime.setattr(revision_backend, "_revision_backend", backend)
         runtime.setattr(revision_backend, "_selected_backend", "bare_git")
         runtime.setattr(activity, "revision_backend", backend)
+        runtime.setattr(agent_sessions, "service", AgentMemoryService(doc_service=backend.document_service))
         runtime.setattr(server, "revision_backend", backend)
         for module in (collections, documents, help, knowledge_io, server):
             runtime.setattr(module, "doc_service", backend.document_service)

@@ -175,6 +175,18 @@ jobs:
           tests/test_role_membership_delta_pg.py::test_full_reconcile_preserves_similarly_prefixed_operator_roles
           -v --tb=short
 
+      - name: Start MinIO for signed file transfers
+        env:
+          MINIO_ROOT_USER: akb-ci
+          MINIO_ROOT_PASSWORD: akb-ci-secret  # pragma: allowlist secret
+        run: |
+          docker run --detach --name akb-test-minio --publish 127.0.0.1:19000:9000 \
+            -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD \
+            docker.io/dappros/minio@sha256:624bad2fe79a8613aa3c5c9b765ebcab365080b8445cf1b05c357cc7753725f0 \
+            server /data
+          curl --fail --silent --show-error --retry 30 --retry-connrefused \
+            http://127.0.0.1:19000/minio/health/ready
+
       - name: Run the backend suite against the live services
         working-directory: backend
         env:
@@ -190,6 +202,7 @@ jobs:
           # accidentally disconnected; a skip here would be a false green.
           REQUIRE_REAL_PG: '1'
           AKB_TEST_REDIS_URL: redis://localhost:16379/0
+          AKB_TEST_S3_ENDPOINT: http://127.0.0.1:19000
           REQUIRE_REAL_REDIS: "1"
           # The vchord server started above. The sparse-shape tests create and drop
           # their own database on it, so it is a separate server, not a

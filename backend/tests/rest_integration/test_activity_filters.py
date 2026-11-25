@@ -1,30 +1,37 @@
 """Activity limits and window boundaries on the authenticated MCP wire."""
+
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from mcp import Client
 
-from .conftest import SecondaryMcpSession
-from .runtime import RuntimeContext
-from .test_product_e2e import _call_json, _create_vault
+from .mcp_client import (
+    SecondaryMcpSession,
+    call_json,
+    create_vault,
+    mcp_actor as mcp_actor,
+    mcp_client as mcp_client,
+    secondary_mcp_client as secondary_mcp_client,
+)
+
+pytestmark = pytest.mark.live_services
 
 
 async def test_activity_limits_count_matching_events(
-    mcp_client: Client, runtime_session: RuntimeContext, secondary_mcp_client: SecondaryMcpSession,
+    mcp_client: Client, secondary_mcp_client: SecondaryMcpSession,
 ) -> None:
-    vault = await _create_vault(mcp_client, runtime_session, "activity-window")
+    vault = await create_vault(mcp_client, "activity-window")
     member = secondary_mcp_client
-    await _call_json(mcp_client, runtime_session, "akb_grant",
-                     {"vault": vault, "user": member.username, "role": "writer"})
+    await call_json(mcp_client, "akb_grant", {"vault": vault, "user": member.username, "role": "writer"})
     hashes = []
     for index, client in enumerate([member.client, member.client, mcp_client, mcp_client, mcp_client]):
-        written = await _call_json(client, runtime_session, "akb_put", {
+        written = await call_json(client, "akb_put", {
             "vault": vault, "collection": "logs", "title": f"Entry {index}", "content": "event",
         })
         hashes.append(written["current_commit"][:12])
 
     async def activity(**opts):
-        return await _call_json(member.client, runtime_session, "akb_activity",
-                                {"vault": vault, "collection": "logs", **opts})
+        return await call_json(member.client, "akb_activity", {"vault": vault, "collection": "logs", **opts})
 
     baseline = await activity()
     assert [e["hash"] for e in baseline["activity"]] == hashes[::-1]
@@ -46,8 +53,8 @@ async def test_activity_limits_count_matching_events(
     assert (await activity(author="no-such-writer", limit=1)) == {
         "vault": vault, "activity": [], "returned": 0, "truncated": False,
     }
-    await _call_json(mcp_client, runtime_session, "akb_revoke", {"vault": vault, "user": member.username})
-    denied = await _call_json(member.client, runtime_session, "akb_activity", {
+    await call_json(mcp_client, "akb_revoke", {"vault": vault, "user": member.username})
+    denied = await call_json(member.client, "akb_activity", {
         "vault": vault, "until": local.isoformat(),
     }, expect_error=True)
     assert denied["code"] == "permission_denied"

@@ -1,22 +1,36 @@
 """Use the public document clocks as exact boundaries through the MCP transport."""
-import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta, timezone
 
 import httpx
+import pytest
 from mcp import Client
 
-from .runtime import RuntimeContext
-from .test_product_e2e import _call_json, _create_vault
+from .helpers import Actor
+from .mcp_client import (
+    call_json,
+    create_vault,
+    mcp_actor as mcp_actor,
+    mcp_client as mcp_client,
+)
+from .search_fixtures import drain_search_index as drain_search_index
+
+pytestmark = pytest.mark.live_services
 
 
-async def test_document_search_time_windows(mcp_client: Client, runtime_session: RuntimeContext) -> None:
+async def test_document_search_time_windows(
+    api: httpx.AsyncClient,
+    mcp_client: Client,
+    mcp_actor: Actor,
+    drain_search_index: Callable[[], Awaitable[None]],
+) -> None:
     catalog = await mcp_client.list_tools(cache_mode="bypass")
     schema = next(tool.input_schema for tool in catalog.tools if tool.name == "akb_search")
     assert "time_range" in schema["properties"] and "time_range" not in schema["required"]
-    vault = await _create_vault(mcp_client, runtime_session, "dated-search")
+    vault = await create_vault(mcp_client, "dated-search")
 
     async def call(tool, args):
-        return await _call_json(mcp_client, runtime_session, tool, args)
+        return await call_json(mcp_client, tool, args)
 
     query = "datewindow"
     uris = []
@@ -34,18 +48,13 @@ async def test_document_search_time_windows(mcp_client: Client, runtime_session:
     def hits(page):
         return {item["uri"] for item in page["results"]}
 
-    for _ in range(90):
-        baseline = await search()
-        if hits(baseline) == set(uris):
-            break
-        await asyncio.sleep(2)
+    await drain_search_index()
+    baseline = await search()
     assert hits(baseline) == set(uris)
     assert "time_range" not in baseline
-    async with httpx.AsyncClient(base_url=runtime_session.descriptor.app_origin, trust_env=False,
-                                 headers={"Authorization": f"Bearer {runtime_session.pat}"}) as rest:
-        previous_contract = await rest.get("/api/v1/search", params={"q": query, **args})
-        previous_contract.raise_for_status()
-        assert baseline == previous_contract.json()
+    previous_contract = await api.get("/api/v1/search", params={"q": query, **args}, headers=mcp_actor.headers)
+    previous_contract.raise_for_status()
+    assert baseline == previous_contract.json()
 
     local_zone = timezone(timedelta(hours=9))
     for field, order in (("created_at", [0, 1, 2]), ("updated_at", [1, 2, 0])):
@@ -67,7 +76,7 @@ async def test_document_search_time_windows(mcp_client: Client, runtime_session:
         assert "gte" not in empty["time_range"] and datetime.fromisoformat(empty["time_range"]["lt"]) == start
 
     assert await search() == baseline
-    rejected = await _call_json(mcp_client, runtime_session, "akb_search", {
+    rejected = await call_json(mcp_client, "akb_search", {
         "query": query, **args, "time_range": {"field": "updated_at", "gte": "2026-01-01T00:00:00Z"},
     }, expect_error=True)
     assert rejected["code"] == "invalid_argument" and rejected["details"]["field"] == "/source_type"

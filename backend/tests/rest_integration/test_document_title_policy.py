@@ -1,18 +1,27 @@
 """Display-title checks over authenticated MCP, including collision and access envelopes."""
+
+import pytest
 from mcp import Client
 
-from .conftest import SecondaryMcpSession
-from .runtime import RuntimeContext
-from .test_product_e2e import _call_json, _create_vault
+from .mcp_client import (
+    SecondaryMcpSession,
+    call_json,
+    create_vault,
+    mcp_actor as mcp_actor,
+    mcp_client as mcp_client,
+    secondary_mcp_client as secondary_mcp_client,
+)
+
+pytestmark = pytest.mark.live_services
 
 
 async def test_title_policy_on_create_rename_and_move(
-    mcp_client: Client, runtime_session: RuntimeContext, secondary_mcp_client: SecondaryMcpSession,
+    mcp_client: Client, secondary_mcp_client: SecondaryMcpSession,
 ) -> None:
     async def call(tool, args, *, error=False):
-        return await _call_json(mcp_client, runtime_session, tool, args, expect_error=error)
+        return await call_json(mcp_client, tool, args, expect_error=error)
 
-    vault = await _create_vault(mcp_client, runtime_session, "title-policy")
+    vault = await create_vault(mcp_client, "title-policy")
     catalog = await mcp_client.list_tools(cache_mode="bypass")
     schemas = {tool.name: tool.input_schema for tool in catalog.tools}
     for name in ("akb_put", "akb_update", "akb_move"):
@@ -34,8 +43,9 @@ async def test_title_policy_on_create_rename_and_move(
         assert rejected["code"] == "document_title_conflict"
         assert rejected["details"]["existing_path"] == twin["path"]
         assert rejected["details"]["existing_title"] == "API Guide"
-        denied = await _call_json(secondary_mcp_client.client, runtime_session, tool,
-                                  {**args, "title_conflict_policy": "reject"}, expect_error=True)
+        denied = await call_json(
+            secondary_mcp_client.client, tool, {**args, "title_conflict_policy": "reject"}, expect_error=True,
+        )
         assert denied["code"] == "permission_denied" and "private-guide" not in str(denied)
         assert "details" not in denied
         for invalid_policy in (None, "overwrite"):
